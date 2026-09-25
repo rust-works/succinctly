@@ -3111,18 +3111,6 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1371: an argument captured at call time. Transparent to
         // evaluation -- it is the substitution passes, not this one, that
         // must treat it as opaque.
-        //
-        // #3012: a `is_pure_chain_link` node -- the shape a `$`-bound
-        // recursive parameter's dereference chain always has -- goes
-        // through the memoizing wrapper instead of a bare re-evaluation, so
-        // a deep chain (`def d($n): ... d($n - 1) ...`) is `O(1)` to
-        // dereference once its own level has already been touched once,
-        // rather than `O(depth)` every time. Anything else keeps today's
-        // unconditional re-evaluation -- see `eval_shared_chain_link`'s own
-        // doc comment for why that's required, not just simpler.
-        Expr::Shared(inner) if is_pure_chain_link(inner) => {
-            eval_shared_chain_link::<W, S>(inner, value, optional)
-        }
         Expr::Shared(inner) => eval_single::<W, S>(inner, value, optional),
         Expr::NamespacedCall {
             namespace,
@@ -5928,9 +5916,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Expr::Shared(inner) => {
             if is_pure_chain_link(inner) {
-                // #3012: memoized for the rest of the live call lineage --
-                // see `eval_shared_chain_link`'s own doc comment.
-                drain_result(eval_shared_chain_link::<W, S>(inner, value, optional), sink)
+                drain_result(eval_single::<W, S>(inner, value, optional), sink)
             } else {
                 eval_each::<W, S>(inner, value, optional, sink)
             }
@@ -31730,6 +31716,25 @@ fn unwrap_paren(expr: &Expr) -> &Expr {
     }
 }
 
+/// [`unwrap_paren`], also peeling `Expr::Shared` -- for the identity
+/// passthrough grammar ([`is_identity_passthrough`] and the matchers that
+/// mirror it), which asks what a bind source *evaluates* to, and `Shared`
+/// is as transparent to evaluation as a paren (#3149).
+///
+/// A `$`-style parameter binds as `Shared(arg) as $x | body`, and a bare one
+/// substitutes `Shared(arg)` into the body, so `def f($x): $x; path(f(.))`
+/// and `def f(x): x as $v | $v; path(f(.))` both bind a source that is `.`
+/// behind a `Shared` -- jq 1.7.1 answers `[]` for each. Kept apart from
+/// `unwrap_paren` itself, whose other callers match fast-path shapes and
+/// were never audited for a `Shared` operand.
+fn unwrap_bind_source(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(inner) => unwrap_bind_source(inner),
+        Expr::Shared(inner) => unwrap_bind_source(inner),
+        other => other,
+    }
+}
+
 /// The three outcomes of one sink-driven path resolution — the same
 /// three [`Flow`] already has for value-mode evaluation ([`Demand`] is
 /// shared verbatim), minus the `pending` field: a path resolution's
@@ -35226,7 +35231,7 @@ fn resolves_to_register<S: EvalSemantics>(
     reg: &OwnedValue,
     frame: &Frame,
 ) -> bool {
-    match unwrap_paren(expr) {
+    match unwrap_bind_source(expr) {
         Expr::Identity => trackable,
         // #3136: [`marker_identical`], shared with `resolve_node_eager`'s
         // own `TrackedVar` arm, so a future refinement of this rule can't
@@ -42778,7 +42783,7 @@ pub(crate) fn as_var_refs(
 /// jq, even though the bound value trivially equals `.` there) -- matching
 /// jq's actual rule takes a syntactic passthrough, not mere value equality.
 pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
-    match unwrap_paren(expr) {
+    match unwrap_bind_source(expr) {
         Expr::Identity => true,
         // #2042: only a marker frozen from `.` itself is a passthrough of
         // `.`; one bound from a navigated position is that *node*, and a
@@ -42809,7 +42814,7 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
 /// itself runs its right side whenever its left yields nothing and not only
 /// when it raises, what `A` must satisfy directly in `A // B` too (#3129).
 fn is_raise_free_identity_passthrough(expr: &Expr) -> bool {
-    match unwrap_paren(expr) {
+    match unwrap_bind_source(expr) {
         Expr::Identity => true,
         Expr::TrackedVar(marker) => {
             matches!(marker.origin, Origin::Snapshot | Origin::SnapshotAt { .. })
@@ -42984,7 +42989,7 @@ fn identity_bind_position<S: EvalSemantics>(
         return None;
     }
     fn position(source: &Expr, trackable: bool, frame: &Frame) -> Option<Origin> {
-        match unwrap_paren(source) {
+        match unwrap_bind_source(source) {
             Expr::Identity if trackable => frame.at.as_ref().map(|at| Origin::SnapshotAt {
                 invocation: frame.invocation,
                 path: BindPath(Rc::clone(at)),
@@ -59320,227 +59325,40 @@ fn eval_func_def<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// applies unconditionally in both configurations.
 #[cfg(feature = "std")]
 mod ambient_frame_depth {
-    use std::cell::{Cell, RefCell};
-    use std::collections::{HashMap, HashSet};
-
-    use super::OwnedValue;
+    use std::cell::Cell;
 
     thread_local! {
         static CURRENT: Cell<u32> = const { Cell::new(0) };
-        // #3012: `Rc::as_ptr(inner) as usize` -> the single `OwnedValue` a
-        // pure `Expr::Shared` chain link (see `is_pure_chain_link`)
-        // evaluated to, so a `$`-bound recursive parameter's dereference
-        // chain doesn't get re-walked from scratch at every recursion
-        // level. Keyed on raw pointer identity of the `Rc` the permanently
-        // memoized `BoundBody` tree owns forever (see `eval_shared_chain_link`'s
-        // own doc comment for why that makes the key ABA-safe), never on
-        // depth or call count.
-        static SHARED_CHAIN_CACHE: RefCell<HashMap<usize, OwnedValue>> =
-            RefCell::new(HashMap::new());
-        // #3012: which `SHARED_CHAIN_CACHE` keys are even *eligible* to be
-        // read or written -- see `mark_dollar_safe`'s own doc comment for
-        // why this exists at all (a `$`-bound reference may be cached; the
-        // *identical* `Rc` reused for a bare reference to the same
-        // parameter name must never be, and nothing else about the node's
-        // shape tells the two apart). Populated by `bind_def_call_params`
-        // when it constructs a `$`-scoped substitution, and purged on the
-        // same `Guard`-drop schedule as `SHARED_CHAIN_CACHE` -- see
-        // `INSERTED_DOLLAR_SAFE_KEYS`'s own doc comment for why a key here
-        // cannot outlive the `Rc` it names, same as a `SHARED_CHAIN_CACHE`
-        // entry can't.
-        static DOLLAR_SAFE_KEYS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
-        // One entry per live `Guard`, holding exactly the keys *that*
-        // guard inserted into `SHARED_CHAIN_CACHE` -- so `Guard::drop`
-        // purges only its own frame's entries, never a sibling's or an
-        // ancestor's still-live ones (#3012).
-        static INSERTED_KEYS: RefCell<Vec<Vec<usize>>> = const { RefCell::new(Vec::new()) };
-        // The `DOLLAR_SAFE_KEYS` twin of `INSERTED_KEYS` -- one entry per
-        // live `Guard`, holding exactly the keys *that* guard marked via
-        // `mark_dollar_safe` (#3012).
-        //
-        // A mark must not outlive the `Rc` it names: `dollar_safe_shared`
-        // only ever runs while the level it's substituting for is already
-        // the innermost live `Guard` (the same ordering `cache_shared_value`
-        // relies on), and that `Rc` is embedded in the substituted body that
-        // level's own evaluation owns -- so the `Rc`, and every reference to
-        // its address, is gone by the time that same `Guard` drops. Without
-        // this, a key stayed marked forever after its `Rc` was freed, so a
-        // *later*, unrelated `Rc<Expr>` allocated at the same (by-then
-        // reused) address -- built for an ordinary bare-scoped substitution,
-        // never through `dollar_safe_shared` -- would be misread as
-        // dollar-safe by nothing more than address coincidence, silently
-        // caching a value real jq requires to be re-evaluated fresh at
-        // every reference. `Rc<Expr>` is a fixed allocation size regardless
-        // of which `Expr` variant it stores, so this was not a remote
-        // corner case: any `Expr::Shared(Rc::new(..))` built anywhere
-        // shortly after a dollar-marked `Rc`'s owning `Guard` dropped was a
-        // same-size-class candidate for the allocator to hand back that
-        // exact address.
-        static INSERTED_DOLLAR_SAFE_KEYS: RefCell<Vec<Vec<usize>>> =
-            const { RefCell::new(Vec::new()) };
     }
 
     pub(crate) fn get() -> u32 {
         CURRENT.with(Cell::get)
     }
 
-    /// Records that `key` (an `Rc<Expr>`'s pointer identity) was built by
-    /// [`super::dollar_safe_shared`] for a `$`-scoped substitution, and is
-    /// therefore safe for [`cache_shared_value`]/[`cached_shared_value`] to
-    /// treat as "evaluated once, reusable for the rest of this call lineage"
-    /// (#3012).
-    ///
-    /// A `$`-bound parameter is evaluated exactly once per invocation in
-    /// real jq (`def f($x): BODY` desugars to `def f(x): x as $x | BODY`,
-    /// and `x as $x` binds once, up front) -- caching is a safe refinement
-    /// of that semantics, not a behavior change. A **bare** reference to
-    /// the same declared name is the opposite: real jq re-evaluates it
-    /// fresh at every reference site, using whatever `.` is ambient *there*
-    /// (confirmed live: `def d(n): if n == 0 then [] else (n | d(n-1)) +
-    /// [n] end; 3 | d(.)` is `[2,3]` in jq 1.7.1 -- caching this shape gives
-    /// `[1,2,3]` instead, a real regression measured while building this
-    /// fix). A `$`-style [`Param`] binds *both* namespaces to the identical
-    /// argument text, and `bind_def_call_params` used to wrap both in the
-    /// same `Rc` -- indistinguishable by pointer identity alone -- so this
-    /// registry only exists because [`dollar_safe_shared`] is now the
-    /// *only* place that produces a marked key: every bare-scoped
-    /// substitution (including a `$`-style parameter's own bare namespace)
-    /// still goes through a plain, unmarked `Expr::Shared(Rc::new(..))` and
-    /// is therefore never looked up here.
-    ///
-    /// `Guard`-scoped, same as [`cache_shared_value`]: a no-op if no `Guard`
-    /// is currently live, and otherwise purged when the *currently
-    /// innermost live* `Guard` drops -- see [`INSERTED_DOLLAR_SAFE_KEYS`]'s
-    /// own doc comment for why a mark must not outlive that (#3012).
-    pub(crate) fn mark_dollar_safe(key: usize) {
-        INSERTED_DOLLAR_SAFE_KEYS.with(|s| {
-            let mut stack = s.borrow_mut();
-            let Some(top) = stack.last_mut() else {
-                return;
-            };
-            top.push(key);
-            DOLLAR_SAFE_KEYS.with(|d| {
-                d.borrow_mut().insert(key);
-            });
-        });
-    }
-
-    /// Whether `key` was marked by [`mark_dollar_safe`] (#3012).
-    pub(crate) fn is_dollar_safe(key: usize) -> bool {
-        DOLLAR_SAFE_KEYS.with(|s| s.borrow().contains(&key))
-    }
-
-    /// Looks up a value [`cache_shared_value`] cached earlier in this same
-    /// still-live call lineage. See that function's own doc comment for the
-    /// scoping guarantee (#3012).
-    pub(crate) fn cached_shared_value(key: usize) -> Option<OwnedValue> {
-        SHARED_CHAIN_CACHE.with(|c| c.borrow().get(&key).cloned())
-    }
-
-    /// Caches `value` for `key`, visible to every dereference of the same
-    /// key for the remainder of the *currently innermost live* [`Guard`]'s
-    /// scope (and any guard nested inside it), and automatically purged
-    /// when that guard drops (#3012).
-    ///
-    /// A no-op if no `Guard` is currently live -- a value with no owning
-    /// frame to purge it could otherwise outlive its rightful scope, so it
-    /// is never inserted in the first place. In practice every call site
-    /// this is reached from is already nested inside `enter_def_call_frame`'s
-    /// own guard, so this only matters for future callers.
-    pub(crate) fn cache_shared_value(key: usize, value: OwnedValue) {
-        INSERTED_KEYS.with(|s| {
-            let mut stack = s.borrow_mut();
-            let Some(top) = stack.last_mut() else {
-                return;
-            };
-            top.push(key);
-            SHARED_CHAIN_CACHE.with(|c| {
-                c.borrow_mut().insert(key, value);
-            });
-        });
-    }
-
     /// Raises the ambient depth to at least `frames` for the caller's scope,
     /// restoring the previous value on drop — so a call that has returned
     /// (or a sibling call not nested inside this one) never inherits it.
-    ///
-    /// #3012: also owns this scope's share of [`SHARED_CHAIN_CACHE`] and
-    /// [`DOLLAR_SAFE_KEYS`] -- every key inserted via [`cache_shared_value`]
-    /// or marked via [`mark_dollar_safe`] while this guard is the innermost
-    /// live one is removed again on drop. For `SHARED_CHAIN_CACHE`, that
-    /// means a value computed during one dynamic invocation of a `DefCall`
-    /// node can never be read back during a *different* dynamic invocation
-    /// of the same (permanently memoized, per [`super::BoundBody`]) node --
-    /// a separate document reusing the same compiled query, a sibling
-    /// backtrack branch of the same call site, or any other re-entry all
-    /// correctly see a fresh, empty cache for that node. For
-    /// `DOLLAR_SAFE_KEYS`, it means a mark can never outlive the `Rc` it
-    /// names -- see [`INSERTED_DOLLAR_SAFE_KEYS`]'s own doc comment for why
-    /// that matters.
     #[must_use]
     pub(crate) struct Guard(u32);
 
     pub(crate) fn enter(frames: u32) -> Guard {
         let previous = get();
         CURRENT.with(|c| c.set(previous.max(frames)));
-        INSERTED_KEYS.with(|s| s.borrow_mut().push(Vec::new()));
-        INSERTED_DOLLAR_SAFE_KEYS.with(|s| s.borrow_mut().push(Vec::new()));
         Guard(previous)
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
             CURRENT.with(|c| c.set(self.0));
-            let keys = INSERTED_KEYS
-                .with(|s| s.borrow_mut().pop())
-                .unwrap_or_default();
-            if !keys.is_empty() {
-                SHARED_CHAIN_CACHE.with(|c| {
-                    let mut cache = c.borrow_mut();
-                    for key in keys {
-                        cache.remove(&key);
-                    }
-                });
-            }
-            let dollar_safe_keys = INSERTED_DOLLAR_SAFE_KEYS
-                .with(|s| s.borrow_mut().pop())
-                .unwrap_or_default();
-            if !dollar_safe_keys.is_empty() {
-                DOLLAR_SAFE_KEYS.with(|d| {
-                    let mut keys = d.borrow_mut();
-                    for key in dollar_safe_keys {
-                        keys.remove(&key);
-                    }
-                });
-            }
         }
     }
 }
 
 #[cfg(not(feature = "std"))]
 mod ambient_frame_depth {
-    use super::OwnedValue;
-
     pub(crate) fn get() -> u32 {
         0
     }
-
-    /// `no_std` has no `thread_local!`, so the `$`-bound recursive
-    /// parameter cache (#3012) is simply never populated -- every lookup
-    /// misses and every recursive dereference falls back to today's
-    /// (correct, just quadratic) re-walk. Not a regression: `no_std` never
-    /// had this optimization to begin with.
-    pub(crate) fn mark_dollar_safe(_key: usize) {}
-
-    pub(crate) fn is_dollar_safe(_key: usize) -> bool {
-        false
-    }
-
-    pub(crate) fn cached_shared_value(_key: usize) -> Option<OwnedValue> {
-        None
-    }
-
-    pub(crate) fn cache_shared_value(_key: usize, _value: OwnedValue) {}
 
     pub(crate) struct Guard;
 
@@ -59605,54 +59423,6 @@ pub(crate) fn enter_def_call_frame(frames: u32) -> ambient_frame_depth::Guard {
     ambient_frame_depth::enter(frames)
 }
 
-/// Public (crate-visible) face of [`ambient_frame_depth::cached_shared_value`]
-/// -- `ambient_frame_depth` itself is private to this module, so
-/// `eval_generic.rs`'s own `eval_shared_chain_link_generic` reaches the cache
-/// through this and [`cache_shared_chain_value`] instead (#3012).
-pub(crate) fn cached_shared_chain_value(key: usize) -> Option<OwnedValue> {
-    ambient_frame_depth::cached_shared_value(key)
-}
-
-/// Public (crate-visible) face of [`ambient_frame_depth::cache_shared_value`]
-/// -- see [`cached_shared_chain_value`]'s own doc comment (#3012).
-pub(crate) fn cache_shared_chain_value(key: usize, value: OwnedValue) {
-    ambient_frame_depth::cache_shared_value(key, value);
-}
-
-/// Public (crate-visible) face of [`ambient_frame_depth::is_dollar_safe`] --
-/// see [`cached_shared_chain_value`]'s own doc comment for why this indirection
-/// exists, and [`ambient_frame_depth::mark_dollar_safe`]'s for why the check
-/// itself is required (#3012).
-pub(crate) fn is_dollar_safe_chain_key(key: usize) -> bool {
-    ambient_frame_depth::is_dollar_safe(key)
-}
-
-/// Wraps `arg` in an `Expr::Shared`, marking the new `Rc` eligible for
-/// [`eval_shared_chain_link`]'s cache (#3012).
-///
-/// The **only** constructor a `$`-scoped substitution may use -- a
-/// bare-scoped one (including a `$`-style [`Param`]'s own bare namespace)
-/// must keep using a plain `Expr::Shared(Rc::new(..))`, unmarked, so it is
-/// never mistaken for a value safe to reuse across references. See
-/// [`ambient_frame_depth::mark_dollar_safe`]'s own doc comment for why the
-/// two must never share one `Rc`.
-///
-/// [`bind_def_call_params`]'s two combined-walk paths (the common,
-/// no-duplicate-name one and the duplicate-name one) both use this for
-/// their dollar-scoped entries. [`sequential_param_substitution`] -- the
-/// `>32`/`>64`-parameter fallback, unreachable in practice -- deliberately
-/// does **not**: it still wraps a `$`-style parameter's single combined
-/// `ParamSubst` in a plain, unmarked `Expr::Shared`, exactly as every path
-/// here did before #3012. That is a missed optimization for that
-/// vanishingly rare case, not a correctness gap -- an unmarked `Rc` simply
-/// never hits the cache, falling back to the pre-#3012 re-derive-every-time
-/// behavior.
-fn dollar_safe_shared(arg: &Expr) -> Expr {
-    let rc = Rc::new(arg.clone());
-    ambient_frame_depth::mark_dollar_safe(Rc::as_ptr(&rc) as usize);
-    Expr::Shared(rc)
-}
-
 /// Whether `expr` is a pure, single-valued combination of `Shared` nodes and
 /// literals -- safe for `eval_each`'s `Expr::Shared` arm to evaluate eagerly
 /// instead of preserving demand-driven laziness (#1371 follow-up).
@@ -59697,61 +59467,6 @@ pub(crate) fn is_pure_chain_link(expr: &Expr) -> bool {
             is_pure_chain_link(left) && is_pure_chain_link(right)
         }
         _ => false,
-    }
-}
-
-/// Evaluates a `Shared` chain link (see [`is_pure_chain_link`]) with the
-/// result memoized for the rest of the live call lineage (#3012).
-///
-/// Every reference to the *same* `$`-bound recursion parameter within one
-/// recursive descent shares the identical `Rc<Expr>` (`bind_def_call_params`
-/// clones the `Rc`, not the value it points to), so keying on `Rc::as_ptr`
-/// and consulting [`ambient_frame_depth::cached_shared_value`] turns the
-/// `O(depth)` re-walk `def d($n): ... d($n - 1) ...` used to pay at every
-/// level into an `O(1)` cache hit once the referenced level has already been
-/// dereferenced once -- which, for this shape, is always before a deeper
-/// level's own chain is even constructed (the deeper level's argument
-/// expression embeds the shallower one, but nothing forces its evaluation
-/// until *that* level's own body runs).
-///
-/// Only a single-valued result (`One`/`OneCursor`/`Owned`) is ever cached;
-/// anything else (`Many`, `ManyOwned`, a `Partial` prefix, `None`, an error,
-/// a break/halt) falls through uncached, exactly as before this existed --
-/// caching is a strict refinement, never a behavior change, for any shape it
-/// doesn't help.
-fn eval_shared_chain_link<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    inner: &Rc<Expr>,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> QueryResult<'a, W> {
-    let key = Rc::as_ptr(inner) as usize;
-    // #3012: caching is only sound for a `$`-scoped substitution (see
-    // `dollar_safe_shared`'s own doc comment) -- a bare one must always
-    // re-derive fresh, exactly as before this cache existed.
-    if !ambient_frame_depth::is_dollar_safe(key) {
-        return eval_single::<W, S>(inner, value, optional);
-    }
-    if let Some(cached) = ambient_frame_depth::cached_shared_value(key) {
-        return QueryResult::Owned(cached);
-    }
-    let result = eval_single::<W, S>(inner, value, optional);
-    if let Some(owned) = cacheable_owned::<_, S>(&result) {
-        ambient_frame_depth::cache_shared_value(key, owned);
-    }
-    result
-}
-
-/// The owned value to cache for a [`QueryResult`], or `None` for any shape
-/// [`eval_shared_chain_link`] must not memoize (#3012) -- see that
-/// function's own doc comment.
-fn cacheable_owned<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    result: &QueryResult<'_, W>,
-) -> Option<OwnedValue> {
-    match result {
-        QueryResult::One(v) => Some(to_owned_lossy::<S, _>(v)),
-        QueryResult::OneCursor(c) => Some(to_owned_lossy::<S, _>(&c.value())),
-        QueryResult::Owned(v) => Some(v.clone()),
-        _ => None,
     }
 }
 
@@ -59900,62 +59615,45 @@ pub(crate) fn bind_def_call<'e>(
     })
 }
 
-/// Substitute every parameter of a `def` call into its own body (#2560).
+/// Bind every parameter of a `def` call into its own body (#2560, #3149).
 ///
-/// The common case -- no two parameters share a name -- is exactly the
-/// pre-#2560 code: one `substitute_func_param` fold per parameter, left to
-/// right, each substitution's `Expr::Shared` insertion opaque to the next
-/// (same cost, same behavior). A duplicate parameter name (rare -- `def
-/// f(a; $a): ...`) broke under that fold: sequential substitution resolves
-/// to the *first* occurrence, but jq's own parameter list is a chain of
-/// nested scopes, innermost (last) first, so a later same-named parameter
-/// entirely shadows an earlier one -- confirmed live against jq 1.7.1,
-/// `def f(a; $a): $a; f(1;2)` is `2`, not `1`.
+/// jq compiles `def f($a): body` to `def f(a): a as $a | body` (#3149), so
+/// the two namespaces bind by different mechanisms and this does both:
 ///
-/// A `$`-style parameter binds *both* the bare and `$` namespace ([`Param`]'s
-/// own doc comment); a bare-style parameter only the bare one. So for each
-/// distinct duplicated name, the bare namespace resolves to the *last*
-/// parameter overall with that name (whichever kind), and the `$` namespace
-/// resolves to the last `$`-style parameter with that name, if any --
-/// possibly a different, earlier position (`def f($a; a): $a; f(1;2)` is
-/// `1`: the trailing bare `a` shadows the bare namespace only, so the
-/// leading `$a`'s own binding is still what `$a` resolves to). Substituting
-/// the bare winner under [`BARE_NAMESPACE_ONLY`] and the `$` winner (if any)
-/// under [`DOLLAR_NAMESPACE_ONLY`] reproduces this, whichever position wins
-/// which namespace.
+/// - **Bare names are substituted.** Every parameter, whichever spelling,
+///   binds its bare name to the argument *expression*, wrapped in
+///   [`Expr::Shared`] -- re-run at every reference site, like jq's closure.
+///   jq's parameter list is a chain of nested scopes, innermost (last)
+///   first, so of several same-named parameters only the *last* one's bare
+///   name is visible -- confirmed live against jq 1.7.1, `def f(a; $a): a;
+///   f(1;2)` is `2`, and so is `def f($a; a): a; f(1;2)`.
+/// - **`$` names are bound, one value at a time.** Each `$`-style parameter
+///   wraps the body in `Shared(arg) as $name | ...`, left to right, the
+///   first parameter outermost -- so a generator argument runs the body once
+///   per value, the arguments' outputs combine as a cartesian product in
+///   that order, an `empty` argument produces nothing and an erroring one
+///   raises even when the body never reads `$name`. Each binding takes its
+///   *own* parameter's argument positionally, never the bare name's winner:
+///   `def f($a; $b; a): [$a, $b, a]; f(1,2; 3,4; 5,6)` binds `$a` to `1,2`
+///   although `a` is `5,6`. A later same-named `$` binding is nested inside
+///   an earlier one and shadows it, which is all a duplicated `$` name needs
+///   (`def f($a; $a): $a; [f(1,2; 3,4)]` is `[3,4,3,4]`: the outer binding
+///   still iterates, its value just never shows).
 ///
-/// The two winners are independent: each rewrites a disjoint set of nodes
-/// ([`SubstScope`] gates the `Expr::Var` and bare `Expr::FuncCall` arms
-/// separately since #2555), so neither can consume or clobber what the other
-/// is looking for. That is what lets them share a single walk since #2633,
-/// where they used to be two sequential passes; before #2555 the bare arm
-/// fired unconditionally and even the two-pass form relied on the bare pass
-/// running first and leaving opaque `Expr::Shared` behind for the `$` pass
-/// to skip over -- correct, but only by construction rather than by the
-/// flags actually saying so.
+/// Before #3149 the `$` namespace was substituted too, with the argument
+/// expression in place of `$name`, so `def g($x): $x + $x; g(1,2)` re-ran
+/// the generator at each read and answered `2,3,3,4` where jq answers `2,4`.
 ///
-/// One consequence worth keeping: when a duplicated name has *no* `$`-style
-/// occurrence at all, no `$` entry is built at all, so a `$name` in the body is
-/// left for an enclosing binder -- which is what jq does
-/// (`5 as $a | def f(a;a): $a + a; f(1;2)` is `7`; the blanket
-/// `subst_dollar: true` fold this replaced captured `$a` as the parameter
-/// and answered `6`).
+/// The `as` binding reuses the argument's `Rc`, so a `$`-style parameter
+/// still clones its argument once. [`Expr::Shared`]'s opacity is what keeps
+/// both halves hygienic: substituting the bare names never descends into an
+/// argument, and neither does binding `$name` (#2077) -- arguments live in
+/// the caller's scope and cannot mention the callee's own parameters.
 ///
-/// Verified against every bare/`$` ordering and combined
-/// bare-and-`$`-reference body jq 1.7.1 can express for two, and for three,
-/// duplicated parameters --
-/// `test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560`
-/// below, plus `tests/jq_cli_tests.rs`' own `test_duplicate_named_param_*_2560`
-/// family end to end.
-///
-/// #2633: one walk over the body carrying every parameter, not one walk per
-/// parameter. The two shapes described above are now two *slice* shapes fed
-/// to that one walk -- the distinct-name case one entry per parameter, the
-/// duplicate-name case a bare-winner and (where one exists) a `$`-winner
-/// entry per distinct name -- rather than one fold and two passes over
-/// rebuilt bodies. `sequential_param_substitution` below is what still has
-/// the per-parameter shape, as the >64 fallback and the differential
-/// oracle.
+/// #2633: the bare substitution is one walk over the body carrying every
+/// parameter, not one walk per parameter.
+/// `sequential_bare_substitution` below keeps the per-parameter shape, as
+/// the >64 fallback and the differential oracle.
 ///
 /// Measured interleaved against `c21736b2f`, 11 reps, best-of, both pinned
 /// boxes, body held at 60 nodes and depth at 1200 so only the parameter
@@ -59972,198 +59670,116 @@ pub(crate) fn bind_def_call<'e>(
 /// count. A 1-parameter `def` has nothing to win -- one walk before, one
 /// after. Every row's output is byte-identical across the two binaries and
 /// against jq 1.7.1.
+///
+/// The `as` wrappers are part of the body [`bind_def_call`] installs, so
+/// `install_def_calls` charges each one a frame like any other structural
+/// level. That charge is real stack: bisected with the guard disabled
+/// (release, 256 MB), every extra `$` parameter costs a thin recursive body
+/// ~2.9 KB a level, about what one charged frame stands for, and leaving
+/// the wrappers uncharged let `def d($n;$m;$k): ... d($n-1;$m;$k) ...;
+/// d(19999;1;2)` overflow the stack (crash floor 17,364 levels) while the
+/// guard still admitted 20,000. Charged, a thin body keeps a 2.1-2.4x
+/// margin from one to eight `$` parameters. The price is headroom: a
+/// `$`-parameter recursion refuses one level in four sooner than before
+/// (`def sum_to($n)` stops at 10,000 levels, not 13,333), where the bare
+/// spelling is unchanged.
 fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
-    let has_duplicate_names = params
+    let shared = share_def_call_args(args);
+    bind_dollar_params(
+        substitute_bare_params(body, params, &shared),
+        params,
+        &shared,
+    )
+}
+
+/// Each argument of a `def` call, behind the one `Rc` both its bare
+/// substitution and its `$` binding share (#3149).
+fn share_def_call_args(args: &[Expr]) -> Vec<Rc<Expr>> {
+    args.iter().map(|arg| Rc::new(arg.clone())).collect()
+}
+
+/// The bare half of [`bind_def_call_params`]: substitute each parameter's
+/// bare name, the last same-named parameter winning, in one walk (#2633).
+fn substitute_bare_params(body: &Expr, params: &[Param], shared: &[Rc<Expr>]) -> Expr {
+    // `zip` truncates to the shorter side -- an arity mismatch cannot reach
+    // here (`install_def_calls` only builds a `DefCall` whose `args.len()`
+    // equals `params.len()`), and if one ever did, leaving the extra
+    // parameters unbound is the old behaviour, not a panic.
+    // Checked before building the substitution list (review): past the
+    // ceiling it would be built only to be thrown away by the fallback.
+    if params.len() > MAX_COMBINED_PARAM_SUBSTS {
+        return sequential_bare_substitution(body, params, shared); // omni-dev: coverage tolerate-line reason="unreachable in practice: a def with more than 64 parameters; the fallback exists so ScopeMask's one-bit-per-parameter u64 is a performance ceiling rather than a correctness limit (#2633)"
+    }
+    let subs: Vec<ParamSubst<'_>> = params
         .iter()
+        .zip(shared)
         .enumerate()
-        .any(|(i, p)| params[i + 1..].iter().any(|q| q.name() == p.name()));
-
-    if !has_duplicate_names {
-        // `zip` truncates to the shorter side, exactly as the pre-#2560
-        // fold did -- an arity mismatch cannot reach here (`install_def_calls`
-        // only builds a `DefCall` whose `args.len()` equals `params.len()`),
-        // and if one ever did, leaving the body unsubstituted is the old
-        // behaviour, not a panic.
-        // #2633: one walk carrying every parameter, not one walk per
-        // parameter. `Expr::Shared`'s own opaque arm is what makes the two
-        // equivalent -- a substituted argument is never descended into, so
-        // no parameter can be substituted into another's argument whether
-        // the walks are sequential or simultaneous.
-        // Checked before the `collect` (review): past the ceiling the vec
-        // would be built -- one `arg.clone()` and `Rc::new` per parameter --
-        // only to be thrown away by the fallback.
-        //
-        // #3012: a `$`-style parameter contributes up to *two* entries below
-        // (a bare-scoped one and a separately-`Rc`'d dollar-scoped one -- see
-        // why under `dollar_safe_shared`'s own doc comment), so the ceiling
-        // is checked against that doubled bound, same as the duplicate-name
-        // path below already does.
-        if params.len() * 2 > MAX_COMBINED_PARAM_SUBSTS {
-            return sequential_param_substitution(body, params, args); // omni-dev: coverage tolerate-line reason="unreachable in practice: a def with more than 32 parameters; the fallback exists so ScopeMask's one-bit-per-parameter u64 is a performance ceiling rather than a correctness limit (#2633)"
-        }
-        let mut subs: Vec<ParamSubst<'_>> = vec_with_capacity(params.len());
-        for (param, arg) in params.iter().zip(args.iter()) {
-            // #3012: a bare-scoped substitution must never be cached (a
-            // bare reference is re-evaluated fresh at every reference site
-            // in real jq; a `$`-scoped one is evaluated exactly once) -- so
-            // the two can no longer share one `Rc`, unlike pre-#3012, where
-            // a `$`-style `Param` bound both namespaces off the identical
-            // `Expr::Shared`. `dollar_safe_shared` is the only constructor
-            // that marks its `Rc` eligible for `eval_shared_chain_link`'s
-            // cache, so only the dollar-scoped entry uses it.
-            subs.push(ParamSubst {
-                name: param.name(),
-                arg: Expr::Shared(Rc::new(arg.clone())),
-                scope: BARE_NAMESPACE_ONLY,
-            });
-            if param.is_dollar() {
-                subs.push(ParamSubst {
-                    name: param.name(),
-                    arg: dollar_safe_shared(arg),
-                    scope: DOLLAR_NAMESPACE_ONLY,
-                });
-            }
-        }
-        if subs.is_empty() {
-            return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: bind_def_call only calls this for a non-empty params, and install_def_calls only builds a DefCall whose args.len() equals params.len(), so the zip is never empty here (#2560)"
-        }
-        return substitute_func_params_impl(body, &subs, ScopeMask::start(&subs));
-    }
-
-    // `None` until the first substitution, so that one rebuilds `body`
-    // itself rather than a copy of it -- the same O(body size)-per-bound-call
-    // allocation `bind_def_call`'s own #2094 comment above exists to avoid,
-    // which seeding this loop with `body.clone()` would put straight back
-    // (once per recursion level, for a recursive `def` that also duplicates a
-    // parameter name).
-    // #2633: the same fold, collected into one walk. Each distinct name
-    // contributes a bare-winner entry and, if any occurrence is `$`-style, a
-    // dollar-winner entry; the two rewrite provably disjoint node sets (a
-    // `Var` consults only the dollar mask, a bare `FuncCall` only the bare
-    // mask), which is why they can share a pass rather than needing two.
-    // Two entries per distinct name in the worst case (a bare winner and a
-    // `$` winner), so the ceiling is checked against that bound before any
-    // argument is cloned -- same reason as the non-duplicate path above.
-    if params.len() * 2 > MAX_COMBINED_PARAM_SUBSTS {
-        return sequential_param_substitution(body, params, args); // omni-dev: coverage tolerate-line reason="unreachable in practice: needs more than 32 duplicated-name parameters; see the non-duplicate path's own note (#2633)"
-    }
-    let mut subs: Vec<ParamSubst<'_>> = Vec::new();
-    let mut substituted_names: Vec<&str> = Vec::new();
-    for param in params {
-        let name = param.name();
-        if substituted_names.contains(&name) {
-            continue;
-        }
-        substituted_names.push(name);
-
-        let by_name = || {
-            params
-                .iter()
-                .zip(args.iter())
-                .filter(|(p, _)| p.name() == name)
-        };
-        let Some((_, bare_arg)) = by_name().next_back() else {
-            // Unreachable for a well-formed `DefCall` (same arity invariant
-            // as the non-duplicate path above); skipping rather than
-            // unwrapping keeps a malformed one from taking the process down.
-            continue; // omni-dev: coverage tolerate-line reason="unreachable: `name` was just read from `params`, so the zip over (params, args) has a matching pair unless args is shorter than params, which install_def_calls' own arity guard rules out (#2560)"
-        };
-        subs.push(ParamSubst {
-            name,
-            arg: Expr::Shared(Rc::new(bare_arg.clone())),
+        .filter(|(i, (param, _))| !shadowed_by_later_param(params, *i, param))
+        .map(|(_, (param, arg))| ParamSubst {
+            name: param.name(),
+            arg: Expr::Shared(Rc::clone(arg)),
             scope: BARE_NAMESPACE_ONLY,
-        });
-
-        if let Some((_, dollar_arg)) = by_name().rfind(|(p, _)| p.is_dollar()) {
-            // #3012: `dollar_safe_shared`, not a plain `Expr::Shared(Rc::new(..))`
-            // -- this entry only ever feeds the dollar namespace (see
-            // `DOLLAR_NAMESPACE_ONLY` above), so it's always safe to mark.
-            subs.push(ParamSubst {
-                name,
-                arg: dollar_safe_shared(dollar_arg),
-                scope: DOLLAR_NAMESPACE_ONLY,
-            });
-        }
-    }
+        })
+        .collect();
     if subs.is_empty() {
-        return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: `params` is non-empty here (bind_def_call's own guard) and its first entry is never skipped, so at least one substitution always ran (#2560)"
+        return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: bind_def_call only calls this for a non-empty params, install_def_calls only builds a DefCall whose args.len() equals params.len(), and the last parameter is never shadowed, so at least one entry is always built (#2560)"
     }
     substitute_func_params_impl(body, &subs, ScopeMask::start(&subs))
+}
+
+/// Whether a later parameter of the same name hides `params[i]`'s bare name
+/// -- see [`bind_def_call_params`] (#2560).
+fn shadowed_by_later_param(params: &[Param], i: usize, param: &Param) -> bool {
+    params[i + 1..].iter().any(|q| q.name() == param.name())
+}
+
+/// Wrap `body` in one `Shared(arg) as $name | ...` per `$`-style parameter,
+/// the first parameter outermost -- jq's own desugaring (#3149). See
+/// [`bind_def_call_params`].
+fn bind_dollar_params(body: Expr, params: &[Param], shared: &[Rc<Expr>]) -> Expr {
+    params
+        .iter()
+        .zip(shared)
+        .rev()
+        .filter(|(param, _)| param.is_dollar())
+        .fold(body, |body, (param, arg)| Expr::As {
+            expr: Box::new(Expr::Shared(Rc::clone(arg))),
+            var: param.name().to_string(),
+            body: Box::new(body),
+        })
 }
 
 /// [`ScopeMask`]'s one-bit-per-substitution `u64`.
 const MAX_COMBINED_PARAM_SUBSTS: usize = 64;
 
-/// The pre-#2633 fold: [`substitute_func_param`] once per parameter, over
+/// The pre-#2633 fold: one bare-namespace substitution per parameter, over
 /// the result of the last.
 ///
 /// Two roles. It is [`bind_def_call_params`]' fallback past
 /// [`MAX_COMBINED_PARAM_SUBSTS`], so the mask's width is a performance
-/// ceiling rather than a correctness limit. And it is the differential
-/// oracle `combined_param_substitution_matches_the_sequential_fold_2633`
-/// checks the combined walk against over the whole capture-hygiene corpus --
-/// the six recorded fixes this function family carries (#2077, #2141, #2283,
-/// #2555, #2560, #2726) plus #2737's deliberately-unfixed gap are pinned by
+/// ceiling rather than a correctness limit. And, followed by the same
+/// [`bind_dollar_params`], it is the differential oracle
+/// `combined_param_substitution_matches_the_sequential_fold_2633` checks the
+/// combined walk against over the whole capture-hygiene corpus -- the six
+/// recorded fixes this function family carries (#2077, #2141, #2283, #2555,
+/// #2560, #2726) plus #2737's deliberately-unfixed gap are pinned by
 /// behaviour tests, but "one walk does what N walks did" is a claim about
 /// the rewrite itself and wants its own structural check.
-fn sequential_param_substitution(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
-    let has_duplicate_names = params
-        .iter()
-        .enumerate()
-        .any(|(i, p)| params[i + 1..].iter().any(|q| q.name() == p.name()));
-
-    if !has_duplicate_names {
-        let mut result: Option<Expr> = None;
-        for (param, arg) in params.iter().zip(args.iter()) {
-            result = Some(substitute_func_param(
-                result.as_ref().unwrap_or(body),
-                param,
-                &Expr::Shared(Rc::new(arg.clone())),
-            ));
-        }
-        return result.unwrap_or_else(|| body.clone());
-    }
-
-    // #2560's own two-pass-per-distinct-name shape, not a plain fold: with a
-    // duplicated name the bare and `$` namespaces resolve to *different*
-    // occurrences, which one sequential pass per parameter cannot express
-    // (it would let the first substitution's `Shared` node hide the second
-    // from the namespace that should win). Reproduced verbatim here because
-    // an oracle that models only the easy path is not an oracle -- the first
-    // run of the differential test below caught exactly that mistake.
+///
+/// A shadowed parameter (a later one shares its name) is skipped rather than
+/// substituted first and overwritten: its `Shared` node would otherwise hide
+/// the winner's references from the later pass.
+fn sequential_bare_substitution(body: &Expr, params: &[Param], shared: &[Rc<Expr>]) -> Expr {
     let mut result: Option<Expr> = None;
-    let mut substituted_names: Vec<&str> = Vec::new();
-    for param in params {
-        let name = param.name();
-        if substituted_names.contains(&name) {
+    for (i, (param, arg)) in params.iter().zip(shared).enumerate() {
+        if shadowed_by_later_param(params, i, param) {
             continue;
         }
-        substituted_names.push(name);
-
-        let by_name = || {
-            params
-                .iter()
-                .zip(args.iter())
-                .filter(|(p, _)| p.name() == name)
-        };
-        let Some((_, bare_arg)) = by_name().next_back() else {
-            continue; // omni-dev: coverage tolerate-line reason="unreachable: same arity invariant as bind_def_call_params' own copy of this loop -- `name` came from `params`, so the zip has a matching pair unless args is shorter, which install_def_calls rules out (#2560)"
-        };
-        let mut substituted = substitute_func_param_impl(
+        result = Some(substitute_func_param(
             result.as_ref().unwrap_or(body),
-            name,
-            &Expr::Shared(Rc::new(bare_arg.clone())),
-            BARE_NAMESPACE_ONLY,
-        );
-        if let Some((_, dollar_arg)) = by_name().rfind(|(p, _)| p.is_dollar()) {
-            substituted = substitute_func_param_impl(
-                &substituted,
-                name,
-                &Expr::Shared(Rc::new(dollar_arg.clone())),
-                DOLLAR_NAMESPACE_ONLY,
-            );
-        }
-        result = Some(substituted);
+            param.name(),
+            &Expr::Shared(Rc::clone(arg)),
+        ));
     }
     result.unwrap_or_else(|| body.clone())
 }
@@ -60706,6 +60322,11 @@ fn params_bind_dollar(params: &[Param], name: &str) -> bool {
 #[derive(Clone, Copy)]
 struct SubstScope {
     /// `$param` (`Expr::Var`) still resolves to this call's own argument.
+    ///
+    /// No production caller sets this since #3149: a `$`-style parameter is
+    /// now bound by an `as` around the body ([`bind_def_call_params`]), not
+    /// substituted, so every entry starts from [`BARE_NAMESPACE_ONLY`]. The
+    /// half is kept, with its tests, until it is stripped as a whole.
     /// Cleared by any binder that rebinds `$param` for real -- `1 as
     /// $param`, a `reduce`/`foreach`/`?//` pattern binding it, or a nested
     /// `def` whose own matching parameter is `$`-style.
@@ -60728,17 +60349,6 @@ struct SubstScope {
     /// aborts with `cannot allocate memory` -- see the "non-terminating def"
     /// divergence in `docs/compliance/jq/limitations.md`.
     bare: bool,
-}
-
-impl SubstScope {
-    /// The scope a call-time parameter binding starts in: a `$`-style
-    /// parameter owns both namespaces, a bare-style one owns only `bare`.
-    fn for_param(param: &Param) -> Self {
-        Self {
-            dollar: param.is_dollar(),
-            bare: true,
-        }
-    }
 }
 
 /// One parameter's worth of a combined substitution (#2633).
@@ -60783,8 +60393,8 @@ struct ScopeMask {
 }
 
 impl ScopeMask {
-    /// The mask every substitution starts in: each parameter's own
-    /// [`SubstScope::for_param`] answer, one bit per index.
+    /// The mask every substitution starts in: each entry's own
+    /// [`SubstScope`], one bit per index.
     fn start(subs: &[ParamSubst<'_>]) -> Self {
         // The capture-hygiene precondition (#2096/#2077): every argument
         // must be `Expr::Shared`-wrapped, or a same-named binder inside the
@@ -60888,39 +60498,30 @@ const BARE_NAMESPACE_ONLY: SubstScope = SubstScope {
     bare: true,
 };
 
-/// Rewrite only `$param` references, leaving every bare `param` alone --
-/// [`bind_def_call_params`]' `$`-winner pass over a duplicated name.
-const DOLLAR_NAMESPACE_ONLY: SubstScope = SubstScope {
-    dollar: true,
-    bare: false,
-};
-
-/// Substitute a function parameter with an argument expression.
+/// Substitute a function parameter's bare name with an argument expression.
 ///
 /// #2141: `param` is always the *bare* spelling of a function parameter
-/// (`params: Vec<String>`, since [`parse_func_def_parts`]'s own parser
-/// discards a leading `$` before storing it -- `def f($x): ...` and
-/// `def f(x): ...` produce the identical `params: ["x"]`). A bare `name`
-/// reference (`Expr::FuncCall{name, args: []}`, jq's own call-by-name
-/// spelling for a parameter) and a `$name` reference (`Expr::Var(name)`)
-/// therefore live in genuinely separate jq namespaces *except* for one
-/// case this substitution itself has to bridge: a `$`-style parameter's
-/// own `$name` references inside the body have no other binding
-/// mechanism (the parser threw away the `$`), so they still rely on this
-/// same substitution to resolve at all (`def f($x): $x; f(5)` is `5`).
+/// (the parser discards a leading `$` before storing it -- `def f($x): ...`
+/// and `def f(x): ...` produce the same name, told apart only by [`Param`]).
+/// A bare `name` reference (`Expr::FuncCall{name, args: []}`, jq's own
+/// call-by-name spelling for a parameter) and a `$name` reference
+/// (`Expr::Var(name)`) live in genuinely separate jq namespaces, and this
+/// rewrites only the bare one. A `$`-style parameter's own `$name`
+/// references used to be substituted here too, as the only thing that bound
+/// them at all; since #3149 they are bound by an `as` around the body
+/// instead (see [`bind_def_call_params`]), one value at a time, as jq does.
 ///
-/// Which namespaces the substitution may rewrite, and what narrows that as
-/// the walk crosses each binder, is [`SubstScope`] -- `param`'s own spelling
-/// decides where it starts (#2726), and only a binder in the matching
-/// namespace clears it (#2555).
+/// What narrows the substitution as the walk crosses each binder is
+/// [`SubstScope`] -- only a binder in the bare namespace clears it (#2555).
 ///
-/// #2633: this is now the one-parameter spelling of
+/// #2633: this is the one-parameter spelling of
 /// [`substitute_func_params_impl`], which carries a whole parameter list
 /// through a single walk. `bind_def_call_params` uses the combined form;
-/// this wrapper serves the two callers that genuinely have one parameter,
-/// and keeps them on the same walk rather than a second copy of it.
-fn substitute_func_param(expr: &Expr, param: &Param, arg: &Expr) -> Expr {
-    substitute_func_param_impl(expr, param.name(), arg, SubstScope::for_param(param))
+/// this wrapper serves the sequential fold, which genuinely has one
+/// parameter at a time, and keeps it on the same walk rather than a second
+/// copy of it.
+fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
+    substitute_func_param_impl(expr, param, arg, BARE_NAMESPACE_ONLY)
 }
 
 fn substitute_func_params_impl(expr: &Expr, subs: &[ParamSubst<'_>], scope: ScopeMask) -> Expr {
@@ -61732,7 +61333,11 @@ mod tests {
             // parameter's own `$a` reaches the nested def's body under
             // exactly the same condition.
             let arg = Expr::Shared(Rc::new(Expr::Literal(Literal::Int(7))));
-            let substituted = substitute_func_param(&def, &Param::Dollar("a".to_string()), &arg);
+            let both = SubstScope {
+                dollar: true,
+                bare: true,
+            };
+            let substituted = substitute_func_param_impl(&def, "a", &arg, both);
             let Expr::FuncDef { body, .. } = substituted else {
                 unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_func_param_impl's FuncDef arm always returns FuncDef (#2555)"
             };
@@ -61761,9 +61366,17 @@ mod tests {
     /// so a mask bit cleared one binder too early or too late fails here
     /// even when no test query happens to reach the difference.
     ///
-    /// `sequential_param_substitution` is kept in the tree for this (it is
+    /// `sequential_bare_substitution` is kept in the tree for this (it is
     /// also the >64-parameter fallback), so the oracle is the real prior
     /// implementation rather than a re-derivation of it.
+    ///
+    /// #3149: this covers the bare half only -- the `$` half is no longer a
+    /// substitution, but one `as` per parameter ([`bind_dollar_params`]),
+    /// with no second implementation to diff it against. Its nesting order,
+    /// names and duplicate handling are pinned by
+    /// `test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560`
+    /// and, end to end against jq 1.7.1, by `tests/jq_cli_tests.rs`'s
+    /// `test_dollar_param_binds_each_value_of_a_generator_argument_3149`.
     #[test]
     fn combined_param_substitution_matches_the_sequential_fold_2633() {
         let bare = |n: &str| Param::Bare(n.to_string());
@@ -61874,10 +61487,11 @@ mod tests {
                 let args: Vec<Expr> = (0..params.len())
                     .map(|i| int(i64::try_from(i).expect("small index") + 1))
                     .collect();
-                let combined = bind_def_call_params(body, params, &args);
+                let shared = share_def_call_args(&args);
+                let combined = substitute_bare_params(body, params, &shared);
                 assert_eq!(
                     combined,
-                    sequential_param_substitution(body, params, &args),
+                    sequential_bare_substitution(body, params, &shared),
                     "combined walk diverged from the sequential fold\n  body: {body:?}\n  params: {params:?}"
                 );
                 // #2633 review: `Expr`'s own `PartialEq` cannot see this.
@@ -61915,13 +61529,18 @@ mod tests {
         found
     }
 
-    /// The `$`-first/bare-last row is the one that pins the two winners
-    /// apart: `$a` must still resolve to the *leading* `$`-style
+    /// The `$`-first/bare-last row is the one that pins the two namespaces
+    /// apart: `$a` must still be bound from the *leading* `$`-style
     /// parameter's argument (the trailing bare parameter creates no
     /// `$`-binding to shadow it with), while a bare `a` reference in the
     /// same body resolves to the *trailing* one -- so a single "last
     /// argument wins" rule, applied to both namespaces at once, would pass
     /// every other row here and still be wrong.
+    ///
+    /// #3149: the `$` namespace is bound by an `as` around the body, not
+    /// substituted -- jq's own `def f($a): body` = `def f(a): a as $a |
+    /// body` -- so each expectation is that wrapper around the bare
+    /// substitution.
     #[test]
     fn test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560() {
         let bare = |name: &str| Param::Bare(name.to_string());
@@ -61932,6 +61551,7 @@ mod tests {
                 Expr::Literal(Literal::Int(2)),
             ]
         };
+        let bind = |body: Expr, params: &[Param]| bind_def_call_params(&body, params, &args());
         let dollar_ref = || Expr::Var("a".to_string());
         let bare_ref = || Expr::FuncCall {
             name: "a".to_string(),
@@ -61941,46 +61561,62 @@ mod tests {
         // `Expr::Shared`-wrapped, since that is what the substitution
         // inserts (#2096 capture hygiene).
         let shared = |n: i64| Expr::Shared(Rc::new(Expr::Literal(Literal::Int(n))));
+        let bound_as = |n: i64, var: &str, body: Expr| Expr::As {
+            expr: Box::new(shared(n)),
+            var: var.to_string(),
+            body: Box::new(body),
+        };
 
-        // `def f(a; $a): $a` -- the issue's own repro: the `$` namespace
-        // resolves to the trailing `$`-style parameter (`2`), not the
-        // leading bare one (`1`, what the pre-#2560 fold answered).
+        // `def f(a; $a): $a` -- the #2560 repro: `$a` is bound from the
+        // trailing `$`-style parameter (`2`), not the leading bare one.
         assert_eq!(
-            bind_def_call_params(&dollar_ref(), &[bare("a"), dollar("a")], &args()),
-            shared(2)
+            bind(dollar_ref(), &[bare("a"), dollar("a")]),
+            bound_as(2, "a", dollar_ref())
         );
         // `def f(a; $a): a` -- a `$`-style parameter binds the bare
         // namespace too, so it shadows the leading bare parameter there
         // as well.
         assert_eq!(
-            bind_def_call_params(&bare_ref(), &[bare("a"), dollar("a")], &args()),
-            shared(2)
+            bind(bare_ref(), &[bare("a"), dollar("a")]),
+            bound_as(2, "a", shared(2))
         );
         // `def f($a; a): $a` -- the trailing *bare* parameter shadows only
         // the bare namespace, so `$a` keeps the leading parameter's `1`.
         assert_eq!(
-            bind_def_call_params(&dollar_ref(), &[dollar("a"), bare("a")], &args()),
-            shared(1)
+            bind(dollar_ref(), &[dollar("a"), bare("a")]),
+            bound_as(1, "a", dollar_ref())
         );
         // `def f($a; a): a` -- and the bare reference in that same shape
         // still follows the trailing parameter.
         assert_eq!(
-            bind_def_call_params(&bare_ref(), &[dollar("a"), bare("a")], &args()),
-            shared(2)
+            bind(bare_ref(), &[dollar("a"), bare("a")]),
+            bound_as(1, "a", shared(2))
         );
 
-        // No duplicate name: the untouched fast path, one substitution per
-        // parameter (`def f(a; $b): [a, $b]`).
+        // No duplicate name (`def f(a; $b): [a, $b]`): one substitution per
+        // parameter, and `$b` bound around it.
+        let pair = |a: Expr, b: Expr| Expr::Array(Box::new(Expr::Comma(vec![a, b])));
         assert_eq!(
-            bind_def_call_params(
-                &Expr::Array(Box::new(Expr::Comma(vec![
-                    bare_ref(),
-                    Expr::Var("b".to_string()),
-                ]))),
-                &[bare("a"), dollar("b")],
-                &args(),
+            bind(
+                pair(bare_ref(), Expr::Var("b".to_string())),
+                &[bare("a"), dollar("b")]
             ),
-            Expr::Array(Box::new(Expr::Comma(vec![shared(1), shared(2)]))),
+            bound_as(2, "b", pair(shared(1), Expr::Var("b".to_string()))),
+        );
+
+        // #3149: several `$` parameters bind left to right, the first
+        // outermost -- `def f($a; $b): [$a, $b]; f(1,2; 3,4)` is jq's
+        // `[1,3]`, `[1,4]`, `[2,3]`, `[2,4]`, not the other nesting's order.
+        assert_eq!(
+            bind(
+                pair(dollar_ref(), Expr::Var("b".to_string())),
+                &[dollar("a"), dollar("b")]
+            ),
+            bound_as(
+                1,
+                "a",
+                bound_as(2, "b", pair(dollar_ref(), Expr::Var("b".to_string())))
+            ),
         );
     }
 
@@ -62014,137 +61650,6 @@ mod tests {
         assert!(
             !Rc::ptr_eq(&first, &third),
             "a different FuncDefBound must compute its own Rc, not see another node's cache"
-        );
-    }
-
-    /// #3012: a key cached under one `Guard`'s scope must be gone once that
-    /// guard drops, so a sibling call reaching the same (permanently
-    /// memoized, per `BoundBody`) node afterward -- a separate document
-    /// reusing the same compiled query, or a separate backtrack branch of
-    /// the same call site -- never sees a stale value from the branch
-    /// before it.
-    #[test]
-    #[cfg(feature = "std")]
-    fn test_shared_chain_cache_purged_when_guard_drops_3012() {
-        let key = 0xdead_beef_usize;
-        {
-            let _guard = enter_def_call_frame(0);
-            ambient_frame_depth::cache_shared_value(key, OwnedValue::Int(1));
-            assert_eq!(
-                ambient_frame_depth::cached_shared_value(key),
-                Some(OwnedValue::Int(1))
-            );
-        }
-        assert_eq!(
-            ambient_frame_depth::cached_shared_value(key),
-            None,
-            "a key must not survive the guard that inserted it dropping"
-        );
-
-        // A second, unrelated guard entered afterward must not inherit
-        // anything the first one left behind -- there is nothing to
-        // inherit, since the drop above already purged it.
-        let _guard = enter_def_call_frame(0);
-        assert_eq!(ambient_frame_depth::cached_shared_value(key), None);
-    }
-
-    /// #3012: a value cached while an *outer* guard is the innermost live
-    /// one must still be visible once a *nested* guard becomes innermost --
-    /// this is exactly what lets a deep recursion's own dereference of an
-    /// ancestor level's already-cached value hit, instead of re-deriving it
-    /// (the whole point of the cache). Only the nested guard's *own*
-    /// insertions are purged when it drops; the outer guard's remain live
-    /// until *it* drops.
-    #[test]
-    #[cfg(feature = "std")]
-    fn test_shared_chain_cache_visible_to_nested_guard_3012() {
-        let outer_key = 0x1111_usize;
-        let nested_key = 0x2222_usize;
-        let _outer = enter_def_call_frame(0);
-        ambient_frame_depth::cache_shared_value(outer_key, OwnedValue::Int(7));
-        {
-            let _nested = enter_def_call_frame(1);
-            assert_eq!(
-                ambient_frame_depth::cached_shared_value(outer_key),
-                Some(OwnedValue::Int(7)),
-                "a nested guard must still see an outer guard's still-live cache entry"
-            );
-            ambient_frame_depth::cache_shared_value(nested_key, OwnedValue::Int(8));
-            assert_eq!(
-                ambient_frame_depth::cached_shared_value(nested_key),
-                Some(OwnedValue::Int(8))
-            );
-        }
-        assert_eq!(
-            ambient_frame_depth::cached_shared_value(nested_key),
-            None,
-            "the nested guard's own entry must not survive its own drop"
-        );
-        assert_eq!(
-            ambient_frame_depth::cached_shared_value(outer_key),
-            Some(OwnedValue::Int(7)),
-            "the outer guard's entry must survive the nested guard's drop"
-        );
-    }
-
-    /// #3012: [`dollar_safe_shared`] is the only thing that may mark a key
-    /// eligible for the cache -- an arbitrary key (standing in for a
-    /// bare-scoped substitution's `Rc`, which is never marked) must read as
-    /// ineligible.
-    #[test]
-    #[cfg(feature = "std")]
-    fn test_dollar_safe_marking_is_opt_in_3012() {
-        let _guard = enter_def_call_frame(0);
-        let unmarked = 0x3333_usize;
-        assert!(!ambient_frame_depth::is_dollar_safe(unmarked));
-
-        let marked = 0x4444_usize;
-        ambient_frame_depth::mark_dollar_safe(marked);
-        assert!(ambient_frame_depth::is_dollar_safe(marked));
-        assert!(
-            !ambient_frame_depth::is_dollar_safe(unmarked),
-            "marking one key must not mark another"
-        );
-    }
-
-    /// #3012 follow-up: a mark must not survive the `Guard` that inserted it
-    /// dropping, exactly like a `SHARED_CHAIN_CACHE` entry
-    /// (`test_shared_chain_cache_purged_when_guard_drops_3012` above) --
-    /// otherwise the mark outlives the `Rc<Expr>` it names (which is
-    /// embedded in that same guard's substituted body and freed no later
-    /// than the guard drops), and a *different*, unrelated `Rc<Expr>` the
-    /// allocator later hands back the same address to -- built for an
-    /// ordinary bare-scoped substitution, never through `dollar_safe_shared`
-    /// -- would be misread as dollar-safe by address coincidence alone,
-    /// letting a bare (dynamically-scoped) reference get silently cached.
-    #[test]
-    #[cfg(feature = "std")]
-    fn test_dollar_safe_mark_purged_when_guard_drops_3012() {
-        let key = 0x5555_usize;
-        {
-            let _guard = enter_def_call_frame(0);
-            ambient_frame_depth::mark_dollar_safe(key);
-            assert!(ambient_frame_depth::is_dollar_safe(key));
-        }
-        assert!(
-            !ambient_frame_depth::is_dollar_safe(key),
-            "a mark must not survive the guard that inserted it dropping -- otherwise a later, \
-             unrelated Rc<Expr> reusing this address would be wrongly treated as dollar-safe"
-        );
-    }
-
-    /// #3012 follow-up: marking with no `Guard` currently live is a no-op,
-    /// mirroring [`cache_shared_value`]'s own no-op case -- a mark with no
-    /// owning frame to purge it could otherwise outlive its rightful scope,
-    /// so (like the value cache) it is never inserted in the first place.
-    #[test]
-    #[cfg(feature = "std")]
-    fn test_dollar_safe_marking_without_a_live_guard_is_a_no_op_3012() {
-        let key = 0x6666_usize;
-        ambient_frame_depth::mark_dollar_safe(key);
-        assert!(
-            !ambient_frame_depth::is_dollar_safe(key),
-            "marking outside any live guard must not stick"
         );
     }
 
@@ -94628,11 +94133,7 @@ mod tests {
             slice_number
         );
         assert_eq!(
-            substitute_func_param(
-                &slice_number,
-                &Param::Bare("x".to_string()),
-                &Expr::Shared(Rc::new(Expr::Identity))
-            ),
+            substitute_func_param(&slice_number, "x", &Expr::Shared(Rc::new(Expr::Identity))),
             slice_number
         );
     }
