@@ -7377,7 +7377,7 @@ mod tests {
                 result.mantissa_str.len() <= PREVIEW_MANTISSA_DIGIT_CAP + 2,
                 "mantissa_str must stay capped regardless of input size \
                  (digit_count={digit_count}): got {} chars",
-                result.mantissa_str.len()
+                result.mantissa_str.len() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3281)"
             );
             // `digit_count` itself must stay the *true* size -- the cap only
             // bounds what gets copied into `mantissa_str`, never the count
@@ -7395,7 +7395,7 @@ mod tests {
         assert!(
             preview.len() < 100,
             "preview output must stay small regardless of input size: got {} chars",
-            preview.len()
+            preview.len() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3281)"
         );
         assert!(preview.starts_with("9.999999999"), "got: {preview}");
     }
