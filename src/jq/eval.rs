@@ -4805,6 +4805,13 @@ where
     let mut escape: Option<Control> = None;
 
     let outer_flow = eval_each::<W, S>(outer, value.clone(), optional, &mut |outer_item| {
+        // #2952: reset before either closure below can set a fresh `escape`
+        // for *this* outer item -- see `fanout_arg_each_inner`'s identical
+        // top-of-closure reset for why one reset per closure invocation is
+        // equivalent to (and less omission-prone than) resetting on every
+        // individual clean-outcome arm; a first pass here did the latter
+        // and missed this whole function.
+        escape = None;
         // #2023: same decode-failure raise as `fanout_arg`'s own lazy sink,
         // for both generators here.
         let o = match checked_or_stop::<_, S>(outer_item, &mut escape) {
@@ -4812,31 +4819,19 @@ where
             Err(demand) => return demand,
         };
         let inner_flow = eval_each::<W, S>(inner, value.clone(), optional, &mut |inner_item| {
+            // #2952: same reset, for `inner`'s own `?//` retries.
+            escape = None;
             let i = match checked_or_stop::<_, S>(inner_item, &mut escape) {
                 Ok(v) => v,
                 Err(demand) => return demand,
             };
             match push_owned_values::<_, S>(body(o.clone(), i), &mut out) {
                 Some(control) => stop_with_escape(&mut escape, control),
-                // #2952: also supersedes any `escape` an *earlier* call to
-                // this same closure (a retried-past `?//` alternative, via
-                // `inner`) already stashed -- see `fanout_arg_each_inner`'s
-                // identical fix.
-                None => {
-                    escape = None;
-                    Demand::Continue
-                }
+                None => Demand::Continue,
             }
         });
         match inner_flow {
-            // #2952: same supersession as above -- a clean `inner_flow` for
-            // *this* outer item means any `escape` still sitting from a
-            // `?//` this outer item's own generator (`outer`) already
-            // retried past is stale.
-            Flow::Exhausted => {
-                escape = None;
-                Demand::Continue
-            }
+            Flow::Exhausted => Demand::Continue,
             // `body` already recorded its own control above.
             Flow::Stopped { .. } => Demand::Stop,
             // The inner generator's own control unwinds the outer loop too.
@@ -6960,6 +6955,25 @@ where
     let mut consumer_stopped = false;
 
     let flow = eval_each::<W, S>(arg_expr, value, optional, &mut |item| {
+        // #2952: reset before anything below can set a fresh `escape` for
+        // *this* call. `escape` is write-only within a call's own verdict
+        // (nothing reads it until after `eval_each` returns), so resetting
+        // here is equivalent to resetting on every arm that doesn't set a
+        // fresh one -- one place instead of a per-arm duty every future
+        // arm has to remember (code review: a first pass here got exactly
+        // that duty wrong for `fanout_two_args_lazy`'s own two closures).
+        // The only way this sink runs again after an earlier call already
+        // answered `Demand::Stop` is a `?//` inside `arg_expr` retrying
+        // past that stop (see the `Flow::Escaped` arm below) -- a
+        // retried-past escape is resolved, not still live, and carrying it
+        // forward would let a body error jq 1.7.1 never sees outrank this
+        // call's own clean verdict. Confirmed live against jq 1.7.1 (via
+        // the pinned-jq `skip` definition, `skip` being 1.8-only, #2952):
+        // `[limit(2;skip((1 as $x ?// $y | 0);10,error("BODY")))]` is
+        // `[10,10]` -- the first alternative's `error("BODY")` retries
+        // into the second, whose own `10` satisfies `limit(2)` before its
+        // own `error("BODY")` is ever reached.
+        escape = None;
         // Before `into_owned`: the cursor this reads lives on the borrowed
         // item, and materializing it is exactly what drops it.
         let origin = if WITH_ORIGIN {
@@ -6975,39 +6989,20 @@ where
         };
         match body(owned, origin) {
             // This argument value's own walk finished; go on to the next.
-            // #2952: also supersedes any `escape` an *earlier* call to
-            // `body` within this same drive stashed. The only way this
-            // sink runs again after an earlier call already answered
-            // `Demand::Stop` (whether via this arm, the one below, or an
-            // escape) is a `?//` inside `arg_expr` retrying past that
-            // stop -- see this function's own `Flow::Escaped` arm's
-            // comment for why. A retried-past escape is resolved, not
-            // still live; carrying it forward would let a body error jq
-            // 1.7.1 never sees outrank this call's own clean verdict.
-            Flow::Exhausted => {
-                escape = None;
-                Demand::Continue
-            }
+            Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => {
-                escape = None;
                 consumer_stopped = true;
                 Demand::Stop
             }
-            // #2952: a body error/break inside `arg_expr` -- e.g. `skip($n;
+            // A body error/break inside `arg_expr` -- e.g. `skip($n;
             // expr)`'s `expr` erroring while `$n` sits behind a `?//` --
             // must reach the `?//` that can retry it. Stashing it here and
             // answering `Demand::Stop` is exactly the idiom that lets it:
             // this sink's `Demand::Stop` surfaces as `arg_expr`'s own
             // `Flow::Stopped` to whatever `?//` alternative loop is
             // driving `arg_expr` (if any), which retries into the next
-            // pattern and calls this sink again -- landing in one of the
-            // two arms above, which is what clears a *resolved* escape.
-            // Confirmed live against jq 1.7.1 (via the pinned-jq `skip`
-            // definition, `skip` being 1.8-only, #2952):
-            // `[limit(2;skip((1 as $x ?// $y | 0);10,error("BODY")))]` is
-            // `[10,10]` -- the first alternative's `error("BODY")` retries
-            // into the second, whose own `10` satisfies `limit(2)` before
-            // its own `error("BODY")` is ever reached.
+            // pattern and calls this sink again -- landing at the reset
+            // above, which is what clears a *resolved* escape.
             Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });

@@ -67369,15 +67369,23 @@ fn test_skip_count_generators_2934() -> Result<()> {
     Ok(())
 }
 
-/// #2952: `fanout_arg_each_inner`/`fanout_arg_each_generic`'s own `escape`
-/// slot used to persist across a `?//` retry it never saw happen. `skip`'s
-/// count argument (`n_expr`) fans out through that shared helper; when a
-/// `?//` *inside* `n_expr` retries past an earlier alternative's body error
-/// (the error escaping from `expr`, not from `n_expr` itself), the helper's
-/// own sink is invoked again for the next alternative -- but the stale
-/// `escape` from the retried-past attempt was never cleared, so it
-/// unconditionally overrode whatever the *new* attempt's own clean verdict
-/// was, even after `limit`'s own demand was already satisfied.
+/// #2952: `fanout_arg_each_generic`'s own `escape` slot (and, sharing the
+/// identical shape, `eval.rs`'s `fanout_arg_each_inner`) used to persist
+/// across a `?//` retry it never saw happen. `skip`'s count argument
+/// (`n_expr`) fans out through that helper; when a `?//` *inside* `n_expr`
+/// retries past an earlier alternative's body error (the error escaping
+/// from `expr`, not from `n_expr` itself), the helper's own sink is invoked
+/// again for the next alternative -- but the stale `escape` from the
+/// retried-past attempt was never cleared, so it unconditionally overrode
+/// whatever the *new* attempt's own clean verdict was, even after `limit`'s
+/// own demand was already satisfied.
+///
+/// **Reaches `eval_generic.rs`'s `fanout_arg_each_generic` only, not
+/// `eval.rs`'s own `fanout_arg_each_inner`** (code review): none of these
+/// rows use `input`/`inputs`, so the CLI's default cursor-based dispatch
+/// never bridges to the owned evaluator `fanout_arg_each_inner` lives on.
+/// [`test_as_binding_and_two_arg_builtins_retry_past_a_body_error_2952`]
+/// below covers that function specifically.
 ///
 /// `skip` is a succinctly extension (real jq has no native `skip/2` before
 /// 1.8, and the pinned oracle here is 1.7.1), so each row was checked
@@ -67441,10 +67449,9 @@ fn test_skip_count_binding_retries_past_a_body_error_2952() -> Result<()> {
     Ok(())
 }
 
-/// #2952 code review: the fix's other two reachable sites, unguarded by
-/// [`test_skip_count_binding_retries_past_a_body_error_2952`] above, which
-/// only exercises `fanout_arg_each`/`fanout_arg_each_generic` via `skip`'s
-/// count binding.
+/// #2952 code review: the fix's other reachable sites, unguarded by
+/// [`test_skip_count_binding_retries_past_a_body_error_2952`] above (which
+/// only reaches `fanout_arg_each_generic`, per that test's own doc comment).
 ///
 /// - A plain `EXPR as $v | BODY` bind (`Expr::As`, not `Expr::AsPattern`)
 ///   fans out through `fanout_arg_each_with_origin`/
@@ -67455,7 +67462,15 @@ fn test_skip_count_binding_retries_past_a_body_error_2952() -> Result<()> {
 ///   has its own independent `escape` variable with the same shape, missed
 ///   by this PR's first pass and confirmed live in review.
 ///
-/// Both rows verified live against jq 1.7.1.
+/// Row 1 (no `input`/`inputs` anywhere) exercises only
+/// `fanout_arg_each_generic_with_origin`, the same as the `skip` test
+/// above. Rows 2 and 3 each include an `input` call specifically to force
+/// the CLI's owned-evaluator bridge (`takes_input_queue_bridge`,
+/// `eval_generic.rs`) for the *whole* query, so they reach `eval.rs`'s
+/// `fanout_two_args_lazy` and `fanout_arg_each_with_origin` respectively --
+/// confirmed in review that without an `input` call, a query built the
+/// same way stays on the native cursor path and never reaches `eval.rs` at
+/// all. All three rows verified live against jq 1.7.1.
 #[test]
 fn test_as_binding_and_two_arg_builtins_retry_past_a_body_error_2952() -> Result<()> {
     let (out, err, code) = run_jq_full(
@@ -67475,6 +67490,15 @@ fn test_as_binding_and_two_arg_builtins_retry_past_a_body_error_2952() -> Result
         Some("1\n2\n"),
     )?;
     assert_eq!((out.as_str(), code), ("9\n9\n", 0), "stderr: {err:?}");
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-cn",
+            r#"[limit(2; input as $unused | (1 as $x ?// $y | 0) as $n | $n, error("BODY"))]"#,
+        ],
+        Some("1\n"),
+    )?;
+    assert_eq!((out.trim_end(), code), ("[0,0]", 0), "stderr: {err:?}");
     Ok(())
 }
 
