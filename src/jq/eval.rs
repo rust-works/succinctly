@@ -97991,26 +97991,29 @@ mod tests {
     #[test]
     fn test_path_register_survives_subexp_stages_that_navigate_3186() {
         for filter in [
-            r"path(. as $x | {k:.a} | $x)",
-            r"path(. as $x | {k:.a} | {j:.k} | $x)",
-            r"path(. as $x | {k:1} | {j: .zz.yy} | $x)",
-            r"path(. as $x | {k: first(.a[])} | $x)",
-            r"path(. as $x | {k: (def f: .a; f)} | $x)",
-            r"path(. as $x | {(.a|tostring): 1} | $x)",
+            r"path(. as $x | { k: .a } | $x)",
+            r"path(. as $x | { k: .a } | { j: .k } | $x)",
+            r"path(. as $x | { k: 1 } | { j: .zz.yy } | $x)",
+            r"path(. as $x | { k: first(.a[]) } | $x)",
+            r"path(. as $x | { k: (def f: .a; f) } | $x)",
+            r"path(. as $x | { (.a|tostring): 1 } | $x)",
             r#"path(. as $x | "\(.a)" | $x)"#,
-            r#"path(. as $x | {k:1} | "\(.zz)" | $x)"#,
+            r#"path(. as $x | { k: 1 } | "\(.zz)" | $x)"#,
             r"path(. as $x | (.a.b + 1) | $x)",
-            r"path(. as $x | ({k:1}|.zz) + 1 | $x)",
+            r"path(. as $x | ({ k: 1 }|.zz) + 1 | $x)",
             r"path(. as $x | (first(.a[]) + 1) | $x)",
             r"path(. as $x | (.a == 1) | $x)",
             r"path(. as $x | if .a.b then 5 else 6 end | $x)",
-            r"path(. as $x | if ({j:1}|.zz) then 5 else 6 end | $x)",
+            r"path(. as $x | if ({ j: 1 }|.zz) then 5 else 6 end | $x)",
         ] {
             assert_eq!(outputs(br#"{"a":{"b":1}}"#, filter), ["[]"], "{filter}");
         }
         // The register is a position: navigation continues off it.
         assert_eq!(
-            outputs(br#"{"a":{"b":1}}"#, r"path(. as $x | {k:.a} | $x | .a.b)"),
+            outputs(
+                br#"{"a":{"b":1}}"#,
+                r"path(. as $x | { k: .a } | $x | .a.b)"
+            ),
             [r#"["a","b"]"#]
         );
     }
@@ -98024,12 +98027,12 @@ mod tests {
     #[test]
     fn test_path_register_still_refuses_after_non_subexp_navigation_3186() {
         for filter in [
-            r"path(. as $x | {k:.a} | [.k] | $x)",
-            r"path(. as $x | {k:.a} | [.a] | $x)",
-            r"path(. as $x | {k:.a} | .k | $x)",
+            r"path(. as $x | { k: .a } | [.k] | $x)",
+            r"path(. as $x | { k: .a } | [.a] | $x)",
+            r"path(. as $x | { k: .a } | .k | $x)",
             r"path(. as $x | (.a and .b) | $x)",
             r"path(. as $x | if .a then .a else 6 end | $x)",
-            r"path(. as $x | .a | {z:.b} | $x)",
+            r"path(. as $x | .a | { z: .b } | $x)",
             r"path(. as $x | .a | (.b + 1) | $x)",
         ] {
             query!(br#"{"a":{"b":1},"k":1}"#, filter,
