@@ -68349,7 +68349,7 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         r"del(. as $x | (.zz // 5) | try ($x | .k))",
         r"del(. as $x | if .k then 5 else .a end | try ($x | .k))",
         r"del(. as $x | (def f: 5; f) | try ($x | .k))",
-        r"del(. as $x | [.a] | try ($x | .a))",
+        r"del(. as $x | [.a?] | try ($x | .a))",
     ] {
         let (stdout, stderr, code) =
             run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1,"l":[1,2]}"#))?;
@@ -68454,6 +68454,9 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
             r#"del(. as $x | has("a") | try ($x as [$q] | $q))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
+        // #3263: nor does an array resolved live -- jq's collect backtracks
+        // the register to where it began.
+        (r"del(. as $x | [.a] | try ($x | .a))", r#"{"k":1}"#),
         // #3186's subexp stage keeps the register, so there is nothing to
         // guess: `$x` re-establishes and the path is jq's.
         (r"[path(. as $x | { k: .a } | try ($x | .a))]", r#"[["a"]]"#),
