@@ -14236,6 +14236,20 @@ where
     let mut consumer_stopped = false;
 
     let flow = eval_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
+        // #2952: reset before anything below can set a fresh `escape` for
+        // *this* call -- see `eval::fanout_arg_each_inner`'s identical
+        // top-of-closure reset (one reset per invocation rather than a
+        // per-arm duty every future arm has to remember) and its own
+        // doc comment for why a later, clean call can follow one that
+        // escaped (a `?//` inside `arg_expr` -- e.g. `skip($n; expr)`'s
+        // `expr` erroring while `$n` sits behind one -- retrying past it).
+        // Confirmed live against jq 1.7.1 (via the pinned-jq `skip`
+        // definition, `skip` being 1.8-only):
+        // `[limit(2;skip((1 as $x ?// $y | 0);10,error("BODY")))]` is
+        // `[10,10]` -- the first alternative's `error("BODY")` retries
+        // into the second, whose own `10` satisfies `limit(2)` before its
+        // own `error("BODY")` is ever reached.
+        escape = None;
         let owned = match generic_item_into_owned::<_, S>(item) {
             Ok(owned) => owned,
             Err(control) => return stop_with_escape(&mut escape, control),
@@ -14286,6 +14300,12 @@ where
     let mut consumer_stopped = false;
 
     let flow = eval_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
+        // #2952: reset before anything below can set a fresh `escape` for
+        // *this* call -- see `fanout_arg_each_generic`'s identical
+        // top-of-closure reset and `eval::fanout_arg_each_inner`'s doc
+        // comment for why a later, clean call can follow one that escaped
+        // (a `?//` inside `arg_expr` retrying past it).
+        escape = None;
         let (owned, origin) = match generic_item_into_owned_with_origin::<_, S>(item) {
             Ok(pair) => pair,
             Err(control) => {
