@@ -30394,6 +30394,37 @@ fn test_dollar_param_binds_each_value_of_a_generator_argument_3149() -> Result<(
         assert_eq!(stdout.trim_end(), expected, "{filter}");
     }
 
+    // #2725's write hazard: re-read as a filter under the reader's `.`, `$x`
+    // navigated and `del(f(.))` deleted the whole document. Bound, it is the
+    // root's value read after `.a`, which jq refuses as a path -- and read
+    // through `getpath`, it names the root's own node, not `.a`'s.
+    for filter in [
+        "def f($x): .a | $x; path(f(.))",
+        "def f($x): .a | $x; del(f(.))",
+        "def f($x): .a | $x; (f(.)) = 1",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{\"a\":{\"b\":2}}"))?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with result {\"a\":{\"b\":2}}"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    for (filter, expected) in [
+        (
+            "def f($x): .a | $x | getpath([\"a\"]) | .b; [path(f(.))]",
+            "[[\"a\",\"b\"]]",
+        ),
+        (
+            "def f($x): .a | $x | getpath([\"a\"]) | .b; del(f(.))",
+            "{\"a\":{}}",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{\"a\":{\"b\":2}}"))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+
     // A bound `$x` is a value, not a path: every path consumer refuses it
     // exactly as jq 1.7.1 does, where the substituted `.a` used to write
     // straight through (`{"a":3}`, `{}`, `[["a"]]`).
