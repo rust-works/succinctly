@@ -4141,10 +4141,15 @@ Three differences remain, all in the direction of erroring rather than aborting:
   `MAX_EVAL_FRAMES` (`src/jq/eval.rs`). Each `$`-style parameter adds a frame
   of its own: since [#3149](https://github.com/rust-works/succinctly/issues/3149)
   it binds through a real `x as $x` around the body, as jq's desugaring does, and
-  that binding holds ~2.9 KB of native stack per level. A thin
-  `def sum_to($n)` therefore stops at 10,000 levels, not the bare spelling's
-  13,333, and three `$` parameters at 8,000. Left uncharged, three parameters
-  overflowed the stack below the guard.
+  that binding holds ~2.9 KB of native stack per level. The ceiling is
+  therefore `MAX_EVAL_FRAMES / (b + k)` levels for a body charging `b` frames
+  a level with `k` `$` parameters, so it falls with every `$` parameter the
+  signature adds. A thin `def sum_to($n)` (`b` = 3) stops at 10,000 levels,
+  not the bare spelling's 13,333. `def r($p1;$p2;$p3;$p4): if $p1 == 0 then
+  0 else r($p1-1;$p2;$p3;$p4) end` (`b` = 2) stops at 6,666, and the same
+  shape with 16 `$` parameters at 2,222. jq answers all of these. Left
+  uncharged, three parameters overflowed the stack below the guard; charged,
+  the margin to the real crash floor stays 2.1-2.9x from one to eight.
 - **A recursively-built value can exceed `MAX_VALUE_TREE_DEPTH` (384) where jq has no such
   limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
   1,200 levels; jq prints it, succinctly reports `nesting depth exceeds limit of 384` and
