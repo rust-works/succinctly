@@ -735,24 +735,39 @@ is the revert that established what the other one costs.
    body is not something a syntactic predicate can do from a name). Every such refusal is
    refuse-only, and since [#3267](https://github.com/rust-works/succinctly/issues/3267) it stays
    refuse-only under `try`/`?` too. It used to be caught as if it were jq's own path error, so
-   the write was silently discarded at exit 0 where jq writes:
+   the write was silently lost at exit 0 where jq writes:
    `del(. as $x \| has("a") \| try ($x \| .a))` returned the document unchanged, and jq
-   returns `{"k":1}`. A navigation refusal is now uncatchable, by that `try` and by any `try`
-   further out, when both hold:
+   returns `{"k":1}`. A navigation refusal is now uncatchable when both hold:
 
-   - a stage upstream dropped a live register without navigating (`register_lost`);
-   - the value refused is one jq could still have held as the register: a frozen `$var`
-     snapshot, or `null`.
+   - a live register did not come out of a stage upstream that did not navigate (the stage is
+     one this resolver can't see inside, or its route hands back no register, like a `reduce`
+     stage);
+   - the value being refused is one jq could still have held as the register: a frozen
+     `$var` snapshot or `null`.
 
-   So each of these is a loud exit 5 (ADR-0018 rule 4). A refusal jq raises too stays
-   catchable: after `.a`, which provably moved the register, or on a computed string, number
-   or boolean, which can never be it (`has("a") \| try (5 \| .a)` is empty in both).
+   Uncatchable here means by the `try` beside the refusal, by any `try` further out, and by a
+   value-position `?` around the whole `del`/assignment, so the refusal is a loud exit 5
+   (ADR-0018 rule 4). The test is made on the value refused, where it is raised, so a refusal
+   jq raises too stays catchable: a computed string, number, boolean or container can never be
+   the register (`$x \| try (5 \| .a)` is caught in both), and after `.a` the register
+   provably moved.
 
-   The price is the reverse case. When the register was only *probably* not moved, and the
-   refused value is a `$var` or a `null`, jq's refusal is exact and caught, while this refuses
-   loudly. `path(.arr[0:1]? as $v0 \| (abs?) \| ($v0 \| .b?)?)` is `[]` in jq, whose
-   jq-defined `abs` hands a non-number back untouched, but `abs` is opaque here.
-   `.a \| has("b") \| try (null \| .x)` is the `null` spelling. The array shape
+   The price is the case this resolver can't tell apart: a stage that *did* move jq's register,
+   invisibly. There jq's refusal is exact and caught, and this refuses loudly:
+   - `del(. as $x \| (def f: .a; f) \| try ($x \| .k))` returns the document unchanged in jq;
+   - `path(.arr[0:1]? as $v0 \| (abs?) \| ($v0 \| .b?)?)` is `[]` in jq, whose jq-defined
+     `abs` hands a non-number back untouched, but `abs` is opaque here;
+   - `.a \| has("b") \| try (null \| .x)` is the `null` spelling.
+
+   The wording can differ too, both tools refusing: jq ends
+   `del(. as $x \| has("a") \| reduce (1) as $i ($x; try ($x \| .zz)))` with its try-caught
+   fold's `Invalid path expression with result null`, while this raises the refusal itself
+   (`… near attempt to access element "zz" of …`).
+
+   One residual keeps the silent drop. A *terminal* refusal (the pipe's last value is a `$var`,
+   with no navigation after it) is still decided where the per-branch knowledge is gone, so a
+   value-position `?` catches it: `[path(. as $x \| has("a") \| $x)?]` is `[]` here and
+   `[[]]` in jq, as it was before #3267. The array shape
    (`del(. as $x \| [.a] \| try ($x \| .a))`, now a loud refusal too) is
    [#3263](https://github.com/rust-works/succinctly/issues/3263), resolving an array's contents. (A third shape used to sit here too — an `as` whose bind source navigates —
    but [#2042](https://github.com/rust-works/succinctly/issues/2042) established that jq

@@ -102,6 +102,9 @@ pub enum ErrorKind {
     /// `MAX_EVAL_FRAMES`) that has no jq counterpart, so no `?`/`try` can
     /// have been written to expect it.
     ResourceLimit,
+    /// See [`EvalError::is_guessed_path_refusal`] -- always uncatchable, in
+    /// path and value position alike (#3267).
+    GuessedPathRefusal,
 }
 
 /// A stream terminator: what ended a sequence of outputs when it wasn't
@@ -1065,23 +1068,36 @@ impl EvalError {
 
     const INVALID_PATH_EXPRESSION_PREFIX: &'static str = "Invalid path expression with result ";
 
-    /// This [`Self::is_untracked_navigation_error`] refusal, made uncatchable
-    /// (#3267): same message, so the user still reads jq's own wording, but
-    /// classified as [`ErrorKind::InvalidPathExpression`], which no `?`,
-    /// `try` or `catch` suppresses.
+    /// This [`Self::is_untracked_navigation_error`] refusal, reclassified as
+    /// the path resolver's *guess* (#3267): same message, so the user still
+    /// reads jq's own wording, but [`ErrorKind::GuessedPathRefusal`], which
+    /// no `?`, `try` or `catch` suppresses, in path or value position.
     ///
     /// For a refusal the path resolver raised only because it could not
-    /// prove where jq's register was: jq may well have answered there, so a
-    /// `try` catching it would turn a divergence into a silently discarded
-    /// write (`del(. as $x | has("a") | try ($x | .a))` echoing the document
-    /// where jq deletes `.a`). Uncaught, it is a loud refusal instead --
-    /// ADR-0018's rule 4. Any other error is returned unchanged.
-    pub(crate) fn into_uncatchable_refusal(self) -> Self {
+    /// prove where jq's register was: jq may well have answered there, so
+    /// catching it would turn a divergence into a silently lost write --
+    /// `del(. as $x | has("a") | try ($x | .a))` echoing the document where
+    /// jq deletes `.a`, or `[del(...)?]` dropping the output altogether.
+    /// Uncaught, it is a loud refusal instead: ADR-0018's rule 4. Any other
+    /// error is returned unchanged.
+    pub(crate) fn into_guessed_path_refusal(self) -> Self {
         if self.is_untracked_navigation_error() {
-            Self::with_kind(self.message, ErrorKind::InvalidPathExpression)
+            Self::with_kind(self.message, ErrorKind::GuessedPathRefusal)
         } else {
             self
         }
+    }
+
+    /// Whether this is the path resolver's *guessed* refusal (#3267): it
+    /// refused a value jq could still have been
+    /// holding as its path register, having lost track of that register.
+    /// Always uncatchable -- unlike [`Self::is_invalid_path_expression`],
+    /// in value position too, because jq itself may not have raised at all.
+    pub fn is_guessed_path_refusal(&self) -> bool {
+        matches!(
+            self.value,
+            EvalErrorPayload::Kind(ErrorKind::GuessedPathRefusal)
+        )
     }
 
     /// `Invalid path expression near attempt to access element <k> of <v>`
@@ -1348,6 +1364,7 @@ impl EvalError {
             || self.is_decode_failure()
             || self.is_yq_negative_index_error()
             || self.is_resource_limit()
+            || self.is_guessed_path_refusal()
     }
 
     /// [`Self::is_uncatchable`], narrowed to the subset that also applies at
@@ -1376,7 +1393,10 @@ impl EvalError {
     /// the deleted eager path-context evaluator's own `Expr::Optional`/`Expr::Try`
     /// arms (`eval.rs`).
     pub fn is_uncatchable_at_value_position(&self) -> bool {
-        self.is_decode_failure() || self.is_yq_negative_index_error() || self.is_resource_limit()
+        self.is_decode_failure()
+            || self.is_yq_negative_index_error()
+            || self.is_resource_limit()
+            || self.is_guessed_path_refusal()
     }
 
     /// `Cannot check whether <container> has a <key type> key`.
@@ -2110,10 +2130,10 @@ mod tests {
     }
 
     /// #3267: a navigation refusal the path resolver only guessed at is made
-    /// uncatchable without losing jq's wording -- the path resolver's `try`
-    /// reads `is_uncatchable()` -- and any other error passes through as is.
+    /// uncatchable at both predicates without losing jq's wording, and any
+    /// other error passes through as is.
     #[test]
-    fn untracked_navigation_refusal_made_uncatchable_keeps_its_wording_3267() {
+    fn guessed_path_refusal_is_uncatchable_everywhere_and_keeps_its_wording_3267() {
         let caught = EvalError::invalid_path_expression_near_access(
             &OwnedValue::String("a".into()),
             &OwnedValue::Null,
@@ -2122,17 +2142,23 @@ mod tests {
         assert!(!caught.is_uncatchable());
         let message = caught.message.clone();
 
-        let refusal = caught.into_uncatchable_refusal();
+        let refusal = caught.into_guessed_path_refusal();
+        assert!(refusal.is_guessed_path_refusal());
         assert!(refusal.is_uncatchable());
+        assert!(
+            refusal.is_uncatchable_at_value_position(),
+            "jq may not have raised at all, so value position must not catch it either"
+        );
+        assert!(!refusal.is_untracked_navigation_error());
         assert_eq!(refusal.message, message, "jq's own wording survives");
 
         // Anything else is handed back untouched.
         let user = EvalError::new("boom");
         assert_eq!(
-            user.clone().into_uncatchable_refusal().message,
+            user.clone().into_guessed_path_refusal().message,
             user.message
         );
-        assert!(!user.into_uncatchable_refusal().is_uncatchable());
+        assert!(!user.into_guessed_path_refusal().is_uncatchable());
     }
 
     /// #2132: a resource-limit raise is uncatchable at both predicates, and
