@@ -1065,6 +1065,25 @@ impl EvalError {
 
     const INVALID_PATH_EXPRESSION_PREFIX: &'static str = "Invalid path expression with result ";
 
+    /// This [`Self::is_untracked_navigation_error`] refusal, made uncatchable
+    /// (#3267): same message, so the user still reads jq's own wording, but
+    /// classified as [`ErrorKind::InvalidPathExpression`], which no `?`,
+    /// `try` or `catch` suppresses.
+    ///
+    /// For a refusal the path resolver raised only because it could not
+    /// prove where jq's register was: jq may well have answered there, so a
+    /// `try` catching it would turn a divergence into a silently discarded
+    /// write (`del(. as $x | has("a") | try ($x | .a))` echoing the document
+    /// where jq deletes `.a`). Uncaught, it is a loud refusal instead --
+    /// ADR-0018's rule 4. Any other error is returned unchanged.
+    pub(crate) fn into_uncatchable_refusal(self) -> Self {
+        if self.is_untracked_navigation_error() {
+            Self::with_kind(self.message, ErrorKind::InvalidPathExpression)
+        } else {
+            self
+        }
+    }
+
     /// `Invalid path expression near attempt to access element <k> of <v>`
     /// (#843).
     ///
@@ -2088,6 +2107,32 @@ mod tests {
             EvalError::urid_invalid_escape(b"%\xe4\xb8").message,
             r#"invalid URL escape "%\xe4\xb8""#
         );
+    }
+
+    /// #3267: a navigation refusal the path resolver only guessed at is made
+    /// uncatchable without losing jq's wording -- the path resolver's `try`
+    /// reads `is_uncatchable()` -- and any other error passes through as is.
+    #[test]
+    fn untracked_navigation_refusal_made_uncatchable_keeps_its_wording_3267() {
+        let caught = EvalError::invalid_path_expression_near_access(
+            &OwnedValue::String("a".into()),
+            &OwnedValue::Null,
+        );
+        assert!(caught.is_untracked_navigation_error());
+        assert!(!caught.is_uncatchable());
+        let message = caught.message.clone();
+
+        let refusal = caught.into_uncatchable_refusal();
+        assert!(refusal.is_uncatchable());
+        assert_eq!(refusal.message, message, "jq's own wording survives");
+
+        // Anything else is handed back untouched.
+        let user = EvalError::new("boom");
+        assert_eq!(
+            user.clone().into_uncatchable_refusal().message,
+            user.message
+        );
+        assert!(!user.into_uncatchable_refusal().is_uncatchable());
     }
 
     /// #2132: a resource-limit raise is uncatchable at both predicates, and

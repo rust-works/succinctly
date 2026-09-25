@@ -733,13 +733,28 @@ is the revert that established what the other one costs.
    `path(. as $x \| {k:.a} \| [.a] \| $x)` raises in jq on the `[.a]`'s `.a`), and a `def`
    whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its
    body is not something a syntactic predicate can do from a name). Every such refusal is
-   refuse-only on its own, but not harmless: `try`/`?` catches it as if it were jq's own path
-   error, so the write is silently discarded, exit 0, where jq writes:
-   `del(. as $x \| has("a") \| try ($x \| .a))` returns the document unchanged, jq returns
-   `{"k":1}`. The class is tracked in [#3267](https://github.com/rust-works/succinctly/issues/3267)
-   (a guessed refusal must not be catchable), and the array shape
-   (`del(. as $x \| [.a] \| try ($x \| .a))`) in
-   [#3263](https://github.com/rust-works/succinctly/issues/3263) (resolving an array's contents). (A third shape used to sit here too — an `as` whose bind source navigates —
+   refuse-only, and since [#3267](https://github.com/rust-works/succinctly/issues/3267) it stays
+   refuse-only under `try`/`?` too. It used to be caught as if it were jq's own path error, so
+   the write was silently discarded at exit 0 where jq writes:
+   `del(. as $x \| has("a") \| try ($x \| .a))` returned the document unchanged, and jq
+   returns `{"k":1}`. A navigation refusal is now uncatchable, by that `try` and by any `try`
+   further out, when both hold:
+
+   - a stage upstream dropped a live register without navigating (`register_lost`);
+   - the value refused is one jq could still have held as the register: a frozen `$var`
+     snapshot, or `null`.
+
+   So each of these is a loud exit 5 (ADR-0018 rule 4). A refusal jq raises too stays
+   catchable: after `.a`, which provably moved the register, or on a computed string, number
+   or boolean, which can never be it (`has("a") \| try (5 \| .a)` is empty in both).
+
+   The price is the reverse case. When the register was only *probably* not moved, and the
+   refused value is a `$var` or a `null`, jq's refusal is exact and caught, while this refuses
+   loudly. `path(.arr[0:1]? as $v0 \| (abs?) \| ($v0 \| .b?)?)` is `[]` in jq, whose
+   jq-defined `abs` hands a non-number back untouched, but `abs` is opaque here.
+   `.a \| has("b") \| try (null \| .x)` is the `null` spelling. The array shape
+   (`del(. as $x \| [.a] \| try ($x \| .a))`, now a loud refusal too) is
+   [#3263](https://github.com/rust-works/succinctly/issues/3263), resolving an array's contents. (A third shape used to sit here too — an `as` whose bind source navigates —
    but [#2042](https://github.com/rust-works/succinctly/issues/2042) established that jq
    evaluates an `as` source with path tracking suspended, so the source alone never moves the
    register; `cannot_move_register`'s `Expr::As` arm now consults only the body, and
