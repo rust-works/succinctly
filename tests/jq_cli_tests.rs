@@ -67368,6 +67368,79 @@ fn test_skip_count_generators_2934() -> Result<()> {
     assert_eq!((out.as_str(), err.as_str(), code), ("10\n20\n", "COUNT", 7));
     Ok(())
 }
+
+/// #2952: `fanout_arg_each_inner`/`fanout_arg_each_generic`'s own `escape`
+/// slot used to persist across a `?//` retry it never saw happen. `skip`'s
+/// count argument (`n_expr`) fans out through that shared helper; when a
+/// `?//` *inside* `n_expr` retries past an earlier alternative's body error
+/// (the error escaping from `expr`, not from `n_expr` itself), the helper's
+/// own sink is invoked again for the next alternative -- but the stale
+/// `escape` from the retried-past attempt was never cleared, so it
+/// unconditionally overrode whatever the *new* attempt's own clean verdict
+/// was, even after `limit`'s own demand was already satisfied.
+///
+/// `skip` is a succinctly extension (real jq has no native `skip/2` before
+/// 1.8, and the pinned oracle here is 1.7.1), so each row was checked
+/// against jq 1.7.1 loaded with jq's own documented `skip` definition (the
+/// same prelude the issue's own repro uses) rather than a bare `jq -n`:
+/// `def skip($n; expr): if $n > 0 then foreach expr as $item ($n; .-1; if .
+/// < 0 then $item else empty end) elif $n == 0 then expr else
+/// error("skip doesn't support negative count") end;`.
+#[test]
+fn test_skip_count_binding_retries_past_a_body_error_2952() -> Result<()> {
+    for (filter, expected) in [
+        // The issue's own repro: the first alternative's body error retries
+        // into the second, whose own `10` satisfies `limit(2)` before its
+        // own `error("BODY")` is ever reached.
+        (
+            r#"[limit(2;skip((1 as $x ?// $y | 0);10,error("BODY")))]"#,
+            r#"[10,10]"#,
+        ),
+        // A destructuring `?//` count source, same shape.
+        (
+            r#"[limit(2;skip(([1] as [$a] ?// [$b,$c] | 0);10,error("BODY")))]"#,
+            r#"[10,10]"#,
+        ),
+        // Three-alternative chain: the first two both fail; only the third
+        // (last) is where `limit`'s demand is met, and no error escapes.
+        (
+            r#"[limit(3;skip((1 as $x ?// $y ?// $z | 0);10,error("BODY")))]"#,
+            r#"[10,10,10]"#,
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(
+            (out.trim_end(), code),
+            (expected, 0),
+            "{filter}: stderr {err:?}"
+        );
+    }
+    // The genuinely-terminal case must still propagate: no `?//` at all, so
+    // there is nothing to retry into and the error must escape exactly as
+    // it did before this fix.
+    let (out, err, code) = run_jq_full(
+        &["-cn", r#"[limit(2;skip((1 as $x | 0);10,error("BODY")))]"#],
+        None,
+    )?;
+    assert_eq!(out.trim_end(), "", "stderr: {err}");
+    assert_eq!(code, 5);
+    assert!(err.contains("BODY"), "stderr: {err}");
+    // The last alternative's own error, with no further alternative to
+    // retry into, must still propagate too -- retrying past the *first*
+    // alternative must not swallow a genuine terminal failure.
+    let (out, err, code) = run_jq_full(
+        &[
+            "-cn",
+            r#"[limit(2;skip((1 as $x ?// $y | 0);error("ONLY_ONE")))]"#,
+        ],
+        None,
+    )?;
+    assert_eq!(out.trim_end(), "", "stderr: {err}");
+    assert_eq!(code, 5);
+    assert!(err.contains("ONLY_ONE"), "stderr: {err}");
+    Ok(())
+}
+
 /// #2874: the whole preserve-vs-reformat flag matrix, in one place.
 ///
 /// The refactor that folded `OutputConfig::jq_compat` and

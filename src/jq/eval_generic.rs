@@ -14242,14 +14242,36 @@ where
         };
         match body(owned) {
             // This `n`'s own walk finished; go on to the next one.
-            Flow::Exhausted => Demand::Continue,
+            // #2952: also supersedes any `escape` an *earlier* call to
+            // `body` within this same drive stashed -- see this function's
+            // own `Flow::Escaped` arm's comment for why a later, clean call
+            // can follow one that escaped, and `eval::fanout_arg_each_inner`
+            // for the identical fix in this function's non-generic twin.
+            Flow::Exhausted => {
+                escape = None;
+                Demand::Continue
+            }
             // The downstream consumer said stop. Its verdict outranks the
             // argument generator's, exactly as it does inside
             // `each_limit_generic`'s own inner sink.
             Flow::Stopped { .. } => {
+                escape = None;
                 consumer_stopped = true;
                 Demand::Stop
             }
+            // #2952: a body error/break inside `arg_expr` -- e.g. `skip($n;
+            // expr)`'s `expr` erroring while `$n` sits behind a `?//` --
+            // must reach the `?//` that can retry it, via the same
+            // stash-and-stop idiom `eval::fanout_arg_each_inner` uses.
+            // Confirmed live against jq 1.7.1 (via the pinned-jq `skip`
+            // definition, `skip` being 1.8-only):
+            // `[limit(2;skip((1 as $x ?// $y | 0);10,error("BODY")))]` is
+            // `[10,10]` -- the first alternative's `error("BODY")` retries
+            // into the second, whose own `10` satisfies `limit(2)` before
+            // its own `error("BODY")` is ever reached. Without the two
+            // clears above, this stale `escape` from the *first*
+            // alternative's already-retried-past failure would outrank
+            // the second alternative's clean `consumer_stopped` verdict.
             Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
@@ -14295,11 +14317,21 @@ where
         };
         match body(owned, origin) {
             // This bound value's own walk finished; go on to the next one.
-            Flow::Exhausted => Demand::Continue,
+            // #2952: also supersedes any `escape` an *earlier* call to
+            // `body` within this same drive stashed -- see
+            // `fanout_arg_each_generic`'s own identical arm and
+            // `eval::fanout_arg_each_inner`'s doc comment for why a later,
+            // clean call can follow one that escaped (a `?//` inside
+            // `arg_expr` retrying past it).
+            Flow::Exhausted => {
+                escape = None;
+                Demand::Continue
+            }
             // The downstream consumer said stop. Its verdict outranks the
             // argument generator's, exactly as it does in
             // `fanout_arg_each_generic` above.
             Flow::Stopped { .. } => {
+                escape = None;
                 consumer_stopped = true;
                 Demand::Stop
             }

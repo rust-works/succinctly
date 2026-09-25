@@ -6961,11 +6961,39 @@ where
         };
         match body(owned, origin) {
             // This argument value's own walk finished; go on to the next.
-            Flow::Exhausted => Demand::Continue,
+            // #2952: also supersedes any `escape` an *earlier* call to
+            // `body` within this same drive stashed. The only way this
+            // sink runs again after an earlier call already answered
+            // `Demand::Stop` (whether via this arm, the one below, or an
+            // escape) is a `?//` inside `arg_expr` retrying past that
+            // stop -- see this function's own `Flow::Escaped` arm's
+            // comment for why. A retried-past escape is resolved, not
+            // still live; carrying it forward would let a body error jq
+            // 1.7.1 never sees outrank this call's own clean verdict.
+            Flow::Exhausted => {
+                escape = None;
+                Demand::Continue
+            }
             Flow::Stopped { .. } => {
+                escape = None;
                 consumer_stopped = true;
                 Demand::Stop
             }
+            // #2952: a body error/break inside `arg_expr` -- e.g. `skip($n;
+            // expr)`'s `expr` erroring while `$n` sits behind a `?//` --
+            // must reach the `?//` that can retry it. Stashing it here and
+            // answering `Demand::Stop` is exactly the idiom that lets it:
+            // this sink's `Demand::Stop` surfaces as `arg_expr`'s own
+            // `Flow::Stopped` to whatever `?//` alternative loop is
+            // driving `arg_expr` (if any), which retries into the next
+            // pattern and calls this sink again -- landing in one of the
+            // two arms above, which is what clears a *resolved* escape.
+            // Confirmed live against jq 1.7.1 (via the pinned-jq `skip`
+            // definition, `skip` being 1.8-only, #2952):
+            // `[limit(2;skip((1 as $x ?// $y | 0);10,error("BODY")))]` is
+            // `[10,10]` -- the first alternative's `error("BODY")` retries
+            // into the second, whose own `10` satisfies `limit(2)` before
+            // its own `error("BODY")` is ever reached.
             Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
