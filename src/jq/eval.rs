@@ -100482,8 +100482,6 @@ mod tests {
             ),
             (r"[3,1,2]", r"del(. as $x | [unique] | try .[0])"),
             (r"[3,1,2]", r"del(. as $x | [unique_by(.)] | try .[0])"),
-            (r#""abc""#, r#"del(. as $x | [sub("a";"x")] | try .[0])"#),
-            (r#""abc""#, r#"del(. as $x | [gsub("a";"x")] | try .[0])"#),
             (r#"{"a":1}"#, r"del(. as $x | [walk(.)] | try .[0])"),
         ] {
             query!(doc.as_bytes(), filter,
@@ -100576,6 +100574,27 @@ mod tests {
         }
     }
 
+    /// #3271, `sub`/`gsub` rows only: split into their own `regex`-gated
+    /// test (CI's non-`regex` feature legs -- `default`, `simd`,
+    /// `scalar-yaml`, `portable-popcount`, ... -- don't build `sub`/`gsub`
+    /// support at all, so a mixed-in row here panics
+    /// "regex feature not enabled" there; the rest of #3271's own matrix
+    /// needs no such gate).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_sub_gsub_raise_unconditionally_3271() {
+        for filter in [
+            r#"del(. as $x | [sub("a";"x")] | try .[0])"#,
+            r#"del(. as $x | [gsub("a";"x")] | try .[0])"#,
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.is_untracked_navigation_error(), "{filter}: {}", e.message);
+                }
+            );
+        }
+    }
+
     /// #3271 review (first cut regressed this): `always_refuses_as_live_path`
     /// runs on the value a construct actually *produced*, never as a
     /// pre-check on `expr`'s bare syntactic shape -- so jq's own type error,
@@ -100620,11 +100639,23 @@ mod tests {
         for (doc, filter) in [
             (r#"{"k":1}"#, r".k += empty"),
             (r#"{"k":null}"#, r".k //= empty"),
-            (r#""abc""#, r#"sub(empty;"x")"#),
-            (r#""abc""#, r#"sub("a";"b";empty)"#),
         ] {
             assert!(
                 outputs(doc.as_bytes(), &format!("path({filter})")).is_empty(),
+                "{filter}"
+            );
+        }
+    }
+
+    /// #3271, `sub`'s own `$re`/`flags` rows only: split into their own
+    /// `regex`-gated test for the same reason as
+    /// `test_sub_gsub_raise_unconditionally_3271` above.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_sub_yields_to_its_own_empty_binding_3271() {
+        for filter in [r#"sub(empty;"x")"#, r#"sub("a";"b";empty)"#] {
+            assert!(
+                outputs(br#""abc""#, &format!("path({filter})")).is_empty(),
                 "{filter}"
             );
         }
