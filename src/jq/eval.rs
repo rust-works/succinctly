@@ -8896,7 +8896,7 @@ pub(crate) fn try_eval_owned_step<S: EvalSemantics>(
     if is_owned_assign(expr) {
         return match owned_assign_step::<S>(expr, &mut state) {
             Some(Ok(())) => OwnedStep::Handled(Ok(state)),
-            Some(Err(error)) => OwnedStep::Handled(Err(error)),
+            Some(Err(error)) => OwnedStep::Handled(Err(error)), // omni-dev: coverage tolerate-line reason="reachable only on a genuine allocation failure: owned_assign_step's single-step arms map every non-allocation error to unreachable_owned_assign_write (provably impossible, see its own doc comment), and its Chain arm's set_path call walks exactly the steps owned_assign_step_child already validated as Field-into-Object/Null or Index-in-[0,len]-into-Array/Null with no mutation in between, so the only way set_path/set_field/set_index/pad_with_nulls can still fail is the same try_reserve-fails-under-OOM branch the codebase already tolerates elsewhere (#2267) (#3138)"
             None => OwnedStep::Declined(state),
         };
     }
@@ -9022,7 +9022,7 @@ fn owned_assign_shape(expr: &Expr) -> bool {
                     other => closed_expr_shape(other),
                 }
         }
-        _ => false,
+        _ => false, // omni-dev: coverage tolerate-line reason="unreachable: owned_assign_shape's only caller (owned_step_shape) gates the call on is_owned_assign(expr), which recognizes exactly Assign/Update/CompoundAssign/AlternativeAssign -- the same four variants this match already has explicit arms for, so `expr` can never be anything else here (#3138)"
     }
 }
 
@@ -9215,7 +9215,7 @@ fn owned_assign_step<S: EvalSemantics>(
             path,
             OwnedAssignRhs::Alternative(closed_expr_to_owned::<S>(value)?),
         ),
-        _ => return None,
+        _ => return None, // omni-dev: coverage tolerate-line reason="unreachable: both call sites (try_eval_owned_step, gated on is_owned_assign; eval_owned_reindex_free's own Assign|Update|CompoundAssign|AlternativeAssign arm) only ever hand this function one of the same four variants this match already covers explicitly (#3138)"
     };
 
     // The keys the write names, each settled against the container it lands
@@ -9289,11 +9289,11 @@ fn owned_assign_new_value<S: EvalSemantics>(
 #[cold]
 fn unreachable_owned_assign_write() -> EvalError {
     debug_assert!(
-        false,
-        "owned_assign_step wrote into a container it did not check"
+        false, // omni-dev: coverage tolerate-line reason="unreachable: this function's own doc comment states why -- the borrow on `state` between owned_assign_step_child's check and the single write makes the container changing shape impossible, so debug_assert!(false, ..) can never fire (#3138)"
+        "owned_assign_step wrote into a container it did not check" // omni-dev: coverage tolerate-line reason="unreachable: same invariant as the `false` above -- this message is only ever formatted if that assert fires (#3138)"
     );
-    EvalError::new("internal error: owned assignment target changed shape")
-}
+    EvalError::new("internal error: owned assignment target changed shape") // omni-dev: coverage tolerate-line reason="unreachable: this function is only called from owned_assign_step's single-step arms, both of which the invariant above already rules out ever calling it for real (#3138)"
+} // omni-dev: coverage tolerate-line reason="unreachable: the whole function body above is provably dead by the same borrow-checker invariant its doc comment states (#3138)"
 
 /// One step of an [`owned_assign_step`] path: an object key or an array
 /// index, the two components [`key_to_path_component`] produces for a
@@ -9330,7 +9330,7 @@ fn owned_assign_single_step<S: EvalSemantics>(path: &Expr) -> SingleStep<'_> {
     match path {
         Expr::Paren(inner) => owned_assign_single_step::<S>(inner),
         Expr::Pipe(stages) => match stages.as_slice() {
-            [only] => owned_assign_single_step::<S>(only),
+            [only] => owned_assign_single_step::<S>(only), // omni-dev: coverage tolerate-line reason="unreachable: Expr::pipe() (the parser's sole Pipe constructor) collapses a one-element list to the bare inner expr instead of wrapping it, and substitute_vars's substitute_var walk preserves a Pipe's stage count rather than dropping stages -- no other site builds an Expr::Pipe for a parsed assignment path, so a path's top-level Pipe here is never single-element (#3138)"
             _ => SingleStep::Chain,
         },
         Expr::IndexExpr { target, key } if matches!(target.as_ref(), Expr::Identity) => {
@@ -61416,6 +61416,15 @@ mod tests {
             OwnedValue::from_number_literal::<JqSemantics>("0"),
             OwnedValue::from_number_literal::<JqSemantics>("1"),
         ]);
+        // `.a[0]` parses as a flat two-stage `Pipe([Field("a"), Index{idx:
+        // 0, key: None}])`, so `owned_assign_path_steps` reads its second
+        // stage through `static_step` (a bare `Index`, not an
+        // `IndexExpr`/`closed_key_step` computed key) -- with `.a` already
+        // an empty array, this is the only row here whose chain produces a
+        // `StepKey::Index`; every other multi-step row here closes a
+        // computed bracket on a string, which `closed_key_step` turns into
+        // `StepKey::Field` instead.
+        let with_empty_array = OwnedValue::object_from([("a".to_string(), OwnedValue::array())]);
 
         let handled = [
             (".[$r.name] = $r.score", OwnedValue::object_from([])),
@@ -61439,6 +61448,27 @@ mod tests {
             // `[]` parses as `Array(Comma([]))`; only `[empty]` reaches the
             // `Array(Builtin::Empty)` arm.
             (".a = [empty]", object.clone()),
+            // A top-level pipe of 2+ assignment-shaped stages: the only
+            // route into `owned_step_shape`/`owned_assign_shape`/
+            // `closed_expr_shape` (a single top-level assignment, every
+            // other row above, never calls them at all -- it goes straight
+            // through `eval_owned_reindex_free`'s own `Assign`/`Update`/...
+            // arm). Exercises `closed_expr_shape`'s `Array`'s `Builtin::Empty`
+            // and `Comma` arms, its `Object` arm with both an
+            // `ObjectKey::Literal` and an `ObjectKey::Expr`, and
+            // `owned_assign_shape`'s `Update` arm with an `. + closed`
+            // filter.
+            (
+                ".a = [1,2] | .b = {\"x\":1,(\"y\"):2} | .c |= . + 1 | .d = [empty]",
+                OwnedValue::object_from([]),
+            ),
+            // `.a[0]` parses as a flat two-stage `Pipe([Field("a"),
+            // Index{idx: 0, key: None}])`, so the write is a `SingleStep::
+            // Chain` whose steps are `[StepKey::Field("a"),
+            // StepKey::Index(0)]` -- the only row in this table whose chain
+            // produces a `StepKey::Index`, exercising `StepKey::
+            // into_component`'s `Index` arm.
+            (".a[0] = 1", with_empty_array.clone()),
         ];
         for (src, input) in handled {
             let expr = subst(src);
@@ -61446,7 +61476,7 @@ mod tests {
                 &expr, &input, false,
             ));
             let direct = eval_owned_reindex_free::<JqSemantics>(&expr, &input)
-                .unwrap_or_else(|| panic!("borrowed route declined {src} on {input:?}"));
+                .unwrap_or_else(|| panic!("borrowed route declined {src} on {input:?}")); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if eval_owned_reindex_free declined a shape this loop's own `handled` table asserts is always answered (#3138)"
             let direct = match direct {
                 Ok(value) => (vec![value], "ok".to_string()),
                 Err(error) => (Vec::new(), format!("error:{}", error.message)),
@@ -61455,7 +61485,7 @@ mod tests {
             let OwnedStep::Handled(Ok(consumed)) =
                 try_eval_owned_step::<JqSemantics>(&expr, input.clone())
             else {
-                panic!("consuming route did not handle {src} on {input:?}");
+                panic!("consuming route did not handle {src} on {input:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on a shape this loop's own `handled` table asserts is always answered Ok (#3138)"
             };
             assert_eq!(
                 format!("{:?}", (vec![consumed], "ok")),
@@ -61494,7 +61524,7 @@ mod tests {
             let OwnedStep::Declined(returned) =
                 try_eval_owned_step::<JqSemantics>(&expr, input.clone())
             else {
-                panic!("consuming route must decline {src}");
+                panic!("consuming route must decline {src}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step handled a shape this loop's own `declined` table asserts is always declined (#3138)"
             };
             assert_eq!(format!("{returned:?}"), format!("{input:?}"), "{src}");
         }
@@ -61515,7 +61545,7 @@ mod tests {
             let OwnedStep::Handled(Ok(consumed)) =
                 try_eval_owned_step::<YqSemantics>(&expr, object.clone())
             else {
-                panic!("yq: consuming route did not handle {src}");
+                panic!("yq: consuming route did not handle {src}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on a yq shape this loop's own table asserts is always answered Ok (#3138)"
             };
             assert_eq!(
                 format!("{:?}", (vec![consumed], "ok")),
@@ -61614,9 +61644,9 @@ mod tests {
         let text_ptr = |state: &OwnedValue| match state {
             OwnedValue::Object(fields) => match fields.get("keep") {
                 Some(OwnedValue::String(text)) => text.as_ptr(),
-                other => panic!("missing sibling: {other:?}"),
+                other => panic!("missing sibling: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the tracked \"keep\" field stopped being a String, which nothing in this test ever touches (#3138)"
             },
-            other => panic!("expected object: {other:?}"),
+            other => panic!("expected object: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if `state` stopped being an Object, which every owned_assign_step write in the loop below preserves (#3138)"
         };
         let before = text_ptr(&state);
         for i in 0..64 {
@@ -61624,12 +61654,12 @@ mod tests {
             let expr = substitute_vars(&parse(".[$k] = $k").unwrap(), [("k", &key)]);
             state = match try_eval_owned_step::<JqSemantics>(&expr, state) {
                 OwnedStep::Handled(Ok(next)) => next,
-                _ => panic!("step {i} was not handled"),
+                _ => panic!("step {i} was not handled"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_eval_owned_step declined or errored on the single-step shape this loop drives every iteration (#3138)"
             };
         }
         assert_eq!(text_ptr(&state), before, "the unchanged sibling was copied");
         let OwnedValue::Object(fields) = &state else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this arm only fires if `state` stopped being an Object, which every write in the loop above preserves (#3138)"
         };
         assert_eq!(fields.len(), 65);
     }
