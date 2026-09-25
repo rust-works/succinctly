@@ -34589,15 +34589,23 @@ enum BuiltinNavigation {
 ///   under #2744. Bare `Flatten` stays: it is `_flatten(-1)`, whose
 ///   argument is jq's own literal and cannot raise.
 /// - **Some raise against a container this function cannot name.**
-///   `unique`, `unique_by`, `map_values`, `with_entries` and `fromstream`
-///   raise against a *derived* value (`[1] | map_values(.)` reports
-///   `element 0 of [[1],[]]`, the `group_by`/`to_entries` intermediate),
-///   which a static answer here cannot produce. They are deliberately
-///   absent rather than reported with the wrong container — #2743, which
-///   also covers `ascii_downcase`/`ascii_upcase` (`explode | map(...)`) and
-///   the `match`/`sub`/`gsub` family, and `transpose` (which additionally
-///   raises only when `map(length)|max` exceeds zero). `INDEX(f)` is a
-///   clean `Iterate` on every input that simply has not been added yet.
+///   `unique`, `unique_by`, `map_values`, `with_entries`, `sub`/`gsub` (with
+///   or without flags) and object-input `walk` raise against a *derived*
+///   value (`[1] | map_values(.)` reports `element 0 of [[1],[]]`, the
+///   `group_by`/`to_entries`/`match`/`_modify` intermediate), which a
+///   *static* answer here cannot produce — so they stay out of this table,
+///   which only ever answers from `expr`'s own shape. #3271 raises for this
+///   set anyway, from a *different* function
+///   ([`always_refuses_as_live_path`]) reached only after `expr` evaluates
+///   by value, naming the value it actually produced rather than the
+///   container this table would need but cannot derive — a deliberate,
+///   narrower approximation, not an extension of this table's own contract.
+///   `fromstream` remains genuinely absent, along with
+///   `ascii_downcase`/`ascii_upcase` (`explode | map(...)`), the
+///   `match`/`scan`/`capture`/`splits` family, and `transpose` (which
+///   additionally raises only when `map(length)|max` exceeds zero) — #2743.
+///   `INDEX(f)` is a clean `Iterate` on every input that simply has not
+///   been added yet.
 ///   `nth(n)`, `reverse` and `indices(i)` are absent for a related reason:
 ///   their element depends on an argument or on `length` (and `reverse`
 ///   does not raise at all on an empty input), so they need a value this
@@ -34626,6 +34634,121 @@ fn builtin_navigation(builtin: &Builtin, value: &OwnedValue) -> Option<BuiltinNa
         Builtin::Walk(_) if matches!(value, OwnedValue::Array(_)) => {
             Some(BuiltinNavigation::Iterate)
         }
+        _ => None,
+    }
+}
+
+/// #3271: six kinds of construct (eleven `Expr`/`Builtin` variants between
+/// them) whose jq-defined bodies always fail jq's own internal path-check
+/// once they have actually *produced a value* -- `with_entries`,
+/// `unique`/`unique_by`, `sub`/`gsub` (with or without flags, four
+/// variants), `map_values`, an object-input `walk` (its object arm
+/// dispatches to `map_values`, [`builtin_navigation`]'s own doc comment
+/// above), and every update assignment (`|=`, compound `op=`, `//=`; plain
+/// `=` is exempt -- a subexp like object construction, #3186, confirmed
+/// live it never raises).
+///
+/// **Ordering is load-bearing (review, first cut of this fix): this must
+/// run *after* `expr` has evaluated by value, on the value it produced --
+/// never as a static pre-check.** jq raises its own type error, or
+/// propagates an `error(...)`/`empty` from an argument, *before* its
+/// internal path-check ever runs — confirmed live: `5 | with_entries(.)`
+/// raises "number (5) has no keys", `.k += error("boom")` raises `"boom"`,
+/// and `.k += empty`/`sub(empty;"x")` produce no output at all (exit 0,
+/// nothing to path-check). A pre-check keyed on `expr`'s syntactic shape
+/// alone cannot see any of that and pre-empts it — the first cut of this
+/// fix did exactly that and regressed every one of those cases from an
+/// exit code matching jq to a wrong, loud "Invalid path expression"
+/// instead. Calling this only from inside [`resolve_leaf_sink`]'s and
+/// [`resolve_leaf`]'s `eval_each_owned` callback -- once per value it
+/// actually produces, on that value -- is what keeps every jq-precedented
+/// failure (a type error, a propagated `error(...)`, an empty-suppressed
+/// output) exactly where it already was: ahead of this check, not behind
+/// it.
+///
+/// `with_entries`/`unique`/`unique_by`/`sub`/`gsub`'s own bodies build a
+/// *fresh* array unrelated to the resolver's input (`to_entries`/
+/// `group_by`/`match`'s own result) and then iterate it (`map(f)`'s own
+/// `.[]`) while jq's path tracking is live, which always raises once that
+/// far — independent of the value's *content*, not of whether evaluating
+/// it raised or suppressed first. `map_values`/object-`walk`/every update
+/// assignment are jq-defined atop `_modify`, whose own bookkeeping always
+/// raises an element-0 access the same way, once `_modify` itself runs at
+/// all.
+///
+/// Unlike [`builtin_navigation`], this is deliberately *not* consulted
+/// from [`array_contents_are_checked`]/`cannot_move_register`'s general
+/// "does this navigate" question -- that broader question also covers
+/// already-correctly-handled real navigation (`[.a|first]`, whose `.a`
+/// and `first` both resolve against genuinely tracked values and so never
+/// raise; confirmed live, `del(. as $x | [.a|first] | $x)` is `null`/exit
+/// 0 in jq 1.7.1), so answering unconditionally there would be a
+/// regression, not a fix.
+///
+/// `input`/`computed`: `input` is `walk`'s own subject, since its jq-
+/// defined body branches on that value's *type* to decide whether it even
+/// reaches `map_values` (an object) at all -- `computed` cannot answer
+/// that, since `walk` never raises evaluating by value regardless of
+/// input shape. Every other arm's applicability is purely syntactic
+/// (`expr`'s own shape), so only `computed` -- the value `expr` actually
+/// produced -- feeds the message.
+///
+/// **Container is approximate, by design (#2743's own limitation, which
+/// this does not lift).** jq's own message shows a *derived* container
+/// this resolver cannot reproduce without re-deriving `to_entries`/
+/// `group_by`/`match` or `_modify`'s own bookkeeping -- `[1] |
+/// map_values(.)]` reports `element 0 of [[1],[]]`, not `[1]` itself.
+/// #2743 left these out of [`builtin_navigation`] rather than report the
+/// wrong container; #3271 takes the opposite tradeoff for this narrower,
+/// set, because the divergence it closes (jq exits 5, a `try` upstream of
+/// the array swallowed nothing and succinctly exited 0 -- #3271's own
+/// silent-`try`-under-`del`/`=` class) is worse than an approximate
+/// container on the loud path both tools now take. Uses `computed` -- the
+/// value `expr` actually produced, always in hand once evaluation
+/// succeeds -- in place of the intermediate jq cannot be asked to name
+/// here. Recorded in `docs/compliance/jq/limitations.md`.
+///
+/// Ordinarily catchable (`ErrorKind::UntrackedNavigation`, not
+/// [`EvalError::into_guessed_path_refusal`]'s uncatchable kind): confirmed
+/// live that a `try`/`?` directly on the raising construct *does* catch it
+/// (`try with_entries(.)` and `try (.k |= 3)` are both `null` under `del`),
+/// while a `try` on a later, sibling pipe stage cannot -- not because the
+/// error is special, but because by the time that stage would run, the
+/// error already unwound past it. Ordinary `Result` propagation through
+/// [`resolve_node_sink`]'s `Try`/`Optional` recursion gets both right with
+/// no extra bookkeeping.
+fn always_refuses_as_live_path<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    computed: &OwnedValue,
+) -> Option<EvalError> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    match expr {
+        Expr::Builtin(
+            Builtin::WithEntries(_)
+            | Builtin::Unique
+            | Builtin::UniqueBy(_)
+            | Builtin::Sub(_, _)
+            | Builtin::SubFlags(_, _, _)
+            | Builtin::Gsub(_, _)
+            | Builtin::GsubFlags(_, _, _),
+        ) => Some(EvalError::invalid_path_expression_near_iterate(computed)),
+        // `map_values`, an object-input `walk` (its object arm dispatches
+        // to `map_values`), and every update assignment are all jq-defined
+        // atop `_modify`, whose bookkeeping always raises the same
+        // element-0 access once it runs at all.
+        Expr::Builtin(Builtin::MapValues(_))
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. } => Some(EvalError::invalid_path_expression_near_access(
+            &OwnedValue::Int(0),
+            computed,
+        )),
+        Expr::Builtin(Builtin::Walk(_)) if matches!(input, OwnedValue::Object(_)) => Some(
+            EvalError::invalid_path_expression_near_access(&OwnedValue::Int(0), computed),
+        ),
         _ => None,
     }
 }
@@ -34690,6 +34813,11 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
 
     let mut delivered = 0usize;
     let mut stopped_by_sink = false;
+    // #3271: set the moment `expr` produces a value one of the five
+    // always-refuses constructs recognizes -- checked on that produced
+    // value, never before it exists. See `always_refuses_as_live_path`'s
+    // own doc comment for why this must run here and not as a pre-check.
+    let mut construct_refusal: Option<EvalError> = None;
     let flow = eval_each_owned::<S>(
         expr,
         value,
@@ -34697,6 +34825,10 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
         Reentry::at_register(trackable),
         &mut |v| {
             delivered += 1;
+            if let Some(e) = always_refuses_as_live_path::<S>(expr, value, &v) {
+                construct_refusal = Some(e);
+                return Demand::Stop;
+            }
             let branch = untracked_at_register(Cow::Owned(v), trackable, value);
             // `untracked_branches`' own rule, applied one value at a time --
             // see its doc comment for why the register is recorded here.
@@ -34727,6 +34859,12 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     // just done.
     if let Some(code) = flow_halt_code(&flow) {
         return ResolveFlow::Escaped(EvalEscape::Halt(code));
+    }
+    // #3271: checked ahead of `stopped_by_sink` -- the `Demand::Stop` that
+    // set this came from this function's own callback, not the sink, so no
+    // branch was ever handed to `sink` for this value.
+    if let Some(e) = construct_refusal {
+        return ResolveFlow::Escaped(EvalEscape::Error(e));
     }
     if stopped_by_sink {
         return ResolveFlow::Stopped;
@@ -34987,12 +35125,21 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     // generator for every value — see [`drive_fold_source`].
     let limit = keep.limit();
     let mut values: Vec<OwnedValue> = Vec::new();
+    // #3271: same rule and same reason as `resolve_leaf_sink`'s own
+    // `construct_refusal` -- checked on each value only once `expr` has
+    // actually produced it, never as a pre-check. See
+    // `always_refuses_as_live_path`'s own doc comment.
+    let mut construct_refusal: Option<EvalError> = None;
     let flow = eval_each_owned::<S>(
         expr,
         value,
         false,
         Reentry::at_register(trackable),
         &mut |v| {
+            if let Some(e) = always_refuses_as_live_path::<S>(expr, value, &v) {
+                construct_refusal = Some(e);
+                return Demand::Stop;
+            }
             values.push(v);
             if values.len() >= limit {
                 Demand::Stop
@@ -35025,6 +35172,14 @@ fn resolve_leaf<'a, S: EvalSemantics>(
                 EvalEscape::Halt(code),
             ))
         };
+    }
+
+    // #3271: checked ahead of `values.is_empty()` below -- the `Demand::
+    // Stop` that produced this came from this function's own callback
+    // before it ever pushed to `values`, so an empty `values` here must
+    // not be read as "no output" the way a genuine empty generator is.
+    if let Some(e) = construct_refusal {
+        return Err((Vec::new(), EvalEscape::Error(e)));
     }
 
     if values.is_empty() {
@@ -100253,9 +100408,15 @@ mod tests {
             // `_modify`, or a builtin jq defines in jq but this evaluates
             // natively -- keeps the array off the register (review: each
             // fabricated a path, `[.k |= . + 1]` a write, before
-            // `array_contents_are_checked`). jq raises too, with different
-            // wording ("near attempt to ..." vs "with result"); what is
-            // pinned here is only that neither answers.
+            // `array_contents_are_checked`). Since #3271,
+            // `always_refuses_as_live_path` raises eagerly, unconditionally,
+            // for every update assignment here (`[.k |= . + 1]`,
+            // `[.[] |= 1]`) and for `with_entries`/`map_values` (jq's *own*
+            // container differs from this one's, #2743 -- see that fix's
+            // own test for the exact kind/wording it now pins); `path([.a])`
+            // alone still takes the pre-#3271 route (a bare-array-terminal
+            // refusal, unrelated to this fix), so this loop's job stays
+            // "some resolver refusal either way," not a specific kind.
             r"path(. as $x | [.k |= . + 1] | $x)",
             r"path(. as $x | [.[] |= 1] | $x)",
             r"path(. as $x | [with_entries(.)] | $x)",
@@ -100266,6 +100427,236 @@ mod tests {
                 QueryResult::Error(e) => {
                     assert!(is_resolver_refusal(&e), "{filter}: {}", e.message);
                 }
+            );
+        }
+    }
+
+    /// #3271: `with_entries`, `map_values`, an object-input `walk`,
+    /// `unique`/`unique_by`, `sub`/`gsub`, and every update assignment
+    /// (`|=`, a compound `op=`, `//=`) raise jq's path error once resolved
+    /// live inside `[...]` and *evaluated to a value* -- whether or not the
+    /// register is still known, and whether or not anything downstream
+    /// consumes the array. **Not unconditionally**: jq's own type error, or
+    /// an `error(...)`/`empty` an argument or the right-hand side produces,
+    /// still comes first and still wins -- `always_refuses_as_live_path`'s
+    /// own doc comment records why that ordering is load-bearing (a first
+    /// cut of this fix got it backwards and regressed every one of those
+    /// cases; see `test_native_builtins_yield_to_jqs_own_earlier_failure_3271`
+    /// below for the pinned matrix). Before this fix, `resolve_leaf_sink`'s
+    /// generic by-value fallback evaluated each with no path check at all,
+    /// so a `try` positioned on a *later*, sibling pipe stage silently
+    /// caught nothing (there was nothing there to catch) and
+    /// `del(...)`/`path(...)` exited 0 where jq exits 5 -- a `try`-under-
+    /// `del` silent write loss, ADR-0018's rule 4 class. Confirmed live
+    /// against jq 1.7.1 for every row (`docs/compliance/jq/limitations.md`
+    /// records the one accepted divergence: succinctly's message names the
+    /// value the construct actually produced rather than jq's derived
+    /// `to_entries`/`group_by`/`match`/`_modify` intermediate, #2743).
+    #[test]
+    fn test_native_builtins_and_update_assignment_raise_unconditionally_3271() {
+        // A `try` on a later pipe stage cannot reach an error an earlier
+        // stage's own evaluation already raised -- confirmed live these are
+        // all jq exit 5, matching `del`'s document-unchanged shape here
+        // only insofar as the write it would otherwise perform never
+        // happens either.
+        for (doc, filter) in [
+            (
+                r#"{"a":{"b":1},"k":1}"#,
+                r"del(. as $x | [with_entries(.)] | try .[0])",
+            ),
+            (
+                r#"{"a":{"b":1},"k":1}"#,
+                r"del(. as $x | [.k |= 3] | try (.[0] | .b))",
+            ),
+            (
+                r#"{"a":{"b":1},"k":1}"#,
+                r"del(. as $x | [map_values(.)] | try .[0])",
+            ),
+            (
+                r#"{"a":{"b":1},"k":1}"#,
+                r"del(. as $x | [.k += 1] | try .[0])",
+            ),
+            (
+                r#"{"a":{"b":1},"k":1}"#,
+                r"del(. as $x | [.k //= 1] | try .[0])",
+            ),
+            (r"[3,1,2]", r"del(. as $x | [unique] | try .[0])"),
+            (r"[3,1,2]", r"del(. as $x | [unique_by(.)] | try .[0])"),
+            (r#"{"a":1}"#, r"del(. as $x | [walk(.)] | try .[0])"),
+        ] {
+            query!(doc.as_bytes(), filter,
+                QueryResult::Error(e) => {
+                    assert!(e.is_untracked_navigation_error(), "{filter}: {}", e.message);
+                }
+            );
+        }
+        // A `try`/`?` directly on the raising construct *does* catch it
+        // (jq: `try with_entries(.)` and `try (.k |= 3)` are both `null`
+        // under `del`, confirmed live) -- ordinary `ErrorKind::
+        // UntrackedNavigation` catchability, ADR-0018 fidelity in the other
+        // direction from the loop above: this fix must not make the error
+        // uncatchable everywhere, only unreachable from a later stage.
+        // (Wrapping the *same* catch in an array, then following it with a
+        // bare `$x` -- `del(. as $x | [try with_entries(.)] | $x)` -- hits
+        // a separate, pre-existing gap: `array_contents_are_checked`'s
+        // static "false" for an unrecognised builtin already left the
+        // array's own trackability at the mercy of whatever
+        // `resolve_seq_stage` carries forward for a later `TrackedVar`, and
+        // that carry-forward does not special-case "the loss came from a
+        // caught error." Filed as #3283's own follow-up territory rather
+        // than fixed here -- this fix's job is raising at all, not
+        // rearchitecting register carry-forward through a catch.)
+        for filter in [
+            r"del(try with_entries(.))",
+            r"del(. as $x | try with_entries(.) | $x)",
+            r"del(try (.k |= 3))",
+            r"del(. as $x | try (.k |= 3) | $x)",
+        ] {
+            assert_eq!(
+                outputs(br#"{"a":{"b":1},"k":1}"#, filter),
+                [r#"{"a":{"b":1},"k":1}"#],
+                "{filter}"
+            );
+        }
+        // `walk` on an array or a scalar input never reaches `map_values`
+        // internally (its object-only arm, `builtin_navigation`'s own doc
+        // comment), so it must not raise -- confirmed live neither does in
+        // jq. Plain `=` is a subexp (#3186) and never raises either. Checked
+        // by calling the gate directly rather than round-tripping through
+        // `del`/an array/`$x`: that route also exercises #3283 (a
+        // *different*, pre-existing gap where `array_contents_are_checked`
+        // wrongly refuses genuinely-tracked navigation like array-input
+        // `walk` or plain `=` for an unrelated reason), which would make
+        // this assertion fail for a cause this fix does not touch.
+        for (expr, value) in [
+            (
+                Expr::Builtin(Builtin::Walk(Box::new(Expr::Identity))),
+                OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()),
+            ),
+            (
+                Expr::Builtin(Builtin::Walk(Box::new(Expr::Identity))),
+                OwnedValue::Int(1),
+            ),
+            (
+                Expr::Assign {
+                    path: Box::new(Expr::Field("k".to_string())),
+                    value: Box::new(Expr::Literal(Literal::Int(3))),
+                },
+                OwnedValue::Object(IndexMap::new().into()),
+            ),
+        ] {
+            assert!(
+                always_refuses_as_live_path::<JqSemantics>(&expr, &value, &value).is_none(),
+                "{expr:?} / {value:?}"
+            );
+        }
+        // jq mode only (ADR-0018): yq's own `with_entries`/`map_values`/
+        // `sub` are real, differently-behaved yq builtins (CLAUDE.md's own
+        // jq/yq divergence rules; `try` is not even yq syntax at all --
+        // confirmed live, real yq's lexer rejects it outright with
+        // "invalid input text" unless `--jq-extensions` widens it), so this
+        // checks the gate directly rather than by round-tripping through
+        // `del`/`path`, which would exercise unrelated machinery (#3283)
+        // instead of this function's own `S::TAG` gate.
+        for expr in [
+            Expr::Builtin(Builtin::WithEntries(Box::new(Expr::Identity))),
+            Expr::Builtin(Builtin::MapValues(Box::new(Expr::Identity))),
+            Expr::Update {
+                path: Box::new(Expr::Field("k".to_string())),
+                filter: Box::new(Expr::Literal(Literal::Int(3))),
+            },
+        ] {
+            let value = OwnedValue::Object(IndexMap::new().into());
+            assert!(
+                always_refuses_as_live_path::<YqSemantics>(&expr, &value, &value).is_none(),
+                "{expr:?}"
+            );
+        }
+    }
+
+    /// #3271, `sub`/`gsub` rows only: split into their own `regex`-gated
+    /// test (CI's non-`regex` feature legs -- `default`, `simd`,
+    /// `scalar-yaml`, `portable-popcount`, ... -- don't build `sub`/`gsub`
+    /// support at all, so a mixed-in row here panics
+    /// "regex feature not enabled" there; the rest of #3271's own matrix
+    /// needs no such gate).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_sub_gsub_raise_unconditionally_3271() {
+        for filter in [
+            r#"del(. as $x | [sub("a";"x")] | try .[0])"#,
+            r#"del(. as $x | [gsub("a";"x")] | try .[0])"#,
+        ] {
+            query!(br#""abc""#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.is_untracked_navigation_error(), "{filter}: {}", e.message);
+                }
+            );
+        }
+    }
+
+    /// #3271 review (first cut regressed this): `always_refuses_as_live_path`
+    /// runs on the value a construct actually *produced*, never as a
+    /// pre-check on `expr`'s bare syntactic shape -- so jq's own type error,
+    /// and an `error(...)`/`empty` an argument or the right-hand side
+    /// produces, still come first and still win, exactly as they did before
+    /// #3271 touched this code at all. Every row confirmed live against jq
+    /// 1.7.1.
+    #[test]
+    fn test_native_builtins_yield_to_jqs_own_earlier_failure_3271() {
+        // A type error the construct's own input fails, before any of
+        // #3271's five ever get a value to path-check.
+        for (doc, filter, needle) in [
+            (r"5", r"with_entries(.)", "number (5) has no keys"),
+            (r"5", r"unique", "Cannot iterate over number"),
+            (r"5", r"map_values(.)", "Cannot iterate over number"),
+            (r"null", r"unique", "Cannot iterate over null"),
+            (r#"{"a":1}"#, r"unique", "cannot be sorted"),
+            (r#"{"a":"b"}"#, r".a += 1", "and number (1) cannot be added"),
+            (r"5", r".k |= 3", "Cannot index number with"),
+        ] {
+            query!(doc.as_bytes(), &format!("path({filter})"),
+                QueryResult::Error(e) => {
+                    assert!(e.message.contains(needle), "{filter}: {}", e.message);
+                    assert!(!is_resolver_refusal(&e), "{filter}: {}", e.message);
+                }
+            );
+        }
+        // An `error(...)` inside the argument, or the right-hand side,
+        // propagates as itself -- never replaced by a path error.
+        for (doc, filter) in [
+            (r"[1,2]", r#"unique_by(error("x"))"#),
+            (r#"{"k":1}"#, r#".k += error("x")"#),
+        ] {
+            query!(doc.as_bytes(), &format!("try path({filter}) catch ."),
+                QueryResult::Owned(OwnedValue::String(s)) => {
+                    assert_eq!(s, "x", "{filter}");
+                }
+            );
+        }
+        // An empty-producing argument or right-hand side suppresses to no
+        // output, exit 0 -- never a raised path error.
+        for (doc, filter) in [
+            (r#"{"k":1}"#, r".k += empty"),
+            (r#"{"k":null}"#, r".k //= empty"),
+        ] {
+            assert!(
+                outputs(doc.as_bytes(), &format!("path({filter})")).is_empty(),
+                "{filter}"
+            );
+        }
+    }
+
+    /// #3271, `sub`'s own `$re`/`flags` rows only: split into their own
+    /// `regex`-gated test for the same reason as
+    /// `test_sub_gsub_raise_unconditionally_3271` above.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_sub_yields_to_its_own_empty_binding_3271() {
+        for filter in [r#"sub(empty;"x")"#, r#"sub("a";"b";empty)"#] {
+            assert!(
+                outputs(br#""abc""#, &format!("path({filter})")).is_empty(),
+                "{filter}"
             );
         }
     }
