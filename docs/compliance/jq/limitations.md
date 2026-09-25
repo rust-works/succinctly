@@ -727,11 +727,16 @@ is the revert that established what the other one costs.
    `//` also leaves jq's register where it was on inputs this predicate can't tell apart
    statically. Those still drop the register here. Before #3186 these refused, and under `try` the refusal was caught as if it
    were jq's own: `del(. as $v \| {k: .a} \| try ($v \| .[]?))` echoed the document where jq
-   deletes every key. Two shapes jq answers still refuse here:
-   an *array* whose contents navigate (`path(. as $x \| [.a] \| $x)` — jq collects an array
-   without a subexp, so its contents are path-checked, and this resolver never sees them:
-   `path(. as $x \| {k:.a} \| [.a] \| $x)` raises in jq on the `[.a]`'s `.a`), and a `def`
-   whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its
+   deletes every key. An array is different: jq collects it without a subexp, so its contents
+   are path-checked (`path(. as $x \| {k:.a} \| [.k] \| $x)` raises on the `.k`), and then
+   backtracks the register to where the collect began. Since
+   [#3263](https://github.com/rust-works/succinctly/issues/3263) an array the resolver resolves
+   live, checking its contents as jq does, carries the register too, so
+   `path(. as $x \| [.a] \| $x)` is `[]` in both tools. Two shapes jq answers still refuse
+   here: an array holding a shape the resolver still evaluates by value (`getpath`, a postfix
+   `?`, a `$var` on an untracked input, parameterized recursion: #2759, #2764), so its
+   navigation is never checked and it can carry no register (`path(. as $x \| [.a?] \| $x)`);
+   and a `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its
    body is not something a syntactic predicate can do from a name). Every such refusal is
    refuse-only, and since [#3267](https://github.com/rust-works/succinctly/issues/3267) it stays
    refuse-only under `try`/`?` too. It used to be caught as if it were jq's own path error, so
@@ -781,9 +786,7 @@ is the revert that established what the other one costs.
    One residual keeps the silent drop. A *terminal* refusal (the pipe's last value is a `$var`,
    with no navigation after it) is still decided where the per-branch knowledge is gone, so a
    value-position `?` catches it: `[path(. as $x \| has("a") \| $x)?]` is `[]` here and
-   `[[]]` in jq, as it was before #3267. The array shape
-   (`del(. as $x \| [.a] \| try ($x \| .a))`, now a loud refusal too) is
-   [#3263](https://github.com/rust-works/succinctly/issues/3263), resolving an array's contents. (A third shape used to sit here too — an `as` whose bind source navigates —
+   `[[]]` in jq, as it was before #3267. (A third shape used to sit here too — an `as` whose bind source navigates —
    but [#2042](https://github.com/rust-works/succinctly/issues/2042) established that jq
    evaluates an `as` source with path tracking suspended, so the source alone never moves the
    register; `cannot_move_register`'s `Expr::As` arm now consults only the body, and
