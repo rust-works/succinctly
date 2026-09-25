@@ -33761,18 +33761,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         //   nor `getpath_result_position` has anything to work from and the
         //   bracket would refuse where jq accepts -- the same shape as
         //   `TrackedVar` above, and the same #2759/#2764 bracket.
-        //   `path(1 | [getpath([])] | empty)` is accepted by jq. #2764.
-        // - `RecurseF`/`RecurseCond`: the shared `recurse_untracked_error`
-        //   guard refuses eagerly whether or not
-        //   `f` navigates -- `recurse(empty)`, `recurse(.+1; .<3)` and a
-        //   caught parameterized recursions are accepted by jq. #2764.
-        //   Bare recursion now defers its navigation error (#2761) and is
-        //   safe to resolve inside brackets.
-        // - `Optional`: the parser erases the parentheses in `(.a)?`, which
-        //   is jq's `try .a` (a *caught* path error), into `.a?`, which is
-        //   jq's `INDEX_OPT` (an uncaught one). Bare `[.a?]` happens to agree
-        //   with jq either way, but `[(.a)? | f]` does not, and this function
-        //   cannot tell the two spellings apart. #2764.
+        //   `path(1 | [getpath([])] | empty)` is accepted by jq. #2759.
+        //
+        // The recurse family and `Optional` were excluded here too until
+        // #2764 made each defer its refusal the way jq does: parameterized
+        // recursion resolves `f` against an untracked seed instead of
+        // refusing on sight, and a `try`-scoped `(E)?` keeps its catching
+        // `?` through `push_path_components`'s flatten rather than turning
+        // into the non-catching postfix `E?`.
         //
         // The scan is O(|inner|), the same order as resolving it.
         Expr::Array(inner) if array_resolves_live::<S>(inner, trackable) => {
@@ -35341,13 +35337,7 @@ fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool 
         && (!trackable || !cannot_move_register(inner))
         && !any_subexpr(inner, &mut |e| {
             (!trackable && matches!(e, Expr::TrackedVar(_)))
-                || matches!(
-                    e,
-                    Expr::Optional(_)
-                        | Expr::Builtin(
-                            Builtin::GetPath(_) | Builtin::RecurseF(_) | Builtin::RecurseCond(_, _)
-                        )
-                )
+                || matches!(e, Expr::Builtin(Builtin::GetPath(_)))
         })
 }
 
@@ -35378,7 +35368,16 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         | Expr::Iterate
         | Expr::RecursiveDescent => true,
         Expr::Builtin(Builtin::Select(_)) => true,
-        Expr::Paren(e) => array_contents_are_checked(e),
+        // #2764: the resolver resolves `f` live against every node, and
+        // `cond` runs as `select(cond)`'s condition, a subexp in jq.
+        Expr::Builtin(Builtin::RecurseF(f) | Builtin::RecurseCond(f, _)) => {
+            array_contents_are_checked(f)
+        }
+        // #2764: both of jq's `?`s -- `INDEX_OPT` on a primitive and `try`
+        // on anything else -- are resolved by `resolve_optional_sink`, which
+        // keeps them apart; the inside is checked exactly when it would be
+        // without the `?`.
+        Expr::Paren(e) | Expr::Optional(e) => array_contents_are_checked(e),
         Expr::Pipe(stages) | Expr::Comma(stages) => stages.iter().all(array_contents_are_checked),
         Expr::If {
             then_branch,
@@ -100055,9 +100054,12 @@ mod tests {
     /// A `def` and a call are excluded because resolving a call to its body
     /// is not something this predicate can do from a name. An array whose
     /// contents hold a shape the `[E]` arm still evaluates by value
-    /// (`getpath`, a postfix `?` -- see [`array_resolves_live`]) is excluded
-    /// too: its navigation is never checked, so it may not carry the
-    /// register. (`[.a]`, `{k:.a}` and `"\(.a)"` used to be listed here:
+    /// (`getpath` -- see [`array_resolves_live`]) is excluded too: its
+    /// navigation is never checked, so it may not carry the register.
+    /// (`[.a?]` was listed here until #2764 let the arm resolve a `?`
+    /// live; it moved to
+    /// `test_path_register_survives_an_array_resolved_live_3263`.
+    /// `[.a]`, `{k:.a}` and `"\(.a)"` used to be listed here:
     /// #3186 moved the two subexp shapes to
     /// `test_path_register_survives_subexp_stages_that_navigate_3186`, and
     /// #3263 the array, resolved live, to
@@ -100070,7 +100072,6 @@ mod tests {
         for filter in [
             r"path(. as $x | (def f: 5; f) | $x)",
             r#"path(. as $x | [.a | getpath(["b"])] | $x)"#,
-            r"path(. as $x | [.a?] | $x)",
         ] {
             query!(br#"{"a":{"b":1}}"#, filter,
                 QueryResult::Error(e) => {
@@ -100099,6 +100100,9 @@ mod tests {
             (r"path(. as $x | [.[.k | tostring]] | $x)", "[]"),
             (r"path(. as $x | [if .k then .a else .k end] | $x)", "[]"),
             (r"path(.a as $y | .a | [.b] | $y | .b)", r#"["a","b"]"#),
+            // #2764: a `?` inside, of either kind, is resolved live too.
+            (r"path(. as $x | [.a?] | $x)", "[]"),
+            (r"path(. as $x | [(.a)?] | $x)", "[]"),
         ] {
             assert_eq!(
                 outputs(br#"{"a":{"b":1},"k":1}"#, filter),

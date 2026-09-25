@@ -68230,16 +68230,18 @@ fn test_tracked_array_accepting_controls_3049() -> Result<()> {
     Ok(())
 }
 
-/// #2764 is a separate optional-navigation limitation, verified unchanged
-/// before and after #3049. Update this characterization when #2764 is fixed.
+/// A postfix `.[]?` inside an array is jq's `EACH_OPT`, whose `?` does not
+/// catch the path error an untracked `5` raises. This was accepted here,
+/// unchanged by #3049, until #2764 let the `[E]` arm resolve a `?` live.
 #[test]
-fn test_tracked_array_optional_navigation_characterize_preexisting_bug_3049() -> Result<()> {
+fn test_tracked_array_optional_navigation_refuses_as_jq_2764() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "path([5 | .[]?] | empty)"], Some("null"))?;
-    assert_eq!(
-        code, 0,
-        "#2764 fix should update this characterization: {stderr:?}"
-    );
+    assert_eq!(code, 5, "{stderr:?}");
     assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:0): Invalid path expression near attempt to iterate through 5\n"
+    );
     Ok(())
 }
 
@@ -68349,7 +68351,6 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         r"del(. as $x | (.zz // 5) | try ($x | .k))",
         r"del(. as $x | if .k then 5 else .a end | try ($x | .k))",
         r"del(. as $x | (def f: 5; f) | try ($x | .k))",
-        r"del(. as $x | [.a?] | try ($x | .a))",
     ] {
         let (stdout, stderr, code) =
             run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1,"l":[1,2]}"#))?;
@@ -68670,5 +68671,34 @@ fn test_try_scoped_optional_catches_untracked_path_error_2764() -> Result<()> {
         (r"path(1 | .[.a]? | empty)", "", "jq: error (at <stdin>:1): Cannot index number with string \"a\"\n", 5),
         (r"path(1 | (.[.a])? | empty)", "", "", 0),
         (r"path(.a | .[.b:]?)", "", "", 0),
+    ])
+}
+
+/// #2764 / #2689: with (b) and (c) fixed, the `[...]` arm resolves `?` and
+/// parameterized recursion live, so `[.a?]`/`[.[]?]` refuse as jq does and
+/// an array of them carries the register to a later `$x`.
+#[test]
+fn test_array_admits_optional_and_recurse_2764() -> Result<()> {
+    assert_rows_2764(&[
+        (r"path(1 | [.a?] | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(1 | [.[]?] | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(1 | [.a?, 2] | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(1 | [(.a)?] | empty)", "", "", 0),
+        (r"path(1 | [(.[])?] | empty)", "", "", 0),
+        (r"path(1 | [recurse(empty)] | empty)", "", "", 0),
+        (r"path(1 | [recurse(.[])] | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(1 | try [.a?])", "", "", 0),
+        (r"path(. as $x | [.a?] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [(.a)?] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | [(.a)?] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | [.a?] | $x)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(. as $x | [.[]?] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [recurse(.b; . != null)] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [1 | recurse(.+1; .<3)] | $x)", "[]\n", "", 0),
+        (r"del(. as $x | [.a?] | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"del(. as $x | 1 | [.a?] | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"del(. as $x | 1 | [(.a)?] | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"del(. as $x | [.a?] | try ($x | .a))", "{\"c\":2}\n", "", 0),
+        (r"del(.a | [(.b)? | type] | select(false))", "{\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", "", 0),
     ])
 }

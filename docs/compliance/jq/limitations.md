@@ -738,9 +738,8 @@ is the revert that established what the other one costs.
    such as `with_entries` or `walk`, or an update assignment's `_modify`, as in `[.k \|= 1]`),
    jq raises too and only the wording differs (`… with result …` here). Two shapes jq
    answers still refuse here. The first is an array holding a shape the resolver still
-   evaluates by value when jq accepts it (a postfix `?`, `getpath`, a `$var` on an untracked
-   input, parameterized recursion: #2759, #2764; `path(. as $x \| [.a?] \| $x)`), or an
-   array nested in another stage's expression (`if true then [.a] else 1 end`, `([.a], [.k])`).
+   evaluates by value when jq accepts it (`getpath`, or a `$var` on an untracked input:
+   #2759; `path(. as $x \| [.a \| getpath(["b"])] \| $x)`), or an array nested in another stage's expression (`if true then [.a] else 1 end`, `([.a], [.k])`).
    The second shape is
    a `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its
    body is not something a syntactic predicate can do from a name). Every such refusal is
