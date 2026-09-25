@@ -33195,11 +33195,18 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 ),
             }
         }
-        // Parameterized recursion (and every yq-mode recurse spelling)
-        // retains the eager guard introduced by #843 and shared in #2696.
-        // Its deferred-navigation gap is tracked in #2764: an arbitrary
-        // `f` may navigate differently or not at all. Bare jq recursion is
-        // handled above (#2761), where the next operation is always `.[]?`.
+        // yq mode retains the eager guard introduced by #843 and shared in
+        // #2696 for every recurse spelling: real yq's lexer rejects
+        // `recurse(f)`, so there is no oracle for a deferred shape, and
+        // yq's scalar-write no-op convention would turn a wrong acceptance
+        // into silent corruption rather than a loud error. Bare jq
+        // recursion is handled above (#2761); parameterized jq recursion
+        // (#2764) falls through to `resolve_recurse_sink`, whose walk
+        // delivers the untracked seed as a passthrough (refused only by a
+        // terminal that reaches it) and resolves `f` against it untracked,
+        // so a navigating `f` raises jq's catchable "near attempt" error
+        // and a non-navigating one (`recurse(empty)`, `recurse(.+1; .<3)`)
+        // navigates nothing -- as jq's `def r: ., (f | r)` does.
         //
         // `&& !snapshot` (#1591): a deferred `$x` snapshot must still reach
         // the walks below (which then correctly emit *self* with the mark
@@ -33211,7 +33218,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             | Builtin::RecurseDown
             | Builtin::RecurseF(_)
             | Builtin::RecurseCond(_, _),
-        ) if !trackable && !snapshot.is_marked() => {
+        ) if S::TAG != EvalTag::Jq && !trackable && !snapshot.is_marked() => {
             ResolveFlow::Escaped(recurse_untracked_error(value).1)
         }
         // `..`/bare `recurse`/`recurse_down` (#2696, following #2235's
@@ -34548,10 +34555,10 @@ fn builtin_navigation(builtin: &Builtin, value: &OwnedValue) -> Option<BuiltinNa
     }
 }
 
-/// The remaining eager recursion guard's terminal error (#843).
-/// Parameterized jq recursion and yq retain it; bare jq recursion instead
-/// delivers its seed before reporting navigation in `resolve_node_sink`
-/// (#2761). The remaining deferred-navigation gap is tracked in #2764.
+/// The remaining eager recursion guard's terminal error (#843), now yq mode
+/// only. Bare jq recursion delivers its seed before reporting navigation in
+/// `resolve_node_sink` (#2761), and parameterized jq recursion resolves `f`
+/// against the untracked seed in `resolve_recurse_sink` (#2764).
 fn recurse_untracked_error<'a>(value: &OwnedValue) -> (Vec<PathBranch<'a>>, EvalEscape) {
     (Vec::new(), EvalError::invalid_path_expression(value).into())
 }
@@ -35566,7 +35573,17 @@ fn cannot_move_register(expr: &Expr) -> bool {
             | Builtin::ToString
             | Builtin::ToNumber
             | Builtin::ToJson
-            | Builtin::FromJson => true,
+            | Builtin::FromJson
+            // #2764: produces nothing, so it navigates nothing --
+            // `path(. as $x | [empty] | $x)` is `[]` in jq 1.7.1.
+            | Builtin::Empty => true,
+            // #2764: jq's `def recurse(f): def r: ., (f | r); r;` moves the
+            // register only through `f`, and `recurse(f; cond)`'s `cond`
+            // runs as `select(cond)`'s `if` condition, a subexp. Live
+            // against jq 1.7.1 on `{}`, both `[]`: `path(. as $x | 1 |
+            // recurse(empty) | $x)` and `path(. as $x | 1 | recurse(.+1;
+            // .<3) | $x)` (`[]` twice).
+            Builtin::RecurseF(f) | Builtin::RecurseCond(f, _) => cannot_move_register(f),
             _ => false,
         },
 
@@ -40302,25 +40319,27 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
-    // Every caller in `resolve_node_sink` already short-circuits on the
-    // shared recurse-family untracked guard before ever reaching here
-    // (#843's "recurse's first output is `.` itself" rule) — this loop
+    // In yq mode every caller in `resolve_node_sink` already short-circuits
+    // on the shared recurse-family untracked guard before ever reaching
+    // here (#843's "recurse's first output is `.` itself" rule) — this loop
     // should only ever run starting from a value already known-trackable,
     // *or* one the guard deliberately deferred because it's a frozen `$x`
     // snapshot (#1591 loosened the guard to `!trackable && !snapshot`,
     // specifically so this function's own seed can still emit *self* with
-    // the mark intact). `trackable`/`snapshot` are threaded as real
-    // parameters (not just documented as an invariant in prose)
+    // the mark intact). jq mode admits an untracked value too (#2764): its
+    // seed is a passthrough and `f` is resolved against it untracked, which
+    // is where jq's own refusal happens. `trackable`/`snapshot` are threaded
+    // as real parameters (not just documented as an invariant in prose)
     // specifically so this assertion can catch a future refactor of that
     // guard silently letting a value through that is neither, instead of
     // depending on every call site to keep re-deriving the same guarantee
     // (review finding on #843: an invariant that only lives in a comment is
     // one a later edit can quietly break).
     debug_assert!(
-        trackable || snapshot.is_marked(),
-        "resolve_recurse_sink called with trackable=false, snapshot=false; the \
-         untracked recurse-family guard in resolve_node_sink should have caught \
-         this first"
+        S::TAG == EvalTag::Jq || trackable || snapshot.is_marked(),
+        "resolve_recurse_sink called with trackable=false, snapshot=false in yq \
+         mode; the untracked recurse-family guard in resolve_node_sink should \
+         have caught this first"
     );
     // #2235: each node is delivered to `sink` as soon as it is popped, and
     // `f`/`cond` are resolved for a node only *after* that node's own
@@ -40493,13 +40512,11 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
             path: Rc::clone(&node.path),
             value: node.value.clone(),
             register: None,
-            // Propagated rather than assumed `true`. The shared
-            // recurse-family guard means only a trackable value can enter
-            // this walk today, so this is `true` in practice — but carrying
-            // it keeps that a fact about the guard rather than a second
-            // place the invariant has to be independently maintained
-            // (#1023's `MAX_ITEMS` triplication is what the other way looks
-            // like). See #986's Stage 3 open risk.
+            // Propagated rather than assumed `true`: in jq mode an
+            // untracked seed enters this walk (#2764) and is delivered as
+            // the passthrough it is, for a terminal to refuse "with result"
+            // and a later `$x` to re-establish from. See #986's Stage 3
+            // open risk.
             trackable: node.trackable,
             // Carried, not assumed `false` (#1591): this is the value the
             // caller actually observes, so it is the one whose provenance a
@@ -42876,8 +42893,8 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // re-establishment rather than something "untracked is absorbing" must
     // demote (#3120, generalised by #3133). From an untracked input, no route
     // can produce a trackable branch except by re-establishing against a
-    // register -- `resolve_leaf` hands back untracked branches, the recurse
-    // family refuses -- and the only register any nested route has is the
+    // register -- `resolve_leaf` and the recurse family (#2764) hand back
+    // untracked branches -- and the only register any nested route has is the
     // one this stage handed down (`stage_frame.register()`: the `AsPattern`
     // route's walk and seeded body, a pipe under `try`/`if`/`,`, a `catch`
     // handler). So when this stage carried one, the step's own verdict
