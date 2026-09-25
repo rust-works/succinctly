@@ -2802,7 +2802,10 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // After the bypasses on purpose: neither reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
     let expr = reentry.reroot::<S>(expr);
-    let doc = owned.reindexed::<S>();
+    let doc = match owned.reindexed::<S>() {
+        Ok(doc) => doc,
+        Err(error) => return GenericResult::Error(error),
+    };
     let cursor = doc.root();
 
     // No `if optional { wrap in Expr::Optional }` here: every public entry
@@ -8742,7 +8745,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let expr = reroot_for_reentry::<S>(expr, &root);
             let expr = expr.as_ref();
             let owned = owned_or_err!(bridge_ambient_input::<_, S>(expr, &value, cursor));
-            let doc = owned.reindexed::<S>();
+            let doc = owned_or_err!(owned.reindexed::<S>());
             let cursor = doc.root();
 
             // No `if optional { wrap in Expr::Optional }` here (see
@@ -28297,12 +28300,12 @@ mod tests {
             let value = OwnedValue::Int(n);
             let expected = alloc::format!("{n}");
             assert_eq!(
-                value.to_json_for_reindex::<JqSemantics>(),
+                value.to_json_for_reindex::<JqSemantics>().unwrap(),
                 expected,
                 "jq-mode reindex spelling for Int({n})"
             );
             assert_eq!(
-                value.to_json_for_reindex::<YqSemantics>(),
+                value.to_json_for_reindex::<YqSemantics>().unwrap(),
                 expected,
                 "yq-mode reindex spelling for Int({n})"
             );
@@ -28316,8 +28319,34 @@ mod tests {
     /// through `eval_on_owned`'s exact bridge (`to_json_for_reindex`,
     /// `JsonIndex::build`, `owned_from_standard_json`) and report whether it
     /// came back unchanged.
+    /// #3261: `eval_on_owned`'s own reindex step -- reached directly here
+    /// since normal CLI dispatch routes a filter-driven-deep value through
+    /// an earlier fast path (`eval_owned_reindex_free`/the embed table)
+    /// long before this one, exactly as `round_trips_unchanged` below
+    /// already calls the bridge directly rather than through a CLI-level
+    /// repro.
+    #[test]
+    fn eval_on_owned_reports_cleanly_past_value_tree_depth_3261() {
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let result = eval_on_owned::<JqSemantics, crate::json::light::StandardJson<'_, Vec<u64>>>(
+            &Expr::Identity,
+            deep,
+            false,
+            Reentry::REBUILT,
+        );
+        match result {
+            GenericResult::Error(e) => {
+                assert_eq!(e.message, "nesting depth exceeds limit of 384");
+            }
+            other => panic!("expected a clean depth-limit error, got: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3261)"
+        }
+    }
+
     fn round_trips_unchanged<S: EvalSemantics>(value: &OwnedValue) -> bool {
-        let doc = value.reindexed::<S>();
+        let doc = value.reindexed::<S>().unwrap();
         let cursor = doc.root();
         let round_tripped = owned_from_standard_json::<S, _>(&cursor.value())
             .expect("the bridge's own serialization must reparse");

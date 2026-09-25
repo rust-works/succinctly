@@ -4227,7 +4227,16 @@ Three differences remain, all in the direction of erroring rather than aborting:
   limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
   1,200 levels; jq prints it, succinctly reports `nesting depth exceeds limit of 384` and
   exits 5. Before #1371 this shape could not recurse far enough to reach the ceiling at
-  all.
+  all. Between f2789080a (2026-08-29) and #3261, the guard's most commonly reached call
+  site -- `reduce`/`foreach`'s own per-iteration reindex bridge
+  (`OwnedValue::to_json_for_reindex`), which every ordinary evaluation of this shape
+  actually hits -- instead panicked uncaught (exit 101, no clean diagnostic), contradicting
+  this very entry; #3261 fixed the reindex bridge to pre-check depth and return a catchable
+  error instead. One call site still panics uncaught rather than exiting 5: `path()`'s
+  non-cursor-native walk (`eval.rs`'s `walk_path`/`step_into`, reached when a trailing
+  `Expr::Slice` routes around the cursor-native evaluator, #2061) hits the identical guard
+  and is deliberately left unfixed here, tracked separately as #3275 -- see
+  `test_path_non_cursor_native_deep_static_chain_panics_cleanly_not_stack_overflow_2058`.
 - **A self-recursive comma generator streams for thousands of elements, not
   indefinitely.** `def naturals: 0, (naturals|.+1); [limit(100000; naturals)]` errors
   (`naturals/0 exceeded maximum recursion depth`) somewhere between 10,000 and 20,000

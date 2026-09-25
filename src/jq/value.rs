@@ -3727,8 +3727,17 @@ impl OwnedValue {
     /// decimal spelling real yq gives *it* because its provenance is
     /// recorded upstream, at [`from_document_float`](Self::from_document_float),
     /// as a `NumberLiteral` that echoes verbatim below.
-    pub fn to_json_for_reindex<S: EvalSemantics>(&self) -> String {
-        self.to_json_for_reindex_at_depth::<S>(0)
+    /// Returns [`EvalError`] rather than panicking past
+    /// [`MAX_VALUE_TREE_DEPTH`] (#3261): `check_tree_depth`'s own allocation-
+    /// free walk shares [`to_json_for_reindex_at_depth`](Self::to_json_for_reindex_at_depth)'s
+    /// exact per-node depth semantics (both recurse into `Array`/`Object`
+    /// only, incrementing by one per level), so an `Ok` here guarantees that
+    /// function's own internal `assert_value_tree_depth` cannot fire
+    /// afterward -- a pre-flight check rather than threading `Result`
+    /// through the self-recursive formatter itself.
+    pub fn to_json_for_reindex<S: EvalSemantics>(&self) -> Result<String, EvalError> {
+        self.check_tree_depth()?;
+        Ok(self.to_json_for_reindex_at_depth::<S>(0))
     }
 
     /// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005) — see
@@ -3738,6 +3747,14 @@ impl OwnedValue {
     /// reindex bridge) are exactly the ones that grow a value one level
     /// deeper per loop iteration with no adversarial document involved, so
     /// it needs the same guard [`to_json`](Self::to_json) does.
+    ///
+    /// In practice this never fires (#3261): the only public entry point,
+    /// [`to_json_for_reindex`](Self::to_json_for_reindex), pre-checks the
+    /// identical depth condition via `check_tree_depth` and returns a
+    /// catchable [`EvalError`] before ever reaching this recursion. Kept as
+    /// a panicking backstop rather than removed, matching
+    /// [`to_json_at_depth`](Self::to_json_at_depth)'s own convention, in
+    /// case a future caller reaches this private function some other way.
     fn to_json_for_reindex_at_depth<S: EvalSemantics>(&self, depth: usize) -> String {
         assert_value_tree_depth(depth);
         match self {
@@ -3796,8 +3813,8 @@ impl OwnedValue {
     /// its index here means no call site can index bridge text as if it were
     /// a user document (which would read every NaN, infinity and computed
     /// float as `null`) -- nor the reverse, which is #3034.
-    pub fn reindexed<S: EvalSemantics>(&self) -> ReindexedDoc {
-        ReindexedDoc::new(self.to_json_for_reindex::<S>())
+    pub fn reindexed<S: EvalSemantics>(&self) -> Result<ReindexedDoc, EvalError> {
+        Ok(ReindexedDoc::new(self.to_json_for_reindex::<S>()?))
     }
 
     /// [`to_json_input_bridge`](Self::to_json_input_bridge)'s text, indexed
@@ -6422,7 +6439,7 @@ mod tests {
         assert_eq!(value.to_json_input_bridge(), value.to_json());
         assert!(value.to_json_input_bridge().contains(&long));
         assert_ne!(
-            value.to_json_for_reindex::<JqSemantics>(),
+            value.to_json_for_reindex::<JqSemantics>().unwrap(),
             value.to_json_input_bridge()
         );
     }
@@ -6462,11 +6479,15 @@ mod tests {
         for f in [1e20, 2.0, 1e10, -0.5] {
             let token = crate::json::validate::computed_float_token(f);
             assert_eq!(
-                OwnedValue::Float(f).to_json_for_reindex::<YqSemantics>(),
+                OwnedValue::Float(f)
+                    .to_json_for_reindex::<YqSemantics>()
+                    .unwrap(),
                 token
             );
             assert_eq!(
-                OwnedValue::Float(f).to_json_for_reindex::<JqSemantics>(),
+                OwnedValue::Float(f)
+                    .to_json_for_reindex::<JqSemantics>()
+                    .unwrap(),
                 token
             );
         }
@@ -6504,8 +6525,8 @@ mod tests {
         ];
         for (value, want) in cases {
             for json in [
-                value.to_json_for_reindex::<YqSemantics>(),
-                value.to_json_for_reindex::<JqSemantics>(),
+                value.to_json_for_reindex::<YqSemantics>().unwrap(),
+                value.to_json_for_reindex::<JqSemantics>().unwrap(),
             ] {
                 let round_tripped = read_as_bridge_text::<YqSemantics>(&json);
                 assert_eq!(format!("{round_tripped:?}"), *want, "{value:?} -> {json}");
@@ -6718,11 +6739,16 @@ mod tests {
         // must emit the reserved sentinel instead of falling back to
         // `to_json`'s "null" substitution (#472).
         assert_eq!(
-            OwnedValue::Float(f64::NAN).to_json_for_reindex::<JqSemantics>(),
+            OwnedValue::Float(f64::NAN)
+                .to_json_for_reindex::<JqSemantics>()
+                .unwrap(),
             NAN_SENTINEL
         );
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into());
-        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), NAN_SENTINEL);
+        assert_eq!(
+            lit.to_json_for_reindex::<JqSemantics>().unwrap(),
+            NAN_SENTINEL
+        );
     }
 
     /// #1083/#1087: the infinity sentinel must be as collision-safe as
@@ -6777,10 +6803,10 @@ mod tests {
     #[test]
     fn test_to_json_for_reindex_reuses_overflow_literal_text() {
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "123e400".into());
-        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), "123e400");
+        assert_eq!(lit.to_json_for_reindex::<JqSemantics>().unwrap(), "123e400");
 
         let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into());
-        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), "-1e400");
+        assert_eq!(lit.to_json_for_reindex::<JqSemantics>().unwrap(), "-1e400");
     }
 
     /// The internal bridge must not replace a long overflow literal with a
@@ -6792,8 +6818,14 @@ mod tests {
             NumberRepr::Float(f64::INFINITY),
             huge_literal.clone().into(),
         );
-        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), huge_literal);
-        assert_eq!(lit.to_json_for_reindex::<YqSemantics>(), huge_literal);
+        assert_eq!(
+            lit.to_json_for_reindex::<JqSemantics>().unwrap(),
+            huge_literal
+        );
+        assert_eq!(
+            lit.to_json_for_reindex::<YqSemantics>().unwrap(),
+            huge_literal
+        );
     }
 
     /// Preserve finite source text even at #1211's pathological length.
@@ -6802,8 +6834,14 @@ mod tests {
         let huge_zero_literal = format!("0.{}e-400", "0".repeat(200_000));
         let lit =
             OwnedValue::NumberLiteral(NumberRepr::Float(0.0), huge_zero_literal.clone().into());
-        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), huge_zero_literal);
-        assert_eq!(lit.to_json_for_reindex::<YqSemantics>(), huge_zero_literal);
+        assert_eq!(
+            lit.to_json_for_reindex::<JqSemantics>().unwrap(),
+            huge_zero_literal
+        );
+        assert_eq!(
+            lit.to_json_for_reindex::<YqSemantics>().unwrap(),
+            huge_zero_literal
+        );
     }
 
     #[test]
@@ -7856,14 +7894,13 @@ mod tests {
     /// #1005: a value built at query-evaluation time (e.g. a `reduce`
     /// accumulator growing one array level per iteration) has no adversarial
     /// *document* behind it, so #998's input-side guards never see it -
-    /// `to_json`/`to_json_for_reindex`/`==` must each independently refuse
-    /// to recurse past the same limit rather than overflow the stack.
+    /// `to_json`/`==` must each independently refuse to recurse past the
+    /// same limit rather than overflow the stack.
     #[test]
     fn to_json_panics_past_nesting_depth_limit_1005() {
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         // Under the limit: succeeds (doesn't panic).
         let _ = under.to_json();
-        let _ = under.to_json_for_reindex::<JqSemantics>();
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over.to_json()));
@@ -7871,13 +7908,27 @@ mod tests {
             result.is_err(),
             "to_json should panic at MAX_VALUE_TREE_DEPTH"
         );
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            over.to_json_for_reindex::<JqSemantics>()
-        }));
-        assert!(
-            result.is_err(),
-            "to_json_for_reindex should panic at MAX_VALUE_TREE_DEPTH"
-        );
+    }
+
+    /// #3261: unlike `to_json` above, `to_json_for_reindex` is reached from
+    /// `reduce`/`foreach`'s own per-iteration reindex bridge with no CLI
+    /// boundary in between to `catch_unwind` it -- so, since #1371's own
+    /// documented contract for this shape
+    /// (`docs/compliance/jq/limitations.md`) is a clean `nesting depth
+    /// exceeds limit of 384` diagnostic at exit 5, it must report an
+    /// `EvalError` instead of panicking. Before this fix it panicked
+    /// uncaught (exit 101) via the exact same assert `to_json` still uses.
+    #[test]
+    fn to_json_for_reindex_reports_clean_error_past_nesting_depth_limit_3261() {
+        let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        // Under the limit: succeeds.
+        assert!(under.to_json_for_reindex::<JqSemantics>().is_ok());
+
+        let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
+        let err = over
+            .to_json_for_reindex::<JqSemantics>()
+            .expect_err("to_json_for_reindex should report an error at MAX_VALUE_TREE_DEPTH");
+        assert_eq!(err.to_string(), "nesting depth exceeds limit of 384");
     }
 
     /// #1005: `==` recurses through a private depth-tracked helper instead

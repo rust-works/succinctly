@@ -8878,7 +8878,10 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     let expr = expr.as_ref();
     // Same round trip, and the same `to_json_for_reindex` reasoning (#561), as
     // `eval_owned_input`.
-    let doc = input.reindexed::<S>();
+    let doc = match input.reindexed::<S>() {
+        Ok(doc) => doc,
+        Err(error) => return Flow::Escaped(Control::Error(error)),
+    };
     let cursor = doc.root();
 
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
@@ -15921,7 +15924,10 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `reindexed`, not `to_json`: this round-trip is purely internal,
         // so an overflowed `NumberLiteral`/`Float` must keep its ±Infinity
         // rather than being silently substituted with JSON's `"null"` (#561).
-        let entry_doc = entry.reindexed::<S>();
+        let entry_doc = match entry.reindexed::<S>() {
+            Ok(doc) => doc,
+            Err(e) => return QueryResult::Error(e),
+        };
         let cursor = entry_doc.root();
 
         // #1755: to_owned, not to_owned_lossy -- an undecodable output
@@ -25319,10 +25325,17 @@ pub fn eval_documents_together<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Same throwaway document `eval_owned_input_bridge` builds, and the
     // same `to_json_for_reindex` (not `to_json`) for the same reason (#561) --
     // one per input document rather than one for a combined array.
-    let docs: Vec<Option<super::value::ReindexedDoc>> = documents
-        .iter()
-        .map(|(value, _, _)| reindex_bridge_is_identity(value).then(|| value.reindexed::<S>()))
-        .collect();
+    let mut docs: Vec<Option<super::value::ReindexedDoc>> = vec_with_capacity(documents.len());
+    for (value, _, _) in documents {
+        if reindex_bridge_is_identity(value) {
+            match value.reindexed::<S>() {
+                Ok(doc) => docs.push(Some(doc)),
+                Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable via --eval-all: every document here comes straight from parse_input, whose own MAX_NESTING_DEPTH (256) guard already rejects anything deep enough to reach MAX_VALUE_TREE_DEPTH (384) here -- confirmed live, a 300-level document fails parse_input's guard before ever reaching this reindex (#3261)"
+            }
+        } else {
+            docs.push(None);
+        }
+    }
     let inputs: Vec<YqDocument<_>> = documents
         .iter()
         .zip(&docs)
@@ -45662,7 +45675,7 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
     // internal, so an overflowed `NumberLiteral`/`Float` must keep its
     // ±Infinity rather than being silently substituted with "null" (#561).
-    let doc = input.reindexed::<S>();
+    let doc = input.reindexed::<S>().map_err(Control::Error)?;
 
     // We need to create a temporary index and cursor
     let cursor = doc.root();
@@ -45864,7 +45877,10 @@ fn eval_owned_input_bridge<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
     // internal, so an overflowed `NumberLiteral`/`Float` must keep its
     // ±Infinity rather than being silently substituted with "null" (#561).
-    let doc = input.reindexed::<S>();
+    let doc = match input.reindexed::<S>() {
+        Ok(doc) => doc,
+        Err(e) => return QueryResult::Error(e),
+    };
     let cursor = doc.root();
 
     detach_from_temp_document::<_, S>(eval_single::<Vec<u64>, S>(expr, cursor.value(), optional))
@@ -49012,7 +49028,10 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // Same throwaway document `eval_owned_input_bridge` builds, and the
     // same `to_json_for_reindex` (not `to_json`) for the same reason (#561).
-    let doc = owned.reindexed::<S>();
+    let doc = match owned.reindexed::<S>() {
+        Ok(doc) => doc,
+        Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable in the current test suite: eval_path_context_pipe_owned itself has zero total call-site coverage today (not just this arm), confirmed by a full-suite eprintln probe across every test binary -- reaching its error arm needs first solving how to reach the function at all, out of scope for #3261's reindex-bridge fix"
+    };
     let cursor = doc.root();
 
     let result =
@@ -69618,7 +69637,7 @@ mod tests {
         input: &OwnedValue,
         optional: bool,
     ) -> Result<Option<OwnedValue>, EvalError> {
-        let doc = input.reindexed::<JqSemantics>();
+        let doc = input.reindexed::<JqSemantics>()?;
         let cursor = doc.root();
         let result = match expr {
             Expr::Identity => QueryResult::One(cursor.value()),
@@ -69635,6 +69654,26 @@ mod tests {
             QueryResult::None => Ok(None),
             QueryResult::Error(e) => Err(e),
             other => panic!("unexpected result from via_cursor: {other:?}"),
+        }
+    }
+
+    /// #3261: `eval_owned_input_bridge`'s own reindex step -- reached
+    /// directly here since normal CLI dispatch routes a filter-driven-deep
+    /// value through `eval_each_owned`'s lazy bridge or an earlier fast
+    /// path long before this one, exactly as `via_cursor` above and the
+    /// bridge-agreement test below already call it directly rather than
+    /// through a CLI-level repro.
+    #[test]
+    fn eval_owned_input_bridge_reports_cleanly_past_value_tree_depth_3261() {
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        match eval_owned_input_bridge::<Vec<u64>, JqSemantics>(&Expr::Identity, &deep, false) {
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "nesting depth exceeds limit of 384");
+            }
+            other => panic!("expected a clean depth-limit error, got: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3261)"
         }
     }
 

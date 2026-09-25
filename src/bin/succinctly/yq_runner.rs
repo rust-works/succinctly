@@ -1727,7 +1727,21 @@ fn evaluate_input(
     sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
-    let doc = input.reindexed::<jq::JqSemantics>();
+    let doc = match input.reindexed::<jq::JqSemantics>() {
+        Ok(doc) => doc,
+        // #3261: report and yield nothing, exactly as `query_result_to_owned_values`'s
+        // own `QueryResult::Error` arm does for a failure surfacing further downstream.
+        //
+        // Unreachable via any real yq CLI document-input path: every document
+        // reaching this function was already parsed by `parse_input`, whose YAML/JSON
+        // reader rejects anything past its own depth-128 guard -- confirmed live, a
+        // 300-level document fails at parse time with "nesting depth exceeds limit of
+        // 128" before ever reaching this reindex (#3261).
+        Err(e) => {
+            sink.report(DiagStyle::Yq, &e, &no_location()); // omni-dev: coverage tolerate-line reason="unreachable: see the block comment above this arm"
+            return Ok(Vec::new()); // omni-dev: coverage tolerate-line reason="unreachable: see the block comment above this arm"
+        } // omni-dev: coverage tolerate-line reason="unreachable: see the block comment above this arm"
+    };
 
     // Build index and evaluate
     let cursor = doc.root();
@@ -3368,7 +3382,7 @@ fn owned_value_at_mut<'v>(
 /// stages the real evaluation is about to run anyway -- whatever fails
 /// there is reported *there*, once, not a second time here.
 fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<OwnedValue>> {
-    let doc = input.reindexed::<jq::JqSemantics>();
+    let doc = input.reindexed::<jq::JqSemantics>().ok()?;
     let cursor = doc.root();
     match jq::eval::<Vec<u64>, YqSemantics>(expr, cursor) {
         QueryResult::One(v) => generic_to_owned::<YqSemantics, _>(&v).ok().map(|v| vec![v]),
