@@ -31163,10 +31163,17 @@ fn test_reduce_growth_past_value_tree_depth_reports_cleanly_3261() -> Result<()>
     Ok(())
 }
 
-/// #3261 sibling: `with_entries(f)` (`builtin_with_entries`) re-indexes each
-/// entry's *value* independently via the same reindex bridge -- a distinct
-/// call site from the bare-filter case above, reached only when the field
-/// value itself (not the whole document) grows past the limit.
+/// #3261 sibling: a `with_entries(f)` pipeline over a field that grows past
+/// the limit also reports cleanly. Despite `builtin_with_entries` having its
+/// own `entry.reindexed::<S>()` call, this filter's failure is actually
+/// caught one step earlier -- converting the freshly-constructed `{a:
+/// deep}` object into the cursor `with_entries` requires reindexes the
+/// *whole* object first, and that whole-object reindex is strictly deeper
+/// than any single field's own re-reindex could be once extracted, so it
+/// always fails first. Kept as a real pipeline-level regression test
+/// despite not pinning `builtin_with_entries`'s own arm specifically --
+/// that arm's own tolerate-line annotation (`eval.rs`) explains why no
+/// input can reach it independently.
 #[test]
 fn test_with_entries_entry_value_past_depth_limit_reports_cleanly_3261() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(

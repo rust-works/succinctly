@@ -15926,7 +15926,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // rather than being silently substituted with JSON's `"null"` (#561).
         let entry_doc = match entry.reindexed::<S>() {
             Ok(doc) => doc,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable: entry is one of to_entries's already-materialized {key,value} pairs, so its depth here is provably no deeper than whatever earlier check let it exist -- a document-decoded entry is already <256 deep (MAX_NESTING_DEPTH, stricter than this 384 guard), and a filter-constructed one already survived becoming a cursor via its own whole-object reindex, which is strictly deeper than any single field extracted from it could be (unwrapping only reduces depth); confirmed live, {a: (reduce range(400) as $i (0; [.]))} | with_entries(.) fails one step earlier at the whole-object bridge, never here (#3261)"
         };
         let cursor = entry_doc.root();
 
