@@ -8323,14 +8323,14 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
 /// would use, which keeps each element's `Rc` (a clone of an
 /// `Rc`-backed container is a refcount bump).
 ///
-/// **Diverting is gated on the outcome, not on the shape.** The native
-/// result is taken only when the embed table recognizes it as a node's own
-/// value; anything else -- a computed number, a fold that raised, a scalar
-/// or non-container input, no binding in scope at all -- answers `None` and
-/// takes the bridge exactly as before. So this can never change *what* is
-/// produced anywhere: the only values it diverts are ones the bridge would
-/// have rebuilt from the same node, and the only difference is that they
-/// arrive still sharing that node's storage.
+/// **For `add`/`min`/`max`, diverting is gated on the outcome, not on the
+/// shape.** The native result is taken only when the embed table recognizes
+/// it as a node's own value; anything else -- a computed number, a fold
+/// that raised, a scalar or non-container input, no binding in scope at all
+/// -- answers `None` and takes the bridge exactly as before. So these can
+/// never change *what* is produced: the only values they divert are ones
+/// the bridge would have rebuilt from the same node, and the only
+/// difference is that they arrive still sharing that node's storage.
 ///
 /// Called from *both* owned re-entries: `eval_generic::eval_on_owned` and
 /// [`eval_each_owned`] (#2889 review). Only the generic one had it at
@@ -8340,11 +8340,21 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
 /// so `[.,.] | max`, `[null,.] | add` and `{a:.} | add` all bridged and
 /// refused where jq answers `[]`.
 ///
-/// Scoped to these three builtins on purpose. `sort`/`unique`/`reverse`/
-/// `to_entries` relocate their elements in jq too, and `. as $x | [.] |
-/// sort | .[0] | path($x)` is `[]` there, but each needs its own
-/// owned-container implementation to stay bug-for-bug with the bridged
-/// one; they stay refuse-only residuals of this pass (#2889).
+/// #3178 widened it to the builtins that relocate *elements* rather than
+/// answering one: `sort`, `unique`, `reverse` and `to_entries` build a new
+/// container around their input's own children in jq, so `. as $x | [.] |
+/// sort | .[0] | path($x)` is `[]` there, and `getpath` with a literal path
+/// answers a node like `add` does. Each runs the bridged builtin's own
+/// calls (`compare_values`'s stable sort, `owned_value_eq`'s dedup of the
+/// first of each equal run, [`owned_to_entries`]) over the cloned children,
+/// so the output is the bridge's, value for value; only the children's
+/// storage differs. The container arms are gated on shape instead: some
+/// child already witnessed ([`any_child_witnessed`]), then a new container
+/// the bridge would also have built. That is *not* the outcome gate's
+/// guarantee -- value parity rests on each arm running the bridged
+/// builtin's own calls, so an arm added here needs that parity checked
+/// against the bridge, not assumed. `getpath` answers a node and takes the
+/// outcome gate.
 pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -8357,9 +8367,11 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     // solitary `max` arrives here as `Expr::Pipe([max])`. Unwrapped for the
     // same reason `eval_owned_fast_path` unwraps it; a pipe with an actual
     // tail is [`embed_peel_step`]'s business, not this function's.
-    let expr = match expr {
+    // Parentheses are spelling, as in [`embed_peel_step`]: the generic
+    // re-entry hands `(sort)` over as one `Expr::Paren`.
+    let expr = match unwrap_paren(expr) {
         Expr::Pipe(stages) => match stages.as_slice() {
-            [only] => only,
+            [only] => unwrap_paren(only),
             _ => return None,
         },
         other => other,
@@ -8367,6 +8379,16 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     let Expr::Builtin(builtin) = expr else {
         return None;
     };
+    match builtin {
+        Builtin::Sort | Builtin::Unique | Builtin::Reverse | Builtin::ToEntries => {
+            return relocate_elements::<S>(builtin, input)
+        }
+        Builtin::GetPath(path) => {
+            let found = owned_literal_getpath::<S>(path, input)?;
+            return embed_witnessed(found).then(|| found.clone());
+        }
+        _ => {}
+    }
     // `add` iterates an object's values as readily as an array's elements
     // (`builtin_add`'s own `Object` arm, #422); `min`/`max` take arrays
     // only, and their scalar/object diagnostics stay the bridge's.
@@ -8380,19 +8402,14 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     // `[1,2,3] | add` declines here, before a single clone. It also
     // subsumes the empty-container check: an `any` over no elements is
     // false.
+    if !any_child_witnessed(input) {
+        return None;
+    }
     let items: Vec<OwnedValue> = match (builtin, input) {
         (Builtin::Add | Builtin::Min | Builtin::Max, OwnedValue::Array(items)) => {
-            if !items.iter().any(embed_witnessed) {
-                return None;
-            }
             items.iter().cloned().collect()
         }
-        (Builtin::Add, OwnedValue::Object(map)) => {
-            if !map.values().any(embed_witnessed) {
-                return None;
-            }
-            map.values().cloned().collect()
-        }
+        (Builtin::Add, OwnedValue::Object(map)) => map.values().cloned().collect(),
         _ => return None,
     };
     let result = match builtin {
@@ -8416,6 +8433,86 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
         return None;
     }
     Some(result)
+}
+
+/// [`eval_owned_relocating_fold`]'s container arms (#3178): the bridged
+/// builtin's own result, built from `input`'s cloned children. `None` unless
+/// the input is the container kind the builtin accepts here and some child
+/// is already witnessed; every other input takes the bridge, which keeps
+/// its own diagnostics.
+fn relocate_elements<S: EvalSemantics>(
+    builtin: &Builtin,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if !any_child_witnessed(input) {
+        return None;
+    }
+    match (builtin, input) {
+        (Builtin::ToEntries, _) => owned_to_entries(input),
+        (Builtin::Sort | Builtin::Unique | Builtin::Reverse, OwnedValue::Array(items)) => {
+            let mut items: Vec<OwnedValue> = items.iter().cloned().collect();
+            if matches!(builtin, Builtin::Reverse) {
+                items.reverse();
+            } else {
+                items.sort_by(compare_values::<S>);
+                if matches!(builtin, Builtin::Unique) {
+                    items.dedup_by(|a, b| owned_value_eq::<S>(a, b));
+                }
+            }
+            Some(OwnedValue::array_from(items))
+        }
+        _ => None,
+    }
+}
+
+/// The node `getpath(P)` reaches in `input` when `P` is a literal path
+/// (#3178), read the way the bridged `getpath` reads it: a string key into
+/// an object, a number into an array through [`resolve_read_index`] (jq's
+/// truncation and negative-index rules). `None` for a missing step, a type
+/// mismatch or a non-array path, all of which the bridge answers with its
+/// own value or diagnostic.
+fn owned_literal_getpath<'v, S: EvalSemantics>(
+    path: &Expr,
+    input: &'v OwnedValue,
+) -> Option<&'v OwnedValue> {
+    let OwnedValue::Array(components) = closed_expr_to_owned::<S>(path)? else {
+        return None;
+    };
+    components
+        .iter()
+        .try_fold(input, |node, component| match (node, component) {
+            (OwnedValue::Object(map), OwnedValue::String(key)) => map.get(key),
+            (OwnedValue::Array(items), key) => items.get(resolve_read_index(key, items.len())?),
+            _ => None,
+        })
+}
+
+/// The builtins [`eval_owned_relocating_fold`] may answer, as a whole
+/// re-entered expression or as a pipe stage [`embed_peel_step`] takes. One
+/// list for both, and for [`leads_with_a_peelable_step`].
+fn is_relocating_builtin(builtin: &Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Add
+            | Builtin::Min
+            | Builtin::Max
+            | Builtin::Sort
+            | Builtin::Unique
+            | Builtin::Reverse
+            | Builtin::ToEntries
+            | Builtin::GetPath(_)
+    )
+}
+
+/// Whether some direct child of an array or object is a node an in-scope
+/// binding holds: the pre-gate every relocating arm scans before cloning
+/// anything (#3178). `false` for a scalar or an empty container.
+fn any_child_witnessed(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Array(items) => items.iter().any(embed_witnessed),
+        OwnedValue::Object(map) => map.values().any(embed_witnessed),
+        _ => false,
+    }
 }
 
 /// Whether `value` still *is* a node an in-scope binding holds -- the
@@ -8769,6 +8866,7 @@ fn peeled_children_need_no_index(rest: &Expr) -> bool {
 fn leads_with_a_peelable_step(expr: &Expr) -> bool {
     match expr {
         Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
+        Expr::Builtin(builtin) => is_relocating_builtin(builtin),
         Expr::Pipe(stages) => stages.first().is_some_and(leads_with_a_peelable_step),
         _ => false,
     }
@@ -8933,20 +9031,13 @@ fn embed_peel_step<S: EvalSemantics>(
                 .first()
                 .is_some_and(|next| !peeled_children_need_no_index(next)) =>
         {
+            if !any_child_witnessed(input) {
+                return None;
+            }
             match input {
-                OwnedValue::Array(items) => {
-                    if !items.iter().any(embed_witnessed) {
-                        return None;
-                    }
-                    Ok(items.iter().cloned().collect())
-                }
-                OwnedValue::Object(map) => {
-                    if !map.values().any(embed_witnessed) {
-                        return None;
-                    }
-                    Ok(map.values().cloned().collect())
-                }
-                _ => return None,
+                OwnedValue::Array(items) => Ok(items.iter().cloned().collect()),
+                OwnedValue::Object(map) => Ok(map.values().cloned().collect()),
+                _ => return None, // omni-dev: coverage tolerate-line reason="unreachable: any_child_witnessed is false for every non-container, checked just above (#3178)"
             }
         }
         Expr::Iterate => match input {
@@ -8956,11 +9047,16 @@ fn embed_peel_step<S: EvalSemantics>(
         },
         // `add`/`min`/`max` as a pipe *stage*, not as the whole expression:
         // the same relocation `eval_generic::eval_on_owned` takes, which
-        // only ever saw the whole-expression spelling. Its own outcome gate
-        // is the payoff test here -- strictly stronger than the witness
-        // scans above, since it asks whether the *answer* is an embed --
-        // so this arm needs none of its own.
-        Expr::Builtin(Builtin::Add | Builtin::Min | Builtin::Max) => {
+        // only ever saw the whole-expression spelling. Its own gates are
+        // the payoff test here -- an outcome gate for the builtins that
+        // answer a node, a witnessed-child pre-gate for the ones that
+        // rebuild a container -- so this arm needs none of its own.
+        //
+        // #3178: the builtins that relocate elements (`sort`, `unique`,
+        // `reverse`, `to_entries`) and a literal `getpath` take the same
+        // route. Their container arms are pre-gated on a witnessed child
+        // rather than on the answer; see [`eval_owned_relocating_fold`].
+        Expr::Builtin(builtin) if is_relocating_builtin(builtin) => {
             Ok(vec![eval_owned_relocating_fold::<S>(first, input)?])
         }
         _ => return None,
@@ -9134,34 +9230,7 @@ pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
             }
             Some(Ok(current))
         }
-        Expr::Builtin(Builtin::ToEntries) => match input {
-            OwnedValue::Object(fields) => {
-                let entries = fields
-                    .iter()
-                    .map(|(key, value)| {
-                        OwnedValue::object_from([
-                            ("key".to_string(), OwnedValue::String(key.clone())),
-                            ("value".to_string(), value.clone()),
-                        ])
-                    })
-                    .collect();
-                Some(Ok(OwnedValue::array_from(entries)))
-            }
-            OwnedValue::Array(items) => {
-                let entries = items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, value)| {
-                        OwnedValue::object_from([
-                            ("key".to_string(), OwnedValue::Int(i as i64)),
-                            ("value".to_string(), value.clone()),
-                        ])
-                    })
-                    .collect();
-                Some(Ok(OwnedValue::array_from(entries)))
-            }
-            _ => None,
-        },
+        Expr::Builtin(Builtin::ToEntries) => owned_to_entries(input).map(Ok),
         Expr::Builtin(Builtin::FromEntries) => {
             let entries: Vec<OwnedValue> = match input {
                 OwnedValue::Array(items) => items.iter().cloned().collect(),
@@ -9181,6 +9250,32 @@ pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
         }
         _ => None,
     }
+}
+
+/// `to_entries` over an owned object or array, each value cloned into its
+/// entry -- a refcount bump for a container, so an entry's `value` is the
+/// very node it came from, as in jq. `None` for anything else, whose
+/// diagnostics stay the evaluator's.
+fn owned_to_entries(input: &OwnedValue) -> Option<OwnedValue> {
+    let entry = |key: OwnedValue, value: &OwnedValue| {
+        OwnedValue::object_from([
+            ("key".to_string(), key),
+            ("value".to_string(), value.clone()),
+        ])
+    };
+    let entries: Vec<OwnedValue> = match input {
+        OwnedValue::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| entry(OwnedValue::String(key.clone()), value))
+            .collect(),
+        OwnedValue::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, value)| entry(OwnedValue::Int(i as i64), value))
+            .collect(),
+        _ => return None,
+    };
+    Some(OwnedValue::array_from(entries))
 }
 
 fn owned_step_shape(expr: &Expr) -> bool {
@@ -36701,8 +36796,8 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
 /// and a value built afresh shares nothing, so `. as $x | [{"a":1}] |
 /// path(.[0] | $x)` and `[.,{a:1}] | path(.[1] | $x)` refuse here as they
 /// do there. The converse is the residual direction: where succinctly
-/// bridges before the resolver runs (`[.] | sort | path(.[0] | $x)`, `{k:.}
-/// | to_entries | path(.[0].value | $x)` -- the stage ahead of `path()`
+/// bridges before the resolver runs (`{k:.} | with_entries(.) | path(.k |
+/// $x)`, `[.] | .[0] |= . | path(.[0] | $x)` -- the stage ahead of `path()`
 /// crosses `eval_on_owned`'s round trip), every node is a fresh copy and
 /// the clause is false where jq's pointer equality answers `[0]`; recorded
 /// in `docs/compliance/jq/limitations.md`. Scalars are not `Rc`-backed and

@@ -63975,28 +63975,10 @@ fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
         ),
         // A stage ahead of `path()` that folds through `eval_on_owned`'s
         // round trip hands the resolver fresh copies. jq answers every one:
-        // its `sort`/`to_entries`/`add`/`setpath` move the element's own
-        // `jv` into the new container.
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | sort | path(.[0] | $x)",
-            "`sort` ahead of `path()` bridges first (jq `[0]`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | reverse | path(.[0] | $x)",
-            "`reverse` ahead of `path()` bridges first (jq `[0]`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | unique | path(.[0] | $x)",
-            "`unique` ahead of `path()` bridges first (jq `[0]`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | {k:.} | to_entries | path(.[0].value | $x)",
-            "`to_entries` ahead of `path()` bridges first (jq `[0,\"value\"]`)",
-        ),
+        // its `with_entries`/`add`/`setpath` move the element's own `jv`
+        // into the new container. (`sort`/`reverse`/`unique`/`to_entries`
+        // relocate natively since #3178 -- see
+        // `test_owned_embed_identity_through_relocating_builtins_3178`.)
         (
             r#"{"a":1}"#,
             r". as $x | {k:.} | with_entries(.) | path(.k | $x)",
@@ -64030,6 +64012,246 @@ fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
         ("", 0),
         "#3177 residual: stderr={stderr:?}"
     );
+    Ok(())
+}
+
+/// #3178: `sort`, `unique`, `reverse` and `to_entries` build their result
+/// from their input's own children in jq, and a literal `getpath` answers a
+/// node, so an embed of `$x` keeps its identity through them. Every
+/// expected output captured live against jq 1.7.1.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_owned_embed_identity_through_relocating_builtins_3178() -> Result<()> {
+    for (args, input, filter, expected) in [
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [.] | sort | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [.] | unique | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [.] | reverse | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | {k:.} | to_entries | .[0].value | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [.] | to_entries | .[0].value | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r#". as $x | {k:.} | getpath(["k"]) | path($x)"#,
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r#". as $x | {k:{j:.}} | getpath(["k","j"]) | path($x)"#,
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [.] | getpath([-1]) | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [.] | sort | path(.[0] | $x)",
+            "[0]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | {k:.} | to_entries | path(.[0].value | $x)",
+            r#"[0,"value"]"#,
+        ),
+        // Which of two equal elements is the node is jq's own: `sort` is
+        // stable, `unique` keeps the first of each equal run.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r#". as $x | [., {"a":1}] | sort | .[0] | path($x)"#,
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r#". as $x | [{"a":1}, .] | sort | .[1] | path($x)"#,
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r#". as $x | [., {"a":1}] | unique | .[0] | path($x)"#,
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r#". as $x | [{"a":0}, .] | reverse | .[0] | path($x)"#,
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r#". as $x | [.,{"b":2},3,null] | sort | .[2] | path($x)"#,
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | {k:.} | to_entries | .[0].value | ($x.a) = 5",
+            r#"{"a":5}"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [.] | sort | del(.[0] | $x)",
+            "[]",
+        ),
+        // The input-queue route (`-n` with `input`) relocates too.
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1} {"a":1}"#,
+            r"input | . as $x | {k:.} | .k | getpath([]) | path($x)",
+            "[]",
+        ),
+        // Reached after a navigation that lands short of the embed, and as a
+        // parenthesised stage.
+        (
+            &["-c"][..],
+            r#"{"a":[1]}"#,
+            r". as $x | {k:[.]} | .k | sort | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":[1]}"#,
+            r". as $x | {k:[.]} | .k | getpath([0]) | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":[1]}"#,
+            r". as $x | [.] | (sort) | path(.[0] | $x)",
+            "[0]",
+        ),
+        // `getpath` reads a fractional index the way jq does, by truncation.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [.] | getpath([0.5]) | path($x)",
+            "[]",
+        ),
+        // With a bind in scope but no child witnessed, each builtin still
+        // takes its ordinary route.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [3,1] | sort",
+            "[1,3]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | {k:.} | getpath([])",
+            r#"{"k":{"a":1}}"#,
+        ),
+        // The values themselves are the bridged builtins' own.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r#". as $x | [.,{"b":2},3,null,.] | unique"#,
+            r#"[null,3,{"a":1},{"b":2}]"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | {k:.,j:[1]} | to_entries",
+            r#"[{"key":"k","value":{"a":1}},{"key":"j","value":[1]}]"#,
+        ),
+    ] {
+        let mut argv = args.to_vec();
+        argv.push(filter);
+        let (stdout, stderr, code) = run_jq_full(&argv, Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3178: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    // A value-equal copy is a different node, and jq refuses it: the other
+    // side of each tie-break above, a `getpath` that misses, and a scalar,
+    // which is not `Rc`-backed and so shares no storage (#3182).
+    for (input, filter) in [
+        (
+            r#"{"a":1}"#,
+            r#". as $x | [{"a":1}, .] | sort | .[0] | path($x)"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#". as $x | [., {"a":1}] | sort | .[1] | path($x)"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#". as $x | [{"a":1}, .] | unique | .[0] | path($x)"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#". as $x | {k:.} | getpath(["z"]) | path($x)"#,
+        ),
+        (r#"{"a":1}"#, r". as $x | [.] | getpath([5]) | path($x)"),
+        ("1", r". as $x | [.] | sort | .[0] | path($x)"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3178: `{filter}` must stay refused: stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3178: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    // A non-array path, a key of the wrong kind, and `to_entries` on a
+    // scalar keep the bridge's own diagnostics.
+    for (filter, message) in [
+        (
+            r#". as $x | {k:.} | getpath("k")"#,
+            "Path must be specified as an array",
+        ),
+        (
+            r". as $x | [.] | getpath([null])",
+            "Cannot index array with null",
+        ),
+        (r"[5] | .[0] | to_entries", "has no keys"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "#3178: `{filter}`");
+        assert!(
+            stderr.contains(message),
+            "#3178: `{filter}`: stderr={stderr:?}"
+        );
+    }
     Ok(())
 }
 
@@ -65615,8 +65837,8 @@ fn test_owned_embed_keeps_node_identity_on_the_input_bridge_2889() -> Result<()>
 ///   `StandardJson` retains, and `{}`/`[]` retain none. The generic
 ///   evaluator, which is handed a real cursor, does answer these -- the one
 ///   place the two routes still disagree, and in the safe direction.
-/// - `[... | path($x)]` and `... | getpath([]) | path($x)` put a further
-///   re-entry between the embed and the read, which carries no witness.
+/// - `[... | path($x)]` puts a further re-entry between the embed and the
+///   read, which carries no witness.
 #[test]
 // jq filter literals are not formatting strings.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -65640,15 +65862,11 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         // it too, so this is the one place the two routes still differ.
         (r"{}", r"input | . as $x | {k:.} | .k | path($x)"),
         (r"[]", r"input | . as $x | {k:.} | .k | path($x)"),
-        // Collecting the pipe into an array, or passing the embedded node
-        // through `getpath([])` first, puts a re-entry between the embed and
-        // the read that carries no witness. jq answers both; the bare twins
-        // of both are recovered above.
+        // Collecting the pipe into an array puts a re-entry between the
+        // embed and the read that carries no witness. jq answers it; the
+        // bare twin is recovered above. (`getpath([])` in the same place
+        // relocates natively since #3178.)
         (r#"{"a":1}"#, r"[input | . as $x | {k:.} | .k | path($x)]"),
-        (
-            r#"{"a":1}"#,
-            r"input | . as $x | {k:.} | .k | getpath([]) | path($x)",
-        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
         assert_eq!(
