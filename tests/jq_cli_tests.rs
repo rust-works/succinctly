@@ -30668,6 +30668,10 @@ fn test_eager_link_stays_lazy_over_an_effect_3287() -> Result<()> {
             "def f(n): if n == 0 then n else f(n - 1 | .) end; [limit(1; f(1, 2))]",
             "[0]",
         ),
+        // Review: a `,` of costly alternatives stays lazy, so `first` never
+        // pays for the one it does not ask for. `debug` stands in for the
+        // cost, observable where time is not.
+        ("def g(n): first(n); def c: 2 | debug | . + 1; g(1, c)", "1"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");

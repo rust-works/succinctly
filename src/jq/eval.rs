@@ -61576,12 +61576,14 @@ pub(crate) fn settles_before_consumer(expr: &Expr) -> bool {
 ///
 /// The lazy path costs an argument-chain link ~70x the native stack of the
 /// eager one, and a recursion reads its whole chain on top of its own frames,
-/// so a link that is not bare arithmetic -- `f(n - 1 | .)`, a nested `def h: n
-/// - 1; f(h)`, a helper `f(g(n))` -- capped recursion at ~115-155 levels where
-/// jq runs 100,000. Laziness is observable only for an argument that runs an
+/// so a link that is not bare arithmetic -- `f(n - 1 | .)`, a nested
+/// `def h: n - 1; f(h)`, a helper `f(g(n))` -- capped recursion at ~115-155
+/// levels where jq runs 100,000. Laziness is observable only for an argument that runs an
 /// effect or produces unboundedly many outputs, so an argument built from
-/// [`single_valued_pure`]'s whitelist -- plus `,` of such, which is finite --
-/// may be evaluated eagerly, `def` calls included.
+/// [`single_valued_pure`]'s whitelist -- plus `,` of constant-cost
+/// alternatives -- may be evaluated eagerly, `def` calls included. A `,` of
+/// anything costlier stays lazy: reading the argument would evaluate every
+/// alternative, including ones an early-stopping consumer never asks for.
 ///
 /// An argument read *inside* the argument (the previous level's `n`) counts by
 /// its own answer, remembered on its [`SharedArg`]: descending into it would
@@ -61606,8 +61608,8 @@ const SETTLE_ANALYSIS_BUDGET: u32 = 1024;
 
 /// The state [`single_valued_pure`] threads through its walk: the node budget
 /// left, and whether it is classifying an argument for [`is_eager_arg`] --
-/// where a nested `Shared` counts by its own remembered answer and a finite
-/// `,` is admitted -- or an operand for [`settles_before_consumer`], which
+/// where a nested `Shared` counts by its own remembered answer and a `,` of
+/// constant-cost alternatives is admitted -- or an operand for [`settles_before_consumer`], which
 /// must be single-valued and walks into every `Shared`.
 struct PureWalk {
     budget: u32,
@@ -61654,7 +61656,13 @@ fn single_valued_pure(
         // An argument captured in the caller's scope: the definition being
         // analysed, if any, has no bearing on what it names.
         Expr::Shared(inner) if walk.for_eager_arg => is_eager_arg(inner).then_some(false),
-        Expr::Comma(items) if walk.for_eager_arg => all_single_valued_pure(items, within, walk),
+        // Every alternative is evaluated when the argument is read, including
+        // ones a `first`/`limit` consumer never asks for, so `,` is eager only
+        // over alternatives that cost nothing to produce: `g(1, (27 | fib))`
+        // must not run `fib` for a `first(n)` (#3287 review).
+        Expr::Comma(items) if walk.for_eager_arg && items.iter().all(is_constant_cost) => {
+            Some(false)
+        }
         Expr::Shared(inner) => single_valued_pure(inner, None, walk),
         Expr::DefCall { def, args, .. } => {
             all_single_valued_pure(args, within, walk)?;
@@ -61672,6 +61680,18 @@ fn single_valued_pure(
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Whether `expr` produces its one output in constant time, with no effect:
+/// the alternatives [`is_eager_arg`] lets a `,` evaluate unasked.
+fn is_constant_cost(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Literal(_) | Expr::Field(_) | Expr::Var(_) | Expr::TrackedVar(_) => {
+            true
+        }
+        Expr::Paren(inner) | Expr::Negate(inner) => is_constant_cost(inner),
+        _ => false,
     }
 }
 
@@ -72263,13 +72283,15 @@ mod tests {
             );
         }
 
-        // Neither: effects and generators stay lazy.
+        // Neither: effects, generators, and a `,` whose alternatives cost
+        // more than a constant to produce.
         for src in [
             "1, (\"B\" | stderr)",
             ".[]",
             "range(3)",
             "debug",
             "error(\"x\")",
+            "1, (1 + 2)",
         ] {
             let expr = parse(src).unwrap();
             assert!(!eager(&expr), "{src:?} must stay lazy");
