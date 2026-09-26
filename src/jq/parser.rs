@@ -2503,54 +2503,70 @@ impl<'a> Parser<'a> {
                             if self.mode == ParserMode::Jq
                                 && !matches!(repr, NumberRepr::Int(n) if crate::jq::eval::jq_int_within_exact_f64_range(n)) =>
                         {
-                            // Multiply rather than subtract from zero:
-                            // `0.0 - 0.0` is IEEE-754 positive zero,
-                            // silently losing the sign of `-0.0`/`-0e0`
-                            // (jq itself prints `-0` for these); `-1.0 *
-                            // 0.0` correctly preserves it. (Plain integer
-                            // `0` never reaches this arm at all -- it's
-                            // exactly in range -- so its own already-correct
-                            // literal-echo of `-0` is untouched.)
-                            //
-                            // #1062: for `Float`, `repr` is `text`'s
-                            // (negative) parsed value, so the split-off
-                            // literal's repr is `-repr` (the positive
-                            // magnitude), not a re-parse. For `Int` (#3044:
-                            // now reachable here, past `2^53`), the same
-                            // negation can overflow `i64` for exactly one
-                            // value -- `i64::MIN`, whose positive magnitude
-                            // (`2^63`) doesn't fit `i64` -- so that one case
-                            // falls back to `jq_literal_int_to_f64` instead,
-                            // the same function `arith_negate`'s own
-                            // out-of-range arm calls, rather than a second,
-                            // independently-written cast that would only
-                            // coincidentally agree with it (it does today,
-                            // since `2^63` sits on a rounding-boundary
-                            // no-op, but nothing would keep the two in sync
-                            // if that function's rounding rule ever
-                            // changed). `jq_literal_int_to_f64` is
-                            // documented sign-symmetric, so negating its
-                            // result on the original (negative) `n` gives
-                            // the positive magnitude directly, with no
-                            // separate positive-side call needed. Every
-                            // other `Int` negates exactly via `checked_neg`.
-                            let stripped_repr = match repr {
-                                NumberRepr::Int(n) => match n.checked_neg() {
-                                    Some(positive) => NumberRepr::Int(positive),
-                                    None => NumberRepr::Float(
-                                        -crate::jq::value::jq_literal_int_to_f64(n),
-                                    ),
-                                },
-                                NumberRepr::Float(f) => NumberRepr::Float(-f),
-                            };
-                            Ok(Expr::Arithmetic {
-                                op: ArithOp::Mul(MergeFlags::default()),
-                                left: Box::new(Expr::Literal(Literal::Int(-1))),
-                                right: Box::new(Expr::Literal(Literal::NumberLiteral(
-                                    stripped_repr,
-                                    text[1..].to_string(),
+                            match repr {
+                                // #3075: an `Int` repr only ever reaches this
+                                // arm once its magnitude is past
+                                // `jq_int_within_exact_f64_range` (an in-range
+                                // `Int` fails the guard above and falls to
+                                // the plain-literal arm below) -- so
+                                // `arith_mul`'s rounding for the `-1 * n`
+                                // split below is fully determined right here,
+                                // at parse time: `jq_checked_int_arith`
+                                // always takes its float branch for this
+                                // magnitude, multiplying
+                                // `jq_literal_int_to_f64` of each operand
+                                // (`-1` and `n`'s positive magnitude, from
+                                // `checked_neg`/the `i64::MIN` fallback
+                                // below). Negating a negation cancels, so
+                                // that product is simply
+                                // `jq_literal_int_to_f64(n)` on the original,
+                                // still-negative `n` -- sign-symmetric per
+                                // that function's own doc, so no
+                                // `checked_neg`/positive-magnitude detour is
+                                // needed here at all (`i64::MIN` needs no
+                                // special case, since `n` is used exactly as
+                                // parsed). Fold straight to the
+                                // already-known `Literal::Float` instead of
+                                // leaving a runtime `Arithmetic::Mul` node
+                                // that re-derives the same value on every
+                                // evaluation of this AST node (e.g. once per
+                                // iteration of
+                                // `range(0;1000000) | -869389897822472004`).
+                                NumberRepr::Int(n) => Ok(Expr::Literal(Literal::Float(
+                                    crate::jq::value::jq_literal_int_to_f64(n),
                                 ))),
-                            })
+                                // #1035: a `Float` repr reaches this arm at
+                                // *any* magnitude, not just out-of-range --
+                                // e.g. plain `-1.0`/`-1e2` -- because jq's
+                                // grammar always destroys a negative float's
+                                // literal-echo fidelity, regardless of size.
+                                // `fold_index_key` below still needs to see
+                                // through this exact `-1 * <literal>` shape
+                                // to keep a negative float/exponent index or
+                                // slice bound on its static
+                                // `Expr::Index`/`Expr::Slice` fast path
+                                // (`test_1035_negative_float_index_and_slice_bound_still_fold_to_static`),
+                                // so #3075's fold above is deliberately not
+                                // extended to this sub-case -- it stays the
+                                // pre-#3075 split, unchanged.
+                                //
+                                // Multiply rather than subtract from zero:
+                                // `0.0 - 0.0` is IEEE-754 positive zero,
+                                // silently losing the sign of `-0.0`/`-0e0`
+                                // (jq itself prints `-0` for these); `-1.0 *
+                                // 0.0` correctly preserves it. `repr` is
+                                // `text`'s (negative) parsed value, so the
+                                // split-off literal's repr is `-repr` (the
+                                // positive magnitude), not a re-parse.
+                                NumberRepr::Float(f) => Ok(Expr::Arithmetic {
+                                    op: ArithOp::Mul(MergeFlags::default()),
+                                    left: Box::new(Expr::Literal(Literal::Int(-1))),
+                                    right: Box::new(Expr::Literal(Literal::NumberLiteral(
+                                        NumberRepr::Float(-f),
+                                        text[1..].to_string(),
+                                    ))),
+                                }),
+                            }
                         }
                         lit => Ok(Expr::Literal(lit)),
                     }
@@ -9465,8 +9481,8 @@ mod tests {
         // `from_number_literal` conversion), only the AST node's stored
         // text is unaffected here. A *negative* literal at the same
         // magnitude does not stay a bare `Literal` -- see
-        // `test_negative_large_integer_literal_splits_past_2_53_3044` --
-        // since jq's own grammar always treats a leading `-` as unary
+        // `test_negative_large_integer_literal_splits_or_folds_past_2_53_3044_3075`
+        // -- since jq's own grammar always treats a leading `-` as unary
         // minus, computed, never a preserved literal (#3044).
         assert_eq!(
             parse("9999999999999999999").unwrap(),
@@ -9484,18 +9500,27 @@ mod tests {
         );
     }
 
-    /// #3044: a negative literal past `2^53`
-    /// ([`crate::jq::eval::jq_int_within_exact_f64_range`]) splits into
-    /// `-1 * <positive literal>` the same way the float/exponent case
-    /// above does, rather than staying a preserved `Literal` -- covering
-    /// both producers of the split-off literal's `Float` repr: a plain
-    /// digit string past `i64::MAX` (never reaches an `Int` repr at all),
-    /// and the one `Int` value whose own negation overflows `i64`
-    /// (`i64::MIN`, magnitude `2^63`).
+    /// #3044/#3075: a negative literal past `2^53`
+    /// ([`crate::jq::eval::jq_int_within_exact_f64_range`]) is never a
+    /// preserved bare `Literal` -- but the two producers of that split
+    /// diverge as of #3075. A `Float` repr (a magnitude that never fits
+    /// `i64` at all) still splits into `-1 * <positive literal>` (#1035's
+    /// mechanism, kept intact because `fold_index_key` needs to keep
+    /// seeing through this exact shape for a negative float/exponent
+    /// index or slice bound --
+    /// `test_1035_negative_float_index_and_slice_bound_still_fold_to_static`).
+    /// An `Int` repr instead folds straight to the already-known
+    /// `Literal::Float` (#3075): no index/slice fast path needs the
+    /// intermediate `Arithmetic::Mul` shape for *this* sub-case
+    /// (`test_out_of_range_negative_index_and_slice_bound_stay_dynamic_3044`
+    /// stays dynamic either way), so there's nothing to lose by computing
+    /// the rounding once here instead of on every evaluation of the AST
+    /// node.
     #[test]
-    fn test_negative_large_integer_literal_splits_past_2_53_3044() {
-        // Every case below parses to `-1 * <split-off literal>`; this
-        // returns that literal's own `Expr` so each case only states what
+    fn test_negative_large_integer_literal_splits_or_folds_past_2_53_3044_3075() {
+        // `Float`-repr magnitudes (never fit `i64`): still split into
+        // `-1 * <split-off literal>`, unaffected by #3075. This returns
+        // the split-off literal's own `Expr` so each case only states what
         // differs (the source and the expected split), not the
         // let-else/panic boilerplate to get there.
         fn split_literal(src: &str) -> Expr {
@@ -9514,8 +9539,8 @@ mod tests {
             ))
         );
 
-        // One past the boundary: the split-off literal is `Int` for every
-        // magnitude that fits `i64`, `Float` only past it.
+        // One past `i64::MIN`'s own magnitude: still doesn't fit `i64`
+        // either direction, so still `Float`-repr, still splits.
         assert_eq!(
             split_literal("-9223372036854775809"),
             Expr::Literal(Literal::NumberLiteral(
@@ -9524,31 +9549,34 @@ mod tests {
             ))
         );
 
-        // Exactly `i64::MIN`: still splits (its magnitude, `2^63`, is far
-        // past `2^53`), but the positive magnitude itself doesn't fit
-        // `i64`, so the split-off literal is `Float`, not `Int`.
+        // `Int`-repr magnitudes (fit `i64`, past `2^53`): fold straight to
+        // `Literal::Float` (#3075) instead, no `Arithmetic::Mul` wrapper.
+
+        // Exactly `i64::MIN`: `n` itself fits `i64` (only its *positive*
+        // magnitude, `2^63`, doesn't), so this is an `Int`-repr case --
+        // `jq_literal_int_to_f64` rounds it directly, with no separate
+        // overflow branch needed (unlike the split this replaces, which
+        // had to fall back once `checked_neg` failed on this one value).
         assert_eq!(
-            split_literal("-9223372036854775808"),
-            Expr::Literal(Literal::NumberLiteral(
-                NumberRepr::Float(9223372036854775808.0),
-                "9223372036854775808".to_string()
-            ))
+            parse("-9223372036854775808").unwrap(),
+            Expr::Literal(Literal::Float(crate::jq::value::jq_literal_int_to_f64(
+                i64::MIN
+            )))
         );
 
-        // Past `2^53` but well within `i64`: the split-off literal stays
-        // an exact `Int`, negated via `arith_mul`'s own #2631/#2906
-        // rounding at evaluation time, not degraded to `Float` here.
+        // Past `2^53` but well within `i64`: same fold, the same rounding
+        // `arith_mul`'s own #2631/#2906 rule used to apply at evaluation
+        // time, now computed once here instead.
         assert_eq!(
-            split_literal("-869389897822472004"),
-            Expr::Literal(Literal::NumberLiteral(
-                NumberRepr::Int(869389897822472004),
-                "869389897822472004".to_string()
-            ))
+            parse("-869389897822472004").unwrap(),
+            Expr::Literal(Literal::Float(crate::jq::value::jq_literal_int_to_f64(
+                -869389897822472004
+            )))
         );
 
         // Below `2^53`: unaffected, still the cheap identity-literal fold
-        // (see `test_literals`'s own `-123` case) -- confirms the new
-        // guard doesn't widen past its intended boundary.
+        // (see `test_literals`'s own `-123` case) -- confirms the guard
+        // doesn't widen past its intended boundary.
         assert_eq!(
             parse("-123").unwrap(),
             Expr::Literal(Literal::number_literal("-123".to_string()))
