@@ -765,8 +765,9 @@ pub enum Expr {
     /// node is built while *evaluating* a call, and everything that could
     /// substitute into it lexically encloses that call and has therefore
     /// already run. Evaluation is transparent — a `Shared` evaluates exactly
-    /// as its inner expression does.
-    Shared(Rc<Self>),
+    /// as its inner expression does; the [`SharedArg`] around it only
+    /// remembers whether that evaluation may be eager (#3287).
+    Shared(Rc<SharedArg>),
 
     /// A call to a user-defined function, bound to its definition but **not
     /// yet substituted** (#1371).
@@ -1374,6 +1375,107 @@ impl PartialEq for BoundBody {
 impl core::fmt::Debug for BoundBody {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("BoundBody")
+    }
+}
+
+impl Expr {
+    /// An [`Expr::Shared`] capturing `expr`.
+    pub fn shared(expr: Self) -> Self {
+        Self::Shared(Rc::new(SharedArg::new(expr)))
+    }
+}
+
+/// What an [`Expr::Shared`] holds: the captured argument, and whether reading
+/// it may be eager (#3287).
+///
+/// Dereferences to the argument, so an [`Expr::Shared`]'s contents read as an
+/// [`Expr`] everywhere. The flag is derived state, computed by the evaluator on
+/// the first read (`eval::is_eager_arg`) and remembered here, because the
+/// question it answers -- is this argument pure and finite, *including every
+/// argument it reads in turn* -- would otherwise walk a recursion's whole
+/// argument chain on every read. Like [`BoundBody`] it takes no part in
+/// equality or `Debug`.
+///
+/// It remembers `eval::needs_path_context` of its contents the same way: that
+/// walk also descends into every `Shared`, and a pipe asks it of each stage on
+/// every evaluation, so a pipe link over a recursion's chain (`f(n - 1 | .)`)
+/// walked the whole chain per link, cubic in the depth.
+#[derive(Clone)]
+pub struct SharedArg {
+    expr: Expr,
+    eager: core::cell::Cell<Option<bool>>,
+    needs_path_context: core::cell::Cell<Option<bool>>,
+}
+
+impl SharedArg {
+    /// Capture `expr` as an argument, its eagerness not yet known.
+    pub fn new(expr: Expr) -> Self {
+        Self {
+            expr,
+            eager: core::cell::Cell::new(None),
+            needs_path_context: core::cell::Cell::new(None),
+        }
+    }
+
+    /// The captured argument.
+    pub fn expr(&self) -> &Expr {
+        &self.expr
+    }
+
+    /// The captured argument, for a pass that rewrites it in place. Forgets
+    /// the eagerness already computed, which described the old contents.
+    pub fn expr_mut(&mut self) -> &mut Expr {
+        self.eager.set(None);
+        self.needs_path_context.set(None);
+        &mut self.expr
+    }
+
+    /// Whether reading this argument may be eager, computing it with
+    /// `classify` on the first call.
+    pub fn eager_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
+        memo(&self.eager, || classify(&self.expr))
+    }
+
+    /// Whether this argument needs path context, computing it with `classify`
+    /// on the first call.
+    pub fn needs_path_context_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
+        memo(&self.needs_path_context, || classify(&self.expr))
+    }
+}
+
+/// `slot`'s answer, computing and remembering it on the first call.
+fn memo(slot: &core::cell::Cell<Option<bool>>, compute: impl FnOnce() -> bool) -> bool {
+    if let Some(known) = slot.get() {
+        return known;
+    }
+    let answer = compute();
+    slot.set(Some(answer));
+    answer
+}
+
+impl core::ops::Deref for SharedArg {
+    type Target = Expr;
+
+    fn deref(&self) -> &Expr {
+        &self.expr
+    }
+}
+
+impl AsRef<Expr> for SharedArg {
+    fn as_ref(&self) -> &Expr {
+        &self.expr
+    }
+}
+
+impl PartialEq for SharedArg {
+    fn eq(&self, other: &Self) -> bool {
+        self.expr == other.expr
+    }
+}
+
+impl core::fmt::Debug for SharedArg {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.expr.fmt(f)
     }
 }
 

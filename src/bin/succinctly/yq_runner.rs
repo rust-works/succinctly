@@ -9829,7 +9829,7 @@ mod tests {
 
         for wrapped in [
             del_arr0(),
-            Expr::Shared(std::rc::Rc::new(del_arr0())),
+            Expr::shared(del_arr0()),
             Expr::As {
                 expr: Box::new(Expr::Literal(succinctly::jq::Literal::Int(1))),
                 var: "v".into(),

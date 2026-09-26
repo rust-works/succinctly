@@ -379,8 +379,8 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 use super::expr::{
     retention_scope, ArithOp, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr,
     FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags, MetaSlot,
-    NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, SliceBoundKey,
-    StringPart, Tracked,
+    NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, SharedArg,
+    SliceBoundKey, StringPart, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, document_number_f64, infinite_float_preview_text, int_to_f64,
@@ -2636,8 +2636,10 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
             needs_path_context(&def.body) || args.iter().any(needs_path_context)
         }
         // Transparent: a `Shared` is its inner expression as far as
-        // evaluation -- and therefore routing -- is concerned.
-        Expr::Shared(inner) => needs_path_context(inner),
+        // evaluation -- and therefore routing -- is concerned. Remembered on
+        // the argument, so a chain is walked once rather than per link
+        // (#3287).
+        Expr::Shared(inner) => inner.needs_path_context_or_init(needs_path_context),
         // `EXPR as $v | body` (#1663): neither `expr` nor `body` navigate
         // away from the caller's own position -- `eval_as` evaluates both
         // against the same `value` -- so a `key`/`parent`/`file_index`
@@ -5896,9 +5898,8 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally. Nothing is gained there either: an arithmetic
         // chain is single-valued, so there is no demand to forward.
         //
-        // A link is a *pure, single-valued* combination of the previous
-        // level's `Shared` and literals -- `is_pure_chain_link` recognizes
-        // exactly that shape (see its own doc comment). This used to be
+        // A link is a pure, finite combination of the previous level's
+        // `Shared` and other pure code. This used to be
         // `any_subexpr(inner, |e| matches!(e, Expr::Shared(_)))`: "does a
         // `Shared` appear anywhere in this subtree" -- which fires on any
         // node that merely *mentions* one, not just a computed chain link
@@ -5922,13 +5923,16 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         //   outer((1, ("SIDE"|stderr)))` ran the stderr branch `first` never
         //   asked for).
         //
-        // `is_pure_chain_link` is a whitelist instead: it never recurses
-        // into what a `Shared` node wraps (any `Shared` is trivially "pure"
-        // here -- its own producer already went through this same
-        // classification), and it only recognizes `Shared`/literals combined
-        // by pure, single-valued operators. Anything else -- `Comma`,
-        // `Pipe`, a `FuncCall`/`DefCall`, a builtin -- is not in the
-        // whitelist and falls through to the always-correct lazy path below.
+        // `is_eager_arg` is a whitelist instead, remembered on the argument
+        // (#3287): pure, finite shapes -- arithmetic, comparison, `if`, a pipe,
+        // `,`, `as`, a call to a `def` whose body is one -- over arguments
+        // that are themselves eager by their own remembered answer. Anything
+        // else -- a builtin, `.[]`, an effect -- falls through to the
+        // always-correct lazy path below. Its predecessor,
+        // `is_pure_chain_link`, admitted only arithmetic and took every
+        // nested `Shared` on trust, which capped a pipe or `def` link at
+        // ~150 levels and let `first(f((1, ("B" | stderr))))` run the effect
+        // through an arithmetic chain.
         //
         // Peel a bare pass-through first, by re-entering this same arm on
         // what it wraps -- `eval_each` dispatches straight back here for
@@ -5939,11 +5943,14 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Shared(_) if native_stack_exhausted() => {
             Flow::Escaped(Control::Error(shared_arg_depth_refusal()))
         }
-        Expr::Shared(inner) if matches!(&**inner, Expr::Shared(_)) => {
+        Expr::Shared(inner) if matches!(inner.expr(), Expr::Shared(_)) => {
             eval_each::<W, S>(inner, value, optional, sink)
         }
         Expr::Shared(inner) => {
-            if is_pure_chain_link(inner) {
+            // #3287: any pure, finite argument is eager -- a pipe, a nested
+            // or helper `def` over the parameter -- and one reading an effect
+            // or generator further down its chain is not; see `is_eager_arg`.
+            if is_eager_arg(inner) {
                 drain_result(eval_single::<W, S>(inner, value, optional), sink)
             } else {
                 eval_each::<W, S>(inner, value, optional, sink)
@@ -46028,9 +46035,9 @@ fn eval_owned_navigation<S: EvalSemantics>(
 /// `eval_owned_pure_declines_exactly_where_the_old_pre_walk_said_no`
 /// checks the fused form against.
 ///
-/// Item 2: see [`is_pure_chain_link`]'s doc comment for why these two
-/// overlapping purity grammars stay separate rather than sharing a
-/// primitive.
+/// Item 2: see `pure_predicates_agree_on_their_intersection_2397` for why
+/// this and [`is_eager_arg`]'s overlapping purity grammar stay separate
+/// rather than sharing a primitive.
 #[cfg(test)]
 fn is_owned_pure_expr(expr: &Expr) -> bool {
     match expr {
@@ -61529,7 +61536,7 @@ pub(crate) fn shared_arg_depth_refusal() -> EvalError {
 /// MB evaluation stack, where `[fib(n - 1), fib(n - 2)] | add` -- which
 /// collects before continuing -- ran `fib(24)`.
 ///
-/// Recognised by a whitelist, like [`is_pure_chain_link`]: literals, `.`, a
+/// Recognised by a whitelist: literals, `.`, a
 /// field, a variable, arithmetic, comparison, `if`, a pipe of such stages, an
 /// `as` binding of one over one, an argument read whose argument is one, and a
 /// call to a `def` whose body is one. Inside a definition's body a read of one
@@ -61560,8 +61567,33 @@ pub(crate) fn settles_before_consumer(expr: &Expr) -> bool {
     if matches!(expr, Expr::Shared(_)) {
         return false;
     }
-    let mut budget = SETTLE_ANALYSIS_BUDGET;
-    single_valued_pure(expr, None, &mut budget) == Some(true)
+    let mut walk = PureWalk::new(false);
+    single_valued_pure(expr, None, &mut walk) == Some(true)
+}
+
+/// Whether reading the argument `arg` may take `eval_single`'s eager path in
+/// the `Expr::Shared` arms, rather than the demand-driven one (#3287).
+///
+/// The lazy path costs an argument-chain link ~70x the native stack of the
+/// eager one, and a recursion reads its whole chain on top of its own frames,
+/// so a link that is not bare arithmetic -- `f(n - 1 | .)`, a nested `def h: n
+/// - 1; f(h)`, a helper `f(g(n))` -- capped recursion at ~115-155 levels where
+/// jq runs 100,000. Laziness is observable only for an argument that runs an
+/// effect or produces unboundedly many outputs, so an argument built from
+/// [`single_valued_pure`]'s whitelist -- plus `,` of such, which is finite --
+/// may be evaluated eagerly, `def` calls included.
+///
+/// An argument read *inside* the argument (the previous level's `n`) counts by
+/// its own answer, remembered on its [`SharedArg`]: descending into it would
+/// walk the whole chain on every read, and taking it on trust is what let
+/// `first(f((1, ("B" | stderr))))` run the effect through an arithmetic chain
+/// before this. The answer is computed once per argument, so a chain costs one
+/// walk of each link, not of each prefix.
+pub(crate) fn is_eager_arg(arg: &SharedArg) -> bool {
+    arg.eager_or_init(|expr| {
+        let mut walk = PureWalk::new(true);
+        single_valued_pure(expr, None, &mut walk).is_some()
+    })
 }
 
 /// How many nodes [`settles_before_consumer`] visits before declining. The
@@ -61569,14 +61601,39 @@ pub(crate) fn settles_before_consumer(expr: &Expr) -> bool {
 /// tree recursion to ~340 levels, far past where an exponential call tree can
 /// finish, while bounding both the check's time and its own native recursion
 /// (an argument chain nests, so the walk recurses about as deep as it visits).
+/// [`is_eager_arg`] walks one link at a time and shares the bound.
 const SETTLE_ANALYSIS_BUDGET: u32 = 1024;
 
-/// [`settles_before_consumer`]'s analysis, within the raw body of `within`
-/// when given: `None` if `expr` is not recognised as single-valued and
-/// effect-free or `budget` runs out, otherwise whether it calls a `def`.
-fn single_valued_pure(expr: &Expr, within: Option<&FuncDefData>, budget: &mut u32) -> Option<bool> {
-    *budget = budget.checked_sub(1)?;
-    let mut sv = |e: &Expr| single_valued_pure(e, within, budget);
+/// The state [`single_valued_pure`] threads through its walk: the node budget
+/// left, and whether it is classifying an argument for [`is_eager_arg`] --
+/// where a nested `Shared` counts by its own remembered answer and a finite
+/// `,` is admitted -- or an operand for [`settles_before_consumer`], which
+/// must be single-valued and walks into every `Shared`.
+struct PureWalk {
+    budget: u32,
+    for_eager_arg: bool,
+}
+
+impl PureWalk {
+    const fn new(for_eager_arg: bool) -> Self {
+        Self {
+            budget: SETTLE_ANALYSIS_BUDGET,
+            for_eager_arg,
+        }
+    }
+}
+
+/// [`settles_before_consumer`]'s and [`is_eager_arg`]'s analysis,
+/// within the raw body of `within` when given: `None` if `expr` is not
+/// recognised as single-valued and effect-free or the budget runs out,
+/// otherwise whether it calls a `def`.
+fn single_valued_pure(
+    expr: &Expr,
+    within: Option<&FuncDefData>,
+    walk: &mut PureWalk,
+) -> Option<bool> {
+    walk.budget = walk.budget.checked_sub(1)?;
+    let mut sv = |e: &Expr| single_valued_pure(e, within, walk);
     match expr {
         Expr::Identity | Expr::Literal(_) | Expr::Field(_) | Expr::Var(_) | Expr::TrackedVar(_) => {
             Some(false)
@@ -61590,16 +61647,18 @@ fn single_valued_pure(expr: &Expr, within: Option<&FuncDefData>, budget: &mut u3
             then_branch,
             else_branch,
         } => Some(sv(cond)? | sv(then_branch)? | sv(else_branch)?),
-        Expr::Pipe(stages) => all_single_valued_pure(stages, within, budget),
+        Expr::Pipe(stages) => all_single_valued_pure(stages, within, walk),
         // One value bound, then one body run for it. A body naming the
         // variable only reads it, and cannot shadow a parameter's bare name.
         Expr::As { expr, body, .. } => Some(sv(expr)? | sv(body)?),
         // An argument captured in the caller's scope: the definition being
         // analysed, if any, has no bearing on what it names.
-        Expr::Shared(inner) => single_valued_pure(inner, None, budget),
+        Expr::Shared(inner) if walk.for_eager_arg => is_eager_arg(inner).then_some(false),
+        Expr::Comma(items) if walk.for_eager_arg => all_single_valued_pure(items, within, walk),
+        Expr::Shared(inner) => single_valued_pure(inner, None, walk),
         Expr::DefCall { def, args, .. } => {
-            all_single_valued_pure(args, within, budget)?;
-            single_valued_pure(&def.body, Some(def), budget)?;
+            all_single_valued_pure(args, within, walk)?;
+            single_valued_pure(&def.body, Some(def), walk)?;
             Some(true)
         }
         Expr::FuncCall { name, args, .. } => match within {
@@ -61607,7 +61666,7 @@ fn single_valued_pure(expr: &Expr, within: Option<&FuncDefData>, budget: &mut u3
                 Some(false)
             }
             Some(def) if *name == def.name && args.len() == def.params.len() => {
-                all_single_valued_pure(args, within, budget)?;
+                all_single_valued_pure(args, within, walk)?;
                 Some(true)
             }
             _ => None,
@@ -61621,11 +61680,11 @@ fn single_valued_pure(expr: &Expr, within: Option<&FuncDefData>, budget: &mut u3
 fn all_single_valued_pure(
     exprs: &[Expr],
     within: Option<&FuncDefData>,
-    budget: &mut u32,
+    walk: &mut PureWalk,
 ) -> Option<bool> {
     let mut calls = false;
     for e in exprs {
-        calls |= single_valued_pure(e, within, budget)?;
+        calls |= single_valued_pure(e, within, walk)?;
     }
     Some(calls)
 }
@@ -61703,53 +61762,6 @@ impl<I> SettledOutputs<I> {
             }
         }
         Demand::Continue
-    }
-}
-
-/// Whether `expr` is a pure, single-valued combination of `Shared` nodes and
-/// literals -- safe for `eval_each`'s `Expr::Shared` arm to evaluate eagerly
-/// instead of preserving demand-driven laziness (#1371 follow-up).
-///
-/// A whitelist, not a blacklist, on purpose: this replaces `any_subexpr(expr,
-/// |e| matches!(e, Expr::Shared(_)))`, which asked "does a `Shared` appear
-/// *anywhere* in this subtree" -- true for a genuine chain link
-/// (`Shared(prev) - 1`), but also true for a `Comma`/`Pipe`/call that merely
-/// *contains* one alongside unrelated multi-valued or side-effecting code, or
-/// for a nested `def` whose own frozen body happens to close over an
-/// already-`Shared`-wrapped outer parameter. Both shapes leaked side effects
-/// past a demand-driven consumer (`first`/`isempty`/`limit`) that never asked
-/// for them -- see the call site's own doc comment for both confirmed
-/// repros.
-///
-/// Never recurses into what a `Shared` node wraps: that value's own producer
-/// already went through this same classification when *it* was evaluated, so
-/// treating any `Shared` as trivially pure here does not re-open the hole
-/// above. Everything not explicitly recognized -- `Comma`, `Pipe`, a
-/// `FuncCall`/`DefCall`, a builtin, `Index`/`Field` navigation -- is
-/// conservatively *not* a pure chain link, which only ever costs the slower,
-/// always-correct lazy path, never correctness.
-/// #2397 (item 2): deliberately **not** merged with
-/// [`is_owned_pure_expr`], despite the two grammars overlapping on
-/// `Literal`/`Paren`/`Compare`. Each side's other leaves are load-bearing
-/// for its own consumer and wrong for the other's: `Expr::Shared` is
-/// meaningless to the owned evaluator, and `Field`/`Index` are deliberately
-/// *impure* here (this predicate's callers, the `Expr::Shared` arms in
-/// `eval.rs` and `eval_generic.rs`, use it to decide whether a chain link
-/// can be re-evaluated without re-reading the input). Extracting a shared
-/// three-arm primitive would save six lines and create exactly the widening
-/// hazard that would break one caller silently. Instead
-/// `pure_predicates_agree_on_their_intersection_2397` pins that they agree
-/// on the overlap and disagree only on the documented exclusive shapes --
-/// CLAUDE.md's "one definition, plus a test that the call sites agree",
-/// applied to the case where one definition is the wrong answer.
-pub(crate) fn is_pure_chain_link(expr: &Expr) -> bool {
-    match expr {
-        Expr::Shared(_) | Expr::Literal(_) => true,
-        Expr::Paren(inner) | Expr::Negate(inner) => is_pure_chain_link(inner),
-        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
-            is_pure_chain_link(left) && is_pure_chain_link(right)
-        }
-        _ => false,
     }
 }
 
@@ -62012,18 +62024,18 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
 /// reading the closure at depth `d` walked `d` links natively, and
 /// `def rep(f; n): if n <= 0 then . else (f | rep(f; n - 1)) end; 0 |
 /// rep(. + 1; 1000)` overflowed the stack at ~670 levels (#3262).
-fn share_def_call_args(args: &[Expr]) -> Vec<Rc<Expr>> {
+fn share_def_call_args(args: &[Expr]) -> Vec<Rc<SharedArg>> {
     args.iter()
         .map(|arg| match arg {
             Expr::Shared(inner) => Rc::clone(inner),
-            _ => Rc::new(arg.clone()),
+            _ => Rc::new(SharedArg::new(arg.clone())),
         })
         .collect()
 }
 
 /// The bare half of [`bind_def_call_params`]: substitute each parameter's
 /// bare name, the last same-named parameter winning, in one walk (#2633).
-fn substitute_bare_params(body: &Expr, params: &[Param], shared: &[Rc<Expr>]) -> Expr {
+fn substitute_bare_params(body: &Expr, params: &[Param], shared: &[Rc<SharedArg>]) -> Expr {
     // `zip` truncates to the shorter side -- an arity mismatch cannot reach
     // here (`install_def_calls` only builds a `DefCall` whose `args.len()`
     // equals `params.len()`), and if one ever did, leaving the extra
@@ -62059,7 +62071,7 @@ fn shadowed_by_later_param(params: &[Param], i: usize, param: &Param) -> bool {
 /// Wrap `body` in one `Shared(arg) as $name | ...` per `$`-style parameter,
 /// the first parameter outermost -- jq's own desugaring (#3149). See
 /// [`bind_def_call_params`].
-fn bind_dollar_params(body: Expr, params: &[Param], shared: &[Rc<Expr>]) -> Expr {
+fn bind_dollar_params(body: Expr, params: &[Param], shared: &[Rc<SharedArg>]) -> Expr {
     params
         .iter()
         .zip(shared)
@@ -62092,7 +62104,7 @@ const MAX_COMBINED_PARAM_SUBSTS: usize = 64;
 /// A shadowed parameter (a later one shares its name) is skipped rather than
 /// substituted first and overwritten: its `Shared` node would otherwise hide
 /// the winner's references from the later pass.
-fn sequential_bare_substitution(body: &Expr, params: &[Param], shared: &[Rc<Expr>]) -> Expr {
+fn sequential_bare_substitution(body: &Expr, params: &[Param], shared: &[Rc<SharedArg>]) -> Expr {
     let mut result: Option<Expr> = None;
     for (i, (param, arg)) in params.iter().zip(shared).enumerate() {
         if shadowed_by_later_param(params, i, param) {
@@ -63931,7 +63943,7 @@ mod tests {
             // Site 2 -- `substitute_func_param_impl`: an outer `$`-style
             // parameter's own `$a` reaches the nested def's body under
             // exactly the same condition.
-            let arg = Expr::Shared(Rc::new(Expr::Literal(Literal::Int(7))));
+            let arg = Expr::shared(Expr::Literal(Literal::Int(7)));
             let both = SubstScope {
                 dollar: true,
                 bare: true,
@@ -64059,7 +64071,7 @@ mod tests {
             Expr::Error(Some(Box::new(call("a")))),
             // #2096/#2077: an already-`Shared` node stays opaque, so a later
             // parameter can never reach into an earlier one's argument.
-            Expr::Shared(Rc::new(pair(call("a"), var("a")))),
+            Expr::shared(pair(call("a"), var("a"))),
             // A builtin argument is ordinary nesting, not a scope boundary.
             Expr::Builtin(Builtin::Select(Box::new(pair(call("a"), var("a"))))),
         ];
@@ -64159,7 +64171,7 @@ mod tests {
         };
         // `Expr::Shared`-wrapped, since that is what the substitution
         // inserts (#2096 capture hygiene).
-        let shared = |n: i64| Expr::Shared(Rc::new(Expr::Literal(Literal::Int(n))));
+        let shared = |n: i64| Expr::shared(Expr::Literal(Literal::Int(n)));
         let bound_as = |n: i64, var: &str, body: Expr| Expr::As {
             expr: Box::new(shared(n)),
             var: var.to_string(),
@@ -64609,7 +64621,7 @@ mod tests {
         );
         let json = b"null";
         let index = JsonIndex::build(json);
-        let read = Expr::Shared(Rc::new(Expr::Literal(Literal::Int(1))));
+        let read = Expr::shared(Expr::Literal(Literal::Int(1)));
         let result = with_stack_budget(0, || {
             eval_single::<Vec<u64>, JqSemantics>(&read, index.root(json).value(), false)
         });
@@ -64697,7 +64709,7 @@ mod tests {
         let read = substitute_func_param(
             &parse("first(g)").expect("parses"),
             "g",
-            &Expr::Shared(Rc::new(Expr::Identity)),
+            &Expr::shared(Expr::Identity),
         );
         assert!(matches!(
             with_stack_budget(0, || eval::<Vec<u64>, YqSemantics>(&read, index.root(json))),
@@ -64722,7 +64734,7 @@ mod tests {
             let expr = substitute_func_param(
                 &parse(filter).expect("parses"),
                 "g",
-                &Expr::Shared(Rc::new(Expr::Identity)),
+                &Expr::shared(Expr::Identity),
             );
             let result =
                 with_stack_budget(0, || eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)));
@@ -64771,13 +64783,13 @@ mod tests {
     /// recursion builds no chain.
     #[test]
     fn a_passed_through_argument_is_shared_not_rewrapped_3262() {
-        let inner = Rc::new(Expr::Literal(Literal::Int(1)));
+        let inner = Rc::new(SharedArg::new(Expr::Literal(Literal::Int(1))));
         let shared = share_def_call_args(&[
             Expr::Shared(Rc::clone(&inner)),
             Expr::Literal(Literal::Int(2)),
         ]);
         assert!(Rc::ptr_eq(&shared[0], &inner));
-        assert!(matches!(&*shared[1], Expr::Literal(Literal::Int(2))));
+        assert!(matches!(shared[1].expr(), Expr::Literal(Literal::Int(2))));
     }
 
     /// **The invariant the whole #820 design rests on**: with a sink that
@@ -72189,14 +72201,21 @@ mod tests {
     /// #2397 (item 2): the two purity grammars agree on their intersection
     /// and differ only where each one's own consumer needs it to.
     ///
-    /// They are *not* merged -- see [`is_pure_chain_link`]'s doc comment --
-    /// so this is the "test that the call sites agree" half of CLAUDE.md's
-    /// duplicated-predicate rule. A future edit that widens one of them into
-    /// the other's exclusive territory fails here rather than silently
-    /// changing what the other's callers accept.
+    /// They are *not* merged: [`is_owned_pure_expr`] states the owned
+    /// evaluator's accept-set, whose arithmetic `?`-suppression rules live in
+    /// `binary_fanout_core`, while [`is_eager_arg`] (#3287, replacing
+    /// `is_pure_chain_link`) decides whether an argument read may be eager,
+    /// where only effects and unbounded output matter. This is the "test that
+    /// the call sites agree" half of CLAUDE.md's duplicated-predicate rule: a
+    /// future edit that moves one of them into the other's exclusive
+    /// territory fails here rather than silently changing what the other's
+    /// callers accept.
     #[test]
     fn pure_predicates_agree_on_their_intersection_2397() {
-        // The overlap: literals, parens, and comparisons built from them.
+        let eager = |expr: &Expr| is_eager_arg(&SharedArg::new(expr.clone()));
+
+        // The overlap: literals, input navigation, and comparisons and pipes
+        // built from them.
         for src in [
             "1",
             "\"s\"",
@@ -72206,58 +72225,84 @@ mod tests {
             "1 == 2",
             "(1) < (2)",
             "1 == (2)",
-            // The parser folds unary minus on a literal, so this is
-            // `Literal(-1)` -- in the intersection, not in the chain-link-only
-            // group below where a first draft of this test put it.
             "-1",
-        ] {
-            let expr = parse(src).unwrap();
-            assert!(
-                is_owned_pure_expr(&expr),
-                "{src:?} should be owned-pure (intersection)"
-            );
-            assert!(
-                is_pure_chain_link(&expr),
-                "{src:?} should be a pure chain link (intersection)"
-            );
-        }
-
-        // Owned-pure only: input-reading navigation and the shapes that
-        // construct a value from the input. A chain link must reject these
-        // -- its callers re-evaluate a link without re-reading the input.
-        for src in [
             ".",
             ".a",
             ".a.b",
-            ".[0]",
-            "type",
-            "not",
-            ".a and .b",
-            ".a or .b",
+            ".a | .b",
         ] {
             let expr = parse(src).unwrap();
             assert!(is_owned_pure_expr(&expr), "{src:?} should be owned-pure");
+            assert!(eager(&expr), "{src:?} should be an eager argument");
+        }
+
+        // Owned-pure only: builtins and connectives the owned evaluator
+        // answers directly, which the eager-argument whitelist has no need
+        // to name -- declining only keeps an argument lazy.
+        for src in [".[0]", "type", "not", ".a and .b", ".a or .b"] {
+            let expr = parse(src).unwrap();
+            assert!(is_owned_pure_expr(&expr), "{src:?} should be owned-pure");
+            assert!(!eager(&expr), "{src:?} is outside the eager whitelist");
+        }
+
+        // Eager only: arithmetic, `,` and `if`, which the owned grammar
+        // excludes because their suppression and fan-out rules live
+        // elsewhere.
+        for src in [
+            "1 + 2",
+            "-(1 + 2)",
+            "1 * 2",
+            "1, 2",
+            "if . then 1 else 2 end",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(eager(&expr), "{src:?} should be an eager argument");
             assert!(
-                !is_pure_chain_link(&expr),
-                "{src:?} must not be a pure chain link -- it reads the input"
+                !is_owned_pure_expr(&expr),
+                "{src:?} must not be owned-pure -- its rules live elsewhere"
             );
         }
 
-        // Chain-link only: arithmetic and negation, which the owned grammar
-        // excludes because their `?`-suppression rules live in
-        // `binary_fanout_core` (see `eval_owned_pure`'s own `Arithmetic`
-        // arm, which admits only the literal-RHS accumulator shape).
-        for src in ["1 + 2", "-(1 + 2)", "1 * 2"] {
+        // Neither: effects and generators stay lazy.
+        for src in [
+            "1, (\"B\" | stderr)",
+            ".[]",
+            "range(3)",
+            "debug",
+            "error(\"x\")",
+        ] {
             let expr = parse(src).unwrap();
-            assert!(
-                is_pure_chain_link(&expr),
-                "{src:?} should be a pure chain link"
-            );
-            assert!(
-                !is_owned_pure_expr(&expr),
-                "{src:?} must not be owned-pure -- its suppression rules live elsewhere"
-            );
+            assert!(!eager(&expr), "{src:?} must stay lazy");
+            assert!(!is_owned_pure_expr(&expr), "{src:?} is not owned-pure");
         }
+    }
+
+    /// #3287: an argument is eager by its own shape *and* by every argument
+    /// it reads, each remembered on its [`SharedArg`], so an effect at the
+    /// base of a chain keeps every link above it lazy, and a chain is
+    /// classified one link at a time rather than walked per read.
+    #[test]
+    fn eager_arg_follows_the_arguments_it_reads_3287() {
+        let one = parse("1").unwrap();
+        let effect = parse("1, (\"B\" | stderr)").unwrap();
+        // `n - 1` over the previous level's `n`, returning the new level's
+        // argument.
+        let link = |prev: Rc<SharedArg>| {
+            Rc::new(SharedArg::new(Expr::Arithmetic {
+                op: ArithOp::Sub,
+                left: Box::new(Expr::Shared(prev)),
+                right: Box::new(one.clone()),
+            }))
+        };
+        let base = |expr: Expr| Rc::new(SharedArg::new(expr));
+        assert!(is_eager_arg(&link(link(base(one.clone())))));
+        assert!(!is_eager_arg(&link(link(base(effect)))));
+
+        // Remembered: rewriting the contents in place forgets the answer.
+        let mut arg = SharedArg::new(one);
+        assert!(is_eager_arg(&arg));
+        *arg.expr_mut() = parse("1, (\"B\" | stderr)").unwrap();
+        assert!(!is_eager_arg(&arg));
     }
 
     /// #3296: [`settle_then_replay`] keeps every output in order -- a
@@ -72358,9 +72403,7 @@ mod tests {
         // it is every lazy-chain link, and must be O(1) to check.
         let call = operand("n", "f(1)");
         assert!(settles_before_consumer(&call));
-        assert!(!settles_before_consumer(&Expr::Shared(Rc::new(
-            call.clone()
-        ))));
+        assert!(!settles_before_consumer(&Expr::shared(call.clone())));
 
         // An argument past the budget declines rather than walking on. Built
         // flat -- a pipe of `.` stages -- so neither the walk nor the drop
@@ -97238,7 +97281,7 @@ mod tests {
             slice_number
         );
         assert_eq!(
-            substitute_func_param(&slice_number, "x", &Expr::Shared(Rc::new(Expr::Identity))),
+            substitute_func_param(&slice_number, "x", &Expr::shared(Expr::Identity)),
             slice_number
         );
     }
@@ -108058,11 +108101,11 @@ mod tests {
     /// either direction.
     #[test]
     fn shared_wrapper_is_transparent_2091() {
-        let write = Expr::Shared(Rc::new(assign_a_2091()));
+        let write = Expr::shared(assign_a_2091());
         assert!(contains_assign(&write));
         assert!(is_alias_sensitive_assign(&write));
 
-        let reshape = Expr::Shared(Rc::new(map_identity_2091()));
+        let reshape = Expr::shared(map_identity_2091());
         assert!(!contains_assign(&reshape));
         assert!(!is_alias_sensitive_assign(&reshape));
     }
@@ -108077,7 +108120,7 @@ mod tests {
         for expr in [
             Expr::Paren(Box::new(assign_a_2091())),
             Expr::Optional(Box::new(assign_a_2091())),
-            Expr::Shared(Rc::new(assign_a_2091())),
+            Expr::shared(assign_a_2091()),
             Expr::As {
                 expr: Box::new(Expr::Literal(Literal::Int(99))),
                 var: "v".into(),

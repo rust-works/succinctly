@@ -4303,18 +4303,19 @@ Three differences remain, all in the direction of erroring rather than aborting:
   1)` stops at ~10,000 levels, a bare `def sum_to(n)` at ~9,200, and a chain
   read inside `path()` or `|=` at ~11,600; each is at the frame count's limit
   or the stack floor, whichever comes first, and each is at least 2x short of
-  where the stack really runs out. jq answers all of these. The steepest
-  divergence is a chain link that is not plain arithmetic (`f(n - 1 | .)`), a
-  nested `def` closing over the parameter (`def h: n - 1; ... f(h)`), or a
-  helper `def` in the argument (`f(g(n))`): each refuses at ~170-220 levels,
-  where jq runs 100,000 in 22-42 MB. Such a link goes through the demand-driven
-  evaluator, whose native stack per link is what the self-recursive generator
-  bullet below describes, and each level's continuation runs on top of the
-  previous level's live chain, so the stack grows with the *square* of the
-  depth: 4x the stack buys 2x the levels. No stack size closes that gap; a
-  bounded-stack path for such links would
-  ([#3287](https://github.com/rust-works/succinctly/issues/3287)). Before #3262
-  all three aborted the process at ~240-330 levels with the guard on. Tree
+  where the stack really runs out. jq answers all of these. A chain link that
+  is not plain arithmetic (`f(n - 1 | .)`), a nested `def` closing over the
+  parameter (`def h: n - 1; ... f(h)`), or a helper `def` in the argument
+  (`f(g(n))`) used to go through the demand-driven evaluator, whose native
+  stack per link is what the self-recursive generator bullet below describes:
+  each refused at ~115-220 levels after #3262 and aborted at ~240-330 before
+  it. Since [#3287](https://github.com/rust-works/succinctly/issues/3287) any
+  argument that is pure and finite, and reads only arguments that are, is read
+  eagerly, and the three stop at ~8,560, ~8,950 and ~9,580 levels (same
+  machine). A link that calls a builtin (`f(n - 1 | select(true))`) or reads
+  an argument holding an effect or generator further down its chain keeps the
+  demand-driven path and its ~150-level ceiling: there the laziness is
+  observable, and a bounded-stack evaluator is what would lift it. Tree
   recursion that combines two calls with `+` or `as` (`fib(n - 1) + fib(n -
   2)`) used to run each right-hand call inside its left sibling's output sink,
   so its stack grew with the number of *calls*; since

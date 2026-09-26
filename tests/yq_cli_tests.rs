@@ -35584,7 +35584,7 @@ fn test_runaway_recursion_errors_cleanly_in_yq_mode_1371() -> Result<()> {
 /// and answers shallow.
 #[test]
 fn test_argument_chain_refuses_in_yq_mode_3262() -> Result<()> {
-    let def = "def f(n): if n == 0 then .a else f(n - 1 | .) end;";
+    let def = "def f(n): if n == 0 then .a else f(n - 1 | select(true)) end;";
     for (filter, args) in [
         (format!("{def} f(3000)"), &[][..]),
         (format!("first({def} f(3000))"), &["--jq-extensions"][..]),
@@ -35618,6 +35618,23 @@ fn test_tree_recursion_stack_follows_depth_in_yq_mode_3296() -> Result<()> {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
         assert_eq!(stdout.trim_end(), "46368", "{filter}");
+    }
+    Ok(())
+}
+
+/// #3287: the generic evaluator's `Shared` arm reads a pure, finite argument
+/// eagerly too, so a pipe or `def` link recurses far past the ~150 levels the
+/// demand-driven path allowed.
+#[test]
+fn test_pure_chain_links_recurse_deep_in_yq_mode_3287() -> Result<()> {
+    for body in [
+        "def f(n): if n == 0 then 0 else f(n - 1 | .) end;",
+        "def g(x): x - 1; def f(n): if n == 0 then 0 else f(g(n)) end;",
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(&format!("{body} f(1000)"), "a: 1\n", &[])?;
+        assert_eq!(code, 0, "{body}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), "0", "{body}");
     }
     Ok(())
 }
