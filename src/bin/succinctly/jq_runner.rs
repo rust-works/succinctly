@@ -467,6 +467,17 @@ fn dedup_bindings_last_wins(bindings: Vec<(String, OwnedValue)>) -> Vec<(String,
     map.into_iter().collect()
 }
 
+/// Adapt an owned `(name, value)` list into the `(&str, &OwnedValue)` pairs
+/// [`jq::substitute_vars`] takes -- the library crate's own `as_var_refs`
+/// (`src/jq/eval.rs`) does the identical one-line projection, but is
+/// `pub(crate)` to that crate and so unreachable from this binary crate;
+/// this is the local twin [`ModuleLoader::load_and_bind_module`] and
+/// [`ModuleLoader::process_program`] both call rather than each writing the
+/// same closure inline.
+fn as_var_refs(bindings: &[(String, OwnedValue)]) -> impl Iterator<Item = (&str, &OwnedValue)> {
+    bindings.iter().map(|(n, v)| (n.as_str(), v))
+}
+
 /// Merge one directive's load failure into a "last failing directive"
 /// selection, keeping whichever carries the higher [`Import::decl_index`]
 /// (#2857).
@@ -1018,8 +1029,7 @@ impl ModuleLoader {
         Ok(own
             .into_iter()
             .map(|(name, params, body)| {
-                let body =
-                    jq::substitute_vars(&body, data_bindings.iter().map(|(n, v)| (n.as_str(), v)));
+                let body = jq::substitute_vars(&body, as_var_refs(&data_bindings));
                 // Groups keep declaration order, and each is wrapped in turn
                 // so the last-declared ends up innermost, exactly as the flat
                 // `wrap_defs` did before the grouping: `include "pa";
@@ -1374,7 +1384,7 @@ impl ModuleLoader {
         // too.
         if !data_bindings.is_empty() {
             let data_bindings = dedup_bindings_last_wins(data_bindings);
-            expr = jq::substitute_vars(&expr, data_bindings.iter().map(|(n, v)| (n.as_str(), v)));
+            expr = jq::substitute_vars(&expr, as_var_refs(&data_bindings));
         }
 
         // Every module some module depends on, outermost first, and every
