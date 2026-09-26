@@ -793,11 +793,10 @@ impl ModuleLoader {
     /// Load a module if it is not already cached, and borrow its function
     /// definitions (name, params, body) in place.
     ///
-    /// The borrowing form exists so a caller that only needs to *read* the
-    /// defs -- [`Self::unqualified_def_names`], which wants their names --
-    /// does not pay for a deep clone of every def body it is about to drop
-    /// (#2395). [`Self::load_module`] is this plus that clone, for callers
-    /// that need an owned copy.
+    /// Borrowing, so a caller that only needs to *read* the defs --
+    /// [`Self::unqualified_def_names`], which wants their names -- does not
+    /// pay for a deep clone of every def body it is about to drop (#2395).
+    /// [`Self::process_program`] clones only the bodies it wraps.
     ///
     /// The defs handed back are the module's **own** defs only, each with
     /// forwarding stubs for its module's dependencies already wrapped around
@@ -1055,7 +1054,10 @@ impl ModuleLoader {
     /// chain's deepest module first (captured live for all three shapes). A
     /// module that is also a top-level `include`/`import` is walked for its
     /// dependencies but not recorded for itself unless something depends on
-    /// it: its top-level run already carries its defs.
+    /// it: its top-level run already carries its defs. When something does,
+    /// it is recorded like any dependency, and its top-level run forwards to
+    /// the link run instead of carrying a second copy of the bodies (#3153,
+    /// [`Self::top_run_defs`]).
     ///
     /// `top_ids` is each top-level `include`/non-data `import`'s
     /// `(decl_index, run id)`, exactly as [`Self::process_program`] already
@@ -1104,12 +1106,6 @@ impl ModuleLoader {
             visit(self, id, false, &mut expanded, &mut recorded, &mut order);
         }
         order
-    }
-
-    /// Load a module and return an owned copy of its function definitions
-    /// (name, params, body).
-    pub fn load_module(&mut self, module_path: &str) -> Result<FuncDefList, ModuleLoadError> {
-        self.ensure_module_loaded(module_path).cloned()
     }
 
     /// Every def name this program's modules will put into the main filter's
@@ -1189,15 +1185,25 @@ impl ModuleLoader {
         // in source order, across both kinds. Every directive is still given
         // its turn to load (the ones that fail simply wrap nothing), failures
         // are merged against the running last via `decl_index`, and the
-        // survivor is returned after both loops. On success the wrapping
-        // order below is bit-for-bit what it was before this issue.
+        // survivor is returned after both loops.
+        //
+        // Loading is a pass of its own, ahead of any wrapping (#3153): which
+        // top-level runs carry bodies and which carry forwarding stubs
+        // depends on which modules end up linked, and that is only known once
+        // every directive -- and so every module's own dependencies -- has
+        // loaded. The wrapping order below is bit-for-bit what it was before.
 
         let mut last_err: Option<(usize, ModuleLoadError)> = None;
         // Every top-level `include`/non-data `import`'s (decl_index, run id),
-        // collected as each is resolved below so `link_dependency_runs` ->
-        // `hoist_order` can place them without re-resolving the same paths
-        // through the filesystem a second time.
+        // collected as each is resolved below so `hoist_order` can place them
+        // without re-resolving the same paths through the filesystem a second
+        // time.
         let mut top_ids: Vec<(usize, u32)> = Vec::new();
+        // The top-level runs to wrap, in wrapping order: run id and, for an
+        // `import`, its alias. `~/.jq` is wrapped between the two blocks and
+        // is not listed.
+        let mut include_runs: Vec<u32> = Vec::new();
+        let mut import_runs: Vec<(u32, &str)> = Vec::new();
 
         // #2682: each `expr = FuncDef { .., then: expr }` wraps the *previous*
         // `expr` one layer further in, so whichever source is processed
@@ -1219,31 +1225,16 @@ impl ModuleLoader {
         // it ends up innermost) and the whole includes block running before
         // the `~/.jq` block that follows it.
         for include in program.includes.iter().rev() {
-            let defs = match self.load_module(&include.path) {
-                Ok(defs) => defs,
-                Err(e) => {
-                    keep_last_decl_failure(&mut last_err, include.decl_index, e);
-                    continue;
-                }
-            };
-            // #2951: bracketed as a run, so these defs' own bodies cannot
-            // see the sibling `include`s and `~/.jq` block wrapped around
-            // them. Before this, `def sa: sb;` in one module resolved `sb`
-            // from an unrelated module that merely happened to be included
-            // first -- and reversing the two `include`s made it agree with
-            // jq again, by accident.
+            if let Err(e) = self.ensure_module_loaded(&include.path) {
+                keep_last_decl_failure(&mut last_err, include.decl_index, e);
+                continue;
+            }
             let id = self.run_id_for(&include.path);
             top_ids.push((include.decl_index, id));
-            expr = wrap_run(expr, defs, id, None);
+            include_runs.push(id);
         }
 
-        // `~/.jq`'s own defs: lowest priority of the two unqualified
-        // sources (loses to any `include`d module of the same name, but
-        // still beats a name that was never `include`d at all).
-        expr = wrap_run(expr, self.auto_loaded_defs.clone(), AUTO_LOAD_RUN_ID, None);
-
         // Process imports (definitions available under namespace::)
-        // Load modules and add their functions with namespace prefixes
         for import in &program.imports {
             // The same data-import handling the module path uses (#2865), so
             // the two agree: a data import binds a `$`-variable rather than a
@@ -1262,34 +1253,59 @@ impl ModuleLoader {
                 }
                 continue;
             }
-            let defs = match self.load_module(&import.path) {
-                Ok(defs) => defs,
-                Err(e) => {
-                    keep_last_decl_failure(&mut last_err, import.decl_index, e);
-                    continue;
-                }
-            };
-            let namespace = &import.alias;
-
-            // Add each function with a namespaced name (namespace::funcname)
-            let defs = defs
-                .into_iter()
-                .map(|(name, params, body)| (format!("{namespace}::{name}"), params, body))
-                .collect();
-            // The alias rides the begin marker (#2989): only the defs of
-            // *this* run were namespaced, so a bare sibling call inside one
-            // of their bodies is retried as `alias::name` by the resolver,
-            // and only within this run.
+            if let Err(e) = self.ensure_module_loaded(&import.path) {
+                keep_last_decl_failure(&mut last_err, import.decl_index, e);
+                continue;
+            }
             let id = self.run_id_for(&import.path);
             top_ids.push((import.decl_index, id));
-            expr = wrap_run(expr, defs, id, Some(namespace));
+            import_runs.push((id, import.alias.as_str()));
         }
 
         if let Some((_, e)) = last_err {
             return Err(e);
         }
 
-        expr = self.link_dependency_runs(program, &top_ids, expr);
+        // Every module some module depends on, outermost first, and every
+        // name reached from the main filter through the top-level runs --
+        // see `link_dependency_runs`. Both are computed before any top-level
+        // run is wrapped, because a module that is linked *and* top-level
+        // gets stubs rather than bodies in its top-level run (#3153).
+        let order = self.hoist_order(&top_ids);
+        let linked: BTreeSet<u32> = order.iter().copied().collect();
+        let wanted = if linked.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.top_level_wanted(program, &include_runs, &import_runs, &linked)
+        };
+
+        for &id in &include_runs {
+            // #2951: bracketed as a run, so these defs' own bodies cannot
+            // see the sibling `include`s and `~/.jq` block wrapped around
+            // them. Before this, `def sa: sb;` in one module resolved `sb`
+            // from an unrelated module that merely happened to be included
+            // first -- and reversing the two `include`s made it agree with
+            // jq again, by accident.
+            let defs = self.top_run_defs(id, None, &linked, &wanted);
+            expr = wrap_run(expr, defs, id, None);
+        }
+
+        // `~/.jq`'s own defs: lowest priority of the two unqualified
+        // sources (loses to any `include`d module of the same name, but
+        // still beats a name that was never `include`d at all).
+        expr = wrap_run(expr, self.auto_loaded_defs.clone(), AUTO_LOAD_RUN_ID, None);
+
+        for &(id, namespace) in &import_runs {
+            // Each function under a namespaced name (namespace::funcname).
+            // The alias rides the begin marker (#2989): only the defs of
+            // *this* run were namespaced, so a bare sibling call inside one
+            // of their bodies is retried as `alias::name` by the resolver,
+            // and only within this run.
+            let defs = self.top_run_defs(id, Some(namespace), &linked, &wanted);
+            expr = wrap_run(expr, defs, id, Some(namespace));
+        }
+
+        expr = self.link_dependency_runs(&order, wanted, expr);
 
         // Transform NamespacedCall expressions to regular FuncCall expressions
         expr = rewrite_namespaced_calls(expr);
@@ -1297,13 +1313,188 @@ impl ModuleLoader {
         Ok(expr)
     }
 
-    /// Wrap `expr` in one link run per module some module depends on
-    /// (#2955): each such module's defs, once, under their
+    /// The defs of one top-level run: module `id`'s own defs, spelt
+    /// `alias::name` for an `import` and bare for an `include`.
+    ///
+    /// ### A module that is also linked carries stubs, not bodies (#3153)
+    ///
+    /// When `id` is in `linked` -- some other module depends on it, so it
+    /// also gets a link run of its own -- every def the main filter reaches
+    /// (its spelling is in `wanted`) is emitted as a
+    /// [`forwarding_stub`] into that link run instead of as a second copy of
+    /// its body, and its link name is added to `wanted` so the link run keeps
+    /// the body. The body then exists once, in the link run, which sits
+    /// outermost and is therefore visible from every stub, whatever order
+    /// the directives were declared in. The other way round -- keeping the
+    /// bodies here and aliasing the link names to them -- only works when
+    /// the dependent happens to be wrapped inside this run, and never when
+    /// the dependent is itself a link run.
+    ///
+    /// Inside the link run the bodies resolve their siblings exactly as they
+    /// do here, one run over: a bare sibling call floors at the run's begin
+    /// marker and is retried under its alias. Same-name entries need no
+    /// special case even though their link names collapse onto one: the main
+    /// filter only ever reaches the last one, and an earlier one is reached
+    /// only from a sibling's body, which is itself a stub now and resolves it
+    /// lexically inside the link run (`def c: 7; def g: c; def c: 8;` still
+    /// gives `[g, c]` as `[7, 8]`, as jq does).
+    ///
+    /// A def of such a module that nothing reaches under this run's
+    /// spelling is dropped rather than emitted: nothing resolves to it, so
+    /// the drop is unobservable (the resolver never checks an unreached body
+    /// either, #2740), and emitting it would be a second copy of a body the
+    /// link run may well carry because a dependent reaches it under another
+    /// spelling (`import "m" as q; include "c"` with `c` = `include "m"`).
+    /// A module that is not linked keeps every def, reached or not, exactly
+    /// as before.
+    fn top_run_defs(
+        &self,
+        id: u32,
+        alias: Option<&str>,
+        linked: &BTreeSet<u32>,
+        wanted: &BTreeSet<String>,
+    ) -> FuncDefList {
+        let Some(defs) = self.module_defs(id) else {
+            return Vec::new();
+        };
+        let is_linked = linked.contains(&id);
+        defs.iter()
+            .filter_map(|(name, params, body)| {
+                let spelled = match alias {
+                    Some(ns) => format!("{ns}::{name}"),
+                    None => name.clone(),
+                };
+                if !is_linked {
+                    Some((spelled, params.clone(), body.clone()))
+                } else if wanted.contains(&spelled) {
+                    // `top_level_wanted` already put the link name in
+                    // `wanted`, so the link run keeps the body.
+                    Some(forwarding_stub(
+                        spelled,
+                        params,
+                        jq::ModuleRun::link_name(id, name),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Module `id`'s loaded defs. `run_origin` and `loaded_modules` are both
+    /// keyed by the same canonical file (#2955), so `id`'s origin is directly
+    /// a `loaded_modules` key -- no separate `id -> loaded_modules key` map is
+    /// needed once both agree on canonicalization.
+    fn module_defs(&self, id: u32) -> Option<&FuncDefList> {
+        self.run_origin(id).and_then(|k| self.loaded_modules.get(k))
+    }
+
+    /// Every name reached from the main filter through the top-level runs,
+    /// as the reaching call spells it: bare for an `include`d or `~/.jq`
+    /// def, `alias::name` for an `import`ed one, and a link name for a stub
+    /// a reached body carries. Seeded from the main filter, then closed over
+    /// the top-level runs' defs.
+    ///
+    /// An `import`ed def calls its siblings bare, and the resolver retries
+    /// that call as `alias::name` (#2989); the closure has to retry it the
+    /// same way, or a sibling reached only that way looks unreached and what
+    /// *it* depends on is never linked (a compile error naming the missing
+    /// link, in a program jq runs).
+    ///
+    /// This is the top-level twin of the per-linked-module fixed point in
+    /// [`Self::link_dependency_runs`]: both share `grow_to_fixed_point` for
+    /// the "grow until nothing new resolves" iteration itself, but what a
+    /// visit *does* still differs, over a different candidate list (`top`'s
+    /// alias-qualified entries here, `defs`'s bare-named ones there) because
+    /// a module can be imported under several different aliases at the top
+    /// level but a hoisted link run is keyed by one globally unique id. A
+    /// retry rule fixed in one almost certainly needs the same fix in the
+    /// other.
+    ///
+    /// A reached def of a module in `linked` contributes its link name
+    /// instead of its body's calls (#3153): its top-level entry is a
+    /// forwarding stub into the link run, so the body -- and what it calls,
+    /// siblings and dependencies alike -- is reached from there, by
+    /// [`Self::link_dependency_runs`]' own fixed point. Expanding it here as
+    /// well would mark siblings only the link run can reach, and give each a
+    /// top-level stub nothing calls.
+    ///
+    /// At the fixed point an entry is reached exactly when its spelling is in
+    /// the returned set, which is what [`Self::top_run_defs`] reads.
+    fn top_level_wanted(
+        &self,
+        program: &Program,
+        include_runs: &[u32],
+        import_runs: &[(u32, &str)],
+        linked: &BTreeSet<u32>,
+    ) -> BTreeSet<String> {
+        struct Entry<'a> {
+            spelled: String,
+            body: &'a Expr,
+            alias: Option<&'a str>,
+            // The link name to forward to, for a def of a linked module.
+            link: Option<String>,
+            kept: bool,
+        }
+        let mut wanted: BTreeSet<String> = called_func_names(&program.expr);
+        let mut top: Vec<Entry> = Vec::new();
+        let runs = include_runs
+            .iter()
+            .map(|&id| (id, None))
+            .chain(import_runs.iter().map(|&(id, ns)| (id, Some(ns))));
+        for (id, alias) in runs {
+            let Some(defs) = self.module_defs(id) else {
+                continue;
+            };
+            let is_linked = linked.contains(&id);
+            top.extend(defs.iter().map(|(n, _, b)| Entry {
+                spelled: alias.map_or_else(|| n.clone(), |ns| format!("{ns}::{n}")),
+                body: b,
+                alias,
+                link: is_linked.then(|| jq::ModuleRun::link_name(id, n)),
+                kept: false,
+            }));
+        }
+        top.extend(self.auto_loaded_defs.iter().map(|(n, _, b)| Entry {
+            spelled: n.clone(),
+            body: b,
+            alias: None,
+            link: None,
+            kept: false,
+        }));
+        grow_to_fixed_point(top.len(), |i| {
+            let entry = &mut top[i];
+            if entry.kept || !wanted.contains(entry.spelled.as_str()) {
+                return false;
+            }
+            entry.kept = true;
+            let before = wanted.len();
+            if let Some(link) = &entry.link {
+                wanted.insert(link.clone());
+                return wanted.len() != before;
+            }
+            for called in called_func_names(entry.body) {
+                if let Some(alias) = entry.alias {
+                    if !called.contains("::") {
+                        wanted.insert(format!("{alias}::{called}"));
+                    }
+                }
+                wanted.insert(called);
+            }
+            wanted.len() != before
+        });
+        wanted
+    }
+
+    /// Wrap `expr` in one link run per module in `order` (#2955), which is
+    /// [`Self::hoist_order`]'s: each such module's defs, once, under their
     /// [`jq::ModuleRun::link_name`]s, in a run whose alias is the module's
     /// [`jq::ModuleRun::link_alias`], outermost of everything -- outside the
-    /// imports, `~/.jq` and includes already wrapped around `expr` -- and in
-    /// [`Self::hoist_order`], so every module sits outside the modules that
-    /// depend on it.
+    /// imports, `~/.jq` and includes already wrapped around `expr` -- so
+    /// every module sits outside the modules that depend on it. `wanted` is
+    /// [`Self::top_level_wanted`], plus the link name of every def a
+    /// top-level run forwards here instead of carrying (#3153, see
+    /// [`Self::top_run_defs`]).
     ///
     /// A consuming def reaches a linked def through the forwarding stub
     /// [`dep_stubs_for`] wrapped into its body; a linked def's own bare calls
@@ -1320,7 +1511,8 @@ impl ModuleLoader {
     /// in a module that depends on this one, or a kept sibling of its own.
     /// "Reached" is by name from the main filter outward: the filter's own
     /// calls, then the top-level runs' defs those name and everything *they*
-    /// name, and only then each linked module, dependents first (the reverse
+    /// name (including the top-level stubs of a module that is linked too),
+    /// and only then each linked module, dependents first (the reverse
     /// of the wrapping order), so it is a single pass. Dropping the rest is
     /// unobservable, since nothing resolves to a def nobody reached names --
     /// the resolver never checks an unreached body either (#2740). What it
@@ -1338,86 +1530,12 @@ impl ModuleLoader {
     /// def k: [g, c];` as `[7, 8]`, both as jq answers).
     fn link_dependency_runs(
         &self,
-        program: &Program,
-        top_ids: &[(usize, u32)],
+        order: &[u32],
+        mut wanted: BTreeSet<String>,
         mut expr: Expr,
     ) -> Expr {
-        let order = self.hoist_order(top_ids);
-        if order.is_empty() {
-            return expr;
-        }
-
-        // Every name reached so far, as the reaching call spells it: bare
-        // for an `include`d or `~/.jq` def, `alias::name` for an `import`ed
-        // one, and a link name once a stub is reached. Seeded from the main
-        // filter, then closed over the top-level runs' defs -- all of which
-        // are emitted regardless; this only decides what they pull in.
-        //
-        // An `import`ed def calls its siblings bare, and the resolver retries
-        // that call as `alias::name` (#2989); the closure has to retry it the
-        // same way, or a sibling reached only that way looks unreached and
-        // what *it* depends on is never linked (a compile error naming the
-        // missing link, in a program jq runs).
-        //
-        // This is the top-level twin of the per-linked-module fixed point
-        // below: both share `grow_to_fixed_point` for the "grow until
-        // nothing new resolves" iteration itself, but what a visit *does*
-        // still differs, over a different candidate list (`top`'s
-        // alias-qualified entries here, `defs`'s bare-named ones there)
-        // because a module can be imported under several different aliases
-        // at the top level but a hoisted link run is keyed by one globally
-        // unique id. A retry rule fixed in one almost certainly needs the
-        // same fix in the other.
-        let mut wanted: BTreeSet<String> = called_func_names(&program.expr);
-        let mut top: Vec<(String, &Expr, Option<&str>, bool)> = Vec::new();
-        for include in &program.includes {
-            // `loaded_modules` is keyed canonically (#2955); `include.path` is
-            // the literal spelling as written, so it has to go through
-            // `run_key` the same way `ensure_module_loaded` does, or a
-            // spelling that differs from whichever one populated the cache
-            // would miss here even though the module is loaded.
-            if let Some(defs) = self.loaded_modules.get(&self.run_key(&include.path)) {
-                top.extend(defs.iter().map(|(n, _, b)| (n.clone(), b, None, false)));
-            }
-        }
-        for import in program.imports.iter().filter(|i| !i.data) {
-            if let Some(defs) = self.loaded_modules.get(&self.run_key(&import.path)) {
-                let ns = import.alias.as_str();
-                top.extend(
-                    defs.iter()
-                        .map(|(n, _, b)| (format!("{ns}::{n}"), b, Some(ns), false)),
-                );
-            }
-        }
-        top.extend(
-            self.auto_loaded_defs
-                .iter()
-                .map(|(n, _, b)| (n.clone(), b, None, false)),
-        );
-        grow_to_fixed_point(top.len(), |i| {
-            let (name, body, alias, kept) = &mut top[i];
-            if *kept || !wanted.contains(name.as_str()) {
-                return false;
-            }
-            *kept = true;
-            let before = wanted.len();
-            for called in called_func_names(body) {
-                if let Some(alias) = alias {
-                    if !called.contains("::") {
-                        wanted.insert(format!("{alias}::{called}"));
-                    }
-                }
-                wanted.insert(called);
-            }
-            wanted.len() != before
-        });
-
         for &id in order.iter().rev() {
-            // `run_origin` and `loaded_modules` are both keyed by the same
-            // canonical file (#2955), so `id`'s origin is directly a
-            // `loaded_modules` key -- no separate `id -> loaded_modules key`
-            // map is needed once both agree on canonicalization.
-            let Some(defs) = self.run_origin(id).and_then(|k| self.loaded_modules.get(k)) else {
+            let Some(defs) = self.module_defs(id) else {
                 continue;
             };
 
@@ -8890,7 +9008,7 @@ mod tests {
     /// cannot be resolved still gets one.
     ///
     /// The unresolvable arm is not reachable through the CLI -- every caller
-    /// runs after a successful `load_module` -- but it is not dead either:
+    /// runs after a successful `ensure_module_loaded` -- but it is not dead either:
     /// it is what keeps `run_id_for` total, and a run id is only ever a
     /// diagnostic key, never a correctness one (`scan_scope` pairs a begin
     /// marker with an end by nesting, not by id). Unit-tested rather than
@@ -9009,6 +9127,103 @@ mod tests {
         }
     }
 
+    /// #3153: a module that is both a top-level `include`/`import` and a
+    /// dependency of another top-level module has its bodies in the
+    /// processed program **once**, in its link run; its top-level run holds
+    /// forwarding stubs. Output cannot show the duplicate (both copies
+    /// answer the same), so this counts it: `helper`'s body is the only
+    /// place `marker_3153` is called, and before the fix it appeared twice,
+    /// once per run.
+    mod top_level_and_linked_module_is_emitted_once_3153 {
+        use super::*;
+
+        /// The processed program for `filter`, with `shared` and its
+        /// dependent `consumer` on the search path.
+        fn process(filter: &str) -> Expr {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                dir.path().join("shared.jq"),
+                "def marker_3153: 1; def helper: marker_3153 + 1;\n",
+            )
+            .expect("write shared");
+            std::fs::write(
+                dir.path().join("consumer.jq"),
+                "include \"shared\"; def use_helper: helper;\n",
+            )
+            .expect("write consumer");
+            let mut loader = ModuleLoader::new(&[dir.path().to_path_buf()]);
+            let program = jq::parse_program(filter).expect("parse");
+            loader.unqualified_def_names(&program).expect("names");
+            loader.process_program(&program).expect("process")
+        }
+
+        /// How many nodes of `expr` match `pred`.
+        fn count(expr: &Expr, pred: impl Fn(&Expr) -> bool) -> usize {
+            let mut n = 0usize;
+            succinctly::jq::walk::any_subexpr(expr, &mut |node| {
+                n += usize::from(pred(node));
+                false
+            });
+            n
+        }
+
+        fn marker_calls(filter: &str) -> usize {
+            count(
+                &process(filter),
+                |node| matches!(node, Expr::FuncCall { name, .. } if name == "marker_3153"),
+            )
+        }
+
+        #[test]
+        fn doubly_reached_body_appears_once() {
+            for filter in [
+                r#"include "shared"; include "consumer"; [helper, use_helper]"#,
+                r#"include "consumer"; include "shared"; [helper, use_helper]"#,
+                r#"import "shared" as s; include "consumer"; [s::helper, use_helper]"#,
+                // Review of #3153: the dependent reaches `helper` under a
+                // spelling the top-level run does not use, so the top-level
+                // entry is unreached -- and still a second copy until it was
+                // dropped.
+                r#"import "shared" as s; include "consumer"; use_helper"#,
+                r#"include "shared"; include "consumer"; use_helper"#,
+                r#"include "shared"; import "consumer" as c; c::use_helper"#,
+            ] {
+                assert_eq!(marker_calls(filter), 1, "{filter}");
+            }
+        }
+
+        /// Review of #3153: `marker_3153` is called only from `helper`'s
+        /// body, which lives in the link run, so the top-level run carries
+        /// nothing for `marker_3153` (only `helper` gets a stub there).
+        #[test]
+        fn a_sibling_reached_only_through_a_stub_gets_no_stub() {
+            for filter in [
+                r#"include "shared"; include "consumer"; [helper, use_helper]"#,
+                r#"import "shared" as s; include "consumer"; [s::helper, use_helper]"#,
+            ] {
+                let expr = process(filter);
+                let top_level_defs = |spelled: &str| {
+                    count(
+                        &expr,
+                        |node| matches!(node, Expr::FuncDef { name, .. } if name == spelled),
+                    )
+                };
+                let ns = if filter.starts_with("import") {
+                    "s::"
+                } else {
+                    ""
+                };
+                assert_eq!(top_level_defs(&format!("{ns}marker_3153")), 0, "{filter}");
+            }
+        }
+
+        /// The control: with no dependent, the top-level run keeps its body.
+        #[test]
+        fn top_level_only_module_keeps_its_body() {
+            assert_eq!(marker_calls(r#"include "shared"; helper"#), 1);
+        }
+    }
+
     /// #2955 review: `loaded_modules` must be keyed by the canonical file
     /// (`ModuleLoader::run_key`), not the literal path a caller wrote, or two
     /// spellings of one module reaching it from different includers (`"dep"`
@@ -9043,8 +9258,8 @@ mod tests {
             .expect("write s2");
 
             let mut loader = ModuleLoader::new(&[dir.path().to_path_buf()]);
-            loader.load_module("s1").expect("load s1");
-            loader.load_module("s2").expect("load s2");
+            loader.ensure_module_loaded("s1").expect("load s1");
+            loader.ensure_module_loaded("s2").expect("load s2");
 
             assert_eq!(
                 loader.loaded_modules.len(),
