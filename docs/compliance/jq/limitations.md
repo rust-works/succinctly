@@ -1066,9 +1066,20 @@ is the revert that established what the other one costs.
    | `. as $x \| .a as $y \| [.] \| path(.[0].a \| $y)`                                                                                                                                                                                | `$x` is bound first, so `[.]` reuses `$x`'s own value, whose `.a` is `$x`'s materialization, not `$y`'s: sharing it needs an *ancestor* lookup when `$y` is bound, the mirror of #3179's nested reuse (jq `[0,"a"]`; the other bind order answers since #3179)                                                                                                                                                                                            |
    | `[.] \| .[0] \|= . \| .[0]`, `[1,2] \| .[0:2]` (all `\| path($x)`)                                                                                                                                                                | none is one of `embed_peel_step`'s recognized head stages (`.foo`/`.[n]`/`.[]`/`add`/`min`/`max`, and since #3178 `sort`/`unique`/`reverse`/`to_entries`/a literal `getpath`, after leading `.` stages are skipped), and a write (`\|=`) always runs through the assignment resolver first — so each re-indexes on the owned route before the read reaches the shared value                                                                               |
    | `reduce (1) as $i (.; if true then . else 1 end) \| path($x)`                                                                                                                                                                     | the UPDATE is not one of the owned fast paths (`eval_owned_navigation`/`eval_owned_relocating_fold`), so the fold's own hoisted per-step reroot rebuilds the accumulator before `path($x)` reads it                                                                                                                                                                                                                                                       |
-   | a marker inside a fold's UPDATE naming the accumulator                                                                                                                                                                            | `reduce_forks`/`foreach_forks`'s hoisted per-step reroot demotes UPDATE against `Owned` once by design, not upgraded here — an owned witness lookup on every fold step priced +3% (#3036)                                                                                                                                                                                                                                                                 |
+   | `[.] \| reduce (1) as $i (.[0]; ($x.a) = 9)` (a fold over an owned input), `reduce (.) as $x (.; path($x))` (the fold's own loop variable)                                                                                        | #3181 witnesses each fold step's accumulator, so a marker naming it now answers; a fold at the head of an owned re-entry still bridges its input first, so INIT is a copy ([#3328](https://github.com/rust-works/succinctly/issues/3328)), and a loop variable is substituted as a literal, never a marker ([#3329](https://github.com/rust-works/succinctly/issues/3329))                                                                                |
    | `no_std` builds                                                                                                                                                                                                                   | `embed_table` is thread-local; without `std` it is a no-op, refuse-only like `file_index`                                                                                                                                                                                                                                                                                                                                                                 |
    | `succinctly yq`                                                                                                                                                                                                                   | unchanged by design — `RootWitness::of_owned` is gated on `S::TAG == EvalTag::Jq`; yq's node model is #2643's business (ADR-0018)                                                                                                                                                                                                                                                                                                                         |
+
+   **[#3181](https://github.com/rust-works/succinctly/issues/3181), now closed: a marker
+   inside a fold's UPDATE or EXTRACT naming the accumulator.** `. as $x \| reduce (1) as $i
+   (.; ($x.a) = 9)` is `{"a":9}` in jq, because INIT `.` places `$x`'s own value.
+   `reduce_forks`/`foreach_forks` still demote their operands once per fold, against `Owned`
+   (#3036). When that hoist changed anything, `FoldOperand::against` asks
+   `RootWitness::of_owned` per step whether the step's accumulator (or, for EXTRACT, the UPDATE
+   output) is still an in-scope binding's node, and reroots the operand as written against it
+   if so. A fold whose operands the hoist left alone pays nothing per step. Later steps refuse
+   as jq does once a write has rebuilt the accumulator (`reduce (1,2) as $i (.; ($x.a) = 9)`),
+   and so does a literal INIT equal to `$x`.
 
    **[#2575](https://github.com/rust-works/succinctly/issues/2575)
    closed one row of this residual as a side effect, not a targeted fix**: `[.] \| .[0] \|
@@ -1179,9 +1190,10 @@ is the revert that established what the other one costs.
      catch "c"` the refusal is *caught* and the handler's `"c"` is printed -- the same
      wrapper class as `path()`'s, [#3189](https://github.com/rust-works/succinctly/issues/3189));
    - a navigated bind (`.a as $y \| [.] \| (.[0].a \| $y).b = 9`,
-     [#3179](https://github.com/rust-works/succinctly/issues/3179)) and a write inside a fold's
-     UPDATE (`reduce range(1) as $i (.; del(.[0] \| $x))`,
-     [#3181](https://github.com/rust-works/succinctly/issues/3181));
+     [#3179](https://github.com/rust-works/succinctly/issues/3179)) and a write inside a fold
+     over the owned input (`[.] \| reduce range(1) as $i (.; del(.[0] \| $x))`,
+     [#3328](https://github.com/rust-works/succinctly/issues/3328); a marker naming the
+     accumulator itself answers since [#3181](https://github.com/rust-works/succinctly/issues/3181));
    - a write reached after `.[]` peels the container (`[.] \| [.[] \| del(. \| $x)]`);
    - a target whose later path raises (`del(.[0] \| $x, .[0])` reports the bridge's refusal
      where jq reports the second path's `Cannot index object with number`);
