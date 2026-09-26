@@ -65511,10 +65511,11 @@ fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
 /// What #3037 leaves refusing, pinned so a later widening is deliberate.
 /// jq 1.7.1 answers every row; each is the safe direction.
 ///
-/// - The positional rows: the marker certified at a non-root register
-///   position inside the invocation (`path(.a | $y)`, `(.a | ($y.b)) = 9`)
-///   needs a document-absolute bind path, the #2042 `Origin::At` machinery
-///   reached from a value-mode bind.
+/// - The positional assignment row: the marker certified at a non-root
+///   register position inside an assignment's resolver (`(.a | ($y.b)) =
+///   9`). Its `path(.a | $y)` twin answers since #3179: the resolver's
+///   materialized root now holds `$y`'s own value at `.a`, where the
+///   assignment resolver does not materialize through `to_owned_cursor`.
 /// - A navigated bind on an *owned-rooted* document (`input | …`, `-n`, a
 ///   `tojson|fromjson`-rebuilt root): the marker's node is an
 ///   `OwnedIdentity` position, and `marker_is_root` reads only a document
@@ -65531,10 +65532,7 @@ fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
 // clippy cannot tell the two apart from the brace shape alone (as `*_2642`).
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
-    for (input, filter) in [
-        (r#"{"a":{"b":1}}"#, r".a as $y | path(.a | $y)"),
-        (r#"{"a":{"b":1}}"#, r".a as $y | (.a | ($y.b)) = 9"),
-    ] {
+    for (input, filter) in [(r#"{"a":{"b":1}}"#, r".a as $y | (.a | ($y.b)) = 9")] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
             code, 5,
@@ -65549,6 +65547,83 @@ fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
     Ok(())
 }
 
+/// #3179: an embed of a bound node reached through a container built from
+/// one of its *ancestors*. The materializer now takes the binding's own
+/// value for a nested container, not only at its depth 0, so `{k:.}`'s copy
+/// of the root holds `$y`'s very value at `.a`, as jq's does. Every expected
+/// output captured live against jq 1.7.1 on `{"a":{"b":1},"c":{"b":1}}`.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_embed_reused_below_depth_zero_3179() -> Result<()> {
+    let input = r#"{"a":{"b":1},"c":{"b":1}}"#;
+    for (filter, expected) in [
+        (r".a as $y | . as $x | {k:.} | .k.a | path($y)", "[]"),
+        (r".a as $y | {k:.} | .k.a | path($y)", "[]"),
+        (r".a as $y | {k:.} | .k.a | ($y.b) = 9", r#"{"b":9}"#),
+        (r".a as $y | [.] | path(.[0].a | $y)", r#"[0,"a"]"#),
+        (r".a as $y | {k:{j:.}} | .k.j.a | path($y)", "[]"),
+        (r".a as $y | [.,.] | .[1].a | path($y)", "[]"),
+        (r".a as $y | {k:.} | .k.a | path($y.b)", r#"["b"]"#),
+        (
+            r".a as $y | .a as $z | {k:.} | .k.a | [path($y), path($z)]",
+            "[[],[]]",
+        ),
+        (r".a as $y | path(.a | $y)", r#"["a"]"#),
+        (
+            r".a as $y | . as $x | [.] | del(.[0].a | $y)",
+            r#"[{"c":{"b":1}}]"#,
+        ),
+        // The shared value is the one a fresh walk would build.
+        (r".a as $y | {k:.} | .k", r#"{"a":{"b":1},"c":{"b":1}}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3179: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    // A value-equal sibling is a different node; a write through the root
+    // copies `.a` first, so the result no longer is `$y`'s. jq refuses both.
+    for filter in [
+        r".a as $y | {k:.} | .k.c | path($y)",
+        r".a as $y | {k:.} | .k.a = 5 | .k.a | path($y)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3179: `{filter}` must stay refused: stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3179: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3179: nested reuse skips the walk of a shared subtree, so it must never
+/// skip the nesting-depth check that walk would have failed. `.a` below is
+/// `n` arrays deep (height `n - 1`) and sits at depth 1 of the root `{k:.}`
+/// materializes: the fresh walk passes exactly when `n < 256`
+/// (`MAX_NESTING_DEPTH`), so at `n = 255` the reuse answers and at `n = 256`
+/// the walk raises the same depth error it raised before #3179.
+#[test]
+fn test_embed_nested_reuse_keeps_the_depth_limit_3179() -> Result<()> {
+    let nested = |n: usize| format!(r#"{{"a":{}{}}}"#, "[".repeat(n), "]".repeat(n));
+    let filter = r".a as $y | {k:.} | .k.a | path($y)";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&nested(255)))?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        ("[]", 0),
+        "n=255: stderr={stderr:?}"
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&nested(256)))?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "n=256: stdout={stdout:?}");
+    assert!(stderr.contains("nesting depth"), "n=256: stderr={stderr:?}");
+    Ok(())
+}
 /// #3135: the owned-rooted twin of `test_navigated_bind_at_its_own_node_3037`.
 /// A navigated bind made on a document with no live cursor behind it -- the
 /// input queue, `-n`'s constructed root, a `tojson|fromjson`-rebuilt root --

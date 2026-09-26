@@ -839,7 +839,6 @@ CASES_EOF
 # other side: a `(` before a `#` in a reason made bash read the `#` as a
 # comment inside the `$( )`, so the closing `)` vanished).
 read -r -d '' REFUSE_ONLY <<'REFUSE_EOF' || true
-value-mode-binding-same-node:eval_as (value mode) binds with no path; the value-mode half of #2042 is the accepting-direction twin of #2642
 def-body-in-path:a def inside path() resolves as an opaque leaf, before #2042 too
 source-rebuilt-container:the source navigates inside a construction, which jq's suspended tracking allows but the resolver refuses; falls back to a plain value
 select-wrapped-source:the witness grammar is pure navigation (is_pure_navigation); a select-wrapped source binds by value
@@ -855,9 +854,8 @@ destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nest
 carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
 in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
-navigated-bind-positional-path:#3037 residual -- the marker certified at a non-root register position inside the invocation needs a document-absolute bind path -- the Origin::At machinery of #2042, reached from a value-mode bind; scoped separately
-navigated-bind-positional-assign:#3037 residual -- same as navigated-bind-positional-path, the write twin
-owned-embed-refuse-path-nested-ancestor-bind:#3177 -- reuse is depth-0 only (#2889): $y is a separate materialization of .a, and the .a inside $x's own storage is a different Rc, so the storage clause has nothing to match; jq answers [0,"a"]
+navigated-bind-positional-assign:#3037 residual -- the marker certified at a non-root register position inside an assignment's own resolver; the path() twin answers since #3179 (the resolver's materialized root now holds $y's own value), the assignment resolver does not materialize through to_owned_cursor
+owned-embed-refuse-path-nested-ancestor-bind:#3177 -- $x is bound first, so [.] reuses $x's own value, whose .a is $x's materialization, not $y's: sharing here needs an *ancestor* lookup when $y is bound, the mirror of #3179's nested reuse; jq answers [0,"a"]
 owned-embed-refuse-path-nested-comma:#3177 -- path() reached through a comma wrapper is not at the head of the owned re-entry's pipe, so it still crosses the bridge; taking it natively would mean re-implementing the wrapper's driver over an owned value (#3189)
 owned-embed-refuse-path-nested-wrapper:#3177 -- same as owned-embed-refuse-path-nested-comma, through an array constructor and limit
 owned-embed-refuse-path-nested-del-fractional:#3188 -- the write door will not re-spell a fractional index: del(.[-0.5]) deletes element 0 here and nothing in jq (#3302), so the static spelling would be a wrong answer
