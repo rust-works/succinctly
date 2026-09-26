@@ -80,6 +80,15 @@ pub struct ModuleLoader {
     /// (#2955) -- keying on the literal path used to let each spelling load
     /// and cache its own copy.
     loaded_modules: BTreeMap<String, FuncDefList>,
+    /// Per module (same key as [`Self::loaded_modules`], same length and
+    /// order as its `FuncDefList`): each def's own body's called names
+    /// *plus* the link-name target of every stub actually wrapped around it
+    /// (#3154). Recorded once, in [`Self::load_and_bind_module`], from data
+    /// already computed there for [`dep_stubs_for`]'s own use -- exactly what
+    /// a second `called_func_names` walk over the *wrapped* body would
+    /// recompute, which is what [`Self::link_dependency_runs`] used to do
+    /// before this table existed.
+    reachable_calls: BTreeMap<String, Vec<BTreeSet<String>>>,
     /// Auto-loaded ~/.jq file definitions (if file exists): name, params, body
     auto_loaded_defs: FuncDefList,
     /// The modules whose own dependencies are currently being loaded, as
@@ -835,6 +844,7 @@ impl ModuleLoader {
         Self {
             search_path,
             loaded_modules: BTreeMap::new(),
+            reachable_calls: BTreeMap::new(),
             auto_loaded_defs,
             loading: Vec::new(),
             run_ids: BTreeMap::new(),
@@ -911,8 +921,9 @@ impl ModuleLoader {
         // recursion being possible at all. It is genuinely unreachable: the
         // insert immediately above it is unconditional on this path.
         if !self.loaded_modules.contains_key(&key) {
-            let defs = self.load_and_bind_module(module_path)?;
+            let (defs, reachable) = self.load_and_bind_module(module_path)?;
             self.loaded_modules.insert(key.clone(), defs);
+            self.reachable_calls.insert(key.clone(), reachable);
         }
 
         Ok(self
@@ -966,7 +977,10 @@ impl ModuleLoader {
     /// `include "deep"` reports `module not found: deep` even with `deep.jq`
     /// sitting next to it. So reusing the search path verbatim is both the
     /// simple implementation and the faithful one.
-    fn load_and_bind_module(&mut self, module_path: &str) -> Result<FuncDefList, ModuleLoadError> {
+    fn load_and_bind_module(
+        &mut self,
+        module_path: &str,
+    ) -> Result<(FuncDefList, Vec<BTreeSet<String>>), ModuleLoadError> {
         // Resolve the module path
         let file_path = resolve_module_in(&self.search_path, module_path).ok_or_else(|| {
             ModuleLoadError::NotFound {
@@ -1026,7 +1040,17 @@ impl ModuleLoader {
         // `--arg`/`--argjson`, is untouched by a module's). The module's own
         // defs are left to the chain it is exported into -- see
         // [`dep_stubs_for`] for why nesting them here is unsound.
-        Ok(own
+        //
+        // Alongside each wrapped body, `reachable` records exactly what a
+        // second `called_func_names` walk over that *wrapped* body would
+        // find (#3154): `called`, the original body's own called names,
+        // already computed here for `dep_stubs_for`'s use, plus the
+        // link-name target of every stub this loop actually wraps in --
+        // `forwarding_stub`'s body is always a single bare call to that
+        // target, so extracting it needs no further walking either.
+        // `link_dependency_runs` reads this back later instead of
+        // re-deriving it.
+        let (own, reachable): (FuncDefList, Vec<BTreeSet<String>>) = own
             .into_iter()
             .map(|(name, params, body)| {
                 let body = jq::substitute_vars(&body, as_var_refs(&data_bindings));
@@ -1036,15 +1060,26 @@ impl ModuleLoader {
                 // include "pb";` with both defining `foo` resolves `foo` to
                 // `pb`'s, as at the top level.
                 let called = called_func_names(&body);
+                let mut reachable = called.clone();
                 let mut wrapped = body;
                 for (origin, alias, group) in deps.iter().rev() {
                     let stubs =
                         dep_stubs_for(group, *origin, alias.as_deref(), &name, &params, &called);
+                    for (_, _, stub_body) in &stubs {
+                        if let Expr::FuncCall {
+                            name: link_name, ..
+                        } = stub_body
+                        {
+                            reachable.insert(link_name.clone());
+                        }
+                    }
                     wrapped = wrap_defs(wrapped, stubs);
                 }
-                (name, params, wrapped)
+                ((name, params, wrapped), reachable)
             })
-            .collect())
+            .unzip();
+
+        Ok((own, reachable))
     }
 
     /// The signature of every def one module's own `include`/`import`
@@ -1659,6 +1694,15 @@ impl ModuleLoader {
             let Some(defs) = self.module_defs(id) else {
                 continue;
             };
+            // Recorded once, at load time, by `load_and_bind_module` -- see
+            // `reachable_calls`'s own doc comment (#3154). Same key
+            // `module_defs` just resolved `id` through, so an entry here is
+            // guaranteed whenever `defs` is `Some`: the two are always
+            // inserted together, in `ensure_module_loaded`.
+            let reachable = self
+                .run_origin(id)
+                .and_then(|k| self.reachable_calls.get(k))
+                .expect("reachable_calls is inserted alongside loaded_modules for every run id");
 
             // Name -> index, built once so the fixed point below is O(log D)
             // per sibling call rather than an O(D) scan of the whole module.
@@ -1687,15 +1731,15 @@ impl ModuleLoader {
                 .collect();
             let mut keep = vec![false; defs.len()];
             grow_to_fixed_point(defs.len(), |i| {
-                let (name, _, body) = &defs[i];
+                let (name, _, _) = &defs[i];
                 if keep[i] || !kept_names.contains(name.as_str()) {
                     return false;
                 }
                 keep[i] = true;
                 let mut grew = false;
-                for called in called_func_names(body) {
-                    if jq::ModuleRun::is_link_name(&called) {
-                        wanted.insert(called);
+                for called in &reachable[i] {
+                    if jq::ModuleRun::is_link_name(called) {
+                        wanted.insert(called.clone());
                     } else if let Some(&sibling_i) = name_index.get(called.as_str()) {
                         grew |= kept_names.insert(defs[sibling_i].0.as_str());
                     }
