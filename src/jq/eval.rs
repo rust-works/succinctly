@@ -41498,10 +41498,13 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
         // [`ResolveFlow`]'s own "never un-emit" rule and exactly what the
         // pre-#2267 `Err((out, ..))` tuple existed to reproduce.
         macro_rules! escape {
-            ($control:expr) => {{
-                target_escape = Some($control);
-                return Demand::Stop;
-            }};
+            // #2924: routes through the shared helper so this stop -- like
+            // every other escape-behind-a-stop in this file -- is
+            // classified for a `?//` sitting inside `key`'s own body,
+            // rather than stashing `target_escape` directly.
+            ($control:expr) => {
+                return stop_with_eval_escape(&mut target_escape, $control)
+            };
         }
         // #843: `target` is a no-op read of the untracked value itself, so
         // this key is the first real navigation attempted against it -- see
@@ -41674,8 +41677,8 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
         // prints only `["x"]` before raising `t` — `["y"]` is a branch
         // jq's generator never reaches.
         if let Some(control) = this_escape {
-            target_escape = Some(control);
-            return Demand::Stop;
+            // #2924: same reasoning as the `escape!` macro above.
+            return stop_with_eval_escape(&mut target_escape, control);
         }
         Demand::Continue
     });
@@ -42090,18 +42093,15 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
                         stopped = true;
                         Demand::Stop
                     }
-                    Err(control) => {
-                        inner_escape = Some(control);
-                        Demand::Stop
-                    }
+                    // #2924: same reasoning as `resolve_index_expr_sink`'s
+                    // `escape!` macro -- this stop needs the same `?//`
+                    // classification any other escape-behind-a-stop gets.
+                    Err(control) => stop_with_eval_escape(&mut inner_escape, control),
                 },
             );
         let ends_escape = match ends {
             Ok(escape) => escape,
-            Err(control) => {
-                inner_escape = Some(control);
-                return Demand::Stop;
-            }
+            Err(control) => return stop_with_eval_escape(&mut inner_escape, control),
         };
         // Priority within this iteration is `target` > `end` (#1517;
         // `start`'s own trailing escape is handled once, after the whole
@@ -42122,8 +42122,8 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
             return Demand::Stop;
         }
         if let Some(control) = ends_escape {
-            inner_escape = Some(control);
-            return Demand::Stop;
+            // #2924: same reasoning as the two sites above.
+            return stop_with_eval_escape(&mut inner_escape, control);
         }
         Demand::Continue
     });
@@ -46619,6 +46619,27 @@ mod nonretryable_stop {
 pub(crate) fn stop_with_escape(slot: &mut Option<Control>, control: Control) -> Demand {
     mark_nonretryable_escape(&control);
     *slot = Some(control);
+    Demand::Stop
+}
+
+/// [`stop_with_escape`] for `resolve_index_expr_sink`/`resolve_slice_expr_sink`
+/// (#2924), whose out-of-band slot holds an [`EvalEscape`] rather than a bare
+/// [`Control`] -- their own return type ([`ResolveFlow`]) has a dedicated
+/// `Escaped` variant, so the escape these two sinks stash is never actually
+/// lost at their own boundary the way it would be for a driver whose return
+/// type is a bare `Flow`/`Demand`. They still owe `?//` the same
+/// classification `stop_with_escape` records, though: the `key`/bound
+/// generator they are driving sees only this stop, and if a `?//` sits
+/// inside that generator's own body it needs `nonretryable_stop` set to
+/// classify it correctly, exactly as any other escape-behind-a-stop does.
+/// Round-trips the payload through [`Control`] rather than re-testing
+/// `is_retryable_control` here -- that classifier drifting into a second
+/// copy is the #106/#1313/#1457 lesson [`mark_nonretryable_escape`] itself
+/// exists to close off.
+pub(crate) fn stop_with_eval_escape(slot: &mut Option<EvalEscape>, escape: EvalEscape) -> Demand {
+    let control = Control::from(escape);
+    mark_nonretryable_escape(&control);
+    *slot = Some(EvalEscape::from(control));
     Demand::Stop
 }
 
@@ -107640,5 +107661,51 @@ mod touched_edge_cases_2999 {
     fn yq_zero_arity_path_at_the_root_is_empty() {
         assert_eq!(yq_json(br#"{"a":1}"#, "path"), "[]");
         assert_eq!(yq_json(br#"{"a":1}"#, ".a | path"), r#"["a"]"#);
+    }
+
+    /// #2924: `stop_with_eval_escape` -- the helper `resolve_index_expr_sink`
+    /// and `resolve_slice_expr_sink` now route through instead of stashing
+    /// `target_escape`/`inner_escape` directly -- must classify exactly like
+    /// its `Control`-shaped sibling [`stop_with_escape`]: `Halt` and an
+    /// uncatchable `Error` set [`nonretryable_stop`], an ordinary `Error` or
+    /// `Break` does not. Unit-level rather than an end-to-end jq repro
+    /// because no observable divergence was found for this gap despite a
+    /// live investigation (structural read: both resolvers reconstruct
+    /// `ResolveFlow::Escaped` from `target_escape`/`inner_escape` at their
+    /// own return boundary, which never degrades into a bare
+    /// `Flow::Stopped` the way a driver with only a `Flow`/`Demand` return
+    /// type would -- matching the issue's own "9000-shape fuzz found
+    /// nothing" report) -- this pins the classification contract directly
+    /// rather than leaving it uncovered.
+    #[test]
+    fn stop_with_eval_escape_classifies_like_stop_with_escape() {
+        clear_nonretryable_stop();
+        let mut slot: Option<EvalEscape> = None;
+        assert_eq!(
+            stop_with_eval_escape(&mut slot, EvalEscape::Halt(3)),
+            Demand::Stop
+        );
+        assert!(matches!(slot, Some(EvalEscape::Halt(3))));
+        assert!(nonretryable_stop::is_set());
+
+        clear_nonretryable_stop();
+        let mut slot: Option<EvalEscape> = None;
+        let uncatchable = EvalError::decode_failure("bad");
+        assert!(uncatchable.is_uncatchable_at_value_position());
+        assert_eq!(
+            stop_with_eval_escape(&mut slot, EvalEscape::Error(uncatchable)),
+            Demand::Stop
+        );
+        assert!(nonretryable_stop::is_set());
+
+        clear_nonretryable_stop();
+        let mut slot: Option<EvalEscape> = None;
+        assert_eq!(
+            stop_with_eval_escape(&mut slot, EvalEscape::Error(EvalError::new("boom"))),
+            Demand::Stop
+        );
+        assert!(matches!(slot, Some(EvalEscape::Error(_))));
+        assert!(!nonretryable_stop::is_set());
+        clear_nonretryable_stop();
     }
 }
