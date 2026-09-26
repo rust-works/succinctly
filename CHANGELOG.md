@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a `$` parameter bound to a literal costs nothing per call** (#3260).
+  Since #3149 every `$`-style parameter binds through an `as` around the body,
+  which re-walks and rebuilds the body on every call. A literal argument
+  (`f(.; 2)`) yields one value, raises nothing and reads no input, so it is now
+  substituted for `$name` once per call site, in the body that is cached
+  anyway: `def f($x; $y): $x * $y + $x; [range(1e6) | f(.; 2)] | add` runs in
+  0.050 s (was 0.070), and `f(2; 3)` in 0.030 s (was 0.070), user time on an
+  Apple M5 Max. The binding no longer adds a frame either, so a recursion that
+  threads literal `$` arguments reaches further before the depth limit.
+  Output is unchanged; a computed argument keeps its `as`.
+
 - **jq: a recursion whose argument is a pipe or a `def` call runs ~60x
   deeper** (#3287). `def f(n): ... f(n - 1 | .)`, a nested `def h: n - 1; ...
   f(h)` and a helper `f(g(n))` read their argument through the demand-driven
