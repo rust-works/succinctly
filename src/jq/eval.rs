@@ -38221,8 +38221,8 @@ fn is_pure_navigation(source: &Expr) -> bool {
 }
 
 /// One node of [`is_pure_navigation`]'s grammar. Shared with
-/// [`owned_write_door`], which admits a superset of it, so a node kind added
-/// here reaches both.
+/// [`classify_navigation`] and with [`owned_write_door`], which admits a
+/// superset of it, so a node kind added here reaches all three.
 fn is_pure_navigation_node(e: &Expr) -> bool {
     is_navigation_node(e)
         || matches!(
@@ -38272,18 +38272,7 @@ fn classify_navigation(source: &Expr) -> (bool, bool) {
     let mut navigates = false;
     let pure = !any_subexpr(source, &mut |e| {
         navigates |= is_navigation_node(e);
-        !(is_navigation_node(e)
-            || matches!(
-                e,
-                Expr::Identity
-                    | Expr::Pipe(_)
-                    | Expr::Comma(_)
-                    | Expr::Paren(_)
-                    | Expr::TrackedVar(_)
-                    | Expr::Literal(_)
-                    | Expr::Array(_)
-                    | Expr::Error(_)
-            ))
+        !is_pure_navigation_node(e)
     });
     (pure, navigates)
 }
