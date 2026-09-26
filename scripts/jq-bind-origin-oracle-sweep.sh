@@ -383,6 +383,11 @@ in-evaluator-control-no-route	{"a":1}	. as $x | {a:1} | ($x.a = 9)
 in-evaluator-control-first	{"a":1}	first(. as $x | {a:1} | ($x.a = 9))
 in-evaluator-control-map	{"a":1}	map(. as $x | {a:1} | ($x.a = 9))
 in-evaluator-input-direct-write	{"a":1} {"a":1}	input | . as $x | ($x.a) = 9
+in-evaluator-input-array-collect-embed	{"a":1} {"a":1}	[input | . as $x | {k:.} | .k | path($x)]
+in-evaluator-input-array-collect-inputs	{"a":1} {"a":1}	[inputs | . as $x | {k:.} | .k | path($x)]
+in-evaluator-input-array-collect-sort	{"a":1} {"a":1}	[input | . as $x | [.] | sort | .[0] | path($x)]
+in-evaluator-input-array-collect-write	{"a":1} {"a":1}	[input | . as $x | {k:.} | .k | ($x.a) = 5]
+in-evaluator-input-array-collect-rebuilt-copy	{"a":1} {"a":1}	[input | . as $x | [{"a":1}] | .[0] | path($x)]
 in-evaluator-input-direct-del	{"a":1} {"a":1}	input | . as $x | del($x.a)
 in-evaluator-input-first-path	{"a":1} {"a":1}	input | . as $x | first(.) | path($x)
 in-evaluator-input-select-path	{"a":1} {"a":1}	input | . as $x | select(true) | path($x)

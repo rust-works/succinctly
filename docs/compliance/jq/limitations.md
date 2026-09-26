@@ -1253,21 +1253,23 @@ is the revert that established what the other one costs.
    row in the `S ∈ {...}` set above now answers, read and write alike, along with the
    navigated-bind twins (`input | .a as $y | {k:.a} | .k | path($y)` and the `($y.b) = 9`
    write) — pinned in
-   `test_owned_embed_keeps_node_identity_on_the_input_bridge_2889`. Three residuals remain,
-   all specific to this route and pinned in
+   `test_owned_embed_keeps_node_identity_on_the_input_bridge_2889`. Three residuals were
+   left, all specific to this route; two are closed since and one remains, pinned in
    `test_input_bridge_embed_residuals_refuse_cleanly_2889`:
    - An **empty container** (`input | . as $x | {k:.} | .k | path($x)` on `{}` or `[]`)
      binds no node at all: `whole_container_cursor` has no retained child cursor to hop
      `parent()` from, so the table never gets an entry. jq answers `[]`; the generic
      evaluator, handed a real cursor rather than one recovered after the fact, still
      answers it — the one place the two routes still disagree, in the safe direction.
-   - A **further re-entry between the embed and the read** that carries no witness —
-     collecting the pipe into an array (`[input | . as $x | {k:.} | .k | path($x)]`) or
-     routing the embedded node through `getpath([])` first (`... | .k | getpath([]) |
-     path($x)`) — loses the table hit the bare twin of each gets.
-   - `input | .a as $y | .a | ($y.b) = 9`: the bind and the use are both plain cursor
-     navigations with no owned re-entry between them at all, so no embed lookup is ever
-     consulted (unchanged by Stage B — jq accepts, this refused identically before it too).
+     Closing it means keeping the container cursor on `JsonFields`/`JsonElements`, which are
+     `Copy` and on the hot iteration path, so it waits on a two-architecture measurement
+     ([#3180](https://github.com/rust-works/succinctly/issues/3180)).
+   - *Closed.* A further re-entry between the embed and the read: collecting the pipe into
+     an array (`[input | . as $x | {k:.} | .k | path($x)]`, `[inputs | ...]`) answers since
+     #3180 — the array constructor reaches its constructions through `eval_owned_input`,
+     the eager twin of `eval_each_owned`, which now takes the same embed peel and
+     relocating fold — and `... | .k | getpath([]) | path($x)` since #3178.
+   - *Closed.* `input | .a as $y | .a | ($y.b) = 9` answers since #3135.
    And
    [#2646](https://github.com/rust-works/succinctly/issues/2646) — `first`/`last`/`add`
    navigating inside their own jq-level definitions against a *constructed* value inside

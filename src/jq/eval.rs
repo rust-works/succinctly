@@ -46582,6 +46582,32 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => e.into(),
         };
     }
+    // #3180: the relocating fold and the embed peel, as in the lazy twin
+    // [`eval_each_owned`]. An eager caller -- an array constructor's
+    // collect, `[input | . as $x | {k:.} | .k | path($x)]` -- reaches a
+    // construction here, and without these the whole pipe bridged, so the
+    // stage standing on the embed saw a copy. Both only fire past their own
+    // payoff gates, so any other input bridges exactly as before.
+    if let Some(relocated) = eval_owned_relocating_fold::<S>(expr, input) {
+        return QueryResult::Owned(relocated);
+    }
+    if let Some((stepped, rest)) = embed_peel_step::<S>(expr, input, optional, reentry) {
+        let values = match stepped {
+            Ok(values) => values,
+            Err(e) => return e.into(),
+        };
+        let mut collected = Vec::new();
+        for value in values {
+            let flow = eval_each_owned::<S>(&rest, &value, optional, Reentry::REBUILT, &mut |v| {
+                collected.push(v);
+                Demand::Continue
+            });
+            if let Flow::Escaped(control) = flow {
+                return partial(collected, control);
+            }
+        }
+        return owned_vec_to_result(collected);
+    }
     // #3177: see `eval_each_owned`.
     if let Some((values, control)) = owned_path_door_collect::<S>(expr, input, optional, reentry) {
         return match control {
