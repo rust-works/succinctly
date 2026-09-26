@@ -1254,13 +1254,18 @@ is the revert that established what the other one costs.
    navigated-bind twins (`input | .a as $y | {k:.a} | .k | path($y)` and the `($y.b) = 9`
    write) — pinned in
    `test_owned_embed_keeps_node_identity_on_the_input_bridge_2889`. Three residuals were
-   left, all specific to this route; two are closed since and one remains, pinned in
-   `test_input_bridge_embed_residuals_refuse_cleanly_2889`:
+   left, all specific to this route; two are closed since. What still refuses on it, bare
+   or collected into an array, where jq and the generic route answer, is pinned in
+   `test_input_bridge_embed_residuals_refuse_cleanly_2889`: the empty container below, a
+   *second* construct-and-navigate hop after the embed (`input | . as $x | {k:.} | .k |
+   {j:.} | .j | path($x)` -- the first hop's re-entry bridges `{j:.}`, and the throwaway
+   document it builds holds no node the table knows), and a scalar root (`input | . as $x |
+   [.] | .[0] | path($x)` on `1`, which never enters the embed table on this route).
    - An **empty container** (`input | . as $x | {k:.} | .k | path($x)` on `{}` or `[]`)
      binds no node at all: `whole_container_cursor` has no retained child cursor to hop
      `parent()` from, so the table never gets an entry. jq answers `[]`; the generic
      evaluator, handed a real cursor rather than one recovered after the fact, still
-     answers it — the one place the two routes still disagree, in the safe direction.
+     answers it — the routes disagree here in the safe direction.
      Closing it means keeping the container cursor on `JsonFields`/`JsonElements`, which are
      `Copy` and on the hot iteration path, so it waits on a two-architecture measurement
      ([#3180](https://github.com/rust-works/succinctly/issues/3180)).

@@ -65860,6 +65860,20 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         (r"[]", r"input | . as $x | {k:.} | .k | path($x)"),
         // (Collecting the pipe into an array answers since #3180 -- see
         // `test_input_route_array_collect_keeps_embed_identity_3180`.)
+        // A second construct-and-navigate hop: the first hop's re-entry
+        // bridges `{j:.}`, and the throwaway document it builds holds no
+        // node the table knows. jq answers `[]`/`[[]]`.
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | {k:.} | .k | {j:.} | .j | path($x)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[input | . as $x | {k:.} | .k | {j:.} | .j | path($x)]",
+        ),
+        // A scalar root never enters the table on this route. jq answers.
+        ("1", r"input | . as $x | [.] | .[0] | path($x)"),
+        ("1", r"[input | . as $x | [.] | .[0] | path($x)]"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
         assert_eq!(
@@ -65918,13 +65932,24 @@ fn test_input_route_array_collect_keeps_embed_identity_3180() -> Result<()> {
             "#3180: `{filter}`: stderr={stderr:?}"
         );
     }
-    // A value-equal copy is a different node: jq refuses, and so must this.
-    for filter in [
-        r#"[input | . as $x | [{"a":1}] | .[0] | path($x)]"#,
-        r"[input | . as $x | {k:.} | .z? | path($x)]",
+    // A value-equal copy is a different node: jq refuses, and so must this --
+    // the last row a write through a value-equal sibling, the case that
+    // would turn an identity bug into a write to the wrong place.
+    for (input, filter) in [
+        (
+            r#"{"a":1} {"a":1}"#,
+            r#"[input | . as $x | [{"a":1}] | .[0] | path($x)]"#,
+        ),
+        (
+            r#"{"a":1} {"a":1}"#,
+            r"[input | . as $x | {k:.} | .z? | path($x)]",
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}} x"#,
+            r"[input | .a as $y | {k:.c} | .k | ($y.b) = 9]",
+        ),
     ] {
-        let (stdout, stderr, code) =
-            run_jq_full(&["-n", "-c", filter], Some(r#"{"a":1} {"a":1}"#))?;
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
         assert_eq!(
             (stdout.as_str(), code),
             ("", 5),

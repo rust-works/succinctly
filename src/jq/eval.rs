@@ -8838,6 +8838,36 @@ fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
     })
 }
 
+/// [`embed_peel_step`] for the eager re-entry (#3180): the peeled stage's
+/// outputs run through `rest` on [`eval_each_owned`], collected with the
+/// escape that ended them, if any -- the same shape as
+/// [`owned_path_door_collect`]. Kept out of `eval_owned_input`, which is
+/// `#[inline(always)]` and generic over the document's word type, so the
+/// loop is instantiated once per semantics rather than per call site.
+fn embed_peel_collect<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+) -> Option<(Vec<OwnedValue>, Option<Control>)> {
+    let (stepped, rest) = embed_peel_step::<S>(expr, input, optional, reentry)?;
+    let values = match stepped {
+        Ok(values) => values,
+        Err(e) => return Some((Vec::new(), Some(Control::Error(e)))),
+    };
+    let mut collected = Vec::new();
+    for value in values {
+        let flow = eval_each_owned::<S>(&rest, &value, optional, Reentry::REBUILT, &mut |v| {
+            collected.push(v);
+            Demand::Continue
+        });
+        if let Flow::Escaped(control) = flow {
+            return Some((collected, Some(control)));
+        }
+    }
+    Some((collected, None))
+}
+
 /// Whether a child peeled out of a `.[]` can run `rest` without building a
 /// throwaway index for itself (#2889 review) -- the shapes
 /// [`eval_owned_fast_path`] answers from the owned value directly.
@@ -46591,22 +46621,11 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if let Some(relocated) = eval_owned_relocating_fold::<S>(expr, input) {
         return QueryResult::Owned(relocated);
     }
-    if let Some((stepped, rest)) = embed_peel_step::<S>(expr, input, optional, reentry) {
-        let values = match stepped {
-            Ok(values) => values,
-            Err(e) => return e.into(),
+    if let Some((values, control)) = embed_peel_collect::<S>(expr, input, optional, reentry) {
+        return match control {
+            Some(control) => partial(values, control),
+            None => owned_vec_to_result(values),
         };
-        let mut collected = Vec::new();
-        for value in values {
-            let flow = eval_each_owned::<S>(&rest, &value, optional, Reentry::REBUILT, &mut |v| {
-                collected.push(v);
-                Demand::Continue
-            });
-            if let Flow::Escaped(control) = flow {
-                return partial(collected, control);
-            }
-        }
-        return owned_vec_to_result(collected);
     }
     // #3177: see `eval_each_owned`.
     if let Some((values, control)) = owned_path_door_collect::<S>(expr, input, optional, reentry) {
