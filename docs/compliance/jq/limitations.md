@@ -8229,12 +8229,30 @@ checked once, so `include "mid"; a, b` with `mid` = `include "dep"; def a: g; de
 first, a chain's deepest first — because that is the order the linked runs are wrapped in.
 Both pinned in `tests/jq_cli_tests.rs` (`_3058`, `_2955`).
 
-**Residual:** a module that is both a top-level `include` and another module's dependency
-has two copies (its top-level run and its linked run), so a body error in it is reported
-twice when the main filter reaches *both* — `include "dep"; include "mid"; [h, bad]` with
-`dep` = `def bad: nosuch;` and `mid` = `include "dep"; def h: bad;` prints
-`jq: 2 compile errors` where jq prints one. Reaching only the linked copy (`[h, k]`) is one
-report, since an unreached body is never checked (#2740).
+**A module that is both top-level and a dependency — closed (#3153).** Such a module used to
+carry two full copies of its bodies: one in its top-level run and one in its linked run. Its
+body errors could then be reported from either copy. With `other` = `def z: alsonope;`,
+`serr` = `def bad: nope; def ok: 1; def bad2: nope2;` and `cerr` = `include "serr"; def u: ok;
+def ub: bad;`, `include "other"; include "serr"; include "cerr"; [z, ub, bad2]` printed
+`other`'s error *between* `serr`'s two, where jq prints both of `serr`'s first. The
+top-level run of such a module now holds forwarding stubs into the linked run
+(`ModuleLoader::top_run_defs`), so each body exists and is checked once. That row matches
+jq, pinned in `test_top_level_module_that_is_also_linked_errors_3153`, and
+`top_level_and_linked_module_is_emitted_once_3153` counts the copies.
+
+The stubs point *into* the linked run, not the other way round, because that run is wrapped
+outermost and so is visible from every stub whatever order the directives are declared in.
+Aliasing the linked names to the top-level bodies instead would only reach a dependent
+wrapped inside the top-level run. It would never reach a dependent that is itself linked.
+
+The cost it removes scales with the size of the reached bodies (Apple M-series, release,
+`/usr/bin/time -l`, output identical to base and to jq). The fat module has 300 defs, each
+body about 30 nodes, reached both from the filter and through a consumer (`include "fat";
+include "fatc"; use + ([s_0, …] | add)`). It went from 900 MB / 0.46 s to 340 MB / 0.19 s,
+the same as a control with no second copy. With 2000 one-literal defs the RSS drops only
+from 5.9 GB to 5.86 GB: a stub is as large as such a body, and the chain's def count, which
+[#3307](https://github.com/rust-works/succinctly/issues/3307) prices, does not change.
+Programs whose modules are only top-level, or only dependencies, are unchanged.
 
 ### Module-scope gaps that are genuinely open
 

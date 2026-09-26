@@ -50079,6 +50079,180 @@ fn test_depth_guard_names_a_linked_def_as_written_2955() -> Result<()> {
     Ok(())
 }
 
+/// #3153: a module that is both a top-level `include`/`import` and a
+/// dependency of another module is linked once; its top-level run forwards
+/// to the link run instead of carrying a second copy of the bodies. Every
+/// row captured live from jq 1.7.1 (`stdout`, exit 0), in both declaration
+/// orders where the order could matter -- the link run sits outermost, so
+/// the stubs have to reach it whichever way round the directives are.
+///
+/// Covered: the issue's repro; same-name entries, whose link names collapse
+/// onto one (the first `c` is only reached from `g`, which resolves it
+/// inside the link run, so `g` is still 7); the `import` spelling, and one
+/// module imported under two aliases; the module reached through a
+/// *linked* consumer (`top` -> `mid` -> `shared`) and through a diamond;
+/// `$param`, closure params and recursion through the top-level stub;
+/// `path()`, `|=` and `del()` through it; and an includer whose own def
+/// shadows the dependency's name.
+#[test]
+fn test_top_level_module_that_is_also_linked_3153() -> Result<()> {
+    const SHARED: (&str, &str) = (
+        "shared",
+        "def helper: 111; def c: 7; def g: c; def c: 8; def p($x): $x + helper; \
+         def f(h): [h, helper]; def rec(n): if n == 0 then 0 else 1 + rec(n - 1) end; \
+         def pa: .a;\n",
+    );
+    const CONSUMER: (&str, &str) = (
+        "consumer",
+        "include \"shared\"; def use_helper: helper; def use: [g, c]; def up: p(1); \
+         def uf: f(2); def ur: rec(5);\n",
+    );
+    let modules: &[(&str, &str)] = &[
+        SHARED,
+        CONSUMER,
+        ("top", "include \"mid\"; def t: m;\n"),
+        ("mid", "include \"shared\"; def m: [helper, g];\n"),
+        ("left", "include \"shared\"; def l: helper;\n"),
+        ("right", "include \"shared\"; def r: c;\n"),
+        (
+            "icons",
+            "import \"shared\" as s; def iu: [s::helper, s::g];\n",
+        ),
+        (
+            "over",
+            "include \"shared\"; def helper: 999; def h2: helper;\n",
+        ),
+    ];
+    let rows: &[(&str, &str)] = &[
+        (
+            r#"include "shared"; include "consumer"; [helper, use_helper]"#,
+            "[111,111]",
+        ),
+        (
+            r#"include "consumer"; include "shared"; [helper, use_helper]"#,
+            "[111,111]",
+        ),
+        (
+            r#"include "shared"; include "consumer"; [g, c, use]"#,
+            "[7,8,[7,8]]",
+        ),
+        (
+            r#"include "consumer"; include "shared"; [g, c, use]"#,
+            "[7,8,[7,8]]",
+        ),
+        (
+            r#"import "shared" as s; include "consumer"; [s::helper, s::g, s::c, use]"#,
+            "[111,7,8,[7,8]]",
+        ),
+        (
+            r#"include "consumer"; import "shared" as s; [s::helper, s::g, s::c, use]"#,
+            "[111,7,8,[7,8]]",
+        ),
+        (
+            r#"import "shared" as a; import "shared" as b; include "consumer"; [a::g, b::c, use, a::p(2), b::f(3)]"#,
+            "[7,8,[7,8],113,[3,111]]",
+        ),
+        (
+            r#"include "shared"; include "top"; [t, helper, g]"#,
+            "[[111,7],111,7]",
+        ),
+        (
+            r#"include "top"; include "shared"; [t, helper, g]"#,
+            "[[111,7],111,7]",
+        ),
+        (
+            r#"include "shared"; include "left"; include "right"; [l, r, helper, c]"#,
+            "[111,8,111,8]",
+        ),
+        (
+            r#"include "right"; include "shared"; include "left"; [l, r, helper, c]"#,
+            "[111,8,111,8]",
+        ),
+        (
+            r#"include "shared"; include "consumer"; [p(5), f(9), rec(30), up, uf, ur]"#,
+            "[116,[9,111],30,112,[2,111],5]",
+        ),
+        (
+            r#"include "consumer"; include "shared"; [p(5), f(9), rec(30), up, uf, ur]"#,
+            "[116,[9,111],30,112,[2,111],5]",
+        ),
+        (
+            r#"include "consumer"; include "shared"; {a: 3} | [path(pa), (pa |= . + 1), del(pa), paths]"#,
+            r#"[["a"],{"a":4},{},["a"]]"#,
+        ),
+        (
+            r#"include "shared"; include "icons"; [iu, helper]"#,
+            "[[111,7],111]",
+        ),
+        (
+            r#"include "icons"; import "shared" as s; [iu, s::helper, s::c]"#,
+            "[[111,7],111,8]",
+        ),
+        (
+            r#"include "shared"; include "over"; [helper, h2]"#,
+            "[999,111]",
+        ),
+        (
+            r#"include "over"; include "shared"; [helper, h2]"#,
+            "[111,111]",
+        ),
+    ];
+    for (filter, want) in rows {
+        let (stdout, stderr, code) = run_jq_with_modules(modules, &["-nc", filter])?;
+        assert_eq!(
+            (stdout.trim_end(), stderr.as_str(), code),
+            (*want, "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// #3153: a compile error in a module that is both top-level and linked is
+/// reported once, from the one copy of its body, and an error in a def
+/// nothing reaches is not reported at all -- captured whole from jq 1.7.1.
+///
+/// The first row is one the duplicate got wrong: with `serr`'s bodies in
+/// both its top-level run and its link run, `bad`'s error came from the
+/// link run and `bad2`'s (reached only from the main filter) from the
+/// top-level run, with `other`'s error printed between the two. jq prints
+/// both of `serr`'s errors together, and so does the single copy.
+#[test]
+fn test_top_level_module_that_is_also_linked_errors_3153() -> Result<()> {
+    let serr = ("serr", "def bad: nope; def ok: 1; def bad2: nope2;");
+    let cerr = ("cerr", "include \"serr\"; def u: ok; def ub: bad;");
+    let other = ("other", "def z: alsonope;");
+    let rows: &[ModuleRow] = &[
+        (
+            "both errors of the doubly-reached module together",
+            &[serr, cerr, other],
+            r#"include "other"; include "serr"; include "cerr"; [z, ub, bad2]"#,
+            "jq: error: nope/0 is not defined at <DIR>/serr.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;         \njq: error: nope2/0 is not defined at <DIR>/serr.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;                                    \njq: error: alsonope/0 is not defined at <DIR>/other.jq, line 1:\ndef z: alsonope;       \njq: 3 compile errors\n",
+        ),
+        (
+            "reached both ways, reported once",
+            &[serr, cerr],
+            r#"include "serr"; include "cerr"; [bad, ub]"#,
+            "jq: error: nope/0 is not defined at <DIR>/serr.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;         \njq: 1 compile error\n",
+        ),
+        (
+            "reached from the top level only",
+            &[serr, cerr],
+            r#"include "cerr"; include "serr"; bad"#,
+            "jq: error: nope/0 is not defined at <DIR>/serr.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;         \njq: 1 compile error\n",
+        ),
+    ];
+    run_module_rows(rows, &[])?;
+
+    // Neither erroring def reached: jq compiles and runs it.
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[serr, cerr, other],
+        &["-nc", r#"include "cerr"; include "serr"; [u, ok]"#],
+    )?;
+    assert_eq!((stdout.as_str(), stderr.as_str(), code), ("[1,1]\n", "", 0));
+    Ok(())
+}
+
 /// #2037: jq reports *every* unresolvable call in one compile pass, not just
 /// the first -- `jq: N compile errors`. Captured live against the pinned
 /// oracle (`/usr/bin/jq` 1.7.1); this filter and its exact three-error output
