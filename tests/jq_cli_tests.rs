@@ -65532,18 +65532,17 @@ fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
 // clippy cannot tell the two apart from the brace shape alone (as `*_2642`).
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
-    for (input, filter) in [(r#"{"a":{"b":1}}"#, r".a as $y | (.a | ($y.b)) = 9")] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(
-            code, 5,
-            "#3037 residual: `{filter}` (jq answers; recorded refuse-only), got \
-             stdout={stdout:?} stderr={stderr:?}"
-        );
-        assert!(
-            stderr.contains("Invalid path expression"),
-            "#3037 residual: `{filter}` -- stderr: {stderr:?}"
-        );
-    }
+    let filter = r".a as $y | (.a | ($y.b)) = 9";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(
+        code, 5,
+        "#3037 residual: `{filter}` (jq answers; recorded refuse-only), got \
+         stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "#3037 residual: `{filter}` -- stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -65610,6 +65609,7 @@ fn test_embed_reused_below_depth_zero_3179() -> Result<()> {
 /// (`MAX_NESTING_DEPTH`), so at `n = 255` the reuse answers and at `n = 256`
 /// the walk raises the same depth error it raised before #3179.
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)]
 fn test_embed_nested_reuse_keeps_the_depth_limit_3179() -> Result<()> {
     let nested = |n: usize| format!(r#"{{"a":{}{}}}"#, "[".repeat(n), "]".repeat(n));
     let filter = r".a as $y | {k:.} | .k.a | path($y)";
