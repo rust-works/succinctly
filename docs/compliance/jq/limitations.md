@@ -8105,15 +8105,14 @@ at 6, 8 and 10 levels and asserts a constant per-level delta; against the copyin
 read 1253 / 5093 / 20453. `test_fan_out_module_chain_stays_linear_2955`
 (`tests/jq_cli_tests.rs`) runs the issue's two shapes end to end.
 
-What remains above jq's 2 MB is the **evaluator's**, not the loader's, and it needs no
-module to appear: a `DefCall` node caches its bound body, so a call tree of `F^L` calls
-leaves `F^L` cached copies behind for the program's lifetime. The same 56 defs written in
+What remained above jq's 2 MB was the **evaluator's**, not the loader's, and it needed no
+module to appear: a `DefCall` node cached its bound body, so a call tree of `F^L` calls
+left `F^L` cached copies behind for the program's lifetime. The same 56 defs written in
 one file cost 58 MB, and `def fib(n): if n < 2 then n else fib(n-1) + fib(n-2) end; fib(20)`
-cost 234 MB against jq's 2 MB, with `fib(21)` overflowing the stack. Since #3296 the stack
-follows the recursion's depth and `fib(24)` answers, but the cached copies remain:
-`fib(20)` peaks at 48 MB and `fib(24)` at 271 MB, against jq's 2.6 MB for both (Apple M5
-Max, release). Filed as
-[#3148](https://github.com/rust-works/succinctly/issues/3148).
+cost 234 MB against jq's 2 MB, with `fib(21)` overflowing the stack. #3296 made the stack
+follow the recursion's depth, and
+[#3148](https://github.com/rust-works/succinctly/issues/3148) (next section) stopped the
+cached copies outliving their calls: `fib(24)` now peaks at 8 MB.
 
 **One shape pays for the linking:** a wide chain of which the filter uses *everything*. With
 20 modules of 50 defs each including the one below, `include "s19"; s19_0` starts in 9 ms
@@ -8124,9 +8123,55 @@ dependency through a stub, is neutral within noise (+1.6%, against +3.3% drift o
 defs written inline).
 Each chain def is installed over the whole program below it when bound, so the chain's
 length is quadratic at startup -- the same pre-existing evaluator cost a single 3000-def
-`include` pays today (1 GB, 0.5 s; also #3148) -- where the copying loader had kept those
+`include` pays today (1 GB, 0.5 s; [#3307](https://github.com/rust-works/succinctly/issues/3307),
+split from #3148) -- where the copying loader had kept those
 bodies nested inside the defs that used them. Only the defs the filter reaches are linked, which is what
 keeps the common shapes at or below their old cost.
+
+### A call tree retained one bound body per call — closed (#3148)
+
+Evaluating a call to a `def` substitutes its arguments into a fresh copy of the body, and
+that copy's own calls are fresh nodes. Each node used to cache its body for as long as the
+node lived, so every call ever evaluated stayed reachable from the root call:
+`def fib(n): if n < 2 then n else [fib(n-1), fib(n-2)] | add end; fib(24)` held one body
+for each of its 150,049 calls. jq shares closures and runs it in 2 MB.
+
+A body bound while a call is being evaluated is now **held** by that call until it returns,
+and **kept** for the node's lifetime only once evaluation reaches the node a second time, or
+first reaches it under a call that was. A call tree evaluated once is freed level by level
+as it returns. A call site reached outside every call's evaluation -- a top-level one, not
+inside another call's output -- keeps its body at once, as before, since such nodes are
+bounded by the program's size. A static probe that binds a body to choose an evaluation
+route shares the cache without counting as a reach. See `BoundBody` and `retention_scope`
+(`src/jq/expr.rs`).
+
+A tree evaluated **more than once** is still kept whole, after its second evaluation rather
+than its first: `fib(24)` over two inputs peaks at 9 MB on the first and returns to the
+pre-fix peak on the second. That trade keeps a repeated call from re-binding its whole tree
+on every round (`[range(20) | fib(18)]`), and bounds what is kept by the largest tree the
+program evaluates twice.
+
+Measured on an AMD Ryzen 9 7950X against `9b82284a8` (release; peak RSS from
+`/usr/bin/time -v`, instructions from cachegrind; output byte-identical between the two
+binaries and equal to jq 1.7.1 on every row):
+
+| program                                            | peak RSS before | after | instructions |
+|----------------------------------------------------|-----------------|-------|--------------|
+| `fib(24)`, `fib(n-1) + fib(n-2)`                   | 303 MB          | 8 MB  | -4.5%        |
+| `fib(24)`, `[fib(n-1), fib(n-2)] \| add`           | 348 MB          | 9 MB  | -4.9%        |
+| `r(16)`, `r(n-1) + r(n-1)`                         | 270 MB          | 8 MB  | -4.7%        |
+| 56 defs in one file, each `a + b` of two below     | 12 MB           | 8 MB  | +0.4%        |
+| the same, each `[a, b] \| add`                     | 16 MB           | 10 MB | -1.1%        |
+| `[range(20) \| fib(14)] \| add` (a repeated call)  | 12 MB           | 12 MB | +2.8%        |
+| `[range(1e5) \| f]`, three chained calls           | 18 MB           | 19 MB | +1.1%        |
+| recursive `map` walker over a depth-17 binary tree | 10 MB           | 10 MB | +0.9%        |
+
+Wall-clock, measured interleaved against `8c04573f7` (15 reps, one pinned core) before #3296
+merged, which touches none of these shapes except the `+` rows: `fib(22)`/`fib(24)` in the
+list spelling -30%, the 56-def list chain -24%, the `range(1e5)` loops -1% to -2%, and three
+recursive walkers (binary, 10-ary, 20,000 small trees) +1.4% to +2.3% against +0.5% to
++0.9% instructions. A repeated call pays for binding its tree twice in its first two
+rounds; a call tree evaluated once no longer pays to keep one.
 
 ### A wrapped dependency sits inside the including def's scope — closed (#2962)
 

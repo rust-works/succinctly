@@ -66,19 +66,20 @@ use super::eval::{
     mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
     owned_to_expr, owned_to_string, pattern_alternatives_var_names, prefer_pending_control,
-    range_from_literal_override, range_max_exceeded_error, range_num, range_values_f64,
-    range_values_int, recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
-    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
-    settle_then_replay, settles_before_consumer, shared_arg_depth_refusal, slice_component_value,
-    slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
-    stop_with_error, stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix,
-    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
-    try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
-    Reentry, RootWitness, SliceTargetKind, YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    probe_def_call, range_from_literal_override, range_max_exceeded_error, range_num,
+    range_values_f64, range_values_int, recurse_walk_flow, reduce_forks, reroot_for_reentry,
+    reroot_markers, resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty,
+    select_emits, settle_then_replay, settles_before_consumer, shared_arg_depth_refusal,
+    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
+    stop_with_downstream, stop_with_error, stop_with_escape, stop_with_escape_cell,
+    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
+    substitute_vars, suppresses, tonumber_from_str, try_payload_root, vec_with_capacity,
+    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
+    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
+    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RootWitness, SliceTargetKind,
+    YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -9353,8 +9354,8 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound) => match enter_def_call(def, *frames) {
-                Ok(_guard) => eval_each_generic::<S, V>(bound, value, optional, cursor, sink),
+            Ok(body) => match enter_def_call(def, *frames, bound) {
+                Ok(_guard) => eval_each_generic::<S, V>(&body, value, optional, cursor, sink),
                 Err(e) => Flow::Escaped(Control::Error(e)),
             },
             Err(e) => Flow::Escaped(Control::Error(e)),
@@ -17817,8 +17818,8 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
             bound,
         } => {
             unfolded < OWNED_IDENTITY_DEF_UNFOLD_LIMIT
-                && bind_def_call(def, args, *frames, bound)
-                    .is_ok_and(|b| path_context_is_navigational_at(b, unfolded + 1))
+                && probe_def_call(def, args, *frames, bound)
+                    .is_ok_and(|b| path_context_is_navigational_at(&b, unfolded + 1))
         }
         // #2558: `?` over navigation moves the position exactly as the bare
         // navigation does, and suppresses the step that raised instead of
@@ -18354,8 +18355,8 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
             Ok(bound_body) => {
-                let _guard = enter_def_call(def, *frames).map_err(Control::Error)?;
-                path_context_step_generic::<S, V>(bound_body, pos, out)
+                let _guard = enter_def_call(def, *frames, bound).map_err(Control::Error)?;
+                path_context_step_generic::<S, V>(&bound_body, pos, out)
             }
             Err(e) => Err(Control::Error(e)),
         },
@@ -20422,8 +20423,8 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
             args,
             frames,
             bound,
-        } => bind_def_call(def, args, *frames, bound)
-            .map_or(true, |b| step_can_yield_absent(b, incoming)),
+        } => probe_def_call(def, args, *frames, bound)
+            .map_or(true, |b| step_can_yield_absent(&b, incoming)),
         _ => true,
     }
 }
@@ -20523,8 +20524,8 @@ fn path_context_stage_preserves_node(expr: &Expr) -> bool {
             args,
             frames,
             bound,
-        } => bind_def_call(def, args, *frames, bound)
-            .is_ok_and(|b| path_context_stage_preserves_node(b)),
+        } => probe_def_call(def, args, *frames, bound)
+            .is_ok_and(|b| path_context_stage_preserves_node(&b)),
         _ => false,
     }
 }
@@ -25029,7 +25030,8 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
                 }
             }
             // A definition is bound exactly as evaluation binds it
-            // (`bind_def`/`bind_def_call` cache the result on the node), and
+            // (`bind_def`/`probe_def_call` share the node's cache with
+            // evaluation, without counting as a reach of it, #3148), and
             // the bound stages are gated like any other -- up to
             // `OWNED_IDENTITY_DEF_UNFOLD_LIMIT` levels of call, past which a
             // recursion stays on the eager evaluator.
@@ -25060,10 +25062,10 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
                 if unfolded >= OWNED_IDENTITY_DEF_UNFOLD_LIMIT {
                     return false;
                 }
-                match bind_def_call(def, args, *frames, bound) {
+                match probe_def_call(def, args, *frames, bound) {
                     Ok(bound_body) => {
                         if !owned_identity_pipe_supported_at(
-                            owned_identity_body_stages(bound_body),
+                            owned_identity_body_stages(&bound_body),
                             unfolded + 1,
                         ) {
                             return false;
@@ -27624,10 +27626,15 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound_body) => match enter_def_call(def, *frames) {
-                Ok(_guard) => {
-                    eval_owned_identity_spliced::<S, V>(bound_body, rest, value, id, optional, tail)
-                }
+            Ok(bound_body) => match enter_def_call(def, *frames, bound) {
+                Ok(_guard) => eval_owned_identity_spliced::<S, V>(
+                    &bound_body,
+                    rest,
+                    value,
+                    id,
+                    optional,
+                    tail,
+                ),
                 Err(e) => Flow::Escaped(Control::Error(e)),
             },
             Err(e) => Flow::Escaped(Control::Error(e)),

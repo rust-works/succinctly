@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a call tree no longer keeps one bound body per call** (#3148). Each
+  call to a `def` binds a fresh copy of its body, and every call node cached
+  its copy for the program's lifetime, so memory grew with the number of calls
+  a program made: `fib(24)` peaked at 303 MB (jq: 2 MB). A body is now held
+  only until its caller returns, and kept for good only once the same call
+  site is evaluated a second time, so `fib(24)` peaks at 8 MB and runs ~5%
+  fewer instructions. A call evaluated repeatedly (`[range(20) | fib(14)]`)
+  still keeps its tree after the second round, and pays ~3% more instructions
+  to bind it twice; tight call loops pay ~1%. The `O(M x N)` install cost of a
+  long chain of top-level defs is split to #3307.
+
 - **jq: tree recursion through `+` or `as` uses stack for its depth, not its
   call count** (#3296). `fib(n - 1) + fib(n - 2)` ran each right-hand call
   inside its left sibling's output sink, so the stack grew with the number of

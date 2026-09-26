@@ -925,41 +925,439 @@ pub enum MetaSlot {
 /// carrying the old node's, since a cache keyed on arguments that just
 /// changed is exactly a stale one.
 ///
-/// Write-once by design (see [`Self::get_or_try_init`] below) — safe *only*
-/// because `DefCall.frames` is a plain field, frozen once by whichever
+/// **Kept only while it can be reused (#3148).** A bound body's own
+/// `DefCall` nodes are fresh, so a cache that kept every body for its node's
+/// lifetime kept one per call-site *path* evaluated: `fib(24)` held one body
+/// for each of its 150,049 calls (349 MB on a 7950X, jq 2 MB). A body is
+/// therefore kept in one of three ways:
+///
+/// - **Held**: bound for the first time while a `DefCall` is being
+///   evaluated. The node keeps the body in a small holder that the
+///   enclosing call's retention scope (`retention_scope`) empties when that
+///   evaluation returns. A node that is reached once and never again --
+///   every node of a `fib` -- is freed as soon as its caller returns, so what
+///   is retained is the live call stack, not the call tree.
+/// - **Hot**: evaluation reached the node a second time. The body is kept
+///   for the node's lifetime, as before #3148 -- reused at no cost when its
+///   holder still has it (siblings under `map(f)`), bound once more when it
+///   does not. The body a hot call evaluates is hot all the way down: its
+///   own calls keep their bodies on first use, because a subtree the program
+///   evaluates twice is likely to be evaluated again (`[range(20) |
+///   fib(18)]` re-bound its whole tree on every round without this). The
+///   price is that a large tree evaluated twice -- the same `fib(24)` over a
+///   second input -- is kept whole after its second evaluation, as it was
+///   before #3148 after its first.
+/// - **Cold**: bound with no scope open -- a call reached outside every
+///   `DefCall` evaluation, which is a top-level call site not itself inside
+///   a call's output, or any call in a `no_std` build, which has no
+///   `thread_local!` -- and kept for the node's lifetime, exactly as before
+///   #3148. Such nodes are bounded by the program's size; a cold body's own
+///   calls are held, not kept.
+///
+/// What stays retained is therefore bounded by the live call stack plus the
+/// call trees of the subtrees evaluated more than once.
+///
+/// Only an **evaluation** reaches a node ([`Self::get_or_try_init`]). A
+/// static probe that binds a body to look inside it before choosing a route
+/// ([`Self::probe`]) shares the cache but not the count: counting it made the
+/// evaluation that follows every probe a second reach, and kept the tree the
+/// probe's route evaluated once (`[fib(12)] | .[0] | key? // .` kept all 465
+/// bodies).
+///
+/// Re-binding gives the same body because binding is a pure function of the
+/// node: `DefCall.frames` is a plain field, frozen once by whichever
 /// `install_def_calls` pass built this specific node, and never re-read from
-/// ambient state at call time. [`Expr::FuncDef`]'s own cache (#2094) needs a
-/// different shape for exactly that reason: see [`FuncDefBound`]'s own doc
-/// comment.
+/// ambient state at call time. The one ambient input, ADR-0025's native-stack
+/// floor, can refuse a re-bind that a cache would have answered -- but only
+/// where the evaluator would refuse to enter the body anyway. [`Expr::FuncDef`]'s
+/// own cache (#2094) needs a different shape for exactly that reason: see
+/// [`FuncDefBound`]'s own doc comment.
 #[derive(Clone, Default)]
-pub struct BoundBody(core::cell::OnceCell<Rc<Expr>>);
+pub struct BoundBody(core::cell::RefCell<BoundSlot>);
+
+/// The states of a [`BoundBody`] (#3148).
+#[derive(Clone, Default)]
+enum BoundSlot {
+    /// Never bound.
+    #[default]
+    Empty,
+    /// Bound while a `DefCall` evaluation was live. The body stays in the
+    /// holder until that evaluation's [`retention_scope`] closes; the node
+    /// owns the holder, so a node dropped earlier frees the body with it.
+    /// Never [`Reach::Hot`]: a hot node's body is kept.
+    Held {
+        holder: Rc<retention_scope::Holder>,
+        reach: Reach,
+    },
+    /// Kept for the node's lifetime.
+    Kept { body: Rc<Expr>, reach: Reach },
+}
+
+/// How far evaluation has reached a [`BoundBody`]'s node (#3148).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reach {
+    /// Bound by a static probe only.
+    Probed,
+    /// Evaluated once.
+    Once,
+    /// Evaluated twice, or first bound under a hot call.
+    Hot,
+}
 
 impl BoundBody {
-    /// The bound body, computing it with a fallible `bind` on first call.
+    /// The bound body for an evaluation of this node, computing it with a
+    /// fallible `bind` when nothing reusable is held -- see the struct's own
+    /// doc comment for when that is. Counts as a reach of the node.
     ///
     /// A failure (the recursion-depth guard) is deliberately **not** cached:
     /// it depends on nothing this node owns that could change, but leaving it
     /// uncached keeps the cache holding only successful, reusable results and
-    /// costs nothing — a node that failed the guard is not evaluated again.
+    /// costs nothing -- a node that failed the guard is not evaluated again.
+    ///
+    /// Owned rather than borrowed: a held body may be released by its scope
+    /// while the caller still runs it, and the caller's `Rc` is what keeps it
+    /// alive until the caller is done.
+    #[inline]
     pub fn get_or_try_init<E>(
         &self,
         bind: impl FnOnce() -> Result<Rc<Expr>, E>,
-    ) -> Result<&Rc<Expr>, E> {
-        if let Some(cached) = self.0.get() {
-            return Ok(cached);
+    ) -> Result<Rc<Expr>, E> {
+        if let BoundSlot::Kept {
+            body,
+            reach: Reach::Hot,
+        } = &*self.0.borrow()
+        {
+            return Ok(Rc::clone(body));
         }
-        let bound = bind()?;
-        // `set`, not `get_or_init`: this cache is write-once by design (see
-        // the struct's own doc comment) because `bind` is not reentrant in
-        // this single-threaded evaluator. `set` makes that invariant
-        // self-checking -- a concurrent/reentrant write panics here instead
-        // of `get_or_init` silently discarding `bound` and returning
-        // whatever the other write raced in with.
-        self.0
-            .set(bound)
-            .expect("BoundBody set twice: bind() must not be reentrant");
-        Ok(self.0.get().expect("just set"))
+        self.bind_slow(bind, true)
     }
+
+    /// The bound body for a static probe that looks inside it without
+    /// evaluating the node -- [`Self::get_or_try_init`], except that it does
+    /// not count as a reach (see the struct's own doc comment).
+    pub fn probe<E>(&self, bind: impl FnOnce() -> Result<Rc<Expr>, E>) -> Result<Rc<Expr>, E> {
+        self.bind_slow(bind, false)
+    }
+
+    /// [`Self::get_or_try_init`] for every slot but a hot one, and
+    /// [`Self::probe`]: out of line, so a hot call -- every call of a loop
+    /// after its second round -- pays one borrow and one clone.
+    #[inline(never)]
+    fn bind_slow<E>(
+        &self,
+        bind: impl FnOnce() -> Result<Rc<Expr>, E>,
+        evaluating: bool,
+    ) -> Result<Rc<Expr>, E> {
+        let (held, kept, reach) = match &*self.0.borrow() {
+            BoundSlot::Empty => (None, None, None),
+            BoundSlot::Held { holder, reach } => (Some(Rc::clone(holder)), None, Some(*reach)),
+            BoundSlot::Kept { body, reach } => (None, Some(Rc::clone(body)), Some(*reach)),
+        };
+        let reach_after = match (reach, evaluating) {
+            (None | Some(Reach::Probed), true) => Reach::Once,
+            (Some(Reach::Once | Reach::Hot), true) => Reach::Hot,
+            (None, false) => Reach::Probed,
+            (Some(reach), false) => reach,
+        };
+        let available = kept.or_else(|| held.as_ref().and_then(|holder| holder.body()));
+        let (slot, body) = match available {
+            // Still here: reuse it, keeping it once the node is hot and
+            // leaving it where it lives otherwise.
+            Some(body) => {
+                let slot = match held {
+                    Some(holder) if reach_after != Reach::Hot => BoundSlot::Held {
+                        holder,
+                        reach: reach_after,
+                    },
+                    _ => BoundSlot::Kept {
+                        body: Rc::clone(&body),
+                        reach: reach_after,
+                    },
+                };
+                (slot, body)
+            }
+            // Never bound, or released by its scope: bind, and place the
+            // body by the innermost scope.
+            None => {
+                let before = self.state();
+                let body = bind()?;
+                // `bind` installs a body and never evaluates one, so nothing
+                // it calls can reach this node: a change here means that
+                // stopped being true, and the write below would discard it.
+                assert!(
+                    self.state() == before,
+                    "BoundBody changed during bind(): bind() must not be reentrant"
+                );
+                let slot = match (reach_after, retention_scope::innermost()) {
+                    (Reach::Hot, _) | (_, Some(retention_scope::Scope::Hot)) => BoundSlot::Kept {
+                        body: Rc::clone(&body),
+                        reach: Reach::Hot,
+                    },
+                    (_, Some(retention_scope::Scope::Cold)) => BoundSlot::Held {
+                        holder: retention_scope::hold(&body),
+                        reach: reach_after,
+                    },
+                    (_, None) => BoundSlot::Kept {
+                        body: Rc::clone(&body),
+                        reach: reach_after,
+                    },
+                };
+                (slot, body)
+            }
+        };
+        *self.0.borrow_mut() = slot;
+        Ok(body)
+    }
+
+    /// The slot's variant and reach, for [`Self::bind_slow`]'s reentrancy
+    /// check.
+    fn state(&self) -> (u8, Option<Reach>) {
+        match &*self.0.borrow() {
+            BoundSlot::Empty => (0, None),
+            BoundSlot::Held { reach, .. } => (1, Some(*reach)),
+            BoundSlot::Kept { reach, .. } => (2, Some(*reach)),
+        }
+    }
+
+    /// Whether evaluation has reached the node twice, or first under a hot
+    /// call -- what the evaluator opens this call's own retention scope
+    /// with.
+    #[must_use]
+    pub fn is_hot(&self) -> bool {
+        matches!(
+            *self.0.borrow(),
+            BoundSlot::Kept {
+                reach: Reach::Hot,
+                ..
+            }
+        )
+    }
+
+    /// The body, if one is available without binding: kept, or still held
+    /// by an open scope (#3148). [`PartialEq`] below ignores the cache, so a
+    /// test pinning the retention rule reads this.
+    #[cfg(test)]
+    pub(crate) fn available(&self) -> Option<Rc<Expr>> {
+        match &*self.0.borrow() {
+            BoundSlot::Kept { body, .. } => Some(Rc::clone(body)),
+            BoundSlot::Held { holder, .. } => holder.body(),
+            BoundSlot::Empty => None,
+        }
+    }
+}
+
+/// Where a [`BoundBody`] bound during a `DefCall` evaluation is held until
+/// that evaluation returns (#3148).
+///
+/// One scope per live `DefCall` evaluation, opened by the evaluator's
+/// `enter_def_call` and closed when its guard drops. A body bound while a
+/// scope is open is registered with the innermost one; closing the scope
+/// empties every holder registered since it opened. Registration is by weak
+/// reference, so a scope never keeps a body alive past its node: a node
+/// rebuilt per iteration (an `as` body's substituted copy) frees its body
+/// when it drops, and the dead entry is pruned the next time the list would
+/// grow.
+pub(crate) mod retention_scope {
+    use super::Expr;
+
+    #[cfg(not(feature = "std"))]
+    use alloc::rc::Rc;
+    #[cfg(feature = "std")]
+    use std::rc::{Rc, Weak};
+
+    /// A first-use body, until its scope closes.
+    #[derive(Default)]
+    pub struct Holder(core::cell::RefCell<Option<Rc<Expr>>>);
+
+    impl Holder {
+        /// The body, if its scope has not closed yet.
+        pub(super) fn body(&self) -> Option<Rc<Expr>> {
+            self.0.borrow().clone()
+        }
+    }
+
+    /// The kind of `DefCall` evaluation a scope was opened for.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Scope {
+        /// A call not known to repeat: first-use bodies are held.
+        Cold,
+        /// A hot call ([`super::BoundBody::is_hot`]): first-use bodies are
+        /// kept.
+        Hot,
+    }
+
+    #[cfg(feature = "std")]
+    mod imp {
+        use super::{Expr, Holder, Rc, Scope, Weak};
+        use std::cell::{Cell, RefCell};
+        use std::vec::Vec;
+
+        /// The part of the scope stack every `DefCall` reads and writes:
+        /// plain `Copy` data in a destructor-free `Cell`, so opening and
+        /// closing a scope is one thread-local access each, and `HELD` is
+        /// touched only by a scope that held something. Measured on a 7950X
+        /// with cachegrind, a loop of three chained calls paid 130
+        /// instructions per call for the scope with two thread-locals and
+        /// the release loop inline in the guard's drop, and 37 after.
+        #[derive(Clone, Copy)]
+        struct State {
+            /// `HELD.len()`.
+            held: usize,
+            /// The innermost open scope: where its entries start in `HELD`,
+            /// and its kind. `None` with no scope open.
+            innermost: Option<(usize, Scope)>,
+        }
+
+        thread_local! {
+            static STATE: Cell<State> = const {
+                Cell::new(State {
+                    held: 0,
+                    innermost: None,
+                })
+            };
+            /// Holders registered by every open scope, innermost last.
+            static HELD: RefCell<Vec<Weak<Holder>>> = const { RefCell::new(Vec::new()) };
+        }
+
+        #[cfg(test)]
+        thread_local! {
+            /// Entries [`prune_from`] has examined on this thread.
+            pub(crate) static SCANNED: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub(crate) fn innermost() -> Option<Scope> {
+            STATE.with(Cell::get).innermost.map(|(_, scope)| scope)
+        }
+
+        /// Register `body` with the innermost scope. Only called with one
+        /// open ([`innermost`] returned `Some`).
+        pub(crate) fn hold(body: &Rc<Expr>) -> Rc<Holder> {
+            let state = STATE.with(Cell::get);
+            let base = state.innermost.map_or(0, |(base, _)| base);
+            let holder = Rc::new(Holder(RefCell::new(Some(Rc::clone(body)))));
+            let held = HELD.with(|held| {
+                let mut held = held.borrow_mut();
+                if held.len() == held.capacity() {
+                    prune_from(&mut held, base);
+                }
+                held.push(Rc::downgrade(&holder));
+                held.len()
+            });
+            STATE.with(|s| s.set(State { held, ..state }));
+            holder
+        }
+
+        /// Drop the innermost scope's dead entries -- nodes freed before
+        /// their scope closed -- from `base` on, before `held` grows. Only
+        /// that segment is scanned, and every outer scope's start offset
+        /// stays valid. When less than half is freed the list grows anyway,
+        /// so the next prune is at least as many pushes away as the list is
+        /// long: without that, a full list of live outer entries would
+        /// rescan on every push of a loop whose nodes each die at once.
+        fn prune_from(held: &mut Vec<Weak<Holder>>, base: usize) {
+            #[cfg(test)]
+            SCANNED.with(|scanned| scanned.set(scanned.get() + held.len() - base));
+            let mut live = base;
+            for index in base..held.len() {
+                if held[index].strong_count() > 0 {
+                    held.swap(live, index);
+                    live += 1;
+                }
+            }
+            held.truncate(live);
+            if held.len() * 2 > held.capacity() {
+                held.reserve(held.capacity());
+            }
+        }
+
+        /// Restores the enclosing scope, emptying this one's holders, on drop.
+        #[must_use]
+        pub struct Guard(Option<(usize, Scope)>);
+
+        /// How many holders the open scopes have registered, dead or alive.
+        #[cfg(test)]
+        pub(crate) fn registered() -> usize {
+            HELD.with(|held| held.borrow().len())
+        }
+
+        pub(crate) fn enter(scope: Scope) -> Guard {
+            Guard(STATE.with(|s| {
+                let state = s.get();
+                s.set(State {
+                    innermost: Some((state.held, scope)),
+                    ..state
+                });
+                state.innermost
+            }))
+        }
+
+        impl Drop for Guard {
+            #[inline]
+            fn drop(&mut self) {
+                let (start, held) = STATE.with(|s| {
+                    let state = s.get();
+                    let start = state.innermost.map_or(state.held, |(start, _)| start);
+                    s.set(State {
+                        held: start.min(state.held),
+                        innermost: self.0,
+                    });
+                    (start, state.held)
+                });
+                if held > start {
+                    release_from(start);
+                }
+            }
+        }
+
+        /// Empty every holder registered from `start` on. Out of line, so the
+        /// common close -- nothing held -- stays a few instructions with no
+        /// frame to set up.
+        #[cold]
+        #[inline(never)]
+        fn release_from(start: usize) {
+            // One entry at a time, each taken out of `HELD` before its body
+            // drops, so no drop observes the list mid-borrow -- and, unlike
+            // `split_off`, with no allocation per closing scope.
+            while let Some(entry) = HELD.with(|held| {
+                let mut held = held.borrow_mut();
+                if held.len() > start {
+                    held.pop()
+                } else {
+                    None
+                }
+            }) {
+                if let Some(holder) = entry.upgrade() {
+                    let body = holder.0.borrow_mut().take();
+                    drop(body);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    mod imp {
+        use super::{Expr, Holder, Rc, Scope};
+
+        pub(crate) fn innermost() -> Option<Scope> {
+            None
+        }
+
+        pub(crate) fn hold(body: &Rc<Expr>) -> Rc<Holder> {
+            Rc::new(Holder(core::cell::RefCell::new(Some(Rc::clone(body)))))
+        }
+
+        #[must_use]
+        pub struct Guard;
+
+        pub(crate) fn enter(_scope: Scope) -> Guard {
+            Guard
+        }
+    }
+
+    pub use imp::Guard;
+    pub(crate) use imp::{enter, hold, innermost};
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) use imp::{registered, SCANNED};
 }
 
 /// Two `DefCall`s are equal when their definition, arguments and frame count
@@ -2772,7 +3170,7 @@ mod tests {
                 Ok::<_, ()>(Rc::new(Expr::Identity))
             })
             .expect("first bind succeeds");
-        assert_eq!(**first, Expr::Identity);
+        assert_eq!(*first, Expr::Identity);
         assert_eq!(bind_calls, 1);
 
         let second = bound
@@ -2782,11 +3180,187 @@ mod tests {
             })
             .expect("cached read succeeds");
         assert_eq!(
-            **second,
+            *second,
             Expr::Identity,
             "must return the first bind's cached value, not re-bind"
         );
         assert_eq!(bind_calls, 1, "bind must not run a second time");
+    }
+
+    /// #3148: with no retention scope open -- a top-level call site -- the
+    /// first bind keeps the body for the node's lifetime (cold), as before
+    /// #3148, and a second use makes it hot without binding again. Holds
+    /// under `no_std` too, where no scope ever opens.
+    #[test]
+    fn test_bound_body_without_scope_keeps_cold_then_hot_3148() {
+        let bound = BoundBody::default();
+        let mut binds = 0usize;
+        let mut bind = || {
+            binds += 1;
+            Ok::<_, ()>(Rc::new(Expr::Identity))
+        };
+        let first = bound.get_or_try_init(&mut bind).unwrap();
+        assert!(bound.available().is_some(), "kept with no scope open");
+        assert!(!bound.is_hot(), "a first use is cold");
+        let second = bound.get_or_try_init(&mut bind).unwrap();
+        assert!(Rc::ptr_eq(&first, &second), "reused, not re-bound");
+        assert!(bound.is_hot(), "a second use is hot");
+        assert_eq!(binds, 1);
+    }
+
+    /// #3148: a first bind inside a cold scope is held only until that scope
+    /// closes -- the `fib` shape, where a node is reached once and its body
+    /// must not outlive its caller -- and a later use binds once more and
+    /// keeps the result, hot.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_bound_body_held_until_cold_scope_closes_3148() {
+        let bound = BoundBody::default();
+        let mut binds = 0usize;
+        let mut bind = || {
+            binds += 1;
+            Ok::<_, ()>(Rc::new(Expr::Identity))
+        };
+        let released = {
+            let _scope = retention_scope::enter(retention_scope::Scope::Cold);
+            let body = bound.get_or_try_init(&mut bind).unwrap();
+            assert!(bound.available().is_some(), "held while the scope is open");
+            assert!(!bound.is_hot());
+            Rc::downgrade(&body)
+        };
+        assert!(
+            bound.available().is_none(),
+            "released when the scope closes"
+        );
+        assert_eq!(released.strong_count(), 0, "and the body is freed");
+        bound.get_or_try_init(&mut bind).unwrap();
+        assert_eq!(binds, 2, "a use after the scope closed binds again");
+        assert!(bound.is_hot(), "and keeps the body, hot");
+    }
+
+    /// #3148: a node reached twice while its scope is still open (siblings
+    /// under `map(f)`) reuses the held body and keeps it, with no second
+    /// bind -- the case a keep-only-during-the-call cache would re-bind.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_bound_body_reused_in_open_scope_is_kept_without_rebinding_3148() {
+        let bound = BoundBody::default();
+        let mut binds = 0usize;
+        let mut bind = || {
+            binds += 1;
+            Ok::<_, ()>(Rc::new(Expr::Identity))
+        };
+        {
+            let _scope = retention_scope::enter(retention_scope::Scope::Cold);
+            let first = bound.get_or_try_init(&mut bind).unwrap();
+            let second = bound.get_or_try_init(&mut bind).unwrap();
+            assert!(Rc::ptr_eq(&first, &second));
+            assert!(bound.is_hot());
+        }
+        assert!(bound.available().is_some(), "kept past the scope's close");
+        assert_eq!(binds, 1);
+    }
+
+    /// #3148: under a hot scope (the evaluation of a call reached twice) a
+    /// first bind is kept, hot, so a subtree evaluated repeatedly is bound
+    /// once rather than once per round.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_bound_body_first_use_under_hot_scope_is_kept_3148() {
+        let bound = BoundBody::default();
+        {
+            let _scope = retention_scope::enter(retention_scope::Scope::Hot);
+            bound
+                .get_or_try_init(|| Ok::<_, ()>(Rc::new(Expr::Identity)))
+                .unwrap();
+        }
+        assert!(bound.available().is_some());
+        assert!(bound.is_hot());
+    }
+
+    /// #3148: a static probe shares the cache but is not a reach. Counting
+    /// it made the evaluation after every probe a second reach, so the whole
+    /// tree the probe's route evaluated once was kept (hot).
+    #[test]
+    fn test_bound_body_probe_is_not_a_reach_3148() {
+        let bound = BoundBody::default();
+        let mut binds = 0usize;
+        let mut bind = || {
+            binds += 1;
+            Ok::<_, ()>(Rc::new(Expr::Identity))
+        };
+        let probed = bound.probe(&mut bind).unwrap();
+        let _ = bound.probe(&mut bind).unwrap();
+        assert!(!bound.is_hot(), "probes alone never make a node hot");
+        let first = bound.get_or_try_init(&mut bind).unwrap();
+        assert!(
+            Rc::ptr_eq(&probed, &first),
+            "evaluation reuses the probed body"
+        );
+        assert!(
+            !bound.is_hot(),
+            "the evaluation after a probe is the first reach"
+        );
+        bound.get_or_try_init(&mut bind).unwrap();
+        assert!(bound.is_hot(), "the second evaluation is");
+        assert_eq!(binds, 1);
+    }
+
+    /// #3148 review: pruning is amortised. A scope whose own entries are
+    /// mostly live, running a loop whose fresh nodes each die at once, used
+    /// to free exactly one dead entry per prune and rescan the whole list on
+    /// every push -- quadratic in the loop count.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_retention_scope_prune_is_amortised_3148() {
+        let _scope = retention_scope::enter(retention_scope::Scope::Cold);
+        let bind = || Ok::<_, ()>(Rc::new(Expr::Identity));
+        let live: Vec<BoundBody> = (0..1_000)
+            .map(|_| {
+                let bound = BoundBody::default();
+                bound.get_or_try_init(bind).unwrap();
+                bound
+            })
+            .collect();
+        let before = retention_scope::SCANNED.with(core::cell::Cell::get);
+        for _ in 0..20_000 {
+            BoundBody::default().get_or_try_init(bind).unwrap();
+        }
+        let scanned = retention_scope::SCANNED.with(core::cell::Cell::get) - before;
+        assert!(
+            scanned < 10 * 21_000,
+            "prune examined {scanned} entries for 20,000 pushes"
+        );
+        assert!(live.iter().all(|bound| bound.available().is_some()));
+    }
+
+    /// #3148: a scope never keeps a body alive past its node. A node rebuilt
+    /// per iteration inside one long call (an `as` body's substituted copy)
+    /// frees its body when it drops, and the scope's list of dead entries is
+    /// pruned instead of growing with the iteration count.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_retention_scope_frees_dropped_nodes_and_prunes_3148() {
+        let _scope = retention_scope::enter(retention_scope::Scope::Cold);
+        let before = retention_scope::registered();
+        let mut last = None;
+        for _ in 0..10_000 {
+            let bound = BoundBody::default();
+            let body = bound
+                .get_or_try_init(|| Ok::<_, ()>(Rc::new(Expr::Identity)))
+                .unwrap();
+            last = Some(Rc::downgrade(&body));
+        }
+        assert_eq!(
+            last.unwrap().strong_count(),
+            0,
+            "a dropped node's body is freed with the scope still open"
+        );
+        let growth = retention_scope::registered() - before;
+        assert!(
+            growth <= 64,
+            "dead entries must be pruned, not accumulate: {growth} registered"
+        );
     }
 
     /// Same invariant as [`test_bound_body_is_invisible_to_eq_and_debug_1371`],
