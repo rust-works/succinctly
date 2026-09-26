@@ -44852,6 +44852,31 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
 /// turns into its right operand) is what gets bound -- and, since `//`
 /// itself runs its right side whenever its left yields nothing and not only
 /// when it raises, what `A` must satisfy directly in `A // B` too (#3129).
+///
+/// **#3143: the `Alternative` arm's claim is not literally true.** `A // B`
+/// only *unconditionally* equals `.`, never raising, for every runtime
+/// truthiness of `.`, when both sides are themselves guaranteed to always
+/// yield exactly `.` -- checking `left` alone (as below) says nothing about
+/// what happens when `.` is null/false at runtime and `right` actually
+/// runs; `right` there is entirely unconstrained and could raise or yield
+/// an unrelated value. This is deliberately *not* tightened to require
+/// `right` too, because every current caller already needs, and has, its
+/// own protection against exactly that gap, independent of this function's
+/// own claim: `is_identity_passthrough`'s own `Alternative` arm (`left`
+/// only, by the same reasoning, #3129) defers to a value-equality check at
+/// substitution time (`substitute_bound_var_at`'s #844 rule) that
+/// independently catches a wrongly-certified `right`'s value at every use
+/// site; `resolves_to_register`'s `Alternative` arm additionally requires
+/// `reg.is_truthy()` against the concrete runtime register before ever
+/// trusting a `left`-only `true` from here. Tried tightening this arm to
+/// `left && right` directly: it regressed a confirmed-correct case
+/// (`test_raising_try_body_is_not_an_identity_passthrough_2978`'s
+/// `try (. // 1) catch 2` row, whose `.a` truthy value legitimately tracks
+/// in real jq 1.7.1 -- confirmed live) by rejecting `right` shapes no
+/// current caller needs rejected. A future caller that trusts a bare
+/// `true` from here with no such deferred/redundant check of its own would
+/// still inherit this gap -- give it one, don't change this shared
+/// function.
 fn is_raise_free_identity_passthrough(expr: &Expr) -> bool {
     match unwrap_bind_source(expr) {
         Expr::Identity => true,
