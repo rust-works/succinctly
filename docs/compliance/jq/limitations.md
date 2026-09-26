@@ -1132,8 +1132,10 @@ is the revert that established what the other one costs.
    witnessed (a `getpath` only when its answer is), so no other program's route changes. Still
    refused where jq answers: the `_by` forms (`sort_by`, `unique_by`, `group_by`, `min_by`),
    `with_entries`, `map_values`, `flatten`, `[.[]]` over an object and `limit`, which need their
-   filter or driver run over owned children; a full slice `.[0:2]`; and a no-op `\|=` (all in the
-   table above, and filed as follow-ups of #3178).
+   filter or driver run over owned children
+   ([#3305](https://github.com/rust-works/succinctly/issues/3305)); a full slice `.[0:2]` and a
+   no-op `\|=` ([#3306](https://github.com/rust-works/succinctly/issues/3306)); and a `getpath` whose
+   path the owned route cannot read as a literal (`getpath([-0.5])`: `-0.5` is a negation).
    **[#3188](https://github.com/rust-works/succinctly/issues/3188), now closed: the same embed
    written through by `del` or an assignment.** jq's `del(f)`, `f = v`, `f |= g`, `f op= v` and
    `f //= v` are all `path(f)` followed by writes at the paths it yields, so

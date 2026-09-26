@@ -8468,9 +8468,12 @@ fn relocate_elements<S: EvalSemantics>(
     }
 }
 
-/// The node `getpath(P)` reaches in `input` when `P` is a literal path of
-/// string keys and integral indexes (#3178), or `None` -- a missing step, a
-/// type mismatch or any other component leaves the answer to the bridge.
+/// The node `getpath(P)` reaches in `input` when `P` is a literal path
+/// (#3178), read the way the bridged `getpath` reads it: a string key into
+/// an object, a number into an array through [`resolve_read_index`] (jq's
+/// truncation and negative-index rules). `None` for a missing step, a type
+/// mismatch or a non-array path, all of which the bridge answers with its
+/// own value or diagnostic.
 fn owned_literal_getpath<'v, S: EvalSemantics>(
     path: &Expr,
     input: &'v OwnedValue,
@@ -8478,20 +8481,13 @@ fn owned_literal_getpath<'v, S: EvalSemantics>(
     let OwnedValue::Array(components) = closed_expr_to_owned::<S>(path)? else {
         return None;
     };
-    let steps = components
+    components
         .iter()
-        .map(|component| match component {
-            OwnedValue::String(key) => Some(Expr::Field(key.clone())),
-            OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _) => {
-                Some(Expr::Index {
-                    idx: *idx,
-                    key: None,
-                })
-            }
+        .try_fold(input, |node, component| match (node, component) {
+            (OwnedValue::Object(map), OwnedValue::String(key)) => map.get(key),
+            (OwnedValue::Array(items), key) => items.get(resolve_read_index(key, items.len())?),
             _ => None,
         })
-        .collect::<Option<Vec<Expr>>>()?;
-    navigate_owned_value(input, &steps)
 }
 
 /// Whether `value` still *is* a node an in-scope binding holds -- the

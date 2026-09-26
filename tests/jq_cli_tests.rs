@@ -64134,6 +64134,27 @@ fn test_owned_embed_identity_through_relocating_builtins_3178() -> Result<()> {
             r"input | . as $x | {k:.} | .k | getpath([]) | path($x)",
             "[]",
         ),
+        // `getpath` reads a fractional index the way jq does, by truncation.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [.] | getpath([0.5]) | path($x)",
+            "[]",
+        ),
+        // With a bind in scope but no child witnessed, each builtin still
+        // takes its ordinary route.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | [3,1] | sort",
+            "[1,3]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r". as $x | {k:.} | getpath([])",
+            r#"{"k":{"a":1}}"#,
+        ),
         // The values themselves are the bridged builtins' own.
         (
             &["-c"][..],
@@ -64177,6 +64198,7 @@ fn test_owned_embed_identity_through_relocating_builtins_3178() -> Result<()> {
             r#"{"a":1}"#,
             r#". as $x | {k:.} | getpath(["z"]) | path($x)"#,
         ),
+        (r#"{"a":1}"#, r". as $x | [.] | getpath([5]) | path($x)"),
         ("1", r". as $x | [.] | sort | .[0] | path($x)"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
@@ -64187,6 +64209,26 @@ fn test_owned_embed_identity_through_relocating_builtins_3178() -> Result<()> {
         );
         assert!(
             stderr.contains("Invalid path expression"),
+            "#3178: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    // A non-array path, a key of the wrong kind, and `to_entries` on a
+    // scalar keep the bridge's own diagnostics.
+    for (filter, message) in [
+        (
+            r#". as $x | {k:.} | getpath("k")"#,
+            "Path must be specified as an array",
+        ),
+        (
+            r". as $x | [.] | getpath([null])",
+            "Cannot index array with null",
+        ),
+        (r"[5] | .[0] | to_entries", "has no keys"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "#3178: `{filter}`");
+        assert!(
+            stderr.contains(message),
             "#3178: `{filter}`: stderr={stderr:?}"
         );
     }
