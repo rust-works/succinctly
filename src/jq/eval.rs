@@ -36513,16 +36513,23 @@ fn cannot_move_register(expr: &Expr) -> bool {
             // CALL_BUILTIN` -- a side effect plus the identity output,
             // never touching the register (confirmed live:
             // `path(. as {a:$q} | (debug|$q))` is `["a"]` in jq 1.7.1).
-            // `debug(msg)` is excluded on purpose: unlike an object's
-            // field values or a binary operator's operands, `msg` is
-            // *not* wrapped in jq's own `SUBEXP_BEGIN`/`SUBEXP_END` --
-            // confirmed live, `path(. as {a:$q} | (debug(.k)|$q))`
-            // refuses in jq 1.7.1 too (an out-of-bounds `.k` on `.`
-            // moves the register exactly as any other navigating stage
-            // would), so it correctly stays on the `_ => false` default
-            // below rather than joining this arm.
             | Builtin::Stderr
             | Builtin::Debug => true,
+            // #3126 review: `msg` is evaluated (and its own value printed)
+            // but, like `error`'s message and `halt_error`'s code just
+            // above, is not itself part of the output -- so this recurses
+            // on `msg` exactly like those two, rather than defaulting to
+            // `false` for every `debug(msg)` regardless of shape. `msg` is
+            // *not* wrapped in jq's own `SUBEXP_BEGIN`/`SUBEXP_END` the way
+            // an object's field values are, so a `msg` that itself
+            // navigates genuinely moves the register: confirmed live,
+            // `path(. as {a:$q} | (debug(.k)|$q))` refuses in jq 1.7.1 too
+            // (an out-of-bounds `.k` on `.` moves it exactly as any other
+            // navigating stage would) -- but `debug(1)`/`debug("hi")` don't
+            // navigate at all, and jq 1.7.1 confirms both keep tracking
+            // (`["a"]`), which the unconditional `false` this replaced got
+            // wrong.
+            Builtin::DebugMsg(msg) => cannot_move_register(msg),
             // #2764: jq's `def recurse(f): def r: ., (f | r); r;` moves the
             // register only through `f`, and `recurse(f; cond)`'s `cond`
             // runs as `select(cond)`'s `if` condition, a subexp. Live
@@ -102112,11 +102119,13 @@ mod tests {
         }
     }
 
-    /// #3126: a `stderr`/bare `debug` stage in path position must not drop
-    /// the register any more than a literal stage does -- both are `DUP;
+    /// #3126: a `stderr`/`debug` stage in path position must not drop the
+    /// register any more than a literal stage does -- both are `DUP;
     /// CALL_BUILTIN` in real jq, a side effect plus the identity output,
-    /// never touching the register. Confirmed live against jq 1.7.1 for
-    /// every row below.
+    /// never touching the register, and `debug(msg)`'s own `msg` is (like
+    /// `error`'s message and `halt_error`'s code) evaluated but not part
+    /// of the output, so it only moves the register when `msg` itself
+    /// navigates. Confirmed live against jq 1.7.1 for every row below.
     #[test]
     fn test_stderr_debug_passthrough_keeps_path_register_3126() {
         let doc = br#"{"a":{"b":1}}"#;
@@ -102124,12 +102133,12 @@ mod tests {
             r"path(. as {a:$q} | (1 | $q))",
             r#"path(. as {a:$q} | ("x"|stderr|$q))"#,
             r"path(. as {a:$q} | (debug|$q))",
+            r"path(. as {a:$q} | (debug(1)|$q))",
+            r#"path(. as {a:$q} | (debug("hi")|$q))"#,
         ] {
             assert_eq!(outputs(doc, filter), [r#"["a"]"#], "{filter}");
         }
-        // `debug(msg)` is excluded on purpose: unlike an object's field
-        // values, `msg` is not wrapped in jq's own subexp markers, so a
-        // navigating `msg` genuinely moves the register (confirmed live:
+        // A navigating `msg` genuinely moves the register (confirmed live:
         // `path(. as {a:$q} | (debug(.k)|$q))` on `{"a":{"b":1},"k":"m"}`
         // refuses in jq 1.7.1 too).
         let parsed = parse(r"debug(.k)").unwrap();
