@@ -8685,7 +8685,7 @@ fn write_target_mut(head: &mut Expr) -> Option<&mut Box<Expr>> {
         | Expr::CompoundAssign { path, .. }
         | Expr::AlternativeAssign { path, .. }
         | Expr::Builtin(Builtin::Del(path)) => Some(path),
-        _ => None,
+        _ => None, // omni-dev: coverage tolerate-line reason="unreachable: owned_write_door calls this only on a clone of a head write_target already matched, and the two list the same five variants (#3188)"
     }
 }
 
@@ -8696,7 +8696,7 @@ fn write_target_mut(head: &mut Expr) -> Option<&mut Box<Expr>> {
 /// step the evaluator can index by (#3300), so neither is re-spelled.
 fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
     let OwnedValue::Array(components) = path else {
-        return None;
+        return None; // omni-dev: coverage tolerate-line reason="unreachable: every value path_over_owned hands back is a path() output, which is always an array (#3188)"
     };
     let mut steps = components
         .iter()

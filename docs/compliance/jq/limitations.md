@@ -1130,7 +1130,8 @@ is the revert that established what the other one costs.
    is built from navigation, `?`, computed keys, arithmetic, literals and `error` -- nothing a
    declined resolution could repeat -- and declines on any escape, so every refusal still
    comes from the bridge's own resolver. A rebuilt equal value still refuses as jq does
-   (`[{"a":1}] \| del(.[0] \| $x)`). Still refused where jq answers:
+   (`[{"a":1}] \| del(.[0] \| $x)`). Still refused where jq answers -- every shape where
+   `path()`'s own door still refuses refuses here too, since the write resolves through it:
 
    - a write under a wrapper (`(del(.[0] \| $x))?` prints nothing, jq `[]`; under `try ...
      catch "c"` the refusal is *caught* and the handler's `"c"` is printed -- the same

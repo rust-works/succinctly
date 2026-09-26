@@ -64005,6 +64005,10 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
         (r". as $x | [.,1] | del(.[.[1] - 1] | $x)", "[1]"),
         (r". as $x | [.,1] | del(.[0.0] | $x)", "[1]"),
         (r". as $x | [1,.] | (.[-1.0] | $x) |= 5", "[1,5]"),
+        // A tail after the write stage, handed on with the rewritten head.
+        (r". as $x | [.] | (del(.[0] | $x) | length)", "0"),
+        // The target resolves to the root itself: `[]`, spelled `.`.
+        (r". as $x | {k:.} | .k | (. | $x) |= 5", "5"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
         assert_eq!(
