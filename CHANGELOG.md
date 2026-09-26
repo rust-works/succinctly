@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: tree recursion through `+` or `as` uses stack for its depth, not its
+  call count** (#3296). `fib(n - 1) + fib(n - 2)` ran each right-hand call
+  inside its left sibling's output sink, so the stack grew with the number of
+  calls: after #3262's stack floor `fib(20)` refused (`18 | fib` in the
+  zero-parameter spelling), and before it `fib(21)` aborted the process. When
+  both operands of an operator, or the source of an `as`, are single-valued,
+  effect-free and call a `def`, each is now evaluated to completion before its
+  consumer runs, in both evaluators, so all three spellings (`+`,
+  zero-parameter, `as`) answer `fib(24)` = `46368` as jq 1.7.1 does. Output
+  order and error precedence are unchanged, and every other operand keeps the
+  path it took: `sum_to` and plain recursion reach the same depths as before.
+
 - **A `reduce`/`until` step that assigns into the accumulator is linear, not
   O(n²)** (#3138). `reduce .users[] as $r ({}; .[$r.name] = $r.score)` (and
   the same with `|=`, `+=`-style `op=`, or `//=`, through a `.x[$k]` chain,
@@ -247,12 +259,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the old guard admitted more than the stack could hold: plain bare recursion
   stops at ~10,000 levels (was 20,000, 3% short of a crash), bare `sum_to` at
   ~9,200 (was 13,297), and the lazy-link shapes at ~170-220, where jq, whose
-  call stack is on the heap, runs 100,000 (#3287). A recursion that combines
-  two recursive calls with `+` or `as` (`fib(n - 1) + fib(n - 2)`) uses stack in
-  proportion to its number of calls, so `fib(20)` now refuses where it used
-  to answer (`18 | fib` in the zero-parameter spelling); `fib(21)` already
-  overflowed the stack. `[fib(n - 1), fib(n - 2)] |
-  add` is unaffected (#3296). Library callers get the same guard by evaluating
+  call stack is on the heap, runs 100,000 (#3287). Library callers get the same guard by evaluating
   inside `succinctly::jq::with_stack_budget`.
 
 - **jq: a malformed nested number raises when read instead of reading as `null`** (#3222).

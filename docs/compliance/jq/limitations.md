@@ -4291,13 +4291,12 @@ Three differences remain, all in the direction of erroring rather than aborting:
   ([#3287](https://github.com/rust-works/succinctly/issues/3287)). Before #3262
   all three aborted the process at ~240-330 levels with the guard on. Tree
   recursion that combines two calls with `+` or `as` (`fib(n - 1) + fib(n -
-  2)`) runs each right-hand call inside its left sibling's output sink, so its
-  stack grows with the number of *calls*, not the depth: `fib(20)` (21,891
-  calls) refuses, `fib(21)` aborted the process before #3262, and jq answers
-  both in 2 MB. The zero-parameter spelling (`def fib: ... (. - 1 | fib) + (.
-  - 2 | fib)`) holds more per call and refuses from `18 | fib`. `[fib(n - 1), fib(n - 2)] | add` returns before continuing and
-  runs `fib(24)`
-  ([#3296](https://github.com/rust-works/succinctly/issues/3296)).
+  2)`) used to run each right-hand call inside its left sibling's output sink,
+  so its stack grew with the number of *calls*; since
+  [#3296](https://github.com/rust-works/succinctly/issues/3296) two
+  single-valued, effect-free operands that both call a `def` (or an `as`
+  source that does) are settled before their consumer runs, and the stack
+  follows the depth like any other recursion.
 - **A recursively-built value can exceed `MAX_VALUE_TREE_DEPTH` (384) where jq has no such
   limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
   1,200 levels; jq prints it, succinctly reports `nesting depth exceeds limit of 384` and
@@ -8084,8 +8083,11 @@ read 1253 / 5093 / 20453. `test_fan_out_module_chain_stays_linear_2955`
 What remains above jq's 2 MB is the **evaluator's**, not the loader's, and it needs no
 module to appear: a `DefCall` node caches its bound body, so a call tree of `F^L` calls
 leaves `F^L` cached copies behind for the program's lifetime. The same 56 defs written in
-one file cost 58 MB, `def fib(n): if n < 2 then n else fib(n-1) + fib(n-2) end; fib(20)`
-costs 234 MB against jq's 2 MB, and `fib(21)` overflows the stack. Filed as
+one file cost 58 MB, and `def fib(n): if n < 2 then n else fib(n-1) + fib(n-2) end; fib(20)`
+cost 234 MB against jq's 2 MB, with `fib(21)` overflowing the stack. Since #3296 the stack
+follows the recursion's depth and `fib(24)` answers, but the cached copies remain:
+`fib(20)` peaks at 48 MB and `fib(24)` at 271 MB, against jq's 2.6 MB for both (Apple M5
+Max, release). Filed as
 [#3148](https://github.com/rust-works/succinctly/issues/3148).
 
 **One shape pays for the linking:** a wide chain of which the filter uses *everything*. With

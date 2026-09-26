@@ -69,11 +69,11 @@ use super::eval::{
     range_from_literal_override, range_max_exceeded_error, range_num, range_values_f64,
     range_values_int, recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
     resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
-    shared_arg_depth_refusal, slice_component_value, slice_object_as_yq_children,
-    slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
-    stop_with_escape_cell, streams_escaped_generator_prefix, streams_unbounded,
-    substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str, try_payload_root,
-    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    settle_then_replay, settles_before_consumer, shared_arg_depth_refusal, slice_component_value,
+    slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
+    stop_with_error, stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix,
+    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
+    try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
     yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
     yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
@@ -13181,6 +13181,40 @@ fn binary_fanout_each_generic<V: DocumentValue, S: EvalSemantics>(
     right: &Expr,
     optional: bool,
     rules: BinaryFanoutRules,
+    combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    // #3296: decided once per operator, as in `eval::binary_fanout_each`.
+    if settles_before_consumer(left) && settles_before_consumer(right) {
+        binary_fanout_each_generic_with::<V, S>(
+            settled_operand_strategy_generic(each_operand),
+            left,
+            right,
+            optional,
+            rules,
+            combine,
+            sink,
+        )
+    } else {
+        binary_fanout_each_generic_with::<V, S>(
+            each_operand,
+            left,
+            right,
+            optional,
+            rules,
+            combine,
+            sink,
+        )
+    }
+}
+
+/// [`binary_fanout_each_generic`] once it has chosen its operand strategy.
+fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
+    each_operand: impl Fn(&Expr, &mut dyn Sink<V>) -> Flow,
+    left: &Expr,
+    right: &Expr,
+    optional: bool,
+    rules: BinaryFanoutRules,
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
@@ -13277,6 +13311,22 @@ fn binary_fanout_each_generic<V: DocumentValue, S: EvalSemantics>(
         return empty_outer_operand_pass_generic::<V, S>(&each_operand, inner_expr, op, sink);
     }
     abort.unwrap_or(outer)
+}
+
+/// The generic evaluator's twin of `eval::settled_operand_strategy`: every
+/// operand is evaluated to completion before its output reaches the sink, so
+/// a tree recursion's continuation does not run on top of each operand's
+/// frames (#3296). Installed only when both operands
+/// `eval::settles_before_consumer`.
+fn settled_operand_strategy_generic<V: DocumentValue>(
+    each_operand: impl Fn(&Expr, &mut dyn Sink<V>) -> Flow,
+) -> impl Fn(&Expr, &mut dyn Sink<V>) -> Flow {
+    move |expr: &Expr, sink: &mut dyn Sink<V>| {
+        settle_then_replay(
+            |collect| each_operand(expr, &mut |item| collect(item)),
+            |item| sink.push(item),
+        )
+    }
 }
 
 /// The generic-evaluator twin of `eval::read_only_operand_strategy` (#2470):
@@ -14230,6 +14280,29 @@ fn stream_owned_outputs_generic<S: EvalSemantics, V: DocumentValue>(
     (out, control)
 }
 
+/// `eval_each_generic`, except that an `expr` which
+/// `eval::settles_before_consumer` is evaluated to completion before its
+/// output reaches `sink` (#3296) -- so a bound source's consumer, often the
+/// rest of a recursion (`f(n - 1) as $a | f(n - 2) as $b | $a + $b`), does not
+/// run on top of the source's own frames.
+fn settled_each_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    if !settles_before_consumer(expr) {
+        return eval_each_generic::<S, V>(expr, value, optional, cursor, sink);
+    }
+    settle_then_replay(
+        |collect| {
+            eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| collect(item))
+        },
+        |item| sink.push(item),
+    )
+}
+
 fn fanout_arg_each_generic<S: EvalSemantics, V: DocumentValue, B>(
     arg_expr: &Expr,
     value: V,
@@ -14245,7 +14318,7 @@ where
     let mut escape: Option<Control> = None;
     let mut consumer_stopped = false;
 
-    let flow = eval_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
+    let flow = settled_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
         // #2952: reset before anything below can set a fresh `escape` for
         // *this* call -- see `eval::fanout_arg_each_inner`'s identical
         // top-of-closure reset (one reset per invocation rather than a
@@ -14309,7 +14382,7 @@ where
     let mut escape: Option<Control> = None;
     let mut consumer_stopped = false;
 
-    let flow = eval_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
+    let flow = settled_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
         // #2952: reset before anything below can set a fresh `escape` for
         // *this* call -- see `fanout_arg_each_generic`'s identical
         // top-of-closure reset and `eval::fanout_arg_each_inner`'s doc

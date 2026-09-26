@@ -6964,7 +6964,7 @@ where
     let mut escape: Option<Control> = None;
     let mut consumer_stopped = false;
 
-    let flow = eval_each::<W, S>(arg_expr, value, optional, &mut |item| {
+    let mut on_item = |item: Item<'_, W>| {
         // #2952: reset before anything below can set a fresh `escape` for
         // *this* call. `escape` is write-only within a call's own verdict
         // (nothing reads it until after `eval_each` returns), so resetting
@@ -7015,7 +7015,20 @@ where
             // above, which is what clears a *resolved* escape.
             Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
-    });
+    };
+    // #3296: a single-valued, effect-free source is evaluated to completion
+    // before its value reaches the body, so the body -- often the rest of a
+    // recursion, as in `f(n - 1) as $a | f(n - 2) as $b | $a + $b` -- does
+    // not run on top of the source's own frames. See
+    // `settles_before_consumer`.
+    let flow = if settles_before_consumer(arg_expr) {
+        settle_then_replay(
+            |collect| eval_each::<W, S>(arg_expr, value, optional, collect),
+            &mut on_item,
+        )
+    } else {
+        eval_each::<W, S>(arg_expr, value, optional, &mut on_item)
+    };
 
     match escape {
         Some(_) => resume_from_escape(escape, flow),
@@ -9893,6 +9906,39 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     right: &Expr,
     optional: bool,
     rules: BinaryFanoutRules,
+    combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // #3296: decided once per operator, and only when *both* operands call a
+    // `def`. That is the shape whose stack grew with its call count -- the
+    // inner operand's calls ran inside the outer's output sink, `fib(n - 1)
+    // + fib(n - 2)`. With one def-calling operand (`n + sum_to(n - 1)`) the
+    // recursion runs inside that operand either way, and settling it would
+    // only add a buffered frame to every level; with none -- every link of a
+    // lazy argument chain, the `n == 0` each level runs through -- there is
+    // nothing to settle.
+    if settles_before_consumer(left) && settles_before_consumer(right) {
+        binary_fanout_each_with::<W, S>(
+            settled_operand_strategy(each_operand),
+            left,
+            right,
+            optional,
+            rules,
+            combine,
+            sink,
+        )
+    } else {
+        binary_fanout_each_with::<W, S>(each_operand, left, right, optional, rules, combine, sink)
+    }
+}
+
+/// [`binary_fanout_each`] once it has chosen its operand strategy.
+fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
+    left: &Expr,
+    right: &Expr,
+    optional: bool,
+    rules: BinaryFanoutRules,
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
@@ -10355,6 +10401,30 @@ pub(crate) fn boolean_fanout_bools(
 /// once, since jq's generator stops asking for further left outputs once one
 /// pairing has failed.
 pub(crate) fn boolean_fanout_each(
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(bool) -> Demand) -> Flow,
+    left: &Expr,
+    right: &Expr,
+    short_circuit: bool,
+    rules: BinaryFanoutRules,
+    sink: &mut dyn FnMut(bool) -> Demand,
+) -> Flow {
+    // #3296: decided once per operator, as in `binary_fanout_each`.
+    if settles_before_consumer(left) && settles_before_consumer(right) {
+        boolean_fanout_each_with(
+            settled_operand_strategy(each_operand),
+            left,
+            right,
+            short_circuit,
+            rules,
+            sink,
+        )
+    } else {
+        boolean_fanout_each_with(each_operand, left, right, short_circuit, rules, sink)
+    }
+}
+
+/// [`boolean_fanout_each`] once it has chosen its operand strategy.
+fn boolean_fanout_each_with(
     each_operand: impl Fn(&Expr, &mut dyn FnMut(bool) -> Demand) -> Flow,
     left: &Expr,
     right: &Expr,
@@ -61328,6 +61398,199 @@ pub(crate) fn shared_arg_depth_refusal() -> EvalError {
     EvalError::resource_limit("exceeded maximum recursion depth".to_string())
 }
 
+/// Whether an operand or bound source should be evaluated to completion before
+/// its output is consumed (#3296): whether it yields at most one output -- one
+/// value, or one error -- does nothing observable besides, and calls a `def`.
+///
+/// An operand like that can be evaluated to completion *before* whatever
+/// consumes its output runs, with the same observable result as feeding its
+/// output through a sink: there is no second output to interleave with, and no
+/// effect after the first to reorder. The operand's native frames are then gone
+/// by the time its consumer runs. Fed through a sink instead, the consumer runs
+/// on top of the operand's deepest frame, and for a tree recursion that nests
+/// the continuation across the whole call tree: `def fib(n): if n < 2 then n
+/// else fib(n - 1) + fib(n - 2) end` held native stack in proportion to its
+/// number of calls, and `fib(21)` (35,421 calls, depth 21) overflowed the 256
+/// MB evaluation stack, where `[fib(n - 1), fib(n - 2)] | add` -- which
+/// collects before continuing -- ran `fib(24)`.
+///
+/// Recognised by a whitelist, like [`is_pure_chain_link`]: literals, `.`, a
+/// field, a variable, arithmetic, comparison, `if`, a pipe of such stages, an
+/// `as` binding of one over one, an argument read whose argument is one, and a
+/// call to a `def` whose body is one. Inside a definition's body a read of one
+/// of its bare parameters is taken as single-valued -- its argument was checked
+/// at the call -- and a call to the definition itself is assumed to be, which
+/// is sound for the same reason induction on the recursion is: if every level's
+/// body yields at most one output given that its calls do, every call does.
+/// Anything else -- a builtin, `,`, `.[]`, a nested `def`, a call to another
+/// definition by name -- is not recognised, which only ever keeps the sink-fed
+/// path it already took.
+///
+/// Only an operand that calls a `def` is settled: that is the only way it can
+/// hold deep native frames when its output is produced. Any other single-valued
+/// operand (`.a`, `1`, `$x - 1`) already returns before its consumer runs to
+/// any depth that matters, and keeps the path it always took. An operator
+/// settles only when both its operands pass (see [`binary_fanout_each`]).
+///
+/// The check runs on every operand a fan-out evaluates, so it must cost O(1)
+/// however deep the recursion is. A bare argument read (a `Shared` operand) is
+/// never settled without looking inside: that is every link of a lazy argument
+/// chain (`n - 1` over the previous level's `n`), which evaluates one binary
+/// operator per link and would otherwise walk the whole chain below it on
+/// every link -- cubic in the depth, `sum_to(1000)` taking 13 s. Everywhere
+/// else the walk stops after [`SETTLE_ANALYSIS_BUDGET`] nodes and declines:
+/// an argument chain that long belongs to a recursion hundreds of levels deep,
+/// which keeps the path it took before #3296.
+pub(crate) fn settles_before_consumer(expr: &Expr) -> bool {
+    if matches!(expr, Expr::Shared(_)) {
+        return false;
+    }
+    let mut budget = SETTLE_ANALYSIS_BUDGET;
+    single_valued_pure(expr, None, &mut budget) == Some(true)
+}
+
+/// How many nodes [`settles_before_consumer`] visits before declining. The
+/// argument chain of `fib(n - 1)` adds three nodes per level, so this settles
+/// tree recursion to ~340 levels, far past where an exponential call tree can
+/// finish, while bounding both the check's time and its own native recursion
+/// (an argument chain nests, so the walk recurses about as deep as it visits).
+const SETTLE_ANALYSIS_BUDGET: u32 = 1024;
+
+/// [`settles_before_consumer`]'s analysis, within the raw body of `within`
+/// when given: `None` if `expr` is not recognised as single-valued and
+/// effect-free or `budget` runs out, otherwise whether it calls a `def`.
+fn single_valued_pure(expr: &Expr, within: Option<&FuncDefData>, budget: &mut u32) -> Option<bool> {
+    *budget = budget.checked_sub(1)?;
+    let mut sv = |e: &Expr| single_valued_pure(e, within, budget);
+    match expr {
+        Expr::Identity | Expr::Literal(_) | Expr::Field(_) | Expr::Var(_) | Expr::TrackedVar(_) => {
+            Some(false)
+        }
+        Expr::Paren(inner) | Expr::Negate(inner) => sv(inner),
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            Some(sv(left)? | sv(right)?)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => Some(sv(cond)? | sv(then_branch)? | sv(else_branch)?),
+        Expr::Pipe(stages) => all_single_valued_pure(stages, within, budget),
+        // One value bound, then one body run for it. A body naming the
+        // variable only reads it, and cannot shadow a parameter's bare name.
+        Expr::As { expr, body, .. } => Some(sv(expr)? | sv(body)?),
+        // An argument captured in the caller's scope: the definition being
+        // analysed, if any, has no bearing on what it names.
+        Expr::Shared(inner) => single_valued_pure(inner, None, budget),
+        Expr::DefCall { def, args, .. } => {
+            all_single_valued_pure(args, within, budget)?;
+            single_valued_pure(&def.body, Some(def), budget)?;
+            Some(true)
+        }
+        Expr::FuncCall { name, args, .. } => match within {
+            Some(def) if args.is_empty() && def.params.iter().any(|p| p.name() == name) => {
+                Some(false)
+            }
+            Some(def) if *name == def.name && args.len() == def.params.len() => {
+                all_single_valued_pure(args, within, budget)?;
+                Some(true)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`single_valued_pure`] over every expression of `exprs`: `None` if any is
+/// not recognised, otherwise whether any calls a `def`.
+fn all_single_valued_pure(
+    exprs: &[Expr],
+    within: Option<&FuncDefData>,
+    budget: &mut u32,
+) -> Option<bool> {
+    let mut calls = false;
+    for e in exprs {
+        calls |= single_valued_pure(e, within, budget)?;
+    }
+    Some(calls)
+}
+
+/// Wrap an operand-enumeration strategy so every operand is evaluated to
+/// completion before its output reaches the sink, rather than delivering it
+/// from inside its own evaluation (#3296). Only installed by an operator whose
+/// operands both [`settles_before_consumer`], and the operator only ever
+/// enumerates those two.
+///
+/// Generic in the item type like [`read_only_operand_strategy`], which wraps
+/// it: the replayed output reaches the sink through that strategy's own
+/// scope restore, as a directly delivered one would.
+pub(crate) fn settled_operand_strategy<I>(
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(I) -> Demand) -> Flow,
+) -> impl Fn(&Expr, &mut dyn FnMut(I) -> Demand) -> Flow {
+    move |expr: &Expr, sink: &mut dyn FnMut(I) -> Demand| {
+        settle_then_replay(|collect| each_operand(expr, collect), sink)
+    }
+}
+
+/// Run `source` to completion into a buffer, then feed what it produced to
+/// `sink` (#3296). Kept out of line so the buffer lives in its own frame: the
+/// path that does not settle is every lazy-chain link of a deep recursion,
+/// and a buffer inlined into its caller's frame would cost stack on each one.
+#[inline(never)]
+pub(crate) fn settle_then_replay<I>(
+    source: impl FnOnce(&mut dyn FnMut(I) -> Demand) -> Flow,
+    mut sink: impl FnMut(I) -> Demand,
+) -> Flow {
+    let mut outputs = SettledOutputs::default();
+    let flow = source(&mut |item| {
+        outputs.push(item);
+        Demand::Continue
+    });
+    match outputs.replay(&mut sink) {
+        Demand::Stop => Flow::Stopped { pending: None },
+        Demand::Continue => flow,
+    }
+}
+
+/// The output of an operand evaluated to completion before its consumer
+/// ([`settles_before_consumer`], #3296): at most one, held without a heap
+/// allocation. A second is kept too, in order, so a recognised shape that
+/// turned out to produce more is still answered correctly, merely without
+/// the stack saving.
+struct SettledOutputs<I> {
+    first: Option<I>,
+    rest: Vec<I>,
+}
+
+impl<I> Default for SettledOutputs<I> {
+    fn default() -> Self {
+        Self {
+            first: None,
+            rest: Vec::new(),
+        }
+    }
+}
+
+impl<I> SettledOutputs<I> {
+    fn push(&mut self, item: I) {
+        if self.first.is_none() && self.rest.is_empty() {
+            self.first = Some(item);
+        } else {
+            self.rest.push(item);
+        }
+    }
+
+    /// Feed every output to `sink` in order, stopping where it does.
+    fn replay(self, mut sink: impl FnMut(I) -> Demand) -> Demand {
+        for item in self.first.into_iter().chain(self.rest) {
+            if matches!(sink(item), Demand::Stop) {
+                return Demand::Stop;
+            }
+        }
+        Demand::Continue
+    }
+}
+
 /// Whether `expr` is a pure, single-valued combination of `Shared` nodes and
 /// literals -- safe for `eval_each`'s `Expr::Shared` arm to evaluate eagerly
 /// instead of preserving demand-driven laziness (#1371 follow-up).
@@ -71745,6 +72008,126 @@ mod tests {
                 "{src:?} must not be owned-pure -- its suppression rules live elsewhere"
             );
         }
+    }
+
+    /// #3296: [`settle_then_replay`] keeps every output in order -- a
+    /// recognised shape yields at most one, but a second is replayed rather
+    /// than lost -- and stops replaying where the sink does.
+    #[test]
+    fn settle_then_replay_keeps_order_and_stops_3296() {
+        let source = |sink: &mut dyn FnMut(i32) -> Demand| {
+            // The collector never stops; the stop under test is the replay's.
+            for i in 1..=3 {
+                assert!(matches!(sink(i), Demand::Continue));
+            }
+            Flow::Exhausted
+        };
+        let mut seen = Vec::new();
+        let flow = settle_then_replay(source, |i| {
+            seen.push(i);
+            Demand::Continue
+        });
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(seen, [1, 2, 3]);
+
+        let mut seen = Vec::new();
+        let flow = settle_then_replay(source, |i| {
+            seen.push(i);
+            if i == 2 {
+                Demand::Stop
+            } else {
+                Demand::Continue
+            }
+        });
+        assert!(matches!(flow, Flow::Stopped { pending: None }));
+        assert_eq!(seen, [1, 2]);
+    }
+
+    /// #3296: [`settles_before_consumer`] accepts exactly the single-valued,
+    /// effect-free operands that call a `def`. Each case is the operand of
+    /// `def f(n): BODY;`'s installed `then`, so `f` is a real `DefCall`.
+    #[test]
+    fn settles_only_single_valued_pure_def_calls_3296() {
+        fn operand(body: &str, use_site: &str) -> Expr {
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = parse(&format!("def f(n): {body}; {use_site}")).unwrap()
+            else {
+                panic!("expected a def") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every source this helper parses starts with `def f(n): ...;` (#3296)"
+            };
+            let def = Rc::new(FuncDefData {
+                name,
+                params,
+                body: *body,
+            });
+            install_def_calls(&then, &def, 0, false)
+        }
+        let fib = "if n < 2 then n else f(n - 1) + f(n - 2) end";
+        for (body, use_site) in [
+            (fib, "f(3)"),
+            (fib, "f(3) - 1"),
+            (fib, "(f(3) | . * 2)"),
+            (fib, "f(3) as $x | $x + 1"),
+            ("n", "f(.a)"),
+            ("-n", "if f(1) == 1 then f(2) else 0 end"),
+        ] {
+            assert!(
+                settles_before_consumer(&operand(body, use_site)),
+                "def f(n): {body}; {use_site} should settle"
+            );
+        }
+        for (body, use_site) in [
+            // No def call: already returns before its consumer runs.
+            (fib, "1"),
+            (fib, ".a - 1"),
+            // Multi-valued, in the body, the argument, or the operand.
+            ("n, n", "f(1)"),
+            ("n", "f(1, 2)"),
+            ("n", "f(1) | (., .)"),
+            ("n | .[]", "f(1)"),
+            // Effects and builtins are outside the whitelist.
+            ("n | debug", "f(1)"),
+            ("error(n)", "f(1)"),
+            ("n", "f(1) | length"),
+            // A nested def inside the body is not recognised.
+            ("def g: n; g", "f(1)"),
+            // Nor is a call to the definition's name at another arity.
+            ("if n == 0 then 0 else f(n; n) end", "f(1)"),
+        ] {
+            assert!(
+                !settles_before_consumer(&operand(body, use_site)),
+                "def f(n): {body}; {use_site} must not settle"
+            );
+        }
+
+        // A bare argument read is never settled, even one that calls a def:
+        // it is every lazy-chain link, and must be O(1) to check.
+        let call = operand("n", "f(1)");
+        assert!(settles_before_consumer(&call));
+        assert!(!settles_before_consumer(&Expr::Shared(Rc::new(
+            call.clone()
+        ))));
+
+        // An argument past the budget declines rather than walking on. Built
+        // flat -- a pipe of `.` stages -- so neither the walk nor the drop
+        // nests deeper than a test thread's stack allows.
+        let Expr::DefCall { def, .. } = &call else {
+            panic!("expected a DefCall") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: `f(1)` under `def f(n)` always installs as a DefCall, which the assert above has just settled (#3296)"
+        };
+        let with_arg = |stages: usize| Expr::DefCall {
+            def: Rc::clone(def),
+            args: vec![Expr::Pipe(vec![Expr::Identity; stages])],
+            frames: 0,
+            bound: BoundBody::default(),
+        };
+        assert!(settles_before_consumer(&with_arg(8)));
+        assert!(!settles_before_consumer(&with_arg(
+            SETTLE_ANALYSIS_BUDGET as usize
+        )));
     }
 
     /// #2397: the navigation shapes the representation gate exists for must

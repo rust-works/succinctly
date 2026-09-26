@@ -30510,6 +30510,66 @@ fn test_recursion_refuses_before_the_native_stack_runs_out_3262() -> Result<()> 
     Ok(())
 }
 
+/// #3296: tree recursion that combines two calls with `+` or `as` ran each
+/// right-hand call inside its left sibling's output sink, so the native stack
+/// grew with the number of *calls*: `fib(20)` refused and the zero-parameter
+/// spelling refused from `18 | fib`. A single-valued, effect-free operand that
+/// calls a `def` is now settled before its consumer runs, so the stack follows
+/// the depth and all three spellings answer `fib(24)` as jq 1.7.1 does.
+#[test]
+fn test_tree_recursion_stack_follows_depth_not_calls_3296() -> Result<()> {
+    for filter in [
+        "def fib(n): if n < 2 then n else fib(n - 1) + fib(n - 2) end; fib(24)",
+        "def fib: if . < 2 then . else (. - 1 | fib) + (. - 2 | fib) end; 24 | fib",
+        "def fib(n): if n < 2 then n else fib(n - 1) as $a | fib(n - 2) as $b | $a + $b end; fib(24)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), "46368", "{filter}");
+    }
+    Ok(())
+}
+
+/// #3296: settling an operand early must not change jq's output order or
+/// which side's error wins. Every expected value is jq 1.7.1's: the right
+/// operand is the outer loop, an `error` right operand still raises (the
+/// settled left side is never observed), and a multi-valued def call is
+/// not settled at all.
+#[test]
+fn test_settled_operand_keeps_jq_order_3296() -> Result<()> {
+    for (filter, expected) in [
+        ("def one: 1; [(1,2) + one, one + (1,2)]", "[2,3,2,3]"),
+        (r#"def f: 1; [try (f + error("x")) catch .]"#, r#"["x"]"#),
+        (
+            "def f(n): n; [f(1) + (10,20), (10,20) + f(2)]",
+            "[11,21,12,22]",
+        ),
+        ("def f(n): n; [f(1,2) + f(10,20)]", "[11,12,21,22]"),
+        ("def g: 5; [g as $x | (1,2) | . + $x]", "[6,7]"),
+        ("def g: 5; [limit(1; (g,g) + 1)]", "[6]"),
+        (
+            "def o: 3; [o < (1,4), o and (true,false)]",
+            "[false,true,true,false]",
+        ),
+        // Both operands settle: `and`/`or`, and a consumer that stops while
+        // the settled output is replayed.
+        (
+            "def t(n): n > 0; [t(1) and t(0), t(0) or t(1)]",
+            "[false,true]",
+        ),
+        (
+            "def f(n): n; [first(f(1) + f(2)), limit(1; f(3) * f(4))]",
+            "[3,12]",
+        ),
+        ("def t(n): n > 0; [first(t(1) and t(1))]", "[true]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
 /// #3262 / ADR-0025: the path routes take the native-stack floor as well --
 /// a lazy-link chain read inside `path()` (the path resolver's `DefCall` and
 /// `Shared` arms), inside `|=`, and with a path-context builtin (`key`) at the

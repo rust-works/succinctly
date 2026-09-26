@@ -35606,6 +35606,22 @@ fn test_argument_chain_refuses_in_yq_mode_3262() -> Result<()> {
     Ok(())
 }
 
+/// #3296: the generic evaluator settles a single-valued def-calling operand
+/// before its consumer runs too, so tree recursion through `+` and `as` in yq
+/// mode uses stack in proportion to its depth and answers `fib(24)`.
+#[test]
+fn test_tree_recursion_stack_follows_depth_in_yq_mode_3296() -> Result<()> {
+    for filter in [
+        "def fib(n): if n < 2 then n else fib(n - 1) + fib(n - 2) end; fib(24)",
+        "def fib(n): if n < 2 then n else fib(n - 1) as $a | fib(n - 2) as $b | $a + $b end; fib(24)",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), "46368", "{filter}");
+    }
+    Ok(())
+}
+
 /// #1872 gates `drive_fold_source`'s single tracked evaluation on
 /// `EvalTag::Jq`. Real yq's lexer rejects `reduce`, `foreach` *and* `path`
 /// outright (confirmed live against yq v4.53.3), so yq mode has no oracle to
