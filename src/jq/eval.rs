@@ -377,9 +377,10 @@ impl EvalSemantics for YqSemantics {
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
-    ArithOp, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound,
-    FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags, MetaSlot, NumberKey, ObjectEntry,
-    ObjectKey, Origin, Param, Pattern, PatternEntry, SliceBoundKey, StringPart, Tracked,
+    retention_scope, ArithOp, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr,
+    FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags, MetaSlot,
+    NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, PatternEntry, SliceBoundKey,
+    StringPart, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, document_number_f64, infinite_float_preview_text, int_to_f64,
@@ -5874,8 +5875,8 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound) => match enter_def_call(def, *frames) {
-                Ok(_guard) => eval_each::<W, S>(bound, value, optional, sink),
+            Ok(body) => match enter_def_call(def, *frames, bound) {
+                Ok(_guard) => eval_each::<W, S>(&body, value, optional, sink),
                 Err(e) => Flow::Escaped(Control::Error(e)),
             },
             Err(e) => Flow::Escaped(Control::Error(e)),
@@ -33383,9 +33384,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             // the native-stack floor checked, and the ambient frame depth
             // raised so a `def` nested in the body installs at this call's
             // depth rather than 0.
-            Ok(bound) => match enter_def_call(def, *frames) {
+            Ok(body) => match enter_def_call(def, *frames, bound) {
                 Ok(_guard) => {
-                    resolve_node_sink::<S>(bound, value, trackable, snapshot, frame, keep, sink)
+                    resolve_node_sink::<S>(&body, value, trackable, snapshot, frame, keep, sink)
                 }
                 Err(e) => ResolveFlow::Escaped(e.into()),
             },
@@ -61379,16 +61380,35 @@ fn def_call_depth_refusal(def: &FuncDefData) -> EvalError {
 
 /// Enter one `DefCall`'s bound body: refuse it if the native stack is spent
 /// (ADR-0025), otherwise raise the ambient frame depth for its duration
-/// ([`enter_def_call_frame`]). What every `Expr::DefCall` evaluation arm
-/// holds around its recursion into the bound body.
+/// ([`enter_def_call_frame`]) and open the retention scope that holds the
+/// bodies its own calls bind for the first time ([`BoundBody`], #3148). What
+/// every `Expr::DefCall` evaluation arm holds around its recursion into the
+/// bound body. `bound` is the call's own cache, whose hotness the scope takes.
 pub(crate) fn enter_def_call(
     def: &FuncDefData,
     frames: u32,
-) -> Result<ambient_frame_depth::Guard, EvalError> {
+    bound: &BoundBody,
+) -> Result<DefCallGuard, EvalError> {
     if native_stack_exhausted() {
         return Err(def_call_depth_refusal(def));
     }
-    Ok(enter_def_call_frame(frames))
+    let scope = if bound.is_hot() {
+        retention_scope::Scope::Hot
+    } else {
+        retention_scope::Scope::Cold
+    };
+    Ok(DefCallGuard {
+        _depth: enter_def_call_frame(frames),
+        _retained: retention_scope::enter(scope),
+    })
+}
+
+/// What [`enter_def_call`] holds for one `DefCall` evaluation. Field order is
+/// drop order: the depth floor is restored before the scope releases the
+/// bodies it held, and neither depends on the other.
+pub(crate) struct DefCallGuard {
+    _depth: ambient_frame_depth::Guard,
+    _retained: retention_scope::Guard,
 }
 
 /// The refusal of an argument read once the native stack is spent
@@ -61753,40 +61773,60 @@ pub(crate) const MAX_EVAL_FRAMES: u32 = 40_000;
 ///   pass stops at a `Shared`, so a binder inside the body (`3 as $x`, a
 ///   `reduce` pattern) cannot reach into an argument that mentions `$x`
 ///   (#2077).
-pub(crate) fn bind_def_call<'e>(
+pub(crate) fn bind_def_call(
     def: &Rc<FuncDefData>,
     args: &[Expr],
     frames: u32,
-    bound: &'e BoundBody,
-) -> Result<&'e Rc<Expr>, EvalError> {
-    bound.get_or_try_init(|| {
-        // ADR-0025: the evaluator arms check the floor before running a
-        // bound body, but a static walk that binds a body to look inside it
-        // (`step_can_yield_absent` and its kin) reaches only this.
-        if frames >= MAX_EVAL_FRAMES || native_stack_exhausted() {
-            return Err(def_call_depth_refusal(def));
-        }
-        // #2094: `def.body` needs to become an owned `Expr` before
-        // `install_def_calls` below only when at least one parameter
-        // substitution actually rebuilds it -- `substitute_func_param`
-        // already deep-clones/rebuilds the whole tree on its own first
-        // call, so seeding the loop with a separate `def.body.clone()`
-        // wasted one O(body size) allocation per bound call (i.e. once per
-        // recursion level, since this whole function is gated by `bound`).
-        // A zero-parameter `def` needs no substitution at all, so it skips
-        // straight to installing over `&def.body` with no clone whatsoever.
-        let installed_body = if def.params.is_empty() {
-            install_def_calls(&def.body, def, frames + 1, true)
-        } else {
-            let body = bind_def_call_params(&def.body, &def.params, args);
-            // `true`: this is `def`'s own body, the scope that repeats
-            // once per actual recursive level -- see
-            // `sibling_frame_charge`'s own doc comment (#2135 code
-            // review, Finding 1).
-            install_def_calls(&body, def, frames + 1, true)
-        };
-        Ok(Rc::new(installed_body))
-    })
+    bound: &BoundBody,
+) -> Result<Rc<Expr>, EvalError> {
+    bound.get_or_try_init(|| bind_def_call_body(def, args, frames))
+}
+
+/// [`bind_def_call`] for a static walk that binds a body to look inside it
+/// (`step_can_yield_absent` and its kin) without evaluating the call: the
+/// same cache, but not a reach of the node, so the evaluation that follows
+/// the walk is still its first (#3148, see [`BoundBody`]).
+pub(crate) fn probe_def_call(
+    def: &Rc<FuncDefData>,
+    args: &[Expr],
+    frames: u32,
+    bound: &BoundBody,
+) -> Result<Rc<Expr>, EvalError> {
+    bound.probe(|| bind_def_call_body(def, args, frames))
+}
+
+/// What [`bind_def_call`] and [`probe_def_call`] cache: `def`'s body with
+/// `args` bound and the definition installed over it.
+fn bind_def_call_body(
+    def: &Rc<FuncDefData>,
+    args: &[Expr],
+    frames: u32,
+) -> Result<Rc<Expr>, EvalError> {
+    // ADR-0025: the evaluator arms check the floor before running a bound
+    // body, but a static walk that binds a body to look inside it
+    // (`step_can_yield_absent` and its kin) reaches only this.
+    if frames >= MAX_EVAL_FRAMES || native_stack_exhausted() {
+        return Err(def_call_depth_refusal(def));
+    }
+    // #2094: `def.body` needs to become an owned `Expr` before
+    // `install_def_calls` below only when at least one parameter
+    // substitution actually rebuilds it -- `substitute_func_param` already
+    // deep-clones/rebuilds the whole tree on its own first call, so seeding
+    // the loop with a separate `def.body.clone()` wasted one O(body size)
+    // allocation per bound call (i.e. once per recursion level, since this
+    // whole function is gated by `bound`). A zero-parameter `def` needs no
+    // substitution at all, so it skips straight to installing over
+    // `&def.body` with no clone whatsoever.
+    let installed_body = if def.params.is_empty() {
+        install_def_calls(&def.body, def, frames + 1, true)
+    } else {
+        let body = bind_def_call_params(&def.body, &def.params, args);
+        // `true`: this is `def`'s own body, the scope that repeats once per
+        // actual recursive level -- see `sibling_frame_charge`'s own doc
+        // comment (#2135 code review, Finding 1).
+        install_def_calls(&body, def, frames + 1, true)
+    };
+    Ok(Rc::new(installed_body))
 }
 
 /// Bind every parameter of a `def` call into its own body (#2560, #3149).
@@ -61982,8 +62022,8 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     match bind_def_call(def, args, frames, cache) {
-        Ok(bound) => match enter_def_call(def, frames) {
-            Ok(_guard) => eval_single::<W, S>(bound, value, optional),
+        Ok(body) => match enter_def_call(def, frames, cache) {
+            Ok(_guard) => eval_single::<W, S>(&body, value, optional),
             Err(e) => QueryResult::Error(e),
         },
         Err(e) => QueryResult::Error(e),
@@ -64270,6 +64310,121 @@ mod tests {
             "message: {}",
             err.message
         );
+    }
+
+    /// How many bound bodies `expr` still retains: every body a `DefCall`
+    /// under it can reach without binding, and theirs in turn (#3148).
+    fn retained_bodies(expr: &Expr) -> usize {
+        let mut count = 0;
+        crate::jq::walk::any_subexpr(expr, &mut |e| {
+            if let Expr::DefCall { bound, .. } = e {
+                if let Some(body) = bound.available() {
+                    count += 1 + retained_bodies(&body);
+                }
+            }
+            false
+        });
+        count
+    }
+
+    /// Evaluate `program` -- a top-level `def` then a filter -- over `null`
+    /// through the CLI's streaming evaluator, and report its outputs and the
+    /// bodies its call tree retains after. Run on its own thread with the
+    /// CLI's stack registered (ADR-0025): the sink evaluator's debug-build
+    /// frames overflow a test thread's default stack.
+    #[cfg(feature = "std")]
+    fn run_and_count_retained(program: &'static str) -> (String, usize) {
+        const STACK: usize = 256 * 1024 * 1024;
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                with_stack_budget(STACK, || {
+                    let Expr::FuncDef {
+                        name,
+                        params,
+                        body,
+                        then,
+                        ..
+                    } = parse(program).unwrap()
+                    else {
+                        panic!("expected a top-level FuncDef");
+                    };
+                    let cache = FuncDefBound::default();
+                    let bound_then = bind_def(&name, &params, &body, &then, &cache);
+                    let json = b"null";
+                    let index = crate::json::JsonIndex::build(json);
+                    let mut outputs = Vec::new();
+                    let control = crate::jq::eval_generic::eval_each_with_cursor(
+                        &bound_then,
+                        index.root(json),
+                        &mut |result| {
+                            outputs.push(format!("{result:?}"));
+                            true
+                        },
+                    );
+                    assert!(control.is_none(), "{control:?}");
+                    (outputs.join(","), retained_bodies(&bound_then))
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// #3148: a call tree evaluated once retains the root call's body only,
+    /// not one body per call. Before the fix, every node's first-use body was
+    /// kept for the program's lifetime, so `fib(12)`'s 465 calls left 465
+    /// bodies behind (`fib(24)`: 349 MB on a 7950X, against jq's 2 MB).
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_call_tree_evaluated_once_retains_only_the_root_body_3148() {
+        let (out, retained) = run_and_count_retained(
+            "def fib(n): if n < 2 then n else [fib(n - 1), fib(n - 2)] | add end; fib(12)",
+        );
+        assert_eq!(out, "Owned(Int(144))");
+        assert_eq!(
+            retained, 1,
+            "only the top-level call site keeps its body; every call below it \
+             is released when its caller returns"
+        );
+    }
+
+    /// #3148 review: a static probe before evaluation does not count as a
+    /// reach. `key?` sends the pipe through the path-context route, whose
+    /// probe binds `fib(12)` to look inside it before the evaluation runs;
+    /// counted as the first reach, it made that evaluation the second, and
+    /// the whole tree was kept (465 bodies).
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_probed_call_tree_evaluated_once_retains_only_the_root_body_3148() {
+        let (out, retained) = run_and_count_retained(
+            "def fib(n): if n < 2 then n else [fib(n - 1), fib(n - 2)] | add end; \
+             [fib(12)] | .[0] | key? // .",
+        );
+        assert_eq!(out, "Owned(Int(0))", "`key` of `.[0]` is its index");
+        assert_eq!(retained, 1);
+    }
+
+    /// #3148: a call reached repeatedly keeps its call tree, so a later round
+    /// binds nothing -- the rule that keeps `[range(20) | fib(18)]` from
+    /// re-binding every call on every round. `fib(8)` has 67 calls, and each
+    /// call site in its tree keeps one body.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_call_tree_evaluated_repeatedly_is_kept_3148() {
+        fn calls(n: u32) -> usize {
+            if n < 2 {
+                1
+            } else {
+                1 + calls(n - 1) + calls(n - 2)
+            }
+        }
+        let (out, retained) = run_and_count_retained(
+            "def fib(n): if n < 2 then n else [fib(n - 1), fib(n - 2)] | add end; \
+             [range(3) | fib(8)] | add",
+        );
+        assert_eq!(out, "Owned(Int(63))");
+        assert_eq!(retained, calls(8));
     }
 
     /// `bind_def_call`'s own `frames >= MAX_EVAL_FRAMES` guard (the check
