@@ -330,6 +330,32 @@ def fold_program(rng):
 
 FOLD_P = 0.2
 
+# #3188: a write whose *target* navigates to an embed of a root bind, over a
+# container built after the bind -- the owned re-entry's write door. Every
+# other family binds inside the wrapper, so none reaches it. Each construct
+# carries navigations into it; the rebuilt ones (`{"a":1}` literals) are the
+# must-refuse half: a value-equal copy shares no storage, and jq refuses.
+EMBED_WRITE_CONSTRUCTS = [
+    ("[.]", [".[0]", ".[]", ".[0]?", ".[-1]", ".[0,0]"]),
+    ("[.,.]", [".[1]", ".[]", ".[0,1]", ".[1]?"]),
+    ("{k:.}", [".k", ".[\"k\"]", ".[]", ".k?"]),
+    ("[[.]]", [".[0][0]", ".[0][]", ".[][]"]),
+    ("{k:{j:.}}", [".k.j", ".k[]"]),
+    ("([.] + [.])", [".[]", ".[1]"]),
+    ("[.,{\"a\":1}]", [".[]", ".[1]", ".[0]"]),
+    ("[{\"a\":1}]", [".[0]", ".[]"]),
+]
+EMBED_WRITE_TAILS = ["", " | .a?", " | .c?", " | .[0]?", " | .x.a?"]
+EMBED_WRITE_WRAPS = [
+    "del(%s)", "(%s) = 9", "(%s) |= 5", "(%s) |= empty", "(%s) //= 3",
+    "((%s) = 9) | length", "del(%s) | .[0]?", ". | del(%s)",
+]
+
+def embed_write_program(rng):
+    construct, navs = rng.choice(EMBED_WRITE_CONSTRUCTS)
+    target = rng.choice(navs) + " | $x" + rng.choice(EMBED_WRITE_TAILS)
+    return f". as $x | {construct} | " + rng.choice(EMBED_WRITE_WRAPS) % target
+
 # #3049: `[f]` keeps path tracking live even when its input is tracked.
 # Earlier pools generated array values but not this tracked-input placement
 # with navigation *inside* the constructor followed by an empty consumer.
@@ -531,6 +557,11 @@ def main():
                          "scaled like the other routes when --fold-p is set). #3135's door opens "
                          "only for a navigated bind used by a resolver on an owned-rooted route, "
                          "so a stock run draws few of them -- run at 1.0 to weight the sweep onto it")
+    ap.add_argument("--embed-write-p", type=float, default=0.0,
+                    help="probability a program is an embed-write program (#3188): a root bind, a "
+                         "container built from it, then del/assignment through a target navigating "
+                         "to it. Off by default so existing seeds keep their stream; run at 1.0 to "
+                         "weight the sweep onto the owned write door")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     pin = open("tests/data/jq-golden/JQ_VERSION").read().strip()
@@ -545,7 +576,9 @@ def main():
                            ("ROUTES", ROUTES), ("REBUILDS", REBUILDS), ("ROOT_USES", ROOT_USES),
                            ("TRACKED_ARRAY_INNERS", TRACKED_ARRAY_INNERS),
                            ("TRACKED_ARRAY_WRAPPERS", TRACKED_ARRAY_WRAPPERS),
-                           ("VALUE_BIND_SOURCES", VALUE_BIND_SOURCES), ("VALUE_BIND_USES", VALUE_BIND_USES)]:
+                           ("VALUE_BIND_SOURCES", VALUE_BIND_SOURCES), ("VALUE_BIND_USES", VALUE_BIND_USES),
+                           ("EMBED_WRITE_CONSTRUCTS", [c for c, _ in EMBED_WRITE_CONSTRUCTS]),
+                           ("EMBED_WRITE_WRAPS", EMBED_WRITE_WRAPS)]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
@@ -564,7 +597,9 @@ def main():
         dv = doc(rng)
         d = json.dumps(dv)
         r = rng.random()
-        if r < TRACKED_ARRAY_P:
+        if a.embed_write_p and rng.random() < a.embed_write_p:
+            f = embed_write_program(rng)
+        elif r < TRACKED_ARRAY_P:
             f = tracked_array_program(rng)
         elif r < TRACKED_ARRAY_P + (1.0 - TRACKED_ARRAY_P) * route_p:
             # #3036: the document twice, so `input` reads a second copy.
