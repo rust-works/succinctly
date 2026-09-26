@@ -796,7 +796,7 @@ pub(super) fn to_owned_cursor_with<C: DocumentCursor, S: EvalSemantics>(
 /// value. Unlike `to_owned_cursor` it never hands back an embedded binding's
 /// value: there is nothing to hand back, and walking is what decides.
 pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Result<(), EvalError> {
-    to_owned_cursor_at_depth::<S, _, CheckOnly>(
+    let result = to_owned_cursor_at_depth::<S, _, CheckOnly>(
         cursor,
         0,
         &|depth| {
@@ -809,7 +809,10 @@ pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Resul
             }
         },
         &|_| None,
-    )
+    );
+    // The same depth-0 assertion `to_owned_cursor` makes (#2334).
+    debug_assert_materialization_error(&result);
+    result
 }
 
 /// What [`to_owned_cursor_at_depth`] assembles from the checks it makes:
