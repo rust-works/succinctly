@@ -57,22 +57,23 @@ use super::eval::{
     classify_nth_n, classify_parent_n, classify_skip_n, clear_nonretryable_stop, collapse_vec,
     collect_pattern_var_names, compare_key_arrays, compare_values,
     debug_assert_materialization_error, demote_for_reentry, each_path_on_owned,
-    each_pattern_binding_set, each_recurse_walk, enter_def_call_frame, entries_to_object,
+    each_pattern_binding_set, each_recurse_walk, enter_def_call, entries_to_object,
     eval_each_owned, eval_full as full_eval, finish_fork_flow, finish_fork_from_flow,
     finish_short_circuit, fold_escaped_generator_prefix, foreach_forks, format_owned,
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_assignment_expr, is_identity_passthrough,
     is_pure_chain_link, is_retryable_control, is_retryable_stop, key_arrays_eq, literal_to_owned,
-    mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
-    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
-    pattern_alternatives_var_names, prefer_pending_control, range_from_literal_override,
-    range_max_exceeded_error, range_num, range_values_f64, range_values_int, recurse_walk_flow,
-    reduce_forks, reroot_for_reentry, reroot_markers, resolve_computed_slice_bounds,
-    resume_from_escape, reverse_length_is_empty, select_emits, slice_component_value,
-    slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
-    stop_with_error, stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix,
-    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
-    try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
+    numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
+    owned_to_expr, owned_to_string, pattern_alternatives_var_names, prefer_pending_control,
+    range_from_literal_override, range_max_exceeded_error, range_num, range_values_f64,
+    range_values_int, recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
+    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
+    shared_arg_depth_refusal, slice_component_value, slice_object_as_yq_children,
+    slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
+    stop_with_escape_cell, streams_escaped_generator_prefix, streams_unbounded,
+    substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str, try_payload_root,
+    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
     yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
     yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
@@ -8674,7 +8675,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         Expr::Label { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
         // #2416 phase 3: a bound call natively via `eval_each_generic`'s own
-        // `DefCall` arm (`bind_def_call`/`enter_def_call_frame`) -- the same
+        // `DefCall` arm (`bind_def_call`/`enter_def_call`) -- the same
         // recursion-depth accounting that arm already does, just reached
         // through `collect_each_generic` instead of the eager bridge.
         Expr::DefCall { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
@@ -9348,10 +9349,10 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound) => {
-                let _guard = enter_def_call_frame(*frames);
-                eval_each_generic::<S, V>(bound, value, optional, cursor, sink)
-            }
+            Ok(bound) => match enter_def_call(def, *frames) {
+                Ok(_guard) => eval_each_generic::<S, V>(bound, value, optional, cursor, sink),
+                Err(e) => Flow::Escaped(Control::Error(e)),
+            },
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         // Same split as `eval.rs`'s own `Shared` arm, for the same measured
@@ -9363,6 +9364,11 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // not a computed chain link) can be arbitrary user code underneath,
         // so it is peeled by re-entering this same arm rather than taken as
         // settled -- see `eval.rs`'s identical split for the full reasoning.
+        //
+        // ADR-0025: every argument read checks the native-stack floor first.
+        Expr::Shared(_) if native_stack_exhausted() => {
+            Flow::Escaped(Control::Error(shared_arg_depth_refusal()))
+        }
         Expr::Shared(inner) if matches!(&**inner, Expr::Shared(_)) => {
             eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
         }
@@ -18271,11 +18277,15 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
             Ok(bound_body) => {
-                let _guard = enter_def_call_frame(*frames);
+                let _guard = enter_def_call(def, *frames).map_err(Control::Error)?;
                 path_context_step_generic::<S, V>(bound_body, pos, out)
             }
             Err(e) => Err(Control::Error(e)),
         },
+        // ADR-0025: every argument read checks the native-stack floor first.
+        Expr::Shared(_) if native_stack_exhausted() => {
+            Err(Control::Error(shared_arg_depth_refusal()))
+        }
         Expr::Shared(inner) => path_context_step_generic::<S, V>(inner, pos, out),
         Expr::FirstExpr(inner) => path_context_step_bounded::<S, V>(inner, Some(1), pos, out),
         Expr::Limit { n, expr } => {
@@ -27537,12 +27547,18 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound_body) => {
-                let _guard = enter_def_call_frame(*frames);
-                eval_owned_identity_spliced::<S, V>(bound_body, rest, value, id, optional, tail)
-            }
+            Ok(bound_body) => match enter_def_call(def, *frames) {
+                Ok(_guard) => {
+                    eval_owned_identity_spliced::<S, V>(bound_body, rest, value, id, optional, tail)
+                }
+                Err(e) => Flow::Escaped(Control::Error(e)),
+            },
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
+        // ADR-0025: every argument read checks the native-stack floor first.
+        Expr::Shared(_) if native_stack_exhausted() => {
+            Flow::Escaped(Control::Error(shared_arg_depth_refusal()))
+        }
         Expr::Shared(inner) => {
             eval_owned_identity_spliced::<S, V>(inner, rest, value, id, optional, tail)
         }
@@ -37807,7 +37823,7 @@ mod tests {
             panic!("expected a top-level FuncDef");
         };
 
-        let _guard = enter_def_call_frame(crate::jq::eval::MAX_EVAL_FRAMES);
+        let _guard = crate::jq::eval::enter_def_call_frame(crate::jq::eval::MAX_EVAL_FRAMES);
         let cache = FuncDefBound::default();
         let defcall = bind_def(&name, &params, &body, &then, &cache);
         assert!(

@@ -230,6 +230,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Deep recursion refuses instead of overflowing the stack, whatever its
+  shape** (#3262, #3294, ADR-0025). The recursion guard counted the structure
+  of a `def`'s body, but what runs out is native stack, and some ordinary
+  shapes cost far more of it per level than their structure shows. A bare
+  parameter's argument is re-evaluated through a chain one link longer per
+  level, and several shapes aborted the process with the guard on: a link that
+  is not plain arithmetic (`def f(n): if n == 0 then 0 else f(n - 1 | .) end`)
+  at ~240 levels, a nested `def` closing over the parameter or a helper `def`
+  in the argument at ~300, an argument three operators deep at ~12,800, and
+  `def rep(f; n): ... (f | rep(f; n - 1))` at ~670. Others ran within 3-65% of
+  a crash. The evaluation thread now registers its stack, and a recursion of
+  any shape refuses with `exceeded maximum recursion depth` (exit 5) once it
+  has used half. A passed-through closure no longer builds a chain at all, so
+  `0 | rep(. + 1; 1000)` answers `1000`, as in jq. The price is headroom where
+  the old guard admitted more than the stack could hold: plain bare recursion
+  stops at ~10,000 levels (was 20,000, 3% short of a crash), bare `sum_to` at
+  ~9,200 (was 13,297), and the lazy-link shapes at ~170-220, where jq, whose
+  call stack is on the heap, runs 100,000 (#3287). A recursion that combines
+  two recursive calls with `+` or `as` (`fib(n - 1) + fib(n - 2)`) uses stack in
+  proportion to its number of calls, so `fib(20)` now refuses where it used
+  to answer (`18 | fib` in the zero-parameter spelling); `fib(21)` already
+  overflowed the stack. `[fib(n - 1), fib(n - 2)] |
+  add` is unaffected (#3296). Library callers get the same guard by evaluating
+  inside `succinctly::jq::with_stack_budget`.
+
 - **jq: a malformed nested number raises when read instead of reading as `null`** (#3222).
   jq rejects `[1.2.3,2]` at parse time. succinctly used to print `[null,2]` for it, while
   `.[0] | type` answered `"number"` and `.[0] | length` raised an error `try` could catch.

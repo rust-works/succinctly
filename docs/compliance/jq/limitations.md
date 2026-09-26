@@ -4219,11 +4219,42 @@ Three differences remain, all in the direction of erroring rather than aborting:
   therefore `MAX_EVAL_FRAMES / (b + k)` levels for a body charging `b` frames
   a level with `k` `$` parameters, so it falls with every `$` parameter the
   signature adds. A thin `def sum_to($n)` (`b` = 3) stops at 10,000 levels,
-  not the bare spelling's 13,333. `def r($p1;$p2;$p3;$p4): if $p1 == 0 then
+  not 13,333. `def r($p1;$p2;$p3;$p4): if $p1 == 0 then
   0 else r($p1-1;$p2;$p3;$p4) end` (`b` = 2) stops at 6,666, and the same
   shape with 16 `$` parameters at 2,222. jq answers all of these. Left
   uncharged, three parameters overflowed the stack below the guard; charged,
   the margin to the real crash floor stays 2.1-2.9x from one to eight.
+  Since [#3262](https://github.com/rust-works/succinctly/issues/3262)
+  ([ADR-0025](../../adrs/adr-0025.md)) a second limit sits beside the frame
+  count: the evaluation thread registers its stack, and a recursion refuses once
+  it has used half of it, whatever its shape. The two differ most for a *bare*
+  parameter. It binds by name, so each level's argument wraps the previous
+  level's (`n - 1` over the last `n - 1`), and reading it evaluates that whole
+  chain natively on top of the live levels -- stack no structural count sees.
+  Measured on an Apple M4 Pro (release, 256 MB), a thin `def f(n): ... f(n -
+  1)` stops at ~10,000 levels, a bare `def sum_to(n)` at ~9,200, and a chain
+  read inside `path()` or `|=` at ~11,600; each is at the frame count's limit
+  or the stack floor, whichever comes first, and each is at least 2x short of
+  where the stack really runs out. jq answers all of these. The steepest
+  divergence is a chain link that is not plain arithmetic (`f(n - 1 | .)`), a
+  nested `def` closing over the parameter (`def h: n - 1; ... f(h)`), or a
+  helper `def` in the argument (`f(g(n))`): each refuses at ~170-220 levels,
+  where jq runs 100,000 in 22-42 MB. Such a link goes through the demand-driven
+  evaluator, whose native stack per link is what the self-recursive generator
+  bullet below describes, and each level's continuation runs on top of the
+  previous level's live chain, so the stack grows with the *square* of the
+  depth: 4x the stack buys 2x the levels. No stack size closes that gap; a
+  bounded-stack path for such links would
+  ([#3287](https://github.com/rust-works/succinctly/issues/3287)). Before #3262
+  all three aborted the process at ~240-330 levels with the guard on. Tree
+  recursion that combines two calls with `+` or `as` (`fib(n - 1) + fib(n -
+  2)`) runs each right-hand call inside its left sibling's output sink, so its
+  stack grows with the number of *calls*, not the depth: `fib(20)` (21,891
+  calls) refuses, `fib(21)` aborted the process before #3262, and jq answers
+  both in 2 MB. The zero-parameter spelling (`def fib: ... (. - 1 | fib) + (.
+  - 2 | fib)`) holds more per call and refuses from `18 | fib`. `[fib(n - 1), fib(n - 2)] | add` returns before continuing and
+  runs `fib(24)`
+  ([#3296](https://github.com/rust-works/succinctly/issues/3296)).
 - **A recursively-built value can exceed `MAX_VALUE_TREE_DEPTH` (384) where jq has no such
   limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
   1,200 levels; jq prints it, succinctly reports `nesting depth exceeds limit of 384` and
@@ -4265,12 +4296,14 @@ linear. Measured interleaved on one machine,
 `sum_to(8000)` is 10.8 s here against jq's 4.3 s: same complexity, ~2.5x constant.
 
 `MAX_EVAL_FRAMES`'s ceiling is calibrated against the 256 MB (release) / 2 GB (debug)
-stack the CLI reserves for evaluation (`EVAL_STACK_SIZE`, `src/bin/succinctly/main.rs`).
-A library caller invoking `succinctly::jq::eval` directly, on a thread sized for anything
-smaller, does not get that guarantee — the same recursion that errors cleanly under the CLI
-can still abort the process with a native stack overflow on an ordinary (e.g. default 8 MB)
-thread. Callers embedding this crate and expecting to run recursive `def`s at any real depth
-should evaluate on a thread reserved at a comparable size.
+stack the CLI reserves for evaluation (`EVAL_STACK_SIZE`, `src/bin/succinctly/main.rs`),
+and the CLI registers that stack for ADR-0025's floor. A library caller invoking
+`succinctly::jq::eval` directly gets neither guarantee on its own: the same recursion that
+errors cleanly under the CLI can abort the process with a native stack overflow on an
+ordinary (e.g. default 8 MB) thread. Wrapping the evaluation in
+`succinctly::jq::with_stack_budget(bytes_available, || ...)` arms the floor for that thread,
+so a recursion too deep for it refuses instead; running recursive `def`s at any real depth
+still needs a thread reserved at a comparable size.
 
 ## `input`/`inputs` residuals after #1309
 

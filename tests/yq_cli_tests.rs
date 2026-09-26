@@ -35577,6 +35577,35 @@ fn test_runaway_recursion_errors_cleanly_in_yq_mode_1371() -> Result<()> {
     Ok(())
 }
 
+/// #3262 / ADR-0025: the generic evaluator's `DefCall` and `Shared` arms take
+/// the native-stack floor too. A lazy-link argument chain, which aborted the
+/// process at ~250 levels with the frame guard alone, refuses in yq mode on
+/// every route `test_runaway_recursion_errors_cleanly_in_yq_mode_1371` walks,
+/// and answers shallow.
+#[test]
+fn test_argument_chain_refuses_in_yq_mode_3262() -> Result<()> {
+    let def = "def f(n): if n == 0 then .a else f(n - 1 | .) end;";
+    for (filter, args) in [
+        (format!("{def} f(3000)"), &[][..]),
+        (format!("first({def} f(3000))"), &["--jq-extensions"][..]),
+        (
+            format!("[limit(1; {def} f(3000))]"),
+            &["--jq-extensions"][..],
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(&filter, "a: 1\n", args)?;
+        assert_eq!(code, 1, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("exceeded maximum recursion depth"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(&format!("{def} f(50)"), "a: 1\n", &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
 /// #1872 gates `drive_fold_source`'s single tracked evaluation on
 /// `EvalTag::Jq`. Real yq's lexer rejects `reduce`, `foreach` *and* `path`
 /// outright (confirmed live against yq v4.53.3), so yq mode has no oracle to

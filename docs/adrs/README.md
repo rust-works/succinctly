@@ -51,6 +51,7 @@ by Michael Nygard.
 | [ADR-0022](adr-0022.md) | ✅ Accepted | 2026-09-12 | Demand Budgets Ride the Sink (#2666)                          |
 | [ADR-0023](adr-0023.md) | ✅ Accepted | 2026-09-16 | Module Scope Boundary as a Resolver Floor (#2951)             |
 | [ADR-0024](adr-0024.md) | ✅ Accepted | 2026-09-17 | Structural Sharing in `OwnedValue` (#2999)                    |
+| [ADR-0025](adr-0025.md) | ✅ Accepted | 2026-09-26 | Guard Recursion by the Native Stack It Spends (#3262)         |
 
 The inventory is maintained by the [`update-adr-inventory`](../../.claude/skills/update-adr-inventory/SKILL.md)
 skill, which scans `adr-*.md` for the title and status and derives the date from git history.
