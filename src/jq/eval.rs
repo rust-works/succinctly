@@ -36508,7 +36508,28 @@ fn cannot_move_register(expr: &Expr) -> bool {
             | Builtin::FromJson
             // #2764: produces nothing, so it navigates nothing --
             // `path(. as $x | [empty] | $x)` is `[]` in jq 1.7.1.
-            | Builtin::Empty => true,
+            | Builtin::Empty
+            // #3126: real jq's `stderr`/bare `debug` are `DUP;
+            // CALL_BUILTIN` -- a side effect plus the identity output,
+            // never touching the register (confirmed live:
+            // `path(. as {a:$q} | (debug|$q))` is `["a"]` in jq 1.7.1).
+            | Builtin::Stderr
+            | Builtin::Debug => true,
+            // #3126 review: `msg` is evaluated (and its own value printed)
+            // but, like `error`'s message and `halt_error`'s code just
+            // above, is not itself part of the output -- so this recurses
+            // on `msg` exactly like those two, rather than defaulting to
+            // `false` for every `debug(msg)` regardless of shape. `msg` is
+            // *not* wrapped in jq's own `SUBEXP_BEGIN`/`SUBEXP_END` the way
+            // an object's field values are, so a `msg` that itself
+            // navigates genuinely moves the register: confirmed live,
+            // `path(. as {a:$q} | (debug(.k)|$q))` refuses in jq 1.7.1 too
+            // (evaluating `.k` moves the register exactly as any other
+            // navigating stage would) -- but `debug(1)`/`debug("hi")` don't
+            // navigate at all, and jq 1.7.1 confirms both keep tracking
+            // (`["a"]`), which the unconditional `false` this replaced got
+            // wrong.
+            Builtin::DebugMsg(msg) => cannot_move_register(msg),
             // #2764: jq's `def recurse(f): def r: ., (f | r); r;` moves the
             // register only through `f`, and `recurse(f; cond)`'s `cond`
             // runs as `select(cond)`'s `if` condition, a subexp. Live
@@ -102096,6 +102117,48 @@ mod tests {
             let parsed = parse(src).unwrap();
             assert_eq!(is_identity_passthrough(&parsed), want, "{src}");
         }
+    }
+
+    /// #3126: a `stderr`/`debug` stage in path position must not drop the
+    /// register any more than a literal stage does -- both are `DUP;
+    /// CALL_BUILTIN` in real jq, a side effect plus the identity output,
+    /// never touching the register, and `debug(msg)`'s own `msg` is (like
+    /// `error`'s message and `halt_error`'s code) evaluated but not part
+    /// of the output, so it only moves the register when `msg` itself
+    /// navigates. Confirmed live against jq 1.7.1 for every row below.
+    #[test]
+    fn test_stderr_debug_passthrough_keeps_path_register_3126() {
+        let doc = br#"{"a":{"b":1}}"#;
+        for filter in [
+            r"path(. as {a:$q} | (1 | $q))",
+            r#"path(. as {a:$q} | ("x"|stderr|$q))"#,
+            r"path(. as {a:$q} | (debug|$q))",
+            r"path(. as {a:$q} | (debug(1)|$q))",
+            r#"path(. as {a:$q} | (debug("hi")|$q))"#,
+            // A multi-valued `msg` (`Expr::Comma`) with every branch
+            // non-navigating keeps tracking too -- `cannot_move_register`'s
+            // own `Comma` arm requires all of them, not just the first.
+            r"path(. as {a:$q} | (debug(1,2)|$q))",
+        ] {
+            assert_eq!(outputs(doc, filter), [r#"["a"]"#], "{filter}");
+        }
+        // A navigating `msg` genuinely moves the register (confirmed live:
+        // `path(. as {a:$q} | (debug(.k)|$q))` on `{"a":{"b":1},"k":"m"}`
+        // refuses in jq 1.7.1 too) -- including when it's only *one*
+        // branch of an otherwise non-navigating `Comma` `msg`.
+        for src in [r"debug(.k)", r"debug(1,.k)"] {
+            assert!(!cannot_move_register(&parse(src).unwrap()), "{src}");
+        }
+
+        // The `?//` masking repro from the issue: a caught refusal must not
+        // answer the handler's value where jq answers the path.
+        assert_eq!(
+            outputs(
+                b"null",
+                r#"[try path(. as {"a":{x:$q}} ?// $z | ("B\($q)"|stderr|$q)) catch "c"]"#
+            ),
+            [r#"[["a","x"]]"#]
+        );
     }
 
     /// yq mode mints no `SnapshotAt` at all (the same single-choke-point
