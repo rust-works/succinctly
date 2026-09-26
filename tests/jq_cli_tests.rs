@@ -63997,6 +63997,7 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
         (r". as $x | [.] | (.[0] | $x | .a) = 5 | .[0]", r#"{"a":5}"#),
         (r". as $x | [.] | map((. | $x) = 1)", "[1]"),
         (r". as $x | 5 | del(.[0]? | $x)", "5"),
+        (r". as $x | [] | del(.[] | $x)", "[]"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
         assert_eq!(
@@ -64025,6 +64026,18 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
             "#3188: `{filter}`: stderr={stderr:?}"
         );
     }
+    // A slice after the embed resolves (jq `[[2]]`), but the door cannot
+    // spell a slice component as a static step until #3300, so it declines
+    // and the bridge refuses.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r". as $x | [.] | del(.[0] | $x | .[0:1])"],
+        Some("[1,2]"),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("", 5),
+        "#3188 slice residual (#3300): stderr={stderr:?}"
+    );
     Ok(())
 }
 

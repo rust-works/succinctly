@@ -1135,7 +1135,10 @@ is the revert that established what the other one costs.
    a navigated bind (`.a as $y \| [.] \| (.[0].a \| $y).b = 9`, #3179), a write reached
    after `.[]` peels the container (`[.] \| [.[] \| del(. \| $x)]`), and a target whose
    later path raises (`del(.[0] \| $x, .[0])` reports the bridge's refusal where jq
-   reports the second path's `Cannot index object with number`).
+   reports the second path's `Cannot index object with number`), and a target that resolves
+   through a slice after the embed (`[.] \| del(.[0] \| $x \| .[0:1])` on `[1,2]`, jq
+   `[[2]]`): the static spelling of a slice component is `.[{"start":0,"end":1}]`, which
+   succinctly does not evaluate yet ([#3300](https://github.com/rust-works/succinctly/issues/3300)).
    **[#3036](https://github.com/rust-works/succinctly/issues/3036), now closed: the same
    fabrication through the routes that never cross a funnel.** #2642's check ran only where
    an expression is handed from the generic evaluator to `eval.rs`; when the bind *and* the
