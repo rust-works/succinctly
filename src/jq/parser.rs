@@ -1864,15 +1864,25 @@ impl<'a> Parser<'a> {
                     // #3044: an `Int`-sourced fold (`key: None`, per the
                     // doc comment below) whose magnitude is past
                     // `jq_int_within_exact_f64_range` must NOT fold here --
-                    // `arith_mul` rounds this exact AST shape at eval time
-                    // now (the same `-1 * <literal>` split a bare
-                    // out-of-range negative literal parses to), so folding
-                    // straight to an exact `Expr::Index` would keep the
-                    // unrounded value and reopen the divergence #3044
-                    // closed for every other spelling. Falling through to
-                    // `None` routes to the runtime `IndexExpr`/
+                    // `arith_mul` rounds this exact AST shape at eval time,
+                    // so folding straight to an exact `Expr::Index` would
+                    // keep the unrounded value and reopen the divergence
+                    // #3044 closed for every other spelling. Falling
+                    // through to `None` routes to the runtime `IndexExpr`/
                     // `DynamicSlice` path instead, which evaluates the
                     // `Mul` node normally and picks up the rounding.
+                    //
+                    // #3075: the negative-literal-*token* producer of this
+                    // exact `-1 * <Int literal>` shape no longer reaches
+                    // here at all -- it now folds straight to a bare
+                    // `Literal::Float` at parse time (`parse_primary_inner`),
+                    // which has no arm in this function and falls through
+                    // to `None` on its own, further up. Only the *other*
+                    // producers `#1061`'s comment above already names --
+                    // an explicit user-written `-1 * <int-literal>`
+                    // expression, or a leading-zero integer like `-01` --
+                    // still reach this specific guard for an out-of-range
+                    // `Int`, so it stays live and necessary for those.
                     // `key: Some(..)` (a `Float`-sourced fold) is
                     // deliberately untouched: its own >17-significant-digit
                     // rounding gap is #2936, pre-existing and out of this
@@ -2506,32 +2516,21 @@ impl<'a> Parser<'a> {
                             match repr {
                                 // #3075: an `Int` repr only ever reaches this
                                 // arm once its magnitude is past
-                                // `jq_int_within_exact_f64_range` (an in-range
-                                // `Int` fails the guard above and falls to
-                                // the plain-literal arm below) -- so
-                                // `arith_mul`'s rounding for the `-1 * n`
-                                // split below is fully determined right here,
-                                // at parse time: `jq_checked_int_arith`
-                                // always takes its float branch for this
-                                // magnitude, multiplying
-                                // `jq_literal_int_to_f64` of each operand
-                                // (`-1` and `n`'s positive magnitude, from
-                                // `checked_neg`/the `i64::MIN` fallback
-                                // below). Negating a negation cancels, so
-                                // that product is simply
-                                // `jq_literal_int_to_f64(n)` on the original,
-                                // still-negative `n` -- sign-symmetric per
-                                // that function's own doc, so no
-                                // `checked_neg`/positive-magnitude detour is
-                                // needed here at all (`i64::MIN` needs no
-                                // special case, since `n` is used exactly as
-                                // parsed). Fold straight to the
-                                // already-known `Literal::Float` instead of
-                                // leaving a runtime `Arithmetic::Mul` node
-                                // that re-derives the same value on every
-                                // evaluation of this AST node (e.g. once per
-                                // iteration of
-                                // `range(0;1000000) | -869389897822472004`).
+                                // `jq_int_within_exact_f64_range` (an
+                                // in-range `Int` fails the guard above and
+                                // falls to the plain-literal arm below), so
+                                // `-1 * n`'s rounding is fully determined at
+                                // parse time -- `jq_literal_int_to_f64`
+                                // applied directly to `n` (still negative,
+                                // as parsed) is exactly what evaluating that
+                                // split would compute, by the sign-symmetry
+                                // its own doc comment describes (no
+                                // `checked_neg`/`i64::MIN` special case
+                                // needed here at all, unlike the split this
+                                // replaces). Fold straight to it instead of
+                                // leaving a runtime `Arithmetic::Mul` that
+                                // re-derives the same value on every
+                                // evaluation of this AST node.
                                 NumberRepr::Int(n) => Ok(Expr::Literal(Literal::Float(
                                     crate::jq::value::jq_literal_int_to_f64(n),
                                 ))),
