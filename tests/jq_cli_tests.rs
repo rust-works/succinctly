@@ -65828,17 +65828,13 @@ fn test_owned_embed_keeps_node_identity_on_the_input_bridge_2889() -> Result<()>
 /// - A cross-bridge marker -- bound before `input` runs, or used after it --
 ///   refuses in jq as well, because `-n` makes `.` `null` at the bind and
 ///   `input`'s own output is what the later stage sees.
-/// - `input | .a as $y | .a | ($y.b) = 9` is one jq *accepts* and this still
-///   refuses: the bind and the use are both plain cursor navigations with no
-///   owned re-entry between them, so no embed entry is ever consulted. It
-///   refused identically before Stage B.
 /// - An empty container binds no node on this route at all: `eval.rs`
 ///   recovers a value's cursor by hopping `parent()` from the child its
 ///   `StandardJson` retains, and `{}`/`[]` retain none. The generic
 ///   evaluator, which is handed a real cursor, does answer these -- the one
-///   place the two routes still disagree, and in the safe direction.
-/// - `[... | path($x)]` puts a further re-entry between the embed and the
-///   read, which carries no witness.
+///   place the two routes still disagree, and in the safe direction
+///   (#3180: it needs the container cursor kept on `JsonFields`/
+///   `JsonElements`, a hot-path change that wants measuring first).
 #[test]
 // jq filter literals are not formatting strings.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -65862,11 +65858,22 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         // it too, so this is the one place the two routes still differ.
         (r"{}", r"input | . as $x | {k:.} | .k | path($x)"),
         (r"[]", r"input | . as $x | {k:.} | .k | path($x)"),
-        // Collecting the pipe into an array puts a re-entry between the
-        // embed and the read that carries no witness. jq answers it; the
-        // bare twin is recovered above. (`getpath([])` in the same place
-        // relocates natively since #3178.)
-        (r#"{"a":1}"#, r"[input | . as $x | {k:.} | .k | path($x)]"),
+        // (Collecting the pipe into an array answers since #3180 -- see
+        // `test_input_route_array_collect_keeps_embed_identity_3180`.)
+        // A second construct-and-navigate hop: the first hop's re-entry
+        // bridges `{j:.}`, and the throwaway document it builds holds no
+        // node the table knows. jq answers `[]`/`[[]]`.
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | {k:.} | .k | {j:.} | .j | path($x)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[input | . as $x | {k:.} | .k | {j:.} | .j | path($x)]",
+        ),
+        // A scalar root never enters the table on this route. jq answers.
+        ("1", r"input | . as $x | [.] | .[0] | path($x)"),
+        ("1", r"[input | . as $x | [.] | .[0] | path($x)]"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
         assert_eq!(
@@ -65876,6 +65883,81 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         assert!(
             stderr.contains("Invalid path expression"),
             "#2889 Stage B: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3180: an array constructor collecting an input-route pipe reaches its
+/// constructions through `eval_owned_input`, the eager twin of
+/// `eval_each_owned`, which now takes the same embed peel and relocating
+/// fold, so the stage standing on the embed sees the node rather than a
+/// copy. Every expected output captured live against jq 1.7.1 (`-n`, the
+/// document twice on stdin).
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_input_route_array_collect_keeps_embed_identity_3180() -> Result<()> {
+    for (filter, expected) in [
+        (r"[input | . as $x | {k:.} | .k | path($x)]", "[[]]"),
+        (r"[inputs | . as $x | {k:.} | .k | path($x)]", "[[],[]]"),
+        (r"[input | . as $x | [.] | .[0] | path($x)]", "[[]]"),
+        (r"[input | . as $x | [.] | sort | .[0] | path($x)]", "[[]]"),
+        (r"[input | . as $x | [.,.] | .[] | path($x)]", "[[],[]]"),
+        (
+            r"[input | . as $x | {k:.} | .k | ($x.a) = 5]",
+            r#"[{"a":5}]"#,
+        ),
+        (r"[input | . as $x | [.,.] | .[] | .a]", "[1,1]"),
+        (
+            r#"try [input | . as $x | [.,.] | .[] | error("e")] catch ."#,
+            r#""e""#,
+        ),
+        // The relocating fold as the whole eager expression, and a peeled
+        // navigation that raises: the bridge's own error text.
+        (r"[input | . as $x | ([.,.] | max) | path($x)]", "[[]]"),
+        (
+            r"[input | . as $x | ([.] | sort) | .[0] | path($x)]",
+            "[[]]",
+        ),
+        (
+            r"try [input | . as $x | {k:.} | .[0] | sort] catch .",
+            r#""Cannot index object with number""#,
+        ),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-n", "-c", filter], Some(r#"{"a":1} {"a":1}"#))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3180: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    // A value-equal copy is a different node: jq refuses, and so must this --
+    // the last row a write through a value-equal sibling, the case that
+    // would turn an identity bug into a write to the wrong place.
+    for (input, filter) in [
+        (
+            r#"{"a":1} {"a":1}"#,
+            r#"[input | . as $x | [{"a":1}] | .[0] | path($x)]"#,
+        ),
+        (
+            r#"{"a":1} {"a":1}"#,
+            r"[input | . as $x | {k:.} | .z? | path($x)]",
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}} x"#,
+            r"[input | .a as $y | {k:.c} | .k | ($y.b) = 9]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3180: `{filter}` must stay refused: stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3180: `{filter}`: stderr={stderr:?}"
         );
     }
     Ok(())
