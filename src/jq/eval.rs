@@ -46632,25 +46632,27 @@ pub(crate) fn stop_with_escape(slot: &mut Option<Control>, control: Control) -> 
 /// generator they are driving sees only this stop, and if a `?//` sits
 /// inside that generator's own body it needs `nonretryable_stop` set to
 /// classify it correctly, exactly as any other escape-behind-a-stop does.
-/// Round-trips the payload through [`Control`] rather than re-testing
-/// `is_retryable_control` here -- that classifier drifting into a second
-/// copy is the #106/#1313/#1457 lesson [`mark_nonretryable_escape`] itself
-/// exists to close off.
+/// Round-trips through [`stop_with_escape`] itself, the same shape
+/// [`stop_with_error`] below uses -- not just its classifier -- so a second
+/// responsibility added to that plumbing later is inherited here for free,
+/// rather than needing its own copy the way [`mark_nonretryable_escape`]'s
+/// own doc comment already lists three drifted copies of (#106/#1313/#1457).
 pub(crate) fn stop_with_eval_escape(slot: &mut Option<EvalEscape>, escape: EvalEscape) -> Demand {
-    let control = Control::from(escape);
-    mark_nonretryable_escape(&control);
-    *slot = Some(EvalEscape::from(control));
-    Demand::Stop
+    let mut control = None;
+    let demand = stop_with_escape(&mut control, Control::from(escape));
+    *slot = control.map(EvalEscape::from);
+    demand
 }
 
 /// The one definition of "a `?//` may not retry past this escape, wherever
 /// it lands" -- `Halt` and decode failures, [`is_retryable_control`]'s two
 /// position-independent exclusions.
 ///
-/// [`stop_with_escape`], [`stop_with_escape_cell`] and
-/// [`stop_with_downstream`] cover the drivers whose slot holds a `Control`
-/// or a whole `Flow`. The four owned-identity stages in `eval_generic.rs`
-/// share `stop_owned_identity_rest_escape`, an adapter over
+/// [`stop_with_escape`], [`stop_with_escape_cell`], [`stop_with_error`] and
+/// [`stop_with_eval_escape`] cover the drivers whose slot holds a `Control`,
+/// an `EvalError`, or an `EvalEscape`; [`stop_with_downstream`] covers the
+/// one whose slot holds a whole `Flow`. The four owned-identity stages in
+/// `eval_generic.rs` share `stop_owned_identity_rest_escape`, an adapter over
 /// [`stop_with_escape`] that answers `Flow::Stopped` instead of
 /// `Demand::Stop` (#2830). The `Flow` kept by [`foreach_forks`] still calls
 /// this beside its own store. The classification rule stays in one place,
@@ -107705,6 +107707,20 @@ mod touched_edge_cases_2999 {
             Demand::Stop
         );
         assert!(matches!(slot, Some(EvalEscape::Error(_))));
+        assert!(!nonretryable_stop::is_set());
+
+        // `Break` is retryable too -- not one of `is_retryable_control`'s
+        // two position-independent exclusions -- pinned directly rather
+        // than left to the ordinary-`Error` case's analogy, since a future
+        // change to that classifier could special-case `Break` without
+        // this test noticing otherwise.
+        clear_nonretryable_stop();
+        let mut slot: Option<EvalEscape> = None;
+        assert_eq!(
+            stop_with_eval_escape(&mut slot, EvalEscape::Break("out".to_string())),
+            Demand::Stop
+        );
+        assert!(matches!(slot, Some(EvalEscape::Break(ref label)) if label == "out"));
         assert!(!nonretryable_stop::is_set());
         clear_nonretryable_stop();
     }
