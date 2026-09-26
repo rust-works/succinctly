@@ -65632,6 +65632,27 @@ fn test_embed_nested_reuse_keeps_the_depth_limit_3179() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&nested(256)))?;
     assert_eq!((stdout.as_str(), code), ("", 5), "n=256: stdout={stdout:?}");
     assert!(stderr.contains("nesting depth"), "n=256: stderr={stderr:?}");
+    // The height is the document's, not the bound value's: a duplicate key
+    // the walk descends into but the value drops (`"x"` twice, the first one
+    // 254 levels deep) still fails the fresh walk, so binding `.a` must not
+    // make the error go away (review of #3179).
+    let dup = format!(
+        r#"{{"a":{{"x":{}1{},"x":1}}}}"#,
+        "[".repeat(254),
+        "]".repeat(254)
+    );
+    for filter in [r"{k:.} | .k.a", r".a as $y | {k:.} | .k.a"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&dup))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "dup `{filter}`: stdout={stdout:?}"
+        );
+        assert!(
+            stderr.contains("nesting depth"),
+            "dup `{filter}`: stderr={stderr:?}"
+        );
+    }
     Ok(())
 }
 /// #3135: the owned-rooted twin of `test_navigated_bind_at_its_own_node_3037`.
@@ -66257,6 +66278,13 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
             r#"{"a":1}"#,
             r"[input | . as $x | {k:.} | .k | {j:.} | .j | path($x)]",
         ),
+        // #3179's nested reuse is the generic evaluator's: `eval.rs`'s own
+        // converter still reuses at depth 0 only. jq answers `[]`/`["a"]`.
+        (
+            r#"{"a":{"b":1}}"#,
+            r"input | .a as $y | {k:.} | .k.a | path($y)",
+        ),
+        (r#"{"a":{"b":1}}"#, r"input | .a as $y | path(.a | $y)"),
         // A scalar root never enters the table on this route. jq answers.
         ("1", r"input | . as $x | [.] | .[0] | path($x)"),
         ("1", r"[input | . as $x | [.] | .[0] | path($x)]"),

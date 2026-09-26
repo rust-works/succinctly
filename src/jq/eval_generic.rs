@@ -648,28 +648,21 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
     // field here) skips the table lookup without every per-item bind
     // (`.[] | .score as $y`, a fold's own `$u`) paying the position lookup
     // when no table is active -- the other order cost 3-6% on an M4 Pro.
-    if let Some(shared) = embed_shared_for::<S, _>(cursor) {
+    //
+    // #3179: the same table pass also names any bound node *below* depth 0
+    // -- `.a as $y | {k:.} | .k.a`, where `{k:.}` materializes the root and
+    // `$y`'s node sits one level inside it -- so a walk that cannot meet one
+    // never consults the table per container.
+    let (shared, nested) = embed_at_or_within::<S, _>(cursor);
+    if let Some(shared) = shared {
         return Ok(shared);
     }
-    // #3179: an embed *below* depth 0 -- `.a as $y | {k:.} | .k.a`, where
-    // `{k:.}` materializes the root and `$y`'s node sits one level inside
-    // it. Asked once here, so a walk that cannot meet a bound node never
-    // consults the table per container.
-    let reuse = embed_may_nest::<S, _>(cursor);
     let result = to_owned_cursor_at_depth::<S, _, BuildOwned>(
         cursor,
         0,
-        &|depth| {
-            if depth >= MAX_NESTING_DEPTH {
-                Err(EvalError::decode_failure(
-                    super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
-                ))
-            } else {
-                Ok(())
-            }
-        },
+        &nesting_depth_check,
         &|_| None,
-        reuse,
+        &nested,
     );
     // #2334: see `debug_assert_materialization_error`'s own doc comment --
     // depth-0 entry point only.
@@ -784,7 +777,19 @@ pub(super) fn to_owned_cursor_with<C: DocumentCursor, S: EvalSemantics>(
     check_depth: impl Fn(usize) -> Result<(), EvalError>,
     scalar_override: impl Fn(&C::Value) -> Option<OwnedValue>,
 ) -> Result<OwnedValue, EvalError> {
-    to_owned_cursor_at_depth::<S, _, BuildOwned>(cursor, 0, &check_depth, &scalar_override, false)
+    to_owned_cursor_at_depth::<S, _, BuildOwned>(cursor, 0, &check_depth, &scalar_override, &[])
+}
+
+/// [`to_owned_cursor`]'s and [`validate_cursor`]'s depth contract: a
+/// catchable decode failure past [`MAX_NESTING_DEPTH`] levels.
+fn nesting_depth_check(depth: usize) -> Result<(), EvalError> {
+    if depth >= MAX_NESTING_DEPTH {
+        Err(EvalError::decode_failure(
+            super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Run every check [`to_owned_cursor`] makes on `cursor`'s value -- nesting
@@ -804,17 +809,9 @@ pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Resul
     let result = to_owned_cursor_at_depth::<S, _, CheckOnly>(
         cursor,
         0,
-        &|depth| {
-            if depth >= MAX_NESTING_DEPTH {
-                Err(EvalError::decode_failure(
-                    super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
-                ))
-            } else {
-                Ok(())
-            }
-        },
+        &nesting_depth_check,
         &|_| None,
-        false,
+        &[],
     );
     // The same depth-0 assertion `to_owned_cursor` makes (#2334).
     debug_assert_materialization_error(&result);
@@ -863,20 +860,21 @@ impl CursorWalkOutput for CheckOnly {
     fn scalar(_: OwnedValue) {}
     /// Never: validating is walking, so no subtree may be skipped.
     fn reuse(_: OwnedValue) -> Option<()> {
-        None // omni-dev: coverage tolerate-line reason="unreachable: validate_cursor, CheckOnly's only instantiation, passes reuse = false, so the walk never asks (#3179)"
+        None // omni-dev: coverage tolerate-line reason="unreachable: validate_cursor, CheckOnly's only instantiation, passes no nested nodes, so the walk never asks (#3179)"
     }
 }
 
-/// `reuse` lets a nested container that *is* an in-scope binding's node come
-/// back as that binding's own value ([`embed_shared_nested`], #3179). Only
-/// [`to_owned_cursor`] turns it on, after [`embed_may_nest`]: its depth
-/// contract is the one the height rule is stated against.
+/// `nested` names the in-scope binding's nodes inside this walk's subtree:
+/// such a child comes back as that binding's own value
+/// ([`embed_shared_nested`], #3179). Only [`to_owned_cursor`] passes any,
+/// from [`embed_at_or_within`]: its depth contract is the one the height rule
+/// is stated against.
 fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
     cursor: &C,
     depth: usize,
     check_depth: &impl Fn(usize) -> Result<(), EvalError>,
     scalar_override: &impl Fn(&C::Value) -> Option<OwnedValue>,
-    reuse: bool,
+    nested: &[usize],
 ) -> Result<B::Out, EvalError> {
     check_depth(depth)?;
     let value = cursor.value();
@@ -901,18 +899,14 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             // only one would leave the cursor and value domains disagreeing
             // about whether a document is valid.
             let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-            let shared = reuse
-                .then(|| embed_shared_nested(&field.value_cursor, depth + 1))
-                .flatten()
-                .and_then(B::reuse);
-            let child = match shared {
+            let child = match embed_shared_nested::<_, B>(&field.value_cursor, depth + 1, nested) {
                 Some(child) => child,
                 None => to_owned_cursor_at_depth::<S, _, B>(
                     &field.value_cursor,
                     depth + 1,
                     check_depth,
                     scalar_override,
-                    reuse,
+                    nested,
                 )?,
             };
             map.insert(key, child);
@@ -942,20 +936,18 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             if !elem_cursor.element_gap_ok(is_first) {
                 return Err(elem_cursor.malformed_delimiter_error());
             }
-            let shared = reuse
-                .then(|| embed_shared_nested(&elem_cursor, depth + 1))
-                .flatten()
-                .and_then(B::reuse);
-            items.push(match shared {
-                Some(child) => child,
-                None => to_owned_cursor_at_depth::<S, _, B>(
-                    &elem_cursor,
-                    depth + 1,
-                    check_depth,
-                    scalar_override,
-                    reuse,
-                )?,
-            });
+            items.push(
+                match embed_shared_nested::<_, B>(&elem_cursor, depth + 1, nested) {
+                    Some(child) => child,
+                    None => to_owned_cursor_at_depth::<S, _, B>(
+                        &elem_cursor,
+                        depth + 1,
+                        check_depth,
+                        scalar_override,
+                        nested,
+                    )?,
+                },
+            );
             last_elem = Some(elem_cursor);
             elems = rest;
             is_first = false;
@@ -5418,7 +5410,7 @@ pub(crate) fn ambient_document_index() -> Option<i64> {
 /// at depth `d` skips the shared subtree's walk, so it is taken only when
 /// `d` plus the entry's height stays under `MAX_NESTING_DEPTH` -- exactly
 /// when that walk would have passed -- and only after one precheck per
-/// materialization ([`embed_may_nest`]) found an entry inside the subtree at
+/// materialization ([`embed_at_or_within`]) found an entry inside the subtree at
 /// all, so a walk that cannot meet one never asks per container. The lazy
 /// and validate-only walks never reuse below depth 0.
 ///
@@ -5441,7 +5433,7 @@ mod embed_table {
         /// Always an `OwnedValue::Array`/`Object` -- [`push`]'s caller
         /// filters, since only those two are `Rc`-backed.
         value: OwnedValue,
-        /// `value`'s nesting height ([`super::owned_height`]), computed the
+        /// The node's subtree height ([`super::cursor_height`]), computed the
         /// first time a nested reuse asks for it (#3179) and kept, so a bind
         /// never pays for it and a reuse pays once.
         height: Cell<Option<usize>>,
@@ -5518,32 +5510,51 @@ mod embed_table {
         })
     }
 
-    /// Whether some in-scope binding's node lies strictly inside the
-    /// subtree opening at `lo` in `document` (#3179). `hi` -- the subtree's
-    /// closing position, a BP `find_close` -- is asked for only when some
-    /// entry of that document opens after `lo` at all, which a per-item
-    /// bind's own later materializations never do.
-    pub(crate) fn nests_within(
+    /// One pass over the table for a walk about to start at `node` (#3179):
+    /// the entry for `node` itself if there is one ([`shared_for`]'s answer),
+    /// else every entry's node lying strictly inside the subtree `node`
+    /// opens -- usually none. `hi`, the subtree's closing position (a BP
+    /// `find_close`), is asked for only when some entry of `document` opens
+    /// after `node` at all, which a per-item bind's own later
+    /// materializations never do.
+    pub(crate) fn at_or_within(
+        node: usize,
         document: usize,
-        lo: usize,
         hi: impl FnOnce() -> Option<usize>,
-    ) -> bool {
+    ) -> (Option<OwnedValue>, Vec<usize>) {
         TABLE.with(|t| {
             let t = t.borrow();
-            if !t.iter().any(|e| e.document == document && e.node > lo) {
-                return false;
+            if let Some(e) = t
+                .iter()
+                .rev()
+                .find(|e| e.node == node && e.document == document)
+            {
+                return (Some(e.value.clone()), Vec::new());
+            }
+            if !t.iter().any(|e| e.document == document && e.node > node) {
+                return (None, Vec::new());
             }
             let Some(hi) = hi() else {
-                return false; // omni-dev: coverage tolerate-line reason="unreachable: hi is find_close of a container's own open paren, which a built index always matches (#3179)"
+                return (None, Vec::new()); // omni-dev: coverage tolerate-line reason="unreachable: hi is find_close of a container's own open paren, which a built index always matches (#3179)"
             };
-            t.iter()
-                .any(|e| e.document == document && e.node > lo && e.node < hi)
+            let inside = t
+                .iter()
+                .filter(|e| e.document == document && e.node > node && e.node < hi)
+                .map(|e| e.node)
+                .collect();
+            (None, inside)
         })
     }
 
-    /// [`shared_for`] with the entry's nesting height, for a reuse below a
-    /// walk's depth 0 (#3179).
-    pub(crate) fn shared_with_height(node: usize, document: usize) -> Option<(OwnedValue, usize)> {
+    /// [`shared_for`] with the height of the node's subtree, `height_of()`
+    /// computed the first time any reuse of this entry asks and cached, so a
+    /// bind never pays for it (#3179). `height_of` reads only the document,
+    /// never this table.
+    pub(crate) fn shared_with_height(
+        node: usize,
+        document: usize,
+        height_of: impl FnOnce() -> usize,
+    ) -> Option<(OwnedValue, usize)> {
         TABLE.with(|t| {
             let t = t.borrow();
             let e = t
@@ -5553,7 +5564,7 @@ mod embed_table {
             let height = match e.height.get() {
                 Some(h) => h,
                 None => {
-                    let h = super::owned_height(&e.value);
+                    let h = height_of();
                     e.height.set(Some(h));
                     h
                 }
@@ -5600,17 +5611,18 @@ mod embed_table {
         None
     }
 
-    pub(crate) fn nests_within(
+    pub(crate) fn at_or_within(
+        _node: usize,
         _document: usize,
-        _lo: usize,
         _hi: impl FnOnce() -> Option<usize>,
-    ) -> bool {
-        false
+    ) -> (Option<OwnedValue>, alloc::vec::Vec<usize>) {
+        (None, alloc::vec::Vec::new())
     }
 
     pub(crate) fn shared_with_height(
         _node: usize,
         _document: usize,
+        _height_of: impl FnOnce() -> usize,
     ) -> Option<(OwnedValue, usize)> {
         None
     }
@@ -5674,54 +5686,76 @@ pub(crate) fn embed_shared_for<S: EvalSemantics, C: DocumentCursor>(
     embed_table::shared_for(cursor.node_id(), cursor.document_token())
 }
 
-/// The nesting height [`to_owned_cursor_at_depth`] walks below a value's own
-/// depth: `0` for a scalar or an empty container, else one more than the
-/// tallest child (#3179). A walk that starts `value`'s node at depth `d`
-/// visits depths `d..=d + height`, so it passes the `MAX_NESTING_DEPTH`
-/// check exactly when `d + height < MAX_NESTING_DEPTH`.
-///
-/// Only ever asked of a value some bind already materialized, which passed
-/// that check from depth 0, so the recursion is bounded by it.
-fn owned_height(value: &OwnedValue) -> usize {
-    let tallest = |children: &mut dyn Iterator<Item = &OwnedValue>| {
-        children
-            .map(|child| owned_height(child) + 1)
-            .max()
-            .unwrap_or(0)
-    };
-    match value {
-        OwnedValue::Array(items) => tallest(&mut items.iter()),
-        OwnedValue::Object(map) => tallest(&mut map.values()),
-        _ => 0,
+/// The height [`to_owned_cursor_at_depth`] walks below `cursor`'s node:
+/// `0` for a scalar or an empty container, else one more than the tallest
+/// child, capped at `cap` (#3179). Measured on the document, not on a bound
+/// value: the walk descends into every member, a duplicate key's included,
+/// where the value keeps only the last. A walk that starts the node at depth
+/// `d` visits depths `d..=d + height`, so it passes the `MAX_NESTING_DEPTH`
+/// check exactly when `d + height < MAX_NESTING_DEPTH`; a height at `cap`
+/// already fails that for every `d >= 1`, so the recursion stops there.
+fn cursor_height<C: DocumentCursor>(cursor: &C, cap: usize) -> usize {
+    if cap == 0 {
+        return 0;
     }
+    let mut tallest = 0;
+    let mut child = cursor.first_child();
+    while let Some(c) = child {
+        tallest = tallest.max(1 + cursor_height(&c, cap - 1));
+        if tallest >= cap {
+            return cap;
+        }
+        child = c.next_sibling();
+    }
+    tallest
 }
 
-/// Whether a walk from `cursor` may meet an in-scope binding's node below its
-/// depth 0 -- the one-time gate [`to_owned_cursor`] takes before letting its
-/// walk ask the table per nested container (#3179). `false` whenever the
-/// depth-0 reuse's own conditions fail, and for a cursor that cannot name
-/// its subtree's extent ([`DocumentCursor::subtree_end`]).
-fn embed_may_nest<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> bool {
-    S::TAG == EvalTag::Jq
-        && embed_table::active()
-        && cursor.is_container()
-        && embed_table::nests_within(cursor.document_token(), cursor.node_id(), || {
-            cursor.subtree_end()
-        })
+/// What the embed table holds for a walk about to start at `cursor`
+/// (#3179): the binding's own value for `cursor`'s node (the depth-0
+/// reuse), or else the nodes strictly inside its subtree that some binding
+/// holds -- empty whenever the depth-0 reuse's own conditions fail, and for
+/// a cursor that cannot name its subtree's extent
+/// ([`DocumentCursor::subtree_end`]). One table pass for both.
+fn embed_at_or_within<S: EvalSemantics, C: DocumentCursor>(
+    cursor: &C,
+) -> (Option<OwnedValue>, Vec<usize>) {
+    // `active()` before `is_container()`, as in [`embed_shared_for`].
+    if S::TAG != EvalTag::Jq || !embed_table::active() || !cursor.is_container() {
+        return (None, Vec::new());
+    }
+    embed_table::at_or_within(cursor.node_id(), cursor.document_token(), || {
+        cursor.subtree_end()
+    })
 }
 
-/// The binding's own value for `child`, met at `depth` inside a walk that
-/// [`embed_may_nest`] opened (#3179) -- when handing it back skips no check
-/// the fresh walk would have failed: the depth is the only one it could
-/// (the bind's own walk made every other check over the same text), and
-/// `depth + height < MAX_NESTING_DEPTH` is exactly when the fresh walk
-/// passes it.
-fn embed_shared_nested<C: DocumentCursor>(child: &C, depth: usize) -> Option<OwnedValue> {
-    if !child.is_container() {
+/// The binding's own value for `child`, met at `depth` inside a walk whose
+/// [`embed_at_or_within`] named `nested` (#3179), when handing it back skips
+/// no check the fresh walk would have failed. The depth is the only one it
+/// could: the bind's own walk made every other check over the same text.
+/// And `depth + height < MAX_NESTING_DEPTH` is exactly when the fresh walk
+/// passes it. The membership test is a compare against a handful of ids,
+/// so a child that is no binding's node costs neither a table borrow nor a
+/// cursor lookup.
+fn embed_shared_nested<C: DocumentCursor, B: CursorWalkOutput>(
+    child: &C,
+    depth: usize,
+    nested: &[usize],
+) -> Option<B::Out> {
+    if nested.is_empty() {
         return None;
     }
-    let (value, height) = embed_table::shared_with_height(child.node_id(), child.document_token())?;
-    (depth + height < MAX_NESTING_DEPTH).then_some(value)
+    let node = child.node_id();
+    if !nested.contains(&node) {
+        return None;
+    }
+    let (value, height) = embed_table::shared_with_height(node, child.document_token(), || {
+        cursor_height(child, MAX_NESTING_DEPTH)
+    })?;
+    if depth + height < MAX_NESTING_DEPTH {
+        B::reuse(value)
+    } else {
+        None
+    }
 }
 
 /// `file_index` for a node at `path`: the origin file of the top-level

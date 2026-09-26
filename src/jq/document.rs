@@ -380,7 +380,7 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// where the format cannot say cheaply; a caller then treats the subtree
     /// as containing nothing.
     fn subtree_end(&self) -> Option<usize> {
-        None // omni-dev: coverage tolerate-line reason="unreachable: the only caller, eval_generic::embed_may_nest, is gated on jq semantics, and the YAML cursor (the one implementor without an override) is only ever evaluated under yq semantics (#3179)"
+        None // omni-dev: coverage tolerate-line reason="unreachable: the only caller, eval_generic::embed_at_or_within, is gated on jq semantics, and the YAML cursor (the one implementor without an override) is only ever evaluated under yq semantics (#3179)"
     }
 
     /// Check if this cursor points to a container (array or object).

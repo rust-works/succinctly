@@ -1155,7 +1155,11 @@ is the revert that established what the other one costs.
    path(.[0].a | $y)`, which needs an ancestor lookup when `$y` is bound), a navigation that lands
    on a container *holding* the embed before a resolver (`.a as $y | {k:.} | .k | path(.a | $y)`:
    the peel's payoff gate reads only the landing value), and the assignment twin `(.a | ($y.b)) =
-   9`, whose resolver does not materialize through `to_owned_cursor`.
+   9`, whose resolver does not materialize through `to_owned_cursor`; and every one of these
+   shapes on the input-queue route (`input | .a as $y | {k:.} | .k.a | path($y)`), whose
+   `eval.rs` converter still reuses at depth 0 only. The depth rule measures the *document's*
+   subtree height, not the bound value's: a duplicate key the walk descends into but the value
+   drops still fails the fresh walk, so binding it never hides a nesting-depth error.
    **[#3188](https://github.com/rust-works/succinctly/issues/3188), now closed: the same embed
    written through by `del` or an assignment.** jq's `del(f)`, `f = v`, `f |= g`, `f op= v` and
    `f //= v` are all `path(f)` followed by writes at the paths it yields, so
