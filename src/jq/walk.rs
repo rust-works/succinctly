@@ -1916,42 +1916,261 @@ fn node_reads_ambient(node: &Expr) -> bool {
         // with the document, metadata written, leaving the value alone.
         | Expr::MetaAssign { .. } => true,
 
-        // Reads unless the builtin is one of the few that ignore their input
-        // entirely. Everything with an `Expr` argument still reads: `map(1)`,
+        // #2973: reshaped into an exhaustive match (mirroring
+        // stage_escapes_own_input's own Builtin match, #2791) so a new
+        // Builtin variant fails to compile here until classified, instead
+        // of silently inheriting a default through a wildcard-shaped
+        // !matches!. The split itself is unchanged from before this
+        // refactor: the same 13-entry allowlist below (builtins whose
+        // whole answer comes from elsewhere -- the clock, the
+        // environment, the language itself, or an
+        // isempty(f)/any(gen; cond)/all(gen; cond) generator argument
+        // any_subexpr already visits separately) answers `false`; every
+        // other variant answers `true`, the same default the old
+        // !matches! fell through to.
+        //
+        // Everything with an `Expr` argument still reads: `map(1)`,
         // `select(true)` and `add` all consult `.` however closed the
-        // argument is, so this allowlist holds only builtins whose whole
-        // answer comes from elsewhere -- the clock, the environment, the
-        // language itself. `EnvObject`/`StrEnv` carry a plain `String` (the
-        // variable name), not an `Expr`, so there is no child for
-        // `any_subexpr` to miss either. Verified against their `eval.rs`
-        // arms, each of which takes `_value` or no value parameter at all.
+        // argument is, so the allowlist holds only builtins whose whole
+        // answer comes from elsewhere. `EnvObject`/`StrEnv` carry a plain
+        // `String` (the variable name), not an `Expr`, so there is no
+        // child for `any_subexpr` to miss either.
         //
         // #2794: `IsEmpty`/`AnyCond`/`AllCond` (the 2-arg `isempty(f)`,
-        // `any(gen; cond)`, `all(gen; cond)` forms) join the allowlist too --
-        // they consume a *generator* argument rather than reading `.`
-        // themselves, and `any_subexpr` already visits that argument
-        // separately, so the node's own contribution is nothing. Their
-        // arity-0/1 siblings (`Any`, `AnyF`, `All`, `AllF` -- `any`, `all`,
-        // `any(cond)`, `all(cond)`) are deliberately NOT here: those desugar
-        // to an implicit `.[]` generator (jq: "true if cond is truthy for
-        // any/every element of `.[]`"), so they read `.` on their own
-        // account and must keep the default "reads" answer.
-        Expr::Builtin(builtin) => !matches!(
-            builtin,
+        // `any(gen; cond)`, `all(gen; cond)` forms) are on the allowlist
+        // because they consume a *generator* argument rather than reading
+        // `.` themselves, and `any_subexpr` already visits that argument
+        // separately. Their arity-0/1 siblings (`Any`, `AnyF`, `All`,
+        // `AllF` -- `any`, `all`, `any(cond)`, `all(cond)`) are
+        // deliberately NOT on it: those desugar to an implicit `.[]`
+        // generator (jq: "true if cond is truthy for any/every element of
+        // `.[]`"), so they read `.` on their own account.
+        Expr::Builtin(builtin) => match builtin {
             Builtin::Empty
-                | Builtin::Now
-                | Builtin::Nan
-                | Builtin::Infinite
-                | Builtin::NullLit
-                | Builtin::Env
-                | Builtin::EnvObject(_)
-                | Builtin::StrEnv(_)
-                | Builtin::Builtins
-                | Builtin::Halt
-                | Builtin::IsEmpty(_)
-                | Builtin::AnyCond(_, _)
-                | Builtin::AllCond(_, _)
-        ),
+            | Builtin::Now
+            | Builtin::Nan
+            | Builtin::Infinite
+            | Builtin::NullLit
+            | Builtin::Env
+            | Builtin::EnvObject(_)
+            | Builtin::StrEnv(_)
+            | Builtin::Builtins
+            | Builtin::Halt
+            | Builtin::IsEmpty(_)
+            | Builtin::AnyCond(_, _)
+            | Builtin::AllCond(_, _) => false,
+
+            // Every other variant: no judgement beyond "not on the
+            // allowlist above", so this preserves exactly the default the
+            // old !matches! fell through to.
+            Builtin::Type
+            | Builtin::IsNull
+            | Builtin::IsBoolean
+            | Builtin::IsNumber
+            | Builtin::IsString
+            | Builtin::IsArray
+            | Builtin::IsObject
+            | Builtin::Values
+            | Builtin::Nulls
+            | Builtin::Booleans
+            | Builtin::Numbers
+            | Builtin::Strings
+            | Builtin::Arrays
+            | Builtin::Objects
+            | Builtin::Iterables
+            | Builtin::Scalars
+            | Builtin::Length
+            | Builtin::Utf8ByteLength
+            | Builtin::Keys
+            | Builtin::KeysUnsorted
+            | Builtin::Has(_)
+            | Builtin::In(_)
+            | Builtin::UpperIn(_)
+            | Builtin::UpperInSrc(_, _)
+            | Builtin::Select(_)
+            | Builtin::Map(_)
+            | Builtin::MapValues(_)
+            | Builtin::Add
+            | Builtin::Any
+            | Builtin::AnyF(_)
+            | Builtin::All
+            | Builtin::AllF(_)
+            | Builtin::Min
+            | Builtin::Max
+            | Builtin::MinBy(_)
+            | Builtin::MaxBy(_)
+            | Builtin::AsciiDowncase
+            | Builtin::AsciiUpcase
+            | Builtin::Ltrimstr(_)
+            | Builtin::Rtrimstr(_)
+            | Builtin::Startswith(_)
+            | Builtin::Endswith(_)
+            | Builtin::Split(_)
+            | Builtin::Join(_)
+            | Builtin::Contains(_)
+            | Builtin::Inside(_)
+            | Builtin::First
+            | Builtin::Last
+            | Builtin::Nth(_)
+            | Builtin::Reverse
+            | Builtin::Flatten
+            | Builtin::FlattenDepth(_)
+            | Builtin::GroupBy(_)
+            | Builtin::Unique
+            | Builtin::UniqueBy(_)
+            | Builtin::Sort
+            | Builtin::SortBy(_)
+            | Builtin::ToEntries
+            | Builtin::FromEntries
+            | Builtin::WithEntries(_)
+            | Builtin::ToString
+            | Builtin::ToNumber
+            | Builtin::ToJson
+            | Builtin::FromJson
+            | Builtin::Explode
+            | Builtin::Implode
+            | Builtin::Test(_)
+            | Builtin::Indices(_)
+            | Builtin::Index(_)
+            | Builtin::Rindex(_)
+            | Builtin::UpperIndex(_)
+            | Builtin::UpperIndexStream(_, _)
+            | Builtin::ToJsonStream
+            | Builtin::FromJsonStream
+            | Builtin::ToStream
+            | Builtin::FromStream(_)
+            | Builtin::TruncateStream(_)
+            | Builtin::GetPath(_)
+            | Builtin::Recurse
+            | Builtin::RecurseF(_)
+            | Builtin::RecurseCond(_, _)
+            | Builtin::Walk(_)
+            | Builtin::IsValid(_)
+            | Builtin::Path(_)
+            | Builtin::PathNoArg
+            | Builtin::Parent
+            | Builtin::ParentN(_)
+            | Builtin::Paths
+            | Builtin::PathsFilter(_)
+            | Builtin::LeafPaths
+            | Builtin::SetPath(_, _)
+            | Builtin::DelPaths(_)
+            | Builtin::Floor
+            | Builtin::Ceil
+            | Builtin::Round
+            | Builtin::Sqrt
+            | Builtin::Fabs
+            | Builtin::Log
+            | Builtin::Log10
+            | Builtin::Log2
+            | Builtin::Exp
+            | Builtin::Exp10
+            | Builtin::Exp2
+            | Builtin::Pow(_, _)
+            | Builtin::Sin
+            | Builtin::Cos
+            | Builtin::Tan
+            | Builtin::Asin
+            | Builtin::Acos
+            | Builtin::Atan
+            | Builtin::Atan2(_, _)
+            | Builtin::Sinh
+            | Builtin::Cosh
+            | Builtin::Tanh
+            | Builtin::Asinh
+            | Builtin::Acosh
+            | Builtin::Atanh
+            | Builtin::Libm1(_)
+            | Builtin::Libm2(..)
+            | Builtin::Libm3(..)
+            | Builtin::IsInfinite
+            | Builtin::IsNan
+            | Builtin::IsNormal
+            | Builtin::IsFinite
+            | Builtin::Debug
+            | Builtin::DebugMsg(_)
+            | Builtin::Stderr
+            | Builtin::HaltError
+            | Builtin::HaltErrorCode(_)
+            | Builtin::EnvVar(_)
+            | Builtin::Trim
+            | Builtin::Ltrim
+            | Builtin::Rtrim
+            | Builtin::Transpose
+            | Builtin::BSearch(_)
+            | Builtin::ModuleMeta
+            | Builtin::Pick(_)
+            | Builtin::Omit(_)
+            | Builtin::Tag
+            | Builtin::Anchor
+            | Builtin::Style
+            | Builtin::Kind
+            | Builtin::Key
+            | Builtin::Line
+            | Builtin::Column
+            | Builtin::DocumentIndex
+            | Builtin::LineComment
+            | Builtin::HeadComment
+            | Builtin::FootComment
+            | Builtin::FileIndex
+            | Builtin::Shuffle
+            | Builtin::Pivot
+            | Builtin::SplitDoc
+            | Builtin::SortKeys(_)
+            | Builtin::SortKeysOneLevel
+            | Builtin::Del(_)
+            | Builtin::Input
+            | Builtin::Inputs
+            | Builtin::InputLineNumber
+            | Builtin::InputFilename
+            | Builtin::GetSearchList
+            | Builtin::GetJqOrigin
+            | Builtin::GetProgOrigin
+            | Builtin::Abs
+            | Builtin::Normals
+            | Builtin::Finites
+            | Builtin::Limit(_, _)
+            | Builtin::FirstStream(_)
+            | Builtin::LastStream(_)
+            | Builtin::NthStream(_, _)
+            | Builtin::RecurseDown
+            | Builtin::Gmtime
+            | Builtin::Localtime
+            | Builtin::Mktime
+            | Builtin::Strftime(_)
+            | Builtin::FormatNamed(_)
+            | Builtin::Strflocaltime(_)
+            | Builtin::Strptime(_)
+            | Builtin::Todate
+            | Builtin::Fromdate
+            | Builtin::Todateiso8601
+            | Builtin::Fromdateiso8601
+            | Builtin::TestFlags(_, _)
+            | Builtin::Match(_)
+            | Builtin::MatchFlags(_, _)
+            | Builtin::Capture(_)
+            | Builtin::CaptureFlags(_, _)
+            | Builtin::Sub(_, _)
+            | Builtin::SubFlags(_, _, _)
+            | Builtin::Gsub(_, _)
+            | Builtin::GsubFlags(_, _, _)
+            | Builtin::Scan(_)
+            | Builtin::ScanFlags(_, _)
+            | Builtin::SplitRegex(_, _)
+            | Builtin::Splits(_)
+            | Builtin::SplitsFlags(_, _)
+            | Builtin::Combinations
+            | Builtin::CombinationsN(_)
+            | Builtin::Trunc
+            | Builtin::ToBoolean
+            | Builtin::Skip(_, _)
+            | Builtin::FromUnix
+            | Builtin::ToUnix
+            | Builtin::Tz(_)
+            | Builtin::Load(_)
+            | Builtin::AtOffset(_)
+            | Builtin::AtPosition(_, _) => true,
+        },
 
         // Everything below contributes nothing of its own: whether it reads
         // `.` is entirely a question about its children, which `any_subexpr`
