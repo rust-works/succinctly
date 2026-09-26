@@ -250,7 +250,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call stack is on the heap, runs 100,000 (#3287). A recursion that combines
   two recursive calls with `+` or `as` (`fib(n - 1) + fib(n - 2)`) uses stack in
   proportion to its number of calls, so `fib(20)` now refuses where it used
-  to answer; `fib(21)` already overflowed the stack. `[fib(n - 1), fib(n - 2)] |
+  to answer (`18 | fib` in the zero-parameter spelling); `fib(21)` already
+  overflowed the stack. `[fib(n - 1), fib(n - 2)] |
   add` is unaffected (#3296). Library callers get the same guard by evaluating
   inside `succinctly::jq::with_stack_budget`.
 

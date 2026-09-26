@@ -61013,22 +61013,18 @@ mod native_stack {
     #[must_use]
     pub(crate) struct Guard(Budget);
 
-    /// Arm `budget` for the caller's scope. A registration nested inside
-    /// another never loosens it: the outer budget's room left at `here` is
-    /// kept when it is the tighter of the two.
-    pub(crate) fn enter(here: usize, budget: Budget) -> Guard {
+    /// Arm a budget of `reach` bytes from `here` for the caller's scope. A
+    /// registration nested inside another never loosens it: the outer
+    /// budget's room left at `here` is kept when it is the tighter of the two.
+    pub(crate) fn enter(here: usize, reach: usize) -> Guard {
         let previous = self::budget();
-        let (origin, reach) = previous;
-        let tighter = if origin == 0 {
-            budget
+        let (origin, outer_reach) = previous;
+        let left = if origin == 0 {
+            reach
         } else {
-            let left = reach.saturating_sub(origin.abs_diff(here));
-            if left < budget.1 {
-                (here, left)
-            } else {
-                budget
-            }
+            outer_reach.saturating_sub(origin.abs_diff(here)).min(reach)
         };
+        let tighter = (here, left);
         BUDGET.with(|b| b.set(tighter));
         Guard(previous)
     }
@@ -61050,7 +61046,7 @@ mod native_stack {
 
     pub(crate) struct Guard;
 
-    pub(crate) fn enter(_here: usize, _budget: Budget) -> Guard {
+    pub(crate) fn enter(_here: usize, _reach: usize) -> Guard {
         Guard
     }
 }
@@ -61059,10 +61055,13 @@ mod native_stack {
 /// (ADR-0025, #3262).
 ///
 /// `available` is how many bytes of stack lie below this call. Evaluation
-/// inside `f` refuses a recursion -- `exceeded maximum recursion depth`, the
-/// uncatchable resource limit the frame-count guard also raises -- once it has
-/// spent half of them, whatever the shape of the program, where it would
-/// otherwise overflow the stack and abort the process. Without a registration
+/// inside `f` refuses recursion through user-defined functions -- a `def`
+/// call, or a read of one of its arguments -- once it has spent half of
+/// them, with `exceeded maximum recursion depth`, the uncatchable resource
+/// limit the frame-count guard also raises. That holds whatever the shape of
+/// the recursion, where it would otherwise overflow the stack and abort the
+/// process. Native recursion that never passes through a `def` -- a builtin
+/// walking a deeply nested *input* document, say -- is not covered. Without a registration
 /// only the frame-count guard protects evaluation, which is calibrated for the
 /// CLI's own evaluation thread and guarantees nothing on an ordinary one.
 ///
@@ -61097,7 +61096,7 @@ mod native_stack {
 /// No-op under `no_std`, which has no thread-locals to hold the floor.
 pub fn with_stack_budget<R>(available: usize, f: impl FnOnce() -> R) -> R {
     let here = stack_address();
-    let _guard = native_stack::enter(here, (here, available / 2));
+    let _guard = native_stack::enter(here, available / 2);
     f()
 }
 
@@ -61315,7 +61314,10 @@ pub(crate) fn bind_def_call<'e>(
     bound: &'e BoundBody,
 ) -> Result<&'e Rc<Expr>, EvalError> {
     bound.get_or_try_init(|| {
-        if frames >= MAX_EVAL_FRAMES {
+        // ADR-0025: the evaluator arms check the floor before running a
+        // bound body, but a static walk that binds a body to look inside it
+        // (`step_can_yield_absent` and its kin) reaches only this.
+        if frames >= MAX_EVAL_FRAMES || native_stack_exhausted() {
             return Err(def_call_depth_refusal(def));
         }
         // #2094: `def.body` needs to become an owned `Expr` before
@@ -63874,8 +63876,9 @@ mod tests {
         assert_eq!(outer.1, 1 << 19, "half the registered stack");
         assert_eq!(nested_small.1, 1 << 9, "a tighter nested budget wins");
         assert!(
-            nested_big.1 <= outer.1,
-            "a looser nested budget never loosens the outer one: {nested_big:?} vs {outer:?}"
+            nested_big.1 < outer.1,
+            "a looser nested budget keeps the outer one's room left, which is \
+             smaller for being measured deeper: {nested_big:?} vs {outer:?}"
         );
         assert_eq!(native_stack::budget().0, 0, "restored on exit");
     }
@@ -63944,17 +63947,66 @@ mod tests {
             "def f: .; .a | to_entries | f | parent",
         ] {
             let expr = parse(filter).expect("parses");
-            let result =
-                with_stack_budget(0, || eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)));
-            match result {
+            let refuse = || match with_stack_budget(0, || {
+                eval::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+            }) {
                 QueryResult::Error(e) => assert!(
                     e.message.ends_with("exceeded maximum recursion depth"),
                     "{filter}: {}",
                     e.message
                 ),
                 other => panic!("{filter}: expected a refusal, got {other:?}"),
-            }
+            };
+            // Cold: the call is refused while its body is bound.
+            refuse();
+            // Warm the node's bound-body cache with the stack unregistered...
+            assert!(
+                !matches!(
+                    eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)),
+                    QueryResult::Error(_)
+                ),
+                "{filter}: answers with the stack unregistered"
+            );
+            // ...so the arm itself refuses the already-bound body.
+            refuse();
         }
+
+        // yq mode evaluates through the generic evaluator's own arms, its
+        // demand-driven ones under `first`/`limit`.
+        for filter in [
+            "def f: .a; first(f)",
+            "def f(g): g; first(f(.a))",
+            "def f: .a; [limit(1; f)]",
+        ] {
+            let expr = parse(filter).expect("parses");
+            let refused = || {
+                matches!(
+                    with_stack_budget(0, || eval::<Vec<u64>, YqSemantics>(
+                        &expr,
+                        index.root(json)
+                    )),
+                    QueryResult::Error(e) if e.message.ends_with("exceeded maximum recursion depth")
+                )
+            };
+            assert!(refused(), "{filter}: cold");
+            assert!(
+                !matches!(
+                    eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)),
+                    QueryResult::Error(_)
+                ),
+                "{filter}: answers with the stack unregistered"
+            );
+            assert!(refused(), "{filter}: warm");
+        }
+        let read = substitute_func_param(
+            &parse("first(g)").expect("parses"),
+            "g",
+            &Expr::Shared(Rc::new(Expr::Identity)),
+        );
+        assert!(matches!(
+            with_stack_budget(0, || eval::<Vec<u64>, YqSemantics>(&read, index.root(json))),
+            QueryResult::Error(e) if e.message == "exceeded maximum recursion depth"
+        ));
 
         // A `DefCall` refuses before its body can read an argument, so an
         // argument read is reached here directly: `g` stands for an argument

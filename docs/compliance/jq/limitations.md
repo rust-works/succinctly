@@ -4251,7 +4251,8 @@ Three differences remain, all in the direction of erroring rather than aborting:
   2)`) runs each right-hand call inside its left sibling's output sink, so its
   stack grows with the number of *calls*, not the depth: `fib(20)` (21,891
   calls) refuses, `fib(21)` aborted the process before #3262, and jq answers
-  both in 2 MB. `[fib(n - 1), fib(n - 2)] | add` returns before continuing and
+  both in 2 MB. The zero-parameter spelling (`def fib: ... (. - 1 | fib) + (.
+  - 2 | fib)`) holds more per call and refuses from `18 | fib`. `[fib(n - 1), fib(n - 2)] | add` returns before continuing and
   runs `fib(24)`
   ([#3296](https://github.com/rust-works/succinctly/issues/3296)).
 - **A recursively-built value can exceed `MAX_VALUE_TREE_DEPTH` (384) where jq has no such
