@@ -779,15 +779,84 @@ pub(super) fn to_owned_cursor_with<C: DocumentCursor, S: EvalSemantics>(
     check_depth: impl Fn(usize) -> Result<(), EvalError>,
     scalar_override: impl Fn(&C::Value) -> Option<OwnedValue>,
 ) -> Result<OwnedValue, EvalError> {
-    to_owned_cursor_at_depth::<S, _>(cursor, 0, &check_depth, &scalar_override)
+    to_owned_cursor_at_depth::<S, _, BuildOwned>(cursor, 0, &check_depth, &scalar_override)
 }
 
-fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor>(
+/// Run every check [`to_owned_cursor`] makes on `cursor`'s value -- nesting
+/// depth, key and delimiter validity, the trailing-gap rules, every scalar's
+/// decode -- without keeping what it builds (#3156).
+///
+/// The same walk, not a re-derivation of it: `to_owned_cursor_at_depth` is
+/// generic over what it assembles, and this instantiates it with
+/// `CheckOnly`, which keeps containers as `()` (an `IndexMap<String, ()>`
+/// for the key-collision rules, a zero-sized `Vec`) and drops each scalar as
+/// soon as it has decoded. So the answer is `to_owned_cursor`'s `Ok`/`Err`,
+/// by construction -- the property #2066's first, hand-written check lacked
+/// -- while memory stays at the depth of the walk rather than the size of the
+/// value. Unlike `to_owned_cursor` it never hands back an embedded binding's
+/// value: there is nothing to hand back, and walking is what decides.
+pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Result<(), EvalError> {
+    let result = to_owned_cursor_at_depth::<S, _, CheckOnly>(
+        cursor,
+        0,
+        &|depth| {
+            if depth >= MAX_NESTING_DEPTH {
+                Err(EvalError::decode_failure(
+                    super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
+                ))
+            } else {
+                Ok(())
+            }
+        },
+        &|_| None,
+    );
+    // The same depth-0 assertion `to_owned_cursor` makes (#2334).
+    debug_assert_materialization_error(&result);
+    result
+}
+
+/// What [`to_owned_cursor_at_depth`] assembles from the checks it makes:
+/// the value itself ([`BuildOwned`]) or nothing ([`CheckOnly`], #3156). The
+/// walk -- every check, in the same order -- is the same for both.
+trait CursorWalkOutput {
+    type Out;
+    fn object(map: IndexMap<String, Self::Out>) -> Self::Out;
+    fn array(items: Vec<Self::Out>) -> Self::Out;
+    fn scalar(value: OwnedValue) -> Self::Out;
+}
+
+/// [`to_owned_cursor`]'s output: the `OwnedValue`.
+struct BuildOwned;
+
+impl CursorWalkOutput for BuildOwned {
+    type Out = OwnedValue;
+    fn object(map: IndexMap<String, OwnedValue>) -> OwnedValue {
+        OwnedValue::Object(map.into())
+    }
+    fn array(items: Vec<OwnedValue>) -> OwnedValue {
+        OwnedValue::array_from(items)
+    }
+    fn scalar(value: OwnedValue) -> OwnedValue {
+        value
+    }
+}
+
+/// [`validate_cursor`]'s output: nothing, dropped as it goes.
+struct CheckOnly;
+
+impl CursorWalkOutput for CheckOnly {
+    type Out = ();
+    fn object(_: IndexMap<String, ()>) {}
+    fn array(_: Vec<()>) {}
+    fn scalar(_: OwnedValue) {}
+}
+
+fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
     cursor: &C,
     depth: usize,
     check_depth: &impl Fn(usize) -> Result<(), EvalError>,
     scalar_override: &impl Fn(&C::Value) -> Option<OwnedValue>,
-) -> Result<OwnedValue, EvalError> {
+) -> Result<B::Out, EvalError> {
     check_depth(depth)?;
     let value = cursor.value();
     if let Some(fields) = value.as_object() {
@@ -813,7 +882,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor>(
             let key = field.checked_key(&f, &map, &mut guard, is_first)?;
             map.insert(
                 key,
-                to_owned_cursor_at_depth::<S, _>(
+                to_owned_cursor_at_depth::<S, _, B>(
                     &field.value_cursor,
                     depth + 1,
                     check_depth,
@@ -833,7 +902,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor>(
         // that left `map` empty -- every iteration sets both -- so the split
         // that decision used to make on `map.is_empty()` is unchanged.
         container_tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
-        Ok(OwnedValue::Object(map.into()))
+        Ok(B::object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
@@ -846,7 +915,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor>(
             if !elem_cursor.element_gap_ok(is_first) {
                 return Err(elem_cursor.malformed_delimiter_error());
             }
-            items.push(to_owned_cursor_at_depth::<S, _>(
+            items.push(to_owned_cursor_at_depth::<S, _, B>(
                 &elem_cursor,
                 depth + 1,
                 check_depth,
@@ -859,10 +928,10 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor>(
         // #2211/#2243: same reasoning as the object arm's own check just
         // above, and now literally the same call (#1803).
         container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
-        Ok(OwnedValue::array_from(items))
+        Ok(B::array(items))
     } else {
         if let Some(owned) = scalar_override(&value) {
-            return Ok(owned);
+            return Ok(B::scalar(owned));
         }
         // An applicable explicit tag resolves from the raw text and so can
         // succeed where a plain decode would not; only the untagged fallback
@@ -885,13 +954,13 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor>(
                     None
                 }
             }) {
-            Some(owned) => Ok(owned),
+            Some(owned) => Ok(B::scalar(owned)),
             // #2358: `None` is correct here regardless of a real cursor
             // being in scope -- `value` is already proven scalar by this
             // point (the caller's own container arms above return before
             // reaching this `else`), so `to_owned_at_depth`'s `cursor`
             // parameter is never consulted on this path.
-            None => to_owned_at_depth::<S, _>(&value, None, depth),
+            None => to_owned_at_depth::<S, _>(&value, None, depth).map(B::scalar),
         }
     }
 }
@@ -37414,6 +37483,51 @@ mod tests {
             malformed_object_member(&fields).is_none(),
             "an undecodable key is #1247's fault, not #1194's"
         );
+    }
+
+    /// #3156: [`validate_cursor`] is [`to_owned_cursor`]'s own walk building
+    /// nothing, so it must answer exactly as `to_owned_cursor` does -- the
+    /// same `Ok`, or the same error -- over every rule that walk enforces.
+    /// #2066's first fix was a hand-written check that matched on depth and
+    /// missed the delimiter rules; this pins the whole set.
+    #[test]
+    fn validate_cursor_agrees_with_to_owned_cursor_3156() {
+        let mut docs: Vec<String> = [
+            r#"{"a":[1,2,{"b":null}],"c":"s","d":true}"#,
+            r#"{"a":1,"a":2}"#,
+            "[]",
+            "{}",
+            r#"[1, {"bad": xyz123}]"#,
+            r#"{123: 1, "b": 2}"#,
+            "{,}",
+            r#"{"a":1,}"#,
+            "[1,,2]",
+            "[1,]",
+            "[,1]",
+            "[1 2]",
+            r#"{"a" 1}"#,
+            r#"{"a":1 "b":2}"#,
+            "[1.2.3]",
+            r#"{"k":[1ee5]}"#,
+            r#"["\q"]"#,
+            r#"["\ud800"]"#,
+            r#"[{"a":{"b":[tru]}}]"#,
+            "[1, 2, 3",
+        ]
+        .iter()
+        .map(|d| (*d).to_string())
+        .collect();
+        docs.push(linear_nest(255));
+        docs.push(linear_nest(256));
+        for doc in &docs {
+            let index = JsonIndex::build(doc.as_bytes());
+            let cursor = index.root(doc.as_bytes());
+            let built = to_owned_cursor::<JqSemantics, _>(&cursor)
+                .map(|_| ())
+                .map_err(|e| e.message);
+            let checked = validate_cursor::<JqSemantics, _>(&cursor).map_err(|e| e.message);
+            assert_eq!(checked, built, "validate_cursor disagrees on {doc}");
+        }
     }
 
     /// #1194: both materializing conversions raise on a non-string key.

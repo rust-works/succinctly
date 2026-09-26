@@ -16,7 +16,7 @@ use succinctly::jq::document::{
 };
 use succinctly::jq::eval_generic::{
     check_nesting_depth, eval_with_cursor, to_owned as generic_to_owned,
-    to_owned_checked as generic_to_owned_checked, to_owned_cursor, GenericResult, LazyElem,
+    to_owned_checked as generic_to_owned_checked, validate_cursor, GenericResult, LazyElem,
     MAX_NESTING_DEPTH,
 };
 use succinctly::jq::walk::{map_builtin_subexprs, map_pattern_subexprs, stamp_loc_file};
@@ -6882,9 +6882,12 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // one), matching `ManyCursor`'s own per-element `JqValue::Cursor`
         // mapping just above.
         //
-        // `to_owned_cursor::<JqSemantics, _>(&c)` per `Cursor` element, discarding its `Ok`
-        // value (#2066 review, #1793 regression): this is the exact function
-        // `lazy_elem_to_owned`'s own `Cursor` arm calls, so it re-validates
+        // `validate_cursor::<JqSemantics, _>(&c)` per `Cursor` element (#3156):
+        // `to_owned_cursor`'s own walk, instantiated to build nothing, so it
+        // answers exactly as `to_owned_cursor` would without the discarded
+        // whole-element copy this arm used to make. Until #3156 it called
+        // `to_owned_cursor` itself (#2066 review, #1793 regression): the
+        // exact function `lazy_elem_to_owned`'s own `Cursor` arm calls, so it re-validates
         // everything `materialize_atomic`'s per-element walk used to --
         // `MAX_NESTING_DEPTH` (a panic, still caught by the `catch_unwind`
         // wrapper a few hundred lines up) *and* the malformed-member/
@@ -6898,12 +6901,8 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // nothing, because delimiter validation had moved to `print_json`'s
         // own `Cursor` arm, which runs *while* writing. Reusing
         // `to_owned_cursor` wholesale closes that gap by construction rather
-        // than by re-deriving its checks a second time; the discarded
-        // `OwnedValue` is the same full-copy cost `materialize_atomic` always
-        // paid for validation, so #2066's own actual win (not collapsing a
-        // duplicate key into the *output*) is unaffected -- only the
-        // never-materialized-for-output copy this arm still makes for
-        // validation's sake is unchanged from before.
+        // than by re-deriving its checks a second time -- which
+        // `validate_cursor` keeps, since it is that same walk.
         GenericResult::LazySeq(seq) => match seq.drain_atomic() {
             // All-or-nothing, matching `materialize_atomic`'s own atomicity
             // contract ("real jq's array construction is all-or-nothing:
@@ -6918,7 +6917,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                     .into_iter()
                     .map(|elem| match elem {
                         LazyElem::Cursor(c) => {
-                            to_owned_cursor::<JqSemantics, _>(&c).map(|_| JqValue::Cursor(c))
+                            validate_cursor::<JqSemantics, _>(&c).map(|()| JqValue::Cursor(c))
                         }
                         LazyElem::Owned(v) => JqValue::try_from_owned(v),
                     })
