@@ -8340,11 +8340,17 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
 /// so `[.,.] | max`, `[null,.] | add` and `{a:.} | add` all bridged and
 /// refused where jq answers `[]`.
 ///
-/// Scoped to these three builtins on purpose. `sort`/`unique`/`reverse`/
-/// `to_entries` relocate their elements in jq too, and `. as $x | [.] |
-/// sort | .[0] | path($x)` is `[]` there, but each needs its own
-/// owned-container implementation to stay bug-for-bug with the bridged
-/// one; they stay refuse-only residuals of this pass (#2889).
+/// #3178 widened it to the builtins that relocate *elements* rather than
+/// answering one: `sort`, `unique`, `reverse` and `to_entries` build a new
+/// container around their input's own children in jq, so `. as $x | [.] |
+/// sort | .[0] | path($x)` is `[]` there, and `getpath` with a literal path
+/// answers a node like `add` does. Each runs the bridged builtin's own
+/// calls (`compare_values`'s stable sort, `owned_value_eq`'s dedup of the
+/// first of each equal run, [`owned_to_entries`]) over the cloned children,
+/// so the output is the bridge's, value for value; only the children's
+/// storage differs. The container arms keep the pre-gate (some child
+/// already witnessed) and so need no outcome gate: every one of them hands
+/// back each witnessed child it was given. `getpath` takes the outcome gate.
 pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -8367,6 +8373,16 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     let Expr::Builtin(builtin) = expr else {
         return None;
     };
+    match builtin {
+        Builtin::Sort | Builtin::Unique | Builtin::Reverse | Builtin::ToEntries => {
+            return relocate_elements::<S>(builtin, input)
+        }
+        Builtin::GetPath(path) => {
+            let found = owned_literal_getpath::<S>(path, input)?;
+            return embed_witnessed(found).then(|| found.clone());
+        }
+        _ => {}
+    }
     // `add` iterates an object's values as readily as an array's elements
     // (`builtin_add`'s own `Object` arm, #422); `min`/`max` take arrays
     // only, and their scalar/object diagnostics stay the bridge's.
@@ -8416,6 +8432,66 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
         return None;
     }
     Some(result)
+}
+
+/// [`eval_owned_relocating_fold`]'s container arms (#3178): the bridged
+/// builtin's own result, built from `input`'s cloned children. `None` unless
+/// the input is the container kind the builtin accepts here and some child
+/// is already witnessed; every other input takes the bridge, which keeps
+/// its own diagnostics.
+fn relocate_elements<S: EvalSemantics>(
+    builtin: &Builtin,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    match (builtin, input) {
+        (Builtin::ToEntries, OwnedValue::Object(map)) if map.values().any(embed_witnessed) => {
+            owned_to_entries(input)
+        }
+        (Builtin::ToEntries, OwnedValue::Array(items)) if items.iter().any(embed_witnessed) => {
+            owned_to_entries(input)
+        }
+        (Builtin::Sort | Builtin::Unique | Builtin::Reverse, OwnedValue::Array(items))
+            if items.iter().any(embed_witnessed) =>
+        {
+            let mut items: Vec<OwnedValue> = items.iter().cloned().collect();
+            if matches!(builtin, Builtin::Reverse) {
+                items.reverse();
+            } else {
+                items.sort_by(compare_values::<S>);
+                if matches!(builtin, Builtin::Unique) {
+                    items.dedup_by(|a, b| owned_value_eq::<S>(a, b));
+                }
+            }
+            Some(OwnedValue::array_from(items))
+        }
+        _ => None,
+    }
+}
+
+/// The node `getpath(P)` reaches in `input` when `P` is a literal path of
+/// string keys and integral indexes (#3178), or `None` -- a missing step, a
+/// type mismatch or any other component leaves the answer to the bridge.
+fn owned_literal_getpath<'v, S: EvalSemantics>(
+    path: &Expr,
+    input: &'v OwnedValue,
+) -> Option<&'v OwnedValue> {
+    let OwnedValue::Array(components) = closed_expr_to_owned::<S>(path)? else {
+        return None;
+    };
+    let steps = components
+        .iter()
+        .map(|component| match component {
+            OwnedValue::String(key) => Some(Expr::Field(key.clone())),
+            OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _) => {
+                Some(Expr::Index {
+                    idx: *idx,
+                    key: None,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<Expr>>>()?;
+    navigate_owned_value(input, &steps)
 }
 
 /// Whether `value` still *is* a node an in-scope binding holds -- the
@@ -8960,9 +9036,20 @@ fn embed_peel_step<S: EvalSemantics>(
         // is the payoff test here -- strictly stronger than the witness
         // scans above, since it asks whether the *answer* is an embed --
         // so this arm needs none of its own.
-        Expr::Builtin(Builtin::Add | Builtin::Min | Builtin::Max) => {
-            Ok(vec![eval_owned_relocating_fold::<S>(first, input)?])
-        }
+        //
+        // #3178: the builtins that relocate elements (`sort`, `unique`,
+        // `reverse`, `to_entries`) and a literal `getpath` take the same
+        // route, gated the same way inside [`eval_owned_relocating_fold`].
+        Expr::Builtin(
+            Builtin::Add
+            | Builtin::Min
+            | Builtin::Max
+            | Builtin::Sort
+            | Builtin::Unique
+            | Builtin::Reverse
+            | Builtin::ToEntries
+            | Builtin::GetPath(_),
+        ) => Ok(vec![eval_owned_relocating_fold::<S>(first, input)?]),
         _ => return None,
     };
     let rest = match rest {
@@ -9134,34 +9221,7 @@ pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
             }
             Some(Ok(current))
         }
-        Expr::Builtin(Builtin::ToEntries) => match input {
-            OwnedValue::Object(fields) => {
-                let entries = fields
-                    .iter()
-                    .map(|(key, value)| {
-                        OwnedValue::object_from([
-                            ("key".to_string(), OwnedValue::String(key.clone())),
-                            ("value".to_string(), value.clone()),
-                        ])
-                    })
-                    .collect();
-                Some(Ok(OwnedValue::array_from(entries)))
-            }
-            OwnedValue::Array(items) => {
-                let entries = items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, value)| {
-                        OwnedValue::object_from([
-                            ("key".to_string(), OwnedValue::Int(i as i64)),
-                            ("value".to_string(), value.clone()),
-                        ])
-                    })
-                    .collect();
-                Some(Ok(OwnedValue::array_from(entries)))
-            }
-            _ => None,
-        },
+        Expr::Builtin(Builtin::ToEntries) => owned_to_entries(input).map(Ok),
         Expr::Builtin(Builtin::FromEntries) => {
             let entries: Vec<OwnedValue> = match input {
                 OwnedValue::Array(items) => items.iter().cloned().collect(),
@@ -9181,6 +9241,32 @@ pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
         }
         _ => None,
     }
+}
+
+/// `to_entries` over an owned object or array, each value cloned into its
+/// entry -- a refcount bump for a container, so an entry's `value` is the
+/// very node it came from, as in jq. `None` for anything else, whose
+/// diagnostics stay the evaluator's.
+fn owned_to_entries(input: &OwnedValue) -> Option<OwnedValue> {
+    let entry = |key: OwnedValue, value: &OwnedValue| {
+        OwnedValue::object_from([
+            ("key".to_string(), key),
+            ("value".to_string(), value.clone()),
+        ])
+    };
+    let entries: Vec<OwnedValue> = match input {
+        OwnedValue::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| entry(OwnedValue::String(key.clone()), value))
+            .collect(),
+        OwnedValue::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, value)| entry(OwnedValue::Int(i as i64), value))
+            .collect(),
+        _ => return None,
+    };
+    Some(OwnedValue::array_from(entries))
 }
 
 fn owned_step_shape(expr: &Expr) -> bool {
@@ -36701,8 +36787,8 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
 /// and a value built afresh shares nothing, so `. as $x | [{"a":1}] |
 /// path(.[0] | $x)` and `[.,{a:1}] | path(.[1] | $x)` refuse here as they
 /// do there. The converse is the residual direction: where succinctly
-/// bridges before the resolver runs (`[.] | sort | path(.[0] | $x)`, `{k:.}
-/// | to_entries | path(.[0].value | $x)` -- the stage ahead of `path()`
+/// bridges before the resolver runs (`{k:.} | with_entries(.) | path(.k |
+/// $x)`, `[.] | .[0] |= . | path(.[0] | $x)` -- the stage ahead of `path()`
 /// crosses `eval_on_owned`'s round trip), every node is a fresh copy and
 /// the clause is false where jq's pointer equality answers `[0]`; recorded
 /// in `docs/compliance/jq/limitations.md`. Scalars are not `Rc`-backed and

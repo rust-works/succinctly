@@ -117,12 +117,12 @@
 # and the owned-value funnels in `eval.rs`; Stage B: the `eval.rs` bind sites
 # themselves, `eval_as`/`each_as`, which minted no node before it, so every
 # `-n 'input | ...'` row above was refuse-only until Stage B gave them one).
-# Most `owned-embed-*` rows now `agree`. The residual `owned-embed-refuse-*`
-# ids, and `owned-embed-fold-if-identity`/`owned-embed-object-getpath`, are
-# pinned in REFUSE_ONLY below with the mechanism each is missing: a scalar
-# root (never `Rc`-backed, so it can't enter the embed table), or a shape
-# `eval::embed_peel_step` does not recognize (`sort`/`unique`/`reverse`/
-# `to_entries`/`getpath`/a slice/a no-op `|=`) and so runs through the
+# Most `owned-embed-*` rows now `agree` (#3178 added `sort`/`unique`/`reverse`/
+# `to_entries`/literal `getpath`). The residual `owned-embed-refuse-*` ids, and
+# `owned-embed-fold-if-identity`, are pinned in REFUSE_ONLY below with the
+# mechanism each is missing: a scalar root (never `Rc`-backed, so it can't
+# enter the embed table), or a shape `eval::embed_peel_step` does not
+# recognize (a slice, a no-op `|=`, `with_entries`) and so runs through the
 # owned-value re-index bridge before the read reaches it, same as a fold's
 # UPDATE that is not one of the owned fast paths -- see
 # docs/compliance/jq/limitations.md's #2889 section.
@@ -597,10 +597,10 @@ owned-embed-refuse-path-nested-reduce-source	{"a":1}	. as $x | [.] | reduce path
 owned-embed-refuse-path-nested-binary-operand	{"a":1}	. as $x | [.] | select(path(.[0] | $x) == [0])
 owned-embed-refuse-path-nested-first-body	{"a":1}	. as $x | [.] | first(path(.[] | $x) | .[0])
 owned-embed-refuse-path-nested-label-body	{"a":1}	. as $x | [.] | label $out | path(.[0] | $x) | ., break $out
-owned-embed-refuse-path-nested-after-sort	{"a":1}	. as $x | [.] | sort | path(.[0] | $x)
-owned-embed-refuse-path-nested-after-reverse	{"a":1}	. as $x | [.] | reverse | path(.[0] | $x)
-owned-embed-refuse-path-nested-after-unique	{"a":1}	. as $x | [.] | unique | path(.[0] | $x)
-owned-embed-refuse-path-nested-after-to-entries	{"a":1}	. as $x | {k:.} | to_entries | path(.[0].value | $x)
+owned-embed-path-nested-after-sort	{"a":1}	. as $x | [.] | sort | path(.[0] | $x)
+owned-embed-path-nested-after-reverse	{"a":1}	. as $x | [.] | reverse | path(.[0] | $x)
+owned-embed-path-nested-after-unique	{"a":1}	. as $x | [.] | unique | path(.[0] | $x)
+owned-embed-path-nested-after-to-entries	{"a":1}	. as $x | {k:.} | to_entries | path(.[0].value | $x)
 owned-embed-refuse-path-nested-after-with-entries	{"a":1}	. as $x | {k:.} | with_entries(.) | path(.k | $x)
 owned-embed-refuse-path-nested-after-add	{"a":1}	. as $x | [[.]] | add | path(.[0] | $x)
 owned-embed-refuse-path-nested-after-update	{"a":1}	. as $x | [.] | .[0] |= . | path(.[0] | $x)
@@ -649,9 +649,9 @@ owned-embed-paren-stage-bare-identity	{"a":1}	. as $x | [.,.] | (.) | max | path
 owned-embed-paren-stage-object-member	{"a":1}	. as $x | {k:.} | (.k) | path($x)
 owned-embed-paren-stage-identity-object-member	{"a":1}	. as $x | {k:.} | (. | .k) | path($x)
 owned-embed-paren-stage-iterate	{"a":1}	. as $x | [.,.] | (.[]) | path($x)
-owned-embed-refuse-sort-element	{"a":1}	. as $x | [.] | sort | .[0] | path($x)
-owned-embed-refuse-unique-element	{"a":1}	. as $x | [.] | unique | .[0] | path($x)
-owned-embed-refuse-to-entries-value	{"a":1}	. as $x | {k:.} | to_entries | .[0].value | path($x)
+owned-embed-sort-element	{"a":1}	. as $x | [.] | sort | .[0] | path($x)
+owned-embed-unique-element	{"a":1}	. as $x | [.] | unique | .[0] | path($x)
+owned-embed-to-entries-value	{"a":1}	. as $x | {k:.} | to_entries | .[0].value | path($x)
 owned-embed-object-getpath	{"a":1}	. as $x | {k:.} | getpath(["k"]) | path($x)
 owned-embed-add-null-right	{"a":1}	. as $x | . + null | path($x)
 owned-embed-add-null-left	{"a":1}	. as $x | null + . | path($x)
@@ -702,7 +702,7 @@ owned-embed-concat-empty-left	{"a":1}	. as $x | [] + [.] | .[0] | path($x)
 owned-embed-refuse-object-member-del-self	{"a":1}	. as $x | {k:.} | .k | del(.a) | path($x)
 owned-embed-agree-map-identity	{"a":1}	. as $x | [.] | map(.) | .[0] | path($x)
 owned-embed-agree-slice-singleton	{"a":1}	. as $x | [.] | .[0:1] | .[0] | path($x)
-owned-embed-refuse-reverse-element	{"a":1}	. as $x | [.] | reverse | .[0] | path($x)
+owned-embed-reverse-element	{"a":1}	. as $x | [.] | reverse | .[0] | path($x)
 owned-embed-refuse-update-noop-element	{"a":1}	. as $x | [.] | .[0] |= . | .[0] | path($x)
 owned-embed-refuse-string-add-empty	"s"	. as $x | . + "" | path($x)
 owned-embed-refuse-number-add-zero	5	. as $x | . + 0 | path($x)
@@ -862,19 +862,10 @@ owned-embed-refuse-path-nested-reduce-source:#3177 review -- same as owned-embed
 owned-embed-refuse-path-nested-binary-operand:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as a binary operand inside select
 owned-embed-refuse-path-nested-first-body:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as the body of first
 owned-embed-refuse-path-nested-label-body:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as the body of label
-owned-embed-refuse-path-nested-after-sort:#3177 review -- jq's sort moves the element's own jv into the new array (jq [0]); the sort stage ahead of path() folds through eval_on_owned's round trip first, so the resolver is handed fresh copies
-owned-embed-refuse-path-nested-after-reverse:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for reverse
-owned-embed-refuse-path-nested-after-unique:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for unique
-owned-embed-refuse-path-nested-after-to-entries:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for to_entries (jq [0,"value"])
-owned-embed-refuse-path-nested-after-with-entries:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for with_entries (jq ["k"])
-owned-embed-refuse-path-nested-after-add:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for a one-element add
-owned-embed-refuse-path-nested-after-update:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for a no-op |= (jq's setpath places the same jv)
+owned-embed-refuse-path-nested-after-with-entries:#3177 review -- a stage ahead of path() still bridges first, for with_entries (jq ["k"])
+owned-embed-refuse-path-nested-after-add:#3177 review -- a stage ahead of path() still bridges first, for a one-element add
+owned-embed-refuse-path-nested-after-update:#3177 review -- a stage ahead of path() still bridges first, for a no-op |= (jq's setpath places the same jv)
 owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
-owned-embed-refuse-sort-element:#2889 -- sort is not one of the owned fast paths eval_owned_relocating_fold covers, so the array re-indexes before the element is read
-owned-embed-refuse-unique-element:#2889 -- same as owned-embed-refuse-sort-element, for unique
-owned-embed-refuse-to-entries-value:#2889 -- same as owned-embed-refuse-sort-element, for to_entries
-owned-embed-object-getpath:#2889 -- getpath is a builtin call, not one of embed_peel_step's Field/Index/Iterate shapes, so it runs through the owned re-index bridge
-owned-embed-refuse-reverse-element:#2889 -- same as owned-embed-refuse-sort-element, for reverse
 owned-embed-refuse-update-noop-element:#2889 -- a `|=` writes through the assignment resolver first, which re-indexes before the trailing read reaches embed_peel_step
 owned-embed-refuse-array-slice:#2889 -- a slice is not one of embed_peel_step's Field/Index/Iterate shapes, so it re-indexes before the read
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
@@ -890,32 +881,32 @@ owned-embed-refuse-scalar-number-root:same as owned-embed-refuse-scalar-string-r
 owned-embed-refuse-path-nested-scalar:same as owned-embed-refuse-scalar-string-root, at a nested position (#3177)
 scalar-string-keeps-tostring:same as owned-embed-refuse-scalar-string-root
 scalar-string-keeps-text:same as owned-embed-refuse-scalar-string-root
-scalar-string-keeps-tostring-twice:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-ltrimstr-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-ltrimstr-nonstring-arg:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-rtrimstr-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-sub-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-gsub-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-tostring-twice:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-ltrimstr-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-ltrimstr-nonstring-arg:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-rtrimstr-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-sub-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-gsub-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
 scalar-string-keeps-add-one:same as owned-embed-refuse-scalar-string-root
 scalar-string-keeps-min-one:same as owned-embed-refuse-scalar-string-root
 scalar-string-keeps-max-one:same as owned-embed-refuse-scalar-string-root
-scalar-string-keeps-sort-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-unique-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-flatten-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-reverse-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-setpath-empty:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-sort-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-unique-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-flatten-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-reverse-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-string-keeps-setpath-empty:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
 scalar-string-keeps-reduce-empty:same as owned-embed-refuse-scalar-string-root
 scalar-string-keeps-destructure-alt:same as owned-embed-refuse-scalar-string-root
 scalar-number-keeps-tonumber:same as owned-embed-refuse-scalar-string-root
-scalar-number-keeps-abs:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
+scalar-number-keeps-abs:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
 scalar-number-keeps-add-one:same as owned-embed-refuse-scalar-string-root
 scalar-number-keeps-min-one:same as owned-embed-refuse-scalar-string-root
-scalar-number-keeps-sort-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-number-keeps-unique-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-number-keeps-max-by-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
-scalar-number-keeps-setpath-empty:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
+scalar-number-keeps-sort-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-number-keeps-unique-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-number-keeps-max-by-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
+scalar-number-keeps-setpath-empty:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
 scalar-number-keeps-reduce-empty:same as owned-embed-refuse-scalar-string-root
-scalar-number-keeps-ltrimstr-passthrough:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (owned-embed-refuse-sort-element's class), so it would stay refuse-only even with scalar storage identity
+scalar-number-keeps-ltrimstr-passthrough:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
 scalar-constant-pool-number-def:same as owned-embed-refuse-scalar-string-root: the literal's value is a fresh materialization on each evaluation here, where jq's constant pool loads one `jv`; the two-literal twin refuses in both
 scalar-constant-pool-string-def:same as owned-embed-refuse-scalar-string-root: the literal's value is a fresh materialization on each evaluation here, where jq's constant pool loads one `jv`; the two-literal twin refuses in both
 scalar-document-element-embed-number:same as owned-embed-refuse-scalar-string-root
