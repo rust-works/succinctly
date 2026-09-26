@@ -777,12 +777,22 @@ is the revert that established what the other one costs.
    loudly, because the stage in between is opaque and might have moved the register there:
    - `del(.a as $y \| has("z") \| try ($y \| .b))` returns the document unchanged in jq, since
      `has` left the register at the root, but `first(.a)` would have moved it onto `$y`;
-   - `del(. as $x \| (def f: .a; f) \| try ($x \| .k))` is the reverse: the `def` really did move
-     the register, off `$x`;
    - after a `reduce`/`foreach` stage, whose route hands back no register value, where the
      register was lost isn't known at all, so every `$var` or `null` refusal after one is loud:
      `path((.a \| ..) as $v0 \| reduce (1) as $i (.; $v0) \| ($v0 \| .b?)?)` is empty in jq
      and refuses here.
+
+   A `def` call used to be a third, opaque-by-construction case here too (`del(. as $x \|
+   (def f: .a; f) \| try ($x \| .k))` refused loudly where jq's own refusal is exact and
+   caught) — [#3297](https://github.com/rust-works/succinctly/issues/3297) gave the path
+   resolver a native `Expr::FuncDef` arm (it previously had none at all, falling to the eager
+   value fallback for *any* `def` reached inside `path()`), so a `def`'s body is no longer
+   opaque to this tracking: it is bound and resolved in path mode like any other reachable
+   node, and whether it moved the register is now known exactly, the same as `if`/`select`.
+   `del(. as $x \| (def f: .a; f) \| try ($x \| .k))` now matches jq exactly (`{"a":{"b":1},"k":1}`,
+   exit 0). A `def` whose body is a *constant* (`def f: 5; f`) is unrelated to this: it is the
+   "third shape" the array-refusal predicate above still can't resolve without evaluating the
+   call, and stays refuse-only.
 
    The wording can differ too, both tools refusing: jq ends
    `del(. as $x \| has("a") \| reduce (1) as $i ($x; try ($x \| .zz)))` with its try-caught

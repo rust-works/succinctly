@@ -69273,6 +69273,14 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         // #3186's subexp stage keeps the register, so there is nothing to
         // guess: `$x` re-establishes and the path is jq's.
         (r"[path(. as $x | { k: .a } | try ($x | .a))]", r#"[["a"]]"#),
+        // #3297 closed this one: the path resolver's new `Expr::FuncDef`
+        // arm sees straight through `def f: .a; f` the same as it already
+        // does for `if`/`select`, so whether the call moved the register is
+        // now known exactly rather than guessed -- no longer refuse-only.
+        (
+            r"del(. as $x | (def f: .a; f) | try ($x | .k))",
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
         assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
@@ -69285,13 +69293,9 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
     // unchanged -- but this resolver cannot tell the stage that left the
     // register alone (`has`) from one that moved it there (`first(.a)`), so
     // it refuses loudly rather than risk the silent loss above.
-    for filter in [
-        r"del(. as $x | (def f: .a; f) | try ($x | .k))",
-        r#"del(.a as $y | has("z") | try ($y | .b))"#,
-    ] {
-        let (stdout, _stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
-        assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
-    }
+    let filter = r#"del(.a as $y | has("z") | try ($y | .b))"#;
+    let (stdout, _stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
+    assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
     Ok(())
 }
 
@@ -69524,4 +69528,50 @@ fn test_array_admits_optional_and_recurse_2764() -> Result<()> {
         (r"path(. as $x | [try error({}) catch .a] | $x)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of {}\n", 5),
         (r"del(. as $x | 1 | [try .a] | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
     ])
+}
+
+/// #3297: `resolve_node_sink` had no `Expr::FuncDef` arm, so a `def`
+/// declared *inside* `path(...)` fell to the eager fallback -- which
+/// evaluates the whole `FuncDef` (definition and `then` alike) as a plain
+/// value rather than continuing path resolution -- and a perfectly valid
+/// path (`.a`'s own navigation) surfaced as "Invalid path expression" over
+/// the *value* the call resolved to. The same `def` declared just outside
+/// `path()` already worked; only the nested-declaration shape was affected.
+/// Confirmed live against jq 1.7.1: every row's expected output here also
+/// matches jq exactly.
+#[test]
+fn test_funcdef_declared_inside_path_resolves_not_invalid_path_3297() -> Result<()> {
+    for (filter, input, expected) in [
+        ("[path(def f: .a; f)]", r#"{"a":1}"#, "[[\"a\"]]\n"),
+        ("def f: .a; [path(f)]", r#"{"a":1}"#, "[[\"a\"]]\n"),
+        (
+            "[path(def g(x): if x == 0 then .a else .b end; g(0))]",
+            r#"{"a":1}"#,
+            "[[\"a\"]]\n",
+        ),
+        (
+            r"[path(def f($n): if $n == 0 then .a else f($n - 1) end; f(50))]",
+            r#"{"a":1}"#,
+            "[[\"a\"]]\n",
+        ),
+        (
+            "[path(.a | def f: .b; f)]",
+            r#"{"a":{"b":1}}"#,
+            "[[\"a\",\"b\"]]\n",
+        ),
+        (
+            "[path(def f: def g: .a; g; f)]",
+            r#"{"a":1}"#,
+            "[[\"a\"]]\n",
+        ),
+        ("[path((def f: .a; f)?)]", r#"{"a":1}"#, "[[\"a\"]]\n"),
+        ("def f: .a; del(def g: f; g)", r#"{"a":1}"#, "{}\n"),
+        ("(def f: .a; f) |= 99", r#"{"a":1}"#, "{\"a\":99}\n"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(stdout, expected, "filter: {filter}");
+        assert_eq!(code, 0, "filter: {filter}");
+    }
+
+    Ok(())
 }

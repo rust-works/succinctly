@@ -33129,6 +33129,28 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         Expr::Paren(inner) => {
             resolve_node_sink::<S>(inner, value, trackable, snapshot, frame, keep, sink)
         }
+        // #3297: a `def` declared *inside* `path(...)` (`path(def f: .a; f)`)
+        // has no arm here, so it fell to the eager fallback below, which
+        // evaluates the whole `FuncDef` -- definition and `then` alike --
+        // as a plain value rather than continuing path resolution, and a
+        // valid path (`.a`'s own navigation) surfaces as an "Invalid path
+        // expression" over the *value* `f` resolved to. [`bind_def`]'s own
+        // doc comment already names this arm as one of the four evaluators
+        // that need it (the plain one, `eval_each`, this path-context one,
+        // and `eval_generic`'s); it was simply missing here. Mirrors
+        // `eval_each`'s identical `FuncDef` arm above (#1371): bind the
+        // call inside `then`, then continue resolving `then` in path mode
+        // with that binding in scope.
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } => {
+            let bound_then = bind_def(name, params, body, then, bound);
+            resolve_node_sink::<S>(&bound_then, value, trackable, snapshot, frame, keep, sink)
+        }
         // #1371: `path(f)` has to see *through* a call to whatever its body
         // navigates, exactly as it did when the body was substituted in
         // before evaluation began. Binding the call here and resolving the
@@ -101848,6 +101870,17 @@ mod tests {
                 "path(.a as $y | .a | $y)",
                 r#"[["a"]]"#,
             ),
+            // def-body-in-path, refuse-only until #3297: `resolve_node_sink`
+            // had no `Expr::FuncDef` arm at all, so a `def` declared inside
+            // `path(...)` fell to the eager value fallback regardless of
+            // what its body referenced -- fixing that arm to bind and
+            // continue resolving in path mode also picks up `$y`'s own
+            // register the ordinary way, with no separate fix needed here
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | def f: $y; .a | f)",
+                r#"[["a"]]"#,
+            ),
             // navigate-after-var
             (
                 br#"{"a":{"b":1}}"#,
@@ -102271,12 +102304,6 @@ mod tests {
             (
                 br#"{"a":{"b":1}}"#,
                 ".a as $y | path(.a | $y)",
-                r#"[["a"]]"#,
-            ),
-            // def-body-in-path
-            (
-                br#"{"a":{"b":1}}"#,
-                "path(.a as $y | def f: $y; .a | f)",
                 r#"[["a"]]"#,
             ),
             // source-rebuilt-container
