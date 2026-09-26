@@ -65898,6 +65898,17 @@ fn test_input_route_array_collect_keeps_embed_identity_3180() -> Result<()> {
             r#"try [input | . as $x | [.,.] | .[] | error("e")] catch ."#,
             r#""e""#,
         ),
+        // The relocating fold as the whole eager expression, and a peeled
+        // navigation that raises: the bridge's own error text.
+        (r"[input | . as $x | ([.,.] | max) | path($x)]", "[[]]"),
+        (
+            r"[input | . as $x | ([.] | sort) | .[0] | path($x)]",
+            "[[]]",
+        ),
+        (
+            r"try [input | . as $x | {k:.} | .[0] | sort] catch .",
+            r#""Cannot index object with number""#,
+        ),
     ] {
         let (stdout, stderr, code) =
             run_jq_full(&["-n", "-c", filter], Some(r#"{"a":1} {"a":1}"#))?;
