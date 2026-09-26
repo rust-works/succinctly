@@ -31732,9 +31732,10 @@ impl Reentry {
     /// evaluators gets it from one place. Deliberately *not* applied to the
     /// fold and loop hoists (`reduce_forks`/`foreach_forks`,
     /// `eval_on_many_owned`), which demote a static operand once for a
-    /// whole run rather than per step: a marker naming the accumulator
-    /// inside a fold's UPDATE stays a refuse-only residual, because
-    /// rerooting per step costs +3% (#3036).
+    /// whole run rather than per step, because rerooting per step costs +3%
+    /// (#3036). The folds recover a marker naming the accumulator their own
+    /// way (#3181, [`FoldOperand`]): a per-step witness, asked only when the
+    /// hoist demoted something.
     #[inline]
     pub(crate) fn witnessed_by<S: EvalSemantics>(self, value: &OwnedValue) -> Self {
         match self {
@@ -45610,7 +45611,7 @@ pub(crate) fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
 fn try_reduce_step_alternatives<S: EvalSemantics>(
     patterns: &[Pattern],
     all_var_names: &[String],
-    update: &Expr,
+    update: FoldOperand<'_>,
     input_val: &OwnedValue,
     acc_input: OwnedValue,
     optional: bool,
@@ -45634,6 +45635,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
         let mut outcome: Option<StepOutcome> = None;
         let walk =
             each_pattern_binding_set::<S>(pattern, input_val, invert_dedup, &mut |bindings| {
+                let (update, reentry) = update.against::<S>(&state);
                 let substituted = substitute_fold_step(update, bindings, all_var_names);
 
                 if let Some(control) = charge_budget(budget, "reduce") {
@@ -45658,10 +45660,11 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
                 // `update_vals.into_iter().last()` read off the collected `Vec`.
                 let mut last_val: Option<OwnedValue> = None;
                 let step_state = core::mem::replace(&mut state, OwnedValue::Null);
-                let flow = fold_step_each::<S>(&substituted, step_state, optional, &mut |v| {
-                    last_val = Some(v);
-                    Demand::Continue
-                });
+                let flow =
+                    fold_step_each::<S>(&substituted, step_state, optional, reentry, &mut |v| {
+                        last_val = Some(v);
+                        Demand::Continue
+                    });
                 // Unconditional, mirroring the pre-#1365 single-pattern fold's own
                 // "acc = update_vals.into_iter().last()" -- run even when `flow` is
                 // `Escaped`, since a retried alternative resumes from exactly this
@@ -45930,6 +45933,55 @@ fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(Arith
     Some((*op, closed_expr_to_owned::<S>(right.as_ref())?))
 }
 
+/// A fold's UPDATE or EXTRACT, as the per-step loop sees it (#3181): the
+/// copy [`demote_for_reentry`] hoisted against [`RootWitness::Owned`] once
+/// per fold (#3036), plus the operand as written when that hoist changed
+/// anything.
+///
+/// The hoist is right for every step whose accumulator is no document
+/// node, which is nearly all of them. It is wrong for a step whose
+/// accumulator still *is* an in-scope binding's node -- `. as $x | reduce
+/// (1) as $i (.; ($x.a) = 9)` is `{"a":9}` in jq, because INIT `.` places
+/// `$x`'s own value -- and #2889's embed table can say which steps those
+/// are. [`FoldOperand::against`] asks it, per step, only when there is a
+/// demoted marker for the answer to rescue: `as_written` is `None` for
+/// every fold whose operand the hoist left alone, so those take exactly
+/// the pre-#3181 path.
+#[derive(Clone, Copy)]
+struct FoldOperand<'e> {
+    hoisted: &'e Expr,
+    as_written: Option<&'e Expr>,
+}
+
+impl<'e> FoldOperand<'e> {
+    /// `expr`'s entry for a fold whose hoisted copy is `hoisted`.
+    fn new(expr: &'e Expr, hoisted: &'e Cow<'e, Expr>) -> Self {
+        Self {
+            hoisted,
+            as_written: matches!(hoisted, Cow::Owned(_)).then_some(expr),
+        }
+    }
+
+    /// The operand to run against `input`, and the [`Reentry`] that goes
+    /// with it: the operand as written, rerooted against the node `input`
+    /// still is, when the embed table proves one; otherwise the hoisted
+    /// copy, already demoted and so [`Reentry::Proven`].
+    ///
+    /// [`RootWitness::of_owned`] costs one thread-local load when no
+    /// binding is registered, and is asked only when `as_written` is
+    /// `Some`, so a fold with no demoted marker pays nothing per step (the
+    /// +3% #3036 measured was a reroot walk on every step).
+    fn against<S: EvalSemantics>(self, input: &OwnedValue) -> (&'e Expr, Reentry) {
+        if let Some(expr) = self.as_written {
+            let witness = RootWitness::of_owned::<S>(input);
+            if witness != RootWitness::Owned {
+                return (expr, Reentry::Against(witness));
+            }
+        }
+        (self.hoisted, Reentry::Proven)
+    }
+}
+
 /// #2157: `reduce`/`foreach`'s own fold-loop UPDATE dispatch -- shared by
 /// [`try_reduce_step_alternatives`] and [`try_foreach_step_alternatives`]
 /// (review flagged an earlier version of this fix as duplicating this
@@ -45989,6 +46041,7 @@ fn fold_step_each<S: EvalSemantics>(
     expr: &Expr,
     state: OwnedValue,
     optional: bool,
+    reentry: Reentry,
     on_update: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     match owned_arith_accumulator_shape::<S>(expr) {
@@ -46000,10 +46053,12 @@ fn fold_step_each<S: EvalSemantics>(
             Err(_) if optional => Flow::Exhausted,
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
-        // #3036/#3122: `Proven` because `reduce_forks`/`foreach_forks`
-        // ran [`demote_for_reentry`] on the fold's own UPDATE once, against
-        // `Owned` (the accumulator is never a document node), before any
-        // element was substituted into it -- `substitute_foreach_steps`
+        // #3036/#3122: `reentry` is `Proven` because `reduce_forks`/
+        // `foreach_forks` ran [`demote_for_reentry`] on the fold's own UPDATE
+        // once, against `Owned`, before any element was substituted into it
+        // -- unless [`FoldOperand::against`] found this step's accumulator
+        // is still a binding's node (#3181), and handed back the UPDATE as
+        // written with that witness to reroot against. `substitute_foreach_steps`
         // substitutes the loop variable through `substitute_vars`, which
         // replaces `Expr::Var` with the value's own literal (`owned_to_expr`)
         // and never with a marker (a node-less `Snapshot` marker *would* be
@@ -46013,7 +46068,7 @@ fn fold_step_each<S: EvalSemantics>(
         // no walk of its own (that walk was +3% on a tight `reduce` over 24k
         // elements, 7950X).
         None if super::eval_generic::embed_table_active() => {
-            eval_each_owned::<S>(expr, &state, optional, Reentry::Proven, on_update)
+            eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
         }
         None => match try_eval_owned_step::<S>(expr, state) {
             OwnedStep::Handled(Ok(value)) => match on_update(value) {
@@ -46023,7 +46078,7 @@ fn fold_step_each<S: EvalSemantics>(
             OwnedStep::Handled(Err(_)) if optional => Flow::Exhausted,
             OwnedStep::Handled(Err(error)) => Flow::Escaped(Control::Error(error)),
             OwnedStep::Declined(state) => {
-                eval_each_owned::<S>(expr, &state, optional, Reentry::Proven, on_update)
+                eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
             }
         },
     }
@@ -47336,8 +47391,8 @@ pub(crate) fn clear_nonretryable_stop() {
 fn try_foreach_step_alternatives<S: EvalSemantics>(
     patterns: &[Pattern],
     all_var_names: &[String],
-    update: &Expr,
-    extract: Option<&Expr>,
+    update: FoldOperand<'_>,
+    extract: Option<FoldOperand<'_>>,
     input_val: &OwnedValue,
     state_input: OwnedValue,
     optional: bool,
@@ -47367,9 +47422,16 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
         let mut outcome: Option<AlternativeOutcome> = None;
         let walk =
             each_pattern_binding_set::<S>(pattern, input_val, invert_dedup, &mut |bindings| {
+                let (update, update_reentry) = update.against::<S>(&state);
                 let substituted_update = substitute_fold_step(update, bindings, all_var_names);
-                let substituted_extract =
-                    extract.map(|ext| substitute_fold_step(ext, bindings, all_var_names));
+                // EXTRACT runs against each UPDATE output, not against `state`,
+                // so which copy it takes (#3181) is decided per output below;
+                // the as-written copy is substituted only for a fold whose
+                // hoist changed EXTRACT at all.
+                let substituted_extract = extract.map(|ext| {
+                    let sub = |e: &Expr| substitute_fold_step(e, bindings, all_var_names);
+                    (sub(ext.hoisted), ext.as_written.map(sub))
+                });
 
                 // #2180 WP3 review: one attempt, one clear -- see
                 // [`each_pattern_alternatives`]'s identical call and
@@ -47421,7 +47483,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                     // twice (#2180 WP3 review: the `else if sink(..) == Demand::Stop`
                     // branch used to carry its own copy of the retry rule).
                     let ext_flow = match &substituted_extract {
-                        Some(ext_expr) => {
+                        Some((hoisted, as_written)) => {
                             // Charged separately from the UPDATE bind above: a single
                             // UPDATE can fan out into far more EXTRACT evals than
                             // there are source elements (#695), and that width needs
@@ -47457,13 +47519,12 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                             // before reading `ext_control` used to encode
                             // positionally (#494): here they are simply already
                             // pushed by the time the `Flow` is inspected.
-                            eval_each_owned::<S>(
-                                ext_expr,
-                                &update_val,
-                                optional,
-                                Reentry::Proven,
-                                sink,
-                            )
+                            let substituted = FoldOperand {
+                                hoisted,
+                                as_written: as_written.as_ref(),
+                            };
+                            let (ext_expr, reentry) = substituted.against::<S>(&update_val);
+                            eval_each_owned::<S>(ext_expr, &update_val, optional, reentry, sink)
                         }
                         // EXTRACT omitted is EXTRACT `.` (jq desugars `foreach f as
                         // $x (init; update)` to `(init; update; .)`), so the push
@@ -47539,8 +47600,13 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 };
 
                 let step_state = core::mem::replace(&mut state, OwnedValue::Null);
-                let update_flow =
-                    fold_step_each::<S>(&substituted_update, step_state, optional, on_update);
+                let update_flow = fold_step_each::<S>(
+                    &substituted_update,
+                    step_state,
+                    optional,
+                    update_reentry,
+                    on_update,
+                );
 
                 match step_outcome {
                     Some(StepOutcome::Retry(update_val)) => {
@@ -47896,13 +47962,17 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     // #3036/#3122: UPDATE/EXTRACT rerun against the fold's own accumulator,
-    // never a document node, so their `Snapshot` markers are demoted against
-    // `Owned` -- once per fold, here, rather than once per element (see
-    // `fold_step_each`); the fold's own callers pass them in as written.
-    let update = demote_for_reentry(update, &RootWitness::Owned);
-    let update: &Expr = &update;
-    let extract = extract.map(|e| demote_for_reentry(e, &RootWitness::Owned));
-    let extract: Option<&Expr> = extract.as_deref();
+    // which is almost never a document node, so their `Snapshot` markers are
+    // demoted against `Owned` -- once per fold, here, rather than once per
+    // element (see `fold_step_each`); the fold's own callers pass them in as
+    // written. #3181: a step whose accumulator still is one takes the
+    // as-written operand instead (see [`FoldOperand`]).
+    let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
+    let update = FoldOperand::new(update, &hoisted_update);
+    let hoisted_extract = extract.map(|e| (e, demote_for_reentry(e, &RootWitness::Owned)));
+    let extract = hoisted_extract
+        .as_ref()
+        .map(|(e, hoisted)| FoldOperand::new(e, hoisted));
     // Lazily computed on the first fork, then reused for every later one --
     // `#2440`'s zero-INIT-outputs short-circuit is no longer a separate
     // early return this could sit above (see this function's own doc
@@ -48039,12 +48109,14 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     drive_source: ForeachSourceDrive<'_>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
-    // #3036/#3122: UPDATE reruns against the fold's own accumulator, never a
-    // document node, so its `Snapshot` markers are demoted against `Owned`
-    // -- once per fold, here, rather than once per element (see
-    // `fold_step_each`); the fold's own callers pass it in as written.
-    let update = demote_for_reentry(update, &RootWitness::Owned);
-    let update: &Expr = &update;
+    // #3036/#3122: UPDATE reruns against the fold's own accumulator, which
+    // is almost never a document node, so its `Snapshot` markers are demoted
+    // against `Owned` -- once per fold, here, rather than once per element
+    // (see `fold_step_each`); the fold's own callers pass it in as written.
+    // #3181: a step whose accumulator still is one takes the as-written
+    // UPDATE instead (see [`FoldOperand`]).
+    let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
+    let update = FoldOperand::new(update, &hoisted_update);
     // Lazily computed on the first fork and reused, for the same reason
     // `foreach_forks` defers it: a zero-output INIT (`reduce halt_error as
     // $x (empty; .)`, which exits 0) must not pay for a `Vec` build it never
@@ -84772,10 +84844,16 @@ mod tests {
         };
         let mut on_update_calls = 0;
         // omni-dev: coverage tolerate reason="the closure is asserted never called below (on_update_calls stays 0) -- Err(_) with optional=true short-circuits fold_step_each before this sink runs (#3122)"
-        let flow = fold_step_each::<JqSemantics>(&expr, OwnedValue::Int(1), true, &mut |_| {
-            on_update_calls += 1;
-            Demand::Continue
-        });
+        let flow = fold_step_each::<JqSemantics>(
+            &expr,
+            OwnedValue::Int(1),
+            true,
+            Reentry::Proven,
+            &mut |_| {
+                on_update_calls += 1;
+                Demand::Continue
+            },
+        );
         // omni-dev: coverage end
         assert_eq!(on_update_calls, 0);
         assert!(matches!(flow, Flow::Exhausted));

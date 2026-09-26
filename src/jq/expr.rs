@@ -131,8 +131,8 @@ pub struct Tracked {
 ///   generic evaluator's route and (Stage B) `eval.rs`'s own
 ///   `eval_as`/`each_as` bind sites. A scalar root (not `Rc`-backed), a
 ///   value re-indexed before the read (`sort`/`unique`/`reverse`/
-///   `to_entries`/`getpath`/a slice), a marker inside a fold's UPDATE
-///   naming the accumulator, and a few Stage-B-only shapes on the
+///   `to_entries`/`getpath`/a slice), a fold over an owned input (#3328)
+///   or a fold's own loop variable (#3329), and a few Stage-B-only shapes on the
 ///   `-n 'input | ...'` route stay documented refuse-only residuals, not
 ///   new correctness gaps -- see `docs/compliance/jq/limitations.md`'s
 ///   #2642 and #3036 sections. #3036 closed the same
