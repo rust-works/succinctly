@@ -8589,6 +8589,130 @@ pub(crate) fn owned_path_door_collect<S: EvalSemantics>(
     Some((collected, control))
 }
 
+/// The owned re-entries' door for a write (#3188): [`owned_path_door`]'s
+/// reasoning, applied to the target of `del(f)`, `f = v`, `f |= g`,
+/// `f op= v` and `f //= v`. Each of those is jq's `path(f)` followed by
+/// writes at the paths it yields, so the one part that needs the caller's
+/// own tree -- resolving `f` -- runs [`path_over_owned`] on `input`, and the
+/// answer comes back as `expr` with `f` replaced by the static paths it
+/// resolved to. The write itself still runs on the ordinary route, so every
+/// operator's semantics keep their one definition.
+///
+/// Declines (`None`, and the re-entry bridges as before) unless the target
+/// holds a marker and is built only from navigation, `?`, computed keys,
+/// literals and `error`: with no marker there is no storage identity to
+/// lose, and such a target has no side effect a declined resolution could
+/// repeat. That is [`is_pure_navigation`]'s grammar plus `?` and `.[k]`,
+/// which it leaves out for its own bind-witness contract, not for effects.
+/// It also declines on any
+/// escape, on zero paths, and on a component with no navigation step (a
+/// slice), so every refusal and error still comes from the bridge's own
+/// resolver, with its own text. jq mode only: the storage clause is jq's
+/// rule, and yq's writes resolve their targets in their own order (#2481).
+pub(crate) fn owned_write_door<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    reentry: Reentry,
+) -> Option<Expr> {
+    if S::TAG != EvalTag::Jq || reentry != Reentry::REBUILT {
+        return None;
+    }
+    let stages = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => stages.as_slice(),
+        other => core::slice::from_ref(other),
+    };
+    let [head, rest @ ..] = skip_identity_stages(stages) else {
+        return None;
+    };
+    let head = unwrap_paren(head);
+    let target = match head {
+        Expr::Assign { path, .. }
+        | Expr::Update { path, .. }
+        | Expr::CompoundAssign { path, .. }
+        | Expr::AlternativeAssign { path, .. }
+        | Expr::Builtin(Builtin::Del(path)) => path.as_ref(),
+        _ => return None,
+    };
+    let mut marked = false;
+    let effectful = any_subexpr(target, &mut |e| {
+        marked |= matches!(e, Expr::TrackedVar(_));
+        !(is_navigation_node(e)
+            || matches!(
+                e,
+                Expr::Identity
+                    | Expr::Pipe(_)
+                    | Expr::Comma(_)
+                    | Expr::Paren(_)
+                    | Expr::Optional(_)
+                    | Expr::IndexExpr { .. }
+                    | Expr::TrackedVar(_)
+                    | Expr::Literal(_)
+                    | Expr::Array(_)
+                    | Expr::Error(_)
+            ))
+    });
+    if effectful || !marked {
+        return None;
+    }
+    let root = RootWitness::of_owned::<S>(input);
+    let (paths, None) = path_over_owned_collect::<S>(target, input, &root, false)? else {
+        return None;
+    };
+    let mut resolved = paths
+        .iter()
+        .map(static_path_expr)
+        .collect::<Option<Vec<Expr>>>()?;
+    let target = match resolved.len() {
+        0 => return None,
+        1 => resolved.pop()?,
+        _ => Expr::Comma(resolved),
+    };
+    let target = Box::new(target);
+    let head = match head.clone() {
+        Expr::Assign { value, .. } => Expr::Assign {
+            path: target,
+            value,
+        },
+        Expr::Update { filter, .. } => Expr::Update {
+            path: target,
+            filter,
+        },
+        Expr::CompoundAssign { op, value, .. } => Expr::CompoundAssign {
+            op,
+            path: target,
+            value,
+        },
+        Expr::AlternativeAssign { value, .. } => Expr::AlternativeAssign {
+            path: target,
+            value,
+        },
+        _ => Expr::Builtin(Builtin::Del(target)),
+    };
+    Some(if rest.is_empty() {
+        head
+    } else {
+        Expr::Pipe(core::iter::once(head).chain(rest.iter().cloned()).collect())
+    })
+}
+
+/// A path `path(f)` produced, as the static navigation that reaches it
+/// (`["a", 0]` is `.a | .[0]`, `[]` is `.`), or `None` for a component no
+/// navigation step can spell.
+fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
+    let OwnedValue::Array(components) = path else {
+        return None;
+    };
+    let mut steps = components
+        .iter()
+        .map(super::eval_generic::path_component_step_expr)
+        .collect::<Option<Vec<Expr>>>()?;
+    Some(match steps.len() {
+        0 => Expr::Identity,
+        1 => steps.pop()?,
+        _ => Expr::Pipe(steps),
+    })
+}
+
 /// Whether a child peeled out of a `.[]` can run `rest` without building a
 /// throwaway index for itself (#2889 review) -- the shapes
 /// [`eval_owned_fast_path`] answers from the owned value directly.
@@ -8893,6 +9017,9 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     if let Some(flow) = owned_path_door::<S>(expr, input, optional, reentry, sink) {
         return flow;
     }
+    // #3188: the same for a write's target, handed on with it resolved.
+    let written = owned_write_door::<S>(expr, input, reentry);
+    let expr = written.as_ref().unwrap_or(expr);
     // #2889: `input` may still *be* a bound node's own value, embedded here
     // by a construction jq would have shared rather than copied -- ask the
     // embed table before settling for `Owned`.
@@ -46288,6 +46415,9 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => owned_vec_to_result(values),
         };
     }
+    // #3188: see `eval_each_owned`.
+    let written = owned_write_door::<S>(expr, input, reentry);
+    let expr = written.as_ref().unwrap_or(expr);
     // #2889: `input` may still *be* a bound node's own value, embedded here
     // by a construction jq would have shared rather than copied -- ask the
     // embed table before settling for `Owned`, exactly as the lazy twin

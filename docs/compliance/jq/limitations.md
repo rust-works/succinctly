@@ -1063,7 +1063,6 @@ is the revert that established what the other one costs.
    | `[.] \| (path(.[0] \| $x), path(.[0] \| $x \| .a))`, `[.] \| [limit(1; path(.[] \| $x))]`, `[.] \| path(.[0] \| $x)?` (the last swallows the refusal into no output)                                                              | a `path()` reached only through a wrapper (a comma, an array constructor, `limit`, `?`/`try`) is not at the head of the owned re-entry's pipe, so #3177's door does not open and the value still crosses the bridge; taking it natively would mean re-implementing the wrapper's own driver over an owned value — [#3189](https://github.com/rust-works/succinctly/issues/3189)                                                                           |
    | `[.] \| path(.[0] \| $x) as $p \| $p`, `[.] \| reduce path(.[0] \| $x) as $p (0; 1)`, `[.] \| select(path(.[0] \| $x) == [0])`, `[.] \| first(path(.[] \| $x) \| .[0])`, `[.] \| label $out \| path(.[0] \| $x) \| ., break $out` | the same rule from the other side: a `path()` that is a bind's *source*, a binary operand, or the body of `first`/`label` is in no position the door looks at either — the door opens only for the head of the pipe the owned re-entry is handed, and `as`/`reduce`/`==`/`first`/`label` each own the driver that runs their inner pipe (#3189)                                                                                                           |
    | `[.] \| sort\|reverse\|unique \| path(.[0] \| $x)`, `{k:.} \| to_entries \| path(.[0].value \| $x)`, `{k:.} \| with_entries(.) \| path(.k \| $x)`, `[[.]] \| add \| path(.[0] \| $x)`, `[.] \| .[0] \|= . \| path(.[0] \| $x)`    | jq answers all of these (`[0]`, `[0,"value"]`, `["k"]`): its `sort`/`to_entries`/`add`/`setpath` move the element's own `jv` into the new container. succinctly refuses because the stage *ahead* of `path()` folds through `eval_on_owned`'s JSON round trip first, so the array the resolver is then handed holds fresh copies and the storage clause has nothing to match — the same bridge that keeps `[.] \| sort \| .[0] \| path($x)` refused below |
-   | `[.] \| del(.[0] \| $x)`, `[.] \| (.[0] \| $x) = 5`                                                                                                                                                                               | the `del` and assignment resolvers still cross the bridge; #3177's storage clause answers there as soon as they are routed like `path()` — [#3188](https://github.com/rust-works/succinctly/issues/3188)                                                                                                                                                                                                                                                  |
    | `.a as $y \| . as $x \| [.] \| path(.[0].a \| $y)`                                                                                                                                                                                | reuse is depth-0 only: `$y`'s value is a separate materialization of `.a`, not the `.a` inside `$x`'s storage, so the position `path()` walks to shares nothing with `$y` (jq `[0,"a"]`)                                                                                                                                                                                                                                                                  |
    | `[.] \| sort\|unique\|reverse \| .[0]`, `{k:.} \| to_entries \| .[0].value`, `{k:.} \| getpath(["k"])`, `[.] \| .[0] \|= . \| .[0]`, `[1,2] \| .[0:2]` (all `\| path($x)`)                                                        | none is one of `embed_peel_step`'s recognized head stages (`.foo`/`.[n]`/`.[]`/`add`/`min`/`max`, after leading `.` stages are skipped), and a write (`\|=`) always runs through the assignment resolver first — so each re-indexes on the owned route before the read reaches the shared value                                                                                                                                                           |
    | `reduce (1) as $i (.; if true then . else 1 end) \| path($x)`                                                                                                                                                                     | the UPDATE is not one of the owned fast paths (`eval_owned_navigation`/`eval_owned_relocating_fold`), so the fold's own hoisted per-step reroot rebuilds the accumulator before `path($x)` reads it                                                                                                                                                                                                                                                       |
@@ -1114,11 +1113,29 @@ is the revert that established what the other one costs.
    `[]`. It now unwraps the parentheses and peels a stage that is the whole pipe (an
    `Expr::Identity` tail), under the same payoff gates. What stays refused is in the table
    above: scalars, a `path()` in any
-   position but the head of the owned re-entry's pipe (#3189), the `del`/assignment
-   resolvers (#3188), a stage ahead of `path()` that bridges first (`sort`, `to_entries`,
+   position but the head of the owned re-entry's pipe (#3189), a stage ahead of `path()`
+   that bridges first (`sort`, `to_entries`,
    `\|=`, ...), and an embed reached through an ancestor's bind. The same clause closed #2042's
    `path(.[0] as $y \| .[-2] \| $y)` residual (jq `[-2]`): the negative spelling never matched
    the bind path, but `.[-2]` stands on the very storage `$y` was bound from.
+   **[#3188](https://github.com/rust-works/succinctly/issues/3188), now closed: the same embed
+   written through by `del` or an assignment.** jq's `del(f)`, `f = v`, `f |= g`, `f op= v` and
+   `f //= v` are all `path(f)` followed by writes at the paths it yields, so
+   `. as $x \| [.] \| del(.[0] \| $x)` is `[]` in jq and `(.[0] \| $x) = 5` is `[5]`. The
+   owned re-entries now take `owned_write_door` beside #3177's `owned_path_door`: the write's
+   target is resolved by `path_over_owned` over the caller's own `OwnedValue`, where the
+   storage clause can see the pointer, and the write then runs on its ordinary route with the
+   target replaced by the static paths it resolved to, so every operator keeps its one
+   definition. The door opens only for a target that holds a marker and is built from
+   navigation, `?`, computed keys, literals and `error` -- nothing a declined resolution
+   could repeat -- and declines on any escape, on zero paths and on a slice component, so
+   every refusal still comes from the bridge's own resolver. A rebuilt equal value still
+   refuses as jq does (`[{"a":1}] \| del(.[0] \| $x)`). What stays refused follows the
+   `path()` door's own residuals: a write under a wrapper (`(del(.[0] \| $x))?`, #3189),
+   a navigated bind (`.a as $y \| [.] \| (.[0].a \| $y).b = 9`, #3179), a write reached
+   after `.[]` peels the container (`[.] \| [.[] \| del(. \| $x)]`), and a target whose
+   later path raises (`del(.[0] \| $x, .[0])` reports the bridge's refusal where jq
+   reports the second path's `Cannot index object with number`).
    **[#3036](https://github.com/rust-works/succinctly/issues/3036), now closed: the same
    fabrication through the routes that never cross a funnel.** #2642's check ran only where
    an expression is handed from the generic evaluator to `eval.rs`; when the bind *and* the

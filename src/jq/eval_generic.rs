@@ -2776,6 +2776,10 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
             None => owned_vec_to_generic_result(values),
         };
     }
+    // #3188: a write's target resolves over `owned` the same way, and the
+    // write goes on with it resolved. See `eval::owned_write_door`.
+    let written = crate::jq::eval::owned_write_door::<S>(expr, &owned, reentry);
+    let expr = written.as_ref().unwrap_or(expr);
     // #2889: `owned` may still *be* a bound node's own value -- see
     // `eval::Reentry::witnessed_by`.
     let reentry = reentry.witnessed_by::<S>(&owned);
@@ -19403,7 +19407,7 @@ fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
 /// path (`path(.c[(1.0)])` is `["c",1.0]` in jq 1.7.1), which is exactly
 /// what [`NumberKey`] carries for a literal float bracket, so the synthesized
 /// node reuses it rather than re-deriving a second rendering rule.
-fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
+pub(crate) fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
     Some(match component {
         OwnedValue::String(s) => Expr::Field(s.clone()),
         OwnedValue::Int(i) => Expr::Index { idx: *i, key: None },

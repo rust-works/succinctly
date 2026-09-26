@@ -570,8 +570,22 @@ owned-embed-refuse-path-nested-ancestor-bind	{"a":{"b":1}}	. as $x | .a as $y | 
 owned-embed-refuse-path-nested-scalar	1	. as $x | [.] | path(.[0] | $x)
 owned-embed-refuse-path-nested-comma	{"a":1}	. as $x | [.] | (path(.[0] | $x), path(.[0] | $x | .a))
 owned-embed-refuse-path-nested-wrapper	{"a":1}	. as $x | [.] | [limit(1; path(.[] | $x))]
-owned-embed-refuse-path-nested-del	{"a":1}	. as $x | [.] | del(.[0] | $x)
-owned-embed-refuse-path-nested-assign	{"a":1}	. as $x | [.] | (.[0] | $x) = 5
+owned-embed-path-nested-del	{"a":1}	. as $x | [.] | del(.[0] | $x)
+owned-embed-path-nested-assign	{"a":1}	. as $x | [.] | (.[0] | $x) = 5
+owned-embed-path-nested-update	{"a":1}	. as $x | [.] | (.[0] | $x) |= 5
+owned-embed-path-nested-update-empty	{"a":1}	. as $x | [.] | (.[0] | $x) |= empty
+owned-embed-path-nested-compound	{"a":1}	. as $x | [[.]] | (.[0][0] | $x).a += 1
+owned-embed-path-nested-alternative	{"a":1}	. as $x | [.] | (.[0] | $x | .a) //= 3
+owned-embed-path-nested-del-object	{"a":1}	. as $x | {k:.} | del(.k | $x)
+owned-embed-path-nested-del-fanout	{"a":1}	. as $x | [.,.] | del(.[] | $x)
+owned-embed-path-nested-del-computed-key	{"a":1}	. as $x | [.,.,.] | del(.[0,1] | $x)
+owned-embed-path-nested-del-optional	{"a":1}	. as $x | [.] | del(.[0]? | $x)
+owned-embed-path-nested-assign-rhs-fork	{"a":1}	. as $x | [.] | (.[0] | $x) = (1,2)
+owned-embed-path-nested-assign-tail	{"a":1}	. as $x | [.] | (.[0] | $x | .a) = 5 | .[0]
+owned-embed-path-nested-del-rebuilt-copy	{"a":1}	. as $x | [{"a":1}] | del(.[0] | $x)
+owned-embed-path-nested-assign-rebuilt-copy	{"a":1}	. as $x | [{"a":1}] | (.[0] | $x) = 5
+owned-embed-path-nested-del-fanout-rebuilt-sibling	{"a":1}	. as $x | [.,{"a":1}] | del(.[] | $x)
+owned-embed-path-nested-del-optional-rebuilt-copy	{"a":1}	. as $x | [{"a":1}] | del((.[0] | $x)?)
 owned-embed-refuse-path-nested-as-source	{"a":1}	. as $x | [.] | path(.[0] | $x) as $p | $p
 owned-embed-refuse-path-nested-reduce-source	{"a":1}	. as $x | [.] | reduce path(.[0] | $x) as $p (0; 1)
 owned-embed-refuse-path-nested-binary-operand	{"a":1}	. as $x | [.] | select(path(.[0] | $x) == [0])
@@ -835,8 +849,6 @@ navigated-bind-positional-assign:#3037 residual -- same as navigated-bind-positi
 owned-embed-refuse-path-nested-ancestor-bind:#3177 -- reuse is depth-0 only (#2889): $y is a separate materialization of .a, and the .a inside $x's own storage is a different Rc, so the storage clause has nothing to match; jq answers [0,"a"]
 owned-embed-refuse-path-nested-comma:#3177 -- path() reached through a comma wrapper is not at the head of the owned re-entry's pipe, so it still crosses the bridge; taking it natively would mean re-implementing the wrapper's driver over an owned value (#3189)
 owned-embed-refuse-path-nested-wrapper:#3177 -- same as owned-embed-refuse-path-nested-comma, through an array constructor and limit
-owned-embed-refuse-path-nested-del:#3177 -- the del resolver still crosses the bridge; the storage clause answers there as soon as del/assignment are routed like path() (#3188)
-owned-embed-refuse-path-nested-assign:#3177 -- same as owned-embed-refuse-path-nested-del, for the assignment resolver
 owned-embed-refuse-path-nested-as-source:#3177 review -- path() as a bind's source is not the head of the owned re-entry's pipe; the as driver owns the inner pipe, so it still bridges (#3189)
 owned-embed-refuse-path-nested-reduce-source:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as a reduce source
 owned-embed-refuse-path-nested-binary-operand:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as a binary operand inside select
