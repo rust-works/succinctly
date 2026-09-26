@@ -30719,6 +30719,20 @@ fn test_literal_dollar_argument_matches_jq_3260() -> Result<()> {
         assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
         assert_eq!(stdout.trim_end(), expected, "{filter}");
     }
+
+    // 33 literal `$` parameters: two substitution entries each outgrow the
+    // combined walk's 64-bit mask, so this binds through the sequential
+    // fallback, statically all the same.
+    let params: Vec<String> = (1..=33).map(|i| format!("$a{i}")).collect();
+    let args: Vec<String> = (1..=33).map(|i| i.to_string()).collect();
+    let filter = format!(
+        "def f({}): [$a1, $a17, $a33]; f({})",
+        params.join("; "),
+        args.join("; ")
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[1,17,33]");
     Ok(())
 }
 

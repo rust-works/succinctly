@@ -62129,7 +62129,7 @@ fn substitute_params(body: &Expr, params: &[Param], shared: &[Rc<SharedArg>]) ->
     // ceiling it would be built only to be thrown away by the fallback. A
     // parameter contributes at most two entries.
     if 2 * params.len() > MAX_COMBINED_PARAM_SUBSTS {
-        return sequential_substitution(body, params, shared); // omni-dev: coverage tolerate-line reason="unreachable in practice: a def with more than 32 parameters; the fallback exists so ScopeMask's one-bit-per-parameter u64 is a performance ceiling rather than a correctness limit (#2633)"
+        return sequential_substitution(body, params, shared);
     }
     let mut subs: Vec<ParamSubst<'_>> = Vec::new();
     for (i, (param, arg)) in params.iter().zip(shared).enumerate() {
