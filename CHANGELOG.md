@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: printing a lazily built array no longer copies each element to
+  validate it** (#3156). `[.[]]`, `map(.)`, `sort`, `reverse` and the other
+  builtins that answer a lazy sequence of document elements built a full owned
+  copy of every element before printing, only to check it and throw it away
+  (#2066's atomicity rule: nothing reaches stdout if any element is
+  malformed). The check now runs `to_owned_cursor`'s own walk instantiated to
+  build nothing, so it enforces exactly the same rules while holding only the
+  walk's depth: `[.[]]` over an 8 MB document peaks at 26 MB (was 96 MB) on an
+  Apple M5 Max, with unchanged output and time.
+
 - **jq: a `$` parameter bound to a literal costs nothing per call** (#3260).
   Since #3149 every `$`-style parameter binds through an `as` around the body,
   which re-walks and rebuilds the body on every call. A literal argument
