@@ -61515,10 +61515,11 @@ fn all_single_valued_pure(
     Some(calls)
 }
 
-/// Wrap an operand-enumeration strategy so an operand that
-/// [`settles_before_consumer`] is evaluated to completion before its output
-/// reaches the sink, rather than delivering it from inside its own
-/// evaluation (#3296). Any other operand is enumerated as before.
+/// Wrap an operand-enumeration strategy so every operand is evaluated to
+/// completion before its output reaches the sink, rather than delivering it
+/// from inside its own evaluation (#3296). Only installed by an operator whose
+/// operands both [`settles_before_consumer`], and the operator only ever
+/// enumerates those two.
 ///
 /// Generic in the item type like [`read_only_operand_strategy`], which wraps
 /// it: the replayed output reaches the sink through that strategy's own
@@ -61527,9 +61528,6 @@ pub(crate) fn settled_operand_strategy<I>(
     each_operand: impl Fn(&Expr, &mut dyn FnMut(I) -> Demand) -> Flow,
 ) -> impl Fn(&Expr, &mut dyn FnMut(I) -> Demand) -> Flow {
     move |expr: &Expr, sink: &mut dyn FnMut(I) -> Demand| {
-        if !settles_before_consumer(expr) {
-            return each_operand(expr, sink);
-        }
         settle_then_replay(|collect| each_operand(expr, collect), sink)
     }
 }
@@ -72010,6 +72008,40 @@ mod tests {
                 "{src:?} must not be owned-pure -- its suppression rules live elsewhere"
             );
         }
+    }
+
+    /// #3296: [`settle_then_replay`] keeps every output in order -- a
+    /// recognised shape yields at most one, but a second is replayed rather
+    /// than lost -- and stops replaying where the sink does.
+    #[test]
+    fn settle_then_replay_keeps_order_and_stops_3296() {
+        let source = |sink: &mut dyn FnMut(i32) -> Demand| {
+            for i in 1..=3 {
+                if matches!(sink(i), Demand::Stop) {
+                    return Flow::Stopped { pending: None };
+                }
+            }
+            Flow::Exhausted
+        };
+        let mut seen = Vec::new();
+        let flow = settle_then_replay(source, |i| {
+            seen.push(i);
+            Demand::Continue
+        });
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(seen, [1, 2, 3]);
+
+        let mut seen = Vec::new();
+        let flow = settle_then_replay(source, |i| {
+            seen.push(i);
+            if i == 2 {
+                Demand::Stop
+            } else {
+                Demand::Continue
+            }
+        });
+        assert!(matches!(flow, Flow::Stopped { pending: None }));
+        assert_eq!(seen, [1, 2]);
     }
 
     /// #3296: [`settles_before_consumer`] accepts exactly the single-valued,

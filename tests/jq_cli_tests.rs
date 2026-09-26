@@ -30551,6 +30551,17 @@ fn test_settled_operand_keeps_jq_order_3296() -> Result<()> {
             "def o: 3; [o < (1,4), o and (true,false)]",
             "[false,true,true,false]",
         ),
+        // Both operands settle: `and`/`or`, and a consumer that stops while
+        // the settled output is replayed.
+        (
+            "def t(n): n > 0; [t(1) and t(0), t(0) or t(1)]",
+            "[false,true]",
+        ),
+        (
+            "def f(n): n; [first(f(1) + f(2)), limit(1; f(3) * f(4))]",
+            "[3,12]",
+        ),
+        ("def t(n): n > 0; [first(t(1) and t(1))]", "[true]"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");

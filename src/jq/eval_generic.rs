@@ -13313,17 +13313,15 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
     abort.unwrap_or(outer)
 }
 
-/// The generic evaluator's twin of `eval::settled_operand_strategy`: an
-/// operand that `eval::settles_before_consumer` is evaluated to completion
-/// before its output reaches the sink, so a tree recursion's continuation
-/// does not run on top of each operand's frames (#3296).
+/// The generic evaluator's twin of `eval::settled_operand_strategy`: every
+/// operand is evaluated to completion before its output reaches the sink, so
+/// a tree recursion's continuation does not run on top of each operand's
+/// frames (#3296). Installed only when both operands
+/// `eval::settles_before_consumer`.
 fn settled_operand_strategy_generic<V: DocumentValue>(
     each_operand: impl Fn(&Expr, &mut dyn Sink<V>) -> Flow,
 ) -> impl Fn(&Expr, &mut dyn Sink<V>) -> Flow {
     move |expr: &Expr, sink: &mut dyn Sink<V>| {
-        if !settles_before_consumer(expr) {
-            return each_operand(expr, sink);
-        }
         settle_then_replay(
             |collect| each_operand(expr, &mut |item| collect(item)),
             |item| sink.push(item),
