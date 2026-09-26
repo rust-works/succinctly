@@ -61450,10 +61450,11 @@ pub(crate) fn settles_before_consumer(expr: &Expr) -> bool {
 }
 
 /// How many nodes [`settles_before_consumer`] visits before declining. The
-/// argument chain of `fib(n - 1)` adds three nodes per level, so this settles tree
-/// recursion to ~1,000 levels, far past where an exponential call tree can
-/// finish, while bounding the check to a few microseconds.
-const SETTLE_ANALYSIS_BUDGET: u32 = 4096;
+/// argument chain of `fib(n - 1)` adds three nodes per level, so this settles
+/// tree recursion to ~340 levels, far past where an exponential call tree can
+/// finish, while bounding both the check's time and its own native recursion
+/// (an argument chain nests, so the walk recurses about as deep as it visits).
+const SETTLE_ANALYSIS_BUDGET: u32 = 1024;
 
 /// [`settles_before_consumer`]'s analysis, within the raw body of `within`
 /// when given: `None` if `expr` is not recognised as single-valued and
@@ -72078,27 +72079,22 @@ mod tests {
             call.clone()
         ))));
 
-        // An argument chain past the budget declines rather than walking on:
-        // `n - 1` over the previous level's `n`, as a deep recursion builds it.
+        // An argument past the budget declines rather than walking on. Built
+        // flat -- a pipe of `.` stages -- so neither the walk nor the drop
+        // nests deeper than a test thread's stack allows.
         let Expr::DefCall { def, .. } = &call else {
             panic!("expected a DefCall")
         };
-        let one = parse("1").unwrap();
-        let mut arg = one.clone();
-        for _ in 0..SETTLE_ANALYSIS_BUDGET {
-            arg = Expr::Arithmetic {
-                op: ArithOp::Sub,
-                left: Box::new(Expr::Shared(Rc::new(arg))),
-                right: Box::new(one.clone()),
-            };
-        }
-        let deep = Expr::DefCall {
+        let with_arg = |stages: usize| Expr::DefCall {
             def: Rc::clone(def),
-            args: vec![arg],
+            args: vec![Expr::Pipe(vec![Expr::Identity; stages])],
             frames: 0,
             bound: BoundBody::default(),
         };
-        assert!(!settles_before_consumer(&deep));
+        assert!(settles_before_consumer(&with_arg(8)));
+        assert!(!settles_before_consumer(&with_arg(
+            SETTLE_ANALYSIS_BUDGET as usize
+        )));
     }
 
     /// #2397: the navigation shapes the representation gate exists for must
