@@ -8286,9 +8286,15 @@ Found while closing #2865, filed rather than recorded as divergences: a dependen
 after a builtin cannot shadow that builtin *inside* the module body, because a module's
 own source is parsed with no shadow-candidate seeding
 ([#2950](https://github.com/rust-works/succinctly/issues/2950)). Data imports
-(`import "f" as $d;`) are also still unimplemented: #2865 records the `$` on `Import::data`
-and resolves the file so a typo is still jq's own `module not found`, but binding the
-variable is [#2956](https://github.com/rust-works/succinctly/issues/2956).
+(`import "f" as $d;`) are implemented
+([#2956](https://github.com/rust-works/succinctly/issues/2956)): the file's parsed JSON
+stream binds to the `$`-variable, scoped exactly as jq scopes it -- a module's own data
+import is visible only inside that module's own def bodies, never to an includer's
+unrelated scope, and a top-level one shadows a same-named `--arg`/`--argjson` entirely.
+The one recorded divergence is the detail text on a data file that exists but fails to
+parse as JSON: jq's own message comes from its C parser (`Invalid numeric literal at
+line 1, column 4`); succinctly's is its own JSON reader's wording, the same fidelity limit
+already recorded above for a module body's own parse failures.
 
 **A module body seeing names it should not** — `~/.jq`'s defs, and sibling `include`d and
 `import`ed modules' defs in a declaration-order-dependent way — **is closed**
