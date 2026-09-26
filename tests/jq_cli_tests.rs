@@ -30736,6 +30736,37 @@ fn test_literal_dollar_argument_matches_jq_3260() -> Result<()> {
     Ok(())
 }
 
+/// #3213: a streaming stage's owned output reaches the rest of its pipe
+/// through the owned re-entry, which reindexed the whole value for any rest
+/// it could not answer natively -- `while(...) | .i | select(...)` rebuilt a
+/// long-literal sibling the `.i` drops on every iteration (~1.4 s at 3,200
+/// iterations over a 200,000-digit literal). The leading `.i` is now taken
+/// natively first. Pinned for output here, against jq 1.7.1's.
+#[test]
+fn test_streaming_projection_then_select_matches_jq_3213() -> Result<()> {
+    let input = format!(r#"{{"i":0,"n":0.{}e-400}}"#, "0".repeat(2000));
+    for (filter, expected) in [
+        (
+            "[while(.i < 50; .i += 1) | .i | select(. % 10 == 9)]",
+            "[9,19,29,39,49]",
+        ),
+        (
+            "[while(.i < 3; .i += 1) | .i | type]",
+            r#"["number","number","number"]"#,
+        ),
+        ("[while(.i < 3; .i += 1) | .n | . == 0]", "[true,true,true]"),
+        (
+            r#"{"a":{"b":[1,{"c":2}]}} | .a.b[1] | .c | select(. > 1)"#,
+            "2",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
 /// #3262 / ADR-0025: a closure passed through unchanged used to be wrapped in
 /// one more `Shared` per level, so reading it at depth `d` walked `d` links
 /// natively and `0 | rep(. + 1; 1000)` overflowed the stack at ~670 levels.

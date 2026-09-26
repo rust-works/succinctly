@@ -9207,6 +9207,9 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
             };
         }
     }
+    if let Some(flow) = projection_peel::<S>(expr, input, optional, reentry, sink) {
+        return flow;
+    }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
     let expr = reentry.reroot::<S>(expr);
@@ -9222,6 +9225,78 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
         sink(item.into_owned_lossy::<S>())
     })
+}
+
+/// Take a pipe's leading `.field`/`.[n]` natively, then re-enter with the
+/// rest on the value it lands on, instead of reindexing the whole input for
+/// the bridge (#3213).
+///
+/// A streaming stage hands each owned output to the rest of its pipe here --
+/// `while(...; .i += 1) | .i | select(. == 3199)` re-enters once per
+/// iteration with the whole loop state. When the rest is not one shape the
+/// doors above answer (a `select` is not), the bridge serializes and indexes
+/// all of it, so a 200,000-digit sibling the `.i` is about to drop cost
+/// ~1.4 s over 3,200 iterations. Navigating first leaves the bridge only
+/// what the navigation keeps.
+///
+/// The step is the one [`eval_owned_fast_path`] already trusts as equivalent
+/// to the bridge when it is the whole expression ([`eval_owned_navigation`]),
+/// and it is taken only where the reorder is unobservable:
+///
+/// - No embed table in scope and no proof on the re-entry
+///   ([`Reentry::REBUILT`]): the rest is rerooted against an owned root either
+///   way, which demotes every marker whatever that root is. Inside an `as`
+///   body [`embed_peel_step`] governs instead.
+/// - A rest that needs no path context ([`needs_path_context`]): yq's `key`,
+///   `parent` and `path` read the node's place in the document, which a
+///   re-rooted child no longer has.
+/// - A navigation that answers a value. Every other outcome -- an error, an
+///   absent yq key's empty result -- declines, so its diagnostics stay the
+///   bridge's.
+fn projection_peel<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    if reentry != Reentry::REBUILT || super::eval_generic::embed_table_active() {
+        return None;
+    }
+    let Expr::Pipe(stages) = unwrap_paren(expr) else {
+        return None;
+    };
+    let [first, rest @ ..] = skip_identity_stages(stages) else {
+        return None;
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let first = unwrap_paren(first);
+    // A chained head (`.a.b | ...`) parses as one nested pipe: flatten it one
+    // level, as `embed_peel_step` does, so its first step is visible.
+    if let Expr::Pipe(inner) = first {
+        let mut flat = inner.clone();
+        flat.extend_from_slice(rest);
+        return projection_peel::<S>(&Expr::Pipe(flat), input, optional, reentry, sink);
+    }
+    if !matches!(first, Expr::Field(_) | Expr::Index { .. }) {
+        return None;
+    }
+    let rest = Expr::Pipe(rest.to_vec());
+    if needs_path_context(&rest) {
+        return None;
+    }
+    let Ok(Some(child)) = eval_owned_navigation::<S>(first, input, optional)? else {
+        return None;
+    };
+    Some(eval_each_owned::<S>(
+        &rest,
+        &child,
+        optional,
+        Reentry::REBUILT,
+        sink,
+    ))
 }
 
 /// Evaluate the few owned operations whose unchanged siblings must not be
@@ -89350,6 +89425,54 @@ mod tests {
         let many: QueryResult<Vec<u64>> =
             QueryResult::ManyOwned(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
         assert_eq!(many.collect_owned::<JqSemantics>().len(), 2);
+    }
+
+    /// #3213: [`projection_peel`] takes a pipe's leading navigation natively
+    /// and re-enters with the rest, answering what the bridge would -- and
+    /// declines wherever the reorder could be observed: a rest that reads
+    /// the node's place in the document, a navigation that raises, or a
+    /// re-entry that already carries a proof.
+    #[test]
+    fn projection_peel_answers_the_bridges_value_and_declines_where_observable_3213() {
+        let json: &[u8] = br#"{"i":3,"n":"a long sibling the projection drops"}"#;
+        let index = JsonIndex::build(json);
+        let input = to_owned::<JqSemantics, _>(&index.root(json).value()).unwrap();
+        let run = |filter: &str, input: &OwnedValue, reentry: Reentry| {
+            let expr = parse(filter).unwrap();
+            let mut out = Vec::new();
+            let flow = projection_peel::<JqSemantics>(&expr, input, false, reentry, &mut |v| {
+                out.push(v);
+                Demand::Continue
+            });
+            flow.map(|flow| (flow, out))
+        };
+
+        // Peeled: `.i` first, then `select` on the child alone -- the value
+        // the whole re-entry answers too.
+        let (flow, out) = run(".i | select(. == 3)", &input, Reentry::REBUILT)
+            .expect("a leading field over an object peels");
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(out, vec![OwnedValue::Int(3)]);
+        let mut bridged = Vec::new();
+        let _ = eval_each_owned::<JqSemantics>(
+            &parse(".i | select(. == 3)").unwrap(),
+            &input,
+            false,
+            Reentry::REBUILT,
+            &mut |v| {
+                bridged.push(v);
+                Demand::Continue
+            },
+        );
+        assert_eq!(out, bridged);
+
+        // Declined: a rest needing path context, a navigation that raises,
+        // a bare navigation with no rest, and a proven re-entry.
+        assert!(run(".i | key", &input, Reentry::REBUILT).is_none());
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        assert!(run(".i | select(true)", &array, Reentry::REBUILT).is_none());
+        assert!(run(".i", &input, Reentry::REBUILT).is_none());
+        assert!(run(".i | select(true)", &input, Reentry::Proven).is_none());
     }
 
     #[test]
