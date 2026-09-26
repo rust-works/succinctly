@@ -62038,7 +62038,7 @@ fn bind_def_call_body(
 ///
 /// #2633: the bare substitution is one walk over the body carrying every
 /// parameter, not one walk per parameter.
-/// `sequential_bare_substitution` below keeps the per-parameter shape, as
+/// `sequential_substitution` below keeps the per-parameter shape, as
 /// the >64 fallback and the differential oracle.
 ///
 /// Measured interleaved against `c21736b2f`, 11 reps, best-of, both pinned
@@ -62069,13 +62069,32 @@ fn bind_def_call_body(
 /// `$`-parameter recursion refuses one level in four sooner than before
 /// (`def sum_to($n)` stops at 10,000 levels, not 13,333), where the bare
 /// spelling is unchanged.
+///
+/// #3260: a `$` parameter whose argument is a literal needs no `as`. A literal
+/// yields exactly one value, raises nothing and reads no input, so binding it
+/// is unobservable except through `$name` -- which the same walk substitutes
+/// with the literal, in the dollar namespace, where it is cached with the rest
+/// of the bound body instead of re-walked on every call. Only the parameter
+/// `$name` resolves to, the last `$` one of that name, is substituted; an
+/// earlier literal one of the same name is shadowed and simply dropped.
 fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
     let shared = share_def_call_args(args);
-    bind_dollar_params(
-        substitute_bare_params(body, params, &shared),
-        params,
-        &shared,
-    )
+    bind_dollar_params(substitute_params(body, params, &shared), params, &shared)
+}
+
+/// Whether `$`-style parameter `params[i]` is bound statically rather than by
+/// an `as` (#3260): its argument is a literal. See [`bind_def_call_params`].
+fn is_static_dollar(params: &[Param], shared: &[Rc<SharedArg>], i: usize) -> bool {
+    params[i].is_dollar() && matches!(shared[i].expr(), Expr::Literal(_))
+}
+
+/// Whether `$name` in the body resolves to `params[i]`: it is `$`-style and
+/// no later `$` parameter shares its name.
+fn is_last_dollar(params: &[Param], i: usize) -> bool {
+    params[i].is_dollar()
+        && !params[i + 1..]
+            .iter()
+            .any(|q| q.is_dollar() && q.name() == params[i].name())
 }
 
 /// Each argument of a `def` call, behind the one `Rc` both its bare
@@ -62098,29 +62117,37 @@ fn share_def_call_args(args: &[Expr]) -> Vec<Rc<SharedArg>> {
         .collect()
 }
 
-/// The bare half of [`bind_def_call_params`]: substitute each parameter's
-/// bare name, the last same-named parameter winning, in one walk (#2633).
-fn substitute_bare_params(body: &Expr, params: &[Param], shared: &[Rc<SharedArg>]) -> Expr {
+/// The substitution half of [`bind_def_call_params`], in one walk (#2633):
+/// each parameter's bare name, the last same-named parameter winning, and
+/// `$name` for each statically bound `$` parameter (#3260).
+fn substitute_params(body: &Expr, params: &[Param], shared: &[Rc<SharedArg>]) -> Expr {
     // `zip` truncates to the shorter side -- an arity mismatch cannot reach
     // here (`install_def_calls` only builds a `DefCall` whose `args.len()`
     // equals `params.len()`), and if one ever did, leaving the extra
     // parameters unbound is the old behaviour, not a panic.
     // Checked before building the substitution list (review): past the
-    // ceiling it would be built only to be thrown away by the fallback.
-    if params.len() > MAX_COMBINED_PARAM_SUBSTS {
-        return sequential_bare_substitution(body, params, shared); // omni-dev: coverage tolerate-line reason="unreachable in practice: a def with more than 64 parameters; the fallback exists so ScopeMask's one-bit-per-parameter u64 is a performance ceiling rather than a correctness limit (#2633)"
+    // ceiling it would be built only to be thrown away by the fallback. A
+    // parameter contributes at most two entries.
+    if 2 * params.len() > MAX_COMBINED_PARAM_SUBSTS {
+        return sequential_substitution(body, params, shared);
     }
-    let subs: Vec<ParamSubst<'_>> = params
-        .iter()
-        .zip(shared)
-        .enumerate()
-        .filter(|(i, (param, _))| !shadowed_by_later_param(params, *i, param))
-        .map(|(_, (param, arg))| ParamSubst {
-            name: param.name(),
-            arg: Expr::Shared(Rc::clone(arg)),
-            scope: BARE_NAMESPACE_ONLY,
-        })
-        .collect();
+    let mut subs: Vec<ParamSubst<'_>> = Vec::new();
+    for (i, (param, arg)) in params.iter().zip(shared).enumerate() {
+        if !shadowed_by_later_param(params, i, param) {
+            subs.push(ParamSubst {
+                name: param.name(),
+                arg: Expr::Shared(Rc::clone(arg)),
+                scope: BARE_NAMESPACE_ONLY,
+            });
+        }
+        if is_static_dollar(params, shared, i) && is_last_dollar(params, i) {
+            subs.push(ParamSubst {
+                name: param.name(),
+                arg: Expr::Shared(Rc::clone(arg)),
+                scope: DOLLAR_NAMESPACE_ONLY,
+            });
+        }
+    }
     if subs.is_empty() {
         return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: bind_def_call only calls this for a non-empty params, install_def_calls only builds a DefCall whose args.len() equals params.len(), and the last parameter is never shadowed, so at least one entry is always built (#2560)"
     }
@@ -62140,8 +62167,10 @@ fn bind_dollar_params(body: Expr, params: &[Param], shared: &[Rc<SharedArg>]) ->
     params
         .iter()
         .zip(shared)
+        .enumerate()
         .rev()
-        .filter(|(param, _)| param.is_dollar())
+        .filter(|(i, (param, _))| param.is_dollar() && !is_static_dollar(params, shared, *i))
+        .map(|(_, pair)| pair)
         .fold(body, |body, (param, arg)| Expr::As {
             expr: Box::new(Expr::Shared(Rc::clone(arg))),
             var: param.name().to_string(),
@@ -62169,17 +62198,24 @@ const MAX_COMBINED_PARAM_SUBSTS: usize = 64;
 /// A shadowed parameter (a later one shares its name) is skipped rather than
 /// substituted first and overwritten: its `Shared` node would otherwise hide
 /// the winner's references from the later pass.
-fn sequential_bare_substitution(body: &Expr, params: &[Param], shared: &[Rc<SharedArg>]) -> Expr {
+fn sequential_substitution(body: &Expr, params: &[Param], shared: &[Rc<SharedArg>]) -> Expr {
     let mut result: Option<Expr> = None;
     for (i, (param, arg)) in params.iter().zip(shared).enumerate() {
-        if shadowed_by_later_param(params, i, param) {
-            continue;
+        if !shadowed_by_later_param(params, i, param) {
+            result = Some(substitute_func_param(
+                result.as_ref().unwrap_or(body),
+                param.name(),
+                &Expr::Shared(Rc::clone(arg)),
+            ));
         }
-        result = Some(substitute_func_param(
-            result.as_ref().unwrap_or(body),
-            param.name(),
-            &Expr::Shared(Rc::clone(arg)),
-        ));
+        if is_static_dollar(params, shared, i) && is_last_dollar(params, i) {
+            result = Some(substitute_func_param_impl(
+                result.as_ref().unwrap_or(body),
+                param.name(),
+                &Expr::Shared(Rc::clone(arg)),
+                DOLLAR_NAMESPACE_ONLY,
+            ));
+        }
     }
     result.unwrap_or_else(|| body.clone())
 }
@@ -62723,10 +62759,9 @@ fn params_bind_dollar(params: &[Param], name: &str) -> bool {
 struct SubstScope {
     /// `$param` (`Expr::Var`) still resolves to this call's own argument.
     ///
-    /// No production caller sets this since #3149: a `$`-style parameter is
-    /// now bound by an `as` around the body ([`bind_def_call_params`]), not
-    /// substituted, so every entry starts from [`BARE_NAMESPACE_ONLY`]. The
-    /// half is kept, with its tests, until it is stripped as a whole.
+    /// Set only for a `$` parameter bound statically to a literal argument
+    /// ([`DOLLAR_NAMESPACE_ONLY`], #3260); any other `$`-style parameter is
+    /// bound by an `as` around the body (#3149, [`bind_def_call_params`]).
     /// Cleared by any binder that rebinds `$param` for real -- `1 as
     /// $param`, a `reduce`/`foreach`/`?//` pattern binding it, or a nested
     /// `def` whose own matching parameter is `$`-style.
@@ -62898,6 +62933,13 @@ const BARE_NAMESPACE_ONLY: SubstScope = SubstScope {
     bare: true,
 };
 
+/// Rewrite only `$param` references, leaving every bare `param` alone -- a
+/// `$` parameter bound statically to its literal argument (#3260).
+const DOLLAR_NAMESPACE_ONLY: SubstScope = SubstScope {
+    dollar: true,
+    bare: false,
+};
+
 /// Substitute a function parameter's bare name with an argument expression.
 ///
 /// #2141: `param` is always the *bare* spelling of a function parameter
@@ -62909,7 +62951,9 @@ const BARE_NAMESPACE_ONLY: SubstScope = SubstScope {
 /// rewrites only the bare one. A `$`-style parameter's own `$name`
 /// references used to be substituted here too, as the only thing that bound
 /// them at all; since #3149 they are bound by an `as` around the body
-/// instead (see [`bind_def_call_params`]), one value at a time, as jq does.
+/// instead (see [`bind_def_call_params`]), one value at a time, as jq does --
+/// except for a literal argument, which [`substitute_func_params_impl`]
+/// substitutes in the dollar namespace ([`DOLLAR_NAMESPACE_ONLY`], #3260).
 ///
 /// What narrows the substitution as the walk crosses each binder is
 /// [`SubstScope`] -- only a binder in the bare namespace clears it (#2555).
@@ -62933,9 +62977,9 @@ fn substitute_func_params_impl(expr: &Expr, subs: &[ParamSubst<'_>], scope: Scop
         // from being substituted *into the first argument*: arguments live in
         // the caller's scope and cannot mention the callee's own parameters.
         Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
-        // See `substitute_func_param`'s own doc comment above for why this
-        // exists at all (a `$`-style parameter's only binding mechanism).
-        // Gated on `scope.dollar`, the variable namespace -- the bare
+        // Reached only by a `$`-style parameter bound statically to a literal
+        // argument (#3260); any other one is bound by an `as` (#3149, see
+        // `substitute_func_param`'s doc comment). Gated on `scope.dollar`, the variable namespace -- the bare
         // `FuncCall` arm below reads `scope.bare` instead, and the two
         // narrow on different binders (#2555).
         Expr::Var(name) => match ScopeMask::resolve(scope.dollar, subs, name) {
@@ -64042,13 +64086,16 @@ mod tests {
     /// so a mask bit cleared one binder too early or too late fails here
     /// even when no test query happens to reach the difference.
     ///
-    /// `sequential_bare_substitution` is kept in the tree for this (it is
+    /// `sequential_substitution` is kept in the tree for this (it is
     /// also the >64-parameter fallback), so the oracle is the real prior
     /// implementation rather than a re-derivation of it.
     ///
-    /// #3149: this covers the bare half only -- the `$` half is no longer a
-    /// substitution, but one `as` per parameter ([`bind_dollar_params`]),
-    /// with no second implementation to diff it against. Its nesting order,
+    /// #3149 / #3260: a `$` parameter is bound by one `as` per parameter
+    /// ([`bind_dollar_params`]) unless its argument is a literal, which the
+    /// walk substitutes in the dollar namespace. So the corpus runs twice:
+    /// with literal arguments, which puts the dollar half under the
+    /// differential check, and with `.`, which leaves it bare-only. The `as`
+    /// wrappers have no second implementation to diff against; their nesting order,
     /// names and duplicate handling are pinned by
     /// `test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560`
     /// and, end to end against jq 1.7.1, by `tests/jq_cli_tests.rs`'s
@@ -64159,15 +64206,24 @@ mod tests {
         ];
 
         for body in &bodies {
-            for params in &param_sets {
+            for (params, literal) in param_sets
+                .iter()
+                .flat_map(|params| [(params, true), (params, false)])
+            {
                 let args: Vec<Expr> = (0..params.len())
-                    .map(|i| int(i64::try_from(i).expect("small index") + 1))
+                    .map(|i| {
+                        if literal {
+                            int(i64::try_from(i).expect("small index") + 1)
+                        } else {
+                            Expr::Identity
+                        }
+                    })
                     .collect();
                 let shared = share_def_call_args(&args);
-                let combined = substitute_bare_params(body, params, &shared);
+                let combined = substitute_params(body, params, &shared);
                 assert_eq!(
                     combined,
-                    sequential_bare_substitution(body, params, &shared),
+                    sequential_substitution(body, params, &shared),
                     "combined walk diverged from the sequential fold\n  body: {body:?}\n  params: {params:?}"
                 );
                 // #2633 review: `Expr`'s own `PartialEq` cannot see this.
@@ -64216,17 +64272,15 @@ mod tests {
     /// #3149: the `$` namespace is bound by an `as` around the body, not
     /// substituted -- jq's own `def f($a): body` = `def f(a): a as $a |
     /// body` -- so each expectation is that wrapper around the bare
-    /// substitution.
+    /// substitution. The arguments are fields, not literals: a literal
+    /// argument is bound statically instead (#3260), pinned by
+    /// `test_literal_dollar_argument_is_bound_statically_3260`.
     #[test]
     fn test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560() {
         let bare = |name: &str| Param::Bare(name.to_string());
         let dollar = |name: &str| Param::Dollar(name.to_string());
-        let args = || {
-            vec![
-                Expr::Literal(Literal::Int(1)),
-                Expr::Literal(Literal::Int(2)),
-            ]
-        };
+        let arg = |n: i64| Expr::Field(format!("a{n}"));
+        let args = || vec![arg(1), arg(2)];
         let bind = |body: Expr, params: &[Param]| bind_def_call_params(&body, params, &args());
         let dollar_ref = || Expr::Var("a".to_string());
         let bare_ref = || Expr::FuncCall {
@@ -64236,7 +64290,7 @@ mod tests {
         };
         // `Expr::Shared`-wrapped, since that is what the substitution
         // inserts (#2096 capture hygiene).
-        let shared = |n: i64| Expr::shared(Expr::Literal(Literal::Int(n)));
+        let shared = |n: i64| Expr::shared(arg(n));
         let bound_as = |n: i64, var: &str, body: Expr| Expr::As {
             expr: Box::new(shared(n)),
             var: var.to_string(),
@@ -64293,6 +64347,94 @@ mod tests {
                 "a",
                 bound_as(2, "b", pair(dollar_ref(), Expr::Var("b".to_string())))
             ),
+        );
+    }
+
+    /// #3260: a `$` parameter whose argument is a literal is bound by
+    /// substituting `$name` in the dollar namespace, with no `as`: a literal
+    /// yields one value, raises nothing and reads no input, so the binding is
+    /// unobservable except through `$name`. Only the parameter `$name`
+    /// resolves to (the last `$` one) is substituted; a shadowed literal one
+    /// is dropped, and a non-literal one keeps its `as` in the same list.
+    #[test]
+    fn test_literal_dollar_argument_is_bound_statically_3260() {
+        let bare = |name: &str| Param::Bare(name.to_string());
+        let dollar = |name: &str| Param::Dollar(name.to_string());
+        let lit = |n: i64| Expr::Literal(Literal::Int(n));
+        let shared_lit = |n: i64| Expr::shared(lit(n));
+        let dollar_ref = |name: &str| Expr::Var(name.to_string());
+        let bare_ref = |name: &str| Expr::FuncCall {
+            name: name.to_string(),
+            args: Vec::new(),
+            builtin_fallback: None,
+        };
+        let pair = |a: Expr, b: Expr| Expr::Array(Box::new(Expr::Comma(vec![a, b])));
+
+        // `def f($a): [$a, a]; f(1)`: both namespaces substituted, no `as`.
+        assert_eq!(
+            bind_def_call_params(
+                &pair(dollar_ref("a"), bare_ref("a")),
+                &[dollar("a")],
+                &[lit(1)]
+            ),
+            pair(shared_lit(1), shared_lit(1)),
+        );
+        // `def f($a; $a): $a; f(1; 2)`: the last `$a` wins, the shadowed
+        // literal one is dropped.
+        assert_eq!(
+            bind_def_call_params(
+                &dollar_ref("a"),
+                &[dollar("a"), dollar("a")],
+                &[lit(1), lit(2)]
+            ),
+            shared_lit(2),
+        );
+        // `def f($a; $a): $a; f(.x; 2)`: the shadowed non-literal one keeps
+        // its `as`, so it still iterates (and can raise) as jq's does.
+        assert_eq!(
+            bind_def_call_params(
+                &dollar_ref("a"),
+                &[dollar("a"), dollar("a")],
+                &[Expr::Field("x".into()), lit(2)]
+            ),
+            Expr::As {
+                expr: Box::new(Expr::shared(Expr::Field("x".into()))),
+                var: "a".into(),
+                body: Box::new(shared_lit(2)),
+            },
+        );
+        // `def f($a; $b): [$a, $b]; f(.x; 2)`: only the literal one is static.
+        assert_eq!(
+            bind_def_call_params(
+                &pair(dollar_ref("a"), dollar_ref("b")),
+                &[dollar("a"), dollar("b")],
+                &[Expr::Field("x".into()), lit(2)]
+            ),
+            Expr::As {
+                expr: Box::new(Expr::shared(Expr::Field("x".into()))),
+                var: "a".into(),
+                body: Box::new(pair(dollar_ref("a"), shared_lit(2))),
+            },
+        );
+        // `def f(a; $a): [$a, a]; f(1; 2)`: a bare parameter never binds `$a`.
+        assert_eq!(
+            bind_def_call_params(
+                &pair(dollar_ref("a"), bare_ref("a")),
+                &[bare("a"), dollar("a")],
+                &[lit(1), lit(2)]
+            ),
+            pair(shared_lit(2), shared_lit(2)),
+        );
+        // `def f($a): 5 as $a | $a; f(1)`: an inner binder shadows the static
+        // substitution exactly as it shadowed the `as`.
+        let shadowed = Expr::As {
+            expr: Box::new(lit(5)),
+            var: "a".into(),
+            body: Box::new(dollar_ref("a")),
+        };
+        assert_eq!(
+            bind_def_call_params(&shadowed, &[dollar("a")], &[lit(1)]),
+            shadowed,
         );
     }
 

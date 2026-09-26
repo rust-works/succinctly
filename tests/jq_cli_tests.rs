@@ -30681,6 +30681,61 @@ fn test_eager_link_stays_lazy_over_an_effect_3287() -> Result<()> {
     Ok(())
 }
 
+/// #3260: a `$` parameter whose argument is a literal is bound by
+/// substituting `$name`, with no `as`. Every expected value is jq 1.7.1's,
+/// covering what the substitution must still respect: an inner binder
+/// (`as`, `reduce`, `foreach`, `?//`, a nested `$` parameter) shadowing
+/// `$name`, duplicate `$` names, a bare parameter of the same name, and a
+/// literal beside a generator argument.
+#[test]
+fn test_literal_dollar_argument_matches_jq_3260() -> Result<()> {
+    for (filter, expected) in [
+        ("def f($x): [$x, (5 as $x | $x), $x]; f(1)", "[1,5,1]"),
+        (
+            "def f($x): reduce (1,2) as $x (0; . + $x) + $x; f(10)",
+            "13",
+        ),
+        (
+            "def f($x): [foreach (1,2) as $x (0; . + $x; [$x, .])] + [$x]; f(10)",
+            "[[1,1],[2,3],10]",
+        ),
+        (
+            "def f($x): [.[] as [$x] ?// $x | $x] + [$x]; [[1],2] | f(10)",
+            "[1,2,10]",
+        ),
+        ("def f($x): def g($x): $x; [g(2), $x]; f(1)", "[2,1]"),
+        ("def f($x): def x: 7; [x, $x]; f(1)", "[7,1]"),
+        ("def f($a; $a): $a; [f(1,2; 3)]", "[3,3]"),
+        ("def f(a; $a): [$a, a]; f(1; 2)", "[2,2]"),
+        ("def f($a; a): [$a, a]; f(1; 2)", "[1,2]"),
+        ("def f($a; $b): [$a, $b]; [f(1; 2,3)]", "[[1,2],[1,3]]"),
+        ("def f($x): {($x): $x}; f(\"k\")", r#"{"k":"k"}"#),
+        (
+            "def r($p1; $p2): if $p1 == 0 then $p2 else r($p1 - 1; $p2) end; r(12000; 7)",
+            "7",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+
+    // 33 literal `$` parameters: two substitution entries each outgrow the
+    // combined walk's 64-bit mask, so this binds through the sequential
+    // fallback, statically all the same.
+    let params: Vec<String> = (1..=33).map(|i| format!("$a{i}")).collect();
+    let args: Vec<String> = (1..=33).map(|i| i.to_string()).collect();
+    let filter = format!(
+        "def f({}): [$a1, $a17, $a33]; f({})",
+        params.join("; "),
+        args.join("; ")
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[1,17,33]");
+    Ok(())
+}
+
 /// #3262 / ADR-0025: a closure passed through unchanged used to be wrapped in
 /// one more `Shared` per level, so reading it at depth `d` walked `d` links
 /// natively and `0 | rep(. + 1; 1000)` overflowed the stack at ~670 levels.
