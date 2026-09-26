@@ -3483,6 +3483,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         self.bp_pos
     }
 
+    /// The matching close parenthesis: every descendant's `bp_pos` lies
+    /// strictly between it and this node's own (#3179).
+    #[inline]
+    fn subtree_end(&self) -> Option<usize> {
+        self.index.bp().find_close(self.bp_pos)
+    }
+
     /// #2072: `BalancedParens::is_open` answers `false` past the end of the
     /// vector, so one call rejects both an out-of-range id and a closing
     /// position -- the two ways an id can fail to name a node here.

@@ -234,7 +234,7 @@ Three findings, in order of what they cost:
   `sort`/`unique`/`reverse`/`to_entries`/`getpath`/a slice/a no-op `|=`, a fold UPDATE that
   is not one of the owned fast paths, a marker inside a fold's UPDATE naming the
   accumulator, an embed reached through a container built from an *ancestor* of the bound
-  node (reuse is depth-0 only), `no_std` builds, and yq mode — see `limitations.md`'s #2642
+  node (reuse was depth-0 only; closed by #3179), `no_std` builds, and yq mode — see `limitations.md`'s #2642
   paragraph.
 - **Closed by [#3036](https://github.com/rust-works/succinctly/issues/3036).** The same
   fabrication where the bind and the rebuild both run inside `eval.rs` (the input-queue

@@ -374,6 +374,15 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// it already holds, never to an unsound answer.
     fn document_token(&self) -> usize;
 
+    /// The closing position of this node's subtree in the
+    /// [`node_id`](Self::node_id) numbering, so a node `n` lies strictly
+    /// inside it exactly when `self.node_id() < n < end` (#3179). `None`
+    /// where the format cannot say cheaply; a caller then treats the subtree
+    /// as containing nothing.
+    fn subtree_end(&self) -> Option<usize> {
+        None // omni-dev: coverage tolerate-line reason="unreachable: the only caller, eval_generic::embed_at_or_within, is gated on jq semantics, and the YAML cursor (the one implementor without an override) is only ever evaluated under yq semantics (#3179)"
+    }
+
     /// Check if this cursor points to a container (array or object).
     fn is_container(&self) -> bool;
 
