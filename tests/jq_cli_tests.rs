@@ -30478,6 +30478,107 @@ fn test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149() ->
     Ok(())
 }
 
+/// #3262 / ADR-0025: recursions whose native stack per level the frame count
+/// cannot predict all aborted the process on `main` with the guard on (256 MB
+/// release / 2 GB debug) -- an argument 201 operators deep at ~450 levels, a
+/// chain link through the lazy evaluator (`n - 1 | .`), a nested `def` closing
+/// over the parameter and a helper `def` in the argument at ~240-330. With the
+/// CLI's stack registered, each refuses once half of it is spent. jq answers
+/// all of them; the refusal is the recorded depth divergence, an exit-5 error
+/// rather than a process abort. No refusal *depth* is pinned: it follows the
+/// registered stack and the build profile (ADR-0025).
+#[test]
+fn test_recursion_refuses_before_the_native_stack_runs_out_3262() -> Result<()> {
+    let deep_arg = format!("n{} - 1", " - 0".repeat(200));
+    for body in [
+        format!("def f(n): if n == 0 then 0 else f({deep_arg}) end;"),
+        "def f(n): if n == 0 then 0 else f(n - 1 | .) end;".to_string(),
+        "def f(n): def h: n - 1; if n == 0 then 0 else f(h) end;".to_string(),
+        "def g(x): x - 1; def f(n): if n == 0 then 0 else f(g(n)) end;".to_string(),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &format!("{body} f(3000)")], None)?;
+        assert_eq!(code, 5, "{body}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("exceeded maximum recursion depth"),
+            "{body}: stderr: {stderr:?}"
+        );
+
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &format!("{body} f(50)")], None)?;
+        assert_eq!(code, 0, "{body}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), "0", "{body}");
+    }
+    Ok(())
+}
+
+/// #3262 / ADR-0025: the path routes take the native-stack floor as well --
+/// a lazy-link chain read inside `path()` (the path resolver's `DefCall` and
+/// `Shared` arms), inside `|=`, and with a path-context builtin (`key`) at the
+/// base case (the generic evaluator's path-context arms) refuses where it
+/// aborted the process, and answers shallow.
+#[test]
+fn test_argument_chain_refuses_on_the_path_routes_3262() -> Result<()> {
+    let def = "def f(n): if n == 0 then .a else f(n - 1 | .) end;";
+    for (filter, input) in [
+        (format!("{def} [path(f(3000))]"), r#"{"a":1}"#),
+        (format!("{def} f(3000) |= 2"), r#"{"a":1}"#),
+        (
+            "def f(n): if n == 0 then (.a | key) else f(n - 1 | .) end; f(3000)".to_string(),
+            r#"{"a":{"b":1}}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("exceeded maximum recursion depth"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    for (filter, input, expected) in [
+        (format!("{def} [path(f(50))]"), r#"{"a":1}"#, r#"[["a"]]"#),
+        (format!("{def} f(50) |= 2"), r#"{"a":1}"#, r#"{"a":2}"#),
+        (
+            "def f(n): if n == 0 then (.a | key) else f(n - 1 | .) end; f(50)".to_string(),
+            r#"{"a":{"b":1}}"#,
+            r#""a""#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// #3262 / ADR-0025: a closure passed through unchanged used to be wrapped in
+/// one more `Shared` per level, so reading it at depth `d` walked `d` links
+/// natively and `0 | rep(. + 1; 1000)` overflowed the stack at ~670 levels.
+/// Shared rather than re-wrapped, it answers as jq does -- and a threaded
+/// generator argument keeps the laziness jq gives it.
+#[test]
+fn test_passed_through_closure_builds_no_chain_3262() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "def rep(f; n): if n <= 0 then . else (f | rep(f; n - 1)) end; 0 | rep(. + 1; 1000)",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1000");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            r#"isempty(def f(g): g; def t(g; n): if n == 0 then f(g) else t(g; n - 1) end; t(1, ("B" | stderr); 50))"#,
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "false");
+    assert_eq!(stderr, "", "the second branch must never run");
+    Ok(())
+}
+
 /// #2141 review: `subst_dollar` must survive crossing into a builtin
 /// argument (`select`, here) the same way it does through ordinary
 /// structural recursion -- `substitute_func_param_in_builtin` used to call
