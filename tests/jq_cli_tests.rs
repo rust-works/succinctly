@@ -65582,6 +65582,16 @@ fn test_embed_reused_below_depth_zero_3179() -> Result<()> {
             "#3179: `{filter}`: stderr={stderr:?}"
         );
     }
+    // An array element, reached the same way.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r".[0] as $y | {k:.} | .k[0] | path($y)"],
+        Some(r#"[{"b":1},2]"#),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        ("[]", 0),
+        "#3179 array element: stderr={stderr:?}"
+    );
     // A value-equal sibling is a different node; a write through the root
     // copies `.a` first, so the result no longer is `$y`'s. jq refuses both.
     for filter in [

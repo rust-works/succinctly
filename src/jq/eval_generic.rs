@@ -863,7 +863,7 @@ impl CursorWalkOutput for CheckOnly {
     fn scalar(_: OwnedValue) {}
     /// Never: validating is walking, so no subtree may be skipped.
     fn reuse(_: OwnedValue) -> Option<()> {
-        None
+        None // omni-dev: coverage tolerate-line reason="unreachable: validate_cursor, CheckOnly's only instantiation, passes reuse = false, so the walk never asks (#3179)"
     }
 }
 
@@ -5534,7 +5534,7 @@ mod embed_table {
                 return false;
             }
             let Some(hi) = hi() else {
-                return false;
+                return false; // omni-dev: coverage tolerate-line reason="unreachable: hi is find_close of a container's own open paren, which a built index always matches (#3179)"
             };
             t.iter()
                 .any(|e| e.document == document && e.node > lo && e.node < hi)
