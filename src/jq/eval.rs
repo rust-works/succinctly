@@ -45935,18 +45935,22 @@ fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(Arith
 
 /// A fold's UPDATE or EXTRACT, as the per-step loop sees it (#3181): the
 /// copy [`demote_for_reentry`] hoisted against [`RootWitness::Owned`] once
-/// per fold (#3036), plus the operand as written when that hoist changed
-/// anything.
+/// per fold (#3036), plus the operand as written when a reroot against a
+/// node could change it -- a `Snapshot` marker the hoist demoted, or an
+/// `Untracked` one (a navigated bind, `.a as $y`) that
+/// [`reroot_for_reentry`] would promote at that node (#3037).
 ///
 /// The hoist is right for every step whose accumulator is no document
 /// node, which is nearly all of them. It is wrong for a step whose
 /// accumulator still *is* an in-scope binding's node -- `. as $x | reduce
 /// (1) as $i (.; ($x.a) = 9)` is `{"a":9}` in jq, because INIT `.` places
 /// `$x`'s own value -- and #2889's embed table can say which steps those
-/// are. [`FoldOperand::against`] asks it, per step, only when there is a
-/// demoted marker for the answer to rescue: `as_written` is `None` for
-/// every fold whose operand the hoist left alone, so those take exactly
-/// the pre-#3181 path.
+/// are. [`FoldOperand::witnessed`] asks it, per step, only when there is a
+/// marker for the answer to rescue: `as_written` is `None` for every fold
+/// whose operand holds no such marker (or no node that can start a
+/// resolver invocation, [`reentry_can_observe`]'s precheck), and in every
+/// mode but jq (where [`RootWitness::of_owned`] never names a node), so
+/// those take exactly the pre-#3181 path.
 #[derive(Clone, Copy)]
 struct FoldOperand<'e> {
     hoisted: &'e Expr,
@@ -45955,30 +45959,43 @@ struct FoldOperand<'e> {
 
 impl<'e> FoldOperand<'e> {
     /// `expr`'s entry for a fold whose hoisted copy is `hoisted`.
-    fn new(expr: &'e Expr, hoisted: &'e Cow<'e, Expr>) -> Self {
+    fn new<S: EvalSemantics>(expr: &'e Expr, hoisted: &'e Cow<'e, Expr>) -> Self {
+        let rerootable = S::TAG == EvalTag::Jq
+            && (matches!(hoisted, Cow::Owned(_))
+                || reentry_can_observe(expr, &|marker| {
+                    matches!(marker.origin, Origin::Untracked).then_some(Origin::Snapshot)
+                }));
         Self {
             hoisted,
-            as_written: matches!(hoisted, Cow::Owned(_)).then_some(expr),
+            as_written: rerootable.then_some(expr),
         }
     }
 
-    /// The operand to run against `input`, and the [`Reentry`] that goes
-    /// with it: the operand as written, rerooted against the node `input`
-    /// still is, when the embed table proves one; otherwise the hoisted
-    /// copy, already demoted and so [`Reentry::Proven`].
+    /// The operand as written, when the embed table proves `input` is still
+    /// an in-scope binding's node; `None` sends the step to the hoisted copy.
     ///
     /// [`RootWitness::of_owned`] costs one thread-local load when no
     /// binding is registered, and is asked only when `as_written` is
     /// `Some`, so a fold with no demoted marker pays nothing per step (the
     /// +3% #3036 measured was a reroot walk on every step).
+    fn witnessed<S: EvalSemantics>(self, input: &OwnedValue) -> Option<&'e Expr> {
+        self.as_written
+            .filter(|_| RootWitness::of_owned::<S>(input) != RootWitness::Owned)
+    }
+
+    /// The operand to run against `input`, and the [`Reentry`] that goes
+    /// with it. A witnessed step takes the operand as written with
+    /// [`Reentry::REBUILT`]: [`eval_each_owned`] refines that to the same
+    /// witness through [`Reentry::witnessed_by`], and only a `REBUILT`
+    /// re-entry opens its embed doors (`embed_peel_step`, `owned_path_door`,
+    /// `owned_write_door`), which an UPDATE like `[.] | .[0] | path($x)`
+    /// needs. Every other step takes the hoisted copy, already demoted and
+    /// so [`Reentry::Proven`].
     fn against<S: EvalSemantics>(self, input: &OwnedValue) -> (&'e Expr, Reentry) {
-        if let Some(expr) = self.as_written {
-            let witness = RootWitness::of_owned::<S>(input);
-            if witness != RootWitness::Owned {
-                return (expr, Reentry::Against(witness));
-            }
+        match self.witnessed::<S>(input) {
+            Some(expr) => (expr, Reentry::REBUILT),
+            None => (self.hoisted, Reentry::Proven),
         }
-        (self.hoisted, Reentry::Proven)
     }
 }
 
@@ -46058,7 +46075,8 @@ fn fold_step_each<S: EvalSemantics>(
         // once, against `Owned`, before any element was substituted into it
         // -- unless [`FoldOperand::against`] found this step's accumulator
         // is still a binding's node (#3181), and handed back the UPDATE as
-        // written with that witness to reroot against. `substitute_foreach_steps`
+        // written with `Reentry::REBUILT`, which `eval_each_owned` refines to
+        // that witness. `substitute_foreach_steps`
         // substitutes the loop variable through `substitute_vars`, which
         // replaces `Expr::Var` with the value's own literal (`owned_to_expr`)
         // and never with a marker (a node-less `Snapshot` marker *would* be
@@ -47425,13 +47443,11 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 let (update, update_reentry) = update.against::<S>(&state);
                 let substituted_update = substitute_fold_step(update, bindings, all_var_names);
                 // EXTRACT runs against each UPDATE output, not against `state`,
-                // so which copy it takes (#3181) is decided per output below;
-                // the as-written copy is substituted only for a fold whose
-                // hoist changed EXTRACT at all.
-                let substituted_extract = extract.map(|ext| {
-                    let sub = |e: &Expr| substitute_fold_step(e, bindings, all_var_names);
-                    (sub(ext.hoisted), ext.as_written.map(sub))
-                });
+                // so which copy it takes (#3181) is decided per output below,
+                // and the as-written copy is substituted only for an output
+                // the embed table witnesses.
+                let substituted_extract =
+                    extract.map(|ext| substitute_fold_step(ext.hoisted, bindings, all_var_names));
 
                 // #2180 WP3 review: one attempt, one clear -- see
                 // [`each_pattern_alternatives`]'s identical call and
@@ -47483,7 +47499,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                     // twice (#2180 WP3 review: the `else if sink(..) == Demand::Stop`
                     // branch used to carry its own copy of the retry rule).
                     let ext_flow = match &substituted_extract {
-                        Some((hoisted, as_written)) => {
+                        Some(hoisted) => {
                             // Charged separately from the UPDATE bind above: a single
                             // UPDATE can fan out into far more EXTRACT evals than
                             // there are source elements (#695), and that width needs
@@ -47519,11 +47535,17 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                             // before reading `ext_control` used to encode
                             // positionally (#494): here they are simply already
                             // pushed by the time the `Flow` is inspected.
-                            let substituted = FoldOperand {
-                                hoisted,
-                                as_written: as_written.as_ref(),
+                            let witnessed;
+                            let (ext_expr, reentry) = match extract
+                                .and_then(|ext| ext.witnessed::<S>(&update_val))
+                            {
+                                Some(as_written) => {
+                                    witnessed =
+                                        substitute_fold_step(as_written, bindings, all_var_names);
+                                    (&witnessed, Reentry::REBUILT)
+                                }
+                                None => (hoisted, Reentry::Proven),
                             };
-                            let (ext_expr, reentry) = substituted.against::<S>(&update_val);
                             eval_each_owned::<S>(ext_expr, &update_val, optional, reentry, sink)
                         }
                         // EXTRACT omitted is EXTRACT `.` (jq desugars `foreach f as
@@ -47968,11 +47990,11 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     // written. #3181: a step whose accumulator still is one takes the
     // as-written operand instead (see [`FoldOperand`]).
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
-    let update = FoldOperand::new(update, &hoisted_update);
+    let update = FoldOperand::new::<S>(update, &hoisted_update);
     let hoisted_extract = extract.map(|e| (e, demote_for_reentry(e, &RootWitness::Owned)));
     let extract = hoisted_extract
         .as_ref()
-        .map(|(e, hoisted)| FoldOperand::new(e, hoisted));
+        .map(|(e, hoisted)| FoldOperand::new::<S>(e, hoisted));
     // Lazily computed on the first fork, then reused for every later one --
     // `#2440`'s zero-INIT-outputs short-circuit is no longer a separate
     // early return this could sit above (see this function's own doc
@@ -48116,7 +48138,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     // #3181: a step whose accumulator still is one takes the as-written
     // UPDATE instead (see [`FoldOperand`]).
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
-    let update = FoldOperand::new(update, &hoisted_update);
+    let update = FoldOperand::new::<S>(update, &hoisted_update);
     // Lazily computed on the first fork and reused, for the same reason
     // `foreach_forks` defers it: a zero-output INIT (`reduce halt_error as
     // $x (empty; .)`, which exits 0) must not pay for a `Vec` build it never

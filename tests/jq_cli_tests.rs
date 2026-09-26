@@ -65580,6 +65580,40 @@ fn test_fold_update_marker_naming_the_accumulator_3181() -> Result<()> {
             );
         }
     }
+    // A navigated bind's marker is `Untracked`, which the hoist leaves
+    // alone; a step whose accumulator is that node promotes it (#3037), so
+    // the fold keeps the operand as written for it too. Stdin route only:
+    // on `-n 'input | ...'` the bind's witness is an owned-identity token
+    // `RootWitness::of_owned` cannot name, which still refuses.
+    for (filter, want) in [
+        (
+            r".a as $y | .a | reduce (1) as $i (.; ($y.b) = 9)",
+            r#"{"b":9}"#,
+        ),
+        (
+            r".a as $y | reduce (1) as $i (.a; ($y.b) = 9)",
+            r#"{"b":9}"#,
+        ),
+        (r".a as $y | foreach (1) as $i (.; .a; path($y))", "[]"),
+        (
+            r".a as $y | . as $x | reduce (1) as $i (.; .a | path($y))",
+            "[]",
+        ),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"c":{"b":1}}"#))?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (want, 0),
+            "#3181: `{filter}`; stderr={stderr:?}"
+        );
+    }
+    // A sibling with an equal value is a different node: refused, as in jq.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r".a as $y | .c | reduce (1) as $i (.; ($y.b) = 9)"],
+        Some(r#"{"a":{"b":1},"c":{"b":1}}"#),
+    )?;
+    assert_eq!((stdout.trim(), code), ("", 5), "stderr={stderr:?}");
     // The first `foreach` step answers and emits; the second, whose
     // accumulator the first step rebuilt, refuses.
     for (args, program) in [
