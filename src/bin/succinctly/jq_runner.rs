@@ -793,11 +793,10 @@ impl ModuleLoader {
     /// Load a module if it is not already cached, and borrow its function
     /// definitions (name, params, body) in place.
     ///
-    /// The borrowing form exists so a caller that only needs to *read* the
-    /// defs -- [`Self::unqualified_def_names`], which wants their names --
-    /// does not pay for a deep clone of every def body it is about to drop
-    /// (#2395). [`Self::load_module`] is this plus that clone, for callers
-    /// that need an owned copy.
+    /// Borrowing, so a caller that only needs to *read* the defs --
+    /// [`Self::unqualified_def_names`], which wants their names -- does not
+    /// pay for a deep clone of every def body it is about to drop (#2395).
+    /// [`Self::process_program`] clones only the bodies it wraps.
     ///
     /// The defs handed back are the module's **own** defs only, each with
     /// forwarding stubs for its module's dependencies already wrapped around
@@ -1109,14 +1108,6 @@ impl ModuleLoader {
         order
     }
 
-    /// Load a module and return an owned copy of its function definitions
-    /// (name, params, body). Test-only since #3153: `process_program` wraps
-    /// top-level runs from the borrowed cache instead.
-    #[cfg(test)]
-    pub fn load_module(&mut self, module_path: &str) -> Result<FuncDefList, ModuleLoadError> {
-        self.ensure_module_loaded(module_path).cloned()
-    }
-
     /// Every def name this program's modules will put into the main filter's
     /// scope *unqualified*, for seeding the parser's shadow-candidate set
     /// (#2395).
@@ -1282,10 +1273,10 @@ impl ModuleLoader {
         // gets stubs rather than bodies in its top-level run (#3153).
         let order = self.hoist_order(&top_ids);
         let linked: BTreeSet<u32> = order.iter().copied().collect();
-        let mut wanted = if linked.is_empty() {
+        let wanted = if linked.is_empty() {
             BTreeSet::new()
         } else {
-            self.top_level_wanted(program)
+            self.top_level_wanted(program, &include_runs, &import_runs, &linked)
         };
 
         for &id in &include_runs {
@@ -1295,7 +1286,7 @@ impl ModuleLoader {
             // from an unrelated module that merely happened to be included
             // first -- and reversing the two `include`s made it agree with
             // jq again, by accident.
-            let defs = self.top_run_defs(id, None, &linked, &mut wanted);
+            let defs = self.top_run_defs(id, None, &linked, &wanted);
             expr = wrap_run(expr, defs, id, None);
         }
 
@@ -1310,7 +1301,7 @@ impl ModuleLoader {
             // *this* run were namespaced, so a bare sibling call inside one
             // of their bodies is retried as `alias::name` by the resolver,
             // and only within this run.
-            let defs = self.top_run_defs(id, Some(namespace), &linked, &mut wanted);
+            let defs = self.top_run_defs(id, Some(namespace), &linked, &wanted);
             expr = wrap_run(expr, defs, id, Some(namespace));
         }
 
@@ -1348,37 +1339,54 @@ impl ModuleLoader {
     /// lexically inside the link run (`def c: 7; def g: c; def c: 8;` still
     /// gives `[g, c]` as `[7, 8]`, as jq does).
     ///
-    /// A def nothing reaches is emitted unchanged: nothing resolves to it,
-    /// and the resolver never checks an unreached body (#2740), so there is
-    /// no reason to point a stub at a link run that does not carry it.
+    /// A def of such a module that nothing reaches under this run's
+    /// spelling is dropped rather than emitted: nothing resolves to it, so
+    /// the drop is unobservable (the resolver never checks an unreached body
+    /// either, #2740), and emitting it would be a second copy of a body the
+    /// link run may well carry because a dependent reaches it under another
+    /// spelling (`import "m" as q; include "c"` with `c` = `include "m"`).
+    /// A module that is not linked keeps every def, reached or not, exactly
+    /// as before.
     fn top_run_defs(
         &self,
         id: u32,
         alias: Option<&str>,
         linked: &BTreeSet<u32>,
-        wanted: &mut BTreeSet<String>,
+        wanted: &BTreeSet<String>,
     ) -> FuncDefList {
-        // `run_origin` and `loaded_modules` are both keyed by the same
-        // canonical file (#2955), and every id here was just loaded.
-        let Some(defs) = self.run_origin(id).and_then(|k| self.loaded_modules.get(k)) else {
+        let Some(defs) = self.module_defs(id) else {
             return Vec::new();
         };
         let is_linked = linked.contains(&id);
         defs.iter()
-            .map(|(name, params, body)| {
+            .filter_map(|(name, params, body)| {
                 let spelled = match alias {
                     Some(ns) => format!("{ns}::{name}"),
                     None => name.clone(),
                 };
-                if is_linked && wanted.contains(&spelled) {
-                    let target = jq::ModuleRun::link_name(id, name);
-                    wanted.insert(target.clone());
-                    forwarding_stub(spelled, params, target)
+                if !is_linked {
+                    Some((spelled, params.clone(), body.clone()))
+                } else if wanted.contains(&spelled) {
+                    // `top_level_wanted` already put the link name in
+                    // `wanted`, so the link run keeps the body.
+                    Some(forwarding_stub(
+                        spelled,
+                        params,
+                        jq::ModuleRun::link_name(id, name),
+                    ))
                 } else {
-                    (spelled, params.clone(), body.clone())
+                    None
                 }
             })
             .collect()
+    }
+
+    /// Module `id`'s loaded defs. `run_origin` and `loaded_modules` are both
+    /// keyed by the same canonical file (#2955), so `id`'s origin is directly
+    /// a `loaded_modules` key -- no separate `id -> loaded_modules key` map is
+    /// needed once both agree on canonicalization.
+    fn module_defs(&self, id: u32) -> Option<&FuncDefList> {
+        self.run_origin(id).and_then(|k| self.loaded_modules.get(k))
     }
 
     /// Every name reached from the main filter through the top-level runs,
@@ -1403,44 +1411,70 @@ impl ModuleLoader {
     /// retry rule fixed in one almost certainly needs the same fix in the
     /// other.
     ///
+    /// A reached def of a module in `linked` contributes its link name
+    /// instead of its body's calls (#3153): its top-level entry is a
+    /// forwarding stub into the link run, so the body -- and what it calls,
+    /// siblings and dependencies alike -- is reached from there, by
+    /// [`Self::link_dependency_runs`]' own fixed point. Expanding it here as
+    /// well would mark siblings only the link run can reach, and give each a
+    /// top-level stub nothing calls.
+    ///
     /// At the fixed point an entry is reached exactly when its spelling is in
     /// the returned set, which is what [`Self::top_run_defs`] reads.
-    fn top_level_wanted(&self, program: &Program) -> BTreeSet<String> {
+    fn top_level_wanted(
+        &self,
+        program: &Program,
+        include_runs: &[u32],
+        import_runs: &[(u32, &str)],
+        linked: &BTreeSet<u32>,
+    ) -> BTreeSet<String> {
+        struct Entry<'a> {
+            spelled: String,
+            body: &'a Expr,
+            alias: Option<&'a str>,
+            // The link name to forward to, for a def of a linked module.
+            link: Option<String>,
+            kept: bool,
+        }
         let mut wanted: BTreeSet<String> = called_func_names(&program.expr);
-        let mut top: Vec<(String, &Expr, Option<&str>, bool)> = Vec::new();
-        for include in &program.includes {
-            // `loaded_modules` is keyed canonically (#2955); `include.path` is
-            // the literal spelling as written, so it has to go through
-            // `run_key` the same way `ensure_module_loaded` does, or a
-            // spelling that differs from whichever one populated the cache
-            // would miss here even though the module is loaded.
-            if let Some(defs) = self.loaded_modules.get(&self.run_key(&include.path)) {
-                top.extend(defs.iter().map(|(n, _, b)| (n.clone(), b, None, false)));
-            }
+        let mut top: Vec<Entry> = Vec::new();
+        let runs = include_runs
+            .iter()
+            .map(|&id| (id, None))
+            .chain(import_runs.iter().map(|&(id, ns)| (id, Some(ns))));
+        for (id, alias) in runs {
+            let Some(defs) = self.module_defs(id) else {
+                continue;
+            };
+            let is_linked = linked.contains(&id);
+            top.extend(defs.iter().map(|(n, _, b)| Entry {
+                spelled: alias.map_or_else(|| n.clone(), |ns| format!("{ns}::{n}")),
+                body: b,
+                alias,
+                link: is_linked.then(|| jq::ModuleRun::link_name(id, n)),
+                kept: false,
+            }));
         }
-        for import in program.imports.iter().filter(|i| !i.data) {
-            if let Some(defs) = self.loaded_modules.get(&self.run_key(&import.path)) {
-                let ns = import.alias.as_str();
-                top.extend(
-                    defs.iter()
-                        .map(|(n, _, b)| (format!("{ns}::{n}"), b, Some(ns), false)),
-                );
-            }
-        }
-        top.extend(
-            self.auto_loaded_defs
-                .iter()
-                .map(|(n, _, b)| (n.clone(), b, None, false)),
-        );
+        top.extend(self.auto_loaded_defs.iter().map(|(n, _, b)| Entry {
+            spelled: n.clone(),
+            body: b,
+            alias: None,
+            link: None,
+            kept: false,
+        }));
         grow_to_fixed_point(top.len(), |i| {
-            let (name, body, alias, kept) = &mut top[i];
-            if *kept || !wanted.contains(name.as_str()) {
+            let entry = &mut top[i];
+            if entry.kept || !wanted.contains(entry.spelled.as_str()) {
                 return false;
             }
-            *kept = true;
+            entry.kept = true;
             let before = wanted.len();
-            for called in called_func_names(body) {
-                if let Some(alias) = alias {
+            if let Some(link) = &entry.link {
+                wanted.insert(link.clone());
+                return wanted.len() != before;
+            }
+            for called in called_func_names(entry.body) {
+                if let Some(alias) = entry.alias {
                     if !called.contains("::") {
                         wanted.insert(format!("{alias}::{called}"));
                     }
@@ -1501,11 +1535,7 @@ impl ModuleLoader {
         mut expr: Expr,
     ) -> Expr {
         for &id in order.iter().rev() {
-            // `run_origin` and `loaded_modules` are both keyed by the same
-            // canonical file (#2955), so `id`'s origin is directly a
-            // `loaded_modules` key -- no separate `id -> loaded_modules key`
-            // map is needed once both agree on canonicalization.
-            let Some(defs) = self.run_origin(id).and_then(|k| self.loaded_modules.get(k)) else {
+            let Some(defs) = self.module_defs(id) else {
                 continue;
             };
 
@@ -8979,7 +9009,7 @@ mod tests {
     /// cannot be resolved still gets one.
     ///
     /// The unresolvable arm is not reachable through the CLI -- every caller
-    /// runs after a successful `load_module` -- but it is not dead either:
+    /// runs after a successful `ensure_module_loaded` -- but it is not dead either:
     /// it is what keeps `run_id_for` total, and a run id is only ever a
     /// diagnostic key, never a correctness one (`scan_scope` pairs a begin
     /// marker with an end by nesting, not by id). Unit-tested rather than
@@ -9108,7 +9138,9 @@ mod tests {
     mod top_level_and_linked_module_is_emitted_once_3153 {
         use super::*;
 
-        fn marker_calls(filter: &str) -> usize {
+        /// The processed program for `filter`, with `shared` and its
+        /// dependent `consumer` on the search path.
+        fn process(filter: &str) -> Expr {
             let dir = tempfile::tempdir().expect("tempdir");
             std::fs::write(
                 dir.path().join("shared.jq"),
@@ -9123,15 +9155,24 @@ mod tests {
             let mut loader = ModuleLoader::new(&[dir.path().to_path_buf()]);
             let program = jq::parse_program(filter).expect("parse");
             loader.unqualified_def_names(&program).expect("names");
-            let expr = loader.process_program(&program).expect("process");
+            loader.process_program(&program).expect("process")
+        }
+
+        /// How many nodes of `expr` match `pred`.
+        fn count(expr: &Expr, pred: impl Fn(&Expr) -> bool) -> usize {
             let mut n = 0usize;
-            succinctly::jq::walk::any_subexpr(&expr, &mut |node| {
-                if matches!(node, Expr::FuncCall { name, .. } if name == "marker_3153") {
-                    n += 1;
-                }
+            succinctly::jq::walk::any_subexpr(expr, &mut |node| {
+                n += usize::from(pred(node));
                 false
             });
             n
+        }
+
+        fn marker_calls(filter: &str) -> usize {
+            count(
+                &process(filter),
+                |node| matches!(node, Expr::FuncCall { name, .. } if name == "marker_3153"),
+            )
         }
 
         #[test]
@@ -9140,8 +9181,40 @@ mod tests {
                 r#"include "shared"; include "consumer"; [helper, use_helper]"#,
                 r#"include "consumer"; include "shared"; [helper, use_helper]"#,
                 r#"import "shared" as s; include "consumer"; [s::helper, use_helper]"#,
+                // Review of #3153: the dependent reaches `helper` under a
+                // spelling the top-level run does not use, so the top-level
+                // entry is unreached -- and still a second copy until it was
+                // dropped.
+                r#"import "shared" as s; include "consumer"; use_helper"#,
+                r#"include "shared"; include "consumer"; use_helper"#,
+                r#"include "shared"; import "consumer" as c; c::use_helper"#,
             ] {
                 assert_eq!(marker_calls(filter), 1, "{filter}");
+            }
+        }
+
+        /// Review of #3153: `marker_3153` is called only from `helper`'s
+        /// body, which lives in the link run, so the top-level run carries
+        /// nothing for `marker_3153` (only `helper` gets a stub there).
+        #[test]
+        fn a_sibling_reached_only_through_a_stub_gets_no_stub() {
+            for filter in [
+                r#"include "shared"; include "consumer"; [helper, use_helper]"#,
+                r#"import "shared" as s; include "consumer"; [s::helper, use_helper]"#,
+            ] {
+                let expr = process(filter);
+                let top_level_defs = |spelled: &str| {
+                    count(
+                        &expr,
+                        |node| matches!(node, Expr::FuncDef { name, .. } if name == spelled),
+                    )
+                };
+                let ns = if filter.starts_with("import") {
+                    "s::"
+                } else {
+                    ""
+                };
+                assert_eq!(top_level_defs(&format!("{ns}marker_3153")), 0, "{filter}");
             }
         }
 
@@ -9186,8 +9259,8 @@ mod tests {
             .expect("write s2");
 
             let mut loader = ModuleLoader::new(&[dir.path().to_path_buf()]);
-            loader.load_module("s1").expect("load s1");
-            loader.load_module("s2").expect("load s2");
+            loader.ensure_module_loaded("s1").expect("load s1");
+            loader.ensure_module_loaded("s2").expect("load s2");
 
             assert_eq!(
                 loader.loaded_modules.len(),

@@ -8235,10 +8235,19 @@ body errors could then be reported from either copy. With `other` = `def z: also
 `serr` = `def bad: nope; def ok: 1; def bad2: nope2;` and `cerr` = `include "serr"; def u: ok;
 def ub: bad;`, `include "other"; include "serr"; include "cerr"; [z, ub, bad2]` printed
 `other`'s error *between* `serr`'s two, where jq prints both of `serr`'s first. The
-top-level run of such a module now holds forwarding stubs into the linked run
-(`ModuleLoader::top_run_defs`), so each body exists and is checked once. That row matches
-jq, pinned in `test_top_level_module_that_is_also_linked_errors_3153`, and
+top-level run of such a module now holds forwarding stubs into the linked run for the defs
+the filter reaches under the top-level spelling, and nothing for the rest
+(`ModuleLoader::top_run_defs`), so each body exists and is checked once. Dropping an
+unreached entry matters when the dependent reaches the module under another spelling than
+the top-level directive (`import "m" as q; include "c"` with `c` = `include "m"`): nothing
+calls `q::…`, but the linked run carries every body `c` reaches. That row matches jq,
+pinned in `test_top_level_module_that_is_also_linked_errors_3153`, and
 `top_level_and_linked_module_is_emitted_once_3153` counts the copies.
+
+This does not make module error *order* match jq in general. A linked module's errors are
+still reported before every top-level module's, where jq interleaves them by its own
+binding order. That divergence predates this change and is tracked as
+[#3313](https://github.com/rust-works/succinctly/issues/3313).
 
 The stubs point *into* the linked run, not the other way round, because that run is wrapped
 outermost and so is visible from every stub whatever order the directives are declared in.
