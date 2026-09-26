@@ -162,6 +162,18 @@ pub(crate) enum ModuleLoadError {
     /// failure now has its own [`Self::Parse`] variant; this is the residue
     /// of the pre-#2703 opaque `anyhow::Error`.
     Other(anyhow::Error),
+    /// A **data** import's file (`import "f" as $d;`, resolving to
+    /// `{path}.json`) exists -- [`Self::NotFound`] is what covers a missing
+    /// one -- but could not be read or parsed as JSON (#2956).
+    ///
+    /// **Wording is succinctly's own** past the `error loading data file
+    /// {path}:` prefix, the same fidelity limit [`Self::Parse`] already
+    /// documents: jq's own message text comes from its C JSON parser
+    /// (confirmed live: `Invalid numeric literal at line 1, column 4` for
+    /// `not json`), which this crate's own reader cannot reproduce
+    /// byte-for-byte. `path` is the resolved file, matching `Self::Parse`'s
+    /// own by-path naming.
+    DataFile { path: PathBuf, detail: String },
 }
 
 /// Report a single compile-time syntax error in jq 1.7.1's report shape
@@ -282,6 +294,11 @@ fn report_module_load_error(e: &ModuleLoadError) {
         ModuleLoadError::Other(inner) => {
             eprintln!("jq: module error: {inner}");
         }
+        ModuleLoadError::DataFile { path, detail } => {
+            eprintln!("jq: error loading data file {}: {detail}", path.display());
+            eprintln!();
+            eprintln!("jq: 1 compile error");
+        }
     }
 }
 
@@ -376,18 +393,89 @@ fn resolve_module_in(search_path: &[PathBuf], module_path: &str) -> Option<PathB
     None
 }
 
-/// Whether a **data** import's file (`{module_path}.json`) exists anywhere on
-/// the search path (#2865).
+/// Resolve a **data** import's path (`{module_path}.json`) against the
+/// search path (#2865), mirroring [`resolve_module_in`]'s own first-match
+/// search but for the `.json` suffix a data import reads instead of the
+/// unconditional `.jq` one (#2702) a module import does.
 ///
-/// `.json`, not `.jq`: a data import reads a JSON file, and the unconditional
-/// `.jq` suffix rule (#2702) is a module-import rule. Confirmed live against
-/// jq 1.7.1, which resolves `import "data" as $d;` to `data.json` and reports
-/// `module not found: data` when there is none.
-fn data_file_exists(search_path: &[PathBuf], module_path: &str) -> bool {
+/// Confirmed live against jq 1.7.1, which resolves `import "data" as $d;`
+/// to `data.json` and reports `module not found: data` when there is none.
+fn resolve_data_file_in(search_path: &[PathBuf], module_path: &str) -> Option<PathBuf> {
     let data_file = format!("{module_path}.json");
-    search_path
-        .iter()
-        .any(|base| base.join(&data_file).is_file())
+    for base in search_path {
+        let full_path = base.join(&data_file);
+        if full_path.is_file() {
+            return Some(full_path);
+        }
+    }
+    None
+}
+
+/// Load one **data** import's binding value (#2956): resolve `{path}.json`
+/// on the search path, read it, and parse it exactly as `--slurpfile` parses
+/// its own file -- a whitespace/self-delineated *stream* of JSON values,
+/// wrapped in one array (`parse_json_stream` plus `OwnedValue::array_from`,
+/// the same pair [`build_context`]'s own `--slurpfile` arm uses). Confirmed
+/// live against jq 1.7.1: a data file holding more than one top-level value
+/// wraps all of them (`{"z":9}\n{"y":1}` imports as `[{"z":9},{"y":1}]`), and
+/// a file holding a single array value still wraps it once more
+/// (`[1,2,3]` imports as `[[1,2,3]]`) -- the array is always the *stream*
+/// wrapper, never unwrapped even when the lone value is itself an array.
+///
+/// Distinguishes [`ModuleLoadError::NotFound`] (no such file -- reported
+/// identically to a missing module import) from
+/// [`ModuleLoadError::DataFile`] (the file exists but a read or parse
+/// failed), matching jq's own two-way split confirmed live: `module not
+/// found: nope` for the former, `error loading data file <path>: <detail>`
+/// for the latter.
+fn load_data_import(
+    search_path: &[PathBuf],
+    module_path: &str,
+) -> Result<OwnedValue, ModuleLoadError> {
+    let Some(path) = resolve_data_file_in(search_path, module_path) else {
+        return Err(ModuleLoadError::NotFound {
+            module_path: module_path.to_string(),
+        });
+    };
+    let contents = std::fs::read_to_string(&path).map_err(|e| ModuleLoadError::DataFile {
+        path: canonical_or_self(&path),
+        detail: strerror_only(&e),
+    })?;
+    let values = parse_json_stream(&contents).map_err(|e| ModuleLoadError::DataFile {
+        path: canonical_or_self(&path),
+        detail: format!("{e:#}"),
+    })?;
+    Ok(OwnedValue::array_from(values))
+}
+
+/// Fold a list of `(name, value)` bindings so a repeated name keeps only its
+/// *last* occurrence, in source order (#2956) -- the same rule a repeated
+/// `--arg`/`--argjson` name already follows in [`build_context`], and
+/// confirmed live for data imports too: `import "a" as $d; import "b" as
+/// $d; $d` binds `$d` to `b`'s contents, not `a`'s.
+///
+/// Exists because [`jq::substitute_vars`] cannot apply this rule itself: one
+/// call for one name replaces every unshadowed `Expr::Var` of that name with
+/// a literal, so a *second* call for the same name has nothing left to find
+/// -- calling it once per binding in source order would let the first
+/// (wrong) value win instead of the last, not the reverse.
+fn dedup_bindings_last_wins(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
+    let mut map = BTreeMap::new();
+    for (name, value) in bindings {
+        map.insert(name, value);
+    }
+    map.into_iter().collect()
+}
+
+/// Adapt an owned `(name, value)` list into the `(&str, &OwnedValue)` pairs
+/// [`jq::substitute_vars`] takes -- the library crate's own `as_var_refs`
+/// (`src/jq/eval.rs`) does the identical one-line projection, but is
+/// `pub(crate)` to that crate and so unreachable from this binary crate;
+/// this is the local twin [`ModuleLoader::load_and_bind_module`] and
+/// [`ModuleLoader::process_program`] both call rather than each writing the
+/// same closure inline.
+fn as_var_refs(bindings: &[(String, OwnedValue)]) -> impl Iterator<Item = (&str, &OwnedValue)> {
+    bindings.iter().map(|(n, v)| (n.as_str(), v))
 }
 
 /// Merge one directive's load failure into a "last failing directive"
@@ -921,14 +1009,27 @@ impl ModuleLoader {
         self.loading.push((canonical, module_path.to_string()));
         let deps = self.module_dep_defs(&program, own_id);
         self.loading.pop();
-        let deps = deps?;
+        let (deps, data_bindings) = deps?;
+        // Last alias wins (confirmed live, same rule a repeated `--arg`/
+        // `--argjson` name already follows): fold before substituting, not
+        // once per binding, since a name `substitute_vars` has already
+        // replaced has no `Expr::Var` left for a later call targeting the
+        // same name to find (#2956).
+        let data_bindings = dedup_bindings_last_wins(data_bindings);
 
-        // Each def wrapped in stubs for the dependencies it names. The
-        // module's own defs are left to the chain it is exported into -- see
+        // Each def wrapped in stubs for the dependencies it names, and in
+        // this module's own data-import bindings (#2956) -- scoped here,
+        // per module, rather than globally: confirmed live against jq 1.7.1
+        // that a module's own `import "f" as $d;` binds `$d` only inside
+        // that module's own defs, never inside an includer's unrelated
+        // scope (an includer's *own* `$d`, from its own import or
+        // `--arg`/`--argjson`, is untouched by a module's). The module's own
+        // defs are left to the chain it is exported into -- see
         // [`dep_stubs_for`] for why nesting them here is unsound.
         Ok(own
             .into_iter()
             .map(|(name, params, body)| {
+                let body = jq::substitute_vars(&body, as_var_refs(&data_bindings));
                 // Groups keep declaration order, and each is wrapped in turn
                 // so the last-declared ends up innermost, exactly as the flat
                 // `wrap_defs` did before the grouping: `include "pa";
@@ -967,8 +1068,13 @@ impl ModuleLoader {
         &mut self,
         program: &Program,
         own_id: u32,
-    ) -> Result<DepGroups, ModuleLoadError> {
+    ) -> Result<(DepGroups, Vec<(String, OwnedValue)>), ModuleLoadError> {
         let mut defs: DepGroups = Vec::new();
+        // A module's own data imports, in source order -- see
+        // [`Self::load_and_bind_module`]'s own doc comment for how these end
+        // up bound only within *this* module's def bodies, confirmed live
+        // against jq 1.7.1 not to leak into an includer's own scope (#2956).
+        let mut data_bindings: Vec<(String, OwnedValue)> = Vec::new();
 
         for include in &program.includes {
             let id = self.run_id_for(&include.path);
@@ -985,26 +1091,15 @@ impl ModuleLoader {
         //
         // A *data* import (`import "f" as $d;`, which binds a `$`-variable to
         // the file's parsed JSON rather than a namespace of defs) contributes
-        // no defs, and resolving one as a module reports `module not found`
-        // where jq reads `<path>.json`. Before #2865 a module's own imports
-        // were never looked at, so declaring one was harmless; processing them
-        // transitively made it fatal. `Import::data` (#2865) is what separates
-        // the two -- skipping on *resolvability* instead would have silently
-        // swallowed a genuinely missing module, which jq reports and exits 3
-        // for. Data imports themselves remain unimplemented (#2956).
+        // no defs -- it is recorded in `data_bindings` above instead, for
+        // `load_and_bind_module` to bind into this module's own def bodies
+        // (#2956).
         for import in &program.imports {
             if import.data {
-                // A data import contributes no defs, but jq still *resolves*
-                // it: with no `nodatafile.json` anywhere on the search path,
-                // `import "nodatafile" as $d;` reports `module not found:
-                // nodatafile` and exits 3, exactly as a missing module does.
-                // Check the same thing so a typo is not silently swallowed,
-                // without implementing the binding itself (#2956).
-                if !data_file_exists(&self.search_path, &import.path) {
-                    return Err(ModuleLoadError::NotFound {
-                        module_path: import.path.clone(),
-                    });
-                }
+                data_bindings.push((
+                    import.alias.clone(),
+                    load_data_import(&self.search_path, &import.path)?,
+                ));
                 continue;
             }
             let id = self.run_id_for(&import.path);
@@ -1012,7 +1107,7 @@ impl ModuleLoader {
             defs.push((id, Some(import.alias.clone()), sigs));
         }
 
-        Ok(defs)
+        Ok((defs, data_bindings))
     }
 
     /// Load `module_path` as a dependency of the module with run id `own_id`
@@ -1154,7 +1249,7 @@ impl ModuleLoader {
             // Same data-import split the real loading path uses (#2865):
             // a data import reads `{path}.json`, not `{path}.jq`.
             if import.data {
-                if !data_file_exists(&self.search_path, &import.path) {
+                if resolve_data_file_in(&self.search_path, &import.path).is_none() {
                     keep_last_decl_failure(
                         &mut last_err,
                         import.decl_index,
@@ -1204,6 +1299,13 @@ impl ModuleLoader {
         // is not listed.
         let mut include_runs: Vec<u32> = Vec::new();
         let mut import_runs: Vec<(u32, &str)> = Vec::new();
+        // Top-level data imports' bindings (#2956), in source order --
+        // folded with `dedup_bindings_last_wins` and substituted into `expr`
+        // below, *before* any wrap (see that call site's own comment for
+        // why the order relative to wrapping matters, and `run_jq`'s own
+        // `substitute_vars` call for why the order relative to
+        // `--arg`/`--argjson` does too).
+        let mut data_bindings: Vec<(String, OwnedValue)> = Vec::new();
 
         // #2682: each `expr = FuncDef { .., then: expr }` wraps the *previous*
         // `expr` one layer further in, so whichever source is processed
@@ -1236,20 +1338,19 @@ impl ModuleLoader {
 
         // Process imports (definitions available under namespace::)
         for import in &program.imports {
-            // The same data-import handling the module path uses (#2865), so
-            // the two agree: a data import binds a `$`-variable rather than a
-            // namespace of defs, so it contributes nothing here, but jq still
-            // resolves its `<path>.json` and reports `module not found` when
-            // there is none. Binding the variable itself is #2956.
+            // A data import binds a `$`-variable rather than a namespace of
+            // defs, so it contributes nothing to `top_ids`/`import_runs` --
+            // its binding is recorded in `data_bindings` above instead, for
+            // substitution into `expr` once every other wrap below is done
+            // (#2956). A load failure (missing file, unreadable, bad JSON)
+            // joins the same "last failing directive wins" merge every other
+            // directive's failure already goes through (#2857): jq's own
+            // resolution order has no notion of failure *kind*, only source
+            // position.
             if import.data {
-                if !data_file_exists(&self.search_path, &import.path) {
-                    keep_last_decl_failure(
-                        &mut last_err,
-                        import.decl_index,
-                        ModuleLoadError::NotFound {
-                            module_path: import.path.clone(),
-                        },
-                    );
+                match load_data_import(&self.search_path, &import.path) {
+                    Ok(value) => data_bindings.push((import.alias.clone(), value)),
+                    Err(e) => keep_last_decl_failure(&mut last_err, import.decl_index, e),
                 }
                 continue;
             }
@@ -1264,6 +1365,26 @@ impl ModuleLoader {
 
         if let Some((_, e)) = last_err {
             return Err(e);
+        }
+
+        // Top-level data imports' bindings (#2956), substituted into the
+        // main filter's own expression *before* any `wrap_run`/`wrap_defs`
+        // call adds a module's own body around it -- everything below this
+        // wraps `expr` in outer layers, never revisits what is already
+        // inside it, so substituting here rather than after is what keeps
+        // this scoped to the main filter alone. Confirmed live against jq
+        // 1.7.1 that this must NOT reach an included module's own def body:
+        // unlike `--arg`/`--argjson` (substituted in `run_jq`, globally,
+        // and confirmed live to reach every included module's own defs too),
+        // a top-level `import "f" as $d;` does not -- `import "data" as $d;
+        // include "usesd"; f` with `usesd.jq` = `def f: $d;` is `$d is not
+        // defined`, not the top level's value. Run before `run_jq`'s own
+        // `substitute_vars` call for `--arg`/`--argjson` regardless -- see
+        // `data_bindings`'s own doc comment above for why that order matters
+        // too.
+        if !data_bindings.is_empty() {
+            let data_bindings = dedup_bindings_last_wins(data_bindings);
+            expr = jq::substitute_vars(&expr, as_var_refs(&data_bindings));
         }
 
         // Every module some module depends on, outermost first, and every

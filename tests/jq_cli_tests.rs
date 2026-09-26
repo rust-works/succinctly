@@ -28865,8 +28865,10 @@ fn test_excluded_sibling_name_stays_excluded_for_other_siblings_2865() -> Result
 /// `<path>.json`: with the file present `import "dat" as $d; 1` answers `1`,
 /// and with it missing jq reports `module not found: dat` and exits 3. Before
 /// this, the top level reported `module not found` either way, which would
-/// have left it disagreeing with the identical line inside a module. Binding
-/// the variable itself is #2956.
+/// have left it disagreeing with the identical line inside a module. The
+/// filters here don't reference `$d`, so this still passes unchanged now
+/// that the binding itself is implemented (#2956) --
+/// [`test_top_level_data_import_binds_the_variable_2956`] covers that.
 #[test]
 fn test_top_level_data_import_resolves_but_contributes_no_defs_2865() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
@@ -28952,8 +28954,9 @@ fn test_dependency_reached_only_from_a_pattern_key_survives_2865() -> Result<()>
 /// cannot tell it from a module import, and resolving one as a module fails
 /// with `module not found`. Before #2865 a module's own imports were never
 /// looked at, so declaring one was harmless; processing them transitively made
-/// it fatal. Data imports themselves remain unimplemented (#2956); this only
-/// pins that declaring one does not break the module around it.
+/// it fatal. This pins that declaring one does not break the module around
+/// it; [`test_module_own_data_import_binds_only_inside_its_own_defs_2956`]
+/// covers the binding itself (#2956).
 #[test]
 fn test_module_declaring_a_data_import_still_loads_2865() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
@@ -29053,6 +29056,203 @@ fn test_module_declaring_a_data_import_still_loads_2865() -> Result<()> {
         stderr.contains("module not found: nosuchmod"),
         "stderr: {stderr:?}"
     );
+
+    Ok(())
+}
+
+/// #2956: a top-level `import "f" as $d;` binds `$d` to the file's parsed
+/// JSON, wrapped in one array exactly as `--slurpfile` wraps its own file --
+/// confirmed live against jq 1.7.1 for every row here, including the
+/// doubly-wrapped case (`arr.json` holding `[1,2,3]` imports as `[[1,2,3]]`,
+/// not `[1,2,3]`: the array is the *stream* wrapper around the file's one
+/// top-level value, not something jq unwraps because that value happens to
+/// already be an array).
+#[test]
+fn test_top_level_data_import_binds_the_variable_2956() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("one.json"), "{\"z\":9}\n")?;
+    std::fs::write(temp_dir.path().join("multi.json"), "{\"z\":9}\n{\"y\":1}\n")?;
+    std::fs::write(temp_dir.path().join("arr.json"), "[1,2,3]\n")?;
+    std::fs::write(temp_dir.path().join("bad.json"), "not json\n")?;
+    std::fs::write(temp_dir.path().join("other.json"), "{\"other\":1}\n")?;
+
+    let run = |args: &[&str]| {
+        let temp_path = temp_dir.path().to_path_buf();
+        let owned: Vec<String> = args.iter().map(|&s| s.to_string()).collect();
+        spawn_with_signal_retry(
+            move || {
+                let mut command = Command::new(succinctly_bin());
+                command.args(["jq", "-L"]).arg(&temp_path).args(&owned);
+                command
+            },
+            None,
+        )
+    };
+
+    #[allow(clippy::literal_string_with_formatting_args)]
+    let cases = [
+        (r#"import "one" as $d; $d"#, r#"[{"z":9}]"#),
+        (r#"import "multi" as $d; $d"#, r#"[{"z":9},{"y":1}]"#),
+        (r#"import "arr" as $d; $d"#, "[[1,2,3]]"),
+        // Metadata on the directive is parsed but does not affect the
+        // binding (confirmed live).
+        (r#"import "one" as $d {foo:1}; $d"#, r#"[{"z":9}]"#),
+        // A later import of the same alias shadows an earlier one --
+        // confirmed live, the same rule a repeated `--arg`/`--argjson` name
+        // already follows.
+        (
+            r#"import "one" as $d; import "other" as $d; $d"#,
+            r#"[{"other":1}]"#,
+        ),
+    ];
+    for (filter, want) in cases {
+        let (output, code) = run(&["-nc", filter])?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+
+    // An import wins over a same-named `--arg` entirely, not a merge --
+    // confirmed live: the CLI value never appears once the import binds it.
+    let (output, code) = run(&["-nc", "--arg", "d", "cliarg", r#"import "one" as $d; $d"#])?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"[{"z":9}]"#);
+
+    // A data file that exists but fails to parse as JSON is a distinct
+    // failure kind from a missing one: `error loading data file <path>:
+    // <detail>`, exit 3, not `module not found`.
+    let (output, code) = run(&["-nc", r#"import "bad" as $d; $d"#])?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("error loading data file")
+            && stderr.contains("bad.json")
+            && stderr.contains("jq: 1 compile error"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #2956: a data file that exists but cannot be *read* (as opposed to one
+/// that reads fine but fails to parse, covered above) hits `DataFile`'s
+/// other producer, `std::fs::read_to_string`'s own error mapped through
+/// `strerror_only`. Root can read a file with no permission bits at all, so
+/// this only means something on a non-root CI runner -- the same
+/// `#[cfg(unix)]` gating this file already uses for its other
+/// permission/ownership-sensitive tests, `PermissionsExt` being Unix-only.
+#[test]
+#[cfg(unix)]
+fn test_top_level_data_import_unreadable_file_reports_data_file_error_2956() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir()?;
+    let unreadable = temp_dir.path().join("unreadable.json");
+    std::fs::write(&unreadable, "{\"z\":9}\n")?;
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))?;
+
+    // Root can read a file with no permission bits at all -- if this
+    // process still can too, the chmod above enforces nothing here, so skip
+    // rather than assert on an exit code the failure path never produces.
+    let root_bypasses_permissions = std::fs::read_to_string(&unreadable).is_ok();
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"import "unreadable" as $d; $d"#]);
+            command
+        },
+        None,
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+
+    // Restore permissions before any `?` above could otherwise leave the
+    // temp dir's own cleanup to fail removing it -- not reached today since
+    // nothing above can error after the chmod, but kept in the same spot a
+    // future edit that adds one would need it.
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))?;
+
+    if root_bypasses_permissions {
+        return Ok(());
+    }
+
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("error loading data file")
+            && stderr.contains("unreadable.json")
+            && stderr.contains("jq: 1 compile error"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #2956: a module's own `import "f" as $d;` binds `$d` only inside that
+/// module's own def bodies -- confirmed live against jq 1.7.1 not to leak
+/// into an includer's unrelated scope, in either direction: an includer
+/// calling into the module sees the module's own binding, but the
+/// includer's *own* `$d` (from its own import, or `--arg`/`--argjson`) is
+/// untouched by it, and an unrelated included module that never declared
+/// its own `$d` import still can't see the top level's.
+#[test]
+fn test_module_own_data_import_binds_only_inside_its_own_defs_2956() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("data.json"), "{\"z\":9}\n")?;
+    std::fs::write(temp_dir.path().join("topdata.json"), "{\"top\":true}\n")?;
+    std::fs::write(
+        temp_dir.path().join("m.jq"),
+        "import \"data\" as $d;\ndef f: $d;\n",
+    )?;
+    std::fs::write(temp_dir.path().join("usesd.jq"), "def f: $d;\n")?;
+
+    let run = |args: &[&str]| {
+        let temp_path = temp_dir.path().to_path_buf();
+        let owned: Vec<String> = args.iter().map(|&s| s.to_string()).collect();
+        spawn_with_signal_retry(
+            move || {
+                let mut command = Command::new(succinctly_bin());
+                command.args(["jq", "-L"]).arg(&temp_path).args(&owned);
+                command
+            },
+            None,
+        )
+    };
+
+    // The module's own `f` sees its own `$d`.
+    let (output, code) = run(&["-nc", r#"include "m"; f"#])?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"[{"z":9}]"#);
+
+    // A top-level `--arg d` does not leak into the module's own `$d`.
+    let (output, code) = run(&["-nc", "--arg", "d", "cliarg", r#"include "m"; f"#])?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"[{"z":9}]"#);
+
+    // The top level's own, *different* data import is independent of the
+    // module's: both resolve to their own file.
+    let (output, code) = run(&["-nc", r#"import "topdata" as $d; include "m"; [f, $d]"#])?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"[[{"z":9}],[{"top":true}]]"#);
+
+    // An unrelated included module that never imported its own `$d` still
+    // can't see the top level's -- a data import is not a namespace, so
+    // there is no chain for it to leak through.
+    let (output, code) = run(&["-nc", r#"import "data" as $d; include "usesd"; f"#])?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(stderr.contains("$d is not defined"), "stderr: {stderr:?}");
 
     Ok(())
 }
