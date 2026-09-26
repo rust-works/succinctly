@@ -63885,16 +63885,6 @@ fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
             r". as $x | [.] | [limit(1; path(.[] | $x))]",
             "`path()` under an array constructor and `limit` still bridges (jq `[[0]]`)",
         ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | del(.[0] | $x)",
-            "the `del` resolver still crosses the bridge (jq `[]`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | (.[0] | $x) = 5",
-            "the assignment resolver still crosses the bridge (jq `[5]`)",
-        ),
         // The door opens only for the head of the pipe the owned re-entry
         // is handed: a `path()` that is a bind's source, a binary operand,
         // or the body of `first`/`label` is in no such position (#3189).
@@ -63980,6 +63970,94 @@ fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
         ("", 0),
         "#3177 residual: stderr={stderr:?}"
     );
+    Ok(())
+}
+
+/// #3188: a write whose target navigates to an embed of `$x` over an owned
+/// root resolves that target over the caller's own tree, as `path(f)` does
+/// since #3177, so `del`, `=`, `|=`, `op=` and `//=` answer where jq does.
+/// Every expected output captured live against jq 1.7.1 on `{"a":1}`.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_owned_embed_write_target_3188() -> Result<()> {
+    for (filter, expected) in [
+        (r". as $x | [.] | del(.[0] | $x)", "[]"),
+        (r". as $x | [.] | (.[0] | $x) = 5", "[5]"),
+        (r". as $x | [.] | (.[0] | $x) |= 5", "[5]"),
+        (r". as $x | [.] | (.[0] | $x) |= empty", "[]"),
+        (r". as $x | [[.]] | (.[0][0] | $x).a += 1", r#"[[{"a":2}]]"#),
+        (r". as $x | [.] | (.[0] | $x | .a) //= 3", r#"[{"a":1}]"#),
+        (r". as $x | {k:.} | del(.k | $x)", "{}"),
+        (r". as $x | [.,.] | del(.[] | $x)", "[]"),
+        (r". as $x | [.,.] | del(.[1] | $x)", r#"[{"a":1}]"#),
+        (r". as $x | [.,.,.] | del(.[0,1] | $x)", r#"[{"a":1}]"#),
+        (r". as $x | [.] | del(.[0]? | $x)", "[]"),
+        (r". as $x | [.] | . | del(.[0] | $x)", "[]"),
+        (r". as $x | [.] | (.[0] | $x) = (1,2)", "[1]\n[2]"),
+        (r". as $x | [.] | (.[0] | $x | .a) = 5 | .[0]", r#"{"a":5}"#),
+        (r". as $x | [.] | map((. | $x) = 1)", "[1]"),
+        (r". as $x | 5 | del(.[0]? | $x)", "5"),
+        (r". as $x | [] | del(.[] | $x)", "[]"),
+        // Zero paths: the target becomes `empty`, a no-op write.
+        (r". as $x | [.] | del(.[0] | $x | .[0]?)", r#"[{"a":1}]"#),
+        (r". as $x | [.] | (.[0] | $x | .[0]?) |= 5", r#"[{"a":1}]"#),
+        // A computed or integral-float key spells as its integer.
+        (r". as $x | [.,1] | del(.[.[1] - 1] | $x)", "[1]"),
+        (r". as $x | [.,1] | del(.[0.0] | $x)", "[1]"),
+        (r". as $x | [1,.] | (.[-1.0] | $x) |= 5", "[1,5]"),
+        // A tail after the write stage, handed on with the rewritten head.
+        (r". as $x | [.] | (del(.[0] | $x) | length)", "0"),
+        // The target resolves to the root itself: `[]`, spelled `.`.
+        (r". as $x | {k:.} | .k | (. | $x) |= 5", "5"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3188: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    // Storage identity, never value identity: a rebuilt equal element is a
+    // different node, and jq refuses the write (captured live). The door
+    // declines on the refusal, so the bridge raises its own error.
+    for filter in [
+        r#". as $x | [{"a":1}] | del(.[0] | $x)"#,
+        r#". as $x | [{"a":1}] | (.[0] | $x) = 5"#,
+        r#". as $x | [.,{"a":1}] | del(.[] | $x)"#,
+        r#". as $x | [{"a":1}] | del((.[0] | $x)?)"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(
+            code, 5,
+            "#3188: `{filter}` must stay refused (jq refuses it too): \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3188: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    // Components the door will not re-spell, so it declines and the bridge
+    // refuses where jq answers: a slice after the embed (jq `[[2]]`; its
+    // spelling `.[{"start":0,"end":1}]` is #3300), and a fractional index,
+    // which is not the integer it truncates to for `del` (jq
+    // `[{"a":1},1]`; succinctly's own `del(.[-0.5])` deletes element 0,
+    // #3302 -- re-spelling it as `.[0]` was a wrong answer, not a refusal).
+    for (input, filter, residual) in [
+        ("[1,2]", r". as $x | [.] | del(.[0] | $x | .[0:1])", "#3300"),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.,1] | del(.[-0.5] | $x)",
+            "#3302",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3188 residual ({residual}): `{filter}`: stderr={stderr:?}"
+        );
+    }
     Ok(())
 }
 

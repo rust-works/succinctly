@@ -2776,6 +2776,10 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
             None => owned_vec_to_generic_result(values),
         };
     }
+    // #3188: a write's target resolves over `owned` the same way, and the
+    // write goes on with it resolved. See `eval::owned_write_door`.
+    let written = crate::jq::eval::owned_write_door::<S>(expr, &owned, reentry);
+    let expr = written.as_ref().unwrap_or(expr);
     // #2889: `owned` may still *be* a bound node's own value -- see
     // `eval::Reentry::witnessed_by`.
     let reentry = reentry.witnessed_by::<S>(&owned);
