@@ -69,7 +69,7 @@ use super::eval::{
     range_from_literal_override, range_max_exceeded_error, range_num, range_values_f64,
     range_values_int, recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
     resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
-    settles_before_consumer, shared_arg_depth_refusal, slice_component_value,
+    settle_then_replay, settles_before_consumer, shared_arg_depth_refusal, slice_component_value,
     slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
     stop_with_error, stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix,
     streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
@@ -78,7 +78,7 @@ use super::eval::{
     yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
     yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
     EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
-    Reentry, RootWitness, SettledOutputs, SliceTargetKind, YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    Reentry, RootWitness, SliceTargetKind, YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -13181,14 +13181,47 @@ fn binary_fanout_each_generic<V: DocumentValue, S: EvalSemantics>(
     right: &Expr,
     optional: bool,
     rules: BinaryFanoutRules,
+    combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    // #3296: decided once per operator, as in `eval::binary_fanout_each`.
+    if settles_before_consumer(left) && settles_before_consumer(right) {
+        binary_fanout_each_generic_with::<V, S>(
+            settled_operand_strategy_generic(each_operand),
+            left,
+            right,
+            optional,
+            rules,
+            combine,
+            sink,
+        )
+    } else {
+        binary_fanout_each_generic_with::<V, S>(
+            each_operand,
+            left,
+            right,
+            optional,
+            rules,
+            combine,
+            sink,
+        )
+    }
+}
+
+/// [`binary_fanout_each_generic`] once it has chosen its operand strategy.
+fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
+    each_operand: impl Fn(&Expr, &mut dyn Sink<V>) -> Flow,
+    left: &Expr,
+    right: &Expr,
+    optional: bool,
+    rules: BinaryFanoutRules,
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     // #2470: same wrapper, same rule, same `BinaryFanoutRules::read_only`
     // flag as `eval::binary_fanout_each` -- see
     // `eval::read_only_operand_strategy` and `eval::yq_read_only_context`.
-    let each_operand =
-        settled_operand_strategy_generic(read_only_operand_strategy_generic(rules, each_operand));
+    let each_operand = read_only_operand_strategy_generic(rules, each_operand);
     let mut abort: Option<Flow> = None;
     // #2460: how many outputs each operand produced, so a *zero* count is
     // answered from `yq_empty_operand_output` rather than contributing no
@@ -13291,15 +13324,10 @@ fn settled_operand_strategy_generic<V: DocumentValue>(
         if !settles_before_consumer(expr) {
             return each_operand(expr, sink);
         }
-        let mut outputs = SettledOutputs::default();
-        let flow = each_operand(expr, &mut |item| {
-            outputs.push(item);
-            Demand::Continue
-        });
-        match outputs.replay(|item| sink.push(item)) {
-            Demand::Stop => Flow::Stopped { pending: None },
-            Demand::Continue => flow,
-        }
+        settle_then_replay(
+            |collect| each_operand(expr, &mut |item| collect(item)),
+            |item| sink.push(item),
+        )
     }
 }
 
@@ -14269,15 +14297,12 @@ fn settled_each_generic<S: EvalSemantics, V: DocumentValue>(
     if !settles_before_consumer(expr) {
         return eval_each_generic::<S, V>(expr, value, optional, cursor, sink);
     }
-    let mut outputs = SettledOutputs::default();
-    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
-        outputs.push(item);
-        Demand::Continue
-    });
-    match outputs.replay(|item| sink.push(item)) {
-        Demand::Stop => Flow::Stopped { pending: None },
-        Demand::Continue => flow,
-    }
+    settle_then_replay(
+        |collect| {
+            eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| collect(item))
+        },
+        |item| sink.push(item),
+    )
 }
 
 fn fanout_arg_each_generic<S: EvalSemantics, V: DocumentValue, B>(
