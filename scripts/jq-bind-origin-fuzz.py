@@ -336,8 +336,9 @@ FOLD_P = 0.2
 # carries navigations into it; the rebuilt ones (`{"a":1}` literals) are the
 # must-refuse half: a value-equal copy shares no storage, and jq refuses.
 EMBED_WRITE_CONSTRUCTS = [
-    ("[.]", [".[0]", ".[]", ".[0]?", ".[-1]", ".[0,0]"]),
-    ("[.,.]", [".[1]", ".[]", ".[0,1]", ".[1]?"]),
+    ("[.]", [".[0]", ".[]", ".[0]?", ".[-1]", ".[0,0]", ".[0.0]", ".[-0.5]", ".[-(-0)]"]),
+    ("[.,.]", [".[1]", ".[]", ".[0,1]", ".[1]?", ".[1.0]", ".[0.5]", ".[-1.5]", ".[(1,0)]",
+               ".[length - 1]", ".[-0.25]"]),
     ("{k:.}", [".k", ".[\"k\"]", ".[]", ".k?"]),
     ("[[.]]", [".[0][0]", ".[0][]", ".[][]"]),
     ("{k:{j:.}}", [".k.j", ".k[]"]),
@@ -345,7 +346,8 @@ EMBED_WRITE_CONSTRUCTS = [
     ("[.,{\"a\":1}]", [".[]", ".[1]", ".[0]"]),
     ("[{\"a\":1}]", [".[0]", ".[]"]),
 ]
-EMBED_WRITE_TAILS = ["", " | .a?", " | .c?", " | .[0]?", " | .x.a?"]
+# `.[0]?` on an object yields no path at all: the zero-path target.
+EMBED_WRITE_TAILS = ["", " | .a?", " | .c?", " | .[0]?", " | .x.a?", " | .[-0.5]?"]
 EMBED_WRITE_WRAPS = [
     "del(%s)", "(%s) = 9", "(%s) |= 5", "(%s) |= empty", "(%s) //= 3",
     "((%s) = 9) | length", "del(%s) | .[0]?", ". | del(%s)",

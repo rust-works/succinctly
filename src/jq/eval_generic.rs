@@ -19407,7 +19407,7 @@ fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
 /// path (`path(.c[(1.0)])` is `["c",1.0]` in jq 1.7.1), which is exactly
 /// what [`NumberKey`] carries for a literal float bracket, so the synthesized
 /// node reuses it rather than re-deriving a second rendering rule.
-pub(crate) fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
+fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
     Some(match component {
         OwnedValue::String(s) => Expr::Field(s.clone()),
         OwnedValue::Int(i) => Expr::Index { idx: *i, key: None },

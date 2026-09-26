@@ -63998,6 +63998,13 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
         (r". as $x | [.] | map((. | $x) = 1)", "[1]"),
         (r". as $x | 5 | del(.[0]? | $x)", "5"),
         (r". as $x | [] | del(.[] | $x)", "[]"),
+        // Zero paths: the target becomes `empty`, a no-op write.
+        (r". as $x | [.] | del(.[0] | $x | .[0]?)", r#"[{"a":1}]"#),
+        (r". as $x | [.] | (.[0] | $x | .[0]?) |= 5", r#"[{"a":1}]"#),
+        // A computed or integral-float key spells as its integer.
+        (r". as $x | [.,1] | del(.[.[1] - 1] | $x)", "[1]"),
+        (r". as $x | [.,1] | del(.[0.0] | $x)", "[1]"),
+        (r". as $x | [1,.] | (.[-1.0] | $x) |= 5", "[1,5]"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
         assert_eq!(
@@ -64026,18 +64033,27 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
             "#3188: `{filter}`: stderr={stderr:?}"
         );
     }
-    // A slice after the embed resolves (jq `[[2]]`), but the door cannot
-    // spell a slice component as a static step until #3300, so it declines
-    // and the bridge refuses.
-    let (stdout, stderr, code) = run_jq_full(
-        &["-c", r". as $x | [.] | del(.[0] | $x | .[0:1])"],
-        Some("[1,2]"),
-    )?;
-    assert_eq!(
-        (stdout.as_str(), code),
-        ("", 5),
-        "#3188 slice residual (#3300): stderr={stderr:?}"
-    );
+    // Components the door will not re-spell, so it declines and the bridge
+    // refuses where jq answers: a slice after the embed (jq `[[2]]`; its
+    // spelling `.[{"start":0,"end":1}]` is #3300), and a fractional index,
+    // which is not the integer it truncates to for `del` (jq
+    // `[{"a":1},1]`; succinctly's own `del(.[-0.5])` deletes element 0,
+    // #3302 -- re-spelling it as `.[0]` was a wrong answer, not a refusal).
+    for (input, filter, residual) in [
+        ("[1,2]", r". as $x | [.] | del(.[0] | $x | .[0:1])", "#3300"),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.,1] | del(.[-0.5] | $x)",
+            "#3302",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3188 residual ({residual}): `{filter}`: stderr={stderr:?}"
+        );
+    }
     Ok(())
 }
 

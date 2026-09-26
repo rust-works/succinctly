@@ -1125,20 +1125,32 @@ is the revert that established what the other one costs.
    owned re-entries now take `owned_write_door` beside #3177's `owned_path_door`: the write's
    target is resolved by `path_over_owned` over the caller's own `OwnedValue`, where the
    storage clause can see the pointer, and the write then runs on its ordinary route with the
-   target replaced by the static paths it resolved to, so every operator keeps its one
-   definition. The door opens only for a target that holds a marker and is built from
-   navigation, `?`, computed keys, literals and `error` -- nothing a declined resolution
-   could repeat -- and declines on any escape, on zero paths and on a slice component, so
-   every refusal still comes from the bridge's own resolver. A rebuilt equal value still
-   refuses as jq does (`[{"a":1}] \| del(.[0] \| $x)`). What stays refused follows the
-   `path()` door's own residuals: a write under a wrapper (`(del(.[0] \| $x))?`, #3189),
-   a navigated bind (`.a as $y \| [.] \| (.[0].a \| $y).b = 9`, #3179), a write reached
-   after `.[]` peels the container (`[.] \| [.[] \| del(. \| $x)]`), and a target whose
-   later path raises (`del(.[0] \| $x, .[0])` reports the bridge's refusal where jq
-   reports the second path's `Cannot index object with number`), and a target that resolves
-   through a slice after the embed (`[.] \| del(.[0] \| $x \| .[0:1])` on `[1,2]`, jq
-   `[[2]]`): the static spelling of a slice component is `.[{"start":0,"end":1}]`, which
-   succinctly does not evaluate yet ([#3300](https://github.com/rust-works/succinctly/issues/3300)).
+   target replaced by the static paths it resolved to (`empty` when there are none), so every
+   operator keeps its one definition. The door opens only for a target that holds a marker and
+   is built from navigation, `?`, computed keys, arithmetic, literals and `error` -- nothing a
+   declined resolution could repeat -- and declines on any escape, so every refusal still
+   comes from the bridge's own resolver. A rebuilt equal value still refuses as jq does
+   (`[{"a":1}] \| del(.[0] \| $x)`). Still refused where jq answers:
+
+   - a write under a wrapper (`(del(.[0] \| $x))?` prints nothing, jq `[]`; under `try ...
+     catch "c"` the refusal is *caught* and the handler's `"c"` is printed -- the same
+     wrapper class as `path()`'s, [#3189](https://github.com/rust-works/succinctly/issues/3189));
+   - a navigated bind (`.a as $y \| [.] \| (.[0].a \| $y).b = 9`,
+     [#3179](https://github.com/rust-works/succinctly/issues/3179)) and a write inside a fold's
+     UPDATE (`reduce range(1) as $i (.; del(.[0] \| $x))`,
+     [#3181](https://github.com/rust-works/succinctly/issues/3181));
+   - a write reached after `.[]` peels the container (`[.] \| [.[] \| del(. \| $x)]`);
+   - a target whose later path raises (`del(.[0] \| $x, .[0])` reports the bridge's refusal
+     where jq reports the second path's `Cannot index object with number`);
+   - a resolved component the door will not re-spell: a slice after the embed
+     (`[.] \| del(.[0] \| $x \| .[0:1])` on `[1,2]`, jq `[[2]]`; its spelling
+     `.[{"start":0,"end":1}]` is [#3300](https://github.com/rust-works/succinctly/issues/3300)),
+     and a fractional index (`[.,1] \| del(.[-0.5] \| $x)`, jq `[{"a":1},1]`). A fractional
+     index is not the integer it truncates to -- succinctly's own `del(.[-0.5])` deletes
+     element 0 where jq deletes nothing ([#3302](https://github.com/rust-works/succinctly/issues/3302))
+     -- so re-spelling it would trade this refusal for a wrong answer. Integral floats
+     (`.[0.0]`, `.[-1.0]`) are re-spelled as their integer and answer.
+
    **[#3036](https://github.com/rust-works/succinctly/issues/3036), now closed: the same
    fabrication through the routes that never cross a funnel.** #2642's check ran only where
    an expression is handed from the generic evaluator to `eval.rs`; when the bind *and* the

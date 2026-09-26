@@ -586,6 +586,12 @@ owned-embed-path-nested-del-rebuilt-copy	{"a":1}	. as $x | [{"a":1}] | del(.[0] 
 owned-embed-path-nested-assign-rebuilt-copy	{"a":1}	. as $x | [{"a":1}] | (.[0] | $x) = 5
 owned-embed-path-nested-del-fanout-rebuilt-sibling	{"a":1}	. as $x | [.,{"a":1}] | del(.[] | $x)
 owned-embed-path-nested-del-optional-rebuilt-copy	{"a":1}	. as $x | [{"a":1}] | del((.[0] | $x)?)
+owned-embed-path-nested-del-zero-paths	{"a":1}	. as $x | [.] | del(.[0] | $x | .[0]?)
+owned-embed-path-nested-update-zero-paths	{"a":1}	. as $x | [.] | (.[0] | $x | .[0]?) |= 5
+owned-embed-path-nested-del-arithmetic-key	{"a":1}	. as $x | [.,1] | del(.[.[1] - 1] | $x)
+owned-embed-path-nested-del-integral-float	{"a":1}	. as $x | [.,1] | del(.[0.0] | $x)
+owned-embed-refuse-path-nested-del-fractional	{"a":1}	. as $x | [.,1] | del(.[-0.5] | $x)
+owned-embed-refuse-path-nested-del-slice	[1,2]	. as $x | [.] | del(.[0] | $x | .[0:1])
 owned-embed-refuse-path-nested-as-source	{"a":1}	. as $x | [.] | path(.[0] | $x) as $p | $p
 owned-embed-refuse-path-nested-reduce-source	{"a":1}	. as $x | [.] | reduce path(.[0] | $x) as $p (0; 1)
 owned-embed-refuse-path-nested-binary-operand	{"a":1}	. as $x | [.] | select(path(.[0] | $x) == [0])
@@ -849,6 +855,8 @@ navigated-bind-positional-assign:#3037 residual -- same as navigated-bind-positi
 owned-embed-refuse-path-nested-ancestor-bind:#3177 -- reuse is depth-0 only (#2889): $y is a separate materialization of .a, and the .a inside $x's own storage is a different Rc, so the storage clause has nothing to match; jq answers [0,"a"]
 owned-embed-refuse-path-nested-comma:#3177 -- path() reached through a comma wrapper is not at the head of the owned re-entry's pipe, so it still crosses the bridge; taking it natively would mean re-implementing the wrapper's driver over an owned value (#3189)
 owned-embed-refuse-path-nested-wrapper:#3177 -- same as owned-embed-refuse-path-nested-comma, through an array constructor and limit
+owned-embed-refuse-path-nested-del-fractional:#3188 -- the write door will not re-spell a fractional index: del(.[-0.5]) deletes element 0 here and nothing in jq (#3302), so the static spelling would be a wrong answer
+owned-embed-refuse-path-nested-del-slice:#3188 -- a slice component has no static spelling the evaluator indexes by (.[{"start":0,"end":1}], #3300), so the write door declines
 owned-embed-refuse-path-nested-as-source:#3177 review -- path() as a bind's source is not the head of the owned re-entry's pipe; the as driver owns the inner pipe, so it still bridges (#3189)
 owned-embed-refuse-path-nested-reduce-source:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as a reduce source
 owned-embed-refuse-path-nested-binary-operand:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as a binary operand inside select

@@ -8595,20 +8595,20 @@ pub(crate) fn owned_path_door_collect<S: EvalSemantics>(
 /// writes at the paths it yields, so the one part that needs the caller's
 /// own tree -- resolving `f` -- runs [`path_over_owned`] on `input`, and the
 /// answer comes back as `expr` with `f` replaced by the static paths it
-/// resolved to. The write itself still runs on the ordinary route, so every
-/// operator's semantics keep their one definition.
+/// resolved to (`empty` for none). The write itself still runs on the
+/// ordinary route, so every operator's semantics keep their one definition.
 ///
 /// Declines (`None`, and the re-entry bridges as before) unless the target
-/// holds a marker and is built only from navigation, `?`, computed keys,
-/// literals and `error`: with no marker there is no storage identity to
-/// lose, and such a target has no side effect a declined resolution could
-/// repeat. That is [`is_pure_navigation`]'s grammar plus `?` and `.[k]`,
-/// which it leaves out for its own bind-witness contract, not for effects.
-/// It also declines on any
-/// escape, on zero paths, and on a component with no navigation step (a
-/// slice), so every refusal and error still comes from the bridge's own
-/// resolver, with its own text. jq mode only: the storage clause is jq's
-/// rule, and yq's writes resolve their targets in their own order (#2481).
+/// holds a marker and is built only from [`is_pure_navigation_node`]s, `?`,
+/// computed keys and arithmetic: with no marker there is no storage identity
+/// to lose, and such a target has no side effect a declined resolution could
+/// repeat. It also declines on any escape, and on a component
+/// [`static_path_expr`] cannot spell exactly, so every refusal and error
+/// still comes from the bridge's own resolver, with its own text. jq mode
+/// only: the storage clause is jq's rule, and yq's writes resolve their
+/// targets in their own order (#2481). Ahead of the #3135 identity-bind door
+/// for the same reason [`owned_path_door`] is: a target the storage clause
+/// answers never needs it, and one it cannot answer declines unchanged.
 pub(crate) fn owned_write_door<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -8625,30 +8625,17 @@ pub(crate) fn owned_write_door<S: EvalSemantics>(
         return None;
     };
     let head = unwrap_paren(head);
-    let target = match head {
-        Expr::Assign { path, .. }
-        | Expr::Update { path, .. }
-        | Expr::CompoundAssign { path, .. }
-        | Expr::AlternativeAssign { path, .. }
-        | Expr::Builtin(Builtin::Del(path)) => path.as_ref(),
-        _ => return None,
-    };
+    let target = write_target(head)?;
     let mut marked = false;
     let effectful = any_subexpr(target, &mut |e| {
         marked |= matches!(e, Expr::TrackedVar(_));
-        !(is_navigation_node(e)
+        !(is_pure_navigation_node(e)
             || matches!(
                 e,
-                Expr::Identity
-                    | Expr::Pipe(_)
-                    | Expr::Comma(_)
-                    | Expr::Paren(_)
-                    | Expr::Optional(_)
+                Expr::Optional(_)
                     | Expr::IndexExpr { .. }
-                    | Expr::TrackedVar(_)
-                    | Expr::Literal(_)
-                    | Expr::Array(_)
-                    | Expr::Error(_)
+                    | Expr::Arithmetic { .. }
+                    | Expr::Negate(_)
             ))
     });
     if effectful || !marked {
@@ -8662,32 +8649,13 @@ pub(crate) fn owned_write_door<S: EvalSemantics>(
         .iter()
         .map(static_path_expr)
         .collect::<Option<Vec<Expr>>>()?;
-    let target = match resolved.len() {
-        0 => return None,
+    let resolved = match resolved.len() {
+        0 => Expr::Builtin(Builtin::Empty),
         1 => resolved.pop()?,
         _ => Expr::Comma(resolved),
     };
-    let target = Box::new(target);
-    let head = match head.clone() {
-        Expr::Assign { value, .. } => Expr::Assign {
-            path: target,
-            value,
-        },
-        Expr::Update { filter, .. } => Expr::Update {
-            path: target,
-            filter,
-        },
-        Expr::CompoundAssign { op, value, .. } => Expr::CompoundAssign {
-            op,
-            path: target,
-            value,
-        },
-        Expr::AlternativeAssign { value, .. } => Expr::AlternativeAssign {
-            path: target,
-            value,
-        },
-        _ => Expr::Builtin(Builtin::Del(target)),
-    };
+    let mut head = head.clone();
+    **write_target_mut(&mut head)? = resolved;
     Some(if rest.is_empty() {
         head
     } else {
@@ -8695,16 +8663,62 @@ pub(crate) fn owned_write_door<S: EvalSemantics>(
     })
 }
 
+/// The target of a write [`owned_write_door`] may resolve: `f` in `del(f)`,
+/// `f = v`, `f |= g`, `f op= v` and `f //= v`.
+fn write_target(head: &Expr) -> Option<&Expr> {
+    match head {
+        Expr::Assign { path, .. }
+        | Expr::Update { path, .. }
+        | Expr::CompoundAssign { path, .. }
+        | Expr::AlternativeAssign { path, .. }
+        | Expr::Builtin(Builtin::Del(path)) => Some(path),
+        _ => None,
+    }
+}
+
+/// [`write_target`], for replacing it. A variant missing here only makes
+/// the door decline.
+fn write_target_mut(head: &mut Expr) -> Option<&mut Box<Expr>> {
+    match head {
+        Expr::Assign { path, .. }
+        | Expr::Update { path, .. }
+        | Expr::CompoundAssign { path, .. }
+        | Expr::AlternativeAssign { path, .. }
+        | Expr::Builtin(Builtin::Del(path)) => Some(path),
+        _ => None,
+    }
+}
+
 /// A path `path(f)` produced, as the static navigation that reaches it
-/// (`["a", 0]` is `.a | .[0]`, `[]` is `.`), or `None` for a component no
-/// navigation step can spell.
+/// (`["a", 0]` is `.a | .[0]`, `[]` is `.`), or `None` unless every
+/// component is a string or an integral number. A fractional index is not the integer it
+/// truncates to (`.[-0.5]` is not `.[0]` to jq's `del`), and a slice has no
+/// step the evaluator can index by (#3300), so neither is re-spelled.
 fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
     let OwnedValue::Array(components) = path else {
         return None;
     };
     let mut steps = components
         .iter()
-        .map(super::eval_generic::path_component_step_expr)
+        .map(|component| match component {
+            OwnedValue::String(key) => Some(Expr::Field(key.clone())),
+            OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _) => {
+                Some(Expr::Index {
+                    idx: *idx,
+                    key: None,
+                })
+            }
+            // An integral float indexes as its integer (`.[0.0]`, `.[-0]`).
+            OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
+                if f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0 =>
+            {
+                Some(Expr::Index {
+                    idx: *f as i64,
+                    key: None,
+                })
+            }
+            _ => None,
+        })
         .collect::<Option<Vec<Expr>>>()?;
     Some(match steps.len() {
         0 => Expr::Identity,
@@ -38203,20 +38217,25 @@ fn apply_pattern_bindings(expr: &Expr, bindings: &[PatternBinding]) -> Expr {
 /// the shapes that costs are listed with the refuse-only rows in
 /// `docs/compliance/jq/limitations.md`.
 fn is_pure_navigation(source: &Expr) -> bool {
-    !any_subexpr(source, &mut |e| {
-        !(is_navigation_node(e)
-            || matches!(
-                e,
-                Expr::Identity
-                    | Expr::Pipe(_)
-                    | Expr::Comma(_)
-                    | Expr::Paren(_)
-                    | Expr::TrackedVar(_)
-                    | Expr::Literal(_)
-                    | Expr::Array(_)
-                    | Expr::Error(_)
-            ))
-    })
+    !any_subexpr(source, &mut |e| !is_pure_navigation_node(e))
+}
+
+/// One node of [`is_pure_navigation`]'s grammar. Shared with
+/// [`owned_write_door`], which admits a superset of it, so a node kind added
+/// here reaches both.
+fn is_pure_navigation_node(e: &Expr) -> bool {
+    is_navigation_node(e)
+        || matches!(
+            e,
+            Expr::Identity
+                | Expr::Pipe(_)
+                | Expr::Comma(_)
+                | Expr::Paren(_)
+                | Expr::TrackedVar(_)
+                | Expr::Literal(_)
+                | Expr::Array(_)
+                | Expr::Error(_)
+        )
 }
 
 /// The navigation-shaped node kinds [`classify_navigation`] looks for,
