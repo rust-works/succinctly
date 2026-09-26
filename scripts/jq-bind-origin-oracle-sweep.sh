@@ -674,6 +674,11 @@ owned-embed-foreach-update-write	{"a":1}	. as $x | foreach (1) as $i (.; ($x.a) 
 owned-embed-foreach-extract-path	{"a":1}	. as $x | foreach (1) as $i (.; .; path($x))
 owned-embed-foreach-extract-per-step	{"a":1}	. as $x | [foreach (1,2) as $i (.; .; ($x.a) = $i)]
 owned-embed-foreach-extract-rebuilt	{"a":1}	. as $x | foreach (1) as $i (.; .a; ($x.a) = 9)
+owned-embed-fold-update-navigated-bind	{"a":{"b":1},"c":{"b":1}}	.a as $y | .a | reduce (1) as $i (.; ($y.b) = 9)
+owned-embed-fold-update-navigated-sibling	{"a":{"b":1},"c":{"b":1}}	.a as $y | .c | reduce (1) as $i (.; ($y.b) = 9)
+owned-embed-foreach-extract-navigated-bind	{"a":{"b":1}}	.a as $y | foreach (1) as $i (.; .a; path($y))
+owned-embed-fold-update-rebuilt-by-nonwrite	{"a":1}	. as $x | reduce (1,2) as $i (.; if $i == 2 then ($x.a) = 9 else . end)
+owned-embed-fold-repeat-source	{"a":1}	. as $x | reduce limit(1; repeat(1)) as $i (.; ($x.a) = 9)
 owned-embed-fold-owned-input-init	{"a":1}	. as $x | [.] | reduce (1) as $i (.[0]; ($x.a) = 9)
 owned-embed-fold-owned-input-contains	{"a":1}	. as $x | [.] | reduce range(1) as $i (.; del(.[0] | $x))
 owned-embed-object-member-del	{"a":1}	. as $x | {k:.} | .k | del($x.a)
@@ -879,6 +884,8 @@ owned-embed-refuse-path-nested-label-body:#3177 review -- same as owned-embed-re
 owned-embed-refuse-path-nested-after-with-entries:#3177 review -- a stage ahead of path() still bridges first, for with_entries (jq ["k"])
 owned-embed-refuse-path-nested-after-add:#3177 review -- a stage ahead of path() still bridges first, for a one-element add
 owned-embed-refuse-path-nested-after-update:#3177 review -- a stage ahead of path() still bridges first, for a no-op |= (jq's setpath places the same jv)
+owned-embed-fold-update-rebuilt-by-nonwrite:#3181 review -- a witnessed step runs its UPDATE through the owned re-index bridge, so even an UPDATE returning `.` hands the next step a rebuilt copy (the owned-embed-fold-if-identity mechanism)
+owned-embed-fold-repeat-source:#3328 -- a `repeat` source fails streams_unbounded, so the whole fold takes the wildcard re-index bridge and INIT is a copy
 owned-embed-fold-owned-input-init:#3328 -- a fold at the head of an owned re-entry is not one of embed_peel_step's shapes, so the whole fold crosses the re-index bridge and INIT navigates a fresh copy
 owned-embed-fold-owned-input-contains:#3328 -- same bridge: the accumulator built from the owned input `[.]` is a re-indexed copy, so its element no longer shares $x's storage
 owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
