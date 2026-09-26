@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a streaming stage followed by a projection and a filter no longer
+  reindexes what the projection drops** (#3213). Each output of a streaming
+  stage (`while`, `until`, `repeat`, ...) reached the rest of its pipe through
+  the owned re-entry, which serialized and reindexed the whole value whenever
+  the rest was not a shape it answers natively -- `while(.i < 3200; .i += 1)
+  | .i | select(. == 3199)` rebuilt a 200,000-digit sibling on every
+  iteration, 1.37 s on an Apple M5 Max. A leading `.field`/`.[n]` is now taken
+  natively first, so only what it keeps is reindexed: the same query runs in
+  under 10 ms. It applies only where the reorder is unobservable (no `as`
+  binding's embed table in scope, and a rest that does not read the node's
+  place in the document, like yq's `key`/`parent`/`path`); output is
+  unchanged.
+
 - **jq: printing a lazily built array no longer copies each element to
   validate it** (#3156). `[.[]]`, `map(.)`, `sort`, `reverse` and the other
   builtins that answer a lazy sequence of document elements built a full owned
