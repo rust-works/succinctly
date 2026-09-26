@@ -1461,12 +1461,6 @@ impl core::ops::Deref for SharedArg {
     }
 }
 
-impl AsRef<Expr> for SharedArg {
-    fn as_ref(&self) -> &Expr {
-        &self.expr
-    }
-}
-
 impl PartialEq for SharedArg {
     fn eq(&self, other: &Self) -> bool {
         self.expr == other.expr
@@ -3025,6 +3019,21 @@ mod tests {
     /// with `cargo +nightly rustc --features cli --lib -- -Zprint-type-sizes`
     /// before changing it. Same 64-bit gate as `EvalError`'s own pin
     /// (`src/jq/error.rs`), for the same reason.
+    /// #3287: a `SharedArg`'s remembered answers are derived state, like
+    /// `BoundBody`'s cache -- they take no part in equality or `Debug`, so a
+    /// node reads the same whether or not it has been evaluated.
+    #[test]
+    fn shared_arg_equality_and_debug_ignore_remembered_answers_3287() {
+        let fresh = SharedArg::new(Expr::Identity);
+        let classified = SharedArg::new(Expr::Identity);
+        assert!(classified.eager_or_init(|_| true));
+        assert!(!classified.needs_path_context_or_init(|_| false));
+        assert_eq!(fresh, classified);
+        assert_eq!(format!("{fresh:?}"), format!("{classified:?}"));
+        assert_eq!(format!("{fresh:?}"), format!("{:?}", Expr::Identity));
+        assert_ne!(fresh, SharedArg::new(Expr::Literal(Literal::Null)));
+    }
+
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_expr_size_is_pinned_1401() {
