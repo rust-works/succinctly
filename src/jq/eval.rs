@@ -36524,7 +36524,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
             // an object's field values are, so a `msg` that itself
             // navigates genuinely moves the register: confirmed live,
             // `path(. as {a:$q} | (debug(.k)|$q))` refuses in jq 1.7.1 too
-            // (an out-of-bounds `.k` on `.` moves it exactly as any other
+            // (evaluating `.k` moves the register exactly as any other
             // navigating stage would) -- but `debug(1)`/`debug("hi")` don't
             // navigate at all, and jq 1.7.1 confirms both keep tracking
             // (`["a"]`), which the unconditional `false` this replaced got
@@ -102135,14 +102135,20 @@ mod tests {
             r"path(. as {a:$q} | (debug|$q))",
             r"path(. as {a:$q} | (debug(1)|$q))",
             r#"path(. as {a:$q} | (debug("hi")|$q))"#,
+            // A multi-valued `msg` (`Expr::Comma`) with every branch
+            // non-navigating keeps tracking too -- `cannot_move_register`'s
+            // own `Comma` arm requires all of them, not just the first.
+            r"path(. as {a:$q} | (debug(1,2)|$q))",
         ] {
             assert_eq!(outputs(doc, filter), [r#"["a"]"#], "{filter}");
         }
         // A navigating `msg` genuinely moves the register (confirmed live:
         // `path(. as {a:$q} | (debug(.k)|$q))` on `{"a":{"b":1},"k":"m"}`
-        // refuses in jq 1.7.1 too).
-        let parsed = parse(r"debug(.k)").unwrap();
-        assert!(!cannot_move_register(&parsed));
+        // refuses in jq 1.7.1 too) -- including when it's only *one*
+        // branch of an otherwise non-navigating `Comma` `msg`.
+        for src in [r"debug(.k)", r"debug(1,.k)"] {
+            assert!(!cannot_move_register(&parse(src).unwrap()), "{src}");
+        }
 
         // The `?//` masking repro from the issue: a caught refusal must not
         // answer the handler's value where jq answers the path.
