@@ -636,10 +636,8 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
     // `OwnedValue`; hand back its `Rc` rather than building a value-equal
     // twin, so jq's pointer identity for `{k:.}`/`[.]`/`. + {}` survives to
     // whatever reads it. Taken here, at the walk's own entry point, and
-    // never inside the recursion -- see the `embed_table` module's doc
-    // comment for why depth 0 is both where every embedding construction
-    // materializes its operand and the only depth at which reuse cannot
-    // skip a `MAX_NESTING_DEPTH` check the fresh walk would have made.
+    // below it only under the height rule (#3179) -- see the `embed_table`
+    // module's doc comment.
     //
     // Gate order matters, and was measured both ways (#2889 A/B): the
     // thread-local `active()` load inside `embed_shared_for` is ~1 ns and
@@ -5413,11 +5411,16 @@ pub(crate) fn ambient_document_index() -> Option<i64> {
 /// canonicalization, and jq mode drives a `JsonCursor`, whose
 /// `explicit_tag`/`canonicalize_numbers` are the trait defaults.
 ///
-/// Reuse is taken at [`to_owned_cursor`]'s own depth 0 only, never inside a
-/// container walk. That is where every embedding construction materializes
-/// its operand, and it keeps the nesting-depth budget exactly the one the
-/// bind itself already passed: a reuse deeper in some *other* node's walk
-/// would skip the `MAX_NESTING_DEPTH` accounting for the shared subtree.
+/// Reuse is taken at [`to_owned_cursor`]'s own depth 0, where every
+/// embedding construction materializes its operand, and since #3179 also
+/// inside its walk, for a nested container that *is* an entry's node (`.a as
+/// $y | {k:.}` materializes the root with `$y`'s node one level in). A reuse
+/// at depth `d` skips the shared subtree's walk, so it is taken only when
+/// `d` plus the entry's height stays under `MAX_NESTING_DEPTH` -- exactly
+/// when that walk would have passed -- and only after one precheck per
+/// materialization ([`embed_may_nest`]) found an entry inside the subtree at
+/// all, so a walk that cannot meet one never asks per container. The lazy
+/// and validate-only walks never reuse below depth 0.
 ///
 /// `#[cfg(feature = "std")]` only, the same `thread_local!`-with-RAII-guard
 /// shape and the same degradation as [`file_origin`]/[`path_base`]/
