@@ -107679,7 +107679,16 @@ mod touched_edge_cases_2999 {
     /// type would -- matching the issue's own "9000-shape fuzz found
     /// nothing" report) -- this pins the classification contract directly
     /// rather than leaving it uncovered.
+    ///
+    /// `std`-gated: [`nonretryable_stop`]'s own `#[cfg(not(feature =
+    /// "std"))]` half is a permanent no-op (`set`/`clear` do nothing,
+    /// `is_set` always `false`) -- a documented, pre-existing trade-off
+    /// (no `thread_local!` in `no_std`), not something this PR changes.
+    /// Asserting `is_set()` after `stop_with_eval_escape` would fail under
+    /// `--no-default-features` for that reason alone, regardless of
+    /// whether the classification itself is correct.
     #[test]
+    #[cfg(feature = "std")]
     fn stop_with_eval_escape_classifies_like_stop_with_escape() {
         clear_nonretryable_stop();
         let mut slot: Option<EvalEscape> = None;
