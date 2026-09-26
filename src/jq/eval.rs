@@ -3119,6 +3119,11 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1371: an argument captured at call time. Transparent to
         // evaluation -- it is the substitution passes, not this one, that
         // must treat it as opaque.
+        // ADR-0025: every argument read is where an argument chain of any
+        // shape is walked, so it checks the native-stack floor.
+        Expr::Shared(_) if native_stack_exhausted() => {
+            QueryResult::Error(shared_arg_depth_refusal())
+        }
         Expr::Shared(inner) => eval_single::<W, S>(inner, value, optional),
         Expr::NamespacedCall {
             namespace,
@@ -5869,10 +5874,10 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound) => {
-                let _guard = enter_def_call_frame(*frames);
-                eval_each::<W, S>(bound, value, optional, sink)
-            }
+            Ok(bound) => match enter_def_call(def, *frames) {
+                Ok(_guard) => eval_each::<W, S>(bound, value, optional, sink),
+                Err(e) => Flow::Escaped(Control::Error(e)),
+            },
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         // Lazy only for an argument the *user* wrote, not for a link in a
@@ -5928,6 +5933,11 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // what it wraps -- `eval_each` dispatches straight back here for
         // another `Shared`, or into whatever real expression or chain-link
         // operator was underneath once the pass-through chain runs out.
+        //
+        // ADR-0025: every argument read checks the native-stack floor first.
+        Expr::Shared(_) if native_stack_exhausted() => {
+            Flow::Escaped(Control::Error(shared_arg_depth_refusal()))
+        }
         Expr::Shared(inner) if matches!(&**inner, Expr::Shared(_)) => {
             eval_each::<W, S>(inner, value, optional, sink)
         }
@@ -33136,14 +33146,25 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound) => {
-                resolve_node_sink::<S>(bound, value, trackable, snapshot, frame, keep, sink)
-            }
+            // ADR-0025: entered like every other evaluator's `DefCall` arm --
+            // the native-stack floor checked, and the ambient frame depth
+            // raised so a `def` nested in the body installs at this call's
+            // depth rather than 0.
+            Ok(bound) => match enter_def_call(def, *frames) {
+                Ok(_guard) => {
+                    resolve_node_sink::<S>(bound, value, trackable, snapshot, frame, keep, sink)
+                }
+                Err(e) => ResolveFlow::Escaped(e.into()),
+            },
             Err(e) => ResolveFlow::Escaped(e.into()),
         },
         // Transparent, like `Paren`: the wrapped argument is ordinary code
         // whose own navigation is exactly as trackable here as it would be
-        // written out in place.
+        // written out in place. ADR-0025: the read checks the native-stack
+        // floor first.
+        Expr::Shared(_) if native_stack_exhausted() => {
+            ResolveFlow::Escaped(shared_arg_depth_refusal().into())
+        }
         Expr::Shared(inner) => {
             resolve_node_sink::<S>(inner, value, trackable, snapshot, frame, keep, sink)
         }
@@ -60966,6 +60987,165 @@ pub(crate) fn enter_def_call_frame(frames: u32) -> ambient_frame_depth::Guard {
     ambient_frame_depth::enter(frames)
 }
 
+/// The lowest stack address evaluation on this thread may reach -- ADR-0025
+/// (#3262). `0` means no stack was registered, and only [`MAX_EVAL_FRAMES`]
+/// guards the thread.
+///
+/// `#[cfg(feature = "std")]` only, like [`ambient_frame_depth`]: a `no_std`
+/// build has no `thread_local!`, so it is always unregistered.
+#[cfg(feature = "std")]
+mod native_stack {
+    use std::cell::Cell;
+
+    /// A stack address evaluation started from, and how far from it the
+    /// stack may move. `(0, _)` is unregistered.
+    pub(crate) type Budget = (usize, usize);
+
+    thread_local! {
+        static BUDGET: Cell<Budget> = const { Cell::new((0, 0)) };
+    }
+
+    pub(crate) fn budget() -> Budget {
+        BUDGET.with(Cell::get)
+    }
+
+    /// Restores the previous budget on drop.
+    #[must_use]
+    pub(crate) struct Guard(Budget);
+
+    /// Arm `budget` for the caller's scope. A registration nested inside
+    /// another never loosens it: the outer budget's room left at `here` is
+    /// kept when it is the tighter of the two.
+    pub(crate) fn enter(here: usize, budget: Budget) -> Guard {
+        let previous = self::budget();
+        let (origin, reach) = previous;
+        let tighter = if origin == 0 {
+            budget
+        } else {
+            let left = reach.saturating_sub(origin.abs_diff(here));
+            if left < budget.1 {
+                (here, left)
+            } else {
+                budget
+            }
+        };
+        BUDGET.with(|b| b.set(tighter));
+        Guard(previous)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BUDGET.with(|b| b.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod native_stack {
+    pub(crate) type Budget = (usize, usize);
+
+    pub(crate) fn budget() -> Budget {
+        (0, 0)
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter(_here: usize, _budget: Budget) -> Guard {
+        Guard
+    }
+}
+
+/// Run `f` with the evaluator's native-stack guard armed on this thread
+/// (ADR-0025, #3262).
+///
+/// `available` is how many bytes of stack lie below this call. Evaluation
+/// inside `f` refuses a recursion -- `exceeded maximum recursion depth`, the
+/// uncatchable resource limit the frame-count guard also raises -- once it has
+/// spent half of them, whatever the shape of the program, where it would
+/// otherwise overflow the stack and abort the process. Without a registration
+/// only the frame-count guard protects evaluation, which is calibrated for the
+/// CLI's own evaluation thread and guarantees nothing on an ordinary one.
+///
+/// ```
+/// # #[cfg(feature = "std")] {
+/// use succinctly::jq::{eval, parse, with_stack_budget, JqSemantics, QueryResult};
+/// use succinctly::json::JsonIndex;
+///
+/// const STACK: usize = 64 * 1024 * 1024;
+/// let refused = std::thread::Builder::new()
+///     .stack_size(STACK)
+///     .spawn(|| {
+///         with_stack_budget(STACK, || {
+///             let json = b"null";
+///             let index = JsonIndex::build(json);
+///             // Far deeper than 32 MiB of native stack can hold.
+///             let expr = parse("def f(n): if n == 0 then 0 else f(n - 1 | .) end; f(100000)")
+///                 .expect("parses");
+///             matches!(
+///                 eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)),
+///                 QueryResult::Error(_)
+///             )
+///         })
+///     })
+///     .expect("spawns")
+///     .join()
+///     .expect("refuses instead of overflowing the stack");
+/// assert!(refused);
+/// # }
+/// ```
+///
+/// No-op under `no_std`, which has no thread-locals to hold the floor.
+pub fn with_stack_budget<R>(available: usize, f: impl FnOnce() -> R) -> R {
+    let here = stack_address();
+    let _guard = native_stack::enter(here, (here, available / 2));
+    f()
+}
+
+/// Whether evaluation on this thread has spent half its registered stack --
+/// checked at every `Expr::DefCall` and `Expr::Shared` evaluation, the two
+/// places every unbounded recursion passes through once per level (ADR-0025).
+///
+/// Measured as a distance from where the budget was registered, in whichever
+/// direction the stack grows, like [`RecurseNativeBudget`]'s own budget.
+pub(crate) fn native_stack_exhausted() -> bool {
+    let (origin, reach) = native_stack::budget();
+    origin != 0 && origin.abs_diff(stack_address()) > reach
+}
+
+/// The refusal of a call to `def` that recursed too deep: by
+/// [`MAX_EVAL_FRAMES`], or by the native-stack floor (ADR-0025).
+fn def_call_depth_refusal(def: &FuncDefData) -> EvalError {
+    // #2132: uncatchable -- `def f: f; try f catch "caught"` answered
+    // `"caught"` at exit 0 with a plain `new`. See
+    // `EvalError::resource_limit`.
+    EvalError::resource_limit(format!(
+        "{}/{} exceeded maximum recursion depth",
+        super::resolve::ModuleRun::display_name(&def.name),
+        def.params.len()
+    ))
+}
+
+/// Enter one `DefCall`'s bound body: refuse it if the native stack is spent
+/// (ADR-0025), otherwise raise the ambient frame depth for its duration
+/// ([`enter_def_call_frame`]). What every `Expr::DefCall` evaluation arm
+/// holds around its recursion into the bound body.
+pub(crate) fn enter_def_call(
+    def: &FuncDefData,
+    frames: u32,
+) -> Result<ambient_frame_depth::Guard, EvalError> {
+    if native_stack_exhausted() {
+        return Err(def_call_depth_refusal(def));
+    }
+    Ok(enter_def_call_frame(frames))
+}
+
+/// The refusal of an argument read once the native stack is spent
+/// (ADR-0025). Unnamed: the innermost live call is not necessarily the
+/// recursion that spent the stack.
+pub(crate) fn shared_arg_depth_refusal() -> EvalError {
+    EvalError::resource_limit("exceeded maximum recursion depth".to_string())
+}
+
 /// Whether `expr` is a pure, single-valued combination of `Shared` nodes and
 /// literals -- safe for `eval_each`'s `Expr::Shared` arm to evaluate eagerly
 /// instead of preserving demand-driven laziness (#1371 follow-up).
@@ -61098,6 +61278,16 @@ pub(crate) fn is_pure_chain_link(expr: &Expr) -> bool {
 /// gates when width compounds) -- the bisected numbers just above are for
 /// the case that flag now confirms unchanged: a recursive call's own
 /// wrapping, still charged exactly as bisected here.
+///
+/// **Not the only guard on a registered thread (ADR-0025, #3262).** A frame
+/// count predicts stack from structure, and #3262 found ordinary shapes it
+/// cannot predict: a bare parameter's argument chain, walked natively at every
+/// read, aborted the process under this ceiling at a few hundred levels when
+/// its links went through the lazy evaluator. A thread that registers its stack
+/// through [`with_stack_budget`] also refuses once half of it is spent
+/// ([`native_stack_exhausted`], checked at every `DefCall` and `Shared`
+/// evaluation); whichever limit is reached first refuses. On an unregistered
+/// thread this constant is the only guard.
 pub(crate) const MAX_EVAL_FRAMES: u32 = 40_000;
 
 /// Evaluate one call to a user-defined function (#1371).
@@ -61126,14 +61316,7 @@ pub(crate) fn bind_def_call<'e>(
 ) -> Result<&'e Rc<Expr>, EvalError> {
     bound.get_or_try_init(|| {
         if frames >= MAX_EVAL_FRAMES {
-            // #2132: uncatchable -- `def f: f; try f catch "caught"` answered
-            // `"caught"` at exit 0 with a plain `new`. See
-            // `EvalError::resource_limit`.
-            return Err(EvalError::resource_limit(format!(
-                "{}/{} exceeded maximum recursion depth",
-                super::resolve::ModuleRun::display_name(&def.name),
-                def.params.len()
-            )));
+            return Err(def_call_depth_refusal(def));
         }
         // #2094: `def.body` needs to become an owned `Expr` before
         // `install_def_calls` below only when at least one parameter
@@ -61237,8 +61420,22 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
 
 /// Each argument of a `def` call, behind the one `Rc` both its bare
 /// substitution and its `$` binding share (#3149).
+///
+/// An argument that is already a `Shared` -- a parameter threaded through
+/// unchanged, `rep(f; n - 1)` -- is shared as the node it wraps rather than
+/// wrapped again (ADR-0025). Evaluation is transparent through a `Shared` and
+/// substitution stops at one either way, so the two are indistinguishable,
+/// but re-wrapping built a chain one pass-through link longer per level:
+/// reading the closure at depth `d` walked `d` links natively, and
+/// `def rep(f; n): if n <= 0 then . else (f | rep(f; n - 1)) end; 0 |
+/// rep(. + 1; 1000)` overflowed the stack at ~670 levels (#3262).
 fn share_def_call_args(args: &[Expr]) -> Vec<Rc<Expr>> {
-    args.iter().map(|arg| Rc::new(arg.clone())).collect()
+    args.iter()
+        .map(|arg| match arg {
+            Expr::Shared(inner) => Rc::clone(inner),
+            _ => Rc::new(arg.clone()),
+        })
+        .collect()
 }
 
 /// The bare half of [`bind_def_call_params`]: substitute each parameter's
@@ -61337,10 +61534,10 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     match bind_def_call(def, args, frames, cache) {
-        Ok(bound) => {
-            let _guard = enter_def_call_frame(frames);
-            eval_single::<W, S>(bound, value, optional)
-        }
+        Ok(bound) => match enter_def_call(def, frames) {
+            Ok(_guard) => eval_single::<W, S>(bound, value, optional),
+            Err(e) => QueryResult::Error(e),
+        },
         Err(e) => QueryResult::Error(e),
     }
 }
@@ -63657,6 +63854,182 @@ mod tests {
             "message: {}",
             err.message
         );
+    }
+
+    /// ADR-0025 (#3262): registration arms this thread's budget for the
+    /// closure only, a nested registration never loosens an outer one, and an
+    /// unregistered thread is never exhausted.
+    #[cfg(feature = "std")]
+    #[test]
+    fn with_stack_budget_scopes_the_budget_3262() {
+        assert_eq!(native_stack::budget().0, 0);
+        assert!(!native_stack_exhausted());
+        let (outer, nested_small, nested_big) = with_stack_budget(1 << 20, || {
+            let outer = native_stack::budget();
+            let nested_small = with_stack_budget(1 << 10, native_stack::budget);
+            let nested_big = with_stack_budget(1 << 30, native_stack::budget);
+            (outer, nested_small, nested_big)
+        });
+        assert_ne!(outer.0, 0);
+        assert_eq!(outer.1, 1 << 19, "half the registered stack");
+        assert_eq!(nested_small.1, 1 << 9, "a tighter nested budget wins");
+        assert!(
+            nested_big.1 <= outer.1,
+            "a looser nested budget never loosens the outer one: {nested_big:?} vs {outer:?}"
+        );
+        assert_eq!(native_stack::budget().0, 0, "restored on exit");
+    }
+
+    /// ADR-0025 (#3262): with no stack left, a `def` call refuses naming the
+    /// definition, and an argument read refuses unnamed -- the uncatchable
+    /// resource limit `MAX_EVAL_FRAMES` also raises.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_spent_native_stack_refuses_calls_and_argument_reads_3262() {
+        let refusal = |filter: &str| {
+            let expr = parse(filter).expect("parses");
+            let json = b"null";
+            let index = JsonIndex::build(json);
+            with_stack_budget(0, || {
+                match eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
+                    QueryResult::Error(e) => e,
+                    other => panic!("{filter}: expected a refusal, got {other:?}"),
+                }
+            })
+        };
+        let err = refusal("def f: 1; f");
+        assert_eq!(err.message, "f/0 exceeded maximum recursion depth");
+        assert!(
+            err.is_resource_limit(),
+            "uncatchable, like MAX_EVAL_FRAMES' refusal"
+        );
+
+        assert_eq!(
+            shared_arg_depth_refusal().message,
+            "exceeded maximum recursion depth"
+        );
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        let read = Expr::Shared(Rc::new(Expr::Literal(Literal::Int(1))));
+        let result = with_stack_budget(0, || {
+            eval_single::<Vec<u64>, JqSemantics>(&read, index.root(json).value(), false)
+        });
+        assert!(
+            matches!(&result, QueryResult::Error(e) if e.message == "exceeded maximum recursion depth"),
+            "{result:?}"
+        );
+    }
+
+    /// ADR-0025 (#3262): every evaluator's `DefCall` and `Shared` arm takes the
+    /// floor, including the path-context and owned-identity routes a
+    /// recursion only reaches with an enclosing one already holding the stack.
+    /// With no stack left, the first check on each route refuses.
+    #[cfg(feature = "std")]
+    #[test]
+    fn every_route_checks_the_native_stack_floor_3262() {
+        let json = br#"{"a":{"b":1}}"#;
+        let index = JsonIndex::build(json);
+        for filter in [
+            "def f: .a; f | key",
+            "def f(g): g; f(.a) | key",
+            "def f: .a; [f | parent]",
+            "def f(g): g; [f(.a) | parent]",
+            "def f: .; f | .a",
+            "def f(g): g; f(.) | .a",
+            "def f: .a; [path(f)]",
+            "def f(g): g; [path(f(.a))]",
+            "def f(g): g; f(.a) |= 2",
+            "def f: .a; first(f)",
+            "def f: .; .a | to_entries | f | key",
+            "def f: .; .a | to_entries | f | parent",
+        ] {
+            let expr = parse(filter).expect("parses");
+            let result =
+                with_stack_budget(0, || eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)));
+            match result {
+                QueryResult::Error(e) => assert!(
+                    e.message.ends_with("exceeded maximum recursion depth"),
+                    "{filter}: {}",
+                    e.message
+                ),
+                other => panic!("{filter}: expected a refusal, got {other:?}"),
+            }
+        }
+
+        // A `DefCall` refuses before its body can read an argument, so an
+        // argument read is reached here directly: `g` stands for an argument
+        // already bound into the query, as `bind_def_call` leaves it.
+        for filter in [
+            "g",
+            "first(g)",
+            "[g]",
+            "g | key",
+            "[g | parent]",
+            "g | .b",
+            "[path(g)]",
+            "g |= 2",
+            ".a | to_entries | g | key",
+            ".a | to_entries | g | parent",
+        ] {
+            let expr = substitute_func_param(
+                &parse(filter).expect("parses"),
+                "g",
+                &Expr::Shared(Rc::new(Expr::Identity)),
+            );
+            let result =
+                with_stack_budget(0, || eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)));
+            match result {
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "exceeded maximum recursion depth", "{filter}");
+                }
+                other => panic!("{filter}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// ADR-0025 (#3262): on a registered thread, recursion whose native stack
+    /// per level the frame count cannot predict refuses instead of overflowing
+    /// -- here on an 8 MiB thread, where the lazy-link chain would otherwise
+    /// abort the test binary within a few dozen levels.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_registered_thread_refuses_instead_of_overflowing_3262() {
+        const STACK: usize = 8 * 1024 * 1024;
+        let refused = std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(|| {
+                with_stack_budget(STACK, || {
+                    let expr = parse("def f(n): if n == 0 then 0 else f(n - 1 | .) end; f(100000)")
+                        .expect("parses");
+                    let json = b"null";
+                    let index = JsonIndex::build(json);
+                    match eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
+                        QueryResult::Error(e) => e.message,
+                        _ => String::new(),
+                    }
+                })
+            })
+            .expect("spawns")
+            .join()
+            .expect("refuses rather than overflowing the stack");
+        assert!(
+            refused.ends_with("exceeded maximum recursion depth"),
+            "{refused:?}"
+        );
+    }
+
+    /// ADR-0025 (#3262): an argument that is already a `Shared` is shared as
+    /// the node it wraps, not wrapped again, so a closure passed through a
+    /// recursion builds no chain.
+    #[test]
+    fn a_passed_through_argument_is_shared_not_rewrapped_3262() {
+        let inner = Rc::new(Expr::Literal(Literal::Int(1)));
+        let shared = share_def_call_args(&[
+            Expr::Shared(Rc::clone(&inner)),
+            Expr::Literal(Literal::Int(2)),
+        ]);
+        assert!(Rc::ptr_eq(&shared[0], &inner));
+        assert!(matches!(&*shared[1], Expr::Literal(Literal::Int(2))));
     }
 
     /// **The invariant the whole #820 design rests on**: with a sink that

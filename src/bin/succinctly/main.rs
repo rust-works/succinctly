@@ -1371,6 +1371,13 @@ fn try_multicall() -> Result<Option<i32>> {
 /// stack with the profile instead keeps *one* frame ceiling correct for both,
 /// so the tests exercise the same limit the shipped binary enforces. Reserved
 /// address space either way: pages are faulted in only as used.
+///
+/// **Registered with the evaluator (ADR-0025, #3262).** `main` arms
+/// `succinctly::jq::with_stack_budget` with this size, so a recursion of any
+/// shape refuses once it has used half of it -- the guarantee the frame count
+/// above could only approximate, since the stack a level costs ranges from
+/// ~1.4 KB to ~1 MB across ordinary programs. Changing this size therefore
+/// moves where deep recursion refuses, in proportion.
 const EVAL_STACK_SIZE: usize = if cfg!(debug_assertions) {
     2 * 1024 * 1024 * 1024
 } else {
@@ -1382,9 +1389,14 @@ fn main() -> Result<()> {
     // propagate its result. A panic in the child is resumed here rather than
     // swallowed, so panic behaviour (and the abort/backtrace a panic produces)
     // is exactly what it was when this ran on the main thread.
+    //
+    // ADR-0025: the thread's stack is registered with the evaluator, so a
+    // recursion of any shape refuses once it has spent half of it instead of
+    // overflowing -- registered first thing, where the stack still available
+    // and the thread's size agree.
     let child = std::thread::Builder::new()
         .stack_size(EVAL_STACK_SIZE)
-        .spawn(run_main)
+        .spawn(|| succinctly::jq::with_stack_budget(EVAL_STACK_SIZE, run_main))
         .context("failed to spawn the evaluation thread")?;
     match child.join() {
         Ok(result) => result,
