@@ -72016,10 +72016,9 @@ mod tests {
     #[test]
     fn settle_then_replay_keeps_order_and_stops_3296() {
         let source = |sink: &mut dyn FnMut(i32) -> Demand| {
+            // The collector never stops; the stop under test is the replay's.
             for i in 1..=3 {
-                if matches!(sink(i), Demand::Stop) {
-                    return Flow::Stopped { pending: None };
-                }
+                assert!(matches!(sink(i), Demand::Continue));
             }
             Flow::Exhausted
         };
@@ -72058,7 +72057,7 @@ mod tests {
                 ..
             } = parse(&format!("def f(n): {body}; {use_site}")).unwrap()
             else {
-                panic!("expected a def")
+                panic!("expected a def") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every source this helper parses starts with `def f(n): ...;` (#3296)"
             };
             let def = Rc::new(FuncDefData {
                 name,
@@ -72096,6 +72095,8 @@ mod tests {
             ("n", "f(1) | length"),
             // A nested def inside the body is not recognised.
             ("def g: n; g", "f(1)"),
+            // Nor is a call to the definition's name at another arity.
+            ("if n == 0 then 0 else f(n; n) end", "f(1)"),
         ] {
             assert!(
                 !settles_before_consumer(&operand(body, use_site)),
@@ -72115,7 +72116,7 @@ mod tests {
         // flat -- a pipe of `.` stages -- so neither the walk nor the drop
         // nests deeper than a test thread's stack allows.
         let Expr::DefCall { def, .. } = &call else {
-            panic!("expected a DefCall")
+            panic!("expected a DefCall") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: `f(1)` under `def f(n)` always installs as a DefCall, which the assert above has just settled (#3296)"
         };
         let with_arg = |stages: usize| Expr::DefCall {
             def: Rc::clone(def),
