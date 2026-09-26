@@ -36508,7 +36508,21 @@ fn cannot_move_register(expr: &Expr) -> bool {
             | Builtin::FromJson
             // #2764: produces nothing, so it navigates nothing --
             // `path(. as $x | [empty] | $x)` is `[]` in jq 1.7.1.
-            | Builtin::Empty => true,
+            | Builtin::Empty
+            // #3126: real jq's `stderr`/bare `debug` are `DUP;
+            // CALL_BUILTIN` -- a side effect plus the identity output,
+            // never touching the register (confirmed live:
+            // `path(. as {a:$q} | (debug|$q))` is `["a"]` in jq 1.7.1).
+            // `debug(msg)` is excluded on purpose: unlike an object's
+            // field values or a binary operator's operands, `msg` is
+            // *not* wrapped in jq's own `SUBEXP_BEGIN`/`SUBEXP_END` --
+            // confirmed live, `path(. as {a:$q} | (debug(.k)|$q))`
+            // refuses in jq 1.7.1 too (an out-of-bounds `.k` on `.`
+            // moves the register exactly as any other navigating stage
+            // would), so it correctly stays on the `_ => false` default
+            // below rather than joining this arm.
+            | Builtin::Stderr
+            | Builtin::Debug => true,
             // #2764: jq's `def recurse(f): def r: ., (f | r); r;` moves the
             // register only through `f`, and `recurse(f; cond)`'s `cond`
             // runs as `select(cond)`'s `if` condition, a subexp. Live
@@ -102096,6 +102110,40 @@ mod tests {
             let parsed = parse(src).unwrap();
             assert_eq!(is_identity_passthrough(&parsed), want, "{src}");
         }
+    }
+
+    /// #3126: a `stderr`/bare `debug` stage in path position must not drop
+    /// the register any more than a literal stage does -- both are `DUP;
+    /// CALL_BUILTIN` in real jq, a side effect plus the identity output,
+    /// never touching the register. Confirmed live against jq 1.7.1 for
+    /// every row below.
+    #[test]
+    fn test_stderr_debug_passthrough_keeps_path_register_3126() {
+        let doc = br#"{"a":{"b":1}}"#;
+        for filter in [
+            r"path(. as {a:$q} | (1 | $q))",
+            r#"path(. as {a:$q} | ("x"|stderr|$q))"#,
+            r"path(. as {a:$q} | (debug|$q))",
+        ] {
+            assert_eq!(outputs(doc, filter), [r#"["a"]"#], "{filter}");
+        }
+        // `debug(msg)` is excluded on purpose: unlike an object's field
+        // values, `msg` is not wrapped in jq's own subexp markers, so a
+        // navigating `msg` genuinely moves the register (confirmed live:
+        // `path(. as {a:$q} | (debug(.k)|$q))` on `{"a":{"b":1},"k":"m"}`
+        // refuses in jq 1.7.1 too).
+        let parsed = parse(r"debug(.k)").unwrap();
+        assert!(!cannot_move_register(&parsed));
+
+        // The `?//` masking repro from the issue: a caught refusal must not
+        // answer the handler's value where jq answers the path.
+        assert_eq!(
+            outputs(
+                b"null",
+                r#"[try path(. as {"a":{x:$q}} ?// $z | ("B\($q)"|stderr|$q)) catch "c"]"#
+            ),
+            [r#"[["a","x"]]"#]
+        );
     }
 
     /// yq mode mints no `SnapshotAt` at all (the same single-choke-point
