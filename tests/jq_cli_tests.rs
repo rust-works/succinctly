@@ -64134,6 +64134,26 @@ fn test_owned_embed_identity_through_relocating_builtins_3178() -> Result<()> {
             r"input | . as $x | {k:.} | .k | getpath([]) | path($x)",
             "[]",
         ),
+        // Reached after a navigation that lands short of the embed, and as a
+        // parenthesised stage.
+        (
+            &["-c"][..],
+            r#"{"a":[1]}"#,
+            r". as $x | {k:[.]} | .k | sort | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":[1]}"#,
+            r". as $x | {k:[.]} | .k | getpath([0]) | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":[1]}"#,
+            r". as $x | [.] | (sort) | path(.[0] | $x)",
+            "[0]",
+        ),
         // `getpath` reads a fractional index the way jq does, by truncation.
         (
             &["-c"][..],

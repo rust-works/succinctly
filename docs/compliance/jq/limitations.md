@@ -1135,7 +1135,14 @@ is the revert that established what the other one costs.
    filter or driver run over owned children
    ([#3305](https://github.com/rust-works/succinctly/issues/3305)); a full slice `.[0:2]` and a
    no-op `\|=` ([#3306](https://github.com/rust-works/succinctly/issues/3306)); and a `getpath` whose
-   path the owned route cannot read as a literal (`getpath([-0.5])`: `-0.5` is a negation).
+   path the owned route cannot read as a literal (`getpath([-0.5])`: `-0.5` is a negation). A
+   builtin reached through a `.[]` whose children are not themselves witnessed
+   (`[[.]] \| .[] \| sort \| .[0] \| path($x)`) still bridges: peeling that iterate per child
+   is the shape #2889 measured at +20%. So does a container that also holds a NaN read from the
+   input (`[.a, 1, $x] \| sort \| .[2] \| path($x)` with `.a` = `NaN`), which is not an identity
+   of the bridge. `unique` inherits the bridge's NaN comparison: jq merges two NaNs read from the
+   input, succinctly on both routes does not
+   ([#3309](https://github.com/rust-works/succinctly/issues/3309)).
    **[#3188](https://github.com/rust-works/succinctly/issues/3188), now closed: the same embed
    written through by `del` or an assignment.** jq's `del(f)`, `f = v`, `f |= g`, `f op= v` and
    `f //= v` are all `path(f)` followed by writes at the paths it yields, so
