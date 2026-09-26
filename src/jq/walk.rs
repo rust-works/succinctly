@@ -1064,7 +1064,7 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
         // explicit arm instead. Implemented anyway, exhaustively, so a
         // hypothetical new caller gets a reasoned default instead of a
         // temptation to add a wildcard.
-        Expr::Shared(inner) => Expr::Shared(Rc::new(f(inner))),
+        Expr::Shared(inner) => Expr::shared(f(inner)),
         Expr::Error(msg) => Expr::Error(msg.as_deref().map(|m| Box::new(f(m)))),
         Expr::Builtin(b) => Expr::Builtin(map_builtin_subexprs(b, f)),
         Expr::FuncDef {
@@ -2584,7 +2584,7 @@ mod tests {
     #[test]
     fn map_subexprs_shared_default_recurses() {
         let inner = Expr::Builtin(Builtin::Length);
-        let shared = Expr::Shared(Rc::new(inner.clone()));
+        let shared = Expr::shared(inner.clone());
         let mut calls = 0usize;
         let result = map_subexprs(&shared, &mut |e| {
             calls += 1;

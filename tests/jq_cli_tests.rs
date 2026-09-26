@@ -30486,15 +30486,17 @@ fn test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149() ->
 /// CLI's stack registered, each refuses once half of it is spent. jq answers
 /// all of them; the refusal is the recorded depth divergence, an exit-5 error
 /// rather than a process abort. No refusal *depth* is pinned: it follows the
-/// registered stack and the build profile (ADR-0025).
+/// registered stack and the build profile (ADR-0025). Since #3287 a pure link
+/// is read eagerly and runs far deeper, so the lazy links here carry a builtin
+/// (`select(true)`), which keeps them on the demand-driven path.
 #[test]
 fn test_recursion_refuses_before_the_native_stack_runs_out_3262() -> Result<()> {
     let deep_arg = format!("n{} - 1", " - 0".repeat(200));
     for body in [
         format!("def f(n): if n == 0 then 0 else f({deep_arg}) end;"),
-        "def f(n): if n == 0 then 0 else f(n - 1 | .) end;".to_string(),
-        "def f(n): def h: n - 1; if n == 0 then 0 else f(h) end;".to_string(),
-        "def g(x): x - 1; def f(n): if n == 0 then 0 else f(g(n)) end;".to_string(),
+        "def f(n): if n == 0 then 0 else f(n - 1 | select(true)) end;".to_string(),
+        "def f(n): def h: n - 1 | select(true); if n == 0 then 0 else f(h) end;".to_string(),
+        "def g(x): x - 1 | select(true); def f(n): if n == 0 then 0 else f(g(n)) end;".to_string(),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", &format!("{body} f(3000)")], None)?;
         assert_eq!(code, 5, "{body}: stdout: {stdout:?} stderr: {stderr:?}");
@@ -30577,12 +30579,13 @@ fn test_settled_operand_keeps_jq_order_3296() -> Result<()> {
 /// aborted the process, and answers shallow.
 #[test]
 fn test_argument_chain_refuses_on_the_path_routes_3262() -> Result<()> {
-    let def = "def f(n): if n == 0 then .a else f(n - 1 | .) end;";
+    let def = "def f(n): if n == 0 then .a else f(n - 1 | select(true)) end;";
     for (filter, input) in [
         (format!("{def} [path(f(3000))]"), r#"{"a":1}"#),
         (format!("{def} f(3000) |= 2"), r#"{"a":1}"#),
         (
-            "def f(n): if n == 0 then (.a | key) else f(n - 1 | .) end; f(3000)".to_string(),
+            "def f(n): if n == 0 then (.a | key) else f(n - 1 | select(true)) end; f(3000)"
+                .to_string(),
             r#"{"a":{"b":1}}"#,
         ),
     ] {
@@ -30597,7 +30600,8 @@ fn test_argument_chain_refuses_on_the_path_routes_3262() -> Result<()> {
         (format!("{def} [path(f(50))]"), r#"{"a":1}"#, r#"[["a"]]"#),
         (format!("{def} f(50) |= 2"), r#"{"a":1}"#, r#"{"a":2}"#),
         (
-            "def f(n): if n == 0 then (.a | key) else f(n - 1 | .) end; f(50)".to_string(),
+            "def f(n): if n == 0 then (.a | key) else f(n - 1 | select(true)) end; f(50)"
+                .to_string(),
             r#"{"a":{"b":1}}"#,
             r#""a""#,
         ),
@@ -30605,6 +30609,74 @@ fn test_argument_chain_refuses_on_the_path_routes_3262() -> Result<()> {
         let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
         assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
         assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// #3287: an argument-chain link that is pure and finite but not bare
+/// arithmetic -- a pipe, a nested `def` over the parameter, a helper `def` --
+/// took the demand-driven path, whose native stack per link capped these at
+/// ~115-155 levels (refused since #3262) where jq runs 100,000. Read eagerly,
+/// they answer, on the path routes too.
+#[test]
+fn test_pure_chain_links_recurse_deep_3287() -> Result<()> {
+    for body in [
+        "def f(n): if n == 0 then 0 else f(n - 1 | .) end;",
+        "def f(n): def h: n - 1; if n == 0 then 0 else f(h) end;",
+        "def g(x): x - 1; def f(n): if n == 0 then 0 else f(g(n)) end;",
+        "def f(n): if n == 0 then 0 else f(n as $m | $m - 1) end;",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &format!("{body} f(1000)")], None)?;
+        assert_eq!(code, 0, "{body}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), "0", "{body}");
+    }
+    let def = "def f(n): if n == 0 then .a else f(n - 1 | .) end;";
+    for (filter, expected) in [
+        (format!("{def} [path(f(1000))]"), r#"[["a"]]"#),
+        (format!("{def} f(1000) |= 2"), r#"{"a":2}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// #3287: a link is eager only when every argument it reads is too, each
+/// argument's answer remembered on it. An effect or generator at the base of
+/// a chain keeps every link above it lazy, so a consumer that stops early
+/// never runs what jq 1.7.1 never runs. `is_pure_chain_link`, which this
+/// replaced, took a nested argument on trust: the arithmetic-chain case here
+/// printed `BB` on `main`, and the two `def` shapes printed `SIDE`/`BB`
+/// under a first draft of #3287 that did the same.
+#[test]
+fn test_eager_link_stays_lazy_over_an_effect_3287() -> Result<()> {
+    for (filter, expected) in [
+        (
+            r#"def f(n): if n == 0 then n else f(n - 1) end; first(f((1, ("B"|stderr))))"#,
+            "0",
+        ),
+        (
+            r#"def g(x): x - 1; def f(n): if n <= 0 then n else f(g(n)) end; first(f((1, ("B"|stderr))))"#,
+            "0",
+        ),
+        (
+            r#"def outer(g): def inner: g; def id(x): x; first(id(inner)); outer((1, ("SIDE"|stderr)))"#,
+            "1",
+        ),
+        (
+            "def f(n): if n == 0 then n else f(n - 1 | .) end; [limit(1; f(1, 2))]",
+            "[0]",
+        ),
+        // Review: a `,` of costly alternatives stays lazy, so `first` never
+        // pays for the one it does not ask for. `debug` stands in for the
+        // cost, observable where time is not.
+        ("def g(n): first(n); def c: 2 | debug | . + 1; g(1, c)", "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+        assert_eq!(stderr, "", "{filter}: the effect must never run");
     }
     Ok(())
 }

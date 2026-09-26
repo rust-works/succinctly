@@ -9202,7 +9202,7 @@ mod tests {
     fn test_rewrite_namespaced_calls_passes_through_shared_and_defcall_1371() {
         use std::rc::Rc;
 
-        let shared = Expr::Shared(Rc::new(Expr::Identity));
+        let shared = Expr::shared(Expr::Identity);
         assert_eq!(rewrite_namespaced_calls(shared.clone()), shared);
 
         let def_call = Expr::DefCall {

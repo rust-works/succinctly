@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a recursion whose argument is a pipe or a `def` call runs ~60x
+  deeper** (#3287). `def f(n): ... f(n - 1 | .)`, a nested `def h: n - 1; ...
+  f(h)` and a helper `f(g(n))` read their argument through the demand-driven
+  evaluator, which refused past ~115-155 levels (#3262) where jq runs
+  100,000; they now reach ~8,500-9,600 on an Apple M5 Max. Any argument that is
+  pure and finite, and reads only arguments that are, is read eagerly, and the
+  answer is remembered on the argument, so a chain is classified once rather
+  than walked per read. The same check fixes a laziness leak: an arithmetic
+  chain over an effectful argument (`first(f((1, ("B" | stderr))))`) used to
+  run the effect jq never runs. A pipe over a deep argument chain also stops
+  re-walking the chain for path context on every link, which had made
+  `f(n - 1 | .)` cubic. `Expr::Shared` now holds `Rc<SharedArg>` (which
+  dereferences to the argument's `Expr`) instead of `Rc<Expr>`; build one with
+  `Expr::shared`.
+
 - **jq: a call tree no longer keeps one bound body per call** (#3148). Each
   call to a `def` binds a fresh copy of its body, and every call node cached
   its copy for the program's lifetime, so memory grew with the number of calls
@@ -270,7 +285,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the old guard admitted more than the stack could hold: plain bare recursion
   stops at ~10,000 levels (was 20,000, 3% short of a crash), bare `sum_to` at
   ~9,200 (was 13,297), and the lazy-link shapes at ~170-220, where jq, whose
-  call stack is on the heap, runs 100,000 (#3287). Library callers get the same guard by evaluating
+  call stack is on the heap, runs 100,000 (#3287, since lifted). Library callers get the same guard by evaluating
   inside `succinctly::jq::with_stack_budget`.
 
 - **jq: a malformed nested number raises when read instead of reading as `null`** (#3222).

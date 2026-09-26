@@ -61,9 +61,9 @@ use super::eval::{
     eval_each_owned, eval_full as full_eval, finish_fork_flow, finish_fork_from_flow,
     finish_short_circuit, fold_escaped_generator_prefix, foreach_forks, format_owned,
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
-    index_one_owned as index_owned_by_key, is_assignment_expr, is_identity_passthrough,
-    is_pure_chain_link, is_retryable_control, is_retryable_stop, key_arrays_eq, literal_to_owned,
-    mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
+    index_one_owned as index_owned_by_key, is_assignment_expr, is_eager_arg,
+    is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq,
+    literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
     owned_to_expr, owned_to_string, pattern_alternatives_var_names, prefer_pending_control,
     probe_def_call, range_from_literal_override, range_max_exceeded_error, range_num,
@@ -9374,11 +9374,12 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::Shared(_) if native_stack_exhausted() => {
             Flow::Escaped(Control::Error(shared_arg_depth_refusal()))
         }
-        Expr::Shared(inner) if matches!(&**inner, Expr::Shared(_)) => {
+        Expr::Shared(inner) if matches!(inner.expr(), Expr::Shared(_)) => {
             eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
         }
         Expr::Shared(inner) => {
-            if is_pure_chain_link(inner) {
+            // #3287: see `eval::is_eager_arg`.
+            if is_eager_arg(inner) {
                 drain_result_generic(eval_single::<S, V>(inner, value, optional, cursor), sink)
             } else {
                 eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
@@ -21954,9 +21955,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             frames: *frames,
             bound: BoundBody::default(),
         },
-        Expr::Shared(inner) => {
-            Expr::Shared(Rc::new(path_context_resolve_constants::<S>(inner, at)?))
-        }
+        Expr::Shared(inner) => Expr::shared(path_context_resolve_constants::<S>(inner, at)?),
         Expr::Alternative(left, right) => Expr::Alternative(boxed(left)?, boxed(right)?),
         // A `|=` is left as written: its filter stands at the *target* and is
         // positioned by `eval::update_path` from the prefix the caller

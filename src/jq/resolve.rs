@@ -1863,7 +1863,7 @@ fn check(
                 // Holding `original` keeps the pre-clone tree alive while it is
                 // paired with the copy -- and guarantees `make_mut` clones.
                 let original = Rc::clone(inner);
-                let target = Rc::make_mut(inner);
+                let target = Rc::make_mut(inner).expr_mut();
                 let rebased = rebase_reachable(&original, target, reachable);
                 check(
                     target,
@@ -1875,7 +1875,7 @@ fn check(
                     occurrences,
                 );
             } else {
-                check(Rc::make_mut(inner), scope, var_scope, label_scope, errors, reachable, occurrences);
+                check(Rc::make_mut(inner).expr_mut(), scope, var_scope, label_scope, errors, reachable, occurrences);
             }
         }
         Expr::DefCall { args, .. } => {
@@ -2915,14 +2915,14 @@ mod tests {
     fn a_called_def_inside_a_multi_owner_shared_is_checked() {
         let program = || parse("def g: nosuchfn; g").expect("filter must parse");
 
-        let mut unique = Expr::Shared(Rc::new(program()));
+        let mut unique = Expr::shared(program());
         assert_eq!(
             resolve_func_calls(&mut unique).map_err(|e| format!("{e}")),
             Err("nosuchfn/0 is not defined".into()),
             "uniquely owned: make_mut does not clone"
         );
 
-        let inner = Rc::new(program());
+        let inner = Rc::new(super::super::SharedArg::new(program()));
         let _keep = Rc::clone(&inner);
         let mut shared = Expr::Shared(inner);
         assert_eq!(
@@ -2932,7 +2932,9 @@ mod tests {
         );
 
         // And the gate still holds there: an uncalled def stays skipped.
-        let inner = Rc::new(parse("def g: nosuchfn; 1").expect("filter must parse"));
+        let inner = Rc::new(super::super::SharedArg::new(
+            parse("def g: nosuchfn; 1").expect("filter must parse"),
+        ));
         let _keep = Rc::clone(&inner);
         let mut shared = Expr::Shared(inner);
         assert_eq!(
@@ -3153,7 +3155,7 @@ mod tests {
         let mut errors = Vec::new();
         let mut occurrences = Occurrences::default();
         check(
-            &mut Expr::Shared(Rc::new(unresolved())),
+            &mut Expr::shared(unresolved()),
             &mut scope,
             &mut var_scope,
             &mut label_scope,
@@ -3232,7 +3234,7 @@ mod tests {
         let mut graph = BTreeMap::new();
         let mut roots = Vec::new();
         build_call_graph(
-            &Expr::Shared(Rc::new(call_to_f())),
+            &Expr::shared(call_to_f()),
             &mut scope,
             None,
             &mut graph,
