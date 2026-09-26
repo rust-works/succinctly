@@ -62951,7 +62951,9 @@ const DOLLAR_NAMESPACE_ONLY: SubstScope = SubstScope {
 /// rewrites only the bare one. A `$`-style parameter's own `$name`
 /// references used to be substituted here too, as the only thing that bound
 /// them at all; since #3149 they are bound by an `as` around the body
-/// instead (see [`bind_def_call_params`]), one value at a time, as jq does.
+/// instead (see [`bind_def_call_params`]), one value at a time, as jq does --
+/// except for a literal argument, which [`substitute_func_params_impl`]
+/// substitutes in the dollar namespace ([`DOLLAR_NAMESPACE_ONLY`], #3260).
 ///
 /// What narrows the substitution as the walk crosses each binder is
 /// [`SubstScope`] -- only a binder in the bare namespace clears it (#2555).
@@ -62975,9 +62977,9 @@ fn substitute_func_params_impl(expr: &Expr, subs: &[ParamSubst<'_>], scope: Scop
         // from being substituted *into the first argument*: arguments live in
         // the caller's scope and cannot mention the callee's own parameters.
         Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
-        // See `substitute_func_param`'s own doc comment above for why this
-        // exists at all (a `$`-style parameter's only binding mechanism).
-        // Gated on `scope.dollar`, the variable namespace -- the bare
+        // Reached only by a `$`-style parameter bound statically to a literal
+        // argument (#3260); any other one is bound by an `as` (#3149, see
+        // `substitute_func_param`'s doc comment). Gated on `scope.dollar`, the variable namespace -- the bare
         // `FuncCall` arm below reads `scope.bare` instead, and the two
         // narrow on different binders (#2555).
         Expr::Var(name) => match ScopeMask::resolve(scope.dollar, subs, name) {
