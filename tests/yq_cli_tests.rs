@@ -20,6 +20,37 @@ use tempfile::{NamedTempFile, TempDir};
 mod cargo_run_exit;
 use cargo_run_exit::{exit_code_or_signal_death, spawn_with_signal_retry};
 
+/// Pinned yq v4.53.3: a final `?` is optional navigation while earlier
+/// adjacent question marks belong to the field name (#3356).
+#[test]
+fn test_question_marks_in_yq_field_names_3356() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        (r#"{"x":1,"x?":2,"x??":3,"x?y":4}"#, ".x?", "1\n"),
+        (r#"{"x":1,"x?":2,"x??":3,"x?y":4}"#, ".x??", "2\n"),
+        (r#"{"x":1,"x?":2,"x??":3}"#, ".x???", "3\n"),
+        (r#"{"x":1,"x?":2,"x??":3,"x?y":4}"#, ".x?y", "4\n"),
+        (r#"{"x":1,"x?":2,"x??":3,"x?y":4}"#, ".x?y?", "4\n"),
+        (r#"{"x?y-z":7}"#, ".x?y-z?", "7\n"),
+        (r#"{"x?-y":7}"#, ".x?-y?", "7\n"),
+        (r#"{"x?--y":8}"#, ".x?--y?", "8\n"),
+        (r#"{"x?-":9}"#, ".x?-?", "9\n"),
+        (r#"{"x?1":9}"#, ".x?1", "9\n"),
+        (r#"{"x":1}"#, ".x??", "null\n"),
+        (r#"{"x":null}"#, ".x??", "null\n"),
+        ("{}", ".x??", "null\n"),
+        ("[1]", ".x??", ""),
+        ("1", ".x??", ""),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input} | {filter}"
+        );
+    }
+    Ok(())
+}
+
 /// Captured from yq v4.53.3 with JSON input and compact JSON output.
 #[test]
 fn test_pick_keys_on_json_cli_3026() -> Result<()> {
