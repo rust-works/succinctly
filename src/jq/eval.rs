@@ -95414,6 +95414,42 @@ mod tests {
         );
     }
 
+    /// #3362's fix, its `exprs.len() == 1` (bare-slot-through-this-bridge)
+    /// case and its yq-mode branch -- both called directly, since
+    /// `eval_path_context_pipe_owned` is a plain private fn any submodule
+    /// of this file can reach, and constructing the exact CLI-level route
+    /// that happens to land a single-element slice or a yq-mode call here
+    /// (rather than through `eval_builtin`'s own, already-mode-aware bare-
+    /// slot arm, or through the jq-mode multi-stage case the CLI-level test
+    /// above already covers) is far more indirect than the property this
+    /// pins: given `exprs = [Key]` alone, the answer is the placeholder
+    /// itself, not the placeholder piped through a further stage; given yq
+    /// mode, the answer is nothing at all, matching `root_path_context_placeholder`'s
+    /// own gate for the bare-slot case (#2421).
+    #[test]
+    fn test_path_context_pipe_owned_key_placeholder_gate_3362() {
+        let input = OwnedValue::Object(IndexMap::new().into());
+        match eval_path_context_pipe_owned::<Vec<u64>, JqSemantics>(
+            &[Expr::Builtin(Builtin::Key)],
+            &input,
+            false,
+        ) {
+            QueryResult::Owned(OwnedValue::Null) => {}
+            other => panic!("expected Owned(Null), got {other:?}"),
+        }
+        match eval_path_context_pipe_owned::<Vec<u64>, YqSemantics>(
+            &[
+                Expr::Builtin(Builtin::Key),
+                Expr::Builtin(Builtin::ToString),
+            ],
+            &input,
+            false,
+        ) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+    }
+
     /// #3122: [`eval_path_context_pipe_owned`]'s own marker-demotion
     /// precheck. `needs_path_context` deliberately does not recurse into a
     /// `?//`-alternative chain's body (`patterns.len() > 1`, mirroring its
