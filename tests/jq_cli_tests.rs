@@ -56588,48 +56588,33 @@ fn test_dollar_param_builtins_keep_their_own_error_2646() -> Result<()> {
     Ok(())
 }
 
-/// #2744: `nth(n)`/`reverse`/`indices(i)`/`index(i)`/`rindex(i)` are the
-/// third group #2646's static table could not answer for -- each needs a
-/// value the table is not given (the evaluated argument, or the input's
-/// own `length`), not a constant. Every row captured live from jq 1.7.1.
+/// #2744, `reverse` only: the one of the third group's three named
+/// builtins (`nth`/`reverse`/`indices`) this PR answers for --
+/// `nth`/`indices`/`index`/`rindex` need a value this table is not given
+/// (the *evaluated argument*), and a speculative evaluation purely to
+/// name it in the message either duplicates real evaluation's own side
+/// effects when it turns out not to raise, or mis-names a multi-output
+/// argument (jq forks and raises on the first value, not a collected
+/// array) -- found live during this PR's own review, and left for a
+/// follow-up (`builtin_navigation`'s own doc comment) since a correct fix
+/// needs the resolver to observe the argument's value inline, as part of
+/// real evaluation. `reverse` has no such argument -- only the input's
+/// own `length` -- so it carries none of that risk. Every row captured
+/// live from jq 1.7.1.
 #[test]
-fn test_argument_dependent_navigating_builtins_raise_inside_path_2744() -> Result<()> {
-    for (filter, doc, element) in [
-        (
-            "[path(([1,2,3] | nth(2)) | empty)]",
-            "{}",
-            "element 2 of [1,2,3]",
-        ),
-        (
-            "[path(([1,2,3] | nth(10)) | empty)]",
-            "{}",
-            "element 10 of [1,2,3]",
-        ),
-        (
-            "[path(([1,2,3] | nth(-1)) | empty)]",
-            "{}",
-            "element -1 of [1,2,3]",
-        ),
-        (
-            r#"[path(([1,2,3] | nth("x")) | empty)]"#,
-            "{}",
-            r#"element "x" of [1,2,3]"#,
-        ),
-        ("[path((true | nth(0)) | empty)]", "{}", "element 0 of true"),
+fn test_reverse_raises_inside_path_on_length_minus_one_2744() -> Result<()> {
+    for (filter, element) in [
         (
             "[path(([1,2,3] | reverse) | empty)]",
-            "{}",
             "element 2 of [1,2,3]",
         ),
-        ("[path((5 | reverse) | empty)]", "{}", "element 4 of 5"),
+        ("[path((5 | reverse) | empty)]", "element 4 of 5"),
         (
             r#"[path(("abc" | reverse) | empty)]"#,
-            "{}",
             r#"element 2 of "abc""#,
         ),
         (
             r#"[path(({"a":1} | reverse) | empty)]"#,
-            "{}",
             r#"element 0 of {"a":1}"#,
         ),
         // Past `i64`'s exact-`f64` range (`jq_int_within_exact_f64_range`),
@@ -56637,32 +56622,10 @@ fn test_argument_dependent_navigating_builtins_raise_inside_path_2744() -> Resul
         // reaches `owned_value_jq_length`'s `Float` arm rather than `Int`.
         (
             "[path((9223372036854775807 | reverse) | empty)]",
-            "{}",
             "9223372036854775807",
         ),
-        (
-            "[path(([1] | indices(1)) | empty)]",
-            "{}",
-            "element [1] of [1]",
-        ),
-        ("[path((5 | indices(1)) | empty)]", "{}", "element 1 of 5"),
-        (
-            "[path(([1,2] | indices([1,2])) | empty)]",
-            "{}",
-            "element [1,2] of [1,2]",
-        ),
-        (
-            "[path(([1,2] | index(2)) | empty)]",
-            "{}",
-            "element [2] of [1,2]",
-        ),
-        (
-            "[path(([1,2] | rindex(2)) | empty)]",
-            "{}",
-            "element [2] of [1,2]",
-        ),
     ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
         assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
         assert!(
             stderr.contains("Invalid path expression near attempt to access "),
@@ -56674,15 +56637,12 @@ fn test_argument_dependent_navigating_builtins_raise_inside_path_2744() -> Resul
 }
 
 /// #2744's boundary: `reverse` does not raise at all on a genuinely empty
-/// input (`length` of `0`), and `indices`/`index`/`rindex` never raise on a
-/// `string` input (`_strindices` is native, no jq-level navigation).
-/// Captured live from jq 1.7.1.
+/// input (`length` of `0`, #2730's own rule). Captured live from jq 1.7.1.
 #[test]
-fn test_argument_dependent_navigators_stay_silent_on_their_own_boundary_2744() -> Result<()> {
+fn test_reverse_stays_silent_on_a_genuinely_empty_input_2744() -> Result<()> {
     for filter in [
         "[path(([] | reverse) | empty)]",
         "[path((null | reverse) | empty)]",
-        r#"[path(("abc" | indices("b")) | empty)]"#,
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
         assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
@@ -56691,74 +56651,46 @@ fn test_argument_dependent_navigators_stay_silent_on_their_own_boundary_2744() -
     Ok(())
 }
 
-/// #2744: the argument's own error/empty always wins, and `reverse`'s own
-/// `length` call can itself raise (a bare `bool` has no length in jq) --
-/// neither is a path error. Same ordering rule #2646's
+/// #2744: `reverse`'s own `length` call can itself raise (a bare `bool`
+/// has no length in jq) -- not a path error. Same ordering rule #2646's
 /// `test_dollar_param_builtins_keep_their_own_error_2646` documents for
 /// `join`/`flatten`. Captured live from jq 1.7.1.
 #[test]
-fn test_argument_dependent_navigators_yield_to_their_own_argument_2744() -> Result<()> {
-    for (filter, needle) in [
-        (r#"[path(([1,2,3] | nth(error("boom"))) | empty)]"#, "boom"),
-        (
-            r#"[path(([1,2,3] | indices(error("boom"))) | empty)]"#,
-            "boom",
-        ),
-        (
-            r#"[path(("abc" | indices(error("boom"))) | empty)]"#,
-            "boom",
-        ),
-        (
-            "[path((true | reverse) | empty)]",
-            "boolean (true) has no length",
-        ),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
-        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
-        assert!(
-            !stderr.contains("Invalid path expression"),
-            "{filter}: the argument's own error must win: {stderr:?}"
-        );
-        assert!(stderr.contains(needle), "{filter}: {stderr:?}");
-    }
-    // An empty-producing argument suppresses to no output, exit 0 -- never
-    // a raised path error. Checked for both `nth` and `indices`: each has
-    // its own `eval_owned_expr_full` call site in `builtin_navigation`'s
-    // `Ok(None)` arm.
-    for filter in [
-        "[path(([1,2,3] | nth(empty)) | empty)]",
-        "[path(([1,2,3] | indices(empty)) | empty)]",
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
-        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
-        assert_eq!(stdout.trim(), "[]", "{filter}");
-    }
+fn test_reverse_yields_to_its_own_length_failure_2744() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[path((true | reverse) | empty)]"], Some("{}"))?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        !stderr.contains("Invalid path expression"),
+        "length's own error must win: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("boolean (true) has no length"),
+        "{stderr:?}"
+    );
     Ok(())
 }
 
 /// #2744, the one *write* whose output moved: `setpath`/`del` consume
 /// `path()`'s output, so a `try` on a later pipe stage cannot reach an
-/// error `nth`/`reverse`/`indices` themselves already raised -- same
-/// #3271-style catchability check its own test makes for its builtin set.
-/// Captured live from jq 1.7.1.
+/// error `reverse` itself already raised -- same #3271-style catchability
+/// check its own test makes for its builtin set. Captured live from jq
+/// 1.7.1.
 #[test]
-fn test_argument_dependent_navigators_raise_unconditionally_2744() -> Result<()> {
-    for filter in [
-        r"del(. as $x | [([1,2,3] | nth(2))] | try .[0])",
-        r"del(. as $x | [([1,2,3] | reverse)] | try .[0])",
-        r"del(. as $x | [([1] | indices(1))] | try .[0])",
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
-        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
-        assert!(
-            stderr.contains("Invalid path expression near attempt to access "),
-            "{filter}: {stderr:?}"
-        );
-    }
+fn test_reverse_raises_unconditionally_2744() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r"del(. as $x | [([1,2,3] | reverse)] | try .[0])"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("Invalid path expression near attempt to access "),
+        "{stderr:?}"
+    );
     // A `try`/`?` directly on the raising construct still catches it.
     for filter in [
-        r"del(try ([1,2,3] | nth(2)))",
-        r"del(. as $x | try ([1,2,3] | nth(2)) | $x)",
+        r"del(try ([1,2,3] | reverse))",
+        r"del(. as $x | try ([1,2,3] | reverse) | $x)",
     ] {
         let (stdout, code) = run_jq_stdin(filter, r#"{"a":1}"#, &["-c"])?;
         assert_eq!(code, 0, "{filter}: stdout {stdout:?}");
