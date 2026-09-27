@@ -35631,6 +35631,20 @@ enum RefusalShape {
 /// (#3283 step 3).
 fn live_path_refusal(expr: &Expr) -> Option<RefusalShape> {
     match expr {
+        // `with_entries`/`unique`/`unique_by`/`sub`/`gsub` (with or without
+        // flags) all raise "iterate through" a derived container their own
+        // jq definition builds and then iterates. `ascii_downcase`/
+        // `ascii_upcase`/the `match`/`scan`/`capture`/`splits` family raise
+        // the exact same way (#2743's other row) -- these never raised at
+        // all before that fix (succinctly answered `[]`/exit 0 where jq
+        // raises), rather than raising with an approximate container.
+        // `ascii_downcase`/`ascii_upcase` are jq-defined via `explode |
+        // map(...) | implode` and `match`/`scan`/`capture`/`splits` via
+        // `_match_impl`, both `.[]`-shaped in jq's own definition (jq's
+        // message: "iterate through" a derived intermediate this resolver
+        // cannot reproduce, the same approximation tradeoff as the
+        // `WithEntries`/`Unique` group). Confirmed live against jq 1.7.1
+        // for every member of both groups.
         Expr::Builtin(
             Builtin::WithEntries(_)
             | Builtin::Unique
@@ -35638,26 +35652,8 @@ fn live_path_refusal(expr: &Expr) -> Option<RefusalShape> {
             | Builtin::Sub(_, _)
             | Builtin::SubFlags(_, _, _)
             | Builtin::Gsub(_, _)
-            | Builtin::GsubFlags(_, _, _),
-        ) => Some(RefusalShape::NearIterate),
-        // `map_values` and every update assignment are all jq-defined atop
-        // `_modify`, whose bookkeeping always raises the same element-0
-        // access once it runs at all.
-        Expr::Builtin(Builtin::MapValues(_))
-        | Expr::Update { .. }
-        | Expr::CompoundAssign { .. }
-        | Expr::AlternativeAssign { .. } => Some(RefusalShape::NearAccessInt0),
-        // #2743's other row: these never raised at all (succinctly answered
-        // `[]`/exit 0 where jq raises), rather than raising with an
-        // approximate container -- confirmed live against jq 1.7.1 for
-        // every one of them. `ascii_downcase`/`ascii_upcase` are jq-defined
-        // via `explode | map(...) | implode` and `match`/`scan`/`capture`/
-        // `splits` via `_match_impl`, both `.[]`-shaped in jq's own
-        // definition (jq's message: "iterate through" a derived
-        // intermediate this resolver cannot reproduce -- same approximation
-        // tradeoff as the `WithEntries`/`Unique` arm above).
-        Expr::Builtin(
-            Builtin::AsciiDowncase
+            | Builtin::GsubFlags(_, _, _)
+            | Builtin::AsciiDowncase
             | Builtin::AsciiUpcase
             | Builtin::Match(_)
             | Builtin::MatchFlags(_, _)
@@ -35668,6 +35664,13 @@ fn live_path_refusal(expr: &Expr) -> Option<RefusalShape> {
             | Builtin::Splits(_)
             | Builtin::SplitsFlags(_, _),
         ) => Some(RefusalShape::NearIterate),
+        // `map_values` and every update assignment are all jq-defined atop
+        // `_modify`, whose bookkeeping always raises the same element-0
+        // access once it runs at all.
+        Expr::Builtin(Builtin::MapValues(_))
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. } => Some(RefusalShape::NearAccessInt0),
         // `fromstream(f)` is jq-defined via a `foreach`/`reduce` accumulator
         // keyed `{x: null, e: false}` (`x` holding the value under
         // construction); jq's own message names that accumulator and
@@ -35696,9 +35699,16 @@ fn array_reaches_object(value: &OwnedValue) -> bool {
     }
 }
 
+/// `walk_input_reaches_object` is [`array_reaches_object`] of the leaf's own
+/// input, computed once by the caller rather than recomputed on every value
+/// this function is asked about: `expr` (and so the answer) is fixed for
+/// the whole `eval_each_owned` drive at a call site, and a multi-output
+/// `Builtin::Walk(f)` (an `f` that itself yields more than once at some
+/// node) calls this function once per produced value, which would otherwise
+/// re-walk the same input tree each time for no reason.
 fn always_refuses_as_live_path<S: EvalSemantics>(
     expr: &Expr,
-    input: &OwnedValue,
+    walk_input_reaches_object: bool,
     computed: &OwnedValue,
 ) -> Option<EvalError> {
     if S::TAG != EvalTag::Jq {
@@ -35722,7 +35732,7 @@ fn always_refuses_as_live_path<S: EvalSemantics>(
         // `array_reaches_object`'s own doc comment. Subsumes the old
         // top-level check (`array_reaches_object` also answers `true` for a
         // bare `OwnedValue::Object`).
-        Expr::Builtin(Builtin::Walk(_)) if array_reaches_object(input) => Some(
+        Expr::Builtin(Builtin::Walk(_)) if walk_input_reaches_object => Some(
             EvalError::invalid_path_expression_near_access(&OwnedValue::Int(0), computed),
         ),
         _ => None,
@@ -35833,6 +35843,9 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     // value, never before it exists. See `always_refuses_as_live_path`'s
     // own doc comment for why this must run here and not as a pre-check.
     let mut construct_refusal: Option<EvalError> = None;
+    // `value` (this leaf's own input) is fixed for the whole drive below --
+    // computed once rather than once per produced value.
+    let walk_input_reaches_object = array_reaches_object(value);
     let flow = eval_each_owned::<S>(
         expr,
         value,
@@ -35840,7 +35853,7 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
         Reentry::at_register(trackable),
         &mut |v| {
             delivered += 1;
-            if let Some(e) = always_refuses_as_live_path::<S>(expr, value, &v) {
+            if let Some(e) = always_refuses_as_live_path::<S>(expr, walk_input_reaches_object, &v) {
                 construct_refusal = Some(e);
                 return Demand::Stop;
             }
@@ -36168,13 +36181,16 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     // actually produced it, never as a pre-check. See
     // `always_refuses_as_live_path`'s own doc comment.
     let mut construct_refusal: Option<EvalError> = None;
+    // `value` (this leaf's own input) is fixed for the whole drive below --
+    // computed once rather than once per produced value.
+    let walk_input_reaches_object = array_reaches_object(value);
     let flow = eval_each_owned::<S>(
         expr,
         value,
         false,
         Reentry::at_register(trackable),
         &mut |v| {
-            if let Some(e) = always_refuses_as_live_path::<S>(expr, value, &v) {
+            if let Some(e) = always_refuses_as_live_path::<S>(expr, walk_input_reaches_object, &v) {
                 construct_refusal = Some(e);
                 return Demand::Stop;
             }
@@ -36708,21 +36724,19 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
             | Builtin::All
             | Builtin::Flatten,
         ) => true,
-        // #3283: `map(f)`/`any(f)`/`all(f)` run `f` on jq-tracked elements,
-        // but this resolver evaluates `f` by value, so admit only an `f`
-        // that navigates nothing at all -- a navigating-but-tracked `f`
-        // (`map(.a)`, `all(.a)`, `map(first)`) needs its own predicate with
-        // its own oracle rows, a follow-up, not this PR (`[map({k:1}|.k)]`
-        // and `[any({k:1}|.k)]` still raise in jq, and admitting them here
-        // would fabricate `[]`).
-        Expr::Builtin(Builtin::Map(f) | Builtin::AnyF(f) | Builtin::AllF(f)) => {
+        // #3283: `map(f)`/`any(f)`/`all(f)`/`walk(f)` all run `f` on
+        // jq-tracked elements, but this resolver evaluates `f` by value, so
+        // admit only an `f` that navigates nothing at all -- a
+        // navigating-but-tracked `f` (`map(.a)`, `all(.a)`, `map(first)`)
+        // needs its own predicate with its own oracle rows, a follow-up,
+        // not this PR (`[map({k:1}|.k)]` and `[any({k:1}|.k)]` still raise
+        // in jq, and admitting them here would fabricate `[]`). `walk(f)`'s
+        // own nested-object refusal is a separate, value-dependent
+        // question `always_refuses_as_live_path`'s own `Walk` arm answers
+        // (step 3, `array_reaches_object`), not this predicate's.
+        Expr::Builtin(Builtin::Map(f) | Builtin::AnyF(f) | Builtin::AllF(f) | Builtin::Walk(f)) => {
             cannot_move_register(f)
         }
-        // #3283: `walk(f)` also runs `f` on every node `map(w)`/`map_values(w)`
-        // constructs, so `f` must navigate nothing either -- the nested-object
-        // refusal itself is `always_refuses_as_live_path`'s `Walk` arm's job
-        // (step 3, `array_reaches_object`), not this predicate's.
-        Expr::Builtin(Builtin::Walk(f)) => cannot_move_register(f),
         // #3284: every construct `always_refuses_as_live_path` raises on
         // unconditionally (#3271's set) is, by that same fact, one the
         // resolver checks exactly as jq's own internal path-check does: it
@@ -36732,10 +36746,15 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // (rather than re-listing the same builtins here) follows
         // `CLAUDE.md`'s "duplicated predicates diverge silently" rule.
         // `Walk`/`FromEntries` are deliberately not members of that
-        // classifier (both stay value-dependent) and so never reach this
-        // arm; `Walk` has its own arm just above, and `FromEntries` stays
-        // refused until its own `always_refuses_as_live_path` follow-up
-        // closes the gap named in step 7.
+        // classifier and so never reach this arm, for two different
+        // reasons: `Walk` has its own arm just above because its refusal
+        // is genuinely value-dependent (`array_reaches_object`). `FromEntries`
+        // is not value-dependent at all -- confirmed live against jq 1.7.1,
+        // it raises unconditionally on every input tried, empty or not --
+        // it simply has no `always_refuses_as_live_path`/`live_path_refusal`
+        // arm of its own *yet*; adding one is the gap named in step 7's
+        // follow-up, after which `FromEntries` becomes eligible for this
+        // same catch-all with no further change here.
         e if live_path_refusal(e).is_some() => true,
         other => cannot_move_register(other),
     }
@@ -103100,7 +103119,12 @@ mod tests {
             ),
         ] {
             assert!(
-                always_refuses_as_live_path::<JqSemantics>(&expr, &value, &value).is_none(),
+                always_refuses_as_live_path::<JqSemantics>(
+                    &expr,
+                    array_reaches_object(&value),
+                    &value
+                )
+                .is_none(),
                 "{expr:?} / {value:?}"
             );
         }
@@ -103139,7 +103163,12 @@ mod tests {
         ] {
             let value = OwnedValue::Object(IndexMap::new().into());
             assert!(
-                always_refuses_as_live_path::<YqSemantics>(&expr, &value, &value).is_none(),
+                always_refuses_as_live_path::<YqSemantics>(
+                    &expr,
+                    array_reaches_object(&value),
+                    &value
+                )
+                .is_none(),
                 "{expr:?}"
             );
         }
@@ -103169,6 +103198,17 @@ mod tests {
             (r"[1,2,3]", r"del(. as $x | [all(. > 1)] | $x[0])", r"[2,3]"),
             (r"[1,2]", r"del(. as $x | [walk(.)] | $x[0])", r"[2]"),
             (r#"{"k":1}"#, r"del(. as $x | (.k = 3) | $x.k)", r"{}"),
+            // Array-wrapped, not just the bare stage just above.
+            (r#"{"k":1}"#, r"del(. as $x | [.k = 3] | $x.k)", r"{}"),
+            // A `map`/`walk` argument that itself succeeds by assignment
+            // (not just navigates nothing at all) is still admitted, since
+            // `cannot_move_register`'s new `Assign` arm feeds directly into
+            // this one -- confirmed live against jq 1.7.1.
+            (
+                r#"[{"a":1},{"a":2}]"#,
+                r"del(. as $x | [map(.a = 3)] | $x[0])",
+                r#"[{"a":2}]"#,
+            ),
         ] {
             assert_eq!(outputs(doc.as_bytes(), filter), [expected], "{filter}");
         }
@@ -103181,6 +103221,24 @@ mod tests {
             ),
             [r#"{"k":1}"#]
         );
+        // A `try`-wrapped `map`/`walk` navigating argument is a different
+        // code path entirely (the `Try { catch: None, .. } => true` arm
+        // below, not the `Map`/`Walk` arm's own `cannot_move_register(f)`
+        // gate) -- confirmed live against jq 1.7.1 that it still matches.
+        for (doc, filter, expected) in [
+            (
+                r#"{"arr":[{"a":1},{"a":2}],"k":1}"#,
+                r"del(. as $x | [try (.arr|map(.a))] | $x.k)",
+                r#"{"arr":[{"a":1},{"a":2}]}"#,
+            ),
+            (
+                r#"{"arr":[{"a":1}],"k":1}"#,
+                r"del(. as $x | [try (.arr|walk(.a))] | $x.k)",
+                r#"{"arr":[{"a":1}]}"#,
+            ),
+        ] {
+            assert_eq!(outputs(doc.as_bytes(), filter), [expected], "{filter}");
+        }
         // Negative rows: a `map`/`any`/`all` argument that itself navigates
         // still refuses -- admitting it would fabricate `[]` where jq
         // raises (`[map({k:1}|.k)]`/`[any({k:1}|.k)]` on tracked input).
@@ -103252,6 +103310,15 @@ mod tests {
         ] {
             assert_eq!(outputs(br#"{"a":1}"#, filter), [r"{}"], "{filter}");
         }
+        // `fromstream` uncaught, not just under `try` above -- still raises
+        // (the same #2743 approximate-container class, message only).
+        query!(
+            br#"{"a":1,"k":1}"#,
+            r"del(. as $x | [fromstream(.a|tostream)] | $x.k)",
+            QueryResult::Error(e) => {
+                assert!(is_resolver_refusal(&e), "{}", e.message);
+            }
+        );
         assert_eq!(
             outputs(
                 br#"[{"key":"a","value":1}]"#,
