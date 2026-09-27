@@ -1321,16 +1321,33 @@ is the revert that established what the other one costs.
    confirmed pre-existing (reproduces byte-for-byte on the commit before #2042), not caused by
    this change. **#2646 is now fixed** — `builtin_navigation` (`src/jq/eval.rs`) answers what
    each jq-defined navigating builtin indexes, and `resolve_leaf`'s `!trackable` guard raises
-   on it. Two groups remain, deliberately, and are divergences in their own right:
+   on it. Three groups remain, deliberately, and are divergences in their own right:
 
    | Still diverging                                                                     | jq 1.7.1                                        | succinctly | Tracked                                                                  |
    | ----------------------------------------------------------------------------------- | ----------------------------------------------- | ---------- | ------------------------------------------------------------------------ |
    | `[path(([1] \| unique) \| empty)]`, and `unique_by`/`map_values`/`with_entries`, `walk` on an *object*, `sub`/`gsub` (with or without flags), `ascii_downcase`/`ascii_upcase`, `fromstream(f)`, the `match`/`scan`/`capture`/`splits` family, and every update assignment (`\|=`, a compound `op=`, `//=`; plain `=` is exempt, #3186) | raises, naming a **derived** container (`iterate through [[1]]`) once the construct's own type-check and argument evaluation have already succeeded | raises the same `ErrorKind::UntrackedNavigation` (ordinarily catchable, same as jq — confirmed live, `try with_entries(.)` and `try (.k \|= 3)` are both caught in both tools), naming the value the construct actually produced rather than jq's `to_entries`/`group_by`/`match`/`_modify`/`explode`/`foreach`-accumulator intermediate. Checked only *after* by-value evaluation succeeds, so jq's own type error, or an `error(...)`/`empty` from an argument or right-hand side, still wins exactly as it did before — a first cut of this fix checked `expr`'s bare shape before evaluating it and wrongly pre-empted all of those | [#3271](https://github.com/rust-works/succinctly/issues/3271) and #2743's own follow-through, fully narrowing [#2743](https://github.com/rust-works/succinctly/issues/2743) |
    | `[path(([1,2,3] \| nth(2)) \| empty)]`, and `indices`/`index`/`rindex`; `INDEX(f)` and `transpose` | raises; element depends on an argument this table cannot evaluate without a probe that duplicates real evaluation's side effects or mis-handles a multi-output argument (found live during #2744's own review) | `[]`       | [#3347](https://github.com/rust-works/succinctly/issues/3347), split off [#2744](https://github.com/rust-works/succinctly/issues/2744) |
-   | `[path(([1] \| last(.[])) \| empty)]`, and `isempty(f)`/`any(gen;cond)`/`all(gen;cond)`/`INDEX(gen;f)` | raises — the *argument* navigates                | `[]`       | [#2746](https://github.com/rust-works/succinctly/issues/2746) |
+   | `[path(([1] \| any(.[]; .)) \| empty)]`, and `all(gen;cond)` | raises — the argument navigates, but stopping needs a real per-element `cond` short-circuit interleaved with path-tracked resolution, a shape the fix for `last(f)`/`isempty(f)`/`INDEX(gen;f)` (a fixed bound or unconditional drain, no data-dependent stop; #2746, now fixed) cannot express safely | `[]`       | [#3349](https://github.com/rust-works/succinctly/issues/3349), split off [#2746](https://github.com/rust-works/succinctly/issues/2746) |
 
    The rule is **jq-mode only** (ADR-0018): `map`, `any`, `all` and `flatten` are real yq
    builtins, and yq v4.53.3 raises for none of them, so `succinctly yq` does not either.
+
+   **#2746's own fix introduced one further, separate divergence, on the register rather
+   than on navigation**: `last(f)`/`INDEX(gen;f)` are `reduce`-based in jq's own definitions,
+   and this resolver treats a `reduce`-based stage as opaque for register-preservation
+   purposes (the same pre-existing rule already documented above for bare `reduce`/`foreach`
+   and `first(...)`) — so a `$x` bound *before* one of these two stages is no longer
+   recognized as still being the live register *after* it, even though the stage's own result
+   is discarded. Confirmed live against jq 1.7.1: `[1,2,3] | path(. as $x \| last(.[]) \| $x)`
+   is `[[]]` in jq (the register genuinely survives in the C implementation — `$x` is still
+   `.` itself) but raises `Invalid path expression with result [1,2,3]` here; same for
+   `INDEX(.[]; .)`. `isempty(f)` is not `reduce`-based, and its own answer already matches jq
+   (both raise) by coincidence of jq's own bytecode, not because either tool "preserves" the
+   register in the sense described above. Pinned by
+   `test_argument_navigation_builtins_drop_the_register_like_reduce_2746`
+   (`tests/jq_cli_tests.rs`). Not tracked by a separate issue: it is the same class of
+   divergence the `reduce`/`foreach`/`first(...)` allowlist above already accepts, extended to
+   two more `reduce`-based builtins by #2746's own fix, rather than a new kind of gap.
 
    [#2072](https://github.com/rust-works/succinctly/issues/2072) supplied the missing
    half of that but deliberately did not spend it here. `Expr::TrackedVar` now carries a

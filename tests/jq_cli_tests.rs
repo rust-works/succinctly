@@ -56699,6 +56699,171 @@ fn test_reverse_raises_unconditionally_2744() -> Result<()> {
     Ok(())
 }
 
+/// #2746: `last(f)`, `isempty(f)` and `INDEX(stream; idx_expr)` navigate
+/// their own argument, and that argument's navigation was previously
+/// evaluated by value, never through the resolver -- an untracked value
+/// inside it (a literal array feeding `.[]`, not the live input) raised
+/// nothing where jq raises `Invalid path expression near attempt to
+/// iterate through [1]`. Captured live from jq 1.7.1.
+#[test]
+fn test_argument_navigation_raises_on_an_untracked_value_2746() -> Result<()> {
+    for filter in [
+        "[path(([1] | last(.[])) | empty)]",
+        "[path(([1] | isempty(.[])) | empty)]",
+        "[path(([1] | INDEX(.[]; .)) | empty)]",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression near attempt to iterate through [1]"),
+            "{filter}: {stderr:?}"
+        );
+    }
+    // The write-side consequence: `del()` on the same construct raises too,
+    // and a `try` directly on the raising construct still catches it.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "del([1] | last(.[]))"], Some("{}"))?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("Invalid path expression near attempt to iterate through [1]"),
+        "{stderr:?}"
+    );
+    for filter in [
+        r"del(try ([1] | last(.[])))",
+        r"del(try ([1] | isempty(.[])))",
+        r"del(try ([1] | INDEX(.[]; .)))",
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "{}", &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), "{}", "{filter}");
+    }
+    Ok(())
+}
+
+/// #2746's boundary: each builtin's own result is a computed value, never a
+/// path into the document, so `path(...)` on the bare construct (nothing
+/// discarding it with `| empty`) raises `Invalid path expression with
+/// result ...` naming that computed value -- exactly like `[f]`'s own
+/// boundary, and unlike `first`/`limit`/`nth`, which forward the argument's
+/// own live path. A genuinely empty generator raises nothing at all, since
+/// none of the three ever navigate anything in that case. Captured live
+/// from jq 1.7.1.
+#[test]
+fn test_argument_navigation_builtins_forward_a_computed_result_2746() -> Result<()> {
+    for (filter, result) in [
+        ("path(last(.[]))", "result null"),
+        ("path(isempty(.[]))", "result true"),
+        ("path(INDEX(.[]; .))", "result {}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with") && stderr.contains(result),
+            "{filter}: {stderr:?}"
+        );
+    }
+    // Not discarded, and not navigated by `path()` at all: plain value mode
+    // on the same empty-generator inputs is unaffected.
+    for (filter, expected) in [
+        ("last(.[])", "null"),
+        ("isempty(.[])", "true"),
+        ("INDEX(.[]; .)", "{}"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "{}", &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2746: `last`/`isempty`/`INDEX(gen;f)` are "opaque" stages for
+/// register-preservation purposes, the same pre-existing rule
+/// `docs/compliance/jq/limitations.md` already documents for
+/// `reduce`/`foreach`/`first(...)`: a `$x` bound before the stage is still
+/// itself, but this resolver does not carry the *live register* through the
+/// stage, so `path(. as $x | last(.[]) | $x)` raises "Invalid path
+/// expression with result [1,2,3]" rather than naming a path. `last`/`INDEX`
+/// (both `reduce`-based in jq's own definitions) diverge from real jq here
+/// exactly as the pre-existing `add`/bare `reduce` already do (jq answers
+/// `[[]]` -- the register genuinely survives in the C implementation) -- an
+/// already-documented, unrelated divergence, not something #2746 introduces
+/// or is scoped to fix. `isempty` is not `reduce`-based, and its own answer
+/// happens to already match jq (both raise). All three confirmed live
+/// against jq 1.7.1.
+#[test]
+fn test_argument_navigation_builtins_drop_the_register_like_reduce_2746() -> Result<()> {
+    for filter in [
+        "path(. as $x | last(.[]) | $x)",
+        "path(. as $x | isempty(.[]) | $x)",
+        "path(. as $x | INDEX(.[]; .) | $x)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2,3]"))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with") && stderr.contains("[1,2,3]"),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2746: nested inside `[...]`, `last(f)`/`isempty(f)`/`INDEX(gen;f)` are
+/// resolved by the `Array` arm's own discarding sink, which -- unlike
+/// `path()`'s own top-level collector -- keeps asking for more once it
+/// receives one, exercising the `Demand::Continue` side of each new arm's
+/// own `match sink(result)` (the `Demand::Stop` side is already reached by
+/// every other test in this group, where the stage is the pipeline's last).
+/// Captured live from jq 1.7.1.
+#[test]
+fn test_argument_navigation_builtins_continue_when_nested_in_an_array_2746() -> Result<()> {
+    for (filter, expected) in [
+        ("[path([last(.[]), 5])]", "[3,5]"),
+        ("[path([isempty(.[]), 5])]", "[false,5]"),
+        ("[path([INDEX(.[]; .), 5])]", r#"[{"1":1,"2":2,"3":3},5]"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2,3]"))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with") && stderr.contains(expected),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2746: `INDEX(gen;f)`'s own `idx_expr` error aborts the whole
+/// construction with no partial object, matching `reduce`'s "only the final
+/// value is observable" semantics -- the same rule `build_upper_index`'s own
+/// doc comment already states for its value-mode counterpart, now also true
+/// through the path-tracked resolver. Captured live from jq 1.7.1.
+#[test]
+fn test_index_stream_idx_expr_error_aborts_construction_2746() -> Result<()> {
+    for filter in [
+        r#"INDEX(.[]; error("boom"))"#,
+        r#"path(INDEX(.[]; error("boom")))"#,
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "[1,2,3]", &["-c"])?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+    }
+    Ok(())
+}
+
+/// #2746: an `idx_expr` producing *more than one* key for the same row
+/// inserts the row under every key (matching `build_upper_index`'s own
+/// "later duplicate keys overwriting earlier ones" fold, here exercised
+/// through the path-tracked resolver's own single-pass construction, which
+/// clones the row for every key but its last). Captured live from jq 1.7.1.
+#[test]
+fn test_index_stream_multi_key_row_reaches_every_key_2746() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(INDEX(.[]; ., .+10))"], Some("[1,2,3]"))?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"1":1,"11":1,"2":2,"12":2"#),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2646: the raise is independent of the input's type for every entry but
 /// `walk` -- `first` on a scalar still reports `element 0 of 5`, matching
 /// jq, rather than being skipped as "not a container". `walk` is the one
