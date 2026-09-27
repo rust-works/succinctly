@@ -149,7 +149,7 @@ pub(crate) use value::assert_depth;
 // detail of `format_number_jq_compat`'s fast path -- not something an
 // external caller has any use for, and not a contract worth freezing on
 // docs.rs.
-pub(crate) use value::is_jq_canonical_number;
+pub(crate) use value::{is_jq_canonical_number, jq_canonical_number_prefix};
 // `pub(crate)` (#2542): `yaml::light`'s yq-mode float formatters
 // (`format_float_with_fraction`, `format_float_yq_yaml`,
 // `format_float_yq_with`) share this exact-tie correction with

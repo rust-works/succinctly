@@ -2824,9 +2824,9 @@ use crate::jq::document::{
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
 use crate::jq::{
-    format_number_jq_compat, is_jq_canonical_number, nesting_depth_exceeded_message,
-    nonfinite_display_string, EvalError, JqSemantics, OwnedValue, YqSemantics,
-    MAX_VALUE_TREE_DEPTH,
+    format_number_jq_compat, is_jq_canonical_number, jq_canonical_number_prefix,
+    nesting_depth_exceeded_message, nonfinite_display_string, EvalError, JqSemantics, OwnedValue,
+    YqSemantics, MAX_VALUE_TREE_DEPTH,
 };
 
 /// A [`JsonError`] as the uncatchable decode failure (#1620) every
@@ -3208,18 +3208,29 @@ fn scan_canonical_literal(bytes: &[u8], pos: usize, literal: &[u8]) -> Option<us
 }
 
 /// The number-token rule from `canonical_compact_jq_span_end`'s own doc
-/// comment: the maximal `[-+.eE0-9]*` run is jq's own canonical spelling
-/// iff [`is_jq_canonical_number`] says so. The span itself comes from
-/// [`nested_number_span`] (#2919 review) rather than a second,
-/// independently maintained copy of the same greedy character-class loop
-/// -- see `number_literal_end`'s #1218 survey doc comment for why this
-/// caller reuses it instead of counting as a fifth independent scanner.
+/// comment: the maximal `[-+.eE0-9]*` run ([`nested_number_span`]'s span)
+/// is jq's own canonical spelling iff [`is_jq_canonical_number`] says so.
+///
+/// Answered in one pass (#3167): [`jq_canonical_number_prefix`] reads the
+/// canonical prefix straight off the document, and the span is canonical
+/// exactly when the byte after that prefix could not extend
+/// [`nested_number_span`]'s greedy class. Every byte of the prefix is in
+/// that class (digits, `.`, a leading `-`), so if the next byte is not,
+/// the greedy span ends where the prefix does and the whole span is
+/// canonical; if it is (an exponent, a second `.`, a digit after a lone
+/// `0`, a trailing sign), the span runs on past a prefix that is not all
+/// of it, which [`is_jq_canonical_number`] rejects. A special word
+/// (`-inf`, `nan`) has no integer part, so it fails the prefix either way.
+/// `scan_canonical_number_agrees_with_the_two_pass_rule_3167` pins the
+/// equivalence against the two-pass form this replaced, which read every
+/// number twice: 48 Ir per byte of a numbers-only document on a 7950X,
+/// 42% of the whole `-c .` run.
 fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
-    let end = nested_number_span(bytes, pos);
-    if end == pos || !is_jq_canonical_number(&bytes[pos..end]) {
-        return None;
+    let end = pos + jq_canonical_number_prefix(&bytes[pos..])?;
+    match bytes.get(end) {
+        Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') => None,
+        _ => Some(end),
     }
-    Some(end)
 }
 
 /// The string-token rule: `bytes[pos]` must be `"`, and the scan returns
@@ -6165,6 +6176,93 @@ mod tests {
     /// Asserted two ways: against the literal expected bytes, and against
     /// the unchanged re-render path, which is the behaviour the echo is
     /// only ever allowed to be a faster spelling of.
+    /// #3167: the one-pass number arm accepts exactly what the two-pass
+    /// rule it replaced accepted, and ends the span in the same place: the
+    /// greedy [`nested_number_span`], then [`is_jq_canonical_number`] over
+    /// it. Every token up to five bytes over the greedy class plus the
+    /// digits that exercise the prefix rules (`0`, `1`, `9`), each followed
+    /// by every byte class that can end or extend a number (a delimiter, a
+    /// class byte, a letter from a special word, end of input), plus the
+    /// `0.000000x` spellings decNumber prints in scientific notation.
+    #[test]
+    fn scan_canonical_number_agrees_with_the_two_pass_rule_3167() {
+        fn two_pass(bytes: &[u8], pos: usize) -> Option<usize> {
+            let end = nested_number_span(bytes, pos);
+            (end != pos && is_jq_canonical_number(&bytes[pos..end])).then_some(end)
+        }
+        const ALPHABET: &[u8] = b"019.eE+-";
+        let mut tokens: Vec<Vec<u8>> = vec![Vec::new()];
+        let mut frontier: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..5 {
+            let mut next = Vec::new();
+            for t in &frontier {
+                for &b in ALPHABET {
+                    let mut u = t.clone();
+                    u.push(b);
+                    next.push(u);
+                }
+            }
+            tokens.extend(next.iter().cloned());
+            frontier = next;
+        }
+        for spelling in [
+            "0.000001",
+            "0.0000001",
+            "0.0000010",
+            "0.000000",
+            "0.0000000",
+            "-0.0000001",
+            "1.0000001",
+            "10.0000001",
+            "-inf",
+            "nan",
+            "-nan",
+            "+1",
+            "01",
+            "-01",
+            "1.2.3",
+        ] {
+            tokens.push(spelling.as_bytes().to_vec());
+        }
+        let mut checked = 0usize;
+        let mut accepted = 0usize;
+        for token in &tokens {
+            for suffix in [
+                &b""[..],
+                b",",
+                b"]",
+                b"}",
+                b" ",
+                b"x",
+                b"n",
+                b"1",
+                b".",
+                b"e",
+                b"-",
+            ] {
+                let doc: Vec<u8> = [token.as_slice(), suffix].concat();
+                // Only a token whose first byte routes to the number arm.
+                if !matches!(doc.first(), Some(b'-' | b'0'..=b'9')) {
+                    continue;
+                }
+                let want = two_pass(&doc, 0);
+                assert_eq!(
+                    scan_canonical_number(&doc, 0),
+                    want,
+                    "{:?}",
+                    String::from_utf8_lossy(&doc)
+                );
+                checked += 1;
+                accepted += usize::from(want.is_some());
+            }
+        }
+        // The matrix must reach both answers, or it proves nothing.
+        assert!(
+            checked > 100_000 && accepted > 1_000,
+            "{checked} {accepted}"
+        );
+    }
+
     #[test]
     fn canonical_echo_stops_at_the_value_end_2608() {
         for (doc, want) in [
