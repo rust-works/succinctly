@@ -56806,6 +56806,47 @@ fn test_argument_navigation_builtins_drop_the_register_like_reduce_2746() -> Res
     Ok(())
 }
 
+/// #2746: nested inside `[...]`, `last(f)`/`isempty(f)`/`INDEX(gen;f)` are
+/// resolved by the `Array` arm's own discarding sink, which -- unlike
+/// `path()`'s own top-level collector -- keeps asking for more once it
+/// receives one, exercising the `Demand::Continue` side of each new arm's
+/// own `match sink(result)` (the `Demand::Stop` side is already reached by
+/// every other test in this group, where the stage is the pipeline's last).
+/// Captured live from jq 1.7.1.
+#[test]
+fn test_argument_navigation_builtins_continue_when_nested_in_an_array_2746() -> Result<()> {
+    for (filter, expected) in [
+        ("[path([last(.[]), 5])]", "[3,5]"),
+        ("[path([isempty(.[]), 5])]", "[false,5]"),
+        ("[path([INDEX(.[]; .), 5])]", r#"[{"1":1,"2":2,"3":3},5]"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2,3]"))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with") && stderr.contains(expected),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2746: `INDEX(gen;f)`'s own `idx_expr` error aborts the whole
+/// construction with no partial object, matching `reduce`'s "only the final
+/// value is observable" semantics -- the same rule `build_upper_index`'s own
+/// doc comment already states for its value-mode counterpart, now also true
+/// through the path-tracked resolver. Captured live from jq 1.7.1.
+#[test]
+fn test_index_stream_idx_expr_error_aborts_construction_2746() -> Result<()> {
+    for filter in [
+        r#"INDEX(.[]; error("boom"))"#,
+        r#"path(INDEX(.[]; error("boom")))"#,
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "[1,2,3]", &["-c"])?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+    }
+    Ok(())
+}
+
 /// #2646: the raise is independent of the input's type for every entry but
 /// `walk` -- `first` on a scalar still reports `element 0 of 5`, matching
 /// jq, rather than being skipped as "not a container". `walk` is the one
