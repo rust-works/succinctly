@@ -2001,7 +2001,11 @@ impl<'a> Parser<'a> {
         let bracket = self.parse_index_bracket()?;
         let bracket_end = self.pos;
         self.skip_ws();
-        if self.mode == ParserMode::Yq && self.pos > bracket_end && self.peek() == Some('?') {
+        if self.mode == ParserMode::Yq
+            && !self.jq_extensions
+            && self.pos > bracket_end
+            && self.peek() == Some('?')
+        {
             return Err(ParseError::new("unexpected '?' after whitespace", self.pos));
         }
         if self.at_postfix_question() {
@@ -2784,6 +2788,7 @@ impl<'a> Parser<'a> {
                 let field_end = self.pos;
                 self.skip_ws();
                 if self.mode == ParserMode::Yq
+                    && !self.jq_extensions
                     && self.peek() == Some('?')
                     && self.input[field_end..self.pos]
                         .bytes()
@@ -7132,7 +7137,19 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Some('.') => {
                     self.next();
+                    let dot_end = self.pos;
                     self.skip_ws();
+
+                    // Yq allows `.?` as an empty field name, but a space or
+                    // newline between the dot and `?` is a lexer error.
+                    if self.mode == ParserMode::Yq
+                        && self.peek() == Some('?')
+                        && self.input[dot_end..self.pos]
+                            .bytes()
+                            .any(|b| matches!(b, b' ' | b'\n'))
+                    {
+                        return Err(ParseError::new("unexpected '?' after whitespace", self.pos));
+                    }
 
                     // Check for bracket after dot
                     if self.peek() == Some('[') {
@@ -7149,6 +7166,7 @@ impl<'a> Parser<'a> {
                         let field_end = self.pos;
                         self.skip_ws();
                         if self.mode == ParserMode::Yq
+                            && !self.jq_extensions
                             && self.peek() == Some('?')
                             && self.input[field_end..self.pos]
                                 .bytes()
@@ -11973,6 +11991,8 @@ mod tests {
             "$x?",
             "(.?)?",
             ". ?",
+            ".a. ?",
+            ".a.\n?",
         ] {
             assert!(
                 parse_with_mode(filter, ParserMode::Yq).is_err(),
@@ -11988,7 +12008,7 @@ mod tests {
             parse_with_mode(".??", ParserMode::Yq).unwrap(),
             Expr::Optional(Box::new(Expr::Field("?".into())))
         );
-        for filter in [".x?", ".[0]?", ".\"x\"?"] {
+        for filter in [".x?", ".[0]?", ".\"x\"?", ".a.?"] {
             assert!(
                 parse_with_mode(filter, ParserMode::Yq).is_ok(),
                 "yq rejected {filter}"
@@ -11998,5 +12018,8 @@ mod tests {
         assert!(parse("length?").is_ok());
         assert!(parse_with_mode_and_extensions("(.x)?", ParserMode::Yq, true).is_ok());
         assert!(parse_with_mode_and_extensions("length?", ParserMode::Yq, true).is_ok());
+        assert!(parse_with_mode_and_extensions(".x ?", ParserMode::Yq, true).is_ok());
+        assert!(parse_with_mode_and_extensions(".[0] ?", ParserMode::Yq, true).is_ok());
+        assert!(parse_with_mode_and_extensions(".a.x ?", ParserMode::Yq, true).is_ok());
     }
 }

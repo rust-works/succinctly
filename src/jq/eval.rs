@@ -54489,9 +54489,10 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
         // yq's root-delete rule (#1702): real yq deletes the whole
         // document and emits nothing for a bare `del(.)` (no `?`
-        // anywhere), and treats `del(.?)` as a full no-op — the
-        // optional root delete never fires. `succinctly` previously
-        // followed jq's model for both (`del(.)` => `null`,
+        // anywhere). An `Optional(Identity)` AST is a no-op here, though
+        // parsed yq `del(.?)` targets the empty-string field (#3378).
+        // `succinctly` previously followed jq's model for both
+        // (`del(.)` => `null`,
         // `del(.?)` => `null`), which is correct for `succinctly jq`
         // but not `succinctly yq`. Checked here, ahead of
         // `delete_at_path`, rather than inside its `Expr::Identity`

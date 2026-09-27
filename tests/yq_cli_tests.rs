@@ -26601,11 +26601,15 @@ fn test_1702_yq_bare_root_del_emits_nothing() -> Result<()> {
     Ok(())
 }
 
-/// `del(.?)` — the root's own `.` marked optional — is a full no-op in real
-/// yq: the original value passes through unchanged, unlike `succinctly
-/// jq`/real jq's `null` (#1702, verified live).
+/// `del(.?)` targets the empty-string field in real yq. It removes that
+/// field when present and leaves other inputs unchanged; `del(.)` instead
+/// removes the whole document (#1702, verified against yq v4.53.3).
 #[test]
-fn test_1702_yq_optional_root_del_is_noop() -> Result<()> {
+fn test_1702_yq_optional_empty_field_del() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.?)", r#"{"":8,"a":1}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":1}"#);
+
     for input in [r#"{"a":1}"#, r"[1,2,3]", r"5"] {
         let (out, code) = run_yq_stdin("del(.?)", input, &["-o=json", "-I=0"])?;
         assert_eq!(code, 0);
@@ -48999,7 +49003,15 @@ fn test_array_register_widening_is_jq_mode_only_3283() -> Result<()> {
 /// #3378: yq's optional navigation suffix is not jq's generic `Term?`.
 #[test]
 fn test_yq_rejects_generic_postfix_optional_3378() -> Result<()> {
-    for filter in ["(.x)?", "length?", "1?", "select(false)?", "(.x)?//1"] {
+    for filter in [
+        "(.x)?",
+        "length?",
+        "1?",
+        "select(false)?",
+        "(.x)?//1",
+        ".a. ?",
+        ".a.\n?",
+    ] {
         let (stdout, stderr, code) =
             run_yq_stdin_with_stderr(filter, "{}", &["-p=json", "-o=json", "-I=0"])?;
         assert_ne!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
@@ -49011,6 +49023,7 @@ fn test_yq_rejects_generic_postfix_optional_3378() -> Result<()> {
         (".?", "{\"\":8}", "8\n"),
         (".??", "{\"?\":7}", "7\n"),
         (".?foo", "{\"?foo\":9}", "9\n"),
+        (".a.?", "{\"a\":{\"\":8}}", "8\n"),
         (".x?", "{}", "null\n"),
         (".[0]?", "{}", "null\n"),
     ] {
@@ -49027,5 +49040,19 @@ fn test_yq_rejects_generic_postfix_optional_3378() -> Result<()> {
     )?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout, "0\n");
+
+    for (filter, input, expected) in [
+        (".x ?", "{\"x\":1}", "1\n"),
+        (".[0] ?", "[5]", "5\n"),
+        (".a.x ?", "{\"a\":{\"x\":2}}", "2\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+            filter,
+            input,
+            &["-p=json", "-o=json", "-I=0", "--jq-extensions"],
+        )?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
     Ok(())
 }

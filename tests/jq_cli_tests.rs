@@ -47136,9 +47136,9 @@ fn test_parent_n_non_numeric_argument_reports_real_type_name_1487() -> Result<()
     Ok(())
 }
 
-/// #1702 fixed `del(.)`/`del(.?)` to emit nothing / no-op in yq mode; confirm
-/// `succinctly jq` still follows real jq's own model unchanged — both
-/// produce `null` on any target.
+/// #1702 added yq's root-delete handling, and #3378 parses yq `.?` as an
+/// empty-string field. Confirm `succinctly jq` still follows real jq's own
+/// model unchanged: both filters produce `null` on any target.
 #[test]
 fn test_jq_mode_root_del_still_null_after_1702() -> Result<()> {
     for expr in ["del(.)", "del(.?)"] {
