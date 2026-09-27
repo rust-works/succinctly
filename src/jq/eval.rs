@@ -35476,6 +35476,45 @@ fn always_refuses_as_live_path<S: EvalSemantics>(
     }
 }
 
+/// [`always_refuses_as_live_path`]'s sibling for the one shape that fell
+/// through it entirely: `match`/`scan`/`capture` (plus their `Flags` forms)
+/// produce **zero** values when the pattern never matches, and
+/// [`always_refuses_as_live_path`] only runs on a value `expr` already
+/// produced -- so a zero-output run never calls it at all, and the
+/// zero-output case in [`resolve_leaf`]/[`resolve_leaf_sink`] read that as
+/// an ordinary empty generator (code review on this issue's own fix caught
+/// this: `del(. as $x | ["abc" | match("z")] | try .[0])` stayed exit 0
+/// where jq raises).
+///
+/// `ascii_downcase`/`ascii_upcase`/`fromstream` always produce exactly one
+/// value and `splits` always produces at least one (an unmatched delimiter
+/// still yields the whole string as its sole piece) -- confirmed live none
+/// of the four can reach this path, so they are not repeated here.
+///
+/// No approximation needed here, unlike [`always_refuses_as_live_path`]'s
+/// own tradeoff: jq's `_match_impl` container on the zero-match branch
+/// really is the empty array `[]`, confirmed live for all three
+/// (`match`/`scan`/`capture`), so this reproduces jq's own message exactly
+/// rather than approximating it.
+fn always_refuses_when_empty<S: EvalSemantics>(expr: &Expr) -> Option<EvalError> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    match expr {
+        Expr::Builtin(
+            Builtin::Match(_)
+            | Builtin::MatchFlags(_, _)
+            | Builtin::Scan(_)
+            | Builtin::ScanFlags(_, _)
+            | Builtin::Capture(_)
+            | Builtin::CaptureFlags(_, _),
+        ) => Some(EvalError::invalid_path_expression_near_iterate(
+            &OwnedValue::Array(Vec::new().into()),
+        )),
+        _ => None,
+    }
+}
+
 /// The remaining eager recursion guard's terminal error (#843), now yq mode
 /// only. Bare jq recursion delivers its seed before reporting navigation in
 /// `resolve_node_sink` (#2761), and parameterized jq recursion resolves `f`
@@ -35591,6 +35630,19 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     }
     if stopped_by_sink {
         return ResolveFlow::Stopped;
+    }
+    // #2743: same "genuinely empty" gate as `resolve_leaf`'s own copy of
+    // this check, for the streaming form -- `delivered == 0` here plays
+    // the same role `values.is_empty()` does there (an early `Demand::Stop`
+    // from this callback always sets `construct_refusal`, handled above,
+    // before `delivered` could read 0 for that reason), and `Flow::
+    // Exhausted` rules out a genuine upstream escape winning instead (an
+    // argument's own type error/`error(...)` must still come first, same
+    // ordering rule as `always_refuses_as_live_path`).
+    if delivered == 0 && matches!(flow, Flow::Exhausted) {
+        if let Some(e) = always_refuses_when_empty::<S>(expr) {
+            return ResolveFlow::Escaped(EvalEscape::Error(e));
+        }
     }
     match flow {
         Flow::Escaped(control) => ResolveFlow::Escaped(EvalEscape::from(control)),
@@ -35906,6 +35958,18 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     }
 
     if values.is_empty() {
+        // #2743: `match`/`scan`/`capture` raise even on a genuinely empty
+        // run (no match at all) -- checked only here, once `Flow::Exhausted`
+        // confirms `expr` really produced nothing, never as a pre-check (the
+        // same ordering rule `always_refuses_as_live_path` documents: jq's
+        // own type error/`error(...)`/`empty` upstream of the match attempt
+        // must still win first, which a bare-shape pre-check would not
+        // respect).
+        if matches!(flow, Flow::Exhausted) {
+            if let Some(e) = always_refuses_when_empty::<S>(expr) {
+                return Err((Vec::new(), EvalEscape::Error(e)));
+            }
+        }
         // No output prunes the branch — unless there never would have been
         // one because evaluating `expr` itself broke/errored (Halt excluded,
         // handled above) before producing anything. `Flow::Stopped` with no
@@ -102810,6 +102874,51 @@ mod tests {
                     assert!(e.is_untracked_navigation_error(), "{filter}: {}", e.message);
                 }
             );
+        }
+    }
+
+    /// #2743, code review's own finding: `match`/`scan`/`capture` (and
+    /// their `Flags` forms) produce **zero** values when the pattern never
+    /// matches, so [`always_refuses_as_live_path`] -- checked only on a
+    /// value `expr` already produced -- never runs at all, and this stayed
+    /// exit 0 where jq raises even after the rest of this fix landed
+    /// ([`always_refuses_when_empty`] closes it). `splits` is deliberately
+    /// absent: an unmatched delimiter still yields the whole string as its
+    /// sole piece (confirmed live), so it never reaches the zero-value case
+    /// this test is about. Every row confirmed live against jq 1.7.1: the
+    /// container is the exact empty array `[]` here, not an approximation
+    /// (jq's own `_match_impl` intermediate on the no-match branch really
+    /// is `[]`).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_stream_builtins_raise_on_zero_matches_2743() {
+        for filter in [
+            r#"["abc" | match("z")] | try .[0]"#,
+            r#"["abc" | match("z";"g")] | try .[0]"#,
+            r#"["abc" | scan("z")] | try .[0]"#,
+            r#"["abc" | scan("z";"g")] | try .[0]"#,
+            r#"["abc" | capture("(?<x>z)")] | try .[0]"#,
+            r#"["abc" | capture("(?<x>z)";"g")] | try .[0]"#,
+        ] {
+            query!(br"null", &format!("del(. as $x | {filter})"),
+                QueryResult::Error(e) => {
+                    assert!(e.is_untracked_navigation_error(), "{filter}: {}", e.message);
+                    assert!(
+                        e.message.ends_with("iterate through []"),
+                        "{filter}: {}",
+                        e.message
+                    );
+                }
+            );
+        }
+        // A `try`/`?` directly on the raising construct still catches it,
+        // same ADR-0018 fidelity check the sibling tests above make.
+        for filter in [
+            r#"del(try ("abc" | match("z")))"#,
+            r#"del(try ("abc" | scan("z")))"#,
+            r#"del(try ("abc" | capture("(?<x>z)")))"#,
+        ] {
+            assert_eq!(outputs(br"null", filter), ["null"], "{filter}");
         }
     }
 
