@@ -369,10 +369,21 @@ TRACKED_ARRAY_INNERS = [
     "[.a[] | select(. == 1)]", "[limit(1; .a[])]",
     "[recurse(.[]?)]", "[[.a]]", "[.a, .x]",
     "[.x as $z | $z.a]", "[.x as $z | [.a, $z.a]]",
+    # #3283/#3284: shapes newly admitted by `array_contents_are_checked`
+    # (builtin_navigation's value-independent members, a non-navigating
+    # map/any/all/walk argument, plain `=`, and a `try`/`?` with no
+    # handler) -- widening the alphabet these two issues' own plan
+    # comments called for.
+    "[first]", "[last]", "[add]", "[any]", "[all]", "[flatten]",
+    "[map(.)]", "[walk(.)]", "[.a = 1]", "[try with_entries(.)]",
+    "[try (.a |= 1)]", "[(.a)?]",
 ]
 TRACKED_ARRAY_WRAPPERS = [
     "path(%s | empty)", "del(%s | select(false))",
     "(%s | empty) = 9", "(%s | empty) |= 9",
+    # #3283/#3284: does the register survive *through* the array to a
+    # later `$x`, not just "does resolving inside it raise correctly"?
+    "path(. as $x | (%s | empty), $x)",
 ]
 TRACKED_ARRAY_P = 0.12
 
