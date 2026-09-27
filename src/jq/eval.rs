@@ -34262,6 +34262,140 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             resolve_nth_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
         }
 
+        // #2746: `last(f)`, `isempty(f)` and `INDEX(stream; idx_expr)` all
+        // navigate through an argument that this resolver previously left to
+        // the eager catch-all below -- an untracked `.` inside it evaluated
+        // by value and never raised, where jq's own definitions (`reduce g as
+        // $item (null; $item)`; `label $out | (g | false, break $out) //
+        // true`; `reduce stream as $row ({}; .[$row|idx_expr|tostring] =
+        // $row)`) raise as soon as `g`/`stream` tries to navigate an
+        // untracked value. Confirmed live against jq 1.7.1: `{} |
+        // path(last(.[]))` raises "Invalid path expression near attempt to
+        // iterate through {}" where this resolver answered nothing at exit 0.
+        //
+        // All three results are computed values, never a path into the
+        // document (like `[f]` just below, unlike `first`/`limit`/`nth`,
+        // which forward the argument's own live branch), so each resolves its
+        // argument with a *discarding* inner sink -- the outer `sink` only
+        // ever sees the builtin's own derived result, mirroring the `Array`
+        // arm's `items.push(...)` shape rather than `FirstExpr`'s pass-through.
+        // The register carries forward exactly as `[f]` does when its
+        // contents are checked (here, unconditionally, since every branch is
+        // always resolved live): `. as $x | last(.[]) | $x` does not move `.`.
+        //
+        // `last`/`INDEX` need every one of the argument's outputs regardless
+        // of what the *outer* consumer wants (`last` cannot know which output
+        // is last without seeing them all; `INDEX` folds every row) -- both
+        // resolve with `Keep::AtMost(usize::MAX)`, not the ambient `keep`,
+        // the same reason `Array`'s own arm does. `isempty` only ever needs
+        // one output (`resolve_bounded_sink`'s `n = 1`, the same shape
+        // `FirstExpr` uses), so the ambient `keep` is harmless to forward
+        // there -- it can only tighten an already-tight bound.
+        //
+        // `any(gen;cond)`/`all(gen;cond)` are deliberately not handled here:
+        // unlike these three, they must interleave real per-element `cond`
+        // evaluation with `gen`'s own consumption to decide when to stop,
+        // which this discard-and-drain shape cannot express safely -- see
+        // #3347's own postmortem on `nth`/`indices`/`index`/`rindex` for the
+        // risk class a rushed version of that would repeat. Filed as #3348.
+        Expr::LastExpr(inner) | Expr::Builtin(Builtin::LastStream(inner)) => {
+            let mut last: Option<OwnedValue> = None;
+            let flow = resolve_node_sink::<S>(
+                inner,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                Keep::AtMost(usize::MAX),
+                &mut |branch| {
+                    last = Some(branch.value.into_owned());
+                    Demand::Continue
+                },
+            );
+            match flow {
+                ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
+                ResolveFlow::Exhausted | ResolveFlow::Stopped => {
+                    let result = untracked_at_register(
+                        Cow::Owned(last.unwrap_or(OwnedValue::Null)),
+                        trackable,
+                        value,
+                    );
+                    match sink(result) {
+                        Demand::Continue => ResolveFlow::Exhausted,
+                        Demand::Stop => ResolveFlow::Stopped,
+                    }
+                }
+            }
+        }
+
+        Expr::Builtin(Builtin::IsEmpty(inner)) => {
+            let mut any = false;
+            let flow = resolve_bounded_sink::<S>(
+                inner,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                1,
+                &mut |_branch| {
+                    any = true;
+                    Demand::Continue
+                },
+            );
+            match flow {
+                ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
+                ResolveFlow::Exhausted | ResolveFlow::Stopped => {
+                    let result =
+                        untracked_at_register(Cow::Owned(OwnedValue::Bool(!any)), trackable, value);
+                    match sink(result) {
+                        Demand::Continue => ResolveFlow::Exhausted,
+                        Demand::Stop => ResolveFlow::Stopped,
+                    }
+                }
+            }
+        }
+
+        Expr::Builtin(Builtin::UpperIndexStream(stream, idx_expr)) => {
+            let mut rows: Vec<OwnedValue> = Vec::new();
+            let flow = resolve_node_sink::<S>(
+                stream,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                Keep::AtMost(usize::MAX),
+                &mut |branch| {
+                    rows.push(branch.value.into_owned());
+                    Demand::Continue
+                },
+            );
+            match flow {
+                ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
+                ResolveFlow::Exhausted | ResolveFlow::Stopped => {
+                    let mut obj = IndexMap::new();
+                    for row in &rows {
+                        let keys = match eval_owned_multi::<S>(idx_expr, row) {
+                            Ok(k) => k,
+                            Err(e) => return ResolveFlow::Escaped(e),
+                        };
+                        for k in keys {
+                            obj.insert(owned_to_string::<S>(&k), row.clone());
+                        }
+                    }
+                    let result = untracked_at_register(
+                        Cow::Owned(OwnedValue::Object(obj.into())),
+                        trackable,
+                        value,
+                    );
+                    match sink(result) {
+                        Demand::Continue => ResolveFlow::Exhausted,
+                        Demand::Stop => ResolveFlow::Stopped,
+                    }
+                }
+            }
+        }
+
         // #2689/#3049: array construction on a tracked or untracked input. jq's `[f]`
         // (`gen_collect`) runs `f` with path tracking live -- unlike `{k:f}`,
         // `if f`, `select(f)`, `try f`, an `as` source or `"\(f)"`, all of

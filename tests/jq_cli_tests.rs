@@ -56699,6 +56699,102 @@ fn test_reverse_raises_unconditionally_2744() -> Result<()> {
     Ok(())
 }
 
+/// #2746: `last(f)`, `isempty(f)` and `INDEX(stream; idx_expr)` navigate
+/// their own argument, and that argument's navigation was previously
+/// evaluated by value, never through the resolver -- an untracked value
+/// inside it (a literal array feeding `.[]`, not the live input) raised
+/// nothing where jq raises `Invalid path expression near attempt to
+/// iterate through [1]`. Captured live from jq 1.7.1.
+#[test]
+fn test_argument_navigation_raises_on_an_untracked_value_2746() -> Result<()> {
+    for filter in [
+        "[path(([1] | last(.[])) | empty)]",
+        "[path(([1] | isempty(.[])) | empty)]",
+        "[path(([1] | INDEX(.[]; .)) | empty)]",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression near attempt to iterate through [1]"),
+            "{filter}: {stderr:?}"
+        );
+    }
+    // The write-side consequence: `del()` on the same construct raises too,
+    // and a `try` directly on the raising construct still catches it.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "del([1] | last(.[]))"], Some("{}"))?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("Invalid path expression near attempt to iterate through [1]"),
+        "{stderr:?}"
+    );
+    for filter in [
+        r"del(try ([1] | last(.[])))",
+        r"del(try ([1] | isempty(.[])))",
+        r"del(try ([1] | INDEX(.[]; .)))",
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "{}", &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), "{}", "{filter}");
+    }
+    Ok(())
+}
+
+/// #2746's boundary: each builtin's own result is a computed value, never a
+/// path into the document, so `path(...)` on the bare construct (nothing
+/// discarding it with `| empty`) raises `Invalid path expression with
+/// result ...` naming that computed value -- exactly like `[f]`'s own
+/// boundary, and unlike `first`/`limit`/`nth`, which forward the argument's
+/// own live path. A genuinely empty generator raises nothing at all, since
+/// none of the three ever navigate anything in that case. Captured live
+/// from jq 1.7.1.
+#[test]
+fn test_argument_navigation_builtins_forward_a_computed_result_2746() -> Result<()> {
+    for (filter, result) in [
+        ("path(last(.[]))", "result null"),
+        ("path(isempty(.[]))", "result true"),
+        ("path(INDEX(.[]; .))", "result {}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with") && stderr.contains(result),
+            "{filter}: {stderr:?}"
+        );
+    }
+    // Not discarded, and not navigated by `path()` at all: plain value mode
+    // on the same empty-generator inputs is unaffected.
+    for (filter, expected) in [
+        ("last(.[])", "null"),
+        ("isempty(.[])", "true"),
+        ("INDEX(.[]; .)", "{}"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "{}", &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2746: the register survives `last`/`isempty`/`INDEX` the same way it
+/// survives any other computed value (#1573) -- `. as $x | (...) | $x`
+/// still sees the original input, not something derived from the
+/// argument's own navigation. Captured live from jq 1.7.1.
+#[test]
+fn test_argument_navigation_builtins_preserve_the_register_2746() -> Result<()> {
+    let (stdout, code) = run_jq_stdin(
+        ". as $x | (last(.[]), isempty(.[]), INDEX(.[]; .)) | $x",
+        "[1,2,3]",
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(
+        stdout.trim(),
+        "[1,2,3]\n[1,2,3]\n[1,2,3]",
+        "unexpected output"
+    );
+    Ok(())
+}
+
 /// #2646: the raise is independent of the input's type for every entry but
 /// `walk` -- `first` on a scalar still reports `element 0 of 5`, matching
 /// jq, rather than being skipped as "not a container". `walk` is the one
