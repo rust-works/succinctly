@@ -63,6 +63,8 @@ fn test_yq_question_slash_field_spelling_3370() -> Result<()> {
         (r#"{"x?//1":5}"#, ".x?//1?", "5\n"),
         (r#"{"x//1":6}"#, ".x//1", "6\n"),
         (r#"{"a":{"x?//1":8}}"#, ".a.x?//1", "8\n"),
+        ("[3]", ".[0]?", "3\n"),
+        (r#"{"x":3}"#, ".[\"x\"]?", "3\n"),
     ] {
         assert_eq!(
             run_yq_stdin_with_stderr(filter, input, args)?,
@@ -75,6 +77,17 @@ fn test_yq_question_slash_field_spelling_3370() -> Result<()> {
         assert_eq!(stdout, "", "{filter}");
         assert_eq!(code, 1, "{filter}: {stderr}");
         assert!(!stderr.is_empty(), "{filter}");
+    }
+    for (input, filter) in [
+        ("[3]", ".[0] ?"),
+        (r#"{"x":3}"#, ".[\"x\"] ?"),
+        ("[3]", ".[0]\t?"),
+        (r#"{"a":[3]}"#, ".a[0] ?"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, input, args)?;
+        assert_eq!(stdout, "", "{input} | {filter}");
+        assert_eq!(code, 1, "{input} | {filter}: {stderr}");
+        assert!(!stderr.is_empty(), "{input} | {filter}");
     }
     Ok(())
 }

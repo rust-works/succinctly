@@ -1983,7 +1983,11 @@ impl<'a> Parser<'a> {
     /// Parse an index bracket and check for optional marker.
     fn parse_index_bracket_with_optional(&mut self) -> Result<Bracket, ParseError> {
         let bracket = self.parse_index_bracket()?;
+        let bracket_end = self.pos;
         self.skip_ws();
+        if self.mode == ParserMode::Yq && self.pos > bracket_end && self.peek() == Some('?') {
+            return Err(ParseError::new("unexpected '?' after whitespace", self.pos));
+        }
         if self.at_postfix_question() {
             self.next();
             Ok(match bracket {
@@ -11748,10 +11752,26 @@ mod tests {
             parse_with_mode(".x?//1?", ParserMode::Yq).unwrap(),
             Expr::Optional(Box::new(Expr::Field("x?//1".into())))
         );
-        for filter in [".x ?// 1", ".x ??// 1", ".x ?", ".x\n?", ".a.x ?// 1"] {
+        for filter in [
+            ".x ?// 1",
+            ".x ??// 1",
+            ".x ?",
+            ".x\n?",
+            ".a.x ?// 1",
+            ".[0] ?",
+            ".[\"x\"] ?",
+            ".[0]\t?",
+            ".a[0] ?",
+        ] {
             assert!(
                 parse_with_mode(filter, ParserMode::Yq).is_err(),
                 "yq accepted {filter}"
+            );
+        }
+        for filter in [".[0]?", ".[\"x\"]?", ".a[0]?"] {
+            assert!(
+                parse_with_mode(filter, ParserMode::Yq).is_ok(),
+                "yq rejected {filter}"
             );
         }
         assert!(parse(".x?//1").is_err());
