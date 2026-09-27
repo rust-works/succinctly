@@ -1244,18 +1244,14 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            if self.peek().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            if self
+                .peek()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            {
                 name.push_str(&self.input[questions_start..questions_end]);
                 let tail_start = self.pos;
                 while let Some(c) = self.peek() {
-                    if c.is_alphanumeric()
-                        || c == '_'
-                        || (c == '-'
-                            && self.input[self.pos + 1..]
-                                .chars()
-                                .next()
-                                .is_some_and(|next| next.is_alphanumeric() || next == '_'))
-                    {
+                    if c.is_alphanumeric() || c == '_' || c == '-' {
                         self.next();
                     } else {
                         break;
@@ -11719,6 +11715,9 @@ mod tests {
             (".x?y?", "x?y"),
             (".x?y??", "x?y?"),
             (".x?y-z?", "x?y-z"),
+            (".x?-y?", "x?-y"),
+            (".x?--y?", "x?--y"),
+            (".x?-?", "x?-"),
             (".a.x??", "x?"),
         ] {
             let expr = parse_with_mode(filter, ParserMode::Yq).unwrap();

@@ -4525,7 +4525,8 @@ navigation and earlier `?` bytes as part of the field pattern. Thus `.x?` reads
 `x` optionally, `.x??` reads `x?` optionally, and `.x???` reads `x??` optionally.
 For `x: 1`, `.x??` yields `null`, rather than `1`; for a mapping with an `x?`
 key, it yields that key's value. `src/jq/parser.rs` now keeps those field names
-intact in yq mode; jq's repeated optional parsing is unchanged. The pinned
+intact in yq mode, including hyphens directly after `?` (`.x?-y?` reads
+`x?-y` optionally); jq's repeated optional parsing is unchanged. The pinned
 `field_question_*_3356` goldens and CLI test capture the distinction.
 
 **Open gap ([#3374](https://github.com/rust-works/succinctly/issues/3374)):** yq
