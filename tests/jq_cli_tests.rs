@@ -71338,3 +71338,156 @@ fn test_repeated_postfix_optional_matches_jq_3273() -> Result<()> {
     assert!(stdout.is_empty());
     Ok(())
 }
+
+/// #3316: `@fmt "lit\(E)lit"` desugars to the plain interpolation with each
+/// `\(E)` piped through `@fmt` first, matching jq's own `gen_format(E, fmt)`.
+/// Every row captured live against jq 1.7.1 (`/usr/bin/jq`) with input
+/// `{"s":"a b&<é","arr":[1,"x y",null,true],"obj":{"k":"v"},"b":"aGk="}`.
+#[test]
+fn test_format_prefixed_string_interpolation_3316() -> Result<()> {
+    let input = r#"{"s":"a b&<é","arr":[1,"x y",null,true],"obj":{"k":"v"},"b":"aGk="}"#;
+
+    for (filter, expected) in [
+        (r#"@base64 "v=\(1)""#, "\"v=MQ==\"\n"),
+        (r#"@text "v=\(1)""#, "\"v=1\"\n"),
+        (r#".s | @base64 "v=\(.)""#, "\"v=YSBiJjzDqQ==\"\n"),
+        (r#"@base64 "abc""#, "\"abc\"\n"),
+        (r#"@base64 "a\("x")b\("y")c""#, "\"aeA==beQ==c\"\n"),
+        (r#"@html "<\(.s)>""#, "\"<a b&amp;&lt;é>\"\n"),
+        (
+            r#"@uri "https://x/?q=\(.s)""#,
+            "\"https://x/?q=a%20b%26%3C%C3%A9\"\n",
+        ),
+        (r#"@sh "echo \(.s)""#, "\"echo 'a b&<é'\"\n"),
+        (r#"@sh "echo \(.arr)""#, "\"echo 1 'x y' null true\"\n"),
+        (r#"@csv "\(.arr)""#, "\"1,\\\"x y\\\",,true\"\n"),
+        (r#"@tsv "\(.arr)""#, "\"1\\tx y\\t\\ttrue\"\n"),
+        (r#"@json "\(.s)""#, "\"\\\"a b&<é\\\"\"\n"),
+        (r#"@base64 "\(.arr)""#, "\"WzEsInggeSIsbnVsbCx0cnVlXQ==\"\n"),
+        (r#"@base64d "\(.b)""#, "\"hi\"\n"),
+        (r#"@base64 "\(null)""#, "\"bnVsbA==\"\n"),
+        (r#"@base64"v=\(1)""#, "\"v=MQ==\"\n"), // no space between format and string
+        (r#"@base64 "v"[0:1]"#, "\"v\"\n"),     // a Term: postfix applies to the result
+        (r#"@base64 "v=\(1)" as $v | $v"#, "\"v=MQ==\"\n"), // a Term: `as` binds it
+        (r#"{a: @base64 "v=\(1)"}"#, "{\"a\":\"v=MQ==\"}\n"),
+        (r#"@base64 "\(1)"?"#, "\"MQ==\"\n"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "filter: {filter}");
+        assert_eq!(stdout, expected, "filter: {filter}");
+    }
+
+    // Cartesian fan-out: `\(...)` slots that yield more than one value
+    // multiply out exactly the way plain (unformatted) interpolation
+    // already does -- `apply_format_to_interpolation` doesn't touch that
+    // machinery at all, it only wraps each slot's `Expr`.
+    let (stdout, code) = run_jq_stdin(r#"@base64 "v=\(1,2)""#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"v=MQ==\"\n\"v=Mg==\"\n");
+
+    let (stdout, code) = run_jq_stdin(r#"@base64 "\(1,2)-\(3,4)""#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout,
+        "\"MQ==-Mw==\"\n\"Mg==-Mw==\"\n\"MQ==-NA==\"\n\"Mg==-NA==\"\n"
+    );
+
+    // A zero-output slot makes the whole interpolation produce nothing,
+    // same as plain (unformatted) interpolation's own `"\(empty)"`.
+    let (stdout, code) = run_jq_stdin(r#"@base64 "v=\(empty)""#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // `path(@fmt "...")` raises the same "Invalid path expression" jq's
+    // own bare `@fmt` filter already raises in path mode -- inherited from
+    // `Expr::Format`'s existing path behavior, unchanged by this issue.
+    let (_stdout, stderr, code) = run_jq_full(&["-c", r#"path(@base64 "x")"#], Some(input))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains(r#"Invalid path expression with result "x""#),
+        "stderr: {stderr:?}"
+    );
+
+    // Error rows: byte-for-byte against jq's own message, inherited
+    // unchanged from the bare `@fmt` filter's existing error path.
+    let (_stdout, stderr, code) = run_jq_full(&["-c", r#"@sh "echo \(.obj)""#], Some(input))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("object ({\"k\":\"v\"}) can not be escaped for shell"),
+        "stderr: {stderr:?}"
+    );
+
+    let (_stdout, stderr, code) = run_jq_full(&["-c", r#"@csv "\(1)""#], Some(input))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("number (1) cannot be csv-formatted"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #3316, yq mode: real yq's lexer rejects a format followed by a string
+/// outright (`bad expression, please check expression syntax`, v4.53.3);
+/// `succinctly yq` must keep rejecting it too, unchanged by this issue.
+#[test]
+fn test_format_prefixed_string_still_rejected_in_yq_mode_cli_3316() -> Result<()> {
+    for filter in [r#"@base64 "v=\(1)""#, r#"@base64"x""#] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-c", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?
+            .wait_with_output()?;
+        assert!(
+            !output.status.success(),
+            "yq mode must still reject `{filter}`"
+        );
+    }
+    Ok(())
+}
+
+/// #3316: both evaluator routes see the desugared `Pipe(E, Format)` inside
+/// the interpolation correctly -- the cursor/generic path (streaming over
+/// an array) and the owned path (`--arg`, `-n`).
+#[test]
+fn test_format_prefixed_string_both_evaluator_routes_3316() -> Result<()> {
+    // Cursor path: `.[]` over an array input feeds each element through
+    // eval_generic.rs's streaming route.
+    let (stdout, code) = run_jq_stdin(r#".[] | @uri "q=\(.)""#, r#"["a b","c&d"]"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"q=a%20b\"\n\"q=c%26d\"\n");
+
+    // Owned path: `--arg`/`-n` binds a variable with no cursor behind it.
+    let (stdout, code) = run_jq_null(r#"@uri "q=\($q)""#, &["-n", "--arg", "q", "a b"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"q=a%20b\"\n");
+
+    Ok(())
+}
+
+/// #3316: the parser doesn't special-case which format precedes a string,
+/// so succinctly's own jq-mode extension formats (`@dsv`, `@yaml`, `@props`,
+/// `@urid` -- real jq has none of these, gated behind `--jq-extensions` in
+/// yq mode per #1512, and unrestricted in jq mode) desugar the same way.
+/// Self-snapshot: no jq oracle exists for any of these, so the pin is
+/// against succinctly's own value.
+#[test]
+fn test_format_prefixed_string_succinctly_extensions_3316() -> Result<()> {
+    for (filter, input, expected) in [
+        (
+            r#"@dsv("|") "\(.arr)""#,
+            r#"{"arr":["a","b"]}"#,
+            "\"\\\"a\\\"|\\\"b\\\"\"\n",
+        ),
+        (r#"@yaml "v: \(1)""#, "null", "\"v: 1\"\n"),
+        (r#"@props "k=\(1)""#, "null", "\"k=1\"\n"),
+        (r#"@urid "\(.s)""#, r#"{"s":"a b"}"#, "\"a b\"\n"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "filter: {filter}");
+        assert_eq!(stdout, expected, "filter: {filter}");
+    }
+    Ok(())
+}

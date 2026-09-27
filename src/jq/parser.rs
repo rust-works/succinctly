@@ -2458,9 +2458,30 @@ impl<'a> Parser<'a> {
             // number") jq 1.7.1 program, confirmed live, and real yq
             // rejects it at parse time the same way it rejects the string/
             // number cases (confirmed live against v4.53.3).
+            //
+            // #3316: a format directly followed by a string literal/
+            // interpolation (`@base64 "v=\(1)"`) desugars to the plain
+            // interpolation with each `\(E)` replaced by `E | @fmt`, jq's
+            // own `gen_format(E, fmt)` rule -- confirmed live that a
+            // literal with no interpolation returns unchanged (`@base64
+            // "abc"` -> `"abc"`, the format never runs) and that the
+            // result is a Term (`@base64 "v" [0:1]` valid, `@base64 "v=\
+            // (1)" as $v | $v` valid). jq mode only: yq's lexer rejects a
+            // format followed by a string outright (`bad expression`),
+            // and `succinctly yq` already matches that by leaving this
+            // arm's original `postfix_if_jq` path untouched below.
             Some('@') => {
                 let format = self.parse_format_string()?;
-                self.postfix_if_jq(format)
+                if self.mode == ParserMode::Jq {
+                    self.skip_ws();
+                }
+                if self.mode == ParserMode::Jq && self.peek() == Some('"') {
+                    let s = self.parse_string_or_interpolation()?;
+                    let formatted = Self::apply_format_to_interpolation(s, &format);
+                    self.parse_postfix(formatted)
+                } else {
+                    self.postfix_if_jq(format)
+                }
             }
 
             // Number literal (starts with digit). #2741, same reasoning as
@@ -6911,6 +6932,33 @@ impl<'a> Parser<'a> {
     /// against v4.53.3 for `"abc"[0:1]`, `1[0]` and `@base64[0]`), so
     /// widening unconditionally would introduce a new divergence rather
     /// than close one.
+    /// #3316: desugars a format-prefixed string (`@fmt "lit\(E)lit"`) into
+    /// the same shape a bare interpolation parses to, with each `\(E)`
+    /// rewritten to `E | @fmt` -- jq's own `gen_format(E, fmt)` rule.
+    /// `s` is always what [`Self::parse_string_or_interpolation`] returns,
+    /// so a plain `Expr::Literal(Literal::String(_))` (no `\(...)`) passes
+    /// through unchanged, matching jq leaving the format unrun for a
+    /// literal with no interpolation. `format` is cloned once per `\(...)`
+    /// slot; `FormatType`/`Expr` are cheap to clone and every slot needs
+    /// its own copy of the same format.
+    fn apply_format_to_interpolation(s: Expr, format: &Expr) -> Expr {
+        match s {
+            Expr::StringInterpolation(parts) => {
+                let parts = parts
+                    .into_iter()
+                    .map(|part| match part {
+                        StringPart::Expr(e) => {
+                            StringPart::Expr(Box::new(Expr::Pipe(vec![*e, format.clone()])))
+                        }
+                        literal @ StringPart::Literal(_) => literal,
+                    })
+                    .collect();
+                Expr::StringInterpolation(parts)
+            }
+            literal => literal,
+        }
+    }
+
     fn postfix_if_jq(&mut self, expr: Expr) -> Result<Expr, ParseError> {
         if self.mode == ParserMode::Jq {
             self.parse_postfix(expr)
@@ -11361,5 +11409,79 @@ mod tests {
         // by construction, so this can't happen in practice today -- pins
         // the guard directly rather than needing a real repro.
         let _ = floor_char_boundary("あ", 2, 1);
+    }
+
+    /// #3316: `@fmt "lit\(E)lit"` desugars to the plain interpolation with
+    /// each `\(E)` rewritten to `E | @fmt`, jq's own `gen_format(E, fmt)`
+    /// rule. A literal with no interpolation returns unchanged (the format
+    /// never runs), and the whole thing is a Term like any other
+    /// format/string primary.
+    #[test]
+    fn test_format_prefixed_string_desugars_3316() {
+        // `\(E)`'s inner expression parses the same whether it sits inside
+        // a format-prefixed string or stands alone -- reuse that instead of
+        // hand-constructing a `NumberLiteral`/`Slice` shape this test
+        // doesn't otherwise need to know.
+        let one = parse("1").unwrap();
+        let x = parse(r#""x""#).unwrap();
+        let y = parse(r#""y""#).unwrap();
+
+        assert_eq!(
+            parse(r#"@base64 "v=\(1)""#).unwrap(),
+            Expr::StringInterpolation(vec![
+                StringPart::Literal("v=".into()),
+                StringPart::Expr(Box::new(Expr::Pipe(vec![
+                    one,
+                    Expr::Format(FormatType::Base64),
+                ]))),
+            ])
+        );
+
+        // No interpolation: a plain literal, format never applied.
+        assert_eq!(
+            parse(r#"@base64 "abc""#).unwrap(),
+            Expr::Literal(Literal::String("abc".into()))
+        );
+
+        // Multiple `\(...)` slots each get their own format wrap.
+        assert_eq!(
+            parse(r#"@base64 "a\("x")b\("y")c""#).unwrap(),
+            Expr::StringInterpolation(vec![
+                StringPart::Literal("a".into()),
+                StringPart::Expr(Box::new(Expr::Pipe(vec![
+                    x,
+                    Expr::Format(FormatType::Base64),
+                ]))),
+                StringPart::Literal("b".into()),
+                StringPart::Expr(Box::new(Expr::Pipe(vec![
+                    y,
+                    Expr::Format(FormatType::Base64),
+                ]))),
+                StringPart::Literal("c".into()),
+            ])
+        );
+
+        // No space between the format name and the string is also valid
+        // (`@base64"x"`, confirmed live against jq 1.7.1).
+        assert!(parse(r#"@base64"x""#).is_ok());
+
+        // A Term: `as $v` binds the whole formatted-string expression.
+        assert!(parse(r#"@base64 "v=\(1)" as $v | $v"#).is_ok());
+
+        // Postfix applies to the result exactly the way it would to a
+        // plain string -- compared against that known-working baseline
+        // rather than a hand-guessed `Slice` shape.
+        assert_eq!(
+            parse(r#"@base64 "v"[0:1]"#).unwrap(),
+            parse(r#""v"[0:1]"#).unwrap()
+        );
+    }
+
+    /// yq's lexer rejects a format followed by a string outright, and this
+    /// issue leaves that unchanged -- only jq mode desugars.
+    #[test]
+    fn test_format_prefixed_string_still_rejected_in_yq_mode_3316() {
+        assert!(parse_with_mode(r#"@base64 "v=\(1)""#, ParserMode::Yq).is_err());
+        assert!(parse_with_mode(r#"@base64"x""#, ParserMode::Yq).is_err());
     }
 }
