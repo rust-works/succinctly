@@ -15535,6 +15535,29 @@ pub(crate) fn reverse_length_is_empty(length: &OwnedValue) -> bool {
     matches!(length, OwnedValue::Int(0)) || matches!(length, OwnedValue::Float(f) if *f == 0.0)
 }
 
+/// jq's own `length`, computed directly on an already-materialized
+/// [`OwnedValue`] rather than a document cursor (#2744) -- [`builtin_length`]
+/// exists for the cursor route and additionally has to worry about decode
+/// failures on raw, unvalidated document bytes, neither of which applies
+/// here: [`builtin_navigation`]'s `Reverse` arm only ever calls this on a
+/// value the resolver already holds in hand. jq mode only, matching every
+/// other caller of this file's untracked-navigation machinery -- a bare
+/// `bool` genuinely has no length in jq (confirmed live: `true | reverse`
+/// raises `boolean (true) has no length`, not a path error at all, since
+/// jq's own `length` call inside `reverse`'s definition fails before the
+/// navigation question is ever reached), so that arm is the one place this
+/// function can itself raise.
+fn owned_value_jq_length<S: EvalSemantics>(value: &OwnedValue) -> Result<OwnedValue, EvalError> {
+    match value.clone().into_plain_number() {
+        OwnedValue::Null => Ok(OwnedValue::Int(0)),
+        OwnedValue::String(s) => Ok(OwnedValue::Int(s.chars().count() as i64)),
+        OwnedValue::Array(items) => Ok(OwnedValue::Int(items.len() as i64)),
+        OwnedValue::Object(fields) => Ok(OwnedValue::Int(fields.len() as i64)),
+        n @ (OwnedValue::Int(_) | OwnedValue::Float(_)) => Ok(numeric_length_owned::<S>(n)),
+        other => Err(EvalError::has_no_length(&other)),
+    }
+}
+
 /// Builtin: flatten - flatten nested arrays (1 level)
 ///
 /// flatten is defined over [.[]], and .[] over an object iterates its
@@ -35298,10 +35321,30 @@ enum BuiltinNavigation {
 ///   their element depends on an argument or on `length` (and `reverse`
 ///   does not raise at all on an empty input), so they need a value this
 ///   function is not given — #2744.
-fn builtin_navigation(builtin: &Builtin, value: &OwnedValue) -> Option<BuiltinNavigation> {
+///
+/// The return type widened for that third group (#2744), from a plain
+/// `Option` into:
+///
+/// - `Ok(None)` — this builtin performs no navigation the resolver needs
+///   to check (either it is not in the set at all, or — `Nth`/`Indices`/
+///   `Index`/`Rindex`/`Reverse` only — its own argument/length computation
+///   produced no output, matching jq's empty-argument exemption).
+/// - `Ok(Some(nav))` — the navigation this builtin performs, to check
+///   against `value`'s trackability exactly like the constant-answer arms.
+/// - `Err(escape)` — evaluating an argument-dependent builtin's own
+///   argument (or, for `Reverse`, its own `length`) raised or broke,
+///   propagated directly, never converted into a path error. jq's own
+///   ordering always lets that win first (confirmed live:
+///   `[1,2,3] | nth(error("x"))` raises `"x"`, never a path error;
+///   `true | reverse` raises `boolean (true) has no length`, since
+///   `length` fails before `reverse`'s own navigation is ever reached).
+fn builtin_navigation<S: EvalSemantics>(
+    builtin: &Builtin,
+    value: &OwnedValue,
+) -> Result<Option<BuiltinNavigation>, EvalEscape> {
     match builtin {
-        Builtin::First => Some(BuiltinNavigation::Access(OwnedValue::Int(0))),
-        Builtin::Last => Some(BuiltinNavigation::Access(OwnedValue::Int(-1))),
+        Builtin::First => Ok(Some(BuiltinNavigation::Access(OwnedValue::Int(0)))),
+        Builtin::Last => Ok(Some(BuiltinNavigation::Access(OwnedValue::Int(-1)))),
         Builtin::Add
         | Builtin::Any
         | Builtin::AnyF(_)
@@ -35309,7 +35352,7 @@ fn builtin_navigation(builtin: &Builtin, value: &OwnedValue) -> Option<BuiltinNa
         | Builtin::AllF(_)
         | Builtin::Flatten
         | Builtin::Map(_)
-        | Builtin::FromEntries => Some(BuiltinNavigation::Iterate),
+        | Builtin::FromEntries => Ok(Some(BuiltinNavigation::Iterate)),
         // The one entry whose answer depends on the *input*, because its
         // own definition branches on it: `def walk(f): def w: if type ==
         // "object" then map_values(w) elif type == "array" then map(w)
@@ -35320,9 +35363,72 @@ fn builtin_navigation(builtin: &Builtin, value: &OwnedValue) -> Option<BuiltinNa
         // raise there -- `5 | walk(.)` inside `path()` answers `[]`, and
         // raising "iterate through 5" would be a divergence of its own.
         Builtin::Walk(_) if matches!(value, OwnedValue::Array(_)) => {
-            Some(BuiltinNavigation::Iterate)
+            Ok(Some(BuiltinNavigation::Iterate))
         }
-        _ => None,
+        // `nth($n)` names the *evaluated argument* verbatim, unconditionally
+        // -- confirmed live it is bounds- and type-agnostic, same as
+        // `First`/`Last`'s own constants above (`[1,2,3] | nth(10)` names
+        // `10` despite the array only having 3 elements; `true | nth(0)`
+        // still names `0` despite the input having no elements at all).
+        Builtin::Nth(n) => match eval_owned_expr_full::<S>(n, value, false) {
+            Ok(None) => Ok(None),
+            Ok(Some((element, _))) => Ok(Some(BuiltinNavigation::Access(element))),
+            Err(control) => Err(EvalEscape::from(control)),
+        },
+        // `indices(i)`/`index(i)`/`rindex(i)` (jq's own
+        // `def indices($i): if type == "array" and ($i|type) == "array"
+        // then .[$i] elif type == "array" then indices([$i]) elif type ==
+        // "string" then _strindices($i) else .[$i] end;`): the needle is
+        // always evaluated first regardless of input type -- its own
+        // error/empty always wins, confirmed live even for a `string`
+        // input that never itself navigates (`"abc" | indices(error("x"))`
+        // still raises `"x"`) -- but the *navigation* only happens for a
+        // non-string input, and only an array input wraps the needle
+        // (`indices([$i])`'s own recursion is what produces the `[needle]`
+        // container `[1] | indices(1)` names; a non-array input's `else`
+        // arm is a bare `.[$i]`, so `5 | indices(1)` names `1` unwrapped,
+        // and an array-typed needle on an array input skips the wrapping
+        // recursion entirely, so `[1,2] | indices([1,2])` also names its
+        // needle unwrapped). `_strindices` is a native builtin with no
+        // jq-level navigation at all, so a `string` input never raises a
+        // path error here (confirmed live, exit 0) -- checked before
+        // synthesizing an element, not by skipping the needle's own
+        // evaluation.
+        Builtin::Indices(needle) | Builtin::Index(needle) | Builtin::Rindex(needle) => {
+            match eval_owned_expr_full::<S>(needle, value, false) {
+                Ok(None) => Ok(None),
+                Ok(Some(_)) if matches!(value, OwnedValue::String(_)) => Ok(None),
+                Ok(Some((needle, _))) => {
+                    let element = if matches!(value, OwnedValue::Array(_))
+                        && !matches!(needle, OwnedValue::Array(_))
+                    {
+                        OwnedValue::array_from(vec![needle])
+                    } else {
+                        needle
+                    };
+                    Ok(Some(BuiltinNavigation::Access(element)))
+                }
+                Err(control) => Err(EvalEscape::from(control)),
+            }
+        }
+        // `reverse` names `length - 1`, and does not navigate at all when
+        // `length` is `0` (#2730's own rule, shared via
+        // `reverse_length_is_empty` so the two cannot drift) -- confirmed
+        // live for array/string/object/number inputs alike (jq's own
+        // `length` is polymorphic, so `5 | reverse` names element `4` of
+        // `5`, never actually attempting `.[4]` on a number).
+        Builtin::Reverse => match owned_value_jq_length::<S>(value) {
+            Ok(len) if reverse_length_is_empty(&len) => Ok(None),
+            Ok(OwnedValue::Int(len)) => {
+                Ok(Some(BuiltinNavigation::Access(OwnedValue::Int(len - 1))))
+            }
+            Ok(OwnedValue::Float(len)) => Ok(Some(BuiltinNavigation::Access(OwnedValue::Float(
+                len - 1.0,
+            )))),
+            Ok(_) => unreachable!("owned_value_jq_length only ever returns Int or Float"),
+            Err(e) => Err(EvalEscape::Error(e)),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -35698,18 +35804,28 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         // these in `builtin.jq`; yq's implementation shares none of it.
         if S::TAG == EvalTag::Jq {
             if let Expr::Builtin(builtin) = expr {
-                if let Some(navigation) = builtin_navigation(builtin, value) {
-                    let (error, step) = match navigation {
-                        BuiltinNavigation::Access(element) => (
-                            EvalError::invalid_path_expression_near_access(&element, value),
-                            NavKind::of(&element),
-                        ),
-                        BuiltinNavigation::Iterate => (
-                            EvalError::invalid_path_expression_near_iterate(value),
-                            Some(NavKind::Iterate),
-                        ),
-                    };
-                    return Some(Err((Vec::new(), refuse(error, step).into())));
+                match builtin_navigation::<S>(builtin, value) {
+                    Ok(Some(navigation)) => {
+                        let (error, step) = match navigation {
+                            BuiltinNavigation::Access(element) => (
+                                EvalError::invalid_path_expression_near_access(&element, value),
+                                NavKind::of(&element),
+                            ),
+                            BuiltinNavigation::Iterate => (
+                                EvalError::invalid_path_expression_near_iterate(value),
+                                Some(NavKind::Iterate),
+                            ),
+                        };
+                        return Some(Err((Vec::new(), refuse(error, step).into())));
+                    }
+                    Ok(None) => {}
+                    // #2744: an argument-dependent builtin's own argument (or
+                    // `Reverse`'s own `length`) raised or broke -- propagated
+                    // directly, never through `refuse`'s uncatchable-guess
+                    // machinery, which exists for a genuinely *untracked*
+                    // navigation attempt, not for an ordinary escape from
+                    // evaluating a sub-expression.
+                    Err(escape) => return Some(Err((Vec::new(), escape))),
                 }
             }
         }

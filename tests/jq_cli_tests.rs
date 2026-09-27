@@ -56588,6 +56588,173 @@ fn test_dollar_param_builtins_keep_their_own_error_2646() -> Result<()> {
     Ok(())
 }
 
+/// #2744: `nth(n)`/`reverse`/`indices(i)`/`index(i)`/`rindex(i)` are the
+/// third group #2646's static table could not answer for -- each needs a
+/// value the table is not given (the evaluated argument, or the input's
+/// own `length`), not a constant. Every row captured live from jq 1.7.1.
+#[test]
+fn test_argument_dependent_navigating_builtins_raise_inside_path_2744() -> Result<()> {
+    for (filter, doc, element) in [
+        (
+            "[path(([1,2,3] | nth(2)) | empty)]",
+            "{}",
+            "element 2 of [1,2,3]",
+        ),
+        (
+            "[path(([1,2,3] | nth(10)) | empty)]",
+            "{}",
+            "element 10 of [1,2,3]",
+        ),
+        (
+            "[path(([1,2,3] | nth(-1)) | empty)]",
+            "{}",
+            "element -1 of [1,2,3]",
+        ),
+        (
+            r#"[path(([1,2,3] | nth("x")) | empty)]"#,
+            "{}",
+            r#"element "x" of [1,2,3]"#,
+        ),
+        ("[path((true | nth(0)) | empty)]", "{}", "element 0 of true"),
+        (
+            "[path(([1,2,3] | reverse) | empty)]",
+            "{}",
+            "element 2 of [1,2,3]",
+        ),
+        ("[path((5 | reverse) | empty)]", "{}", "element 4 of 5"),
+        (
+            r#"[path(("abc" | reverse) | empty)]"#,
+            "{}",
+            r#"element 2 of "abc""#,
+        ),
+        (
+            r#"[path(({"a":1} | reverse) | empty)]"#,
+            "{}",
+            r#"element 0 of {"a":1}"#,
+        ),
+        (
+            "[path(([1] | indices(1)) | empty)]",
+            "{}",
+            "element [1] of [1]",
+        ),
+        ("[path((5 | indices(1)) | empty)]", "{}", "element 1 of 5"),
+        (
+            "[path(([1,2] | indices([1,2])) | empty)]",
+            "{}",
+            "element [1,2] of [1,2]",
+        ),
+        (
+            "[path(([1,2] | index(2)) | empty)]",
+            "{}",
+            "element [2] of [1,2]",
+        ),
+        (
+            "[path(([1,2] | rindex(2)) | empty)]",
+            "{}",
+            "element [2] of [1,2]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression near attempt to access "),
+            "{filter}: {stderr:?}"
+        );
+        assert!(stderr.contains(element), "{filter}: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2744's boundary: `reverse` does not raise at all on a genuinely empty
+/// input (`length` of `0`), and `indices`/`index`/`rindex` never raise on a
+/// `string` input (`_strindices` is native, no jq-level navigation).
+/// Captured live from jq 1.7.1.
+#[test]
+fn test_argument_dependent_navigators_stay_silent_on_their_own_boundary_2744() -> Result<()> {
+    for filter in [
+        "[path(([] | reverse) | empty)]",
+        "[path((null | reverse) | empty)]",
+        r#"[path(("abc" | indices("b")) | empty)]"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), "[]", "{filter}");
+    }
+    Ok(())
+}
+
+/// #2744: the argument's own error/empty always wins, and `reverse`'s own
+/// `length` call can itself raise (a bare `bool` has no length in jq) --
+/// neither is a path error. Same ordering rule #2646's
+/// `test_dollar_param_builtins_keep_their_own_error_2646` documents for
+/// `join`/`flatten`. Captured live from jq 1.7.1.
+#[test]
+fn test_argument_dependent_navigators_yield_to_their_own_argument_2744() -> Result<()> {
+    for (filter, needle) in [
+        (r#"[path(([1,2,3] | nth(error("boom"))) | empty)]"#, "boom"),
+        (
+            r#"[path(([1,2,3] | indices(error("boom"))) | empty)]"#,
+            "boom",
+        ),
+        (
+            r#"[path(("abc" | indices(error("boom"))) | empty)]"#,
+            "boom",
+        ),
+        (
+            "[path((true | reverse) | empty)]",
+            "boolean (true) has no length",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            !stderr.contains("Invalid path expression"),
+            "{filter}: the argument's own error must win: {stderr:?}"
+        );
+        assert!(stderr.contains(needle), "{filter}: {stderr:?}");
+    }
+    // An empty-producing argument suppresses to no output, exit 0 -- never
+    // a raised path error.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[path(([1,2,3] | nth(empty)) | empty)]"],
+        Some("{}"),
+    )?;
+    assert_eq!(code, 0, "stderr {stderr:?}");
+    assert_eq!(stdout.trim(), "[]");
+    Ok(())
+}
+
+/// #2744, the one *write* whose output moved: `setpath`/`del` consume
+/// `path()`'s output, so a `try` on a later pipe stage cannot reach an
+/// error `nth`/`reverse`/`indices` themselves already raised -- same
+/// #3271-style catchability check its own test makes for its builtin set.
+/// Captured live from jq 1.7.1.
+#[test]
+fn test_argument_dependent_navigators_raise_unconditionally_2744() -> Result<()> {
+    for filter in [
+        r"del(. as $x | [([1,2,3] | nth(2))] | try .[0])",
+        r"del(. as $x | [([1,2,3] | reverse)] | try .[0])",
+        r"del(. as $x | [([1] | indices(1))] | try .[0])",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression near attempt to access "),
+            "{filter}: {stderr:?}"
+        );
+    }
+    // A `try`/`?` directly on the raising construct still catches it.
+    for filter in [
+        r"del(try ([1,2,3] | nth(2)))",
+        r"del(. as $x | try ([1,2,3] | nth(2)) | $x)",
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, r#"{"a":1}"#, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), r#"{"a":1}"#, "{filter}");
+    }
+    Ok(())
+}
+
 /// #2646: the raise is independent of the input's type for every entry but
 /// `walk` -- `first` on a scalar still reports `element 0 of 5`, matching
 /// jq, rather than being skipped as "not a container". `walk` is the one
