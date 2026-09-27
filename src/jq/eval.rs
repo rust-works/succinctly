@@ -2829,10 +2829,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Slice { start, end, .. } => match value {
             StandardJson::Array(elements) => {
-                // Fast path: full slice [:] / [0:] returns the original array unchanged
-                if matches!(start, None | Some(0)) && end.is_none() {
-                    return QueryResult::One(value);
-                }
+                let all: Vec<_> = elements.collect();
                 // jq array slicing yields a single sub-array, not a stream of
                 // elements. #1932: `to_owned`, not an unchecked
                 // `to_owned_lossy`, per element -- an undecodable element's string
@@ -2853,11 +2850,52 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // `to_owned_or_suppress!` macro directly inside
                 // `.map()` here since its `return` would return from the
                 // closure, not this function.
-                let sliced = slice_elements::<W>(elements, *start, *end);
-                match sliced.iter().map(to_owned::<S, _>).collect() {
-                    Ok(items) => QueryResult::Owned(OwnedValue::Array(items)),
-                    Err(e) => suppress_or_raise(e, optional),
+                //
+                // Validated unconditionally, ahead of the #3306 fast path
+                // just below: `test_style_0012_routed_sites_still_raise_2334`
+                // pins `.[0:1]` on a malformed single-element array as one of
+                // the "routed sites" that must still raise eagerly, which an
+                // early return *before* this validation would silently skip
+                // -- a slice is a materializing operation for this purpose
+                // even when its own range happens to be the identity one,
+                // unlike a bare `.`/`Expr::Identity`, which never decodes at
+                // all.
+                let items = match all
+                    .iter()
+                    .map(to_owned::<S, _>)
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(items) => items,
+                    Err(e) => return suppress_or_raise(e, optional),
+                };
+                // Fast path (#3306, jq mode only): jq's own slice identity
+                // rule -- `jv_slice(a, 0, len)` hands back `a` itself, not a
+                // copy, so a slice naming every element of a non-empty array
+                // must return the original value unchanged, the same as
+                // the syntactically fully-open spelling (`.[:]`/`.[0:]`)
+                // this fast path already special-cased -- widened here to
+                // any closed bound pair that happens to resolve to the
+                // same range (`.[0:2]` on a 2-element array, `.[0:5]` on
+                // one with fewer than 5 elements, ...). Mode-gated the same
+                // way, and for the same reason, as `eval_generic.rs`'s own
+                // native `Expr::Slice` arm (see its doc comment): real yq's
+                // own slicing always re-marshals its result to a fresh
+                // style regardless of range, so preserving style through a
+                // full-range slice here would diverge in yq mode for a
+                // jq-only extension's benefit.
+                if S::TAG != EvalTag::Yq
+                    && SliceBounds::from_literals(*start, *end).is_full_range(all.len())
+                {
+                    return QueryResult::One(value);
                 }
+                let range = SliceBounds::from_literals(*start, *end).resolve(all.len());
+                QueryResult::Owned(OwnedValue::Array(
+                    items
+                        .into_iter()
+                        .skip(range.start)
+                        .take(range.len())
+                        .collect(),
+                ))
             }
             // yq treats a null/number/boolean target as an empty container
             // for slicing purposes (#1065, verified live against real yq
@@ -25635,20 +25673,6 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
     elements: JsonElements<'_, W>,
 ) -> Result<usize, EvalError> {
     elements.len_checked()
-}
-
-/// Slice elements from an array.
-fn slice_elements<W: Clone + AsRef<[u64]>>(
-    elements: JsonElements<'_, W>,
-    start: Option<i64>,
-    end: Option<i64>,
-) -> Vec<StandardJson<'_, W>> {
-    let all: Vec<_> = elements.collect();
-    let range = SliceBounds::from_literals(start, end).resolve(all.len());
-    all.into_iter()
-        .skip(range.start)
-        .take(range.len())
-        .collect()
 }
 
 /// Evaluate a jq expression against a JSON cursor.

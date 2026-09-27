@@ -65489,6 +65489,104 @@ fn test_owned_embed_identity_through_relocating_builtins_3178() -> Result<()> {
     Ok(())
 }
 
+/// #3306: a slice naming every element of a non-empty array is jq's own
+/// `jv_identical` to that array (`jv_slice(a, 0, len)` hands back `a`
+/// itself, not a copy), so `path($x)` after binding the array and then
+/// full-range-slicing it succeeds, the same as a bare `.` would -- both at
+/// the root and after a real navigation step. A partial or empty-array
+/// slice still refuses, since neither is `jv_identical` to anything. Every
+/// expected output captured live against jq 1.7.1.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_full_range_slice_keeps_node_identity_3306() -> Result<()> {
+    for (input, filter, expected) in [
+        (r"[1,2]", r". as $x | .[0:2] | path($x)", "[]"),
+        (r"[1,2]", r". as $x | .[0:] | path($x)", "[]"),
+        (r"[1,2]", r". as $x | .[:5] | path($x)", "[]"),
+        // An over-wide bound still clamps to the full range.
+        (r"[1,2]", r". as $x | .[-9:9] | path($x)", "[]"),
+        (r#"{"c":[1,2]}"#, r".c as $x | .c[0:2] | path($x)", "[]"),
+        // Ordinary value output is unaffected either way -- this is a
+        // `path()`-identity fix, not a value-production change.
+        (r"[1,2]", r".[0:2]", "[1,2]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3306: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    // Refuse-only rows: a partial slice, and the empty array (which has no
+    // "whole" to be identical to -- `[] as $x | .[0:0] | path($x)` raises in
+    // jq 1.7.1 too, same as any other non-identity slice).
+    for (input, filter) in [
+        (r"[1,2,3]", r". as $x | .[0:2] | path($x)"),
+        (r"[]", r". as $x | .[0:0] | path($x)"),
+        (r#"{"c":[1,2,3]}"#, r".c as $x | .c[0:2] | path($x)"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "#3306: `{filter}`");
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3306: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    // A direct `path(EXPR)` print always includes the slice's own literal
+    // component regardless of full-vs-partial range -- #3306's identity
+    // rule governs whether a *bound variable's* later position is
+    // recognized as the same node, not what a direct navigation expression
+    // prints for its own literal shape. Both captured live against jq 1.7.1.
+    for (filter, expected) in [
+        (r"path(.c[0:2])", r#"["c",{"start":0,"end":2}]"#),
+        (r"path(.c[0:1])", r#"["c",{"start":0,"end":1}]"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"c":[1,2]}"#))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3306: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3306 review: real yq's own slicing always re-marshals its result to a
+/// fresh style, discarding whatever flow/block annotation the source had --
+/// captured live against yq v4.53.3, `.c[0:2]` on `c: [1, 2]` prints
+/// block-style `- 1\n- 2`, not the flow-style `[1, 2]` a bare `.c` itself
+/// prints. #3306's jq-mode fast path must not change that: `path`/`as`-
+/// then-`path($x)` is a jq-only extension real yq's own lexer rejects
+/// outright, so yq mode has no oracle-comparable identity behavior to fix,
+/// and must keep going through the same bridge it always has.
+#[test]
+fn test_full_range_slice_yq_mode_style_unaffected_3306() -> Result<()> {
+    for (doc, expected) in [
+        (&b"c: [1, 2]\n"[..], "- 1\n- 2\n"),
+        // Partial (`.c[0:2]` keeps only the first two of three elements) --
+        // block style either way, since real yq's own slicing always
+        // re-marshals regardless of range.
+        (&b"c: [1, 2, 3]\n"[..], "- 1\n- 2\n"),
+    ] {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut cmd = Command::new(succinctly_bin());
+                cmd.arg("yq").arg(".c[0:2]");
+                cmd
+            },
+            Some(doc),
+        )?;
+        let stdout = String::from_utf8(output.stdout)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 /// #3188: a write whose target navigates to an embed of `$x` over an owned
 /// root resolves that target over the caller's own tree, as `path(f)` does
 /// since #3177, so `del`, `=`, `|=`, `op=` and `//=` answer where jq does.

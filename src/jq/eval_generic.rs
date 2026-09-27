@@ -7880,6 +7880,63 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // a real position instead of falling to the `One`->`None` default.
         Expr::Identity => cursor.map_or(GenericResult::One(value), GenericResult::OneCursor),
 
+        // #3306 (jq mode only): a slice naming every element of a non-empty
+        // array is jq's own `jv_identical` to that array, so it is handled
+        // exactly like `Expr::Identity` just above -- most importantly,
+        // *natively*, never through this function's `_` catch-all a few
+        // arms down, which bridges into `eval.rs` via a JSON serialize/
+        // reparse round trip (`bridge_ambient_input` + `reindexed`). That
+        // round trip unconditionally treats its own output as a fresh value
+        // with no relationship to whatever the input carried, which would
+        // demote an `as`-bound variable's marker as "rebuilt" regardless of
+        // what this arm's own fix inside `eval.rs`'s `Expr::Slice` arm does
+        // -- confirmed live, fixing only the `eval.rs` side left `. as $x |
+        // .[0:2] | path($x)` refusing exactly as before. Handling it here
+        // avoids the bridge outright for the identity-preserving case, the
+        // same way `Expr::Identity` always has.
+        //
+        // **jq mode only**: real yq's own slicing always re-marshals its
+        // result, discarding any flow/block style annotation the source had
+        // -- confirmed live, `.c[0:2]` on `c: [1, 2]` (yq v4.53.3) prints
+        // block-style `- 1\n- 2`, not the flow-style `[1, 2]` a bare `.c`
+        // itself prints. Taking this native, cursor-preserving route in yq
+        // mode too would keep the source's own style for a full-range slice
+        // specifically (since it hands back the exact same node `.c` would),
+        // diverging from that real-yq behavior for no reason `path()`-style
+        // jv-identity tracking needs -- `path`/`as`-then-`path($x)` is a jq-
+        // only extension real yq's own lexer rejects outright ("bad
+        // expression, please check expression syntax"), so yq mode has no
+        // oracle-comparable behavior this arm could even be fixing. A
+        // genuinely partial slice already falls through unguarded to the
+        // catch-all below in both modes, unchanged.
+        Expr::Slice { start, end, .. }
+            if S::TAG != EvalTag::Yq
+                && value.as_array().is_some_and(|elements| {
+                    SliceBounds::from_literals(*start, *end).is_full_range(elements.len())
+                }) =>
+        {
+            // Validated eagerly despite the fast path:
+            // `test_style_0012_routed_sites_still_raise_2334` pins `.[0:1]`
+            // on a malformed single-element array as one of the "routed
+            // sites" that must still raise. A slice is a materializing
+            // operation for this purpose even when its own range happens to
+            // be the identity one, unlike a bare `.`/`Expr::Identity`, which
+            // never decodes at all.
+            if let Some(elements) = value.as_array() {
+                for element in elements.collect_values() {
+                    // STYLE-0012: a decode failure is uncatchable at value
+                    // position (`is_uncatchable_at_value_position`), so this
+                    // must raise regardless of `optional` -- only
+                    // `eval.rs`'s slow general path (`suppress_or_raise`)
+                    // ever needs to consult it for this same error class.
+                    if let Err(e) = to_owned::<S, _>(&element) {
+                        return GenericResult::Error(e);
+                    }
+                }
+            }
+            cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
+        }
+
         Expr::Field(name) => {
             // #2470 (yq mode, read-only context only): see
             // `eval::yq_absent_key_read_is_empty` -- the same rule the eager
@@ -17842,7 +17899,14 @@ fn owned_nav_children<S: EvalSemantics>(
         // Mode decides the slice component (ADR-0018): real yq keeps the
         // container's position (`.c[0:1] | path` is `["c"]`, `.c[0:1] | .[0]
         // | path` is `["c",0]`, captured from v4.53.3), while jq mode follows
-        // jq's own `path(.c[0:1])`, `["c",{"start":0,"end":1}]`.
+        // jq's own `path(.c[0:1])`, `["c",{"start":0,"end":1}]` -- live-
+        // verified this holds even for a full-range slice (`path(.c[0:2])`
+        // on a 2-element `.c` is still `["c",{"start":0,"end":2}]`, never
+        // `["c"]`): #3306's slice-identity rule governs whether a *bound
+        // variable's* later position is recognized as the same node, not
+        // what a direct `path(EXPR)` prints for EXPR's own literal shape --
+        // the two are independent questions, and this component is only
+        // ever the latter.
         Expr::Slice {
             start,
             end,
