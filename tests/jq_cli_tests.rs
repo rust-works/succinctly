@@ -48570,6 +48570,59 @@ fn join_and_format_match_jq_3046() -> Result<()> {
     Ok(())
 }
 
+/// #3358: jq stringifies every input before `@base64d` decodes it. These
+/// whole CLI results were captured from /usr/bin/jq 1.7.1.
+#[test]
+fn base64d_stringifies_before_decode_3358() -> Result<()> {
+    for (input, filter, want_out, want_err, want_code) in [
+        ("null", "@base64d", "\"��\"\n", "", 0),
+        ("42", "@base64d", "\"�\"\n", "", 0),
+        ("true", "@base64d", "\"���\"\n", "", 0),
+        (
+            "false",
+            "@base64d",
+            "",
+            "jq: error (at <stdin>:1): string (\"false\") trailing base64 byte found\n",
+            5,
+        ),
+        (
+            r#"[1,"x y"]"#,
+            "@base64d",
+            "",
+            concat!(
+                r#"jq: error (at <stdin>:1): string ("[1,\"x y\"]") is not valid base64 data"#,
+                "\n"
+            ),
+            5,
+        ),
+        (
+            r#"{"arr":[1,"x y"]}"#,
+            r#".arr | format("base64d")"#,
+            "",
+            concat!(
+                r#"jq: error (at <stdin>:1): string ("[1,\"x y\"]") is not valid base64 data"#,
+                "\n"
+            ),
+            5,
+        ),
+        (
+            r#"["aGVsbG8=",null]"#,
+            ".[] | @base64d",
+            "\"hello\"\n\"��\"\n",
+            "",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "input={input}, filter={filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #3046: `JOIN`'s wrong arities and a malformed call resolve as jq's do --
 /// `JOIN/0`, `JOIN/1` and `JOIN/5` are not defined (exit 3), and an unclosed
 /// argument list is a syntax error (jq's wording differs).
