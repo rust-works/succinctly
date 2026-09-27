@@ -627,6 +627,35 @@ pub(crate) fn is_jq_canonical_number(raw: &[u8]) -> bool {
     // and a second full scan costs more than the allocation it saves --
     // measured at +1.3% to +2.0% on a 7950X, i.e. a net loss. The scan, not
     // the allocation, is the expensive half.
+    //
+    // An exponent (or trailing junk like `1.2.3`) leaves the canonical set:
+    // the formatter has its own reformatting path for exponents, so the
+    // canonical prefix must be the whole of `raw`.
+    jq_canonical_number_prefix(raw) == Some(raw.len())
+}
+
+/// Where a greedy left-to-right parse of `-?(0|[1-9][0-9]*)(\.[0-9]+)?`
+/// over `raw` stops, if that parse satisfies [`is_jq_canonical_number`]'s
+/// rules; `None` when it does not (no integer part, a `.` with no digit
+/// after it, or the `0.000000x` spellings decNumber writes in scientific
+/// notation).
+///
+/// This is *not* the longest canonical prefix: a `.` commits the parse to
+/// a fraction, so `1.x` and `1.e5` answer `None` although `1` alone would
+/// be canonical. Both callers only ever ask whether the parse covers a
+/// whole token, where the two readings agree.
+///
+/// [`is_jq_canonical_number`] is this prefix being all of `raw`. The JSON
+/// canonical-compact scan (`src/json/light.rs`, #3167) reads the prefix off
+/// the document directly and checks the byte after it, so it recognises a
+/// number in one pass instead of finding the greedy span first and then
+/// re-reading it here: one definition of "canonical", two ways to ask.
+// `inline(always)`: the scan's call is per number, usually a one- or
+// two-byte token, where an out-of-line call cost as much as the scan
+// (33 Ir per single-digit number on a 7950X, #3167).
+#[inline(always)]
+#[must_use]
+pub(crate) fn jq_canonical_number_prefix(raw: &[u8]) -> Option<usize> {
     let mut i = 0usize;
     let n = raw.len();
     if i < n && raw[i] == b'-' {
@@ -644,7 +673,7 @@ pub(crate) fn is_jq_canonical_number(raw: &[u8]) -> bool {
         }
     }
     if i == int_start {
-        return false;
+        return None;
     }
     // Fraction: a `.` must be followed by at least one digit. `1.` is a
     // scanner-lenient span RFC 8259 rejects and the `from_number_bytes`
@@ -656,7 +685,7 @@ pub(crate) fn is_jq_canonical_number(raw: &[u8]) -> bool {
             i += 1;
         }
         if i == frac_start {
-            return false;
+            return None;
         }
         // decNumber writes `0.` followed by 6+ zeros and a digit, or by 7+
         // zeros alone, in scientific notation (`1E-7`, `0E-7`), which the
@@ -666,13 +695,11 @@ pub(crate) fn is_jq_canonical_number(raw: &[u8]) -> bool {
             let frac = &raw[frac_start..i];
             let zeros = frac.iter().take_while(|&&b| b == b'0').count();
             if zeros >= 6 && !(zeros == 6 && frac.len() == 6) {
-                return false;
+                return None;
             }
         }
     }
-    // Any exponent (or trailing junk like `1.2.3`) leaves the canonical
-    // set: the formatter has its own reformatting path for exponents.
-    i == n
+    Some(i)
 }
 
 /// decNumber's to-scientific-string for a plain decimal literal (no
