@@ -95435,7 +95435,7 @@ mod tests {
             false,
         ) {
             QueryResult::Owned(OwnedValue::Null) => {}
-            other => panic!("expected Owned(Null), got {other:?}"),
+            other => panic!("expected Owned(Null), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
         }
         match eval_path_context_pipe_owned::<Vec<u64>, YqSemantics>(
             &[
@@ -95446,7 +95446,7 @@ mod tests {
             false,
         ) {
             QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
+            other => panic!("expected None, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
         }
     }
 
