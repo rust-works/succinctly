@@ -11978,6 +11978,7 @@ mod tests {
                 "yq accepted {filter:?}"
             );
         }
+    }
 
     #[test]
     fn test_yq_rejects_generic_postfix_optional_3378() {
