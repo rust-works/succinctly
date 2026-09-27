@@ -56744,6 +56744,105 @@ fn test_path_reports_the_earlier_failure_when_both_stages_fail_2680() -> Result<
     Ok(())
 }
 
+/// #2752: postfix `?` on a parenthesised generator must stop the whole
+/// generator at the first raise, not skip the failing element and keep
+/// producing later ones -- jq's `?` never resumes a generator past an
+/// error, so `.a[1]` (the element after the one that raises) must never be
+/// reached at all. Filed against an older commit where `step_into`'s
+/// `Err(EvalEscape::Error(_)) if optional => return Ok(())` (`src/jq/eval.rs`)
+/// turned a failing step into "no output for that element, keep walking" --
+/// the wrong scope for `?` to catch at.
+///
+/// Re-investigated while triaging this issue and found already fixed on
+/// `main` (verified live against jq 1.7.1 for every row below, including the
+/// two write-side rows from the issue's own follow-up comment): a live probe
+/// (temporary `eprintln!` at `step_into`'s and `walk_path`'s entry, reverted
+/// before this commit) showed neither function is even reached for this
+/// shape any more. `resolve_dynamic_indexes_sink`'s prepass
+/// (`builtin_path_on_owned`'s first step) now resolves a mid-pipe
+/// `Expr::Iterate` into concrete per-branch `Expr`s ahead of the walk --
+/// enumerating `.a[]`'s branches itself, stopping at the first one that
+/// fails to resolve through `.b`, and only ever handing `walk_path` an
+/// already-resolved, non-optional branch. `step_into`'s own `optional`
+/// swallow (still present in the source, reached only via a *trailing*
+/// `Expr::Optional(Iterate)` the prepass deliberately defers for a different
+/// reason, #888) is dead for this shape, not the active mechanism any more.
+/// This test exists so that fact stays true: a future change to the prepass
+/// or to `step_into` that reopens this gap fails here immediately, on the
+/// exact repro the issue reported.
+#[test]
+fn test_optional_generator_stops_at_first_raise_2752() -> Result<()> {
+    // Read-side: `path(...)`. Element 0 (`5 | .b`) raises; `?` must stop the
+    // whole generator there, so element 1 is never reached and nothing is
+    // emitted at all (not even a diagnostic -- `?` suppresses it).
+    let (stdout, code) = run_jq_stdin(
+        "path((.a[] | .b)? | .c[0:1])",
+        r#"{"a":[5,{"b":{}}]}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        "",
+        "the generator must stop at element 0's raise, never reaching element 1"
+    );
+
+    // Control: the failing element last -- nothing after it to skip, so both
+    // tools already agreed before this issue and must still agree.
+    let (stdout, code) = run_jq_stdin(
+        "path((.a[] | .b)? | .c[0:1])",
+        r#"{"a":[{"b":{}},5]}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim_end(), r#"["a",0,"b","c",{"start":0,"end":1}]"#);
+
+    // Write-side, from the issue's own follow-up comment: `del`/`=` consume
+    // `path()`'s output, so the read-side bug became an *extra write* --
+    // element 2's `.c` must be left untouched, since jq's generator never
+    // reaches it.
+    let (stdout, code) = run_jq_stdin(
+        r"del((.a[] | .b)? | .c)",
+        r#"{"a":[{"b":{"c":1}},5,{"b":{"c":2}}]}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#"{"a":[{"b":{}},5,{"b":{"c":2}}]}"#,
+        "element 2's .c must survive -- the generator never reaches it"
+    );
+
+    let (stdout, code) = run_jq_stdin(
+        r"((.a[] | .b)? | .c) = 9",
+        r#"{"a":[{"b":{"c":1}},5,{"b":{"c":2}}]}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#"{"a":[{"b":{"c":9}},5,{"b":{"c":2}}]}"#,
+        "element 2 must not be written -- the generator never reaches it"
+    );
+
+    // Generality check the issue itself asked for: the same "error ends the
+    // generator" rule holds with `try/catch` instead of `?`, and for a bare
+    // (non-path) generator with no `path()`/write wrapper at all.
+    let (stdout, code) = run_jq_stdin(
+        r#"[try (.a[] | .b) catch "caught"]"#,
+        r#"{"a":[5,{"b":{}}]}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim_end(), r#"["caught"]"#);
+
+    let (stdout, code) = run_jq_stdin("(.a[] | .b)?", r#"{"a":[5,{"b":{}}]}"#, &["-c"])?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim_end(), "");
+
+    Ok(())
+}
+
 /// #2680: the one *write* whose output moved. `setpath` consumes `path()`'s
 /// output, so a path that was previously dropped now reaches it and the
 /// write happens -- which is what jq does, since jq produced that path all
