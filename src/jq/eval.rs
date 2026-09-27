@@ -36984,13 +36984,17 @@ fn marker_identical<S: EvalSemantics>(
 /// recurses to, so a stale marker refuses wherever it's reached, not just
 /// at the top.
 ///
-/// Mirrors `is_identity_passthrough`'s grammar otherwise, with one
-/// difference: `Alternative` is gated on the *runtime* register being
-/// truthy (`A // B` only ever equals `.` exactly when `A` actually
+/// Mirrors `is_identity_passthrough`'s grammar otherwise, with two
+/// differences. First: `Alternative` is gated on the *runtime* register
+/// being truthy (`A // B` only ever equals `.` exactly when `A` actually
 /// produced the value) rather than on `is_raise_free_identity_passthrough
 /// (left)` alone, which says nothing about which side's value reached
 /// `bound` -- the same #3129 lesson applied to an immediate, non-deferred
-/// certification instead of a later one.
+/// certification instead of a later one. Second (#3127): this function has
+/// an `Expr::Comma` arm and `is_identity_passthrough` does not -- a gap
+/// this function's own review found and fixed here, `is_identity_passthrough`'s
+/// still open as #3334, so this "mirrors ... otherwise" claim is accurate
+/// only up to that one recorded exception.
 fn resolves_to_register<S: EvalSemantics>(
     expr: &Expr,
     trackable: bool,
@@ -37020,8 +37024,10 @@ fn resolves_to_register<S: EvalSemantics>(
         // `is_identity_passthrough` mechanism, is #3334, not fixed here),
         // and still refuses `(., 1) as [$z] ?// {a:$q} | $q` on the
         // *second* output only (jq's own message names `1`, not the whole
-        // document), where this arm's own `false` for that mixed shape
-        // leaves the existing per-bound fallback to answer, unchanged.
+        // document) -- where this arm's own `false` for that mixed shape
+        // leaves the existing per-bound fallback to (wrongly) refuse the
+        // first, resolvable branch too, a real, tracked divergence (#3334)
+        // this fix does not reach.
         Expr::Comma(exprs) => exprs
             .iter()
             .all(|e| resolves_to_register::<S>(e, trackable, reg, frame)),
@@ -106694,17 +106700,14 @@ mod tests {
                 r"[path(((.,.) as [$z] ?// {a:$q} | ($q, 0))?)]",
                 Err(r"Invalid path expression with result 0"),
             ),
-            // Control: the asymmetric source this fix does not recognize --
-            // `resolves_to_register`'s own `&&` still answers `false` here,
-            // and the pre-existing per-bound fallback refuses a non-
-            // null/bool value regardless, same as before this fix.
-            (
-                r#"{"a":[1,2],"b":[3]}"#,
-                r"[path((.,1) as [$z] ?// {a:$q} | $q)]",
-                Err(
-                    r#"Invalid path expression near attempt to access element "a" of {"a":[1,2],"b":[3]}"#,
-                ),
-            ),
+            // The asymmetric source (`.` resolves, `1` does not) is
+            // deliberately *not* pinned here: `resolves_to_register`'s own
+            // `&&` still answers `false` for the whole comma in that case,
+            // and the pre-existing per-bound fallback then refuses the
+            // resolvable branch too -- a real, separately-tracked
+            // divergence from jq (#3334), not something this fix reaches.
+            // Pinning succinctly's own current (wrong) answer as "expected"
+            // here would misrepresent it as verified-correct.
         ] {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
