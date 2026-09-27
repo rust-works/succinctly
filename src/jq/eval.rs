@@ -37003,6 +37003,28 @@ fn resolves_to_register<S: EvalSemantics>(
         // own `TrackedVar` arm, so a future refinement of this rule can't
         // apply to one and silently miss the other.
         Expr::TrackedVar(marker) => marker_identical::<S>(marker, reg, frame),
+        // #3127: every branch of a comma-fanned source is its own separate
+        // output (`eval_owned_expr_fork`'s `sources`), so this is sound
+        // exactly when every branch is -- `(.,.)` (both `Identity`) proves
+        // every output register-identical this way; `(., 1)` does not (`1`
+        // fails its own arm), and correctly falls through to the per-bound
+        // null/bool fallback below for the branch that does resolve, same
+        // conservative "guess" this function already makes for any shape
+        // it doesn't recognize (see this function's own doc comment) --
+        // this arm only turns a previously-unrecognized shape into one that
+        // sometimes proves `true`, never the reverse. Confirmed live: jq
+        // agrees `[path((.,.) as [$z] ?// {a:$q} | $q)]` is `[["a"],["a"]]`
+        // (this arm's only caller, `resolve_as_pattern`, is reached through
+        // `?//`/destructuring, never a bare `. as $x | body` -- that
+        // simpler form's own identical gap, in the unrelated
+        // `is_identity_passthrough` mechanism, is #3334, not fixed here),
+        // and still refuses `(., 1) as [$z] ?// {a:$q} | $q` on the
+        // *second* output only (jq's own message names `1`, not the whole
+        // document), where this arm's own `false` for that mixed shape
+        // leaves the existing per-bound fallback to answer, unchanged.
+        Expr::Comma(exprs) => exprs
+            .iter()
+            .all(|e| resolves_to_register::<S>(e, trackable, reg, frame)),
         Expr::If {
             then_branch,
             else_branch,
@@ -106635,6 +106657,87 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// #3127: `resolves_to_register`'s head-shape check had no arm for
+    /// `Expr::Comma` at all, so a comma-fanned source (`(., .)`) fell to the
+    /// `_ => false` default regardless of what each branch actually
+    /// produces -- unlike `Expr::If`, whose two branches it already checks
+    /// with the same "every branch must independently resolve" `&&` rule
+    /// this arm now applies to every element of the comma. Every one of
+    /// `(., .)`'s outputs really is `.` itself, so `path((.,.) as [$z] ?//
+    /// {a:$q} | $q)` should track both to `["a"]` exactly as the
+    /// single-output twin `path(. as [$z] ?// {a:$q} | $q)` already did --
+    /// instead, off the (unrecognized) head shape, the per-bound null/bool
+    /// value-identity fallback also refused a non-null/bool value like our
+    /// object, so *every* output silently vanished, and the whole `path()`
+    /// answered `[]` at exit 0 in the write-adjacent `?`-wrapped shape the
+    /// issue's own repro uses.
+    ///
+    /// `(., 1)` (row 3) is the asymmetric control this fix deliberately
+    /// leaves unrecognized: `1` doesn't resolve on its own, so the `&&`
+    /// answers `false` for the whole comma and the existing per-bound
+    /// fallback is what's left to judge each branch -- same as before this
+    /// fix, and still a real, separately-tracked gap (#3334; a per-branch,
+    /// not per-head, provenance question) that this issue's own narrow fix
+    /// does not attempt.
+    #[test]
+    fn test_comma_fanned_source_recognizes_every_identity_branch_3127() {
+        for (doc, filter, want) in [
+            (
+                r#"{"a":[1,2],"b":[3]}"#,
+                r"[path((.,.) as [$z] ?// {a:$q} | $q)]",
+                Ok(r#"[["a"],["a"]]"#),
+            ),
+            (
+                r#"{"a":[1,2],"b":[3]}"#,
+                r"[path(((.,.) as [$z] ?// {a:$q} | ($q, 0))?)]",
+                Err(r"Invalid path expression with result 0"),
+            ),
+            // Control: the asymmetric source this fix does not recognize --
+            // `resolves_to_register`'s own `&&` still answers `false` here,
+            // and the pre-existing per-bound fallback refuses a non-
+            // null/bool value regardless, same as before this fix.
+            (
+                r#"{"a":[1,2],"b":[3]}"#,
+                r"[path((.,1) as [$z] ?// {a:$q} | $q)]",
+                Err(
+                    r#"Invalid path expression near attempt to access element "a" of {"a":[1,2],"b":[3]}"#,
+                ),
+            ),
+        ] {
+            let json = doc.as_bytes();
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            match want {
+                Ok(want) => {
+                    let got: Vec<String> = got
+                        .collect_owned::<JqSemantics>()
+                        .iter()
+                        .map(OwnedValue::to_json)
+                        .collect();
+                    assert_eq!(got, vec![want.to_string()], "{doc} | {filter}");
+                }
+                Err(want) => match got {
+                    QueryResult::Error(e) => assert_eq!(e.message, want, "{doc} | {filter}"),
+                    other => panic!("{doc} | {filter}: expected a refusal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the assertion above, only formatted if the match doesn't hit the Error arm (#3127)"
+                },
+            }
+        }
+
+        // Write form, matching real jq: deleting the same path twice is
+        // harmless, not an error.
+        let json = br#"{"a":[1,2],"b":[3]}"#;
+        let index = JsonIndex::build(json);
+        let expr = parse(r"del((.,.) as [$z] ?// {a:$q} | $q)").unwrap();
+        let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+        let got: Vec<String> = got
+            .collect_owned::<JqSemantics>()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        assert_eq!(got, vec![r#"{"b":[3]}"#.to_string()]);
     }
 
     /// #3133: a pipe nested under `try`/`?` in a pattern body used to carry
