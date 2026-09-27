@@ -56847,6 +56847,23 @@ fn test_index_stream_idx_expr_error_aborts_construction_2746() -> Result<()> {
     Ok(())
 }
 
+/// #2746: an `idx_expr` producing *more than one* key for the same row
+/// inserts the row under every key (matching `build_upper_index`'s own
+/// "later duplicate keys overwriting earlier ones" fold, here exercised
+/// through the path-tracked resolver's own single-pass construction, which
+/// clones the row for every key but its last). Captured live from jq 1.7.1.
+#[test]
+fn test_index_stream_multi_key_row_reaches_every_key_2746() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(INDEX(.[]; ., .+10))"], Some("[1,2,3]"))?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"1":1,"11":1,"2":2,"12":2"#),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2646: the raise is independent of the input's type for every entry but
 /// `walk` -- `first` on a scalar still reports `element 0 of 5`, matching
 /// jq, rather than being skipped as "not a container". `walk` is the one
