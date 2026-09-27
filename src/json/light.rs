@@ -3312,15 +3312,37 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 /// answers, 16-32 bytes at a time, against jq's own writer table (#2608).
 /// The loop below therefore jumps from one byte that needs a decision to the
 /// next instead of walking; the arms are unchanged, because the scanner can
-/// only ever stop on one of those four. Its `PREFIX`-byte word probe is
-/// #2963's, applied for #2963's reason -- see [`next_jq_string_special`].
+/// only ever stop on one of those four. On aarch64 the first 16 bytes of a
+/// string are walked one at a time first (#3168) -- see
+/// [`CANONICAL_STRING_SCALAR_PREFIX`].
 fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
-    scan_json_string_span_probed::<STRING_SCALAR_PREFIX>(bytes, pos)
+    scan_json_string_span_probed::<CANONICAL_STRING_SCALAR_PREFIX>(bytes, pos)
 }
 
-/// [`scan_json_string_span`] with the word-probe length as a parameter, so
-/// both the probed and the unprobed path are testable on every architecture
-/// -- exactly as [`string_literal_end_probed`] is, and for the same reason.
+/// How many bytes of a string [`next_jq_string_special`] walks one at a time
+/// before handing the rest to the SIMD scanner: 16 on aarch64, 0 elsewhere
+/// (#3168).
+///
+/// Measured on both pinned boxes, `-c .` on 4 MB arrays of `L`-byte strings
+/// and on the #2608 record corpus. With no prefix the NEON scanner lost on
+/// every string under 8 bytes and on record-shaped documents (M4 Pro: +2.9%
+/// at 4 bytes, `data` +9.7%, `users` +5.4%) and won from 8 bytes up (-7% to
+/// -20%). A never-calling holdout build read neutral there, so that loss is
+/// the scanner's own per-call cost (compare, narrow, move to a general
+/// register) on short strings, not code layout. #2963's 8-byte word probe
+/// did not remove it, and a 16-byte word probe was worse (+13% at 8 bytes).
+/// A plain byte walk over the first 16 bytes removed every regression and
+/// kept the long-string win (-7.7% at 32 bytes, -17.5% at 64). On the 7950X
+/// the AVX2 scanner wins from the shortest strings up, so x86_64 goes
+/// straight to it.
+#[cfg(target_arch = "aarch64")]
+const CANONICAL_STRING_SCALAR_PREFIX: usize = 16;
+#[cfg(not(target_arch = "aarch64"))]
+const CANONICAL_STRING_SCALAR_PREFIX: usize = 0;
+
+/// [`scan_json_string_span`] with the scalar-prefix length as a parameter,
+/// so both the prefixed and the unprefixed path are testable on every
+/// architecture -- as [`string_literal_end_probed`] is, for the same reason.
 #[inline(always)]
 fn scan_json_string_span_probed<const PREFIX: usize>(
     bytes: &[u8],
@@ -3383,49 +3405,25 @@ fn scan_json_string_span_probed<const PREFIX: usize>(
 /// [`next_string_special`], differing only in that DEL is in the predicate
 /// (see [`find_jq_escape`](crate::util::simd::escape::find_jq_escape)).
 ///
-/// The `PREFIX`-byte word probe is #2963's, for #2963's reason: the scanner
-/// is handed the rest of the *document*, so its own
-/// shorter-than-a-chunk-goes-scalar threshold never fires from inside a
-/// string, and on aarch64 a 16-byte NEON chunk's compare/movemask/
-/// vector-to-GPR latency loses to a couple of general-register operations on
-/// the short strings a record-shaped document is made of. `PREFIX` is
-/// [`STRING_SCALAR_PREFIX`], which is 8 on aarch64 and 0 everywhere else, so
-/// this compiles down to a bare call to the scanner on x86_64.
+/// The first `PREFIX` bytes are walked one at a time, and only a string
+/// still open after them reaches the SIMD scanner -- see
+/// [`CANONICAL_STRING_SCALAR_PREFIX`] for why that is 16 on aarch64 and 0
+/// on x86_64, where this compiles down to a bare call to the scanner.
 #[inline(always)]
 fn next_jq_string_special<const PREFIX: usize>(bytes: &[u8], i: usize) -> usize {
-    debug_assert!(PREFIX % 8 == 0, "the probe is measured in 64-bit words");
     if PREFIX > 0 {
+        let end = bytes.len().min(i + PREFIX);
         let mut at = i;
-        while at + 8 <= bytes.len() && at < i + PREFIX {
-            // `at + 8 <= len` was just checked, so the slice is in bounds.
-            let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
-            let mask = word_jq_special_mask(word);
-            if mask != 0 {
-                // The lowest set bit is exact; see `word_special_mask`.
-                return at + (mask.trailing_zeros() / 8) as usize;
+        while at < end {
+            let b = bytes[at];
+            if b == b'"' || b == b'\\' || b < 0x20 || b == 0x7F {
+                return at;
             }
-            at += 8;
+            at += 1;
         }
         return crate::util::simd::escape::find_jq_escape(bytes, at);
     }
     crate::util::simd::escape::find_jq_escape(bytes, i)
-}
-
-/// [`word_special_mask`] plus DEL: the same `haszero` term for `0x7F` that
-/// that function already uses for `"` and `\\`.
-///
-/// Built *on* `word_special_mask` rather than beside it so the three shared
-/// terms have one definition, not two that can drift (`CLAUDE.md`'s #106
-/// rule); the extra term's borrow chain starts only at a genuine `0x7F`, so
-/// the composed mask keeps the "lowest set bit is exact" property callers
-/// rely on -- the OR of two masks whose lowest true hits are each exact has
-/// an exact lowest true hit.
-#[inline(always)]
-fn word_jq_special_mask(word: u64) -> u64 {
-    const ONES: u64 = 0x0101_0101_0101_0101;
-    const HIGHS: u64 = 0x8080_8080_8080_8080;
-    let del = word ^ (ONES * 0x7F);
-    word_special_mask(word) | (del.wrapping_sub(ONES) & !del & HIGHS)
 }
 
 /// The object-token rule: `{`, then either an immediate `}` or
@@ -8888,62 +8886,9 @@ mod tests {
         assert_eq!(word_special_mask(u64::from_le_bytes([0x80; 8])), 0);
     }
 
-    /// `word_jq_special_mask`'s contract, the same sweep
-    /// `test_word_special_mask_lowest_bit_is_exact_2963` runs against the
-    /// mask it is built on (#2608): every byte value at every one of the 8
-    /// positions, alone and then under a borrow-provoking neighbour, plus
-    /// the DEL byte the jq table adds -- `0x7F` is one below `0x80`, so the
-    /// `hasless` term for `< 0x20` and the new `haszero` term for DEL are
-    /// exactly the two a composed mask could get wrong together.
-    #[test]
-    fn test_word_jq_special_mask_lowest_bit_is_exact_2608() {
-        let is_special = |b: u8| b == b'"' || b == b'\\' || b < 0x20 || b == 0x7F;
-        for pos in 0..8 {
-            for byte in 0u8..=255 {
-                let mut w = [b'a'; 8];
-                w[pos] = byte;
-                let mask = word_jq_special_mask(u64::from_le_bytes(w));
-                if is_special(byte) {
-                    assert_eq!(
-                        mask.trailing_zeros() / 8,
-                        pos as u32,
-                        "0x{byte:02X} at {pos}"
-                    );
-                } else {
-                    assert_eq!(mask, 0, "0x{byte:02X} at {pos} is not jq-special");
-                }
-                if is_special(byte) && pos < 7 {
-                    for above in [0x20u8, 0x21, 0x7F, 0x80, 0xFF, b'"', 0x00] {
-                        w[pos + 1] = above;
-                        let mask = word_jq_special_mask(u64::from_le_bytes(w));
-                        assert_eq!(
-                            mask.trailing_zeros() / 8,
-                            pos as u32,
-                            "0x{byte:02X} at {pos} with 0x{above:02X} above"
-                        );
-                    }
-                }
-            }
-        }
-        assert_eq!(word_jq_special_mask(u64::from_le_bytes(*b"abcdefgh")), 0);
-        assert_eq!(word_jq_special_mask(u64::from_le_bytes([0xFF; 8])), 0);
-        assert_eq!(word_jq_special_mask(u64::from_le_bytes([0x80; 8])), 0);
-        // DEL is the one byte `word_special_mask` and its jq twin disagree
-        // on -- pinned here so the pair cannot drift (`CLAUDE.md`'s #106
-        // rule), the `json`/`jq` predicate pair in `util::simd::escape`
-        // being the SIMD half of the same pinning.
-        for pos in 0..8 {
-            let mut w = [b'a'; 8];
-            w[pos] = 0x7F;
-            let word = u64::from_le_bytes(w);
-            assert_eq!(word_special_mask(word), 0, "DEL is not yq-special");
-            assert_eq!(word_jq_special_mask(word).trailing_zeros() / 8, pos as u32);
-        }
-    }
-
-    /// The word probe #2608 put in front of `scan_json_string_span`'s SIMD
-    /// scan must not change what the scan decides: every probe length is
-    /// driven on every architecture (`PREFIX` is 8 only on aarch64), over
+    /// The scalar prefix #3168 put in front of `scan_json_string_span`'s SIMD
+    /// scan must not change what the scan decides: every prefix length is
+    /// driven on every architecture (`PREFIX` is 16 only on aarch64), over
     /// every byte value at every offset across the probe's own edge, the
     /// 16-byte NEON edge and the 32-byte AVX2 edge, plus buffers shorter
     /// than the probe.
