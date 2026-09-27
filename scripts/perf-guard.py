@@ -284,12 +284,9 @@ DEFAULT_THRESHOLD = 5.0
 # the identity writer no longer materializing every field of an object up
 # front before writing the first one made the row faster (-7.2% x86_64 /
 # -7.1% ARM64-Linux against the PR's own merge-base). #2720 is long since in
-# `main`, but the entry survived both the #2999/#3009 cleanup (#3077, #3161)
-# and the #2608/#3035 one (#3170, #3175) untouched -- neither targeted it,
-# so it sat unnoticed for two rounds of this same cleanup until #3345's own
-# staleness check caught it: an unrelated PR's CI logs read `users_identity`
-# +0.0%/-0.0%, and the checked-in baseline already carries #2720's cost from
-# its own regeneration on that tree. Removed (#3345).
+# `main` -- unlike the two cleanups below, this entry sat untargeted through
+# both of them, so #3345 removed it once an unrelated PR's own CI logs
+# confirmed the row back at ~0% drift.
 #
 # `users_del_select` / `users_del_bound_select` / `users_yq_del_select` (#2999)
 # and `users_assign_scores` (#3009) carried overrides of the same kind --
