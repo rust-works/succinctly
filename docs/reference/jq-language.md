@@ -137,6 +137,9 @@ below and [ADR-0019](../adrs/adr-0019.md).
 - [x] `@sh` - Shell quoting
 - [x] `@yaml` - YAML flow-style encoding (yq)
 - [x] `@props` - Java properties format (yq)
+- [x] Format-prefixed string interpolation: `@base64 "v=\(.)"` -- each `\(...)`
+      slot is run through the format first, jq's own `gen_format` rule; a
+      literal with no interpolation is returned unchanged (#3316)
 
 ### Variables & Control Flow
 - [x] `as $var | expr` - Variable binding

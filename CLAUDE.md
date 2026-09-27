@@ -209,6 +209,13 @@ first, then formatted, matching real jq (`[1,2] | @uri` => `"%5B1%2C2%5D"`) — 
 yq` still rejects a container outright for all three, matching real yq's own
 `cannot encode !!seq as URI/base64...` error (#1096).
 
+**Format-prefixed string interpolation (jq mode only):** `@fmt "lit\(E)lit"` runs each
+`\(E)` slot through the format before splicing it in — jq's own `gen_format` desugar,
+`@base64 "v=\(1)"` => `"v=MQ=="` — while the literal text passes through unchanged. A
+literal with no interpolation never runs the format at all (`@base64 "abc"` => `"abc"`).
+yq's lexer rejects a format followed by a string outright, and `succinctly yq` matches
+that unchanged (#3316).
+
 **@dsv(delimiter) specifics:**
 - Custom delimiters: Any single or multi-character string
 - Always-quoted strings: every string field is double-quoted (matching jq's `@csv`), regardless of content; non-strings are bare and null is empty
