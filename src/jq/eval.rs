@@ -50781,6 +50781,56 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .collect()
         });
     let exprs: &[Expr] = demoted.as_deref().unwrap_or(exprs);
+
+    // #3362: `key`/`parent` as this pipe's own *first* stage need the real
+    // document's ancestry to answer correctly -- exactly what this
+    // function's whole job (reconstructing `owned` as an isolated,
+    // single-node throwaway document below) structurally cannot give them.
+    // Walked with a cursor rooted at that throwaway document,
+    // `eval_generic.rs`'s own cursor-native `key`/`parent` arms answer as if
+    // genuinely at the document root (their own deliberate, correct policy
+    // for a *genuine* root, #2421's "no key/parent context" case) --
+    // wrongly triggered here for a position that was never the real root,
+    // so the rest of the pipe never runs and the whole thing silently
+    // answers empty. A *bare* `key`/`parent` slot with no further stages
+    // (`path("\(key)")`) never reaches that cursor-native arm at all: it
+    // resolves through this same crate's other, owned-value `eval_builtin`
+    // (this file, `Builtin::Key => root_path_context_placeholder(..)`),
+    // which is already mode-aware -- `Null`/an empty object in jq mode,
+    // nothing in yq mode. Substituting that identical placeholder for the
+    // first stage here, then evaluating the rest of the pipe against it by
+    // value, gives the multi-stage case the same answer the bare case
+    // already had, without needing this function's reconstruction to
+    // somehow preserve context it does not have. Confirmed live against jq
+    // 1.7.1's own reference behaviour for `key`/`parent` as extensions
+    // (ADR-0018 rule 5): `path("\(key)")` already raised correctly before
+    // this fix; `path("\(key|tostring)")` silently produced nothing.
+    if let [first, rest @ ..] = exprs {
+        let placeholder = match first {
+            Expr::Builtin(Builtin::Key) => Some(OwnedValue::Null),
+            Expr::Builtin(Builtin::Parent) => Some(no_parent_placeholder()),
+            _ => None,
+        };
+        if let Some(placeholder) = placeholder {
+            // Same gate `root_path_context_placeholder` uses for the
+            // bare-slot case: yq mode answers nothing at the root (real
+            // yq's own behaviour, #2421), so the rest of the pipe never
+            // runs either -- a genuinely empty generator, not a value to
+            // feed forward.
+            if S::ROOT_PATH_CONTEXT_YIELDS_NOTHING {
+                return QueryResult::None;
+            }
+            return if rest.is_empty() {
+                QueryResult::Owned(placeholder)
+            } else {
+                match eval_owned_multi::<S>(&Expr::Pipe(rest.to_vec()), &placeholder) {
+                    Ok(values) => QueryResult::ManyOwned(values),
+                    Err(e) => e.into(),
+                }
+            };
+        }
+    }
+
     if !reindex_bridge_is_identity(owned) {
         if let Some(result) =
             eval_path_context_pipe_detached::<S, StandardJson<'_, Vec<u64>>>(exprs, owned, optional)
@@ -95219,6 +95269,56 @@ mod tests {
         assert_eq!(
             outputs(b"[10,20]", ".[] | (key, key)"),
             vec!["0", "0", "1", "1"]
+        );
+    }
+
+    /// #3362: `path("\(key|tostring)")` (a `Pipe` over `key`/`parent` as a
+    /// string interpolation slot) silently produced zero outputs instead of
+    /// raising, where the bare slot (`path("\(key)")`) already raised
+    /// correctly -- both reach `eval_path_context_pipe_owned`'s own
+    /// single-node throwaway-document reconstruction, which has no real
+    /// key/parent to answer with; the fix substitutes the same mode-aware
+    /// placeholder `eval_builtin`'s own `Builtin::Key`/`Builtin::Parent`
+    /// arms already use for the bare case, then evaluates the rest of the
+    /// pipe against it by value. `key`/`parent` have no jq equivalent
+    /// (succinctly extensions, ADR-0018 rule 5), so there is no jq oracle
+    /// for their own value -- but the general "a computed/string-
+    /// interpolation result always refuses `path()`" shape is confirmed
+    /// live against jq 1.7.1 via the `length|tostring` control below, which
+    /// already behaved identically in both tools before this fix.
+    #[test]
+    fn test_path_interpolation_pipe_over_key_or_parent_raises_3362() {
+        for (doc, filter, needle) in [
+            (r#"{"foo":1}"#, r#".[] | path("\(key|tostring)")"#, "null"),
+            (r#"{"foo":1}"#, r#".[] | path("\(key+0)")"#, "0"),
+            (r#"{"foo":1}"#, r".[] | path(key|tostring)", "null"),
+            (r#"{"foo":1}"#, r#".[] | path("\(parent|tostring)")"#, "{}"),
+            (r#"{"foo":1}"#, r#".[] | path("\(length|tostring)")"#, "1"),
+        ] {
+            query!(doc.as_bytes(), filter,
+                QueryResult::Error(e) => {
+                    assert!(e.message.contains(needle), "{filter}: {}", e.message);
+                }
+            );
+        }
+        // The write-side consequence: a computed interpolation slot over
+        // `key`/`parent` must not silently drop the write either.
+        for filter in [
+            r#".[] | ("\(key|tostring)") = "x""#,
+            r#".[] | ("\(key|tostring)") |= "x""#,
+        ] {
+            query!(br#"{"foo":1}"#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.message.contains("null"), "{filter}: {}", e.message);
+                }
+            );
+        }
+        // An error inside the rest of the pipe still propagates as itself,
+        // not swallowed by the placeholder substitution.
+        query!(br#"{"foo":1}"#, r#".[] | path("\(key|error("boom"))")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
         );
     }
 
