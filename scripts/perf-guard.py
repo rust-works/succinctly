@@ -280,17 +280,13 @@ DEFAULT_THRESHOLD = 5.0
 # scan (-8.2% ARM64 / +2.2% x86_64 against its own merge-base) until #2963
 # removed it.
 #
-# `users_identity` (#2720): faster on both architectures. The identity writer
-# no longer materializes every field of an object (a 144-byte `DocumentField`
-# each, decoded up front) before writing the first one; it validates the
-# object with one key-only walk and streams the fields, materializing only
-# for `-S` or a repeated key. Measured by this guard against the PR's own
-# merge-base: `users_identity` -7.2% x86_64 / -7.1% ARM64-Linux,
-# `wide_identity` -3.0% / -1.0% (under the default), every other row within
-# +0.4% (the `keys_unsorted` rows, for the `,` arm #2720's review added to
-# the key-only value-delimiter scan).
-# 12% clears the measured number with headroom; remove once `main` has moved
-# past #2720, per the rule above.
+# `users_identity` (#2720) carried an override of the same one-off kind --
+# the identity writer no longer materializing every field of an object up
+# front before writing the first one made the row faster (-7.2% x86_64 /
+# -7.1% ARM64-Linux against the PR's own merge-base). #2720 is long since in
+# `main` -- unlike the two cleanups below, this entry sat untargeted through
+# both of them, so #3345 removed it once an unrelated PR's own CI logs
+# confirmed the row back at ~0% drift.
 #
 # `users_del_select` / `users_del_bound_select` / `users_yq_del_select` (#2999)
 # and `users_assign_scores` (#3009) carried overrides of the same kind --
@@ -309,30 +305,18 @@ DEFAULT_THRESHOLD = 5.0
 # (#3170, #3175) once every row read ~0% again against a merge-base that
 # already included all three.
 #
-# #3140: `BalancedParens::find_close` answers a leaf (its close is the next
-# bit) before entering its state machine, so every sibling hop over a key or
-# scalar got cheaper -- faster on every row that walks object fields or
-# array elements. Measured by this guard against the PR's own merge-base
-# (x86_64 / ARM64-Linux, CI): `wide_identity` -14.0% / -13.3%,
-# `users_identity` -13.1% / -12.6%, `users_compact_latefail` -12.4% / -11.8%,
-# `wide_keys_unsorted` -11.5% / -10.8%, `wide_escaped_keys_unsorted` -10.0% /
-# -9.2%, `arrays_identity` -8.5% / -7.4%, `users_path_walk` -6.6% / -6.0%,
-# `arrays_map_iterate` -4.8% / -3.8%, `wide_to_entries` -4.1% / -3.3%, every
-# other row -0% to -3.6%. The last two sit under the default but too close
-# to it for a merge-queue batch or push run that also carries another saving.
-# One-off, per the rule above: once `main` carries #3140, restore this dict
-# to its pre-#3140 contents (`wide_keys_unsorted` 10.0, `users_identity`
-# 12.0 -- whether those two still apply is their own entries' question).
+# #3140 (`BalancedParens::find_close` answering a leaf before entering its
+# state machine, cheaper on every row that walks object fields or array
+# elements) carried nine overrides of the same one-off kind
+# (`wide_identity`, `users_identity`, `users_compact_latefail`,
+# `wide_keys_unsorted`, `wide_escaped_keys_unsorted`, `arrays_identity`,
+# `users_path_walk`, `arrays_map_iterate`, `wide_to_entries`). Now in
+# `main`; the entries were removed (#3345), restoring `wide_keys_unsorted`
+# to its own permanent 10.0 above and `users_identity` to none (see that
+# entry's own removal, also #3345) once every row read ~0% again against a
+# merge-base that already included it.
 QUERY_THRESHOLDS = {
-    "wide_keys_unsorted": 15.0,
-    "users_identity": 17.0,
-    "wide_identity": 18.0,
-    "users_compact_latefail": 16.0,
-    "wide_escaped_keys_unsorted": 14.0,
-    "arrays_identity": 12.0,
-    "users_path_walk": 10.0,
-    "arrays_map_iterate": 8.0,
-    "wide_to_entries": 8.0,
+    "wide_keys_unsorted": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
