@@ -634,11 +634,16 @@ pub(crate) fn is_jq_canonical_number(raw: &[u8]) -> bool {
     jq_canonical_number_prefix(raw) == Some(raw.len())
 }
 
-/// The length of the longest prefix of `raw` that [`is_jq_canonical_number`]'s
-/// rules accept -- `-?(0|[1-9][0-9]*)(\.[0-9]+)?`, minus the `0.000000x`
-/// spellings decNumber writes in scientific notation -- or `None` when no
-/// prefix is (no integer part, a `.` with no digit after it, or too many
-/// fraction zeros after a `0`).
+/// Where a greedy left-to-right parse of `-?(0|[1-9][0-9]*)(\.[0-9]+)?`
+/// over `raw` stops, if that parse satisfies [`is_jq_canonical_number`]'s
+/// rules; `None` when it does not (no integer part, a `.` with no digit
+/// after it, or the `0.000000x` spellings decNumber writes in scientific
+/// notation).
+///
+/// This is *not* the longest canonical prefix: a `.` commits the parse to
+/// a fraction, so `1.x` and `1.e5` answer `None` although `1` alone would
+/// be canonical. Both callers only ever ask whether the parse covers a
+/// whole token, where the two readings agree.
 ///
 /// [`is_jq_canonical_number`] is this prefix being all of `raw`. The JSON
 /// canonical-compact scan (`src/json/light.rs`, #3167) reads the prefix off

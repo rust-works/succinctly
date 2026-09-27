@@ -2172,12 +2172,13 @@ fn parse_hex4(hex: &[u8]) -> Result<u16, JsonError> {
 ///
 /// #2608 later added a fifth number-adjacent caller,
 /// `scan_canonical_number` (this file) -- unlike the four above, it is
-/// *not* independent: its span-finding loop has no grammar difference
-/// from `nested_number_span`'s own greedy `[0-9.eE+-]*` run (same
-/// permissive, malformed-shape-absorbing contract this caller also
-/// needs, since a not-canonical span still has to resolve to *one* span
-/// for `is_jq_canonical_number` to reject), so it calls that function
-/// directly rather than adding a fifth copy of the loop (#2919 review).
+/// *not* independent: its span has no grammar difference from
+/// `nested_number_span`'s own greedy `[0-9.eE+-]*` run (same permissive,
+/// malformed-shape-absorbing contract). Since #3167 it reads jq's
+/// canonical prefix in one pass and accepts it only where the greedy run
+/// would end too, which it asks through `is_number_span_byte` -- the one
+/// definition of that class, shared with `nested_number_span` and
+/// `strict_number_end` -- rather than calling `nested_number_span` first.
 /// Plain backticks, not an intra-doc link: this function is `pub` and
 /// `is_jq_canonical_number` is `pub(crate)`, which rustdoc's
 /// `private_intra_doc_links` lint rejects under CI's
@@ -2438,11 +2439,8 @@ fn nested_number_span(text: &[u8], start: usize) -> usize {
         i += 1;
     }
     let body_start = i;
-    while i < text.len() {
-        match text[i] {
-            b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-' => i += 1,
-            _ => break,
-        }
+    while i < text.len() && is_number_span_byte(text[i]) {
+        i += 1;
     }
     // Nothing numeric after the (optional) sign: a decNumber special word
     // (`nan`, `sNaN12`, `-Infinity`, `+inf`, #2877)? Only then, and only if
@@ -2455,6 +2453,17 @@ fn nested_number_span(text: &[u8], start: usize) -> usize {
         }
     }
     i
+}
+
+/// Whether `byte` continues [`nested_number_span`]'s greedy number run --
+/// `[0-9.eE+-]`, the one definition of that class (#3167). The span's own
+/// loop, [`strict_number_end`]'s "ends where the greedy span would" check
+/// and the canonical-echo gate's one-pass number arm
+/// ([`scan_canonical_number`]) all ask this, so a byte added to the class
+/// reaches all three.
+#[inline(always)]
+fn is_number_span_byte(byte: u8) -> bool {
+    matches!(byte, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
 }
 
 /// The reason a nested number span that is not a number carries as a
@@ -2495,11 +2504,7 @@ fn strict_number_end(text: &[u8], start: usize) -> Option<usize> {
         }
         i = digits(text, i)?;
     }
-    (!matches!(
-        text.get(i),
-        Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
-    ))
-    .then_some(i)
+    (!text.get(i).copied().is_some_and(is_number_span_byte)).then_some(i)
 }
 
 /// Where the token starting at `start` ends, if it is one of decNumber's
@@ -3038,8 +3043,11 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 /// - Numbers: the maximal `[-+.eE0-9]*` run at the current position (safe
 ///   because a compact number is always immediately followed by
 ///   `,`/`}`/`]`/end-of-input -- no whitespace, no other adjacent token
-///   char) is handed to [`is_jq_canonical_number`], which already answers
+///   char) must satisfy [`is_jq_canonical_number`], which already answers
 ///   "would `format_number_jq_compat` echo these exact bytes" (#2206).
+///   Since #3167 that is asked in one pass: the rule's own prefix parser,
+///   [`jq_canonical_number_prefix`], plus a check that the run ends where
+///   the prefix does (see `scan_canonical_number`).
 /// - Strings: scanned byte-by-byte between the quotes against exactly
 ///   [`write_json_body_jq`]'s escape table (see `scan_json_string_span`'s
 ///   own doc comment) -- **not** [`write_json_body_jq_ascii`]'s. That
@@ -3178,18 +3186,16 @@ pub(crate) fn is_canonical_compact_jq_span(bytes: &[u8]) -> bool {
 /// document is exactly the case that must fall through to
 /// `stream_json_pretty`'s own real depth-exceeded error, not have this
 /// checker's stack overflow instead.
-fn scan_canonical_value(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
-    scan_canonical_element(bytes, pos, depth)
-}
-
-/// [`scan_canonical_value`]'s body, inlined into the array and object loops
-/// so a scalar element is scanned in the loop itself and only a container
-/// pays the recursive call (#3167). The call per element was most of the
-/// scan's own cost on a numbers-only document. The depth check stays on
-/// every element, scalars included, so a scalar at the ceiling still bails
-/// exactly where `stream_json_pretty`'s counter would.
+///
+/// `inline(always)` (#3167): inlined into the array and object loops, a
+/// scalar element is scanned in the loop itself and only a container pays
+/// the recursive call, which was most of the scan's own cost on a
+/// numbers-only document. The depth check stays on every element, scalars
+/// included, so a scalar at the ceiling still bails exactly where
+/// `stream_json_pretty`'s counter would. The string arm stays one
+/// out-of-line call ([`scan_json_string_span`]).
 #[inline(always)]
-fn scan_canonical_element(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
+fn scan_canonical_value(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
     if depth >= MAX_VALUE_TREE_DEPTH {
         return None;
     }
@@ -3238,10 +3244,7 @@ fn scan_canonical_literal(bytes: &[u8], pos: usize, literal: &[u8]) -> Option<us
 /// 42% of the whole `-c .` run.
 fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
     let end = pos + jq_canonical_number_prefix(&bytes[pos..])?;
-    match bytes.get(end) {
-        Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') => None,
-        _ => Some(end),
-    }
+    (!bytes.get(end).copied().is_some_and(is_number_span_byte)).then_some(end)
 }
 
 /// The string-token rule: `bytes[pos]` must be `"`, and the scan returns
@@ -3432,7 +3435,7 @@ fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize
         if bytes.get(after_key) != Some(&b':') {
             return None;
         }
-        i = scan_canonical_element(bytes, after_key + 1, depth + 1)?;
+        i = scan_canonical_value(bytes, after_key + 1, depth + 1)?;
         match bytes.get(i) {
             Some(b',') => i += 1,
             Some(b'}') => return Some(i + 1),
@@ -3450,7 +3453,7 @@ fn scan_canonical_array(bytes: &[u8], pos: usize, depth: usize) -> Option<usize>
         return Some(i + 1);
     }
     loop {
-        i = scan_canonical_element(bytes, i, depth + 1)?;
+        i = scan_canonical_value(bytes, i, depth + 1)?;
         match bytes.get(i) {
             Some(b',') => i += 1,
             Some(b']') => return Some(i + 1),
@@ -6175,26 +6178,16 @@ mod tests {
         Some(out)
     }
 
-    /// The echo branch no longer asks the cursor for its raw span; it takes
-    /// the node's start and lets the canonical scan report the end
-    /// (`canonical_compact_jq_span_end`, #2608 follow-up). That makes
-    /// "stops exactly at the value's last byte" a property of the *scanner*
-    /// rather than of `text_range`, so it needs its own pin: every document
-    /// below has something after the root value that must not be echoed --
-    /// the trailing newline every real file ends with, a second top-level
-    /// document (`jq` reads a stream, not one value), and outright garbage.
-    ///
-    /// Asserted two ways: against the literal expected bytes, and against
-    /// the unchanged re-render path, which is the behaviour the echo is
-    /// only ever allowed to be a faster spelling of.
     /// #3167: the one-pass number arm accepts exactly what the two-pass
     /// rule it replaced accepted, and ends the span in the same place: the
     /// greedy [`nested_number_span`], then [`is_jq_canonical_number`] over
-    /// it. Every token up to five bytes over the greedy class plus the
-    /// digits that exercise the prefix rules (`0`, `1`, `9`), each followed
-    /// by every byte class that can end or extend a number (a delimiter, a
-    /// class byte, a letter from a special word, end of input), plus the
-    /// `0.000000x` spellings decNumber prints in scientific notation.
+    /// it. Every token of up to four bytes over the greedy class plus the
+    /// digits that exercise the prefix rules (`0`, `1`, `9`), followed by
+    /// each of the 256 byte values and by end of input; five-byte tokens
+    /// against the class bytes and a delimiter; the `0.000000x` spellings
+    /// decNumber prints in scientific notation. Each accepted token is then
+    /// checked inside an array and as an object value too, through the
+    /// whole gate, so the loops' inlined dispatch is covered.
     #[test]
     fn scan_canonical_number_agrees_with_the_two_pass_rule_3167() {
         fn two_pass(bytes: &[u8], pos: usize) -> Option<usize> {
@@ -6202,19 +6195,31 @@ mod tests {
             (end != pos && is_jq_canonical_number(&bytes[pos..end])).then_some(end)
         }
         const ALPHABET: &[u8] = b"019.eE+-";
-        let mut tokens: Vec<Vec<u8>> = vec![Vec::new()];
-        let mut frontier: Vec<Vec<u8>> = vec![Vec::new()];
-        for _ in 0..5 {
-            let mut next = Vec::new();
-            for t in &frontier {
-                for &b in ALPHABET {
-                    let mut u = t.clone();
-                    u.push(b);
-                    next.push(u);
-                }
+        let mut by_len: Vec<Vec<Vec<u8>>> = vec![vec![Vec::new()]];
+        for len in 1..=5 {
+            let next = by_len[len - 1]
+                .iter()
+                .flat_map(|t| {
+                    ALPHABET.iter().map(move |&b| {
+                        let mut u = t.clone();
+                        u.push(b);
+                        u
+                    })
+                })
+                .collect();
+            by_len.push(next);
+        }
+        let all_bytes: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
+        let short_suffixes: Vec<Vec<u8>> =
+            ALPHABET.iter().chain(b",]} x").map(|&b| vec![b]).collect();
+        let mut cases: Vec<(Vec<u8>, &[Vec<u8>])> = Vec::new();
+        for tokens in &by_len[1..=4] {
+            for t in tokens {
+                cases.push((t.clone(), &all_bytes));
             }
-            tokens.extend(next.iter().cloned());
-            frontier = next;
+        }
+        for t in &by_len[5] {
+            cases.push((t.clone(), &short_suffixes));
         }
         for spelling in [
             "0.000001",
@@ -6233,29 +6238,16 @@ mod tests {
             "-01",
             "1.2.3",
         ] {
-            tokens.push(spelling.as_bytes().to_vec());
+            cases.push((spelling.as_bytes().to_vec(), &all_bytes));
         }
-        let mut checked = 0usize;
-        let mut accepted = 0usize;
-        for token in &tokens {
-            for suffix in [
-                &b""[..],
-                b",",
-                b"]",
-                b"}",
-                b" ",
-                b"x",
-                b"n",
-                b"1",
-                b".",
-                b"e",
-                b"-",
-            ] {
+        let (mut checked, mut accepted) = (0usize, 0usize);
+        for (token, suffixes) in &cases {
+            // Only a token whose first byte routes to the number arm.
+            if !matches!(token.first(), Some(b'-' | b'0'..=b'9')) {
+                continue;
+            }
+            for suffix in suffixes.iter().map(Vec::as_slice).chain([&b""[..]]) {
                 let doc: Vec<u8> = [token.as_slice(), suffix].concat();
-                // Only a token whose first byte routes to the number arm.
-                if !matches!(doc.first(), Some(b'-' | b'0'..=b'9')) {
-                    continue;
-                }
                 let want = two_pass(&doc, 0);
                 assert_eq!(
                     scan_canonical_number(&doc, 0),
@@ -6266,14 +6258,40 @@ mod tests {
                 checked += 1;
                 accepted += usize::from(want.is_some());
             }
+            // In container context, through the whole gate: the token is a
+            // canonical element exactly when the two-pass rule ends it at
+            // the closing bracket.
+            for (open, close) in [(&b"["[..], &b"]"[..]), (b"{\"k\":", b"}"), (b"[0,", b",1]")] {
+                let doc: Vec<u8> = [open, token.as_slice(), close].concat();
+                let at = open.len();
+                let element_ok = two_pass(&doc, at) == Some(at + token.len());
+                assert_eq!(
+                    canonical_compact_jq_span_end(&doc) == Some(doc.len()),
+                    element_ok,
+                    "{:?}",
+                    String::from_utf8_lossy(&doc)
+                );
+            }
         }
         // The matrix must reach both answers, or it proves nothing.
         assert!(
-            checked > 100_000 && accepted > 1_000,
+            checked > 500_000 && accepted > 1_000,
             "{checked} {accepted}"
         );
     }
 
+    /// The echo branch no longer asks the cursor for its raw span; it takes
+    /// the node's start and lets the canonical scan report the end
+    /// (`canonical_compact_jq_span_end`, #2608 follow-up). That makes
+    /// "stops exactly at the value's last byte" a property of the *scanner*
+    /// rather than of `text_range`, so it needs its own pin: every document
+    /// below has something after the root value that must not be echoed --
+    /// the trailing newline every real file ends with, a second top-level
+    /// document (`jq` reads a stream, not one value), and outright garbage.
+    ///
+    /// Asserted two ways: against the literal expected bytes, and against
+    /// the unchanged re-render path, which is the behaviour the echo is
+    /// only ever allowed to be a faster spelling of.
     #[test]
     fn canonical_echo_stops_at_the_value_end_2608() {
         for (doc, want) in [
