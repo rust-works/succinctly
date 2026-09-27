@@ -27250,7 +27250,192 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
         | Builtin::Split(arg)
         | Builtin::Join(arg)
         | Builtin::GetPath(arg) => yields_at_most_one_value(arg),
-        _ => false,
+
+        // #3325: every other variant, exhaustively listed rather than a
+        // wildcard, so a new `Builtin` variant is a compile error here
+        // instead of silently inheriting this default. No judgement beyond
+        // "not on an allowlist above" -- this preserves exactly the answer
+        // the old `_ => false` fell through to for each one, including the
+        // generator family (`recurse`, `paths`, `range` is its own `Expr`
+        // node not a `Builtin`, `to_entries`'s streaming siblings), the
+        // regex `scan`/`splits`/`match` family, `limit`, and `inputs`.
+        Builtin::Abs
+        | Builtin::Acos
+        | Builtin::Acosh
+        | Builtin::All
+        | Builtin::AllCond(_, _)
+        | Builtin::AllF(_)
+        | Builtin::Anchor
+        | Builtin::Any
+        | Builtin::AnyCond(_, _)
+        | Builtin::AnyF(_)
+        | Builtin::Asin
+        | Builtin::Asinh
+        | Builtin::AtOffset(_)
+        | Builtin::AtPosition(_, _)
+        | Builtin::Atan
+        | Builtin::Atan2(_, _)
+        | Builtin::Atanh
+        | Builtin::BSearch(_)
+        | Builtin::Builtins
+        | Builtin::Capture(_)
+        | Builtin::CaptureFlags(_, _)
+        | Builtin::Ceil
+        | Builtin::Column
+        | Builtin::Combinations
+        | Builtin::CombinationsN(_)
+        | Builtin::Cos
+        | Builtin::Cosh
+        | Builtin::Del(_)
+        | Builtin::DelPaths(_)
+        | Builtin::DocumentIndex
+        | Builtin::Env
+        | Builtin::EnvObject(_)
+        | Builtin::EnvVar(_)
+        | Builtin::Exp
+        | Builtin::Exp10
+        | Builtin::Exp2
+        | Builtin::Explode
+        | Builtin::Fabs
+        | Builtin::FileIndex
+        | Builtin::Finites
+        | Builtin::First
+        | Builtin::FirstStream(_)
+        | Builtin::Flatten
+        | Builtin::FlattenDepth(_)
+        | Builtin::Floor
+        | Builtin::FootComment
+        | Builtin::FormatNamed(_)
+        | Builtin::FromEntries
+        | Builtin::FromJson
+        | Builtin::FromJsonStream
+        | Builtin::FromStream(_)
+        | Builtin::FromUnix
+        | Builtin::Fromdate
+        | Builtin::Fromdateiso8601
+        | Builtin::GetJqOrigin
+        | Builtin::GetProgOrigin
+        | Builtin::GetSearchList
+        | Builtin::Gmtime
+        | Builtin::GroupBy(_)
+        | Builtin::Gsub(_, _)
+        | Builtin::GsubFlags(_, _, _)
+        | Builtin::Halt
+        | Builtin::HaltError
+        | Builtin::HaltErrorCode(_)
+        | Builtin::HeadComment
+        | Builtin::Implode
+        | Builtin::Index(_)
+        | Builtin::Indices(_)
+        | Builtin::Infinite
+        | Builtin::InputFilename
+        | Builtin::InputLineNumber
+        | Builtin::Inputs
+        | Builtin::IsEmpty(_)
+        | Builtin::IsFinite
+        | Builtin::IsInfinite
+        | Builtin::IsNan
+        | Builtin::IsNormal
+        | Builtin::IsValid(_)
+        | Builtin::Key
+        | Builtin::Kind
+        | Builtin::Last
+        | Builtin::LastStream(_)
+        | Builtin::LeafPaths
+        | Builtin::Libm1(_)
+        | Builtin::Libm2(_, _, _)
+        | Builtin::Libm3(_, _, _, _)
+        | Builtin::Limit(_, _)
+        | Builtin::Line
+        | Builtin::LineComment
+        | Builtin::Load(_)
+        | Builtin::Localtime
+        | Builtin::Log
+        | Builtin::Log10
+        | Builtin::Log2
+        | Builtin::Ltrim
+        | Builtin::Map(_)
+        | Builtin::MapValues(_)
+        | Builtin::Match(_)
+        | Builtin::MatchFlags(_, _)
+        | Builtin::MaxBy(_)
+        | Builtin::MinBy(_)
+        | Builtin::Mktime
+        | Builtin::ModuleMeta
+        | Builtin::Nan
+        | Builtin::Normals
+        | Builtin::Now
+        | Builtin::Nth(_)
+        | Builtin::NthStream(_, _)
+        | Builtin::NullLit
+        | Builtin::Omit(_)
+        | Builtin::Parent
+        | Builtin::ParentN(_)
+        | Builtin::Path(_)
+        | Builtin::PathNoArg
+        | Builtin::Paths
+        | Builtin::PathsFilter(_)
+        | Builtin::Pick(_)
+        | Builtin::Pivot
+        | Builtin::Pow(_, _)
+        | Builtin::Recurse
+        | Builtin::RecurseCond(_, _)
+        | Builtin::RecurseDown
+        | Builtin::RecurseF(_)
+        | Builtin::Reverse
+        | Builtin::Rindex(_)
+        | Builtin::Round
+        | Builtin::Rtrim
+        | Builtin::Scan(_)
+        | Builtin::ScanFlags(_, _)
+        | Builtin::SetPath(_, _)
+        | Builtin::Shuffle
+        | Builtin::Sin
+        | Builtin::Sinh
+        | Builtin::Skip(_, _)
+        | Builtin::Sort
+        | Builtin::SortBy(_)
+        | Builtin::SortKeys(_)
+        | Builtin::SortKeysOneLevel
+        | Builtin::SplitDoc
+        | Builtin::SplitRegex(_, _)
+        | Builtin::Splits(_)
+        | Builtin::SplitsFlags(_, _)
+        | Builtin::Sqrt
+        | Builtin::StrEnv(_)
+        | Builtin::Strflocaltime(_)
+        | Builtin::Strftime(_)
+        | Builtin::Strptime(_)
+        | Builtin::Style
+        | Builtin::Sub(_, _)
+        | Builtin::SubFlags(_, _, _)
+        | Builtin::Tag
+        | Builtin::Tan
+        | Builtin::Tanh
+        | Builtin::Test(_)
+        | Builtin::TestFlags(_, _)
+        | Builtin::ToBoolean
+        | Builtin::ToEntries
+        | Builtin::ToJson
+        | Builtin::ToJsonStream
+        | Builtin::ToStream
+        | Builtin::ToUnix
+        | Builtin::Todate
+        | Builtin::Todateiso8601
+        | Builtin::Transpose
+        | Builtin::Trim
+        | Builtin::Trunc
+        | Builtin::TruncateStream(_)
+        | Builtin::Tz(_)
+        | Builtin::Unique
+        | Builtin::UniqueBy(_)
+        | Builtin::UpperIn(_)
+        | Builtin::UpperInSrc(_, _)
+        | Builtin::UpperIndex(_)
+        | Builtin::UpperIndexStream(_, _)
+        | Builtin::Utf8ByteLength
+        | Builtin::Walk(_)
+        | Builtin::WithEntries(_) => false,
     }
 }
 
