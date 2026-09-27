@@ -418,82 +418,6 @@ pub fn find_json_escape(bytes: &[u8], start: usize) -> usize {
     json_escape::find(bytes, start)
 }
 
-// ---- jq writer escape predicate --------------------------------------------
-//
-// [`find_json_escape`]'s set plus DEL (`0x7f`): exactly the bytes
-// `write_json_body_jq` (`src/jq/escape.rs`) re-encodes rather than copying.
-// The two differ by that one byte and nothing else -- jq escapes DEL where
-// yq leaves it raw (#2591/#2592) -- which `jq_and_json_predicates_differ_by_del`
-// in this module's tests pins, so the pair cannot drift apart silently
-// (`CLAUDE.md`'s #106 "duplicated predicates diverge silently" rule).
-//
-// The `< 0x20` compare is unsigned for the same reason as the JSON one: read
-// that comment before touching these kernels.
-
-/// NEON match mask for the jq escape predicate (`"`, `\`, `< 0x20`, DEL).
-#[cfg(all(
-    target_arch = "aarch64",
-    not(feature = "broadword-yaml"),
-    not(feature = "scalar-yaml")
-))]
-#[inline]
-#[target_feature(enable = "neon")]
-unsafe fn jq_neon_mask(chunk: uint8x16_t) -> uint8x16_t {
-    vorrq_u8(json_neon_mask(chunk), vceqq_u8(chunk, vdupq_n_u8(0x7f)))
-}
-
-/// AVX2 match mask for the jq escape predicate.
-#[cfg(all(
-    target_arch = "x86_64",
-    not(feature = "scalar-yaml"),
-    any(test, feature = "std")
-))]
-#[inline]
-#[target_feature(enable = "avx2")]
-unsafe fn jq_avx2_mask(chunk: __m256i) -> __m256i {
-    _mm256_or_si256(
-        json_avx2_mask(chunk),
-        _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(0x7f)),
-    )
-}
-
-/// SSE2 match mask for the jq escape predicate.
-#[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
-#[inline]
-#[target_feature(enable = "sse2")]
-unsafe fn jq_sse2_mask(chunk: __m128i) -> __m128i {
-    _mm_or_si128(
-        json_sse2_mask(chunk),
-        _mm_cmpeq_epi8(chunk, _mm_set1_epi8(0x7f)),
-    )
-}
-
-define_escape_scanner! {
-    /// jq-writer string escape scanner (`find_json_escape`'s set plus DEL).
-    mod jq_escape;
-    scalar: |b| b == b'"' || b == b'\\' || b < 0x20 || b == 0x7f;
-    neon_mask: jq_neon_mask;
-    avx2_mask: jq_avx2_mask;
-    sse2_mask: jq_sse2_mask;
-}
-
-/// Find the next byte jq's own JSON string writer would escape, in `bytes` at
-/// or after `start`: `"`, `\`, a control character (`< 0x20`), or DEL
-/// (`0x7f`). Returns `bytes.len()` if there is none.
-///
-/// [`find_json_escape`]'s predicate minus DEL is yq's escape table; this one
-/// is jq's (`write_json_body_jq`, `src/jq/escape.rs`). The consumer is
-/// `json::light`'s canonical-span scan (#2608), which has to *reject* a raw
-/// DEL rather than copy it, so it needs the byte's position exactly as the
-/// writer's own loop does.
-///
-/// `#[inline(always)]` is load-bearing for the same reason it is on
-/// [`find_json_escape`] (O3 / #87).
-#[inline(always)]
-pub fn find_jq_escape(bytes: &[u8], start: usize) -> usize {
-    jq_escape::find(bytes, start)
-}
-
 // ---- Carriage-return existence scan -----------------------------------------
 //
 // The `has_cr` precheck the YAML oracle uses to pick its `HAS_CR`
@@ -838,106 +762,6 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // `find_jq_escape` (#2608): the same machinery under jq's own writer
-    // table, which is `find_json_escape`'s plus DEL.
-    // ------------------------------------------------------------------------
-
-    /// Independent scalar reference for the jq predicate, kept separate from
-    /// both the module's `scalar` and this file's `reference` above for the
-    /// same reason.
-    fn jq_reference(bytes: &[u8], start: usize) -> usize {
-        for (i, &b) in bytes[start..].iter().enumerate() {
-            if b == b'"' || b == b'\\' || b < 0x20 || b == 0x7f {
-                return start + i;
-            }
-        }
-        bytes.len()
-    }
-
-    /// The relationship between the two predicates, pinned so they cannot
-    /// drift apart silently (`CLAUDE.md`'s #106 rule): identical on every
-    /// byte but DEL, which jq escapes and yq does not (#2591/#2592).
-    #[test]
-    fn jq_and_json_predicates_differ_by_del() {
-        for byte in 0u8..=255 {
-            let input = [byte];
-            let json_hit = find_json_escape(&input, 0) == 0;
-            let jq_hit = find_jq_escape(&input, 0) == 0;
-            if byte == 0x7f {
-                assert!(jq_hit && !json_hit, "DEL must be jq-only");
-            } else {
-                assert_eq!(
-                    json_hit, jq_hit,
-                    "predicates disagree on byte {byte:#04x}, which is not DEL"
-                );
-            }
-        }
-    }
-
-    /// Every byte value at every alignment across a buffer long enough to
-    /// exercise the 32-byte AVX2 loop, its 16-byte tail and the scalar
-    /// remainder -- the #150/#230 unsigned-compare test, applied to the new
-    /// kernels (DEL is `0x7f`, so a signed `< 0x20` compare would also
-    /// misread every byte `>= 0x80` here).
-    #[test]
-    fn jq_exhaustive_bytes_match_reference() {
-        for byte in 0u8..=255 {
-            for pos in 0..56usize {
-                let mut input = vec![b'a'; 56];
-                input[pos] = byte;
-                assert_eq!(
-                    jq_reference(&input, 0),
-                    find_jq_escape(&input, 0),
-                    "mismatch for byte {byte:#04x} at offset {pos}"
-                );
-            }
-        }
-    }
-
-    /// Multi-byte UTF-8, chunk boundaries and every `start` offset.
-    #[test]
-    fn jq_matches_reference_including_utf8() {
-        let cases: &[&[u8]] = &[
-            b"",
-            b"\x7f",
-            b"plain",
-            b"del at end\x7f",
-            b"\x7fdel at start",
-            b"has both \" and \x7f",
-            &[b'x'; 100],
-            "love \u{2665} and peace \u{262e}".as_bytes(),
-            "aaaaaaaaaaaaaaaa\u{2665}".as_bytes(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f601}".as_bytes(),
-            "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}".as_bytes(),
-        ];
-        for &input in cases {
-            for start in 0..=input.len() {
-                assert_eq!(
-                    jq_reference(input, start),
-                    find_jq_escape(input, start),
-                    "mismatch for {input:?} at start {start}"
-                );
-            }
-        }
-    }
-
-    /// The module-level `scalar` fallback for the jq scanner, reached only
-    /// through the SIMD kernels' short-buffer path or a scalar-only build.
-    #[test]
-    fn jq_scalar_fallback_matches_reference() {
-        let cases: &[&[u8]] = &[b"", b"\x7f", b"plain text", b"del\x7fin\\the\tmiddle"];
-        for &input in cases {
-            for start in 0..=input.len() {
-                assert_eq!(
-                    jq_reference(input, start),
-                    super::jq_escape::scalar(input, start),
-                    "scalar mismatch for {input:?} at start {start}"
-                );
-            }
-        }
-    }
-
     /// The module-level `scalar` fallback is only reached through the SIMD
     /// kernels' short-string path (arch-dependent) or a scalar-only build, so
     /// exercise it directly on every target for parity and coverage.
@@ -1023,45 +847,6 @@ mod tests {
                             reference(input, start),
                             avx2_index(input, start),
                             "AVX2 mismatch for {input:?} at start {start}"
-                        );
-                    }
-                }
-            }
-        }
-
-        fn jq_sse2_index(input: &[u8], start: usize) -> usize {
-            // SAFETY: SSE2 is the x86_64 baseline.
-            unsafe { super::super::jq_escape::sse2(input, start) }
-                .map_or(input.len(), |off| start + off)
-        }
-
-        fn jq_avx2_index(input: &[u8], start: usize) -> usize {
-            // SAFETY: gated on runtime AVX2 detection by callers.
-            unsafe { super::super::jq_escape::avx2(input, start) }
-                .map_or(input.len(), |off| start + off)
-        }
-
-        /// #2608's jq-table kernels, checked the same way and for the same
-        /// reason: on AVX2 hardware the dispatcher never picks SSE2, so
-        /// only a direct call covers it, and a signed `< 0x20` compare
-        /// would misread every byte >= 0x80 (#150/#230).
-        #[test]
-        fn jq_kernels_exhaustive_bytes_match_reference() {
-            let run_avx2 = has_avx2();
-            for byte in 0u8..=255 {
-                for pos in 0..56 {
-                    let mut input = [b'a'; 56];
-                    input[pos] = byte;
-                    assert_eq!(
-                        super::jq_reference(&input, 0),
-                        jq_sse2_index(&input, 0),
-                        "jq SSE2 mismatch for byte 0x{byte:02x} at {pos}"
-                    );
-                    if run_avx2 {
-                        assert_eq!(
-                            super::jq_reference(&input, 0),
-                            jq_avx2_index(&input, 0),
-                            "jq AVX2 mismatch for byte 0x{byte:02x} at {pos}"
                         );
                     }
                 }
@@ -1156,24 +941,6 @@ mod tests {
                             reference(&input, start),
                             super::super::json_escape::neon(&input, start),
                             "NEON mismatch for byte 0x{b:02x} at pos {pos}, start {start}"
-                        );
-                    }
-                }
-            }
-        }
-
-        /// #2608's jq-table NEON kernel, swept the same way.
-        #[test]
-        fn jq_exhaustive_bytes_match_reference() {
-            for b in 0u8..=255 {
-                for &pos in &[0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47] {
-                    let mut input = vec![b'A'; 48];
-                    input[pos] = b;
-                    for &start in &[0usize, 3, 16] {
-                        assert_eq!(
-                            super::jq_reference(&input, start),
-                            super::super::jq_escape::neon(&input, start),
-                            "jq NEON mismatch for byte 0x{b:02x} at pos {pos}, start {start}"
                         );
                     }
                 }

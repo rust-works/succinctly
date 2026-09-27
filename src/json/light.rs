@@ -3270,8 +3270,7 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 /// - a literal byte `< 0x20` or `0x7F` appearing unescaped is rejected --
 ///   the writer always escapes these;
 /// - every other byte, ASCII or a UTF-8 lead/continuation byte `>= 0x80`,
-///   is literal content, and is skipped over rather than inspected (see the
-///   SIMD note below).
+///   is literal content.
 ///
 /// **UTF-8 validity is deliberately not decided here.** Every byte `>= 0x80`
 /// is advanced over one at a time, as literal content, and the single
@@ -3305,57 +3304,11 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 /// validation at all, and only the CLI substitutes invalid input ahead of
 /// indexing (`utf8_lossy_document`, `src/bin/succinctly/jq_runner.rs`), so a
 /// library caller can hand a `JsonCursor` a buffer with any byte in it.
-///
-/// With the decode gone, every byte in a string that is neither `"`, `\`, a
-/// control byte nor DEL needs no decision at all -- which is exactly the
-/// question [`find_jq_escape`](crate::util::simd::escape::find_jq_escape)
-/// answers, 16-32 bytes at a time, against jq's own writer table (#2608).
-/// The loop below therefore jumps from one byte that needs a decision to the
-/// next instead of walking; the arms are unchanged, because the scanner can
-/// only ever stop on one of those four. On aarch64 the first 16 bytes of a
-/// string are walked one at a time first (#3168) -- see
-/// [`CANONICAL_STRING_SCALAR_PREFIX`].
 fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
-    scan_json_string_span_probed::<CANONICAL_STRING_SCALAR_PREFIX>(bytes, pos)
-}
-
-/// How many bytes of a string [`next_jq_string_special`] walks one at a time
-/// before handing the rest to the SIMD scanner: 16 on aarch64, 0 elsewhere
-/// (#3168).
-///
-/// Measured on both pinned boxes, `-c .` on 4 MB arrays of `L`-byte strings
-/// and on the #2608 record corpus. With no prefix the NEON scanner lost on
-/// every string under 8 bytes and on record-shaped documents (M4 Pro: +2.9%
-/// at 4 bytes, `data` +9.7%, `users` +5.4%) and won from 8 bytes up (-7% to
-/// -20%). A never-calling holdout build read neutral there, so that loss is
-/// the scanner's own per-call cost (compare, narrow, move to a general
-/// register) on short strings, not code layout. #2963's 8-byte word probe
-/// did not remove it, and a 16-byte word probe was worse (+13% at 8 bytes).
-/// A plain byte walk over the first 16 bytes removed every regression and
-/// kept the long-string win (-7.7% at 32 bytes, -17.5% at 64). On the 7950X
-/// the AVX2 scanner wins from the shortest strings up, so x86_64 goes
-/// straight to it.
-#[cfg(target_arch = "aarch64")]
-const CANONICAL_STRING_SCALAR_PREFIX: usize = 16;
-#[cfg(not(target_arch = "aarch64"))]
-const CANONICAL_STRING_SCALAR_PREFIX: usize = 0;
-
-/// [`scan_json_string_span`] with the scalar-prefix length as a parameter,
-/// so both the prefixed and the unprefixed path are testable on every
-/// architecture -- as [`string_literal_end_probed`] is, for the same reason.
-#[inline(always)]
-fn scan_json_string_span_probed<const PREFIX: usize>(
-    bytes: &[u8],
-    pos: usize,
-) -> Option<(usize, usize, usize)> {
     debug_assert_eq!(bytes.get(pos), Some(&b'"'));
     let content_start = pos + 1;
     let mut i = content_start;
     loop {
-        // Skip everything that needs no decision. Whatever the scan stops on
-        // is one of the four bytes the match below handles, so the arms are
-        // unchanged -- only the walk between them is.
-        i = next_jq_string_special::<PREFIX>(bytes, i);
         match *bytes.get(i)? {
             b'"' => {
                 return Some((content_start, i, i + 1));
@@ -3391,39 +3344,14 @@ fn scan_json_string_span_probed<const PREFIX: usize>(
                     _ => return None,
                 }
             }
-            // `next_jq_string_special` only ever stops on `"`, `\\`, a
-            // control byte or DEL, so nothing else can reach here -- and the
-            // last two are exactly what the writer always escapes, so a raw
-            // one means the span is not canonical.
-            _ => return None,
+            b if b < 0x20 || b == 0x7F => return None,
+            // Every other byte -- ASCII, or any byte of a multi-byte UTF-8
+            // sequence -- is one byte of literal content. UTF-8 validity is
+            // deliberately *not* decided here; see this function's own doc
+            // comment.
+            _ => i += 1,
         }
     }
-}
-
-/// The index of the first byte jq's string writer would escape (`"`, `\\`,
-/// `< 0x20`, DEL) at or after `i`, or `bytes.len()`: the twin of
-/// [`next_string_special`], differing only in that DEL is in the predicate
-/// (see [`find_jq_escape`](crate::util::simd::escape::find_jq_escape)).
-///
-/// The first `PREFIX` bytes are walked one at a time, and only a string
-/// still open after them reaches the SIMD scanner -- see
-/// [`CANONICAL_STRING_SCALAR_PREFIX`] for why that is 16 on aarch64 and 0
-/// on x86_64, where this compiles down to a bare call to the scanner.
-#[inline(always)]
-fn next_jq_string_special<const PREFIX: usize>(bytes: &[u8], i: usize) -> usize {
-    if PREFIX > 0 {
-        let end = bytes.len().min(i + PREFIX);
-        let mut at = i;
-        while at < end {
-            let b = bytes[at];
-            if b == b'"' || b == b'\\' || b < 0x20 || b == 0x7F {
-                return at;
-            }
-            at += 1;
-        }
-        return crate::util::simd::escape::find_jq_escape(bytes, at);
-    }
-    crate::util::simd::escape::find_jq_escape(bytes, i)
 }
 
 /// The object-token rule: `{`, then either an immediate `}` or
@@ -8884,53 +8812,6 @@ mod tests {
         assert_eq!(word_special_mask(u64::from_le_bytes([0xFF; 8])), 0);
         assert_eq!(word_special_mask(u64::from_le_bytes([0x20; 8])), 0);
         assert_eq!(word_special_mask(u64::from_le_bytes([0x80; 8])), 0);
-    }
-
-    /// The scalar prefix #3168 put in front of `scan_json_string_span`'s SIMD
-    /// scan must not change what the scan decides: every prefix length is
-    /// driven on every architecture (`PREFIX` is 16 only on aarch64), over
-    /// every byte value at every offset across the probe's own edge, the
-    /// 16-byte NEON edge and the 32-byte AVX2 edge, plus buffers shorter
-    /// than the probe.
-    #[test]
-    fn test_scan_json_string_span_probe_lengths_agree_2608() {
-        for byte in 0u8..=255 {
-            for pos in 0..40usize {
-                let mut doc = vec![b'"'];
-                doc.extend(core::iter::repeat_n(b'a', 40));
-                doc.push(b'"');
-                doc[1 + pos] = byte;
-                let want = scan_json_string_span_probed::<0>(&doc, 0);
-                assert_eq!(
-                    scan_json_string_span_probed::<8>(&doc, 0),
-                    want,
-                    "probe 8 differs for byte {byte:#04x} at {pos}"
-                );
-                assert_eq!(
-                    scan_json_string_span_probed::<16>(&doc, 0),
-                    want,
-                    "probe 16 differs for byte {byte:#04x} at {pos}"
-                );
-            }
-        }
-        // Short buffers, including ones that end inside the probe window and
-        // one that is nothing but an opening quote.
-        for doc in [
-            &b"\""[..],
-            &b"\"\""[..],
-            &b"\"a\""[..],
-            &b"\"abc"[..],
-            &b"\"abcdef\""[..],
-            &b"\"abcdefgh\""[..],
-            &b"\"\\"[..],
-            &b"\"\\n\""[..],
-            "\"caf\u{e9}\"".as_bytes(),
-            "\"\u{65e5}\u{672c}\u{8a9e}\"".as_bytes(),
-        ] {
-            let want = scan_json_string_span_probed::<0>(doc, 0);
-            assert_eq!(scan_json_string_span_probed::<8>(doc, 0), want, "{doc:?}");
-            assert_eq!(scan_json_string_span_probed::<16>(doc, 0), want, "{doc:?}");
-        }
     }
 
     /// Independent scalar reference for the tests below -- the pre-#2878
