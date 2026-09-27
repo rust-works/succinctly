@@ -1222,6 +1222,56 @@ impl<'a> Parser<'a> {
         Ok(self.input[start..self.pos].to_string())
     }
 
+    /// Parse an unquoted field name. In yq, `?` can be part of the key:
+    /// `.x??` reads `x?` optionally and `.x?y` reads `x?y`.
+    /// Leave the final adjacent `?` for the navigation-optional parser.
+    /// The `?//` spelling has separate yq behavior (#3370), so keep its
+    /// existing parse route until that issue is addressed.
+    fn parse_field_ident(&mut self) -> Result<String, ParseError> {
+        let mut name = self.parse_ident()?;
+        if self.mode != ParserMode::Yq {
+            return Ok(name);
+        }
+
+        while self.peek() == Some('?') {
+            let questions_start = self.pos;
+            while self.peek() == Some('?') {
+                self.next();
+            }
+            let questions_end = self.pos;
+            if self.peek_str(2) == "//" {
+                self.pos = questions_start;
+                break;
+            }
+
+            if self.peek().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                name.push_str(&self.input[questions_start..questions_end]);
+                let tail_start = self.pos;
+                while let Some(c) = self.peek() {
+                    if c.is_alphanumeric()
+                        || c == '_'
+                        || (c == '-'
+                            && self.input[self.pos + 1..]
+                                .chars()
+                                .next()
+                                .is_some_and(|next| next.is_alphanumeric() || next == '_'))
+                    {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
+                name.push_str(&self.input[tail_start..self.pos]);
+            } else {
+                name.push_str(&self.input[questions_start..questions_end - 1]);
+                self.pos = questions_end - 1;
+                break;
+            }
+        }
+
+        Ok(name)
+    }
+
     /// Parse a number literal (integer or float).
     fn parse_number_literal(&mut self) -> Result<Literal, ParseError> {
         let start = self.pos;
@@ -2729,7 +2779,7 @@ impl<'a> Parser<'a> {
                     Expr::Field(name)
                 } else {
                     // Field access `.foo`
-                    let name = self.parse_ident()?;
+                    let name = self.parse_field_ident()?;
                     Expr::Field(name)
                 };
 
@@ -7041,7 +7091,7 @@ impl<'a> Parser<'a> {
                         chain.push(field_expr);
                     } else {
                         // Field access
-                        let name = self.parse_ident()?;
+                        let name = self.parse_field_ident()?;
                         let mut field_expr = Expr::Field(name);
 
                         // Check for optional
@@ -11656,5 +11706,44 @@ mod tests {
         ] {
             assert!(parse(filter).is_ok(), "jq rejected {filter}");
         }
+    }
+
+    /// Pinned yq v4.53.3 treats all but the final adjacent `?` as part
+    /// of an unquoted field name; jq retains its repeated optional grammar.
+    #[test]
+    fn test_yq_question_marks_in_unquoted_field_names_3356() {
+        for (filter, name) in [
+            (".x??", "x?"),
+            (".x???", "x??"),
+            (".x????", "x???"),
+            (".x?y?", "x?y"),
+            (".x?y??", "x?y?"),
+            (".x?y-z?", "x?y-z"),
+            (".a.x??", "x?"),
+        ] {
+            let expr = parse_with_mode(filter, ParserMode::Yq).unwrap();
+            let expected = Expr::Optional(Box::new(Expr::Field(name.into())));
+            if filter.starts_with(".a.") {
+                assert_eq!(
+                    expr,
+                    Expr::Pipe(vec![Expr::Field("a".into()), expected]),
+                    "{filter}"
+                );
+            } else {
+                assert_eq!(expr, expected, "{filter}");
+            }
+        }
+        assert_eq!(
+            parse_with_mode(".x?y", ParserMode::Yq).unwrap(),
+            Expr::Field("x?y".into())
+        );
+        assert_eq!(
+            parse_with_mode(".x?1", ParserMode::Yq).unwrap(),
+            Expr::Field("x?1".into())
+        );
+        assert_eq!(
+            parse(".x??").unwrap(),
+            Expr::Optional(Box::new(Expr::Optional(Box::new(Expr::Field("x".into())))))
+        );
     }
 }
