@@ -71712,6 +71712,50 @@ fn test_format_prefixed_string_succinctly_extensions_3316() -> Result<()> {
     Ok(())
 }
 
+/// #3369: `key`/`parent`/`parent(n)` as a format-prefixed interpolation
+/// slot's *own* first pipe stage (`@fmt "\(key|tostring)"`) must raise the
+/// same "Invalid path expression" `path()` already raises for the bare,
+/// unwrapped slot (`@fmt "\(key)"`) -- before this fix the `Pipe`-wrapped
+/// case silently produced nothing instead (exit 0, empty stdout), because
+/// the format desugar nested a fresh `Pipe` around it, hiding `key` one
+/// level deeper than `eval_path_context_pipe_owned` (#3362/#3373) looks.
+/// `key`/`parent` are succinctly extensions with no jq equivalent, so this
+/// captures the general "path() on a computed/string value always raises"
+/// shape rather than a specific value (confirmed against `/usr/bin/jq`
+/// 1.7.1 via `length|tostring` as a control, same error family).
+#[test]
+fn test_format_prefixed_key_parent_pipe_slot_raises_3369() -> Result<()> {
+    for (filter, input) in [
+        (r#"path(@base64 "\(key)")"#, r#"{"foo":1}"#),
+        (r#"path(@base64 "\(key|tostring)")"#, r#"{"foo":1}"#),
+        (
+            r#".[] | path(@base64 "\(parent|tostring)")"#,
+            r#"{"foo":1}"#,
+        ),
+        (
+            r#".a[] | path(@base64 "\(parent(1)|tostring)")"#,
+            r#"{"a":{"foo":1}}"#,
+        ),
+        (r#".[] | path(@base64 "\((key)|tostring)")"#, r#"{"foo":1}"#),
+        (r#".[] | path(@base64 "\(key?|tostring)")"#, r#"{"foo":1}"#),
+        (r#"path(@base64 "\(length|tostring)")"#, r#"{"foo":1}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(stdout, "", "{input} | {filter}");
+        assert_eq!(code, 5, "{input} | {filter}: {stderr}");
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "{input} | {filter}: {stderr}"
+        );
+    }
+    // Control: an ordinary (non-key/parent) pipe under a format is
+    // unaffected by the flattening -- still evaluates normally.
+    let (stdout, code) = run_jq_stdin(r#"@base64 "\(1+1|tostring)""#, "null", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"Mg==\"\n");
+    Ok(())
+}
+
 /// #3283: the CLI route (not only the library harness) reaches
 /// `array_contents_are_checked`'s newly-admitted shapes. Confirmed live
 /// against jq 1.7.1.

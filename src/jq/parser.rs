@@ -7069,9 +7069,30 @@ impl<'a> Parser<'a> {
     /// jq leaving the format unrun for a literal with no interpolation.
     /// `format` is cloned once per `\(...)` slot; `FormatType`/`Expr` are
     /// cheap to clone and every slot needs its own copy of the same format.
+    ///
+    /// #3369: when `e` is itself already a multi-stage `Expr::Pipe` (e.g.
+    /// `\(key|tostring)`), append `format` to that *same* flat `Vec` rather
+    /// than wrapping the whole thing in a fresh, nested `Pipe` -- pipe is
+    /// associative (`(A|B)|C` == `A|B|C`), so this changes nothing about
+    /// what the expression evaluates to, but it keeps this slot's own
+    /// desugared shape exactly as flat as a plain (non-format) `\(key|
+    /// tostring)` already parses to. That flatness is load-bearing:
+    /// `eval_path_context_pipe_owned` (#3362/#3373) recognizes `key`/
+    /// `parent`/`parent(n)` only as its *own* pipe's first element --
+    /// nesting one more nested `Pipe` around it (the pre-fix behavior)
+    /// hid `key` one level deeper than that check ever looks, so
+    /// `path(@base64 "\(key|tostring)")` silently produced nothing instead
+    /// of raising the same "Invalid path expression" the bare, unwrapped
+    /// `path(@base64 "\(key)")` already correctly does.
     fn apply_format_to_interpolation(s: Expr, format: &Expr) -> Expr {
         map_subexprs(&s, &mut |e: &Expr| {
-            Expr::Pipe(vec![e.clone(), format.clone()])
+            if let Expr::Pipe(stages) = e {
+                let mut stages = stages.clone();
+                stages.push(format.clone());
+                Expr::Pipe(stages)
+            } else {
+                Expr::Pipe(vec![e.clone(), format.clone()])
+            }
         })
     }
 
@@ -11604,6 +11625,49 @@ mod tests {
         assert_eq!(
             parse(r#"@base64 "v"[0:1]"#).unwrap(),
             parse(r#""v"[0:1]"#).unwrap()
+        );
+    }
+
+    /// #3369: when the interpolation slot's own expr is already a
+    /// multi-stage `Pipe` (`\(key|tostring)`), the format desugar appends
+    /// to that *same* flat `Vec` instead of nesting a fresh `Pipe` around
+    /// it -- `eval_path_context_pipe_owned` (#3362/#3373) only recognizes
+    /// `key`/`parent`/`parent(n)` as its own pipe's first element, so a
+    /// nested shape hid it one level too deep and silently dropped the
+    /// write instead of raising, unlike the bare (non-`Pipe`) slot case
+    /// just above, which was already flat and already correct.
+    #[test]
+    fn test_format_prefixed_string_flattens_pipe_slot_3369() {
+        let key = Expr::Builtin(Builtin::Key);
+        let tostring = Expr::Builtin(Builtin::ToString);
+
+        assert_eq!(
+            parse(r#"@base64 "\(key|tostring)""#).unwrap(),
+            Expr::StringInterpolation(vec![StringPart::Expr(Box::new(Expr::Pipe(vec![
+                key.clone(),
+                tostring.clone(),
+                Expr::Format(FormatType::Base64),
+            ])))])
+        );
+
+        // A non-`Pipe` slot still gets the pre-existing 2-element wrap.
+        assert_eq!(
+            parse(r#"@base64 "\(key)""#).unwrap(),
+            Expr::StringInterpolation(vec![StringPart::Expr(Box::new(Expr::Pipe(vec![
+                key,
+                Expr::Format(FormatType::Base64),
+            ])))])
+        );
+
+        // A longer chain flattens all the way, not just the first two.
+        assert_eq!(
+            parse(r#"@base64 "\(key|tostring|length)""#).unwrap(),
+            Expr::StringInterpolation(vec![StringPart::Expr(Box::new(Expr::Pipe(vec![
+                Expr::Builtin(Builtin::Key),
+                tostring,
+                Expr::Builtin(Builtin::Length),
+                Expr::Format(FormatType::Base64),
+            ])))])
         );
     }
 
