@@ -117,6 +117,19 @@ impl SliceBounds {
         let end = clamp(self.end.map_or(end_default, f64::ceil), len);
         start..end.max(start)
     }
+
+    /// Whether these bounds name every element of a non-empty container of
+    /// length `len` — jq's own slice identity rule (#3306): such a slice
+    /// shares the container's own `jv`, rather than being a distinct value
+    /// the way any other slice is. An empty container is deliberately
+    /// excluded: `[] | .[0:0]` still names a fresh empty array in jq, not the
+    /// original (there is no "whole container" to be identical *to* when
+    /// there is nothing in it) — confirmed live, `[] as $x | .[0:0] |
+    /// path($x)` raises in jq 1.7.1, the same as any other non-identity
+    /// slice would.
+    pub(crate) fn is_full_range(&self, len: usize) -> bool {
+        len > 0 && self.resolve(len) == (0..len)
+    }
 }
 
 /// One `start`/`end` slot of a descriptor.
@@ -301,6 +314,32 @@ mod tests {
             end: Some(1e100),
         };
         assert_eq!(huge.resolve(3), 1..3);
+    }
+
+    #[test]
+    fn full_range_is_recognized_by_every_spelling_3306() {
+        // Every way of naming "the whole 2-element array".
+        for (start, end) in [(None, None), (Some(0), None), (None, Some(2))] {
+            assert!(SliceBounds::from_literals(start, end).is_full_range(2));
+        }
+        // An over-wide bound still clamps to the full range (`.[0:5]` on a
+        // 2-element array is the whole array, same as `.[:]`).
+        assert!(SliceBounds::from_literals(Some(0), Some(5)).is_full_range(2));
+        assert!(SliceBounds::from_literals(Some(-9), None).is_full_range(2));
+    }
+
+    #[test]
+    fn partial_or_empty_ranges_are_not_full_3306() {
+        // A genuinely partial slice, in either direction.
+        assert!(!SliceBounds::from_literals(Some(1), None).is_full_range(2));
+        assert!(!SliceBounds::from_literals(None, Some(1)).is_full_range(2));
+        // The empty container has no "whole" to be identical to (jq 1.7.1,
+        // live: `[] as $x | .[0:0] | path($x)` raises, same as any other
+        // non-identity slice).
+        assert!(!SliceBounds::from_literals(None, None).is_full_range(0));
+        // A crossed-bounds insertion point is empty, not full, even though it
+        // clamps into range.
+        assert!(!SliceBounds::from_literals(Some(2), Some(1)).is_full_range(3));
     }
 
     #[test]
