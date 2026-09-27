@@ -1679,6 +1679,58 @@ fn no_parent_placeholder() -> OwnedValue {
     OwnedValue::Object(IndexMap::new().into())
 }
 
+/// Whether `expr` is `key`/`parent`/`parent(n)`, optionally wrapped in any
+/// number of the constructs [`needs_path_context`] already treats as
+/// transparent pass-throughs for the same "does this need real document
+/// context" question -- `Paren`, `Optional` (a bare `key?`, not the
+/// primitive-navigation `?`, since `key` is never one of those), and
+/// `Comma` (every branch, so a mixed `(key, .a)` still refuses via the
+/// `false` fallthrough for the branch that is not one of these). Used by
+/// [`eval_path_context_pipe_owned`] (#3362) to recognize every syntactic
+/// spelling of "answer with the same mode-aware placeholder the bare-slot
+/// case already gets" that reaches its reconstruction with no real
+/// ancestry to give these three builtins -- not `Compare`/`Arithmetic`/
+/// `Select`/... and the rest of `needs_path_context`'s own, much wider
+/// recursion, which stay on the pre-existing reconstruction route.
+fn key_or_parent_root_construct(expr: &Expr) -> bool {
+    match expr {
+        Expr::Builtin(Builtin::Key | Builtin::Parent | Builtin::ParentN(_)) => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => key_or_parent_root_construct(inner),
+        Expr::Comma(parts) => parts.iter().all(key_or_parent_root_construct),
+        _ => false,
+    }
+}
+
+/// The concrete placeholder value(s) [`key_or_parent_root_construct`]
+/// (already confirmed true for `expr`) answers with -- empty in yq mode,
+/// where the whole construct yields nothing at the root (#2421), mirroring
+/// `root_path_context_placeholder`'s own gate without evaluating anything
+/// through it (this is computed directly, precisely to avoid the
+/// evaluation cycle described at this function's own call site: handing
+/// `expr` itself back to the ordinary evaluator would reach the identical
+/// `needs_path_context`-true dispatch that called this in the first
+/// place). One value per `Key`/`Parent`/`ParentN`, transparent through
+/// `Paren`/`Optional`, and flattened across every `Comma` branch (so
+/// `(key, parent)` answers two placeholders, matching jq's own fan-out for
+/// a plain `,`).
+fn key_or_parent_placeholder_values<S: EvalSemantics>(expr: &Expr) -> Vec<OwnedValue> {
+    if S::ROOT_PATH_CONTEXT_YIELDS_NOTHING {
+        return Vec::new();
+    }
+    match expr {
+        Expr::Builtin(Builtin::Key) => vec![OwnedValue::Null],
+        Expr::Builtin(Builtin::Parent | Builtin::ParentN(_)) => vec![no_parent_placeholder()],
+        Expr::Paren(inner) | Expr::Optional(inner) => key_or_parent_placeholder_values::<S>(inner),
+        Expr::Comma(parts) => parts
+            .iter()
+            .flat_map(key_or_parent_placeholder_values::<S>)
+            .collect(),
+        // Unreachable: every caller checks `key_or_parent_root_construct`
+        // first, which this function's own match mirrors arm-for-arm.
+        _ => Vec::new(), // omni-dev: coverage tolerate-line reason="unreachable: key_or_parent_root_construct's identical structural match already refused any expr shape that would reach this arm"
+    }
+}
+
 /// [`yq_empty_operand_output`]'s `and`/`or` row, as the `bool` those two
 /// operators actually consume (#2460). `None` in jq mode, and `None` too if
 /// the table ever stops answering for `Boolean` -- the table stays the single
@@ -50781,6 +50833,71 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .collect()
         });
     let exprs: &[Expr] = demoted.as_deref().unwrap_or(exprs);
+
+    // #3362: `key`/`parent`/`parent(n)` as this pipe's own *first* stage
+    // need the real document's ancestry to answer correctly -- exactly
+    // what this function's whole job (reconstructing `owned` as an
+    // isolated, single-node throwaway document below) structurally cannot
+    // give them. Walked with a cursor rooted at that throwaway document,
+    // `eval_generic.rs`'s own cursor-native `key`/`parent` arms answer as
+    // if genuinely at the document root (their own deliberate, correct
+    // policy for a *genuine* root, #2421's "no key/parent context" case)
+    // -- wrongly triggered here for a position that was never the real
+    // root, so the rest of the pipe never runs and the whole thing
+    // silently answers empty. A *bare* `key`/`parent` slot with no further
+    // stages (`path("\(key)")`) never reaches that cursor-native arm at
+    // all: it resolves through this same crate's other, owned-value
+    // `eval_builtin` (this file; `Builtin::Key`/`Parent`/`ParentN`'s own
+    // "no context" arms, all `root_path_context_placeholder`-based), which
+    // is already mode-aware -- `Null`/an empty object in jq mode, nothing
+    // in yq mode -- and, for `parent(n)`, independent of `n`: with zero
+    // real ancestry, no `n` has an ancestor to find, so it degenerates to
+    // the same placeholder `parent` (bare) gets.
+    //
+    // A first cut of this fix matched only the bare `Expr::Builtin(Key/
+    // Parent)` shape directly and missed every wrapped form (`(key)`,
+    // `key?`, `(key,parent)`, ...) -- code review caught this live:
+    // `path("\((key)|tostring)")` and `path("\(key?|tostring)")` both
+    // still silently produced nothing under that narrower match.
+    // `key_or_parent_root_construct` widens the *recognition* to every
+    // shape `needs_path_context` already treats as transparent for this
+    // question. **Delegating the whole pipe** (`exprs.to_vec()`, first
+    // stage included) to `eval_owned_multi` was the first attempt at
+    // reusing that evaluator's own correct handling -- it stack-overflows:
+    // that evaluator's own `Expr::Pipe` dispatch sees the *same*
+    // `needs_path_context`-true first stage and routes straight back into
+    // this function with the identical, unshortened `exprs`, forever. Only
+    // `rest` (everything *after* the recognized first stage, strictly
+    // shorter) is safe to hand back to the ordinary evaluator; the first
+    // stage's own placeholder value(s) are computed directly instead,
+    // mirroring `root_path_context_placeholder`'s own per-builtin/per-mode
+    // answer without evaluating anything through it.
+    if let [first, rest @ ..] = exprs {
+        if key_or_parent_root_construct(first) {
+            let placeholders = key_or_parent_placeholder_values::<S>(first);
+            if placeholders.is_empty() {
+                // Yq mode: nothing at the root (#2421), so `rest` never
+                // runs either -- a genuinely empty generator.
+                return QueryResult::None;
+            }
+            if rest.is_empty() {
+                return if let [only] = placeholders.as_slice() {
+                    QueryResult::Owned(only.clone())
+                } else {
+                    QueryResult::ManyOwned(placeholders)
+                };
+            }
+            let mut values = Vec::new();
+            for placeholder in &placeholders {
+                match eval_owned_multi::<S>(&Expr::Pipe(rest.to_vec()), placeholder) {
+                    Ok(outputs) => values.extend(outputs),
+                    Err(e) => return e.into(),
+                }
+            }
+            return QueryResult::ManyOwned(values);
+        }
+    } // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: the new gate test above (`Builtin::Length` as `first`) demonstrably takes `key_or_parent_root_construct(first) == false` and falls through to the reindex-bridge route below, passing -- but this closing brace, like the one at #56920 for the same reason, is never itself credited a hit"
+
     if !reindex_bridge_is_identity(owned) {
         if let Some(result) =
             eval_path_context_pipe_detached::<S, StandardJson<'_, Vec<u64>>>(exprs, owned, optional)
@@ -95222,6 +95339,76 @@ mod tests {
         );
     }
 
+    /// #3362: `path("\(key|tostring)")` (a `Pipe` over `key`/`parent` as a
+    /// string interpolation slot) silently produced zero outputs instead of
+    /// raising, where the bare slot (`path("\(key)")`) already raised
+    /// correctly -- both reach `eval_path_context_pipe_owned`'s own
+    /// single-node throwaway-document reconstruction, which has no real
+    /// key/parent to answer with; the fix substitutes the same mode-aware
+    /// placeholder `eval_builtin`'s own `Builtin::Key`/`Builtin::Parent`
+    /// arms already use for the bare case, then evaluates the rest of the
+    /// pipe against it by value. `key`/`parent` have no jq equivalent
+    /// (succinctly extensions, ADR-0018 rule 5), so there is no jq oracle
+    /// for their own value -- but the general "a computed/string-
+    /// interpolation result always refuses `path()`" shape is confirmed
+    /// live against jq 1.7.1 via the `length|tostring` control below, which
+    /// already behaved identically in both tools before this fix.
+    ///
+    /// The `(key)`/`key?`/`(key,parent)` rows pin a review finding on this
+    /// same PR: a first cut matched only the bare `Expr::Builtin(Key/
+    /// Parent)` shape and missed every one of these wrapped forms, which
+    /// reached the identical silent-drop through `key_or_parent_root_construct`'s
+    /// wider recognition (`Paren`/`Optional`/`Comma`, mirroring what
+    /// `needs_path_context` itself already treats as transparent).
+    #[test]
+    fn test_path_interpolation_pipe_over_key_or_parent_raises_3362() {
+        for (doc, filter, needle) in [
+            (r#"{"foo":1}"#, r#".[] | path("\(key|tostring)")"#, "null"),
+            (r#"{"foo":1}"#, r#".[] | path("\(key+0)")"#, "0"),
+            (r#"{"foo":1}"#, r".[] | path(key|tostring)", "null"),
+            (r#"{"foo":1}"#, r#".[] | path("\(parent|tostring)")"#, "{}"),
+            (r#"{"foo":1}"#, r#".[] | path("\(length|tostring)")"#, "1"),
+            (r#"{"foo":1}"#, r#".[] | path("\((key)|tostring)")"#, "null"),
+            (r#"{"foo":1}"#, r#".[] | path("\(key?|tostring)")"#, "null"),
+        ] {
+            query!(doc.as_bytes(), filter,
+                QueryResult::Error(e) => {
+                    assert!(e.message.contains(needle), "{filter}: {}", e.message);
+                }
+            );
+        }
+        // `(key, parent)` fans out to two forks, each with its own
+        // placeholder -- the first fork's own raise still wins (jq's own
+        // general error-propagation rule: the first uncaught error aborts
+        // before a later comma branch ever runs).
+        query!(br#"{"foo":1}"#, r#".[] | path("\((key,parent)|tostring)")"#,
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("null"), "{}", e.message);
+            }
+        );
+        // The write-side consequence: a computed interpolation slot over
+        // `key`/`parent` must not silently drop the write either --
+        // including through the `Paren`-wrapped shape.
+        for filter in [
+            r#".[] | ("\(key|tostring)") = "x""#,
+            r#".[] | ("\(key|tostring)") |= "x""#,
+            r#".[] | ("\((key)|tostring)") = "x""#,
+        ] {
+            query!(br#"{"foo":1}"#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.message.contains("null"), "{filter}: {}", e.message);
+                }
+            );
+        }
+        // An error inside the rest of the pipe still propagates as itself,
+        // not swallowed by the placeholder substitution.
+        query!(br#"{"foo":1}"#, r#".[] | path("\(key|error("boom"))")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
     /// #1510: the deleted eager path-context evaluator's two `Expr::Pipe` arms. A
     /// nested pipe is the one stage shape that still has to splice
     /// `[i0..in] ++ rest` into an owned `Vec<Expr>`, because `rest:
@@ -95312,6 +95499,87 @@ mod tests {
             outputs(b"[10,20]", ".[] | key | tostring"),
             vec![r#""0""#, r#""1""#]
         );
+    }
+
+    /// #3362's fix, its `exprs.len() == 1` (bare-slot-through-this-bridge)
+    /// case and its yq-mode branch -- both called directly, since
+    /// `eval_path_context_pipe_owned` is a plain private fn any submodule
+    /// of this file can reach, and constructing the exact CLI-level route
+    /// that happens to land a single-element slice or a yq-mode call here
+    /// (rather than through `eval_builtin`'s own, already-mode-aware bare-
+    /// slot arm, or through the jq-mode multi-stage case the CLI-level test
+    /// above already covers) is far more indirect than the property this
+    /// pins: given `exprs = [Key]` alone, the answer is the placeholder
+    /// itself, not the placeholder piped through a further stage; given yq
+    /// mode, the answer is nothing at all, matching `root_path_context_placeholder`'s
+    /// own gate for the bare-slot case (#2421).
+    #[test]
+    fn test_path_context_pipe_owned_key_placeholder_gate_3362() {
+        let input = OwnedValue::Object(IndexMap::new().into());
+        match eval_path_context_pipe_owned::<Vec<u64>, JqSemantics>(
+            &[Expr::Builtin(Builtin::Key)],
+            &input,
+            false,
+        ) {
+            QueryResult::Owned(OwnedValue::Null) => {}
+            other => panic!("expected Owned(Null), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+        }
+        match eval_path_context_pipe_owned::<Vec<u64>, YqSemantics>(
+            &[
+                Expr::Builtin(Builtin::Key),
+                Expr::Builtin(Builtin::ToString),
+            ],
+            &input,
+            false,
+        ) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+        }
+        // #3362 review: a `Paren`-wrapped `key` as the pipe's own first
+        // stage must be recognized too, not only the bare builtin -- the
+        // gap the CLI-level test above pins through `path()`; this pins
+        // the same property one layer down, directly on the function the
+        // gap was actually in.
+        match eval_path_context_pipe_owned::<Vec<u64>, JqSemantics>(
+            &[
+                Expr::Paren(Box::new(Expr::Builtin(Builtin::Key))),
+                Expr::Builtin(Builtin::ToString),
+            ],
+            &input,
+            false,
+        ) {
+            QueryResult::ManyOwned(values)
+                if values == [OwnedValue::String("null".to_string())] => {}
+            other => panic!("expected ManyOwned([\"null\"]), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+        }
+        // Two more of this same gate's arms the CLI-level tests above don't
+        // reach: a `Comma` of two key/parent constructs with nothing else in
+        // the pipe (`rest.is_empty()` but `placeholders.len() > 1`, so the
+        // `ManyOwned` fan-out branch runs instead of the single-value one
+        // just above), and a first stage that is *not* a key/parent
+        // construct at all -- `key_or_parent_root_construct` answers `false`,
+        // so this falls through to the pre-existing reindex-bridge route
+        // instead (`length` on an empty object, well past this gate).
+        match eval_path_context_pipe_owned::<Vec<u64>, JqSemantics>(
+            &[Expr::Comma(vec![
+                Expr::Builtin(Builtin::Key),
+                Expr::Builtin(Builtin::Parent),
+            ])],
+            &input,
+            false,
+        ) {
+            QueryResult::ManyOwned(values)
+                if values == [OwnedValue::Null, no_parent_placeholder()] => {}
+            other => panic!("expected ManyOwned([null, {{}}]), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+        }
+        match eval_path_context_pipe_owned::<Vec<u64>, JqSemantics>(
+            &[Expr::Builtin(Builtin::Length)],
+            &input,
+            false,
+        ) {
+            QueryResult::Owned(OwnedValue::Int(0)) => {}
+            other => panic!("expected Owned(Int(0)), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+        }
     }
 
     /// #3122: [`eval_path_context_pipe_owned`]'s own marker-demotion
