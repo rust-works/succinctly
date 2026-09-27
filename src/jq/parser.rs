@@ -1225,6 +1225,17 @@ impl<'a> Parser<'a> {
     /// Parse an unquoted field name. In yq, `?` and `/` can be part of the
     /// key: `.x?//1` reads `x?//1`, while `.x??` reads `x?` optionally.
     /// Leave only the final adjacent `?` for the navigation-optional parser.
+    ///
+    /// #3377: real yq also keeps a tab, carriage return, or nonbreaking
+    /// space (U+00A0) that follows the field stem as part of the key
+    /// itself -- confirmed live against yq v4.53.3 with `{"x\t":7}` /
+    /// `.x\t?` (and `.x\t` with no suffix at all): both print `7`, not
+    /// `null`. Unlike a literal space or newline (`unexpected '?' after
+    /// whitespace` below, #3370), these three bytes are never lexer
+    /// separators in real yq's unquoted-field grammar, so they belong in
+    /// this loop's own charset rather than being left to `skip_ws()` --
+    /// which would otherwise discard them before the trailing-`?` check
+    /// ever sees them.
     fn parse_field_ident(&mut self) -> Result<String, ParseError> {
         let mut name = self.parse_ident()?;
         if self.mode != ParserMode::Yq {
@@ -1232,10 +1243,9 @@ impl<'a> Parser<'a> {
         }
 
         let suffix_start = self.pos;
-        while self
-            .peek()
-            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '?'))
-        {
+        while self.peek().is_some_and(|c| {
+            c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '?' | '\t' | '\r' | '\u{a0}')
+        }) {
             self.next();
         }
         if self.pos > suffix_start && self.input.as_bytes()[self.pos - 1] == b'?' {
@@ -11836,5 +11846,47 @@ mod tests {
             );
         }
         assert!(parse(".x?//1").is_err());
+    }
+
+    /// Real yq keeps a tab, carriage return, or nonbreaking space (U+00A0)
+    /// that follows the field stem as part of the unquoted field name
+    /// itself -- confirmed live against yq v4.53.3: `.x<TAB>?` on
+    /// `{"x\t":7}` prints `7`, not `null`. Unlike a literal space or
+    /// newline (#3370, still rejected below, unchanged), these three bytes
+    /// are never lexer separators in real yq's grammar.
+    #[test]
+    fn test_yq_field_name_keeps_tab_cr_nbsp_3377() {
+        for (filter, name) in [
+            (".x\t?", "x\t"),
+            (".x\t", "x\t"),
+            (".x\t\t?", "x\t\t"),
+            (".x\r?", "x\r"),
+            (".x\u{a0}?", "x\u{a0}"),
+            (".a.x\t?", "x\t"),
+        ] {
+            let expr = parse_with_mode(filter, ParserMode::Yq).unwrap();
+            if filter.ends_with('?') {
+                let expected = Expr::Optional(Box::new(Expr::Field(name.into())));
+                if filter.starts_with(".a.") {
+                    assert_eq!(
+                        expr,
+                        Expr::Pipe(vec![Expr::Field("a".into()), expected]),
+                        "{filter:?}"
+                    );
+                } else {
+                    assert_eq!(expr, expected, "{filter:?}");
+                }
+            } else {
+                assert_eq!(expr, Expr::Field(name.into()), "{filter:?}");
+            }
+        }
+        // Unchanged from #3370: a literal space or newline still separates
+        // the field from a trailing `?` rather than joining it.
+        for filter in [".x ?", ".x\n?"] {
+            assert!(
+                parse_with_mode(filter, ParserMode::Yq).is_err(),
+                "yq accepted {filter:?}"
+            );
+        }
     }
 }

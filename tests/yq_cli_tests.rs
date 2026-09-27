@@ -92,6 +92,39 @@ fn test_yq_question_slash_field_spelling_3370() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: a tab, carriage return, or nonbreaking space (U+00A0)
+/// that follows the field stem is kept as part of the unquoted field name,
+/// unlike a literal space or newline (#3370, unaffected here) which still
+/// separate the field from a trailing `?`. Input keys are JSON-escaped
+/// (`\t`/`\r`/` `) rather than raw bytes to avoid a separate, unrelated
+/// divergence in how a literal control byte inside a JSON string value is
+/// read (tracked separately, not part of this grammar fix).
+#[test]
+fn test_yq_field_name_keeps_tab_cr_nbsp_3377() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        (r#"{"x\t":7}"#, ".x\t?", "7\n"),
+        (r#"{"x\t":7}"#, ".x\t", "7\n"),
+        (r#"{"x\t\t":7}"#, ".x\t\t?", "7\n"),
+        (r#"{"x\r":7}"#, ".x\r?", "7\n"),
+        (r#"{"x ":7}"#, ".x\u{a0}?", "7\n"),
+        (r#"{"a":{"x\t":9}}"#, ".a.x\t?", "9\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input:?} | {filter:?}"
+        );
+    }
+    for filter in [".x ?", ".x\n?"] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, r#"{"x\t":7}"#, args)?;
+        assert_eq!(stdout, "", "{filter:?}");
+        assert_eq!(code, 1, "{filter:?}: {stderr}");
+        assert!(!stderr.is_empty(), "{filter:?}");
+    }
+    Ok(())
+}
+
 /// Captured from yq v4.53.3 with JSON input and compact JSON output.
 #[test]
 fn test_pick_keys_on_json_cli_3026() -> Result<()> {
