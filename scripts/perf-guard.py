@@ -308,9 +308,26 @@ DEFAULT_THRESHOLD = 5.0
 # three changes are now in `main`; the entries were removed together
 # (#3170, #3175) once every row read ~0% again against a merge-base that
 # already included all three.
+#
+# #3140: `BalancedParens::find_close` answers a leaf (its close is the next
+# bit) before entering its state machine, so every sibling hop over a key or
+# scalar got cheaper -- faster on every row that walks object fields or
+# array elements. Measured by this guard against the PR's own merge-base on
+# a 7950X: `wide_identity` -14.0%, `users_identity` -13.2%,
+# `users_compact_latefail` -12.4%, `wide_keys_unsorted` -11.5%,
+# `wide_escaped_keys_unsorted` -10.0%, `arrays_identity` -8.5%,
+# `users_path_walk` -6.5%, every other row -0% to -4.8%. The entries below
+# clear those numbers with headroom; once `main` has moved past #3140, drop
+# the #3140-only rows and return `wide_keys_unsorted` to 10.0 and
+# `users_identity` to its own rule above.
 QUERY_THRESHOLDS = {
-    "wide_keys_unsorted": 10.0,
-    "users_identity": 12.0,
+    "wide_keys_unsorted": 15.0,
+    "users_identity": 17.0,
+    "wide_identity": 18.0,
+    "users_compact_latefail": 16.0,
+    "wide_escaped_keys_unsorted": 14.0,
+    "arrays_identity": 12.0,
+    "users_path_walk": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
