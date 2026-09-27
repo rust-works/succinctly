@@ -4353,11 +4353,18 @@ impl<'a> Parser<'a> {
     fn parse_format_string(&mut self) -> Result<Expr, ParseError> {
         self.expect('@')?;
 
-        // Parse the format name
+        // Parse the format name. #3357 review: widened from
+        // `is_ascii_alphabetic() || c == '6' || c == '4'` (a special case
+        // for base64/base64d's own digits) to alphanumeric-or-underscore --
+        // confirmed live against jq 1.7.1 that its own format token has no
+        // narrower grammar than this: `@1foo`, `@foo_bar` and `@_foo` all
+        // defer to the same runtime "X is not a valid format" jq's other
+        // unknown names do, not a compile error, and no leading-character
+        // restriction (unlike a general identifier) applies.
         let format_start = self.pos;
         while self
             .peek()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '6' || c == '4')
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             self.next();
         }
@@ -4396,6 +4403,22 @@ impl<'a> Parser<'a> {
             "urid" => FormatType::Urid,
             "yaml" => FormatType::Yaml,
             "props" => FormatType::Props,
+            // #3357: jq mode only, and only when a name actually followed
+            // the `@`. jq's own grammar accepts any `@name` token at parse
+            // time and defers the "is this a real format" check to when
+            // the format is actually applied -- confirmed live against jq
+            // 1.7.1 (`@foo "x"` compiles; `1 | @foo` raises `foo is not a
+            // valid format` at runtime). A bare `@` with nothing after it
+            // is a different case: jq's own lexer rejects it as
+            // `unexpected INVALID_CHARACTER` at compile time (exit 3, not
+            // 5) -- confirmed live -- since there's no token there at all,
+            // not an unrecognized one, so this stays the pre-#3357 parse
+            // error for that case specifically. yq's lexer rejects an
+            // unrecognized `@name` outright regardless of length, so this
+            // stays a parse error there too, unchanged.
+            _ if self.mode == ParserMode::Jq && !format_name.is_empty() => {
+                FormatType::Unknown(format_name.to_string())
+            }
             _ => {
                 return Err(ParseError::new(
                     format!("unknown format '@{format_name}'"),
@@ -11042,8 +11065,11 @@ mod tests {
 
     #[test]
     fn test_parse_error_paths() {
-        // Unknown @format.
-        assert!(parse("@foobar")
+        // #3357: an unknown @format is no longer a jq-mode parse error --
+        // jq's own grammar defers that check to runtime. See
+        // test_unknown_format_defers_to_runtime_in_jq_mode_3357 for the
+        // full behavior; yq mode still rejects it here, unchanged.
+        assert!(parse_with_mode("@foobar", ParserMode::Yq)
             .unwrap_err()
             .message
             .contains("unknown format"));
@@ -11481,5 +11507,61 @@ mod tests {
     fn test_format_prefixed_string_still_rejected_in_yq_mode_3316() {
         assert!(parse_with_mode(r#"@base64 "v=\(1)""#, ParserMode::Yq).is_err());
         assert!(parse_with_mode(r#"@base64"x""#, ParserMode::Yq).is_err());
+    }
+
+    /// #3357: jq's own grammar accepts any `@name` token at parse time and
+    /// defers the "is this a real format" check to when the format is
+    /// actually applied, so an unrecognized `@foo` compiles in jq mode --
+    /// unlike yq, whose lexer rejects it outright, which stays a parse
+    /// error here too.
+    #[test]
+    fn test_unknown_format_defers_to_runtime_in_jq_mode_3357() {
+        assert_eq!(
+            parse("@foo").unwrap(),
+            Expr::Format(FormatType::Unknown("foo".into()))
+        );
+
+        // Format-prefixed string interpolation (#3316) composes with this:
+        // the desugar wraps the unknown format the same way as any other.
+        assert_eq!(
+            parse(r#"@foo "v=\(1)""#).unwrap(),
+            Expr::StringInterpolation(vec![
+                StringPart::Literal("v=".into()),
+                StringPart::Expr(Box::new(Expr::Pipe(vec![
+                    parse("1").unwrap(),
+                    Expr::Format(FormatType::Unknown("foo".into())),
+                ]))),
+            ])
+        );
+
+        // A no-interpolation literal never applies the format at all
+        // (#3316's own rule), so an unknown name doesn't even matter here.
+        assert_eq!(
+            parse(r#"@foo "v""#).unwrap(),
+            Expr::Literal(Literal::String("v".into()))
+        );
+
+        assert!(parse_with_mode("@foo", ParserMode::Yq).is_err());
+    }
+
+    /// #3357 review: the format-name scanner has no leading-character
+    /// restriction and accepts digits/underscores anywhere, matching jq
+    /// 1.7.1's own permissive format token exactly (`@1foo`, `@foo_bar`,
+    /// `@_foo`, `@_` all defer to runtime there, confirmed live) -- and a
+    /// bare `@` with nothing after it stays a compile-time error in both
+    /// tools (jq: `unexpected INVALID_CHARACTER`; exit 3 either way), since
+    /// there's no name to defer a judgement on at all.
+    #[test]
+    fn test_unknown_format_name_grammar_matches_jq_3357() {
+        for name in ["foo_bar", "_foo", "1foo", "foo123", "Foo", "_"] {
+            assert_eq!(
+                parse(&format!("@{name}")).unwrap(),
+                Expr::Format(FormatType::Unknown(name.into())),
+                "@{name}"
+            );
+        }
+
+        assert!(parse("@").is_err());
+        assert!(parse_with_mode("@", ParserMode::Yq).is_err());
     }
 }

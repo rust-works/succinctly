@@ -71645,3 +71645,98 @@ fn test_caught_refusal_inside_array_keeps_register_via_cli_3284() -> Result<()> 
     }
     Ok(())
 }
+
+/// #3357: jq compiles any `@name` token and defers "is this a real format"
+/// to runtime -- confirmed live against jq 1.7.1.
+#[test]
+fn test_unknown_format_is_a_runtime_error_3357() -> Result<()> {
+    // Accepted at compile time; raises only when actually applied.
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "@foo"], Some("1"))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("foo is not a valid format"),
+        "stderr: {stderr:?}"
+    );
+
+    // `?` suppresses it generically (empty output), not a special-cased
+    // `""` the way `@csv`'s own optional convenience works.
+    let (stdout, code) = run_jq_stdin("@foo?", "1", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    let (stdout, code) = run_jq_stdin("[@foo?]", "1", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[]\n");
+
+    // A branch that's never taken doesn't need `@foo` to be a real format --
+    // impossible before this fix, when any `@foo` anywhere was a compile
+    // error regardless of reachability.
+    let (stdout, code) = run_jq_stdin("if false then @foo else 1 end", "1", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n");
+
+    // Composes with #3316's format-prefixed string interpolation: the
+    // interpolated slot raises the same way the bare filter does.
+    let (_stdout, stderr, code) = run_jq_full(&["-c", r#"@foo "v=\(1)""#], Some("1"))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("foo is not a valid format"),
+        "stderr: {stderr:?}"
+    );
+
+    // A no-interpolation literal never runs the format at all (#3316's own
+    // rule), so an unknown name doesn't even matter here.
+    let (stdout, code) = run_jq_stdin(r#"@foo "v""#, "1", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"v\"\n");
+
+    // yq mode is unchanged: its lexer still rejects `@foo` at parse time.
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-c", "@foo"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?
+        .wait_with_output()?;
+    assert!(!output.status.success(), "yq mode must still reject @foo");
+
+    Ok(())
+}
+
+/// #3357 review: the format-name scanner has no leading-character
+/// restriction and accepts digits/underscores anywhere, matching jq 1.7.1's
+/// own permissive format token; a bare `@` with nothing after it stays a
+/// compile-time error in both tools, since there's no name to defer a
+/// judgement on at all.
+#[test]
+fn test_unknown_format_name_grammar_matches_jq_cli_3357() -> Result<()> {
+    for (name, expected_err) in [
+        ("foo_bar", "foo_bar is not a valid format"),
+        ("_foo", "_foo is not a valid format"),
+        ("1foo", "1foo is not a valid format"),
+        ("foo123", "foo123 is not a valid format"),
+        ("Foo", "Foo is not a valid format"),
+        ("_", "_ is not a valid format"),
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-c", &format!("@{name}")], Some("1"))?;
+        assert_eq!(code, 5, "@{name}: stderr={stderr:?}");
+        assert!(stderr.contains(expected_err), "@{name}: stderr={stderr:?}");
+    }
+
+    // A bare `@` is a genuine syntax error (exit 3), not a runtime one --
+    // there's no token there at all, unlike an unrecognized-but-present name.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", "@"], Some("1"))?;
+    assert_eq!(code, 3);
+    assert!(stdout.is_empty());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-c", "@"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?
+        .wait_with_output()?;
+    assert!(!output.status.success(), "yq mode must still reject bare @");
+
+    Ok(())
+}

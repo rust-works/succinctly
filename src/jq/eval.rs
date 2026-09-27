@@ -16931,6 +16931,14 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Urid => format_urid::<S>(owned, optional),
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props => format_props(owned),
+        // #3357: matches builtin_format_named's own not_a_valid_format
+        // call for the identical dynamic-name case (#3046) -- an ordinary
+        // catchable error, not a decode failure, so `?`/optional suppress
+        // it generically the same way (confirmed live: `1 | @foo?` is
+        // empty output in jq 1.7.1, not `""`).
+        FormatType::Unknown(name) => Err(EvalError::not_a_valid_format(&OwnedValue::String(
+            name.clone(),
+        ))),
     }
 }
 
