@@ -403,7 +403,38 @@ The echo itself is free; everything the gate costs is spent deciding whether it 
 
 The late-fail twin is the precheck-cost control CLAUDE.md's O6/#1514 lesson calls for: the whole scan is charged and the whole re-render still runs afterward. It started at +12.7% (7950X) / +13.8% (M4 Pro) with the reviewed PR, and the two changes above (dropping the `text_range` rescan, moving UTF-8 validation out of the string scan) took it to +7.7% / +8.8%; the residual gate (23.3 Ir/byte against the re-render's ~253 Ir/byte on that row) predicts +9.2%, which matches. A document that fails early — the common non-canonical case, e.g. pretty-printed input fails at its first whitespace — pays only the early-fail row's +1–2%.
 
-**Rejected: SIMD-skipping a string's plain bytes.** A jq-table `define_escape_scanner!` instantiation (`"`, `\`, `< 0x20`, DEL) plus #2963's 8-byte word probe cut `scan_json_string_span` from 10.54 to 7.02 Ir/byte (−33% on that arm, −4.8% Ir on the whole run on the 7950X), and *regressed wall-clock on both boxes*: data 10 MB +8.5%/+9.4% (M4 Pro, reproduced twice), +2.9%/+9.0% (7950X); users 2 MB +3.5–5.6% / +0.4–3.4%; the late-fail row it existed to help got worse (+1.5–3.0%); and the pretty row moved +3.0%/+4.4% on the 7950X on identical instruction counts. The strings in these fixtures are 4–12 bytes, below the width where a NEON/AVX compare→movemask→GPR round trip beats a short scalar loop (#2963), with a code-layout band on top — the two mechanisms were never separated with a holdout build. Reverted (commit `c74f11a66`, not on this branch).
+**Rejected again: SIMD-skipping a string's plain bytes (#3168).** #2608 tried a jq-table `define_escape_scanner!` instantiation (`"`, `\`, `< 0x20`, DEL) in `scan_json_string_span`, behind #2963's 8-byte word probe on aarch64. It cut that arm from 10.54 to 7.02 Ir/byte, yet regressed wall-clock on both boxes (data 10 MB +8.5%/+9.4% on the M4 Pro, +2.9%/+9.0% on the 7950X, and the pretty row +3.0%/+4.4% on the 7950X on identical instruction counts). The commit that added it, `c74f11a66`, was then dropped from #2608's branch without the two candidate mechanisms being separated. #3168 re-applied it on `60e74bcd9` and measured variants against a holdout:
+- **Holdout:** the same tree dispatching once per string, at function entry, to the old loop (`black_box(false)`), so the scanner is compiled in and never called. A first holdout that tested inside the byte loop added +5–6% Ir and was discarded.
+- **Variants:** the scanner called on every string ("prefix 0"), and a plain byte walk over each string's first 8 or 16 bytes before calling it.
+- **Corpus:** 4 MB arrays of 0–3-byte ("tiny") and 4/8/16/64-byte strings, escape-dense strings (embedded JSON, tabs, quotes), records with one-character keys, and the #2608 `data`/`users` files.
+
+All runs are `-c .`, 21 interleaved reps, with output identical everywhere:
+
+| M4 Pro, wall (median)              | tiny  | 4 B   | 8 B    | 16 B  | 64 B   | esc-dense | short keys | data  | users |
+|------------------------------------|-------|-------|--------|-------|--------|-----------|------------|-------|-------|
+| control (base vs itself)           | −0.2% | +0.1% | +0.8%  | −2.6% | +0.4%  | +0.6%     | +0.2%      | +0.6% | 0.0%  |
+| holdout (never calls the scanner)  | +1.8% | +1.0% | −1.0%  | +0.5% | −2.0%  | +0.3%     | +2.2%      | +1.5% | +0.1% |
+| prefix 0 (scanner on every string) | +3.4% | −4.8% | −11.3% | −7.4% | −20.2% | +16.7%    | +12.0%     | +5.8% | +3.5% |
+| 8-byte scalar prefix               | +0.6% | +0.3% | +2.5%  | −7.1% | −19.4% | +3.7%     | +0.9%      | −0.4% | 0.0%  |
+| 16-byte scalar prefix              | +0.8% | −0.4% | −2.2%  | +4.1% | −17.3% | +1.3%     | +0.7%      | +0.7% | −0.7% |
+
+| 7950X, Ir             | tiny   | 4 B   | 8 B   | 16 B   | 64 B   | esc-dense | short keys | data  | users |
+|-----------------------|--------|-------|-------|--------|--------|-----------|------------|-------|-------|
+| holdout               | +2.9%  | +2.1% | +1.5% | +0.9%  | +0.3%  | +0.6%     | +1.6%      | +1.1% | +1.1% |
+| prefix 0              | +10.3% | −0.4% | −9.1% | −16.7% | −24.2% | +3.5%     | +6.6%      | −4.9% | −4.7% |
+| 8-byte scalar prefix  | +6.2%  | +3.0% | +7.4% | −6.4%  | −21.6% | +3.8%     | +3.6%      | −0.3% | −0.1% |
+| 16-byte scalar prefix | +6.2%  | +3.0% | +0.3% | +2.4%  | −18.9% | +2.7%     | +3.6%      | +0.5% | +0.7% |
+
+| 7950X, wall (median) | tiny  | 4 B   | 8 B    | 64 B   | esc-dense | short keys | data  | users |
+|----------------------|-------|-------|--------|--------|-----------|------------|-------|-------|
+| control              | −0.8% | +1.9% | −1.2%  | −1.8%  | −3.9%     | −0.7%      | −1.0% | −1.3% |
+| holdout              | −1.4% | −5.6% | −3.4%  | −6.3%  | −1.8%     | −2.7%      | −2.1% | −2.5% |
+| prefix 0             | −7.6% | −4.5% | −10.2% | −18.1% | +3.1%     | +0.7%      | −6.2% | −7.3% |
+
+- **The mechanism is real and per call.** The scanner's cost is paid on entry, once per string and again after every escape. It wins as soon as a string is long enough to amortise that (every variant: −17% to −24% at 64 bytes), and loses where entries are dense: escape-dense text, short keys, tiny strings. On the M4 Pro it is large (+17% escape-dense, +12% short keys with no prefix); on the 7950X it shows net of the holdout as about +5% (escape-dense) and +3% (short keys) wall, and in Ir as +3.5%/+6.6%.
+- **#2608's own M4 Pro loss was partly the word probe, not NEON.** The build it measured resolved almost every 4-byte string in the 8-byte word probe, which LLVM vectorised (a GPR→NEON→GPR round trip). The truly prefix-free build above *wins* at 4 bytes on the M4 Pro.
+- **Layout exists on x86 but is not the story.** The holdout reads −1% to −6% wall on the 7950X, and ±2% on the M4 Pro.
+- **No variant is neutral-or-better on every shape on both boxes.** A scalar prefix hides the entry cost on aarch64 but keeps only the 64-byte win, and on x86 every prefix regresses tiny strings and short keys in Ir. So nothing ships. The per-byte loop stays, and the shape that would remove the per-call entry entirely (classify the span's string specials in one pass) is [#3340](https://github.com/rust-works/succinctly/issues/3340).
 
 **Numbers in one pass (#3167).** On a numbers-only document (`arrays` 10 MB, 6,291,458 bytes) the gate's number arm was 48.0 Ir/byte, 42% of the whole run. It read every number twice (the greedy `nested_number_span`, then `is_jq_canonical_number` over it), and it paid an out-of-line recursive `scan_canonical_value` call for every array element and an out-of-line `is_jq_canonical_number` call per number: 33 Ir each on single-digit numbers. Now `jq_canonical_number_prefix` (the canonical rules, with `is_jq_canonical_number` defined as "the prefix parse covers the whole span") is read straight off the document, and the span is accepted when the next byte cannot extend the greedy class (`is_number_span_byte`, the class's one definition, shared with `nested_number_span` and `strict_number_end`). `scan_canonical_value` is `inline(always)` into the array and object loops, so only a container recurses; the string arm stays one out-of-line call. `scan_canonical_number_agrees_with_the_two_pass_rule_3167` pins the one-pass arm against the two-pass rule for every token of up to four class bytes followed by each of the 256 byte values, and inside an array and an object through the whole gate. Against `923a080a5`, `-c .`, 21 interleaved reps, output identical on every row:
 

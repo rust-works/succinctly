@@ -86,7 +86,7 @@ let name: &str = cursor.as_str();
   verbatim instead of walking the semi-index — removing the walk entirely on the accepting path, at
   the cost of a scan charged to every render. See
   [json.md#canonical-compact-echo--c-2608](json.md#canonical-compact-echo--c-2608) for the
-  measurements and the rejected SIMD follow-up.
+  measurements and the SIMD string skip #3168 measured and rejected again.
 
 ## Depends On
 
