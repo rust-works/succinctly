@@ -308,9 +308,31 @@ DEFAULT_THRESHOLD = 5.0
 # three changes are now in `main`; the entries were removed together
 # (#3170, #3175) once every row read ~0% again against a merge-base that
 # already included all three.
+#
+# #3140: `BalancedParens::find_close` answers a leaf (its close is the next
+# bit) before entering its state machine, so every sibling hop over a key or
+# scalar got cheaper -- faster on every row that walks object fields or
+# array elements. Measured by this guard against the PR's own merge-base
+# (x86_64 / ARM64-Linux, CI): `wide_identity` -14.0% / -13.3%,
+# `users_identity` -13.1% / -12.6%, `users_compact_latefail` -12.4% / -11.8%,
+# `wide_keys_unsorted` -11.5% / -10.8%, `wide_escaped_keys_unsorted` -10.0% /
+# -9.2%, `arrays_identity` -8.5% / -7.4%, `users_path_walk` -6.6% / -6.0%,
+# `arrays_map_iterate` -4.8% / -3.8%, `wide_to_entries` -4.1% / -3.3%, every
+# other row -0% to -3.6%. The last two sit under the default but too close
+# to it for a merge-queue batch or push run that also carries another saving.
+# One-off, per the rule above: once `main` carries #3140, restore this dict
+# to its pre-#3140 contents (`wide_keys_unsorted` 10.0, `users_identity`
+# 12.0 -- whether those two still apply is their own entries' question).
 QUERY_THRESHOLDS = {
-    "wide_keys_unsorted": 10.0,
-    "users_identity": 12.0,
+    "wide_keys_unsorted": 15.0,
+    "users_identity": 17.0,
+    "wide_identity": 18.0,
+    "users_compact_latefail": 16.0,
+    "wide_escaped_keys_unsorted": 14.0,
+    "arrays_identity": 12.0,
+    "users_path_walk": 10.0,
+    "arrays_map_iterate": 8.0,
+    "wide_to_entries": 8.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
