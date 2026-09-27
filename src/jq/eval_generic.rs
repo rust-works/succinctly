@@ -7933,7 +7933,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         return GenericResult::Error(e);
                     }
                 }
-            }
+            } // omni-dev: coverage tolerate-line reason="unreachable: this arm's own match guard already evaluated `value.as_array().is_some_and(..)` as true to be here at all, and `as_array()` is a pure read of `value` -- the second call inside the body can never answer `None` where the guard's own call just answered `Some`"
             cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
         }
 
