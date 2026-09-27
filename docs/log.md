@@ -2,6 +2,20 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-09-27 — SIMD string skip re-measured and rejected again (issue #3168)
+
+**Sources ingested:**
+- The #2608 commit `c74f11a66` (`find_jq_escape`, a jq-table `define_escape_scanner!`), re-applied on
+  `60e74bcd9`, with a once-per-string holdout and 0/8/16-byte scalar-prefix variants
+- Cachegrind and interleaved wall-clock A/B on terminus (7950X) and johns-mac-mini (M4 Pro),
+  2026-09-27, over a new corpus: tiny, 4-64-byte strings, escape-dense strings, short-key records,
+  plus the #2608 `data`/`users` files
+
+**Pages updated:**
+- [parsing/json.md](parsing/json.md) — the #2608 "Rejected" paragraph becomes the #3168 result:
+  three measurement tables, the per-call mechanism, and the one-pass follow-up (#3340)
+- [parsing/json-index.md](parsing/json-index.md) — pointer wording
+
 ## 2026-09-19 — Canonical compact echo fast path documented (issue #2608)
 
 **Sources ingested:**
