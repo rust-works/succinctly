@@ -1332,6 +1332,23 @@ is the revert that established what the other one costs.
    The rule is **jq-mode only** (ADR-0018): `map`, `any`, `all` and `flatten` are real yq
    builtins, and yq v4.53.3 raises for none of them, so `succinctly yq` does not either.
 
+   **#2746's own fix introduced one further, separate divergence, on the register rather
+   than on navigation**: `last(f)`/`INDEX(gen;f)` are `reduce`-based in jq's own definitions,
+   and this resolver treats a `reduce`-based stage as opaque for register-preservation
+   purposes (the same pre-existing rule already documented above for bare `reduce`/`foreach`
+   and `first(...)`) — so a `$x` bound *before* one of these two stages is no longer
+   recognized as still being the live register *after* it, even though the stage's own result
+   is discarded. Confirmed live against jq 1.7.1: `[1,2,3] | path(. as $x \| last(.[]) \| $x)`
+   is `[[]]` in jq (the register genuinely survives in the C implementation — `$x` is still
+   `.` itself) but raises `Invalid path expression with result [1,2,3]` here; same for
+   `INDEX(.[]; .)`. `isempty(f)` is not `reduce`-based, and its own answer already matches jq
+   (both raise) by coincidence of jq's own bytecode, not because either tool "preserves" the
+   register in the sense described above. Pinned by
+   `test_argument_navigation_builtins_drop_the_register_like_reduce_2746`
+   (`tests/jq_cli_tests.rs`). Not tracked by a separate issue: it is the same class of
+   divergence the `reduce`/`foreach`/`first(...)` allowlist above already accepts, extended to
+   two more `reduce`-based builtins by #2746's own fix, rather than a new kind of gap.
+
    [#2072](https://github.com/rust-works/succinctly/issues/2072) supplied the missing
    half of that but deliberately did not spend it here. `Expr::TrackedVar` now carries a
    `BoundVar` (`src/jq/expr.rs`) whose `origin: Option<BindOrigin>` names the node the

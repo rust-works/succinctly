@@ -34270,8 +34270,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // true`; `reduce stream as $row ({}; .[$row|idx_expr|tostring] =
         // $row)`) raise as soon as `g`/`stream` tries to navigate an
         // untracked value. Confirmed live against jq 1.7.1: `{} |
-        // path(last(.[]))` raises "Invalid path expression near attempt to
-        // iterate through {}" where this resolver answered nothing at exit 0.
+        // path([1] | last(.[]))` raises "Invalid path expression near
+        // attempt to iterate through [1]" where this resolver answered
+        // nothing at exit 0 (`{} | path(last(.[]))` alone raises too, but
+        // for a different reason -- `.[]` on the trackable, genuinely empty
+        // `{}` produces zero outputs, so `last` folds to `null`, and jq
+        // rejects that computed `null` as "Invalid path expression with
+        // result null", the same boundary `test_argument_navigation_builtins_forward_a_computed_result_2746`
+        // pins).
         //
         // All three results are computed values, never a path into the
         // document (like `[f]` just below, unlike `first`/`limit`/`nth`,
@@ -34312,24 +34318,22 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                     Demand::Continue
                 },
             );
-            match flow {
-                ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
-                ResolveFlow::Exhausted | ResolveFlow::Stopped => {
-                    let result = untracked_at_register(
-                        Cow::Owned(last.unwrap_or(OwnedValue::Null)),
-                        trackable,
-                        value,
-                    );
-                    match sink(result) {
-                        Demand::Continue => ResolveFlow::Exhausted,
-                        Demand::Stop => ResolveFlow::Stopped,
-                    }
-                }
-            }
+            forward_drained_result(
+                flow,
+                last.unwrap_or(OwnedValue::Null),
+                trackable,
+                value,
+                sink,
+            )
         }
 
         Expr::Builtin(Builtin::IsEmpty(inner)) => {
-            let mut any = false;
+            // A single output is all `resolve_bounded_sink` needs to see to
+            // know the argument isn't empty -- answering `Demand::Stop`
+            // immediately (its own `n = 1` cap already stops the underlying
+            // generator after one branch either way) turns its returned
+            // `flow` itself into the emptiness signal: `Stopped` means a
+            // branch arrived, `Exhausted` means none did.
             let flow = resolve_bounded_sink::<S>(
                 inner,
                 value,
@@ -34338,26 +34342,21 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 frame,
                 keep,
                 1,
-                &mut |_branch| {
-                    any = true;
-                    Demand::Continue
-                },
+                &mut |_branch| Demand::Stop,
             );
-            match flow {
-                ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
-                ResolveFlow::Exhausted | ResolveFlow::Stopped => {
-                    let result =
-                        untracked_at_register(Cow::Owned(OwnedValue::Bool(!any)), trackable, value);
-                    match sink(result) {
-                        Demand::Continue => ResolveFlow::Exhausted,
-                        Demand::Stop => ResolveFlow::Stopped,
-                    }
-                }
-            }
+            let is_empty = !matches!(flow, ResolveFlow::Stopped);
+            forward_drained_result(flow, OwnedValue::Bool(is_empty), trackable, value, sink)
         }
 
         Expr::Builtin(Builtin::UpperIndexStream(stream, idx_expr)) => {
-            let mut rows: Vec<OwnedValue> = Vec::new();
+            // Folds directly in the drain closure (one pass, no
+            // intermediate `Vec<OwnedValue>` holding every row) -- an
+            // `idx_expr` error is captured here and re-raised once
+            // `resolve_node_sink` returns, matching `build_upper_index`'s
+            // own "no partial object" rule without its second pass over
+            // already-collected rows.
+            let mut obj = IndexMap::new();
+            let mut idx_escape: Option<EvalEscape> = None;
             let flow = resolve_node_sink::<S>(
                 stream,
                 value,
@@ -34366,34 +34365,34 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 frame,
                 Keep::AtMost(usize::MAX),
                 &mut |branch| {
-                    rows.push(branch.value.into_owned());
-                    Demand::Continue
-                },
-            );
-            match flow {
-                ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
-                ResolveFlow::Exhausted | ResolveFlow::Stopped => {
-                    let mut obj = IndexMap::new();
-                    for row in &rows {
-                        let keys = match eval_owned_multi::<S>(idx_expr, row) {
-                            Ok(k) => k,
-                            Err(e) => return ResolveFlow::Escaped(e),
-                        };
-                        for k in keys {
-                            obj.insert(owned_to_string::<S>(&k), row.clone());
+                    let row = branch.value.into_owned();
+                    match eval_owned_multi::<S>(idx_expr, &row) {
+                        Ok(keys) => {
+                            // Every key but the last clones `row`; the last
+                            // key moves it -- 0 clones for the common
+                            // single-key case, N-1 for N keys, instead of N.
+                            let mut keys = keys.into_iter().peekable();
+                            while let Some(k) = keys.next() {
+                                if keys.peek().is_some() {
+                                    obj.insert(owned_to_string::<S>(&k), row.clone());
+                                } else {
+                                    obj.insert(owned_to_string::<S>(&k), row);
+                                    break;
+                                }
+                            }
+                            Demand::Continue
+                        }
+                        Err(e) => {
+                            idx_escape = Some(e);
+                            Demand::Stop
                         }
                     }
-                    let result = untracked_at_register(
-                        Cow::Owned(OwnedValue::Object(obj.into())),
-                        trackable,
-                        value,
-                    );
-                    match sink(result) {
-                        Demand::Continue => ResolveFlow::Exhausted,
-                        Demand::Stop => ResolveFlow::Stopped,
-                    }
-                }
+                },
+            );
+            if let Some(escape) = idx_escape {
+                return ResolveFlow::Escaped(escape);
             }
+            forward_drained_result(flow, OwnedValue::Object(obj.into()), trackable, value, sink)
         }
 
         // #2689/#3049: array construction on a tracked or untracked input. jq's `[f]`
@@ -34488,24 +34487,17 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                     Demand::Continue
                 },
             );
-            match flow {
-                ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
-                ResolveFlow::Exhausted | ResolveFlow::Stopped => {
-                    // #3263: jq's collect backtracks to where it began, so the
-                    // register is where it was entering -- `value` itself when
-                    // trackable -- but only when every navigation inside was
-                    // checked here too; otherwise no register is claimed.
-                    let array = untracked_at_register(
-                        Cow::Owned(OwnedValue::Array(items.into())),
-                        trackable && array_contents_are_checked(inner),
-                        value,
-                    );
-                    match sink(array) {
-                        Demand::Continue => ResolveFlow::Exhausted,
-                        Demand::Stop => ResolveFlow::Stopped,
-                    }
-                }
-            }
+            // #3263: jq's collect backtracks to where it began, so the
+            // register is where it was entering -- `value` itself when
+            // trackable -- but only when every navigation inside was
+            // checked here too; otherwise no register is claimed.
+            forward_drained_result(
+                flow,
+                OwnedValue::Array(items.into()),
+                trackable && array_contents_are_checked(inner),
+                value,
+                sink,
+            )
         }
 
         // #2760: on an untracked input, every navigating stage inside
@@ -36236,6 +36228,33 @@ fn untracked_at_register<'a>(
     value: &'a OwnedValue,
 ) -> PathBranch<'a> {
     PathBranch::untracked(computed).with_register(trackable.then(|| Cow::Borrowed(value)))
+}
+
+/// Shared tail for every "drain an argument fully via a discarding sink,
+/// then forward one computed value" arm in [`resolve_node_sink`] (`Array`,
+/// `LastExpr`/`LastStream`, `IsEmpty`, `UpperIndexStream` -- #2746): once the
+/// drain itself is done (`flow`), build the one branch it produced and
+/// forward it to `sink`, propagating an escape from the drain immediately
+/// and mapping the caller's own `Demand` back to a `ResolveFlow`. Lets each
+/// call site's own match arm differ only in *what* `computed` is, not in
+/// this control shape.
+fn forward_drained_result<'a>(
+    flow: ResolveFlow,
+    computed: OwnedValue,
+    trackable: bool,
+    value: &'a OwnedValue,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    match flow {
+        ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
+        ResolveFlow::Exhausted | ResolveFlow::Stopped => {
+            let result = untracked_at_register(Cow::Owned(computed), trackable, value);
+            match sink(result) {
+                Demand::Continue => ResolveFlow::Exhausted,
+                Demand::Stop => ResolveFlow::Stopped,
+            }
+        }
+    }
 }
 
 /// One deferred, untracked branch per value — #986's "defer, don't raise"
