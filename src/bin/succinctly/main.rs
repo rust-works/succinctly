@@ -1104,10 +1104,9 @@ pub struct YqCommand {
     #[arg(long, overrides_with = "validate")]
     pub validate: bool,
 
-    /// Accept jq-only builtins real yq's lexer rejects (`paths`, `getpath`,
-    /// `limit`, `gsub`/`scan`/`splits`, `leaf_paths`, etc.) as a succinctly
-    /// extension. Off by default so `succinctly yq` matches real yq's
-    /// syntax surface (#1512).
+    /// Accept jq-only builtins and generic postfix `?` that real yq's lexer
+    /// rejects as succinctly extensions. Off by default so `succinctly yq`
+    /// matches real yq's syntax surface (#1512, #3378).
     #[arg(long, overrides_with = "jq_extensions")]
     pub jq_extensions: bool,
 

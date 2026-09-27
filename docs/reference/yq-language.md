@@ -555,6 +555,11 @@ surface (#1512):
 | `skip(n; f)`                                         | Drop the first `n` outputs of `f` (#1882)     |
 | `ascii_downcase`, `ascii_upcase`                     | jq's spellings of `downcase`/`upcase` (#2462) |
 
+The flag also enables jq's generic postfix `?` after an expression such as
+`length?` or `(.x)?` (#3378). Default yq accepts optional navigation on
+fields and brackets (`.x?`, `.[0]?`), as in real yq. `.?` is optional access
+to the empty field name.
+
 ```bash
 echo '{}' | succinctly yq 'paths'
 # Error: parse error: ... "paths" is not part of yq's syntax; pass --jq-extensions ...
@@ -577,16 +582,16 @@ same kind of thing as the rest of this table — extra, off by default.
 
 ### Input Options
 
-| Flag                  | Description                                      |
-|-----------------------|--------------------------------------------------|
-| `-n, --null-input`    | Don't read input; use null                       |
-| `-p, --input-format`  | Input format: `auto`, `yaml`, `json`             |
-| `-s, --slurp`         | Read all inputs into array                       |
-| `-R, --raw-input`     | Read lines as strings instead of YAML            |
-| `--doc N`             | Select Nth document (0-indexed)                  |
-| `--eval-all`, `--ea`  | Combine docs/files into one eval context (below) |
-| `--front-matter MODE` | Extract/process YAML front matter (below)        |
-| `--jq-extensions`     | Accept jq-only builtins yq's lexer lacks (above) |
+| Flag                  | Description                                             |
+|-----------------------|---------------------------------------------------------|
+| `-n, --null-input`    | Don't read input; use null                              |
+| `-p, --input-format`  | Input format: `auto`, `yaml`, `json`                    |
+| `-s, --slurp`         | Read all inputs into array                              |
+| `-R, --raw-input`     | Read lines as strings instead of YAML                   |
+| `--doc N`             | Select Nth document (0-indexed)                         |
+| `--eval-all`, `--ea`  | Combine docs/files into one eval context (below)        |
+| `--front-matter MODE` | Extract/process YAML front matter (below)               |
+| `--jq-extensions`     | Accept jq-only builtins and generic postfix `?` (above) |
 
 ### Output Options
 

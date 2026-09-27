@@ -6735,7 +6735,8 @@ fn test_yaml_paren_wrapped_optional_assign_through_anchor_updates_alias() -> Res
     // still count as alias-sensitive: `is_alias_sensitive_assign` unwraps
     // both `Paren` and `Optional` before checking for a write underneath.
     let input = "a: &x 1\nb: *x\n";
-    let (output, exit_code) = run_yq_stdin("(.a = 99)?", input, &["-o=json", "-I=0"])?;
+    let (output, exit_code) =
+        run_yq_stdin("(.a = 99)?", input, &["-o=json", "-I=0", "--jq-extensions"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), r#"{"a":99,"b":99}"#);
     Ok(())
@@ -13978,7 +13979,7 @@ fn test_693_optional_around_stream_stops_at_the_first_error() -> Result<()> {
     let (stdout, code) = run_yq_stdin(
         r#"(.[] | if .==2 then error("boom") else . end)?"#,
         "- 1\n- 2\n- 3\n",
-        &[],
+        &["--jq-extensions"],
     )?;
     assert_eq!(stdout, "1\n");
     assert_eq!(code, 0);
@@ -13987,7 +13988,7 @@ fn test_693_optional_around_stream_stops_at_the_first_error() -> Result<()> {
     let (stdout, code) = run_yq_stdin(
         r#"[1,2,3] | (.[] | if .==2 then error("boom") else . end)?"#,
         "",
-        &["-n"],
+        &["-n", "--jq-extensions"],
     )?;
     assert_eq!(stdout, "1\n");
     assert_eq!(code, 0);
@@ -23158,7 +23159,11 @@ fn test_yq_sub_3arg_non_string_input_errors_1122() -> Result<()> {
 /// pins the observable, extension-level behaviour, not that internal arm.
 #[test]
 fn test_yq_sub_3arg_non_string_input_optional_is_silent_1122() -> Result<()> {
-    let (output, code) = run_yq_stdin(r#"sub("a"; "X"; "g")?"#, "1\n", &["-o", "json"])?;
+    let (output, code) = run_yq_stdin(
+        r#"sub("a"; "X"; "g")?"#,
+        "1\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "output: {output:?}");
     assert_eq!(output.trim(), "");
     Ok(())
@@ -23168,7 +23173,11 @@ fn test_yq_sub_3arg_non_string_input_optional_is_silent_1122() -> Result<()> {
 /// an error, same #693 outer-wrapper mechanism as the non-`?` case above.
 #[test]
 fn test_yq_sub_3arg_invalid_pattern_optional_is_silent_1122() -> Result<()> {
-    let (output, code) = run_yq_stdin(r#"sub("["; "X"; "g")?"#, "\"abc\"\n", &["-o", "json"])?;
+    let (output, code) = run_yq_stdin(
+        r#"sub("["; "X"; "g")?"#,
+        "\"abc\"\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "output: {output:?}");
     assert_eq!(output.trim(), "");
     Ok(())
@@ -23925,7 +23934,11 @@ fn test_slice_assign_scalar_noop_still_propagates_halt_1101() -> Result<()> {
 /// catch, not just propagate unconditionally.
 #[test]
 fn test_slice_update_scalar_noop_optional_swallows_filter_error_1101() -> Result<()> {
-    let (out, code) = run_yq_stdin(r#"(.[0:1] |= error("boom"))?"#, "5", &["-o", "json"])?;
+    let (out, code) = run_yq_stdin(
+        r#"(.[0:1] |= error("boom"))?"#,
+        "5",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "");
     Ok(())
@@ -26030,7 +26043,11 @@ fn test_1153_optional_outside_paren_still_applies_parent_key_rule() -> Result<()
     let input = r#"{"a":5,"b":6}"#;
     let expected = r#"{"b":6}"#;
 
-    let (out, code) = run_yq_stdin("del((.a[0:1])?)", input, &["-o=json", "-I=0"])?;
+    let (out, code) = run_yq_stdin(
+        "del((.a[0:1])?)",
+        input,
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), expected, "optional outside parens");
 
@@ -27846,7 +27863,7 @@ fn test_1223_multi_path_del_object_target_fixed_paren_wrapped_with_optional() ->
     let (out, code) = run_yq_stdin(
         "del((.a[0:1], .c)?)",
         r#"{"a":{"x":1,"y":2},"b":6,"c":9}"#,
-        &["-o=json", "-I=0"],
+        &["-o=json", "-I=0", "--jq-extensions"],
     )?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), r#"{"b":6}"#);
@@ -29090,7 +29107,11 @@ fn test_yq_base64d_tolerates_only_leading_and_trailing_newlines_1135() -> Result
 /// catchable, same as every other `@base64d` error in this file.
 #[test]
 fn test_yq_base64d_malformed_padding_error_is_catchable_1135() -> Result<()> {
-    let (out, code) = run_yq_stdin("(\"====\" | @base64d)?", "null", &["-o", "json"])?;
+    let (out, code) = run_yq_stdin(
+        "(\"====\" | @base64d)?",
+        "null",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "");
     Ok(())
@@ -31425,7 +31446,7 @@ fn test_yq_string_interpolation_path_context_error_is_atomic_1403() -> Result<()
     let (output, code) = run_yq_stdin(
         r#".a | "\(key)-\(error("boom"))"?"#,
         "a: 1\n",
-        &["-o", "json"],
+        &["-o", "json", "--jq-extensions"],
     )?;
     assert_eq!(code, 0, "output: {output:?}");
     assert_eq!(output, "");
@@ -31539,7 +31560,7 @@ fn test_yq_string_interpolation_path_context_optional_threaded_through_rest_1403
     let (output, code) = run_yq_stdin(
         r#".a | ("\(key)-\(error("boom"))")? | key"#,
         "a: 1\n",
-        &["-o", "json"],
+        &["-o", "json", "--jq-extensions"],
     )?;
     assert_eq!(code, 0, "output: {output:?}");
     assert_eq!(output, "");
@@ -32791,7 +32812,11 @@ fn test_yq_inside_shares_contains_kind_mismatch_rule_1649() -> Result<()> {
 /// handling.
 #[test]
 fn test_yq_contains_optional_still_suppresses_the_remaining_error_cases_1649() -> Result<()> {
-    let (out, code) = run_yq_stdin(".x | contains(\"a\")?", "x: [1]\n", &["-o", "json"])?;
+    let (out, code) = run_yq_stdin(
+        ".x | contains(\"a\")?",
+        "x: [1]\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "output: {out:?}");
     assert_eq!(out.trim(), "");
     Ok(())
@@ -33672,21 +33697,19 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
     Ok(())
 }
 
-/// #1620: a decode failure must never be suppressed by `?` -- real yq's
-/// equivalent is a parse-time rejection no program could ever catch, since
-/// real yq has no `try`/`catch` construct at all to catch it with. `\q` is
-/// not a YAML escape, so the scalar is structurally valid but undecodable,
+/// #1620: a decode failure must never be suppressed by an optional
+/// navigation -- real yq has no `try`/`catch` construct that could catch it.
+/// `\q` is not a YAML escape, so the scalar is structurally valid but undecodable,
 /// same repro as `test_decode_failure_does_not_corrupt_json_output_1247`
 /// above.
 ///
 /// `.a?` (no downstream builtin) is deliberately not included: bare field
 /// access never decodes the string at all, so there is no decode failure for
-/// `?` to have swallowed in the first place -- same reasoning as the jq-side
-/// pin in `jq_cli_tests.rs`.
+/// the optional navigation to have swallowed in the first place.
 #[test]
 fn test_decode_failure_not_suppressed_by_optional_1620() -> Result<()> {
     let input = "a: \"x\\qy\"\nb: 2\n";
-    for filter in [".a | length?", "to_entries?"] {
+    for filter in [".a? | length", ".a? | to_entries"] {
         let (output, stderr, exit_code) = run_yq_stdin_with_stderr(filter, input, &[])?;
         assert_ne!(
             exit_code, 0,
@@ -33729,7 +33752,7 @@ fn test_decode_failure_not_caught_by_try_catch_1620() -> Result<()> {
 fn test_ordinary_type_error_still_suppressed_and_caught_1620() -> Result<()> {
     let input = "a: 1\n";
 
-    let (output, exit_code) = run_yq_stdin(".a | keys?", input, &[])?;
+    let (output, exit_code) = run_yq_stdin(".a | keys?", input, &["--jq-extensions"])?;
     assert_eq!(exit_code, 0, "output: {output:?}");
     assert_eq!(output.trim(), "");
 
@@ -34079,7 +34102,7 @@ fn test_select_no_longer_raises_via_scalar_alias_1804_2692() -> Result<()> {
 fn test_colliding_display_key_error_is_uncatchable_yq_1813() -> Result<()> {
     let doc = "\"b\\qc\": 1\n\"b\\qc\": 2\n";
 
-    let (out, err, code) = run_yq_stdin_with_stderr("sort?", doc, &[])?;
+    let (out, err, code) = run_yq_stdin_with_stderr("sort?", doc, &["--jq-extensions"])?;
     assert_ne!(
         code, 0,
         "`?` must not silently suppress a colliding-key error, out: {out:?}"
@@ -44080,7 +44103,7 @@ fn test_any_all_reject_non_arrays_in_yq_mode_2476() -> Result<()> {
     // same split the before-this-change bridge produced (`{a: 1} | any?`
     // and `1 | any?` are both empty at exit 0).
     for doc in ["a: 1\n", "1\n"] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr("any?", doc, &[])?;
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr("any?", doc, &["--jq-extensions"])?;
         assert_eq!(code, 0, "{doc:?} -- stderr: {stderr:?}");
         assert_eq!(stdout.trim(), "", "{doc:?}");
     }
@@ -45503,7 +45526,8 @@ fn test_resource_limit_caps_are_uncatchable_in_yq_mode_2132() -> Result<()> {
             "f/0 exceeded maximum recursion depth",
         ),
     ] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
         assert_ne!(
             code, 0,
             "`{filter}`: the cap must not be caught: {stdout:?}"
@@ -47173,6 +47197,7 @@ mod typed_key_node_2785 {
     }
 
     const JSON: &[&str] = &["-o=json", "-I=0"];
+    const JSON_EXT: &[&str] = &["-o=json", "-I=0", "--jq-extensions"];
     const YAML: &[&str] = &[];
 
     /// The issue's table: the three readers agree with each other and with
@@ -47417,17 +47442,17 @@ mod typed_key_node_2785 {
             assert_eq!(code, 1, "`{filter}`: {out:?}");
         }
         check(&[
-            ("[with_entries(.key = [1])?]", AB, JSON, "[]\n"),
+            ("[with_entries(.key = [1])?]", AB, JSON_EXT, "[]\n"),
             (
                 "[with_entries(.value |= error(\"boom\"))?]",
                 AB,
-                JSON,
+                JSON_EXT,
                 "[]\n",
             ),
             (
                 "with_entries(.key = [1])? // \"fallback\"",
                 AB,
-                JSON,
+                JSON_EXT,
                 "\"fallback\"\n",
             ),
         ])
@@ -48968,5 +48993,39 @@ fn test_reduce_growth_past_value_tree_depth_reports_cleanly_yq_3261() -> Result<
 fn test_array_register_widening_is_jq_mode_only_3283() -> Result<()> {
     let (stdout, code) = run_yq_stdin("del(. as $x | [.a] | $x)", "a: 1\n", &[])?;
     assert_ne!(code, 0, "stdout: {stdout:?}");
+    Ok(())
+}
+
+/// #3378: yq's optional navigation suffix is not jq's generic `Term?`.
+#[test]
+fn test_yq_rejects_generic_postfix_optional_3378() -> Result<()> {
+    for filter in ["(.x)?", "length?", "1?", "select(false)?", "(.x)?//1"] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "{}", &["-p=json", "-o=json", "-I=0"])?;
+        assert_ne!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(stderr.contains('?'), "{filter}: stderr: {stderr:?}");
+    }
+
+    for (filter, input, expected) in [
+        (".?", "{}", "null\n"),
+        (".?", "{\"\":8}", "8\n"),
+        (".??", "{\"?\":7}", "7\n"),
+        (".?foo", "{\"?foo\":9}", "9\n"),
+        (".x?", "{}", "null\n"),
+        (".[0]?", "{}", "null\n"),
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, input, &["-p=json", "-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        "length?",
+        "{}",
+        &["-p=json", "-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "0\n");
     Ok(())
 }
