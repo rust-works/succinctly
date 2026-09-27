@@ -3155,15 +3155,50 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse the expression to try
-        let expr = self.parse_primary()?;
+        let mut expr = self.parse_primary()?;
         let ended_generic_optional = self.last_primary_ended_generic_optional;
         self.skip_ws();
 
+        // This rejection is scoped to a *bare* generic-optional body (no
+        // `as` follows below) -- see #3371's own doc comment just below for
+        // why an `as`-chain's body gets no such restriction, confirmed live
+        // against jq 1.7.1. `self.matches_keyword("catch")` here already
+        // returns false whenever `as` is next instead, so this never needs
+        // its own extra guard against that case.
         if self.mode == ParserMode::Jq && ended_generic_optional && self.matches_keyword("catch") {
             return Err(ParseError::new(
                 "syntax error, unexpected 'catch' after generic '?' (parenthesize the optional body)",
                 self.pos,
             ));
+        }
+
+        // #3371: real jq classifies `Term "as" Patterns '|' Exp` as itself a
+        // Term production, not an Exp-level operator like bare `|`/`,` --
+        // confirmed live against jq 1.7.1: `try .a | .+1 catch .` and
+        // `try 1,2 catch .` both still raise "unexpected catch" (a bare pipe
+        // or comma is never part of try's own un-parenthesized body), but
+        // `try .a as $x | length? catch .` succeeds (`1`), and chained
+        // bindings do too (`try .a as $x | .b as $y | ($x+$y) catch .`).
+        // So unlike a bare `|`/`,`, an `as` binding here has to be consumed
+        // as part of *this* term, the same way `parse_binding` consumes one
+        // above the comma level -- looped, since each binding's own body can
+        // itself start with another `Term "as" ...`.
+        //
+        // Notably, the generic-`?`-before-`catch` rejection above does NOT
+        // extend into an as-chain's own body: `try .a as $x | (1/0)? catch
+        // "c"` compiles and runs (empty output -- the `?` suppresses the
+        // error before `catch` is ever reached) on jq 1.7.1, even though the
+        // bare `try (1/0)? catch "c"` shape is rejected. Real jq's own
+        // grammar draws this line by nonterminal (`Exp '?'` directly under
+        // `try`, vs. nested inside `Term "as" Patterns '|' Exp`'s own `Exp`),
+        // not by "does the body end in a suppressed generic optional" --
+        // so this loop applies no equivalent check to what it consumes.
+        while self.mode == ParserMode::Jq && self.matches_keyword("as") {
+            self.require_term_before_as()?;
+            self.consume_keyword("as");
+            self.skip_ws();
+            expr = self.parse_as_pattern(expr)?;
+            self.skip_ws();
         }
 
         // Check for optional catch
@@ -11689,6 +11724,32 @@ mod tests {
             "try if true then 1 else 2 end catch .",
         ] {
             assert!(parse(filter).is_ok(), "jq rejected {filter}");
+        }
+    }
+
+    #[test]
+    fn test_try_body_as_binding_and_catch_3371() {
+        for filter in [
+            "try .a as $x | length? catch .",
+            "try .a as $x | .b as $y | ($x+$y) catch .",
+            r#"try .a as $x | $x, 99 catch "c""#,
+            r#"try .a as $x | (1/0)? catch "c""#,
+            r#"try .a? as $x | $x catch "c""#,
+            r#"try .a as $x | $x catch "e" | . + 1"#,
+            r#"try (1/0) as $x | $x catch "caught""#,
+        ] {
+            assert!(parse(filter).is_ok(), "jq rejected {filter}");
+        }
+        // A bare `|`/`,` still never belongs to try's own un-parenthesized
+        // body (unlike `as`, neither is a Term-level production in jq's
+        // grammar) -- unchanged by this fix, confirmed still rejected.
+        for filter in [
+            "try .a | .+1 catch .",
+            r#"try 5, 6 catch "caught""#,
+            r#"try error("x")? as $z | $z catch "c""#,
+            r#"try .a as $x | error("x")? as $y | $y catch "c""#,
+        ] {
+            assert!(parse(filter).is_err(), "jq accepted {filter}");
         }
     }
 

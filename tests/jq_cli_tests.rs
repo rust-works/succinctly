@@ -84,6 +84,45 @@ fn test_question_alternative_and_try_catch_compile_boundaries_3277() -> Result<(
     Ok(())
 }
 
+/// Captured against /usr/bin/jq 1.7.1 with input {"a":1,"b":2} (#3371). Real
+/// jq classifies `Term "as" Patterns '|' Exp` as itself a Term production, so
+/// an `as` binding is consumed as part of `try`'s own un-parenthesized body
+/// (unlike a bare `|`/`,`, which stay excluded -- confirmed still rejected
+/// below, unchanged by this fix). The one place this interacts with #3277's
+/// own "generic `?` directly before `catch`" rejection: that rejection is
+/// scoped to a *bare* body only -- nested inside an `as`-chain's own body
+/// (`(1/0)? catch "c"` below), jq accepts it and `catch` simply never runs.
+#[test]
+fn test_try_body_as_binding_and_catch_3371() -> Result<()> {
+    let input = r#"{"a":1,"b":2}"#;
+    for (filter, expected) in [
+        ("try .a as $x | length? catch .", "2\n"),
+        ("try .a as $x | .b as $y | ($x+$y) catch .", "3\n"),
+        (r#"try .a as $x | $x, 99 catch "c""#, "1\n99\n"),
+        (r#"try .a as $x | (1/0)? catch "c""#, ""),
+        (r#"try .a? as $x | $x catch "c""#, "1\n"),
+        ("try .a as $x | $x catch \"e\" | . + 1", "2\n"),
+        (r#"try (1/0) as $x | $x catch "caught""#, "\"caught\"\n"),
+    ] {
+        assert_eq!(
+            run_jq_full(&["-c", filter], Some(input))?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    for filter in [
+        "try .a | .+1 catch .",
+        r#"try 5, 6 catch "caught""#,
+        r#"try error("x")? as $z | $z catch "c""#,
+        r#"try .a as $x | error("x")? as $y | $y catch "c""#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 3, "{filter}: {stderr}");
+        assert!(stdout.is_empty(), "{filter}: {stdout}");
+    }
+    Ok(())
+}
+
 /// Captured from /usr/bin/jq 1.7.1-apple for both CLI input routes.
 #[test]
 fn test_parenthesized_pattern_bind_pipe_retry_cli_3031() -> Result<()> {
