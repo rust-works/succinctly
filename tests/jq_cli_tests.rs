@@ -56632,6 +56632,14 @@ fn test_argument_dependent_navigating_builtins_raise_inside_path_2744() -> Resul
             "{}",
             r#"element 0 of {"a":1}"#,
         ),
+        // Past `i64`'s exact-`f64` range (`jq_int_within_exact_f64_range`),
+        // `length`'s own result is a `Float` -- the one input shape that
+        // reaches `owned_value_jq_length`'s `Float` arm rather than `Int`.
+        (
+            "[path((9223372036854775807 | reverse) | empty)]",
+            "{}",
+            "9223372036854775807",
+        ),
         (
             "[path(([1] | indices(1)) | empty)]",
             "{}",
@@ -56714,13 +56722,17 @@ fn test_argument_dependent_navigators_yield_to_their_own_argument_2744() -> Resu
         assert!(stderr.contains(needle), "{filter}: {stderr:?}");
     }
     // An empty-producing argument suppresses to no output, exit 0 -- never
-    // a raised path error.
-    let (stdout, stderr, code) = run_jq_full(
-        &["-c", "[path(([1,2,3] | nth(empty)) | empty)]"],
-        Some("{}"),
-    )?;
-    assert_eq!(code, 0, "stderr {stderr:?}");
-    assert_eq!(stdout.trim(), "[]");
+    // a raised path error. Checked for both `nth` and `indices`: each has
+    // its own `eval_owned_expr_full` call site in `builtin_navigation`'s
+    // `Ok(None)` arm.
+    for filter in [
+        "[path(([1,2,3] | nth(empty)) | empty)]",
+        "[path(([1,2,3] | indices(empty)) | empty)]",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), "[]", "{filter}");
+    }
     Ok(())
 }
 

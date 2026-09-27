@@ -35425,7 +35425,7 @@ fn builtin_navigation<S: EvalSemantics>(
             Ok(OwnedValue::Float(len)) => Ok(Some(BuiltinNavigation::Access(OwnedValue::Float(
                 len - 1.0,
             )))),
-            Ok(_) => unreachable!("owned_value_jq_length only ever returns Int or Float"),
+            Ok(_) => unreachable!("owned_value_jq_length only ever returns Int or Float"), // omni-dev: coverage tolerate-line reason="unreachable: owned_value_jq_length's own match only ever constructs OwnedValue::Int or OwnedValue::Float, checked just above this arm (#2744)"
             Err(e) => Err(EvalEscape::Error(e)),
         },
         _ => Ok(None),
