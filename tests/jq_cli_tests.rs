@@ -57713,6 +57713,61 @@ fn test_and_or_negate_on_untracked_input_boundary_2760() -> Result<()> {
     Ok(())
 }
 
+/// #3299: the first `?//` alternative's failed negation must not be
+/// resurrected after the second alternative resolves it. Expected results
+/// and the two error controls were captured from /usr/bin/jq 1.7.1.
+/// `paths(filter)` evaluates this shape through its eager root pre-check
+/// instead of this resolver arm; that remaining divergence is #3366.
+#[test]
+fn test_negate_path_arm_retry_does_not_resurrect_a_resolved_error_3299() -> Result<()> {
+    let operand = "[1] as $a ?// $b | if $a == null then 1 else $a end";
+    let traced = "[1] as $a ?// $b | (\"A\"|stderr) | if $a == null then 1 else $a end";
+    let cases = [
+        (format!("path(1 | -({traced}) | empty)"), None, "", "AA", 0),
+        (
+            format!("del(1 | -({operand}) | empty)"),
+            Some("{}\n"),
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            format!("try path(1 | -({operand}) | empty) catch \"C:\"+."),
+            None,
+            "",
+            "",
+            0,
+        ),
+        (
+            format!("[path(1 | -({operand}))]"),
+            None,
+            "",
+            "jq: error (at <unknown>): Invalid path expression with result -1\n",
+            5,
+        ),
+        (
+            "path(1 | -([1] as $a ?// $b | [1]) | empty)".to_string(),
+            None,
+            "",
+            "jq: error (at <unknown>): array ([1]) cannot be negated\n",
+            5,
+        ),
+    ];
+    for (filter, input, stdout, stderr, code) in cases {
+        let args = if input.is_some() {
+            ["-c", filter.as_str()]
+        } else {
+            ["-cn", filter.as_str()]
+        };
+        assert_eq!(
+            run_jq_full(&args, input)?,
+            (stdout.to_string(), stderr.to_string(), code),
+            "{filter} on {input:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3290: `array_resolves_live`'s `TrackedVar` exclusion used to scan
 /// `[E]`'s *whole* subtree (`any_subexpr`), so a `TrackedVar` anywhere in a
 /// mixed array disqualified live resolution for the entire array -- silently
