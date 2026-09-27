@@ -71647,3 +71647,41 @@ fn test_unknown_format_is_a_runtime_error_3357() -> Result<()> {
 
     Ok(())
 }
+
+/// #3357 review: the format-name scanner has no leading-character
+/// restriction and accepts digits/underscores anywhere, matching jq 1.7.1's
+/// own permissive format token; a bare `@` with nothing after it stays a
+/// compile-time error in both tools, since there's no name to defer a
+/// judgement on at all.
+#[test]
+fn test_unknown_format_name_grammar_matches_jq_cli_3357() -> Result<()> {
+    for (name, expected_err) in [
+        ("foo_bar", "foo_bar is not a valid format"),
+        ("_foo", "_foo is not a valid format"),
+        ("1foo", "1foo is not a valid format"),
+        ("foo123", "foo123 is not a valid format"),
+        ("Foo", "Foo is not a valid format"),
+        ("_", "_ is not a valid format"),
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-c", &format!("@{name}")], Some("1"))?;
+        assert_eq!(code, 5, "@{name}: stderr={stderr:?}");
+        assert!(stderr.contains(expected_err), "@{name}: stderr={stderr:?}");
+    }
+
+    // A bare `@` is a genuine syntax error (exit 3), not a runtime one --
+    // there's no token there at all, unlike an unrecognized-but-present name.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", "@"], Some("1"))?;
+    assert_eq!(code, 3);
+    assert!(stdout.is_empty());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-c", "@"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?
+        .wait_with_output()?;
+    assert!(!output.status.success(), "yq mode must still reject bare @");
+
+    Ok(())
+}

@@ -4353,11 +4353,18 @@ impl<'a> Parser<'a> {
     fn parse_format_string(&mut self) -> Result<Expr, ParseError> {
         self.expect('@')?;
 
-        // Parse the format name
+        // Parse the format name. #3357 review: widened from
+        // `is_ascii_alphabetic() || c == '6' || c == '4'` (a special case
+        // for base64/base64d's own digits) to alphanumeric-or-underscore --
+        // confirmed live against jq 1.7.1 that its own format token has no
+        // narrower grammar than this: `@1foo`, `@foo_bar` and `@_foo` all
+        // defer to the same runtime "X is not a valid format" jq's other
+        // unknown names do, not a compile error, and no leading-character
+        // restriction (unlike a general identifier) applies.
         let format_start = self.pos;
         while self
             .peek()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '6' || c == '4')
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             self.next();
         }
@@ -4396,14 +4403,22 @@ impl<'a> Parser<'a> {
             "urid" => FormatType::Urid,
             "yaml" => FormatType::Yaml,
             "props" => FormatType::Props,
-            // #3357: jq mode only. jq's own grammar accepts any `@name`
-            // token at parse time and defers the "is this a real format"
-            // check to when the format is actually applied -- confirmed
-            // live against jq 1.7.1 (`@foo "x"` compiles; `1 | @foo`
-            // raises `foo is not a valid format` at runtime). yq's lexer
-            // rejects an unrecognized `@name` outright, so this stays a
-            // parse error there, unchanged.
-            _ if self.mode == ParserMode::Jq => FormatType::Unknown(format_name.to_string()),
+            // #3357: jq mode only, and only when a name actually followed
+            // the `@`. jq's own grammar accepts any `@name` token at parse
+            // time and defers the "is this a real format" check to when
+            // the format is actually applied -- confirmed live against jq
+            // 1.7.1 (`@foo "x"` compiles; `1 | @foo` raises `foo is not a
+            // valid format` at runtime). A bare `@` with nothing after it
+            // is a different case: jq's own lexer rejects it as
+            // `unexpected INVALID_CHARACTER` at compile time (exit 3, not
+            // 5) -- confirmed live -- since there's no token there at all,
+            // not an unrecognized one, so this stays the pre-#3357 parse
+            // error for that case specifically. yq's lexer rejects an
+            // unrecognized `@name` outright regardless of length, so this
+            // stays a parse error there too, unchanged.
+            _ if self.mode == ParserMode::Jq && !format_name.is_empty() => {
+                FormatType::Unknown(format_name.to_string())
+            }
             _ => {
                 return Err(ParseError::new(
                     format!("unknown format '@{format_name}'"),
@@ -11527,5 +11542,26 @@ mod tests {
         );
 
         assert!(parse_with_mode("@foo", ParserMode::Yq).is_err());
+    }
+
+    /// #3357 review: the format-name scanner has no leading-character
+    /// restriction and accepts digits/underscores anywhere, matching jq
+    /// 1.7.1's own permissive format token exactly (`@1foo`, `@foo_bar`,
+    /// `@_foo`, `@_` all defer to runtime there, confirmed live) -- and a
+    /// bare `@` with nothing after it stays a compile-time error in both
+    /// tools (jq: `unexpected INVALID_CHARACTER`; exit 3 either way), since
+    /// there's no name to defer a judgement on at all.
+    #[test]
+    fn test_unknown_format_name_grammar_matches_jq_3357() {
+        for name in ["foo_bar", "_foo", "1foo", "foo123", "Foo", "_"] {
+            assert_eq!(
+                parse(&format!("@{name}")).unwrap(),
+                Expr::Format(FormatType::Unknown(name.into())),
+                "@{name}"
+            );
+        }
+
+        assert!(parse("@").is_err());
+        assert!(parse_with_mode("@", ParserMode::Yq).is_err());
     }
 }
