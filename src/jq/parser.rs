@@ -43,7 +43,7 @@ use super::expr::{
     ObjectKey, Param, Pattern, PatternEntry, Program, SliceBoundKey, StringPart,
 };
 use super::value::{parse_i64_or_f64_in, NumberRepr, OwnedValue};
-use super::walk::any_subexpr;
+use super::walk::{any_subexpr, map_subexprs};
 use core::cmp::Ordering;
 
 /// Parser mode controls syntax differences between jq and yq.
@@ -2472,9 +2472,14 @@ impl<'a> Parser<'a> {
             // arm's original `postfix_if_jq` path untouched below.
             Some('@') => {
                 let format = self.parse_format_string()?;
-                if self.mode == ParserMode::Jq {
-                    self.skip_ws();
-                }
+                // Unconditional, not jq-mode-gated: harmless in yq mode too --
+                // `parse_with_mode_and_extensions`'s own top-level `skip_ws`
+                // (run before its final `is_eof` check) already lands on the
+                // same position by the time any error is reported, since
+                // `skip_ws` is idempotent. Gating this call added no observable
+                // difference and only invited a second, driftable copy of the
+                // `self.mode == ParserMode::Jq` test just below.
+                self.skip_ws();
                 if self.mode == ParserMode::Jq && self.peek() == Some('"') {
                     let s = self.parse_string_or_interpolation()?;
                     let formatted = Self::apply_format_to_interpolation(s, &format);
@@ -6922,6 +6927,26 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// #3316: desugars a format-prefixed string (`@fmt "lit\(E)lit"`) into
+    /// the same shape a bare interpolation parses to, with each `\(E)`
+    /// rewritten to `E | @fmt` -- jq's own `gen_format(E, fmt)` rule. Routed
+    /// through [`map_subexprs`] rather than a hand-rolled `StringPart` walk,
+    /// so a future change to that shape (a new `StringPart` variant, a
+    /// different traversal contract) updates this call site the same way it
+    /// updates every other one-level `Expr` walk in the parser/evaluator.
+    /// `s` is always what [`Self::parse_string_or_interpolation`] returns --
+    /// `Expr::Literal(Literal::String(_))` or `Expr::StringInterpolation`,
+    /// both of which `map_subexprs` already has a correct arm for, so a
+    /// plain literal (no `\(...)`) passes through unchanged (cloned), matching
+    /// jq leaving the format unrun for a literal with no interpolation.
+    /// `format` is cloned once per `\(...)` slot; `FormatType`/`Expr` are
+    /// cheap to clone and every slot needs its own copy of the same format.
+    fn apply_format_to_interpolation(s: Expr, format: &Expr) -> Expr {
+        map_subexprs(&s, &mut |e: &Expr| {
+            Expr::Pipe(vec![e.clone(), format.clone()])
+        })
+    }
+
     /// #2741: applies `parse_postfix` in jq mode, leaves `expr` untouched in
     /// yq mode. Shared by the string, `@format`, and number-literal arms of
     /// `parse_primary_inner` -- unlike #2667's own array/object-literal
@@ -6932,33 +6957,6 @@ impl<'a> Parser<'a> {
     /// against v4.53.3 for `"abc"[0:1]`, `1[0]` and `@base64[0]`), so
     /// widening unconditionally would introduce a new divergence rather
     /// than close one.
-    /// #3316: desugars a format-prefixed string (`@fmt "lit\(E)lit"`) into
-    /// the same shape a bare interpolation parses to, with each `\(E)`
-    /// rewritten to `E | @fmt` -- jq's own `gen_format(E, fmt)` rule.
-    /// `s` is always what [`Self::parse_string_or_interpolation`] returns,
-    /// so a plain `Expr::Literal(Literal::String(_))` (no `\(...)`) passes
-    /// through unchanged, matching jq leaving the format unrun for a
-    /// literal with no interpolation. `format` is cloned once per `\(...)`
-    /// slot; `FormatType`/`Expr` are cheap to clone and every slot needs
-    /// its own copy of the same format.
-    fn apply_format_to_interpolation(s: Expr, format: &Expr) -> Expr {
-        match s {
-            Expr::StringInterpolation(parts) => {
-                let parts = parts
-                    .into_iter()
-                    .map(|part| match part {
-                        StringPart::Expr(e) => {
-                            StringPart::Expr(Box::new(Expr::Pipe(vec![*e, format.clone()])))
-                        }
-                        literal @ StringPart::Literal(_) => literal,
-                    })
-                    .collect();
-                Expr::StringInterpolation(parts)
-            }
-            literal => literal,
-        }
-    }
-
     fn postfix_if_jq(&mut self, expr: Expr) -> Result<Expr, ParseError> {
         if self.mode == ParserMode::Jq {
             self.parse_postfix(expr)
