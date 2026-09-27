@@ -1171,8 +1171,11 @@ is the revert that established what the other one costs.
    refused where jq answers: the `_by` forms (`sort_by`, `unique_by`, `group_by`, `min_by`),
    `with_entries`, `map_values`, `flatten`, `[.[]]` over an object and `limit`, which need their
    filter or driver run over owned children
-   ([#3305](https://github.com/rust-works/succinctly/issues/3305)); a full slice `.[0:2]` and a
-   no-op `\|=` ([#3306](https://github.com/rust-works/succinctly/issues/3306)); and a `getpath` whose
+   ([#3305](https://github.com/rust-works/succinctly/issues/3305)); a no-op `\|=` (#3306's
+   remaining half, tracked as
+   [#3383](https://github.com/rust-works/succinctly/issues/3383) -- the full-range slice half
+   of [#3306](https://github.com/rust-works/succinctly/issues/3306) is fixed, see
+   [`SliceBounds::is_full_range`](../../../src/jq/slice.rs)); and a `getpath` whose
    path the owned route cannot read as a literal (`getpath([-0.5])`: `-0.5` is a negation). A
    builtin reached through a `.[]` whose children are not themselves witnessed
    (`[[.]] \| .[] \| sort \| .[0] \| path($x)`) still bridges: peeling that iterate per child
