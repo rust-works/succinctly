@@ -2315,12 +2315,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a primary expression (atoms and parenthesized expressions), then
-    /// check for a trailing `?` (jq's postfix `try` shorthand), which applies
+    /// check for trailing `?` (jq's postfix `try` shorthand), which applies
     /// to any Term - not just path expressions. Field/bracket access already
     /// consume their own narrower `?` inline (see
     /// `parse_index_bracket_with_optional` and the dot-field branch below),
     /// so by the time control reaches here any such `?` is already gone;
-    /// this only wraps a `?` still left over the whole term.
+    /// this wraps each `?` still left over the whole term. jq permits repeated
+    /// generic `?`; yq mode retains its single-`?` grammar.
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         self.expr_depth += 1;
         let result = if self.expr_depth > MAX_EXPR_DEPTH {
@@ -2369,10 +2370,18 @@ impl<'a> Parser<'a> {
     /// `self.parse_primary()`, not this function, so the counter sees every
     /// nesting level.
     fn parse_primary_optional(&mut self) -> Result<Expr, ParseError> {
-        let expr = self.parse_primary_inner()?;
-        self.skip_ws();
-        if self.peek() == Some('?') {
+        let mut expr = self.parse_primary_inner()?;
+        let mut wraps = 0;
+        loop {
+            self.skip_ws();
+            if self.peek() != Some('?')
+                || (self.mode == ParserMode::Jq && self.peek_str(3) == "?//")
+            {
+                break;
+            }
             self.next();
+            wraps += 1;
+            self.check_expr_nesting(wraps)?;
             // #3038: this generic `EXPR?` suppression is jq's `Exp: Exp
             // '?'` production, never `Term` -- unlike `.foo?`/`.[0]?`
             // (handled entirely inside `parse_postfix`'s own loop, which
@@ -2382,10 +2391,12 @@ impl<'a> Parser<'a> {
             // (Term-shaped) function call -- the `?` alone demotes it,
             // regardless of what it wraps.
             self.last_primary_is_term = false;
-            Ok(Expr::Optional(Box::new(expr)))
-        } else {
-            Ok(expr)
+            expr = Expr::Optional(Box::new(expr));
+            if self.mode != ParserMode::Jq {
+                break;
+            }
         }
+        Ok(expr)
     }
 
     fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
@@ -11109,6 +11120,37 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    #[test]
+    fn test_repeated_postfix_optional_3273() {
+        for (filter, depth) in [
+            ("length??", 2),
+            ("length???", 3),
+            ("(.a)??", 2),
+            (".a???", 3),
+            ("$__loc__??", 2),
+            (".[0]???", 3),
+            ("length ? ?", 2),
+        ] {
+            let mut expr = parse(filter).unwrap_or_else(|err| panic!("{filter}: {err}"));
+            let mut actual_depth = 0;
+            while let Expr::Optional(inner) = expr {
+                actual_depth += 1;
+                expr = *inner;
+            }
+            assert_eq!(actual_depth, depth, "{filter}");
+        }
+
+        for filter in ["length??", "(.x)??"] {
+            assert!(parse_with_mode(filter, ParserMode::Yq).is_err(), "{filter}");
+        }
+
+        with_parser_stack(|| {
+            let filter = format!(".{}", "?".repeat(MAX_EXPR_DEPTH + 10));
+            let err = parse(&filter).expect_err("deep optional chain must be rejected");
+            assert!(err.message.contains("depth limit"), "{err}");
+        });
     }
 
     /// Control: `pipe` and `comma` build a flat `Vec`, not a nested tree, so

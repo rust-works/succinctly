@@ -71295,3 +71295,46 @@ fn test_funcdef_declared_inside_path_resolves_not_invalid_path_3297() -> Result<
 
     Ok(())
 }
+
+/// #3273: jq permits repeated generic `?` after any expression. The outer
+/// suppression must retain try-style path semantics, and yq mode must keep
+/// rejecting repeated generic `?` as its reference does.
+#[test]
+fn test_repeated_postfix_optional_matches_jq_3273() -> Result<()> {
+    for (filter, input, expected) in [
+        ("length??", r#"{"a":1}"#, "1\n"),
+        ("(.a)??", r#"{"a":1}"#, "1\n"),
+        (".a???", r#"{"a":1}"#, "1\n"),
+        ("1 + length??", r#"{"a":1}"#, "2\n"),
+        ("length ? ?", r#"{"a":1}"#, "1\n"),
+        ("if true then 1 else 2 end??", "null", "1\n"),
+        ("reduce (1,2) as $i (0;.+$i)??", "null", "3\n"),
+        ("path(.a??)", r#"{"a":1}"#, "[\"a\"]\n"),
+        ("path(1 | .a??? | empty)", r#"{"a":1}"#, ""),
+        (".a??? = 3", r#"{"a":1}"#, "{\"a\":3}\n"),
+        (".a??? |= 3", r#"{"a":1}"#, "{\"a\":3}\n"),
+        ("del(.a???)", r#"{"a":1,"b":2}"#, "{\"b\":2}\n"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: {stdout:?}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+
+    for filter in [
+        ".a?? as $x | $x",
+        "length?? as $x | $x",
+        "{a: .a??}",
+        ".a??[0]",
+        ".a??.b",
+        ".a??//1",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(code, 3, "{filter}: stdout={stdout:?} stderr={stderr:?}");
+        assert!(stdout.is_empty(), "{filter}: {stdout:?}");
+    }
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path(1 | .a? | empty)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert!(stdout.is_empty());
+    Ok(())
+}
