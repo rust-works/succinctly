@@ -14,6 +14,29 @@ echo ""
 echo "=== Linting succinctly (clippy) ==="
 cargo clippy --all-targets --all-features -- -D warnings
 
+# `--all-features` turns on `scalar-yaml` (compiles out every YAML SIMD
+# backend) and `portable-popcount` (compiles out the AVX-512 popcount path),
+# so the step above never lints `yaml/simd/{x86,neon,broadword}.rs` or
+# `bits/popcount.rs`'s AVX-512 arm -- the same blind spot ci.yml's own
+# `clippy`/`clippy-all-variants` jobs run a second (and, on ARM, third)
+# invocation to close (#185, #388, #3006). Matches ci.yml's `clippy` job.
+echo ""
+echo "=== Linting succinctly (clippy, YAML SIMD + AVX-512 popcount backend selected) ==="
+cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+
+# The YAML backend selectors are cfg-exclusive to one target_arch, so the
+# invocation above never selects `neon`/`broadword` on an ARM machine either
+# -- only `--features broadword-yaml` does, and only on aarch64/arm64 is
+# there anything under `target_arch = "aarch64"` for it to actually lint.
+# Matches ci.yml's ARM64-only `clippy-all-variants` third invocation.
+case "$(uname -m)" in
+  aarch64|arm64)
+    echo ""
+    echo "=== Linting succinctly (clippy, ARM broadword-yaml backend selected) ==="
+    cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+    ;;
+esac
+
 echo ""
 echo "=== Building succinctly ==="
 cargo build --release
