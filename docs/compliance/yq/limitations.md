@@ -4416,7 +4416,11 @@ has anything resembling these; there is no reference token to gate them against.
 `leaf_paths`, `tostream`/`fromstream`/`truncate_stream`, `IN`, `ltrimstr`, `limit`,
 `isempty`, `debug`, `infinite`, `isnan`, and `gsub`/`scan`/`splits`. `succinctly yq` matches
 real yq's rejection of all of these by default; the flag opts back into the jq-compatible
-surface. `leaf_paths` is grouped here even though it isn't real jq syntax either — real jq
+surface. The same gate applies to jq's generic postfix `?` after a parenthesized
+expression, builtin, literal, or variable
+([#3378](https://github.com/rust-works/succinctly/issues/3378)); yq's field and bracket
+optionals (`.x?`, `.[0]?`) remain available by default. `leaf_paths` is grouped here even
+though it isn't real jq syntax either — real jq
 itself rejects it too (`leaf_paths/0 is not defined`; it's a succinctly-only invention
 modeled on a jq community recipe, see CLAUDE.md) — because, from `succinctly yq`'s
 syntax-surface point of view, it's the same kind of thing as the rest of this list: extra,

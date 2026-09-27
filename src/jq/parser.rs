@@ -506,10 +506,9 @@ struct Parser<'a> {
     input: &'a str,
     pos: usize,
     mode: ParserMode,
-    /// Whether yq mode accepts jq-only surface real yq's lexer rejects
-    /// (`paths`, `getpath`, `limit`, `gsub`/`scan`/`splits`, etc.), gated
-    /// behind `--jq-extensions` (#1512). Ignored in jq mode, which always
-    /// accepts this surface.
+    /// Whether yq mode accepts jq-only syntax real yq's lexer rejects:
+    /// builtins such as `paths`/`getpath` (#1512) and generic postfix `?`
+    /// such as `length?` (#3378). Ignored in jq mode, which always accepts it.
     jq_extensions: bool,
     /// Current `Pattern` recursion depth; see [`MAX_PATTERN_DEPTH`].
     pattern_depth: usize,
@@ -1237,7 +1236,13 @@ impl<'a> Parser<'a> {
     /// which would otherwise discard them before the trailing-`?` check
     /// ever sees them.
     fn parse_field_ident(&mut self) -> Result<String, ParseError> {
-        let mut name = self.parse_ident()?;
+        // Yq accepts an empty name before the optional marker (`.?`), and
+        // a leading `?` can itself be part of a longer unquoted name (`.??`).
+        let mut name = if self.mode == ParserMode::Yq && self.peek() == Some('?') {
+            String::new()
+        } else {
+            self.parse_ident()?
+        };
         if self.mode != ParserMode::Yq {
             return Ok(name);
         }
@@ -1995,7 +2000,11 @@ impl<'a> Parser<'a> {
         let bracket = self.parse_index_bracket()?;
         let bracket_end = self.pos;
         self.skip_ws();
-        if self.mode == ParserMode::Yq && self.pos > bracket_end && self.peek() == Some('?') {
+        if self.mode == ParserMode::Yq
+            && !self.jq_extensions
+            && self.pos > bracket_end
+            && self.peek() == Some('?')
+        {
             return Err(ParseError::new("unexpected '?' after whitespace", self.pos));
         }
         if self.at_postfix_question() {
@@ -2368,7 +2377,8 @@ impl<'a> Parser<'a> {
     /// `parse_index_bracket_with_optional` and the dot-field branch below),
     /// so by the time control reaches here any such `?` is already gone;
     /// this wraps each `?` still left over the whole term. jq permits repeated
-    /// generic `?`; yq mode retains its single-`?` grammar.
+    /// generic `?`; default yq's field and bracket optionals are handled by
+    /// their own productions. `--jq-extensions` enables the generic form.
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         self.expr_depth += 1;
         let result = if self.expr_depth > MAX_EXPR_DEPTH {
@@ -2421,7 +2431,7 @@ impl<'a> Parser<'a> {
         let mut wraps = 0;
         loop {
             self.skip_ws();
-            if !self.at_postfix_question() {
+            if (self.mode == ParserMode::Yq && !self.jq_extensions) || !self.at_postfix_question() {
                 break;
             }
             self.next();
@@ -2437,9 +2447,6 @@ impl<'a> Parser<'a> {
             // regardless of what it wraps.
             self.last_primary_is_term = false;
             expr = Expr::Optional(Box::new(expr));
-            if self.mode != ParserMode::Jq {
-                break;
-            }
         }
         if self.mode == ParserMode::Jq && self.peek_str(3) == "?//" {
             return Err(ParseError::new(
@@ -2725,7 +2732,11 @@ impl<'a> Parser<'a> {
                 }
 
                 // Check for identity (just `.`)
-                if self.is_eof() || self.is_expr_terminator() {
+                if (self.is_eof() || self.is_expr_terminator())
+                    && !(self.mode == ParserMode::Yq
+                        && self.pos == dot_end
+                        && self.peek() == Some('?'))
+                {
                     self.last_primary_is_term = true; // #3038: leaf Term
                     return Ok(Expr::Identity);
                 }
@@ -2776,6 +2787,7 @@ impl<'a> Parser<'a> {
                 let field_end = self.pos;
                 self.skip_ws();
                 if self.mode == ParserMode::Yq
+                    && !self.jq_extensions
                     && self.peek() == Some('?')
                     && self.input[field_end..self.pos]
                         .bytes()
@@ -7124,7 +7136,19 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Some('.') => {
                     self.next();
+                    let dot_end = self.pos;
                     self.skip_ws();
+
+                    // Yq allows `.?` as an empty field name, but a space or
+                    // newline between the dot and `?` is a lexer error.
+                    if self.mode == ParserMode::Yq
+                        && self.peek() == Some('?')
+                        && self.input[dot_end..self.pos]
+                            .bytes()
+                            .any(|b| matches!(b, b' ' | b'\n'))
+                    {
+                        return Err(ParseError::new("unexpected '?' after whitespace", self.pos));
+                    }
 
                     // Check for bracket after dot
                     if self.peek() == Some('[') {
@@ -7141,6 +7165,7 @@ impl<'a> Parser<'a> {
                         let field_end = self.pos;
                         self.skip_ws();
                         if self.mode == ParserMode::Yq
+                            && !self.jq_extensions
                             && self.peek() == Some('?')
                             && self.input[field_end..self.pos]
                                 .bytes()
@@ -8439,14 +8464,15 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
 ///
 /// Use `ParserMode::Yq` to allow kebab-case identifiers like `.my-key`. In
 /// `Yq` mode, jq-only builtins real yq's lexer rejects (`paths`, `getpath`,
-/// `limit`, `gsub`/`scan`/`splits`, etc.) are rejected too; use
-/// [`parse_with_mode_and_extensions`] to accept them (#1512).
+/// `limit`, etc.) and generic postfix `?` (`length?`, `(.x)?`) are rejected;
+/// use [`parse_with_mode_and_extensions`] to accept them (#1512, #3378).
 pub fn parse_with_mode(input: &str, mode: ParserMode) -> Result<Expr, ParseError> {
     parse_with_mode_and_extensions(input, mode, false)
 }
 
 /// Parse a jq expression with a specific parser mode, optionally accepting
-/// jq-only builtins real yq's lexer rejects (`--jq-extensions`, #1512).
+/// jq-only builtins and generic postfix `?` that real yq's lexer rejects
+/// (`--jq-extensions`, #1512, #3378).
 ///
 /// `jq_extensions` is ignored in `ParserMode::Jq`, which always accepts this
 /// surface.
@@ -8503,15 +8529,15 @@ pub fn parse_program(input: &str) -> Result<Program, ParseError> {
 ///
 /// Use `ParserMode::Yq` to allow kebab-case identifiers like `.my-key`. In
 /// `Yq` mode, jq-only builtins real yq's lexer rejects (`paths`, `getpath`,
-/// `limit`, `gsub`/`scan`/`splits`, etc.) are rejected too; use
-/// [`parse_program_with_mode_and_extensions`] to accept them (#1512).
+/// `limit`, etc.) and generic postfix `?` (`length?`, `(.x)?`) are rejected;
+/// use [`parse_program_with_mode_and_extensions`] to accept them (#1512, #3378).
 pub fn parse_program_with_mode(input: &str, mode: ParserMode) -> Result<Program, ParseError> {
     parse_program_with_mode_and_extensions(input, mode, false)
 }
 
 /// Parse a complete jq program with a specific parser mode, optionally
-/// accepting jq-only builtins real yq's lexer rejects (`--jq-extensions`,
-/// #1512).
+/// accepting jq-only builtins and generic postfix `?` that real yq's lexer
+/// rejects (`--jq-extensions`, #1512, #3378).
 ///
 /// `jq_extensions` is ignored in `ParserMode::Jq`, which always accepts this
 /// surface.
@@ -11952,5 +11978,49 @@ mod tests {
                 "yq accepted {filter:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_yq_rejects_generic_postfix_optional_3378() {
+        for filter in [
+            "(.x)?",
+            "(.x)?//1",
+            "length?",
+            "1?",
+            "true?",
+            "select(false)?",
+            "$x?",
+            "(.?)?",
+            ". ?",
+            ".a. ?",
+            ".a.\n?",
+        ] {
+            assert!(
+                parse_with_mode(filter, ParserMode::Yq).is_err(),
+                "yq accepted {filter}"
+            );
+        }
+
+        assert_eq!(
+            parse_with_mode(".?", ParserMode::Yq).unwrap(),
+            Expr::Optional(Box::new(Expr::Field(String::new())))
+        );
+        assert_eq!(
+            parse_with_mode(".??", ParserMode::Yq).unwrap(),
+            Expr::Optional(Box::new(Expr::Field("?".into())))
+        );
+        for filter in [".x?", ".[0]?", ".\"x\"?", ".a.?"] {
+            assert!(
+                parse_with_mode(filter, ParserMode::Yq).is_ok(),
+                "yq rejected {filter}"
+            );
+        }
+        assert!(parse("(.x)?").is_ok());
+        assert!(parse("length?").is_ok());
+        assert!(parse_with_mode_and_extensions("(.x)?", ParserMode::Yq, true).is_ok());
+        assert!(parse_with_mode_and_extensions("length?", ParserMode::Yq, true).is_ok());
+        assert!(parse_with_mode_and_extensions(".x ?", ParserMode::Yq, true).is_ok());
+        assert!(parse_with_mode_and_extensions(".[0] ?", ParserMode::Yq, true).is_ok());
+        assert!(parse_with_mode_and_extensions(".a.x ?", ParserMode::Yq, true).is_ok());
     }
 }
