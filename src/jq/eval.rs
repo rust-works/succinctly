@@ -50896,7 +50896,7 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             return QueryResult::ManyOwned(values);
         }
-    }
+    } // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: the new gate test above (`Builtin::Length` as `first`) demonstrably takes `key_or_parent_root_construct(first) == false` and falls through to the reindex-bridge route below, passing -- but this closing brace, like the one at #56920 for the same reason, is never itself credited a hit"
 
     if !reindex_bridge_is_identity(owned) {
         if let Some(result) =
@@ -95551,6 +95551,34 @@ mod tests {
             QueryResult::ManyOwned(values)
                 if values == [OwnedValue::String("null".to_string())] => {}
             other => panic!("expected ManyOwned([\"null\"]), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+        }
+        // Two more of this same gate's arms the CLI-level tests above don't
+        // reach: a `Comma` of two key/parent constructs with nothing else in
+        // the pipe (`rest.is_empty()` but `placeholders.len() > 1`, so the
+        // `ManyOwned` fan-out branch runs instead of the single-value one
+        // just above), and a first stage that is *not* a key/parent
+        // construct at all -- `key_or_parent_root_construct` answers `false`,
+        // so this falls through to the pre-existing reindex-bridge route
+        // instead (`length` on an empty object, well past this gate).
+        match eval_path_context_pipe_owned::<Vec<u64>, JqSemantics>(
+            &[Expr::Comma(vec![
+                Expr::Builtin(Builtin::Key),
+                Expr::Builtin(Builtin::Parent),
+            ])],
+            &input,
+            false,
+        ) {
+            QueryResult::ManyOwned(values)
+                if values == [OwnedValue::Null, no_parent_placeholder()] => {}
+            other => panic!("expected ManyOwned([null, {{}}]), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
+        }
+        match eval_path_context_pipe_owned::<Vec<u64>, JqSemantics>(
+            &[Expr::Builtin(Builtin::Length)],
+            &input,
+            false,
+        ) {
+            QueryResult::Owned(OwnedValue::Int(0)) => {}
+            other => panic!("expected Owned(Int(0)), got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make"
         }
     }
 
