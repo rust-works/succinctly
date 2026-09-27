@@ -48853,3 +48853,17 @@ fn test_reduce_growth_past_value_tree_depth_reports_cleanly_yq_3261() -> Result<
     assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
     Ok(())
 }
+
+/// #3283/#3284: `array_contents_are_checked`'s widening is jq-mode only --
+/// `array_resolves_live` gates its whole call path on `S::TAG ==
+/// EvalTag::Jq`, so `succinctly yq` must be byte-for-byte unchanged.
+/// `del(. as $x | [.a] | $x)` is pre-existing #2643 territory (yq's own
+/// node-identity `$var` model), not something this fix touches -- pinned
+/// here so a future change to either mechanism notices if it accidentally
+/// starts interacting with the other.
+#[test]
+fn test_array_register_widening_is_jq_mode_only_3283() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("del(. as $x | [.a] | $x)", "a: 1\n", &[])?;
+    assert_ne!(code, 0, "stdout: {stdout:?}");
+    Ok(())
+}

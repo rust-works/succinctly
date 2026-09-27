@@ -733,19 +733,37 @@ is the revert that established what the other one costs.
    [#3263](https://github.com/rust-works/succinctly/issues/3263) an array carries the register
    too when the resolver both resolves it live and checks everything jq checks inside it:
    navigation, `..`, `select`, an `if`'s branches, both of jq's `?`s and `try`/`catch`,
-   `recurse(f)`/`recurse(f; cond)` (#2764), and pipes, commas and subexp shapes of those. So
-   `path(. as $x \| [.a] \| $x)` and `path(. as $x \| [try .a] \| $x)` are `[]` in both
-   tools. Any other array carries no register. Where it holds navigation this resolver can't
-   see (a builtin jq defines in jq, such as `with_entries` or `walk`, or an update
-   assignment's `_modify`, as in `[.k \|= 1]`), jq raises too and only the wording differs
-   (`… with result …` here). Three shapes jq answers still refuse here. The first is an array
-   holding anything outside that list that jq accepts: a shape the resolver still evaluates
-   by value (`getpath`:
-   `path(. as $x \| [.a \| getpath(["b"])] \| $x)`), or one it resolves but does not count as
-   checked (`//`, `first(f)`: `path(. as $x \| [first(.a)] \| $x)`). The second is an array
-   nested in another stage's expression (`if true then [.a] else 1 end`, `([.a], [.k])`). The
-   third is a `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` —
-   resolving a call to its body is not something a syntactic predicate can do from a name).
+   `recurse(f)`/`recurse(f; cond)` (#2764), and pipes, commas and subexp shapes of those.
+   [#3283](https://github.com/rust-works/succinctly/issues/3283)/[#3284](https://github.com/rust-works/succinctly/issues/3284)
+   widened that list further: `builtin_navigation`'s value-independent members (bare
+   `first`/`last`/`add`/`any`/`all`/`flatten`, no argument — jq's internal `.[0]`/`.[]` is
+   `path_intact` against a tracked input and cannot path-fail there, and an untracked input
+   already raises through `builtin_navigation` before this claim is reached); a
+   `map(f)`/`any(f)`/`all(f)`/`walk(f)` argument that itself navigates nothing at all; plain
+   `=` (a subexp, #3186, whose `path(paths)`/reduce backtrack never move the register); a
+   `try`/`?` with **no handler** (never lets an error out, so the claim never depends on
+   whether its body is otherwise checked — a *handler* still has to stay checked, since a
+   handler jq itself never reaches when the body only fails *here* would fabricate `[]`); and,
+   through that `try`-admission, #3271's own construct set (`with_entries`/`map_values`/an
+   object-input `walk`/`unique`/`unique_by`/`sub`/`gsub`/every update assignment) whenever
+   wrapped in one. So `path(. as $x \| [.a] \| $x)`, `path(. as $x \| [first] \| $x)`,
+   `path(. as $x \| (.a = 3) \| $x.a)` and `path(. as $x \| [try with_entries(.)] \| $x.a)`
+   are all `[]`/a real path in both tools. Any other array carries no register. Where it holds
+   navigation this resolver can't see (a builtin jq defines in jq, such as `with_entries` or
+   `walk`, or an update assignment's `_modify`, as in `[.k \|= 1]`, **uncaught**), jq raises too
+   and only the wording differs (`… with result …` here). Three shapes jq answers still refuse
+   here. The first is an array holding anything outside that list that jq accepts: a shape the
+   resolver still evaluates by value (`getpath`:
+   `path(. as $x \| [.a \| getpath(["b"])] \| $x)`), one it resolves but does not count as
+   checked (`//`, `first(f)`: `path(. as $x \| [first(.a)] \| $x)` — note the *argument* form,
+   distinct from the bare `first` just admitted above), `from_entries` (jq's own `map(...) |
+   add` always iterates the constructed array, so jq itself always raises — admitting it here
+   would fabricate `[]`), or a `map`/`any`/`all`/`walk` argument that navigates but stays
+   tracked (`[map(.a)]`, `[all(.a)]`, `[map(first)]`, all `[]` in jq — needs its own
+   navigates-only-the-register predicate, a follow-up). The second is an array nested in
+   another stage's expression (`if true then [.a] else 1 end`, `([.a], [.k])`). The third is a
+   `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call
+   to its body is not something a syntactic predicate can do from a name).
    Every such refusal is
    refuse-only, and since [#3267](https://github.com/rust-works/succinctly/issues/3267) it stays
    refuse-only under `try`/`?` too. It used to be caught as if it were jq's own path error, so
@@ -1325,7 +1343,7 @@ is the revert that established what the other one costs.
 
    | Still diverging                                                                     | jq 1.7.1                                        | succinctly | Tracked                                                                  |
    | ----------------------------------------------------------------------------------- | ----------------------------------------------- | ---------- | ------------------------------------------------------------------------ |
-   | `[path(([1] \| unique) \| empty)]`, and `unique_by`/`map_values`/`with_entries`, `walk` on an *object*, `sub`/`gsub` (with or without flags), `ascii_downcase`/`ascii_upcase`, `fromstream(f)`, the `match`/`scan`/`capture`/`splits` family, and every update assignment (`\|=`, a compound `op=`, `//=`; plain `=` is exempt, #3186) | raises, naming a **derived** container (`iterate through [[1]]`) once the construct's own type-check and argument evaluation have already succeeded | raises the same `ErrorKind::UntrackedNavigation` (ordinarily catchable, same as jq — confirmed live, `try with_entries(.)` and `try (.k \|= 3)` are both caught in both tools), naming the value the construct actually produced rather than jq's `to_entries`/`group_by`/`match`/`_modify`/`explode`/`foreach`-accumulator intermediate. Checked only *after* by-value evaluation succeeds, so jq's own type error, or an `error(...)`/`empty` from an argument or right-hand side, still wins exactly as it did before — a first cut of this fix checked `expr`'s bare shape before evaluating it and wrongly pre-empted all of those | [#3271](https://github.com/rust-works/succinctly/issues/3271) and #2743's own follow-through, fully narrowing [#2743](https://github.com/rust-works/succinctly/issues/2743) |
+   | `[path(([1] \| unique) \| empty)]`, and `unique_by`/`map_values`/`with_entries`, `walk` on an *object* (or an array holding one at any depth, since #3283 step 3 — `array_reaches_object`), `sub`/`gsub` (with or without flags), `ascii_downcase`/`ascii_upcase`, `fromstream(f)`, the `match`/`scan`/`capture`/`splits` family, and every update assignment (`\|=`, a compound `op=`, `//=`; plain `=` is exempt, #3186) | raises, naming a **derived** container (`iterate through [[1]]`) once the construct's own type-check and argument evaluation have already succeeded | raises the same `ErrorKind::UntrackedNavigation` (ordinarily catchable, same as jq — confirmed live, `try with_entries(.)` and `try (.k \|= 3)` are both caught in both tools), naming the value the construct actually produced rather than jq's `to_entries`/`group_by`/`match`/`_modify`/`explode`/`foreach`-accumulator intermediate. Checked only *after* by-value evaluation succeeds, so jq's own type error, or an `error(...)`/`empty` from an argument or right-hand side, still wins exactly as it did before — a first cut of this fix checked `expr`'s bare shape before evaluating it and wrongly pre-empted all of those. `with_entries(error("x"))` is one further, narrower message-only residual on top of that: jq raises its own path error first (its `map` iterates the constructed `to_entries` before `f` runs), where this resolver raises `x` — the argument's own `error(...)` "still wins" rule this row already documents holds for `op=` but not for `with_entries`; only the message differs, and both exit 5 (#3271 residual, found while implementing #3284) | [#3271](https://github.com/rust-works/succinctly/issues/3271) and #2743's own follow-through, fully narrowing [#2743](https://github.com/rust-works/succinctly/issues/2743) |
    | `[path(([1,2,3] \| nth(2)) \| empty)]`, and `indices`/`index`/`rindex`; `INDEX(f)` and `transpose` | raises; element depends on an argument this table cannot evaluate without a probe that duplicates real evaluation's side effects or mis-handles a multi-output argument (found live during #2744's own review) | `[]`       | [#3347](https://github.com/rust-works/succinctly/issues/3347), split off [#2744](https://github.com/rust-works/succinctly/issues/2744) |
    | `[path(([1] \| any(.[]; .)) \| empty)]`, and `all(gen;cond)` | raises — the argument navigates, but stopping needs a real per-element `cond` short-circuit interleaved with path-tracked resolution, a shape the fix for `last(f)`/`isempty(f)`/`INDEX(gen;f)` (a fixed bound or unconditional drain, no data-dependent stop; #2746, now fixed) cannot express safely | `[]`       | [#3349](https://github.com/rust-works/succinctly/issues/3349), split off [#2746](https://github.com/rust-works/succinctly/issues/2746) |
 

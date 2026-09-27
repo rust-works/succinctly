@@ -35604,14 +35604,32 @@ fn builtin_navigation<S: EvalSemantics>(
 /// error already unwound past it. Ordinary `Result` propagation through
 /// [`resolve_node_sink`]'s `Try`/`Optional` recursion gets both right with
 /// no extra bookkeeping.
-fn always_refuses_as_live_path<S: EvalSemantics>(
-    expr: &Expr,
-    input: &OwnedValue,
-    computed: &OwnedValue,
-) -> Option<EvalError> {
-    if S::TAG != EvalTag::Jq {
-        return None;
-    }
+/// The shape of the error [`always_refuses_as_live_path`] builds for a
+/// [`live_path_refusal`]-classified construct -- which access/iterate
+/// wording, and (for `fromstream`) which named key. Carries no value: every
+/// member here raises the same way regardless of what the construct
+/// produced, which is exactly what makes it safe for [`live_path_refusal`]
+/// to answer with no `input`/`computed` in scope (#3284).
+enum RefusalShape {
+    NearIterate,
+    NearAccessInt0,
+    NearAccessKeyX,
+}
+
+/// The value-independent half of [`always_refuses_as_live_path`]: which
+/// constructs *always* raise once they run at all, with no dependence on
+/// what they produced or what input they ran against. Split out (#3284) so
+/// [`array_contents_are_checked`] can consult the same classification this
+/// resolver already uses to decide whether a construct inside `[...]`
+/// genuinely needs live navigation-checking (if it always raises on its
+/// own, per this table, resolving it live can never wrongly *accept*
+/// something jq refuses -- see that function's own `live_path_refusal` arm).
+/// `Builtin::Walk` is deliberately not a member: whether it raises depends
+/// on the input it ran against (does it reach an object at any depth), so
+/// it stays in [`always_refuses_as_live_path`]'s own match, and
+/// [`array_contents_are_checked`] gets a dedicated arm for it instead
+/// (#3283 step 3).
+fn live_path_refusal(expr: &Expr) -> Option<RefusalShape> {
     match expr {
         Expr::Builtin(
             Builtin::WithEntries(_)
@@ -35621,21 +35639,14 @@ fn always_refuses_as_live_path<S: EvalSemantics>(
             | Builtin::SubFlags(_, _, _)
             | Builtin::Gsub(_, _)
             | Builtin::GsubFlags(_, _, _),
-        ) => Some(EvalError::invalid_path_expression_near_iterate(computed)),
-        // `map_values`, an object-input `walk` (its object arm dispatches
-        // to `map_values`), and every update assignment are all jq-defined
-        // atop `_modify`, whose bookkeeping always raises the same
-        // element-0 access once it runs at all.
+        ) => Some(RefusalShape::NearIterate),
+        // `map_values` and every update assignment are all jq-defined atop
+        // `_modify`, whose bookkeeping always raises the same element-0
+        // access once it runs at all.
         Expr::Builtin(Builtin::MapValues(_))
         | Expr::Update { .. }
         | Expr::CompoundAssign { .. }
-        | Expr::AlternativeAssign { .. } => Some(EvalError::invalid_path_expression_near_access(
-            &OwnedValue::Int(0),
-            computed,
-        )),
-        Expr::Builtin(Builtin::Walk(_)) if matches!(input, OwnedValue::Object(_)) => Some(
-            EvalError::invalid_path_expression_near_access(&OwnedValue::Int(0), computed),
-        ),
+        | Expr::AlternativeAssign { .. } => Some(RefusalShape::NearAccessInt0),
         // #2743's other row: these never raised at all (succinctly answered
         // `[]`/exit 0 where jq raises), rather than raising with an
         // approximate container -- confirmed live against jq 1.7.1 for
@@ -35644,8 +35655,7 @@ fn always_refuses_as_live_path<S: EvalSemantics>(
         // `splits` via `_match_impl`, both `.[]`-shaped in jq's own
         // definition (jq's message: "iterate through" a derived
         // intermediate this resolver cannot reproduce -- same approximation
-        // tradeoff as the `WithEntries`/`Unique` arm above, using
-        // `computed` in its place).
+        // tradeoff as the `WithEntries`/`Unique` arm above).
         Expr::Builtin(
             Builtin::AsciiDowncase
             | Builtin::AsciiUpcase
@@ -35657,20 +35667,64 @@ fn always_refuses_as_live_path<S: EvalSemantics>(
             | Builtin::CaptureFlags(_, _)
             | Builtin::Splits(_)
             | Builtin::SplitsFlags(_, _),
-        ) => Some(EvalError::invalid_path_expression_near_iterate(computed)),
+        ) => Some(RefusalShape::NearIterate),
         // `fromstream(f)` is jq-defined via a `foreach`/`reduce` accumulator
         // keyed `{x: null, e: false}` (`x` holding the value under
         // construction); jq's own message names that accumulator and
-        // always keys the access as `"x"`, confirmed live across multiple
-        // stream shapes. `computed` (the value fromstream actually
-        // produced) stands in for the accumulator's `.x`, the same
-        // approximation this function already uses elsewhere.
-        Expr::Builtin(Builtin::FromStream(_)) => {
-            Some(EvalError::invalid_path_expression_near_access(
+        // always keys the access as `"x"`.
+        Expr::Builtin(Builtin::FromStream(_)) => Some(RefusalShape::NearAccessKeyX),
+        _ => None,
+    }
+}
+
+/// #3283 step 3: does `value` (or anything nested inside it through arrays
+/// only) contain an object at any depth? `walk(f)`'s own jq definition
+/// (`def w: if type == "object" then map_values(w) elif type == "array"
+/// then map(w) else . end | f; w;`) recurses through arrays via `map(w)`,
+/// and the moment it reaches an object, `map_values(w)` always raises (the
+/// same [`RefusalShape::NearAccessInt0`] class above) -- so reaching an
+/// object at *any* depth is the raising condition, and there is nothing
+/// further to check once one is found. Confirmed live against jq 1.7.1:
+/// `path([walk(.)] | empty)` on `[1,[2,{"a":1}]]` raises "near attempt to
+/// access element 0 of [{"a":1},[]]" (exit 5); on `[1,[2,3]]` (no object
+/// anywhere) it is `[]` (exit 0).
+fn array_reaches_object(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Object(_) => true,
+        OwnedValue::Array(items) => items.iter().any(array_reaches_object),
+        _ => false,
+    }
+}
+
+fn always_refuses_as_live_path<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    computed: &OwnedValue,
+) -> Option<EvalError> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    if let Some(shape) = live_path_refusal(expr) {
+        return Some(match shape {
+            RefusalShape::NearIterate => EvalError::invalid_path_expression_near_iterate(computed),
+            RefusalShape::NearAccessInt0 => {
+                EvalError::invalid_path_expression_near_access(&OwnedValue::Int(0), computed)
+            }
+            RefusalShape::NearAccessKeyX => EvalError::invalid_path_expression_near_access(
                 &OwnedValue::String("x".to_string()),
                 computed,
-            ))
-        }
+            ),
+        });
+    }
+    match expr {
+        // #3283 step 3: was `matches!(input, OwnedValue::Object(_))` --
+        // widened to any depth through nested arrays; see
+        // `array_reaches_object`'s own doc comment. Subsumes the old
+        // top-level check (`array_reaches_object` also answers `true` for a
+        // bare `OwnedValue::Object`).
+        Expr::Builtin(Builtin::Walk(_)) if array_reaches_object(input) => Some(
+            EvalError::invalid_path_expression_near_access(&OwnedValue::Int(0), computed),
+        ),
         _ => None,
     }
 }
@@ -36589,22 +36643,43 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         Expr::Builtin(Builtin::RecurseF(f) | Builtin::RecurseCond(f, _)) => {
             array_contents_are_checked(f)
         }
-        // #2764: both of jq's `?`s -- `INDEX_OPT` on a primitive and `try`
-        // on anything else -- are resolved by `resolve_optional_sink`, which
-        // keeps them apart; the inside is checked exactly when it would be
-        // without the `?`.
-        Expr::Paren(e) | Expr::Optional(e) => array_contents_are_checked(e),
-        // #2764: `try E` is the same jq program as `(E)?`, so it is checked
-        // exactly when `E` is. A handler runs live against the error
-        // message, where its own navigation raises as in jq --
+        Expr::Paren(e) => array_contents_are_checked(e),
+        // #2764: a primitive postfix `?` (`.a?`, `INDEX_OPT`) is not `try` at
+        // all -- it is resolved natively by `resolve_optional_sink`'s own
+        // primitive arm, so the claim still depends on whether the
+        // primitive itself is checked (always true for every one admitted
+        // above, but kept general rather than hardcoded).
+        Expr::Optional(e) if is_postfix_optional_primitive(e) => array_contents_are_checked(e),
+        // #3284: every other `?` desugars to `try E` with no handler (jq's
+        // own `(E)?` rule) -- same reasoning as the no-handler `Try` arm
+        // just below.
+        Expr::Optional(_) => true,
+        // #3284: `try E` (no handler) never lets an error out of `E` --
+        // the collect always completes and backtracks the register,
+        // whatever `E` navigated or refused to. Only `break`/`halt` escape
+        // a bare `try`, and the resolver propagates those as
+        // `ResolveFlow::Escaped` before this claim is ever reached, so
+        // there is nothing left for the claim itself to get wrong.
+        // Confirmed live against jq 1.7.1: `path(. as $x | [try
+        // with_entries(.)] | $x.a)` is `["a"]`, and `path(. as $x | [try
+        // to_entries] | $x.a)` (no error at all, just an unrecognised
+        // shape) is `["a"]` too -- the deciding factor is the static shape,
+        // not whether anything was actually thrown.
+        //
+        // **With a handler, the body must stay checked.** If jq's body
+        // raises where this resolver's by-value evaluation of it would not,
+        // jq runs the handler and this resolver never does -- admitting the
+        // array unconditionally there would fabricate `[]` for e.g. `[try
+        // from_entries catch .zz] | $x` and `[try from_entries catch
+        // error] | $x` on `[{"key":"a","value":1}]`, both of which jq
+        // itself raises through. A handler that runs live against the
+        // error message is checked the same as any other operand --
         // `path(. as $x | [try .a catch .k] | $x)` is `[]` in jq 1.7.1.
-        Expr::Try { expr, catch } => {
-            array_contents_are_checked(expr)
-                && match catch {
-                    Some(handler) => array_contents_are_checked(handler),
-                    None => true,
-                }
-        }
+        Expr::Try { catch: None, .. } => true,
+        Expr::Try {
+            expr,
+            catch: Some(handler),
+        } => array_contents_are_checked(expr) && array_contents_are_checked(handler),
         Expr::Pipe(stages) | Expr::Comma(stages) => stages.iter().all(array_contents_are_checked),
         Expr::If {
             then_branch,
@@ -36614,6 +36689,54 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         Expr::IndexExpr { target, .. } | Expr::SliceExpr { target, .. } => {
             array_contents_are_checked(target)
         }
+        // #3283: `builtin_navigation`'s value-independent members. On an
+        // untracked input, `resolve_leaf_bounded` already raises jq's own
+        // "near attempt to access/iterate" error through `builtin_navigation`
+        // before this claim would ever be reached. On a tracked input, the
+        // input *is* jq's register, so jq's own internal `.[0]`/`.[]` is
+        // `path_intact` and cannot raise a path error -- the only errors
+        // left are value errors (`{"a":1} | [first]`, `null | [add]`),
+        // which by-value evaluation here raises identically. The output
+        // then goes untracked, stricter than jq, so any navigation after it
+        // inside the brackets still refuses (`[first] | .[0]` raises
+        // identically in both tools).
+        Expr::Builtin(
+            Builtin::First
+            | Builtin::Last
+            | Builtin::Add
+            | Builtin::Any
+            | Builtin::All
+            | Builtin::Flatten,
+        ) => true,
+        // #3283: `map(f)`/`any(f)`/`all(f)` run `f` on jq-tracked elements,
+        // but this resolver evaluates `f` by value, so admit only an `f`
+        // that navigates nothing at all -- a navigating-but-tracked `f`
+        // (`map(.a)`, `all(.a)`, `map(first)`) needs its own predicate with
+        // its own oracle rows, a follow-up, not this PR (`[map({k:1}|.k)]`
+        // and `[any({k:1}|.k)]` still raise in jq, and admitting them here
+        // would fabricate `[]`).
+        Expr::Builtin(Builtin::Map(f) | Builtin::AnyF(f) | Builtin::AllF(f)) => {
+            cannot_move_register(f)
+        }
+        // #3283: `walk(f)` also runs `f` on every node `map(w)`/`map_values(w)`
+        // constructs, so `f` must navigate nothing either -- the nested-object
+        // refusal itself is `always_refuses_as_live_path`'s `Walk` arm's job
+        // (step 3, `array_reaches_object`), not this predicate's.
+        Expr::Builtin(Builtin::Walk(f)) => cannot_move_register(f),
+        // #3284: every construct `always_refuses_as_live_path` raises on
+        // unconditionally (#3271's set) is, by that same fact, one the
+        // resolver checks exactly as jq's own internal path-check does: it
+        // raises on every value the construct produces, and neither tool
+        // raises when the construct produces none (`.k += empty`) or hits
+        // its own type/argument error first. Sharing `live_path_refusal`
+        // (rather than re-listing the same builtins here) follows
+        // `CLAUDE.md`'s "duplicated predicates diverge silently" rule.
+        // `Walk`/`FromEntries` are deliberately not members of that
+        // classifier (both stay value-dependent) and so never reach this
+        // arm; `Walk` has its own arm just above, and `FromEntries` stays
+        // refused until its own `always_refuses_as_live_path` follow-up
+        // closes the gap named in step 7.
+        e if live_path_refusal(e).is_some() => true,
         other => cannot_move_register(other),
     }
 }
@@ -36748,6 +36871,24 @@ fn cannot_move_register(expr: &Expr) -> bool {
         // `SUBEXP_BEGIN`/`SUBEXP_END`, where nothing moves the register or
         // raises a path error -- see the doc comment.
         Expr::Object(_) | Expr::StringInterpolation(_) => true,
+
+        // #3283: plain `=` is jq-defined as `reduce path(paths) as $p (.;
+        // setpath($p; $value))` -- `$value` is a subexp, `path(paths)`
+        // itself saves and restores the path state while it runs, and the
+        // fold backtracks its source, so the register never moves whatever
+        // either side navigates. Confirmed live against jq 1.7.1:
+        // `path(. as $x | (.a = 3) | $x.a)` is `["a"]`,
+        // `path(. as $x | (.a = (.k,.a)) | $x.a)` is `["a"] ["a"]`, and
+        // `path(. as $x | ((.a,.k) = 3) | $x.a)` is `["a"]`. An error on
+        // either side (`(1|.k) = 3`, `.k = error("x")`) still raises
+        // exactly as it does today -- this predicate only decides whether
+        // the register survives a *successful* stage, matching
+        // `Object`/`StringInterpolation` just above. `Update`/
+        // `CompoundAssign`/`AlternativeAssign` (`|=`, `op=`, `//=`) stay out:
+        // as a stage each runs `_modify`, which always raises
+        // (`always_refuses_as_live_path`'s own arm for them), so admitting
+        // them here would be unreachable in the success case anyway.
+        Expr::Assign { .. } => true,
         // Path-checked against the register (no subexp), then restored by
         // backtracking -- only safe to carry when nothing inside navigates;
         // see the doc comment.
@@ -102889,16 +103030,17 @@ mod tests {
         // UntrackedNavigation` catchability, ADR-0018 fidelity in the other
         // direction from the loop above: this fix must not make the error
         // uncatchable everywhere, only unreachable from a later stage.
-        // (Wrapping the *same* catch in an array, then following it with a
-        // bare `$x` -- `del(. as $x | [try with_entries(.)] | $x)` -- hits
-        // a separate, pre-existing gap: `array_contents_are_checked`'s
-        // static "false" for an unrecognised builtin already left the
-        // array's own trackability at the mercy of whatever
-        // `resolve_seq_stage` carries forward for a later `TrackedVar`, and
-        // that carry-forward does not special-case "the loss came from a
-        // caught error." Filed as #3283's own follow-up territory rather
-        // than fixed here -- this fix's job is raising at all, not
-        // rearchitecting register carry-forward through a catch.)
+        //
+        // #3284 (now fixed): wrapping the *same* catch in an array, then
+        // following it with a bare `$x`, used to hit a separate,
+        // pre-existing gap -- `array_contents_are_checked`'s static "false"
+        // for an unrecognised builtin left the array's own trackability at
+        // the mercy of whatever `resolve_seq_stage` carries forward for a
+        // later `TrackedVar`, with no special case for "the loss came from
+        // a caught error." `array_contents_are_checked`'s `Try { catch:
+        // None, .. } => true` arm closes it: a `try` with no handler never
+        // lets an error out, so the register claim never depended on
+        // whether the body itself was checked.
         for filter in [
             r"del(try with_entries(.))",
             r"del(. as $x | try with_entries(.) | $x)",
@@ -102911,16 +103053,35 @@ mod tests {
                 "{filter}"
             );
         }
+        // Wrapped in `[...]`, the *array itself* still produces exactly one
+        // output regardless of whether the caught construct raised (`[]`)
+        // or produced a value -- so `$x` resolves to the array's own
+        // entering position, the document root, and `del` there deletes
+        // the whole document. Confirmed live against jq 1.7.1: both are
+        // `null`, not the document unchanged (the bare, non-array forms
+        // above differ because `try E | $x` with no array has *nothing* to
+        // pipe `$x` through when `E` raises and is caught -- zero outputs
+        // altogether, so `del` of that is a no-op).
+        for filter in [
+            r"del(. as $x | [try with_entries(.)] | $x)",
+            r"del(. as $x | [try (.k |= 3)] | $x)",
+        ] {
+            assert_eq!(
+                outputs(br#"{"a":{"b":1},"k":1}"#, filter),
+                ["null"],
+                "{filter}"
+            );
+        }
         // `walk` on an array or a scalar input never reaches `map_values`
         // internally (its object-only arm, `builtin_navigation`'s own doc
         // comment), so it must not raise -- confirmed live neither does in
         // jq. Plain `=` is a subexp (#3186) and never raises either. Checked
-        // by calling the gate directly rather than round-tripping through
-        // `del`/an array/`$x`: that route also exercises #3283 (a
-        // *different*, pre-existing gap where `array_contents_are_checked`
-        // wrongly refuses genuinely-tracked navigation like array-input
-        // `walk` or plain `=` for an unrelated reason), which would make
-        // this assertion fail for a cause this fix does not touch.
+        // by calling the gate directly, not only by round-tripping through
+        // `del`/an array/`$x` (see the #3283 round-trip versions just below,
+        // now that `array_contents_are_checked` admits both shapes) --
+        // keeping this direct check pins `always_refuses_as_live_path`
+        // itself, independent of whatever `array_contents_are_checked`
+        // does or does not admit.
         for (expr, value) in [
             (
                 Expr::Builtin(Builtin::Walk(Box::new(Expr::Identity))),
@@ -102943,6 +103104,23 @@ mod tests {
                 "{expr:?} / {value:?}"
             );
         }
+        // #3283: the same two shapes, now round-tripped through `del`/an
+        // array/`$x` -- a stronger pin than the direct-gate check above,
+        // since it also exercises `array_contents_are_checked`'s own new
+        // `Walk`/`Assign` admission rather than just `always_refuses_as_live_path`.
+        // `[E] | $x` always discards `[E]`'s own value (whatever `E` was)
+        // and replaces it with `$x` -- so when the register survives, `$x`
+        // is the array's own entering position, the document root, and
+        // `del` of the whole root is `null`, not `[E]`'s value or the
+        // document unchanged (confirmed live against jq 1.7.1).
+        assert_eq!(
+            outputs(br"[1,2]", r"del(. as $x | [walk(.)] | $x)"),
+            ["null"]
+        );
+        assert_eq!(
+            outputs(br#"{"k":1}"#, r"del(. as $x | (.k = 3) | $x.k)"),
+            ["{}"]
+        );
         // jq mode only (ADR-0018): yq's own `with_entries`/`map_values`/
         // `sub` are real, differently-behaved yq builtins (CLAUDE.md's own
         // jq/yq divergence rules; `try` is not even yq syntax at all --
@@ -102964,6 +103142,183 @@ mod tests {
                 always_refuses_as_live_path::<YqSemantics>(&expr, &value, &value).is_none(),
                 "{expr:?}"
             );
+        }
+    }
+
+    /// #3283: `array_contents_are_checked`'s allowlist was missing several
+    /// shapes the resolver already checks the way jq does -- `builtin_navigation`'s
+    /// value-independent members (`first`/`last`/`add`/`any`/`all`/`flatten`),
+    /// a non-navigating `map(f)`/`any(f)`/`all(f)`/`walk(f)` argument, and
+    /// plain `=`. Each row is `del(. as $x | [E] | $x[0])`, so a preserved
+    /// register writes through to the array's own root (`.[0]`/`.a`),
+    /// matching jq's own write; every row confirmed live against jq 1.7.1.
+    #[test]
+    // `"{k:1}"` is a jq filter literal, not a formatting string; clippy
+    // cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_array_register_admits_self_checked_builtins_3283() {
+        for (doc, filter, expected) in [
+            (r"[1,2,3]", r"del(. as $x | [first] | $x[0])", r"[2,3]"),
+            (r"[1,2,3]", r"del(. as $x | [last] | $x[0])", r"[2,3]"),
+            (r"[1,2,3]", r"del(. as $x | [add] | $x[0])", r"[2,3]"),
+            (r"[1,2,3]", r"del(. as $x | [any] | $x[0])", r"[2,3]"),
+            (r"[1,2,3]", r"del(. as $x | [all] | $x[0])", r"[2,3]"),
+            (r"[[1],[2]]", r"del(. as $x | [flatten] | $x[0])", r"[[2]]"),
+            (r"[1,2,3]", r"del(. as $x | [map(.)] | $x[0])", r"[2,3]"),
+            (r"[1,2,3]", r"del(. as $x | [any(. > 1)] | $x[0])", r"[2,3]"),
+            (r"[1,2,3]", r"del(. as $x | [all(. > 1)] | $x[0])", r"[2,3]"),
+            (r"[1,2]", r"del(. as $x | [walk(.)] | $x[0])", r"[2]"),
+            (r#"{"k":1}"#, r"del(. as $x | (.k = 3) | $x.k)", r"{}"),
+        ] {
+            assert_eq!(outputs(doc.as_bytes(), filter), [expected], "{filter}");
+        }
+        // The issue's own repro shape: `.a|first` navigates a field, not
+        // the bare register, and the array still carries it.
+        assert_eq!(
+            outputs(
+                br#"{"a":[1,2,3],"k":1}"#,
+                r"del(. as $x | [.a|first] | $x.a)"
+            ),
+            [r#"{"k":1}"#]
+        );
+        // Negative rows: a `map`/`any`/`all` argument that itself navigates
+        // still refuses -- admitting it would fabricate `[]` where jq
+        // raises (`[map({k:1}|.k)]`/`[any({k:1}|.k)]` on tracked input).
+        for (doc, filter) in [
+            (
+                r#"[{"k":1},{"k":2}]"#,
+                r"path(. as $x | [map({k:1}|.k)] | $x)",
+            ),
+            (r#"[{"k":1}]"#, r"path(. as $x | [any({k:1}|.k)] | $x)"),
+            (r"[1,2,3]", r"path(. as $x | first | $x)"),
+        ] {
+            query!(doc.as_bytes(), filter,
+                QueryResult::Error(e) => {
+                    assert!(is_resolver_refusal(&e), "{filter}: {}", e.message);
+                }
+            );
+        }
+        // Step 3: `walk(f)` over an array now also refuses when it reaches
+        // an object at *any* depth through nested arrays, not only at the
+        // top level -- `map(w)`'s recursion bottoms out in `map_values(w)`
+        // the moment it does, which always raises (the same #3271 class).
+        // An array of arrays/scalars with no object anywhere still doesn't.
+        query!(br#"[1,[2,{"a":1}]]"#, r"path([walk(.)] | empty)",
+            QueryResult::Error(e) => {
+                assert!(is_resolver_refusal(&e), "{}", e.message);
+            }
+        );
+        assert_eq!(
+            outputs(br"[1,[2,3]]", r"path([walk(.)] | empty)"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// #3284: the same allowlist gap, for #3271's own construct set --
+    /// `array_contents_are_checked` had no arm for any of them, so an array
+    /// holding one always refused, whether or not it was wrapped in a
+    /// `try`/`?` and whether or not the construct actually raised. A `try`
+    /// with no handler never lets an error out (jq's own semantics), so the
+    /// register claim never depends on whether the body is otherwise
+    /// checked; a handler *does* have to stay checked, since a handler jq
+    /// itself never reaches (because the body succeeded here where jq's own
+    /// path-check would have raised through it) must not be trusted blind.
+    /// Every row confirmed live against jq 1.7.1: `del(. as $x | [try E] |
+    /// $x.a)` writes through to `.a` (deleting it) when the register
+    /// survives, exactly as the unwrapped, always-checked rows already do.
+    #[test]
+    fn test_caught_refusal_inside_array_keeps_register_3284() {
+        for filter in [
+            r"del(. as $x | [try with_entries(.)] | $x.a)",
+            r"del(. as $x | [try (.k |= 3)] | $x.a)",
+            r"del(. as $x | [try to_entries] | $x.a)",
+            r"del(. as $x | [try (def f: .a; f)] | $x.a)",
+            r"del(. as $x | [try map_values(.)] | $x.a)",
+            r"del(. as $x | [try walk(.)] | $x.a)",
+            r"del(. as $x | [.k += empty] | $x.a)",
+            r"del(. as $x | [.k //= empty] | $x.a)",
+        ] {
+            assert_eq!(
+                outputs(br#"{"a":1,"k":1}"#, filter),
+                [r#"{"k":1}"#],
+                "{filter}"
+            );
+        }
+        for filter in [
+            r"del(. as $x | [try (.a|tostring|ascii_upcase)] | $x.a)",
+            r"del(. as $x | [try (.a|[.]|unique)] | $x.a)",
+            r"del(. as $x | [try (.a|[.]|unique_by(.))] | $x.a)",
+            r"del(. as $x | [try fromstream(.a|tostream)] | $x.a)",
+        ] {
+            assert_eq!(outputs(br#"{"a":1}"#, filter), [r"{}"], "{filter}");
+        }
+        assert_eq!(
+            outputs(
+                br#"[{"key":"a","value":1}]"#,
+                r"del(. as $x | [try from_entries] | $x[0])"
+            ),
+            [r"[]"]
+        );
+        // The issue's own two repros.
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1},"k":1}"#,
+                r"del(. as $x | [try with_entries(.)] | $x)"
+            ),
+            [r"null"]
+        );
+        // A handler that runs live against the caught error is checked the
+        // same as any other operand: `.` (identity) is admitted, so the
+        // array carries the register even with a handler present.
+        assert_eq!(
+            outputs(
+                br#"{"a":1}"#,
+                r"del(. as $x | [try with_entries(.) catch .] | $x.a)"
+            ),
+            [r"{}"]
+        );
+        // Negative rows: a handler jq never actually reaches (because the
+        // body succeeds here where jq's own path-check would raise through
+        // it) must not be trusted -- admitting it would fabricate `[]`
+        // where jq raises through the handler.
+        for (doc, filter) in [
+            (
+                r#"[{"key":"a","value":1}]"#,
+                r"path(. as $x | [try from_entries catch .zz] | $x)",
+            ),
+            (
+                r#"[{"key":"a","value":1}]"#,
+                r"path(. as $x | [try from_entries catch error] | $x)",
+            ),
+            (
+                r#"{"a":1}"#,
+                r"path(. as $x | [try with_entries(.) catch .zz] | $x.a)",
+            ),
+        ] {
+            query!(doc.as_bytes(), filter,
+                QueryResult::Error(e) => {
+                    assert!(is_resolver_refusal(&e), "{filter}: {}", e.message);
+                }
+            );
+        }
+        // The #3271 pin is unchanged: `del(. as $x | [with_entries(.)] |
+        // try .[0])` (uncatchable from a later, sibling stage) is already
+        // covered by `test_native_builtins_and_update_assignment_raise_unconditionally_3271`.
+    }
+
+    /// #3284, `sub`/`match`/`splits` rows only: split into their own
+    /// `regex`-gated test for the same reason `test_sub_gsub_raise_unconditionally_3271`
+    /// is -- CI's non-`regex` feature legs don't build regex-builtin support
+    /// at all. Every row confirmed live against jq 1.7.1.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_caught_refusal_inside_array_keeps_register_regex_3284() {
+        for filter in [
+            r#"del(. as $x | [try (.a|tostring|sub("a";"x"))] | $x.a)"#,
+            r#"del(. as $x | [try (.a|tostring|match("z"))] | $x.a)"#,
+            r#"del(. as $x | [try (.a|tostring|splits("b"))] | $x.a)"#,
+        ] {
+            assert_eq!(outputs(br#"{"a":1}"#, filter), [r"{}"], "{filter}");
         }
     }
 

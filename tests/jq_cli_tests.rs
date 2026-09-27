@@ -71491,3 +71491,49 @@ fn test_format_prefixed_string_succinctly_extensions_3316() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3283: the CLI route (not only the library harness) reaches
+/// `array_contents_are_checked`'s newly-admitted shapes. Confirmed live
+/// against jq 1.7.1.
+#[test]
+fn test_array_admits_self_checked_builtins_via_cli_3283() -> Result<()> {
+    for (filter, input, expected) in [
+        ("del(. as $x | [first] | $x | .[0])", "[1,2,3]", "[2,3]\n"),
+        ("del(. as $x | (.a = 3) | $x.a)", r#"{"a":1}"#, "{}\n"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(stdout, expected, "filter: {filter}");
+        assert_eq!(code, 0, "filter: {filter}");
+    }
+    // Step 3: `walk(.)` over an array reaching an object at any depth
+    // through nested arrays raises, exit 5.
+    let (_, stderr, code) = run_jq_full(
+        &["-c", "path([walk(.)] | empty)"],
+        Some("[1,[2,{\"a\":1}]]"),
+    )?;
+    assert_ne!(code, 0, "stderr: {stderr}");
+    Ok(())
+}
+
+/// #3284: a caught #3271 construct inside `[...]` keeps the register
+/// through the CLI route too. Confirmed live against jq 1.7.1.
+#[test]
+fn test_caught_refusal_inside_array_keeps_register_via_cli_3284() -> Result<()> {
+    for (filter, input, expected) in [
+        (
+            "del(. as $x | [try with_entries(.)] | $x.a)",
+            r#"{"a":1,"k":1}"#,
+            "{\"k\":1}\n",
+        ),
+        (
+            "del(. as $x | [try (.k |= 3)] | $x.a)",
+            r#"{"a":1,"k":1}"#,
+            "{\"k\":1}\n",
+        ),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(stdout, expected, "filter: {filter}");
+        assert_eq!(code, 0, "filter: {filter}");
+    }
+    Ok(())
+}
