@@ -2757,10 +2757,16 @@ impl<'a> Parser<'a> {
                     Expr::Field(name)
                 };
 
-                // yq lexes a spaced `?` as an error, not a field suffix.
+                // yq lexes a `?` after a space or newline as an error, not a
+                // field suffix. Other whitespace has separate lexer behavior.
                 let field_end = self.pos;
                 self.skip_ws();
-                if self.mode == ParserMode::Yq && self.pos > field_end && self.peek() == Some('?') {
+                if self.mode == ParserMode::Yq
+                    && self.peek() == Some('?')
+                    && self.input[field_end..self.pos]
+                        .bytes()
+                        .any(|b| matches!(b, b' ' | b'\n'))
+                {
                     return Err(ParseError::new("unexpected '?' after whitespace", self.pos));
                 }
                 if self.at_postfix_question() {
@@ -7065,8 +7071,10 @@ impl<'a> Parser<'a> {
                         let field_end = self.pos;
                         self.skip_ws();
                         if self.mode == ParserMode::Yq
-                            && self.pos > field_end
                             && self.peek() == Some('?')
+                            && self.input[field_end..self.pos]
+                                .bytes()
+                                .any(|b| matches!(b, b' ' | b'\n'))
                         {
                             return Err(ParseError::new(
                                 "unexpected '?' after whitespace",
@@ -11740,7 +11748,7 @@ mod tests {
             parse_with_mode(".x?//1?", ParserMode::Yq).unwrap(),
             Expr::Optional(Box::new(Expr::Field("x?//1".into())))
         );
-        for filter in [".x ?// 1", ".x ??// 1", ".x ?", ".a.x ?// 1"] {
+        for filter in [".x ?// 1", ".x ??// 1", ".x ?", ".x\n?", ".a.x ?// 1"] {
             assert!(
                 parse_with_mode(filter, ParserMode::Yq).is_err(),
                 "yq accepted {filter}"

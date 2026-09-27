@@ -4531,7 +4531,7 @@ intact in yq mode, including hyphens directly after `?` (`.x?-y?` reads
 
 **Resolved (#3370):** adjacency also decides whether `?//` belongs to the
 field pattern. Pinned yq parses `.x?//1` as a lookup using `x?//1` and
-`.x??//1` using `x??//1`; a space before the question mark, as in
+`.x??//1` using `x??//1`; a space or newline before the question mark, as in
 `.x ?// 1` or `.x ??// 1`, is a lexer error. The same unquoted-field token
 rule includes `/` without a question mark (`.x//1` reads key `x//1`). The
 parser and CLI tests pin these spellings while jq's pattern-alternative

@@ -70,7 +70,7 @@ fn test_yq_question_slash_field_spelling_3370() -> Result<()> {
             "{input} | {filter}"
         );
     }
-    for filter in [".x ?// 1", ".x ??// 1", ".x ?", ".a.x ?// 1"] {
+    for filter in [".x ?// 1", ".x ??// 1", ".x ?", ".x\n?", ".a.x ?// 1"] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "{}", args)?;
         assert_eq!(stdout, "", "{filter}");
         assert_eq!(code, 1, "{filter}: {stderr}");
