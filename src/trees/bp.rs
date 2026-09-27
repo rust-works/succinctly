@@ -2523,8 +2523,17 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         // hops over one per field, so answer them before entering the
         // state machine below, which costs ~170 instructions even when its
         // first word scan finds the match at once (#3140).
-        if self.is_close(p + 1) {
-            return Some(p + 1);
+        //
+        // `get`, not `is_close`: a truncated document can leave `len` past
+        // the last stored word (`[` x 64 gives one word and `len` 128), and
+        // the state machine answers `None` there rather than indexing.
+        let q = p + 1;
+        if q < self.len {
+            if let Some(word) = self.words.as_ref().get(q / 64) {
+                if (word >> (q % 64)) & 1 == 0 {
+                    return Some(q);
+                }
+            }
         }
         self.find_close_from(p + 1, 1)
     }
@@ -4185,15 +4194,21 @@ mod tests {
         // padding past `len` holds a 0 where the close would be.
         let bp = BalancedParens::new(vec![0b1u64], 1);
         assert_eq!(bp.find_close(0), None);
-        let bp = BalancedParens::new(vec![0b01u64], 2);
-        assert_eq!(bp.find_close(0), Some(1));
         let bp = BalancedParens::new(vec![u64::MAX], 64);
         assert_eq!(bp.find_close(63), None);
 
-        // Leaves and nested nodes mixed across three words, every open
-        // checked against the linear scan: "(" + "()((" x 47 + "))" x 47 +
-        // "()" + ")" -- leaves inside words, at word boundaries, and
-        // enclosing the nested ones.
+        // `len` past the stored words: a truncated `[` x 64 builds one word
+        // of opens with `len` 128. The leaf probe at bit 64 has no word to
+        // read, and must answer `None` as the state machine does, not panic.
+        let bp = BalancedParens::new(vec![u64::MAX], 128);
+        assert_eq!(bp.find_close(63), None);
+        assert_eq!(bp.next_sibling(63), None);
+        let index = crate::json::JsonIndex::build(&[b'['; 64]);
+        assert_eq!(index.bp().find_close(63), None);
+
+        // Leaves and nested nodes mixed over 286 bits (five words), every
+        // open checked against the linear scan: "(" + "()((" x 47 +
+        // "))" x 47 + "()" + ")".
         let mut bits = vec![true];
         for _ in 0..47 {
             bits.extend([true, false, true, true]);
@@ -4202,20 +4217,38 @@ mod tests {
             bits.extend([false, false]);
         }
         bits.extend([true, false, false]);
-        let len = bits.len();
-        let mut words = vec![0u64; len.div_ceil(64)];
+        let (words, len) = pack_bits(&bits);
+        let bp = BalancedParens::new(words.clone(), len);
+        for p in (0..len).filter(|&p| bits[p]) {
+            assert_eq!(bp.find_close(p), find_close(&words, len, p), "open at {p}");
+        }
+    }
+
+    #[test]
+    fn test_find_close_non_leaf_match_at_l1_block_start_3140() {
+        // The leaf fast path answers the 2047 -> 2048 queries the older
+        // L1-boundary tests make, so pin the state machine's own transition
+        // with a non-leaf: opens at 0..=2046, then closes. 2045 encloses
+        // the leaf at 2046 and closes at 2048, bit 0 of the second L1
+        // block, reached through FromL1 with excess 1.
+        let mut bits = vec![true; 2047];
+        bits.extend(vec![false; 2047]);
+        let (words, len) = pack_bits(&bits);
+        let bp = BalancedParens::new(words.clone(), len);
+        assert_eq!(bp.find_close(2045), Some(2048));
+        assert_eq!(find_close(&words, len, 2045), Some(2048));
+        assert_eq!(bp.find_close(2046), Some(2047));
+        assert_eq!(bp.find_close(0), Some(len - 1));
+    }
+
+    fn pack_bits(bits: &[bool]) -> (Vec<u64>, usize) {
+        let mut words = vec![0u64; bits.len().div_ceil(64)];
         for (i, &b) in bits.iter().enumerate() {
             if b {
                 words[i / 64] |= 1 << (i % 64);
             }
         }
-        let bp = BalancedParens::new(words.clone(), len);
-        let mut leaves = 0;
-        for p in (0..len).filter(|&p| bits[p]) {
-            leaves += usize::from(p + 1 < len && !bits[p + 1]);
-            assert_eq!(bp.find_close(p), find_close(&words, len, p), "open at {p}");
-        }
-        assert!(leaves > 40, "fixture should be leaf-heavy, got {leaves}");
+        (words, bits.len())
     }
 
     #[test]
