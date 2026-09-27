@@ -1755,6 +1755,16 @@ pub enum FormatType {
     Yaml,
     /// @props - Java properties format (yq)
     Props,
+    /// #3357: a format name the parser didn't recognize, jq mode only.
+    /// jq's own grammar accepts any `@name` token at parse time and defers
+    /// the "is this a real format" check to when the format is actually
+    /// applied (`"foo is not a valid format"`, confirmed live against jq
+    /// 1.7.1) -- unlike real yq, whose lexer rejects an unrecognized
+    /// `@name` outright, matching `parse_format_string`'s own yq-mode
+    /// behavior, which stays a parse error and never constructs this
+    /// variant. Carries the name (without the leading `@`) so
+    /// `format_owned` can raise jq's exact message.
+    Unknown(String),
 }
 
 /// The unary libm builtins jq exposes beyond the trigonometric/exponential

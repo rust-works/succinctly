@@ -71590,3 +71590,60 @@ fn test_caught_refusal_inside_array_keeps_register_via_cli_3284() -> Result<()> 
     }
     Ok(())
 }
+
+/// #3357: jq compiles any `@name` token and defers "is this a real format"
+/// to runtime -- confirmed live against jq 1.7.1.
+#[test]
+fn test_unknown_format_is_a_runtime_error_3357() -> Result<()> {
+    // Accepted at compile time; raises only when actually applied.
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "@foo"], Some("1"))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("foo is not a valid format"),
+        "stderr: {stderr:?}"
+    );
+
+    // `?` suppresses it generically (empty output), not a special-cased
+    // `""` the way `@csv`'s own optional convenience works.
+    let (stdout, code) = run_jq_stdin("@foo?", "1", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    let (stdout, code) = run_jq_stdin("[@foo?]", "1", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[]\n");
+
+    // A branch that's never taken doesn't need `@foo` to be a real format --
+    // impossible before this fix, when any `@foo` anywhere was a compile
+    // error regardless of reachability.
+    let (stdout, code) = run_jq_stdin("if false then @foo else 1 end", "1", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n");
+
+    // Composes with #3316's format-prefixed string interpolation: the
+    // interpolated slot raises the same way the bare filter does.
+    let (_stdout, stderr, code) = run_jq_full(&["-c", r#"@foo "v=\(1)""#], Some("1"))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("foo is not a valid format"),
+        "stderr: {stderr:?}"
+    );
+
+    // A no-interpolation literal never runs the format at all (#3316's own
+    // rule), so an unknown name doesn't even matter here.
+    let (stdout, code) = run_jq_stdin(r#"@foo "v""#, "1", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"v\"\n");
+
+    // yq mode is unchanged: its lexer still rejects `@foo` at parse time.
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-c", "@foo"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?
+        .wait_with_output()?;
+    assert!(!output.status.success(), "yq mode must still reject @foo");
+
+    Ok(())
+}

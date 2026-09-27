@@ -4396,6 +4396,14 @@ impl<'a> Parser<'a> {
             "urid" => FormatType::Urid,
             "yaml" => FormatType::Yaml,
             "props" => FormatType::Props,
+            // #3357: jq mode only. jq's own grammar accepts any `@name`
+            // token at parse time and defers the "is this a real format"
+            // check to when the format is actually applied -- confirmed
+            // live against jq 1.7.1 (`@foo "x"` compiles; `1 | @foo`
+            // raises `foo is not a valid format` at runtime). yq's lexer
+            // rejects an unrecognized `@name` outright, so this stays a
+            // parse error there, unchanged.
+            _ if self.mode == ParserMode::Jq => FormatType::Unknown(format_name.to_string()),
             _ => {
                 return Err(ParseError::new(
                     format!("unknown format '@{format_name}'"),
@@ -11042,8 +11050,11 @@ mod tests {
 
     #[test]
     fn test_parse_error_paths() {
-        // Unknown @format.
-        assert!(parse("@foobar")
+        // #3357: an unknown @format is no longer a jq-mode parse error --
+        // jq's own grammar defers that check to runtime. See
+        // test_unknown_format_defers_to_runtime_in_jq_mode_3357 for the
+        // full behavior; yq mode still rejects it here, unchanged.
+        assert!(parse_with_mode("@foobar", ParserMode::Yq)
             .unwrap_err()
             .message
             .contains("unknown format"));
@@ -11481,5 +11492,40 @@ mod tests {
     fn test_format_prefixed_string_still_rejected_in_yq_mode_3316() {
         assert!(parse_with_mode(r#"@base64 "v=\(1)""#, ParserMode::Yq).is_err());
         assert!(parse_with_mode(r#"@base64"x""#, ParserMode::Yq).is_err());
+    }
+
+    /// #3357: jq's own grammar accepts any `@name` token at parse time and
+    /// defers the "is this a real format" check to when the format is
+    /// actually applied, so an unrecognized `@foo` compiles in jq mode --
+    /// unlike yq, whose lexer rejects it outright, which stays a parse
+    /// error here too.
+    #[test]
+    fn test_unknown_format_defers_to_runtime_in_jq_mode_3357() {
+        assert_eq!(
+            parse("@foo").unwrap(),
+            Expr::Format(FormatType::Unknown("foo".into()))
+        );
+
+        // Format-prefixed string interpolation (#3316) composes with this:
+        // the desugar wraps the unknown format the same way as any other.
+        assert_eq!(
+            parse(r#"@foo "v=\(1)""#).unwrap(),
+            Expr::StringInterpolation(vec![
+                StringPart::Literal("v=".into()),
+                StringPart::Expr(Box::new(Expr::Pipe(vec![
+                    parse("1").unwrap(),
+                    Expr::Format(FormatType::Unknown("foo".into())),
+                ]))),
+            ])
+        );
+
+        // A no-interpolation literal never applies the format at all
+        // (#3316's own rule), so an unknown name doesn't even matter here.
+        assert_eq!(
+            parse(r#"@foo "v""#).unwrap(),
+            Expr::Literal(Literal::String("v".into()))
+        );
+
+        assert!(parse_with_mode("@foo", ParserMode::Yq).is_err());
     }
 }
