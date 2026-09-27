@@ -4529,6 +4529,15 @@ intact in yq mode, including hyphens directly after `?` (`.x?-y?` reads
 `x?-y` optionally); jq's repeated optional parsing is unchanged. The pinned
 `field_question_*_3356` goldens and CLI test capture the distinction.
 
+**Resolved (#3370):** adjacency also decides whether `?//` belongs to the
+field pattern. Pinned yq parses `.x?//1` as a lookup using `x?//1` and
+`.x??//1` using `x??//1`; a space or newline before the question mark, as in
+`.x ?// 1` or `.x ??// 1`, is a lexer error. The same unquoted-field token
+rule includes `/` without a question mark (`.x//1` reads key `x//1`). The
+parser and CLI tests pin these spellings while jq's pattern-alternative
+grammar remains unchanged. Bracket navigation similarly requires an adjacent
+optional suffix: `.[0]?` is valid, while `.[0] ?` is a yq lexer error.
+
 **Open gap ([#3374](https://github.com/rust-works/succinctly/issues/3374)):** yq
 also interprets `?` inside a field pattern as a one-byte wildcard and emits
 all matching values. Succinctly currently looks up the exact key, including
