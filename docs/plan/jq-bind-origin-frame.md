@@ -232,8 +232,8 @@ Three findings, in order of what they cost:
   element is a `LazySeq` on the same cursor). Residuals still refuse-only: a nested embed
   navigated inside `path()`'s own argument, a scalar root, an element or value re-indexed by
   `sort`/`unique`/`reverse`/`to_entries`/`getpath`/a slice/a no-op `|=`, a fold UPDATE that
-  is not one of the owned fast paths, a marker inside a fold's UPDATE naming the
-  accumulator, an embed reached through a container built from an *ancestor* of the bound
+  is not one of the owned fast paths, a fold over an owned input (#3328; a marker naming
+  the accumulator itself answers since #3181), a fold's own loop variable (#3329), an embed reached through a container built from an *ancestor* of the bound
   node (reuse was depth-0 only; closed by #3179), `no_std` builds, and yq mode — see `limitations.md`'s #2642
   paragraph.
 - **Closed by [#3036](https://github.com/rust-works/succinctly/issues/3036).** The same

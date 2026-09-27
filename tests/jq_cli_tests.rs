@@ -65427,9 +65427,13 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
 }
 
 /// What is left of #3036's agree-to-refuse flips on the `eval.rs` route
-/// after #2889 Stage B: a marker used inside a fold's own UPDATE, whether it
-/// names the accumulator (`reduce (.) as $x`) or was bound outside the fold
-/// entirely (`. as $x | reduce (1) as $i`).
+/// after #2889 Stage B and #3181: the fold's own loop variable used inside
+/// its UPDATE (`reduce (.) as $x`). The fold substitutes a loop variable's
+/// value as a literal, so there is no marker for anything to reroot.
+///
+/// A marker bound outside the fold (`. as $x | reduce (1) as $i`) was the
+/// other row here; #3181 answers it wherever the accumulator is still `$x`'s
+/// node, in `test_fold_update_marker_naming_the_accumulator_3181`.
 ///
 /// The rest of this list -- the embedding constructions (`[.] | .[0]`,
 /// `{k:.} | .k`, `reduce empty as $i (.; .)`, each `| path($x)`) and the
@@ -65438,13 +65442,9 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
 /// asserted to *answer* in
 /// `test_owned_embed_keeps_node_identity_on_the_input_bridge_2889`.
 ///
-/// These rows stay because `reduce_forks`/`foreach_forks` demote their static
-/// operand once for a whole run rather than per step, deliberately: per-step
-/// rerooting costs +3% (#3036), so `Reentry::witnessed_by` is applied at the
-/// two owned re-entries and *not* at the fold hoists (#2889). They are recorded
-/// in `docs/compliance/jq/limitations.md`; a row here answering again would
-/// be a genuine recovery, not a bug, so it is pinned as refuse-only rather
-/// than asserted to error forever.
+/// They are recorded in `docs/compliance/jq/limitations.md`; a row here
+/// answering again would be a genuine recovery, not a bug, so it is pinned
+/// as refuse-only rather than asserted to error forever.
 #[test]
 // jq filter literals like `{k:.}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
@@ -65466,11 +65466,6 @@ fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> 
             r#"{"a":1}"#,
             "input | reduce (.) as $x (.; path($x))",
         ),
-        (
-            &["-n", "-c"][..],
-            r#"{"a":1}"#,
-            "input | . as $x | reduce (1) as $i (.; ($x.a = 9))",
-        ),
     ] {
         let mut argv: Vec<&str> = args.to_vec();
         argv.push(filter);
@@ -65480,6 +65475,166 @@ fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> 
             "#3036: `{filter}` is a documented refuse-only residual (real jq \
              accepts it), got stdout={stdout:?} stderr={stderr:?}"
         );
+    }
+    Ok(())
+}
+
+/// #3181: a marker bound outside a fold, used inside its UPDATE or EXTRACT,
+/// on a step whose accumulator is still that binding's node. INIT `.`
+/// places `$x`'s own value, so jq's first step writes through `$x`; once a
+/// write has rebuilt the accumulator, later steps refuse. `reduce_forks`/
+/// `foreach_forks` still hoist the demotion once per fold, and
+/// `FoldOperand::against` asks the embed table per step whether that step's
+/// accumulator is a binding's node.
+///
+/// Every row runs on both routes: stdin through the generic evaluator, and
+/// `-n 'input | ...'` through `eval.rs`'s own bind sites. All rows are
+/// captured from jq 1.7.1, and every answering row refused on `main`.
+#[test]
+fn test_fold_update_marker_naming_the_accumulator_3181() -> Result<()> {
+    let answering = [
+        (r". as $x | reduce (1) as $i (.; ($x.a) = 9)", r#"{"a":9}"#),
+        (r". as $x | foreach (1) as $i (.; ($x.a) = 9)", r#"{"a":9}"#),
+        (r". as $x | reduce (1) as $i (.; del($x.a))", "{}"),
+        (r". as $x | reduce (1) as $i (.; path($x.a))", r#"["a"]"#),
+        (r". as $x | reduce (1) as $i (.; ($x.a) = $i)", r#"{"a":1}"#),
+        (r". as $x | reduce .a as $i (.; ($x.a) += $i)", r#"{"a":2}"#),
+        (
+            r". as $x | reduce (1) as $i (.; ($x.a) //= 9)",
+            r#"{"a":1}"#,
+        ),
+        (r". as $x | reduce (1) as $i (.; ($x.a) = 9)?", r#"{"a":9}"#),
+        // A binding made inside the UPDATE does not hide `$x`'s node.
+        (
+            r". as $x | reduce (1) as $i (.; . as $y | ($x.a) = 9)",
+            r#"{"a":9}"#,
+        ),
+        // `. + {}` hands back the same `Rc`, so INIT is still `$x`'s node.
+        (
+            r". as $x | reduce (1) as $i (. + {}; ($x.a) = 9)",
+            r#"{"a":9}"#,
+        ),
+        // EXTRACT runs against each UPDATE output and is witnessed per
+        // output: an identity UPDATE leaves every step at `$x`'s node.
+        (r". as $x | foreach (1) as $i (.; .; path($x))", "[]"),
+        (
+            r". as $x | foreach (1) as $i (.; .; ($x.a) = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            r". as $x | [foreach (1,2) as $i (.; .; ($x.a) = $i)]",
+            r#"[{"a":1},{"a":2}]"#,
+        ),
+        // A consumer's stop ends the fold before the refusing second step.
+        (
+            r". as $x | [limit(1; foreach (1,2) as $i (.; ($x.a) = 9))]",
+            r#"[{"a":9}]"#,
+        ),
+        // A rebuilt equal EXTRACT input is still caught as a refusal.
+        (
+            r#". as $x | [foreach (1,2) as $i (.; {"a":1}; try (($x.a) = $i) catch "E")]"#,
+            r#"["E","E"]"#,
+        ),
+    ];
+    // jq refuses these too: the accumulator is a rebuilt copy on the step
+    // that writes through `$x`, either from the start (a literal INIT, an
+    // UPDATE `.a`) or after an earlier step's write.
+    let refusing = [
+        r". as $x | reduce (1,2) as $i (.; ($x.a) = 9)",
+        r". as $x | reduce (1,2) as $i (.; ($x.a) |= .+1)",
+        r#". as $x | reduce (1) as $i ({"a":1}; ($x.a) = 9)"#,
+        r". as $x | foreach (1) as $i (.; .a; ($x.a) = 9)",
+        r". as $x | foreach (1,2) as $i (.; ($x.a) = 9; path($x))",
+    ];
+    for (filter, want) in answering {
+        for (args, program) in [
+            (&["-c"][..], filter.to_string()),
+            (&["-n", "-c"][..], format!("input | {filter}")),
+        ] {
+            let mut argv: Vec<&str> = args.to_vec();
+            argv.push(&program);
+            let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+            assert_eq!(
+                (stdout.trim(), code),
+                (want, 0),
+                "#3181: `{program}` ({args:?}) must answer as jq 1.7.1 does; stderr={stderr:?}"
+            );
+        }
+    }
+    for filter in refusing {
+        for (args, program) in [
+            (&["-c"][..], filter.to_string()),
+            (&["-n", "-c"][..], format!("input | {filter}")),
+        ] {
+            let mut argv: Vec<&str> = args.to_vec();
+            argv.push(&program);
+            let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+            assert_eq!(
+                (stdout.trim(), code),
+                ("", 5),
+                "#3181: `{program}` ({args:?}) must refuse as jq 1.7.1 does; stderr={stderr:?}"
+            );
+            assert!(
+                stderr.contains("Invalid path expression"),
+                "#3181: `{program}` ({args:?}) refused for the wrong reason: {stderr:?}"
+            );
+        }
+    }
+    // A navigated bind's marker is `Untracked`, which the hoist leaves
+    // alone; a step whose accumulator is that node promotes it (#3037), so
+    // the fold keeps the operand as written for it too. Stdin route only:
+    // on `-n 'input | ...'` the bind's witness is an owned-identity token
+    // `RootWitness::of_owned` cannot name, which still refuses.
+    for (filter, want) in [
+        (
+            r".a as $y | .a | reduce (1) as $i (.; ($y.b) = 9)",
+            r#"{"b":9}"#,
+        ),
+        (
+            r".a as $y | reduce (1) as $i (.a; ($y.b) = 9)",
+            r#"{"b":9}"#,
+        ),
+        (r".a as $y | foreach (1) as $i (.; .a; path($y))", "[]"),
+        (
+            r".a as $y | . as $x | reduce (1) as $i (.; .a | path($y))",
+            "[]",
+        ),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"c":{"b":1}}"#))?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (want, 0),
+            "#3181: `{filter}`; stderr={stderr:?}"
+        );
+    }
+    // A sibling with an equal value is a different node: refused, as in jq.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r".a as $y | .c | reduce (1) as $i (.; ($y.b) = 9)"],
+        Some(r#"{"a":{"b":1},"c":{"b":1}}"#),
+    )?;
+    assert_eq!((stdout.trim(), code), ("", 5), "stderr={stderr:?}");
+    // The first `foreach` step answers and emits; the second, whose
+    // accumulator the first step rebuilt, refuses.
+    for (args, program) in [
+        (
+            &["-c"][..],
+            r". as $x | foreach (1,2) as $i (.; ($x.a) = 9)",
+        ),
+        (
+            &["-n", "-c"][..],
+            r"input | . as $x | foreach (1,2) as $i (.; ($x.a) = 9)",
+        ),
+    ] {
+        let mut argv: Vec<&str> = args.to_vec();
+        argv.push(program);
+        let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (r#"{"a":9}"#, 5),
+            "stderr={stderr:?}"
+        );
+        assert!(stderr.contains("Invalid path expression"), "{stderr:?}");
     }
     Ok(())
 }
