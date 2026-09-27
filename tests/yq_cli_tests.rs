@@ -25131,14 +25131,12 @@ fn test_yq_base64d_container_stringifies_to_empty_1109() -> Result<()> {
     Ok(())
 }
 
-/// jq mode is unaffected by #1109's yq-only stringification: it must keep
-/// erroring on every non-string scalar, exactly as before.
+/// jq `@urid` is unaffected by #1109's yq-only stringification. `@base64d`
+/// now follows jq's stringify-first rule instead (#3358).
 #[test]
-fn test_jq_urid_base64d_still_reject_non_string_1109() -> Result<()> {
-    for filter in ["@urid", "@base64d"] {
-        let (_out, code) = run_jq_stdin(filter, "42", &[])?;
-        assert_ne!(code, 0, "filter {filter:?} unexpectedly succeeded");
-    }
+fn test_jq_urid_still_rejects_non_string_1109() -> Result<()> {
+    let (_out, code) = run_jq_stdin("@urid", "42", &[])?;
+    assert_ne!(code, 0);
     Ok(())
 }
 

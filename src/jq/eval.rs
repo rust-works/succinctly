@@ -17409,8 +17409,9 @@ fn format_base64<S: EvalSemantics>(
 /// error) is this decoder's own leniency/strictness on the *string* it's
 /// given, unrelated to what type reached it. A container stringifies to the
 /// empty string (#1109), which trivially decodes to `""` (zero chunks)
-/// rather than needing its own early return. jq mode is unaffected: it
-/// keeps erroring on every non-string type, unchanged from before.
+/// rather than needing its own early return. jq mode stringifies every value
+/// before decoding, like `@text`; decode errors describe that stringified
+/// value rather than the original type (#3358).
 ///
 /// jq mode's decode algorithm matches real jq's exactly (see the
 /// truncate-at-first-`=` comment inside), and validates every character of
@@ -17425,13 +17426,12 @@ fn format_base64<S: EvalSemantics>(
 /// this (#1135), rather than sharing jq's truncate-at-first-`=` loop.
 fn format_base64d<S: EvalSemantics>(
     value: &OwnedValue,
-    optional: bool,
+    _optional: bool,
 ) -> Result<String, EvalError> {
     let s = match value {
         OwnedValue::String(s) => s.clone(),
         _ if S::TAG == EvalTag::Yq => yq_stringify_scalar_or_empty::<S>(value),
-        _ if optional => return Ok(String::new()),
-        _ => return Err(EvalError::type_error("string", value.type_name())),
+        _ => owned_to_string::<S>(value),
     };
 
     // Simple base64 decoding of a single non-padding character.
@@ -17644,7 +17644,9 @@ fn format_base64d<S: EvalSemantics>(
     // (`base64_invalid_data`/`base64_trailing_byte`, #1146) -- yq's
     // uniform, byte-position-based `base64_illegal_data` lives entirely in
     // the strict decoder above now.
-    let char_error = |_pos: usize| -> EvalError { EvalError::base64_invalid_data(value) };
+    let char_error = |_pos: usize| -> EvalError {
+        EvalError::base64_invalid_data(&OwnedValue::String(s.clone()))
+    };
 
     for (chunk_index, chunk) in prefix.chunks(4).enumerate() {
         let chunk_start = chunk_index * 4;
@@ -17688,7 +17690,7 @@ fn format_base64d<S: EvalSemantics>(
                 // the 2/3/4-length arms above, which already validate
                 // every byte before deciding anything.
                 return Err(if decode_char(chunk[0]).is_some() {
-                    EvalError::base64_trailing_byte(value)
+                    EvalError::base64_trailing_byte(&OwnedValue::String(s.clone()))
                 } else {
                     char_error(chunk_start)
                 });
