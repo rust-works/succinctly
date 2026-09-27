@@ -60,9 +60,13 @@ that `W` can be a borrowed slice (mmap) and so that select support is a compile-
 Find the matching closing parenthesis for position i.
 
 Algorithm:
-1. Track "excess" (opens - closes)
-2. Find first position where excess drops to starting level
-3. Use RangeMin index for O(1) amortized lookup
+1. If the next bit is a close, `i` is a leaf and `i + 1` is the answer. Leaves are most of a
+   document's nodes (every key and scalar), so this is checked before anything else: it takes a
+   sibling hop from ~170 instructions to a word load (#3140, −14% instructions on `jq .` over a wide
+   object)
+2. Otherwise track "excess" (opens - closes)
+3. Find first position where excess drops to starting level
+4. Use RangeMin index for O(1) amortized lookup
 
 ### find_open(i)
 
