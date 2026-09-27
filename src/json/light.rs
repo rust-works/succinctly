@@ -3179,6 +3179,17 @@ pub(crate) fn is_canonical_compact_jq_span(bytes: &[u8]) -> bool {
 /// `stream_json_pretty`'s own real depth-exceeded error, not have this
 /// checker's stack overflow instead.
 fn scan_canonical_value(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
+    scan_canonical_element(bytes, pos, depth)
+}
+
+/// [`scan_canonical_value`]'s body, inlined into the array and object loops
+/// so a scalar element is scanned in the loop itself and only a container
+/// pays the recursive call (#3167). The call per element was most of the
+/// scan's own cost on a numbers-only document. The depth check stays on
+/// every element, scalars included, so a scalar at the ceiling still bails
+/// exactly where `stream_json_pretty`'s counter would.
+#[inline(always)]
+fn scan_canonical_element(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
     if depth >= MAX_VALUE_TREE_DEPTH {
         return None;
     }
@@ -3421,7 +3432,7 @@ fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize
         if bytes.get(after_key) != Some(&b':') {
             return None;
         }
-        i = scan_canonical_value(bytes, after_key + 1, depth + 1)?;
+        i = scan_canonical_element(bytes, after_key + 1, depth + 1)?;
         match bytes.get(i) {
             Some(b',') => i += 1,
             Some(b'}') => return Some(i + 1),
@@ -3439,7 +3450,7 @@ fn scan_canonical_array(bytes: &[u8], pos: usize, depth: usize) -> Option<usize>
         return Some(i + 1);
     }
     loop {
-        i = scan_canonical_value(bytes, i, depth + 1)?;
+        i = scan_canonical_element(bytes, i, depth + 1)?;
         match bytes.get(i) {
             Some(b',') => i += 1,
             Some(b']') => return Some(i + 1),

@@ -645,6 +645,10 @@ pub(crate) fn is_jq_canonical_number(raw: &[u8]) -> bool {
 /// the document directly and checks the byte after it, so it recognises a
 /// number in one pass instead of finding the greedy span first and then
 /// re-reading it here: one definition of "canonical", two ways to ask.
+// `inline(always)`: the scan's call is per number, usually a one- or
+// two-byte token, where an out-of-line call cost as much as the scan
+// (33 Ir per single-digit number on a 7950X, #3167).
+#[inline(always)]
 #[must_use]
 pub(crate) fn jq_canonical_number_prefix(raw: &[u8]) -> Option<usize> {
     let mut i = 0usize;
