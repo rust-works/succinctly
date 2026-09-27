@@ -506,10 +506,9 @@ struct Parser<'a> {
     input: &'a str,
     pos: usize,
     mode: ParserMode,
-    /// Whether yq mode accepts jq-only surface real yq's lexer rejects
-    /// (`paths`, `getpath`, `limit`, `gsub`/`scan`/`splits`, etc.), gated
-    /// behind `--jq-extensions` (#1512). Ignored in jq mode, which always
-    /// accepts this surface.
+    /// Whether yq mode accepts jq-only syntax real yq's lexer rejects:
+    /// builtins such as `paths`/`getpath` (#1512) and generic postfix `?`
+    /// such as `length?` (#3378). Ignored in jq mode, which always accepts it.
     jq_extensions: bool,
     /// Current `Pattern` recursion depth; see [`MAX_PATTERN_DEPTH`].
     pattern_depth: usize,
@@ -8465,14 +8464,15 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
 ///
 /// Use `ParserMode::Yq` to allow kebab-case identifiers like `.my-key`. In
 /// `Yq` mode, jq-only builtins real yq's lexer rejects (`paths`, `getpath`,
-/// `limit`, `gsub`/`scan`/`splits`, etc.) are rejected too; use
-/// [`parse_with_mode_and_extensions`] to accept them (#1512).
+/// `limit`, etc.) and generic postfix `?` (`length?`, `(.x)?`) are rejected;
+/// use [`parse_with_mode_and_extensions`] to accept them (#1512, #3378).
 pub fn parse_with_mode(input: &str, mode: ParserMode) -> Result<Expr, ParseError> {
     parse_with_mode_and_extensions(input, mode, false)
 }
 
 /// Parse a jq expression with a specific parser mode, optionally accepting
-/// jq-only builtins real yq's lexer rejects (`--jq-extensions`, #1512).
+/// jq-only builtins and generic postfix `?` that real yq's lexer rejects
+/// (`--jq-extensions`, #1512, #3378).
 ///
 /// `jq_extensions` is ignored in `ParserMode::Jq`, which always accepts this
 /// surface.
@@ -8529,15 +8529,15 @@ pub fn parse_program(input: &str) -> Result<Program, ParseError> {
 ///
 /// Use `ParserMode::Yq` to allow kebab-case identifiers like `.my-key`. In
 /// `Yq` mode, jq-only builtins real yq's lexer rejects (`paths`, `getpath`,
-/// `limit`, `gsub`/`scan`/`splits`, etc.) are rejected too; use
-/// [`parse_program_with_mode_and_extensions`] to accept them (#1512).
+/// `limit`, etc.) and generic postfix `?` (`length?`, `(.x)?`) are rejected;
+/// use [`parse_program_with_mode_and_extensions`] to accept them (#1512, #3378).
 pub fn parse_program_with_mode(input: &str, mode: ParserMode) -> Result<Program, ParseError> {
     parse_program_with_mode_and_extensions(input, mode, false)
 }
 
 /// Parse a complete jq program with a specific parser mode, optionally
-/// accepting jq-only builtins real yq's lexer rejects (`--jq-extensions`,
-/// #1512).
+/// accepting jq-only builtins and generic postfix `?` that real yq's lexer
+/// rejects (`--jq-extensions`, #1512, #3378).
 ///
 /// `jq_extensions` is ignored in `ParserMode::Jq`, which always accepts this
 /// surface.
