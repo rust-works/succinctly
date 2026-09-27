@@ -1222,48 +1222,26 @@ impl<'a> Parser<'a> {
         Ok(self.input[start..self.pos].to_string())
     }
 
-    /// Parse an unquoted field name. In yq, `?` can be part of the key:
-    /// `.x??` reads `x?` optionally and `.x?y` reads `x?y`.
-    /// Leave the final adjacent `?` for the navigation-optional parser.
-    /// The `?//` spelling has separate yq behavior (#3370), so keep its
-    /// existing parse route until that issue is addressed.
+    /// Parse an unquoted field name. In yq, `?` and `/` can be part of the
+    /// key: `.x?//1` reads `x?//1`, while `.x??` reads `x?` optionally.
+    /// Leave only the final adjacent `?` for the navigation-optional parser.
     fn parse_field_ident(&mut self) -> Result<String, ParseError> {
         let mut name = self.parse_ident()?;
         if self.mode != ParserMode::Yq {
             return Ok(name);
         }
 
-        while self.peek() == Some('?') {
-            let questions_start = self.pos;
-            while self.peek() == Some('?') {
-                self.next();
-            }
-            let questions_end = self.pos;
-            if self.peek_str(2) == "//" {
-                self.pos = questions_start;
-                break;
-            }
-
-            if self
-                .peek()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-')
-            {
-                name.push_str(&self.input[questions_start..questions_end]);
-                let tail_start = self.pos;
-                while let Some(c) = self.peek() {
-                    if c.is_alphanumeric() || c == '_' || c == '-' {
-                        self.next();
-                    } else {
-                        break;
-                    }
-                }
-                name.push_str(&self.input[tail_start..self.pos]);
-            } else {
-                name.push_str(&self.input[questions_start..questions_end - 1]);
-                self.pos = questions_end - 1;
-                break;
-            }
+        let suffix_start = self.pos;
+        while self
+            .peek()
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/' | '?'))
+        {
+            self.next();
         }
+        if self.pos > suffix_start && self.input.as_bytes()[self.pos - 1] == b'?' {
+            self.pos -= 1;
+        }
+        name.push_str(&self.input[suffix_start..self.pos]);
 
         Ok(name)
     }
@@ -2779,8 +2757,12 @@ impl<'a> Parser<'a> {
                     Expr::Field(name)
                 };
 
-                // Check for optional
+                // yq lexes a spaced `?` as an error, not a field suffix.
+                let field_end = self.pos;
                 self.skip_ws();
+                if self.mode == ParserMode::Yq && self.pos > field_end && self.peek() == Some('?') {
+                    return Err(ParseError::new("unexpected '?' after whitespace", self.pos));
+                }
                 if self.at_postfix_question() {
                     self.next();
                     expr = Expr::Optional(Box::new(expr));
@@ -7072,26 +7054,25 @@ impl<'a> Parser<'a> {
                     if self.peek() == Some('[') {
                         let bracket = self.parse_index_bracket_with_optional()?;
                         push_bracket(&mut chain, bracket);
-                    } else if self.peek() == Some('"') {
-                        // Quoted field access `."key"`
-                        let name = self.parse_string_literal()?;
-                        let mut field_expr = Expr::Field(name);
-
-                        // Check for optional
-                        self.skip_ws();
-                        if self.at_postfix_question() {
-                            self.next();
-                            field_expr = Expr::Optional(Box::new(field_expr));
-                        }
-
-                        chain.push(field_expr);
                     } else {
-                        // Field access
-                        let name = self.parse_field_ident()?;
+                        let name = if self.peek() == Some('"') {
+                            self.parse_string_literal()?
+                        } else {
+                            self.parse_field_ident()?
+                        };
                         let mut field_expr = Expr::Field(name);
 
-                        // Check for optional
+                        let field_end = self.pos;
                         self.skip_ws();
+                        if self.mode == ParserMode::Yq
+                            && self.pos > field_end
+                            && self.peek() == Some('?')
+                        {
+                            return Err(ParseError::new(
+                                "unexpected '?' after whitespace",
+                                self.pos,
+                            ));
+                        }
                         if self.at_postfix_question() {
                             self.next();
                             field_expr = Expr::Optional(Box::new(field_expr));
@@ -11658,12 +11639,7 @@ mod tests {
         ] {
             assert!(parse(filter).is_ok(), "jq rejected {filter}");
         }
-        for filter in [".x?//1", ".x ?// 1"] {
-            assert!(
-                parse_with_mode(filter, ParserMode::Yq).is_ok(),
-                "yq changed {filter}"
-            );
-        }
+        // yq's distinct `?//` spellings are pinned below in #3370's test.
     }
 
     #[test]
@@ -11744,5 +11720,32 @@ mod tests {
             parse(".x??").unwrap(),
             Expr::Optional(Box::new(Expr::Optional(Box::new(Expr::Field("x".into())))))
         );
+    }
+
+    #[test]
+    fn test_yq_adjacent_question_slashes_are_field_names_3370() {
+        for (filter, name) in [
+            (".x?//1", "x?//1"),
+            (".x??//1", "x??//1"),
+            (".x?//true", "x?//true"),
+            (".x//1", "x//1"),
+        ] {
+            assert_eq!(
+                parse_with_mode(filter, ParserMode::Yq).unwrap(),
+                Expr::Field(name.into()),
+                "{filter}"
+            );
+        }
+        assert_eq!(
+            parse_with_mode(".x?//1?", ParserMode::Yq).unwrap(),
+            Expr::Optional(Box::new(Expr::Field("x?//1".into())))
+        );
+        for filter in [".x ?// 1", ".x ??// 1", ".x ?", ".a.x ?// 1"] {
+            assert!(
+                parse_with_mode(filter, ParserMode::Yq).is_err(),
+                "yq accepted {filter}"
+            );
+        }
+        assert!(parse(".x?//1").is_err());
     }
 }

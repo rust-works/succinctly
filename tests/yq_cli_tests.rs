@@ -51,6 +51,34 @@ fn test_question_marks_in_yq_field_names_3356() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: adjacent `?//` is part of an unquoted key, while a
+/// question mark separated from the field by whitespace is a lexer error.
+#[test]
+fn test_yq_question_slash_field_spelling_3370() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        ("{}", ".x?//1", "null\n"),
+        (r#"{"x":0,"x?//1":5}"#, ".x?//1", "5\n"),
+        (r#"{"x??//1":7}"#, ".x??//1", "7\n"),
+        (r#"{"x?//1":5}"#, ".x?//1?", "5\n"),
+        (r#"{"x//1":6}"#, ".x//1", "6\n"),
+        (r#"{"a":{"x?//1":8}}"#, ".a.x?//1", "8\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input} | {filter}"
+        );
+    }
+    for filter in [".x ?// 1", ".x ??// 1", ".x ?", ".a.x ?// 1"] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "{}", args)?;
+        assert_eq!(stdout, "", "{filter}");
+        assert_eq!(code, 1, "{filter}: {stderr}");
+        assert!(!stderr.is_empty(), "{filter}");
+    }
+    Ok(())
+}
+
 /// Captured from yq v4.53.3 with JSON input and compact JSON output.
 #[test]
 fn test_pick_keys_on_json_cli_3026() -> Result<()> {
