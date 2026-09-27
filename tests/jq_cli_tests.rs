@@ -11,6 +11,79 @@ use anyhow::Result;
 use proptest::prelude::*;
 use tempfile::NamedTempFile;
 
+/// Captured against /usr/bin/jq 1.7.1 with input {"a":1} (#3277).
+#[test]
+fn test_question_alternative_and_try_catch_compile_boundaries_3277() -> Result<()> {
+    let input = r#"{"a":1}"#;
+    for filter in [
+        ".a ?// 1",
+        ".a?//1",
+        "(.a)?//1",
+        ".[0]?//1",
+        r#"."a"?//1"#,
+        "path(.a?//1)",
+        "[.a?//1]",
+        ".a?//=1",
+        ".a??//1",
+        ".a ??// 1",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 3, "{filter}: {stderr}");
+        assert!(stdout.is_empty(), "{filter}: {stdout}");
+        assert!(stderr.contains("?//"), "{filter}: {stderr}");
+    }
+    for filter in [
+        "try (.a)? catch .",
+        "try length? catch .",
+        "try $__loc__? catch .",
+        r#"try error("x")? catch ."#,
+        "try .a? ? catch .",
+        "try .a?? catch .",
+        "try .[]?? catch .",
+        r#"try "\(1)"? catch ."#,
+        "try .. ? catch .",
+        "try (try .a)? catch .",
+        "try try length? catch .",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 3, "{filter}: {stderr}");
+        assert!(stdout.is_empty(), "{filter}: {stdout}");
+        assert!(stderr.contains("catch"), "{filter}: {stderr}");
+    }
+    for (filter, expected) in [
+        (".a? // 1", "1\n"),
+        ("[.[] as [$a] ?// $a | $a]", "[1]\n"),
+        (". as $x?//$y | $x", "{\"a\":1}\n"),
+        ("1 as $x ?// $y | 2", "2\n"),
+        ("reduce . as $x ?// [$x] (0; 1)", "1\n"),
+        ("try .a? catch .", "1\n"),
+        ("try .[0]? catch .", ""),
+        ("try .[]? catch .", "1\n"),
+        (r#"try ."a"? catch ."#, "1\n"),
+        (
+            "try .a?[0] catch .",
+            "\"Cannot index number with number\"\n",
+        ),
+        ("try .a[]? catch .", ""),
+        ("try .a.b? catch .", ""),
+        ("try (.a?) catch .", "1\n"),
+        ("try (.a)? | 1", "1\n"),
+        ("try -length? catch .", "-1\n"),
+        ("try -(.a)? catch .", "-1\n"),
+        ("try label $f | length? catch .", "1\n"),
+        ("try def f: 1; f? catch .", "1\n"),
+        ("try try .a? catch .", "1\n"),
+        ("try if true then 1 else 2 end catch .", "1\n"),
+    ] {
+        assert_eq!(
+            run_jq_full(&["-c", filter], Some(input))?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// Captured from /usr/bin/jq 1.7.1-apple for both CLI input routes.
 #[test]
 fn test_parenthesized_pattern_bind_pipe_retry_cli_3031() -> Result<()> {

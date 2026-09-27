@@ -655,6 +655,9 @@ struct Parser<'a> {
     /// widen this to a return-type change through every intervening
     /// precedence level.
     last_primary_is_term: bool,
+    /// Whether the outermost completed primary consumed jq's generic `?`.
+    /// Navigation optionals inside that primary do not close a `try` body.
+    last_primary_ended_generic_optional: bool,
 }
 
 /// Where one ordinary function call's identifier begins in the filter source
@@ -934,12 +937,18 @@ impl<'a> Parser<'a> {
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
             wrong_arity_call: None,
             last_primary_is_term: true,
+            last_primary_ended_generic_optional: false,
         }
     }
 
     /// Peek at the current character without consuming it.
     fn peek(&self) -> Option<char> {
         self.input[self.pos..].chars().next()
+    }
+
+    /// jq's lexer takes `?//` as a single pattern-alternative token.
+    fn at_postfix_question(&self) -> bool {
+        self.peek() == Some('?') && !(self.mode == ParserMode::Jq && self.peek_str(3) == "?//")
     }
 
     /// Peek at the next up to `n` bytes, for comparing against a short ASCII
@@ -1951,7 +1960,7 @@ impl<'a> Parser<'a> {
     fn parse_index_bracket_with_optional(&mut self) -> Result<Bracket, ParseError> {
         let bracket = self.parse_index_bracket()?;
         self.skip_ws();
-        if self.peek() == Some('?') {
+        if self.at_postfix_question() {
             self.next();
             Ok(match bracket {
                 Bracket::Static(expr) => Bracket::Static(Expr::Optional(expr.into())),
@@ -2374,9 +2383,7 @@ impl<'a> Parser<'a> {
         let mut wraps = 0;
         loop {
             self.skip_ws();
-            if self.peek() != Some('?')
-                || (self.mode == ParserMode::Jq && self.peek_str(3) == "?//")
-            {
+            if !self.at_postfix_question() {
                 break;
             }
             self.next();
@@ -2396,6 +2403,13 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        if self.mode == ParserMode::Jq && self.peek_str(3) == "?//" {
+            return Err(ParseError::new(
+                "syntax error, unexpected '?//' (only valid between destructuring alternatives)",
+                self.pos,
+            ));
+        }
+        self.last_primary_ended_generic_optional = wraps > 0;
         Ok(expr)
     }
 
@@ -2721,7 +2735,7 @@ impl<'a> Parser<'a> {
 
                 // Check for optional
                 self.skip_ws();
-                if self.peek() == Some('?') {
+                if self.at_postfix_question() {
                     self.next();
                     expr = Expr::Optional(Box::new(expr));
                 }
@@ -3104,7 +3118,15 @@ impl<'a> Parser<'a> {
 
         // Parse the expression to try
         let expr = self.parse_primary()?;
+        let ended_generic_optional = self.last_primary_ended_generic_optional;
         self.skip_ws();
+
+        if self.mode == ParserMode::Jq && ended_generic_optional && self.matches_keyword("catch") {
+            return Err(ParseError::new(
+                "syntax error, unexpected 'catch' after generic '?' (parenthesize the optional body)",
+                self.pos,
+            ));
+        }
 
         // Check for optional catch
         let catch = if self.matches_keyword("catch") {
@@ -7011,7 +7033,7 @@ impl<'a> Parser<'a> {
 
                         // Check for optional
                         self.skip_ws();
-                        if self.peek() == Some('?') {
+                        if self.at_postfix_question() {
                             self.next();
                             field_expr = Expr::Optional(Box::new(field_expr));
                         }
@@ -7024,7 +7046,7 @@ impl<'a> Parser<'a> {
 
                         // Check for optional
                         self.skip_ws();
-                        if self.peek() == Some('?') {
+                        if self.at_postfix_question() {
                             self.next();
                             field_expr = Expr::Optional(Box::new(field_expr));
                         }
@@ -11563,5 +11585,76 @@ mod tests {
 
         assert!(parse("@").is_err());
         assert!(parse_with_mode("@", ParserMode::Yq).is_err());
+    }
+
+    #[test]
+    fn test_question_alternative_token_only_in_patterns_3277() {
+        for filter in [
+            ".a ?// 1",
+            ".a?//1",
+            "(.a)?//1",
+            ".[0]?//1",
+            r#"."a"?//1"#,
+            "path(.a?//1)",
+            "[.a?//1]",
+            ".a?//=1",
+            ".a??//1",
+            ".a ??// 1",
+        ] {
+            assert!(parse(filter).is_err(), "jq accepted {filter}");
+        }
+        for filter in [
+            ".a? // 1",
+            "[.[] as [$a] ?// $a | $a]",
+            ". as $x?//$y | $x",
+            "1 as $x ?// $y | 2",
+            "reduce . as $x ?// [$x] (0; 1)",
+        ] {
+            assert!(parse(filter).is_ok(), "jq rejected {filter}");
+        }
+        for filter in [".x?//1", ".x ?// 1"] {
+            assert!(
+                parse_with_mode(filter, ParserMode::Yq).is_ok(),
+                "yq changed {filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_body_generic_question_closes_catch_3277() {
+        for filter in [
+            "try (.a)? catch .",
+            "try length? catch .",
+            "try $__loc__? catch .",
+            r#"try error("x")? catch ."#,
+            "try .a? ? catch .",
+            "try .a?? catch .",
+            "try .[]?? catch .",
+            r#"try "\(1)"? catch ."#,
+            "try .. ? catch .",
+            "try (try .a)? catch .",
+            "try try length? catch .",
+        ] {
+            assert!(parse(filter).is_err(), "jq accepted {filter}");
+        }
+        for filter in [
+            "try .a? catch .",
+            "try .[0]? catch .",
+            "try .[]? catch .",
+            r#"try ."a"? catch ."#,
+            "try .a?[0] catch .",
+            "try .a[]? catch .",
+            "try .a.b? catch .",
+            "try (.a?) catch .",
+            "try (.a)? | 1",
+            "try -length? catch .",
+            "try -(.a)? catch .",
+            "try label $f | length? catch .",
+            "try def f: 1; f? catch .",
+            "try try .a? catch .",
+            "try if true then 1 else 2 end catch .",
+        ] {
+            assert!(parse(filter).is_ok(), "jq rejected {filter}");
+        }
     }
 }
