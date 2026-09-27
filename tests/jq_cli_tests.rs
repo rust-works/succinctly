@@ -56843,6 +56843,113 @@ fn test_optional_generator_stops_at_first_raise_2752() -> Result<()> {
     Ok(())
 }
 
+/// #2754: `reduce`/`foreach` must consume a source *lazily*, one element at
+/// a time, running UPDATE on each element as it arrives rather than fully
+/// materializing the source first. Filed after adversarial review of #2680
+/// (PR #2753): `path(.a[]|.b|.c[0:1])` on `{"a":[{"b":{}},5]}` walks
+/// element 0 to a valid (slice-typed) path and would fail walking element 1
+/// (`5|.b`) -- but jq's `setpath` on element 0's path *itself* raises first
+/// (a slice can't take a scalar `9`), and since jq pulls one source element
+/// at a time, element 1 is never even demanded. An eager consumer that
+/// materializes the whole source before folding would instead hit element
+/// 1's walk failure first and report the wrong error -- which is what
+/// `main` (`56926e912`) did for `reduce`, while `foreach` already pulled
+/// lazily and agreed with jq.
+///
+/// Re-investigated while triaging and found already fixed on `main`,
+/// confirmed live against jq 1.7.1 for the issue's own repro (both `reduce`
+/// and `foreach` now report the identical `setpath` error and agree with
+/// each other) and the "mirror problem" checks its own suggested fix
+/// direction asked to verify first: an UPDATE (not the source) raising
+/// mid-fold, and a non-`path()` source for both `reduce` and `foreach`.
+#[test]
+fn test_reduce_folds_partial_prefix_before_raising_2754() -> Result<()> {
+    // The issue's own repro. `reduce` has no partial output on error (only
+    // `foreach` does), so stdout is empty here -- the error is on stderr,
+    // exit code nonzero.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "reduce path(.a[] | .b | .c[0:1]) as $p (.; setpath($p; 9))",
+        ],
+        Some(r#"{"a":[{"b":{}},5]}"#),
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim_end(), "");
+    assert!(
+        stderr.contains("A slice of an array can only be assigned another array"),
+        "must report setpath's own error on element 0, not element 1's walk failure: {stderr:?}"
+    );
+
+    // foreach over the identical source, already correct before this issue
+    // was filed -- pinned alongside reduce so a future change cannot fix
+    // one and break the other. Also no stdout: element 0's own UPDATE
+    // raises before foreach ever emits anything.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "foreach path(.a[] | .b | .c[0:1]) as $p (.; setpath($p; 9))",
+        ],
+        Some(r#"{"a":[{"b":{}},5]}"#),
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim_end(), "");
+    assert!(
+        stderr.contains("A slice of an array can only be assigned another array"),
+        "{stderr:?}"
+    );
+
+    // Mirror problem: the UPDATE itself (not the source) raises mid-fold.
+    // No source-side generator involved at all, so this checks reduce's own
+    // fold loop independently of the source-laziness question above.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"reduce .a[] as $x (0; if $x == 2 then error("boom") else . + $x end)"#,
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim_end(), "");
+    assert!(stderr.contains("boom"), "{stderr:?}");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"foreach .a[] as $x (0; if $x == 2 then error("boom") else . + $x end)"#,
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    // foreach already emitted element 0's fold (0 + 1 = 1) before element
+    // 1 raised.
+    assert_eq!(stdout.trim_end(), "1");
+    assert!(stderr.contains("boom"), "{stderr:?}");
+
+    // Non-path() source, both consumers: a plain array iteration hitting a
+    // non-numeric element mid-fold.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "reduce .[] as $x (0; . + $x)"], Some("[1,2,{}]"))?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim_end(), "");
+    assert!(
+        stderr.contains("number (3) and object ({}) cannot be added"),
+        "{stderr:?}"
+    );
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "foreach .[] as $x (0; . + $x)"], Some("[1,2,{}]"))?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    // foreach already emitted 0+1=1 and 1+2=3 before {} raised.
+    assert_eq!(stdout.trim_end(), "1\n3");
+    assert!(
+        stderr.contains("number (3) and object ({}) cannot be added"),
+        "{stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #2680: the one *write* whose output moved. `setpath` consumes `path()`'s
 /// output, so a path that was previously dropped now reaches it and the
 /// write happens -- which is what jq does, since jq produced that path all
