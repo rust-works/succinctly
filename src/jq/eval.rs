@@ -34846,11 +34846,12 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // first reports "boolean (false) cannot be negated" where jq's live
         // path-tracked evaluation reaches `.a`'s own navigation refusal
         // first. Resolving `inner` live surfaces that refusal the same way
-        // every other arm here does; `arith_negate`'s own error (an
-        // ordinary catchable `EvalError`, unrelated to path-refusal) still
-        // applies once `inner` resolves to something.
+        // every other arm here does. Reset the negation escape on each
+        // branch: `?//` can retry after a failed alternative and resolve a
+        // later one. A final `arith_negate` error still escapes through the
+        // shared stop classifier so `?//` sees its proper retryability.
         Expr::Negate(inner) if S::TAG == EvalTag::Jq && !trackable => {
-            let mut inner_flow: Option<ResolveFlow> = None;
+            let mut negate_escape: Option<EvalEscape> = None;
             let flow = resolve_node_sink::<S>(
                 inner,
                 value,
@@ -34858,15 +34859,17 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 snapshot,
                 frame,
                 keep,
-                &mut |branch| match arith_negate::<S>(branch.value.into_owned()) {
-                    Ok(negated) => sink(untracked_at_register(Cow::Owned(negated), false, value)),
-                    Err(e) => {
-                        inner_flow = Some(ResolveFlow::Escaped(e.into()));
-                        Demand::Stop
+                &mut |branch| {
+                    negate_escape = None;
+                    match arith_negate::<S>(branch.value.into_owned()) {
+                        Ok(negated) => {
+                            sink(untracked_at_register(Cow::Owned(negated), false, value))
+                        }
+                        Err(e) => stop_with_eval_escape(&mut negate_escape, e.into()),
                     }
                 },
             );
-            inner_flow.unwrap_or(flow)
+            negate_escape.map_or(flow, ResolveFlow::Escaped)
         }
 
         // #2267: both computed-navigation resolvers drive their own
@@ -47926,12 +47929,12 @@ pub(crate) fn stop_with_escape(slot: &mut Option<Control>, control: Control) -> 
 }
 
 /// [`stop_with_escape`] for `resolve_index_expr_sink`/`resolve_slice_expr_sink`
-/// (#2924), whose out-of-band slot holds an [`EvalEscape`] rather than a bare
-/// [`Control`] -- their own return type ([`ResolveFlow`]) has a dedicated
-/// `Escaped` variant, so the escape these two sinks stash is never actually
-/// lost at their own boundary the way it would be for a driver whose return
-/// type is a bare `Flow`/`Demand`. They still owe `?//` the same
-/// classification `stop_with_escape` records, though: the `key`/bound
+/// (#2924) and the live negation arm of [`resolve_node_sink`] (#3299), whose
+/// out-of-band slot holds an [`EvalEscape`] rather than a bare [`Control`] --
+/// their return type ([`ResolveFlow`]) has a dedicated `Escaped` variant, so
+/// the escape each stashes is never lost at its own boundary the way it would
+/// be for a driver returning bare `Flow`/`Demand`. They still owe `?//` the same
+/// classification `stop_with_escape` records, though: the key/bound/operand
 /// generator they are driving sees only this stop, and if a `?//` sits
 /// inside that generator's own body it needs `nonretryable_stop` set to
 /// classify it correctly, exactly as any other escape-behind-a-stop does.
