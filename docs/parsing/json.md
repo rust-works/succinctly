@@ -405,7 +405,19 @@ The late-fail twin is the precheck-cost control CLAUDE.md's O6/#1514 lesson call
 
 **Rejected: SIMD-skipping a string's plain bytes.** A jq-table `define_escape_scanner!` instantiation (`"`, `\`, `< 0x20`, DEL) plus #2963's 8-byte word probe cut `scan_json_string_span` from 10.54 to 7.02 Ir/byte (−33% on that arm, −4.8% Ir on the whole run on the 7950X), and *regressed wall-clock on both boxes*: data 10 MB +8.5%/+9.4% (M4 Pro, reproduced twice), +2.9%/+9.0% (7950X); users 2 MB +3.5–5.6% / +0.4–3.4%; the late-fail row it existed to help got worse (+1.5–3.0%); and the pretty row moved +3.0%/+4.4% on the 7950X on identical instruction counts. The strings in these fixtures are 4–12 bytes, below the width where a NEON/AVX compare→movemask→GPR round trip beats a short scalar loop (#2963), with a code-layout band on top — the two mechanisms were never separated with a holdout build. Reverted (commit `c74f11a66`, not on this branch).
 
-**Follow-ups (reported, not built):** on a numbers-only document (`arrays` 10 MB, 6,291,458 bytes) `scan_canonical_value` is 48.0 Ir/byte and 42% of the whole run, all in the inlined `nested_number_span` + `is_jq_canonical_number` — an arrays-shaped late failure would pay far more than the +7.7% above. On `wide` 2 MB the >16-key `KeyHashes::insert` tier costs 5.4 Ir/byte, 18% of the gate, while the ≤16-key pairwise fingerprint scan is invisible on record-shaped documents.
+**Numbers in one pass (#3167).** On a numbers-only document (`arrays` 10 MB, 6,291,458 bytes) the gate's number arm was 48.0 Ir/byte, 42% of the whole run. It read every number twice (the greedy `nested_number_span`, then `is_jq_canonical_number` over it), and it paid an out-of-line recursive `scan_canonical_value` call for every array element and an out-of-line `is_jq_canonical_number` call per number: 33 Ir each on single-digit numbers. Now `jq_canonical_number_prefix` (the canonical rules, with `is_jq_canonical_number` defined as "the prefix is the whole span") is read straight off the document, and the span is accepted when the next byte cannot extend the greedy class. The array and object loops inline the scalar dispatch (`scan_canonical_element`), so only a container recurses. `scan_canonical_number_agrees_with_the_two_pass_rule_3167` pins the one-pass arm against the two-pass rule over every token of up to five class bytes. Against `923a080a5`, `-c .`, output identical on every row:
+
+| row | 7950X Ir | 7950X wall (median) | M4 Pro wall (median) |
+|---|---|---|---|
+| arrays 10 MB | −14.2% | −7.0% | −4.1% |
+| data 10 MB | −3.4% | −9.1% | −2.2% |
+| data 10 MB late-fail | −1.0% | −5.1% | −0.7% |
+| data 10 MB early-fail | +0.02% | — | — |
+| users 2 MB | −3.4% | −8.0% | −0.8% |
+| wide 2 MB | −5.0% | −5.7% | −1.2% |
+| pretty `.`, arrays / data (unreachable control) | +0.14% / +0.02% | +1.9% / −4.1% | +1.2% / −0.1% |
+
+`ab-cli.py --control` read −1.5%..+0.5% on the 7950X and −0.3%..+0.3% on the M4 Pro. The 7950X's pretty rows move ±2–4% on flat Ir, the layout band this page's #2720 notes describe, and part of the x86 `-c` wall-clock wins is plausibly that band too; the Ir column is the attribution. `scripts/perf-guard.py` stays within threshold (`users_compact_identity` −3.2%, `users_compact_latefail` −0.9%). The per-object zeroing of `scan_canonical_object`'s small-tier arrays is not visible in any profile (inline stores, no `memset` call). The >16-key `KeyHashes::insert` tier is now the largest gate term on a wide object, 83 Ir per key and 6.9% of `wide`'s run, and is [#3333](https://github.com/rust-works/succinctly/issues/3333).
 
 ---
 
