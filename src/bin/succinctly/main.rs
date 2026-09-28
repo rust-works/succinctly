@@ -1293,6 +1293,114 @@ fn parse_size(s: &str) -> Result<usize, String> {
 /// detects the alias from argv[0] and dispatches directly to the
 /// appropriate subcommand, bypassing the top-level Cli parser.
 ///
+/// Whether `token` is one of jq's own "not actually an option" spellings
+/// for a `-`-leading FILTER argument (#3389). jq 1.7.1's own CLI parser
+/// decides this from the character right after the leading `-`: a letter
+/// or another `-` still reads as an option (`-n`, `-c`, `--slurp`, and a
+/// genuine unknown flag like `-x`, which must keep erroring rather than
+/// silently becoming the filter), anything else (a digit, `.`, `(`, `$`,
+/// `[`, `{`, `"`, or a lone `-`) is the start of a filter expression jq
+/// goes on to parse (`-1`, `-.[0]`, `-(1)`, `-$__loc__.line`). Confirmed
+/// live against jq 1.7.1 that this rule, not `allow_hyphen_values`-style
+/// blanket acceptance, is the actual boundary.
+///
+/// `succinctly yq`'s own FILTER needs no such rule: real yq's cobra parser
+/// always treats a `-`-leading argument's remaining bytes as shorthand
+/// flags and errors on anything it can't resolve that way (`yq '-1'` fails
+/// with "unknown shorthand flag: '1' in -1", confirmed live against yq
+/// v4.53.3) -- `succinctly yq` already matches that (rejecting without
+/// `--`), so this helper and its callers below are jq-only.
+fn looks_like_negative_filter(token: &str) -> bool {
+    let mut chars = token.chars();
+    if chars.next() != Some('-') {
+        return false;
+    }
+    !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '-')
+}
+
+/// If `err` is clap's refusal of an unrecognized `-`-leading argument that
+/// [`looks_like_negative_filter`], returns the positions in `args` `--`
+/// might need inserting before so a retried parse accepts the token as the
+/// positional FILTER instead of an unknown flag -- most-plausible position
+/// first (see below).
+///
+/// Matches by *prefix*, not equality: when clap fails to bundle-parse a
+/// short-flag argument (`Parser::parse_short_arg`'s `NoMatchingArg` arm), it
+/// reports only `-` plus the first character it couldn't resolve as a short
+/// flag, not the argument's full text -- `-.[0]` surfaces as `InvalidArg`
+/// `"-."`, `-(1)` as `"-("`, `-$__loc__.line` as `"-$"`. That truncated form
+/// is always exactly two bytes (the leading `-` and one more character), so
+/// [`looks_like_negative_filter`] on it already answers the same question a
+/// check on the full token would (both read the same second character) --
+/// but more than one token can share that same two-byte prefix, and the
+/// prefix alone can't tell them apart.
+///
+/// Candidates come back **last-occurrence first**, never just the first
+/// match (code review on #3389): an option like `--arg`/`-L` that already
+/// takes `allow_hyphen_values` can have *already been given* a value
+/// sharing the bad token's prefix (`--arg x -1x`'s `-1x`), which sits
+/// earlier in `args` than the real, still-unclaimed FILTER token clap
+/// actually choked on. `parse_allowing_negative_filter` below tries each
+/// candidate in the order returned and keeps the first one that makes the
+/// whole thing parse -- correctness comes from that verification, not from
+/// this function guessing right, but trying later positions first means
+/// the common shape (FILTER after every flag) succeeds on the first retry
+/// rather than the last.
+fn negative_filter_retry_candidates(args: &[String], err: &clap::error::Error) -> Vec<usize> {
+    if err.kind() != clap::error::ErrorKind::UnknownArgument {
+        return Vec::new();
+    }
+    let Some(clap::error::ContextValue::String(bad)) =
+        err.get(clap::error::ContextKind::InvalidArg)
+    else {
+        return Vec::new(); // omni-dev: coverage tolerate-line reason="unreachable given clap 4.6's own unknown_argument() error constructor: every ErrorKind::UnknownArgument it builds sets ContextKind::InvalidArg to ContextValue::String(arg) in the same call, so this arm only guards a future clap release changing that invariant"
+    };
+    if !looks_like_negative_filter(bad) {
+        return Vec::new();
+    }
+    let mut positions: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.starts_with(bad.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    positions.reverse();
+    positions
+}
+
+/// Parses `args` as `P` (a jq-only [`clap::Parser`], see
+/// [`looks_like_negative_filter`]'s own doc comment for why `yq` needs no
+/// equivalent), retrying with `--` spliced in before each candidate
+/// [`negative_filter_retry_candidates`] returns, in order, until one
+/// actually parses (#3389). Clap has no per-positional way to express jq's
+/// letter-vs-non-letter split -- `allow_hyphen_values` is all-or-nothing on
+/// the FILTER positional, and would also swallow a genuine unknown-flag
+/// typo as the filter instead of erroring on it -- so this recovers from
+/// clap's own rejection after the fact instead of trying to configure it
+/// away. Every retry is itself verified by `try_parse_from`, never assumed
+/// correct from the candidate order alone.
+fn parse_allowing_negative_filter<P, I, T>(args: I) -> P
+where
+    P: Parser,
+    I: IntoIterator<Item = T>,
+    T: Into<String>,
+{
+    let args: Vec<String> = args.into_iter().map(Into::into).collect();
+    match P::try_parse_from(args.iter().cloned()) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            for idx in negative_filter_retry_candidates(&args, &e) {
+                let mut fixed = args.clone();
+                fixed.insert(idx, "--".to_string());
+                if let Ok(cmd) = P::try_parse_from(fixed) {
+                    return cmd;
+                } // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_accepted_via_sjq_multicall_alias_3389's '-x' row demonstrably reaches the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
+            }
+            e.exit()
+        }
+    }
+}
+
 /// Returns `Some(exit_code)` if a multi-call alias was detected,
 /// or `None` to fall through to normal `Cli::parse()`.
 fn try_multicall() -> Result<Option<i32>> {
@@ -1310,7 +1418,7 @@ fn try_multicall() -> Result<Option<i32>> {
 
     match name {
         "sjq" | "jq" => {
-            let cmd = JqCommand::parse_from(
+            let cmd: JqCommand = parse_allowing_negative_filter(
                 std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
             );
             Ok(Some(jq_runner::run_jq(cmd)?))
@@ -1423,13 +1531,45 @@ fn exit_after_run(exit_code: i32) -> ! {
     std::process::exit(exit_code)
 }
 
+/// [`Cli::parse`], plus the same `succinctly jq` retry
+/// [`parse_allowing_negative_filter`] gives the `sjq`/`jq` multicall path
+/// (#3389). Gated on `argv[1] == "jq"` (the `succinctly jq ...` spelling's
+/// subcommand token) rather than applying the retry to every subcommand:
+/// the retry only ever fires on a narrowly-shaped clap error already, but
+/// scoping it here too keeps `succinctly json`/`dsv`/`yaml`/`dev`/... error
+/// behavior provably untouched rather than merely unlikely to change.
+/// `succinctly yq` needs no equivalent gate on `"yq"` -- see
+/// `looks_like_negative_filter`'s own doc comment for why.
+fn parse_cli_allowing_negative_filter() -> Cli {
+    let args: Vec<String> = std::env::args().collect();
+    match Cli::try_parse_from(args.iter().cloned()) {
+        Ok(cli) => cli,
+        Err(e) => {
+            let scoped = args.get(1).map(String::as_str) == Some("jq");
+            let candidates = if scoped {
+                negative_filter_retry_candidates(&args, &e)
+            } else {
+                Vec::new()
+            };
+            for idx in candidates {
+                let mut fixed = args.clone();
+                fixed.insert(idx, "--".to_string());
+                if let Ok(cli) = Cli::try_parse_from(fixed) {
+                    return cli;
+                } // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_boundary_characters_3389's '-x'/'-n1'/'--bogus' rows demonstrably reach the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
+            }
+            e.exit()
+        }
+    }
+}
+
 fn run_main() -> Result<()> {
     // Multi-call binary: check if invoked via a known alias name (e.g., sjq, syq)
     if let Some(exit_code) = try_multicall()? {
         exit_after_run(exit_code);
     }
 
-    let cli = Cli::parse();
+    let cli = parse_cli_allowing_negative_filter();
 
     match cli.command {
         Command::Jq(args) => {
@@ -2536,6 +2676,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #3389: every character named in the issue's own boundary table, plus
+    /// the edge cases the CLI-level tests in `tests/jq_cli_tests.rs` can't
+    /// isolate as cleanly as a direct unit test can (a token that doesn't
+    /// start with `-` at all, and an empty string).
+    #[test]
+    fn test_looks_like_negative_filter_3389() {
+        for filter_like in [
+            "-1",
+            "-1.5",
+            "-.[0]",
+            "-(1)",
+            "-$__loc__.line",
+            "-[]",
+            "-{}",
+            "-\"a\"",
+            "-",
+        ] {
+            assert!(
+                looks_like_negative_filter(filter_like),
+                "{filter_like:?} should read as a filter"
+            );
+        }
+        for option_like in ["-x", "-n1", "-c", "--bogus", "--", "abc", ""] {
+            assert!(
+                !looks_like_negative_filter(option_like),
+                "{option_like:?} should read as an option"
+            );
+        }
+    }
+
+    /// #3389: `negative_filter_retry_candidates` against real `clap::Error`
+    /// values from `JqCommand::try_parse_from`, rather than only through a
+    /// spawned subprocess (`tests/jq_cli_tests.rs`) -- this reaches the
+    /// function's own defensive branches directly: a non-`UnknownArgument`
+    /// error kind (here, `--help`'s `DisplayHelp`) must never trigger a
+    /// retry, matching the same "only this one error shape" discipline
+    /// `stop_with_escape`'s callers elsewhere in this codebase apply to
+    /// their own out-of-band signals.
+    #[test]
+    fn test_negative_filter_retry_candidates_3389() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        let err = JqCommand::try_parse_from(["jq", "-x"]).unwrap_err();
+        assert_eq!(
+            negative_filter_retry_candidates(&args(&["jq", "-x"]), &err),
+            Vec::<usize>::new(),
+            "a genuine unknown flag must not retry"
+        );
+
+        let err = JqCommand::try_parse_from(["jq", "-1"]).unwrap_err();
+        assert_eq!(
+            negative_filter_retry_candidates(&args(&["jq", "-1"]), &err),
+            vec![1],
+            "a filter-shaped rejection must retry at the token's own index"
+        );
+
+        let err = JqCommand::try_parse_from(["jq", "--help"]).unwrap_err();
+        assert_eq!(
+            negative_filter_retry_candidates(&args(&["jq", "--help"]), &err),
+            Vec::<usize>::new(),
+            "a non-UnknownArgument error kind must never retry"
+        );
+
+        // Code review on #3389: an earlier `allow_hyphen_values` option's
+        // own already-consumed value (`--arg x -1x`'s `-1x`) can share the
+        // bad token's two-byte prefix with the real, still-unclaimed
+        // FILTER (`-1`) that follows it. Candidates must be tried
+        // last-occurrence first, so the real FILTER position (index 3)
+        // comes before the decoy (index 2).
+        let err = JqCommand::try_parse_from(["jq", "--arg", "x", "-1x", "-1"]).unwrap_err();
+        assert_eq!(
+            negative_filter_retry_candidates(&args(&["jq", "--arg", "x", "-1x", "-1"]), &err),
+            vec![4, 3],
+            "the real FILTER position must be tried before the decoy"
+        );
     }
 
     /// The flag spelling a user would actually type, for a test-failure
