@@ -8540,6 +8540,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // through. `-length` on `b: 1\na: 2\nb: 3\n` answered `-2` where
         // bare `length` answers `3` and `length * -1` -- real yq's own
         // spelling, since yq has no unary minus -- now answers `-3`.
+        // A `?//` in the operand retries past the negation's own failure
+        // only when it sees it (#3410): drive the operand's sink.
+        Expr::Negate(inner) if crate::jq::eval::contains_retrying_pattern_bind(inner) => {
+            negate_driving_operand_sink::<S, V>(inner, value, optional, cursor)
+        }
         Expr::Negate(inner) => {
             let (values, control) =
                 stream_owned_outputs_generic::<S, V>(inner, value, optional, cursor);
@@ -8828,14 +8833,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         }
 
         Expr::Array(inner) => {
-            // A label break or try escape may be consumed by a `?//` retry
-            // in its body, so collect those forms from the sink route too.
+            // A failure after a `?//` (a label break, a try escape, an
+            // operator on its output) may be consumed by its retry, so
+            // collect any body holding one from the sink route (#3410).
             // A loop followed by a projection must reach the projection's
             // sink before its next state is retained. `eval_single` first
             // collects every whole state, which can keep thousands of
             // unchanged long literals alive for `[while(... ) | .i]`.
-            if (matches!(inner.as_ref(), Expr::Label { .. } | Expr::Try { .. })
-                && crate::jq::eval::contains_retrying_pattern_bind(inner))
+            if crate::jq::eval::contains_retrying_pattern_bind(inner)
                 || matches!(inner.as_ref(), Expr::Pipe(stages) if stages.iter().any(|stage| matches!(stage, Expr::While { .. } | Expr::Until { .. })))
             {
                 let mut items = Vec::new();
@@ -14299,6 +14304,39 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
         Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
         Some(Flow::Exhausted) | None => from_flow,
     }
+}
+
+/// `eval_single`'s `-E` for an operand holding a `?//` (#3410): collect
+/// [`each_negate_generic`], whose sink the bind sees fail, instead of
+/// negating an operand already evaluated to completion.
+///
+/// Its own function, never inlined, because it sits on `eval_single`'s
+/// match: every arm's locals share that frame in an unoptimized build, and
+/// that frame is live once per level of a recursive `def` (#3149 pins how
+/// little native stack a level may cost).
+#[inline(never)]
+fn negate_driving_operand_sink<S: EvalSemantics, V: DocumentValue>(
+    operand: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    let mut out: Vec<OwnedValue> = Vec::new();
+    let mut stray: Option<Control> = None;
+    let flow = each_negate_generic::<S, V>(operand, value, optional, cursor, &mut |item| {
+        match generic_item_into_owned::<_, S>(item) {
+            Ok(v) => {
+                out.push(v);
+                Demand::Continue
+            }
+            Err(control) => stop_with_escape(&mut stray, control), // omni-dev: coverage tolerate-line reason="unreachable: each_negate_generic pushes only GenericItem::Owned (arith_negate's result), which converts infallibly (#3410)"
+        }
+    });
+    let control = match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+        Flow::Escaped(control) => Some(control),
+    };
+    finish_fork_generic(out, control.or(stray), optional)
 }
 
 /// Unary minus with the cursor threaded into its operand (#2626) -- the
@@ -33772,6 +33810,27 @@ mod tests {
             .and_then(|k| k.next_sibling())
             .expect("a value");
         assert_eq!(nan.value().number_token_address(), None);
+    }
+
+    /// #3410: `eval_single`'s `-E` drives the operand's sink when it holds a
+    /// `?//`, so the bind retries past the negation's failure; an item the
+    /// sink cannot decode still raises.
+    #[test]
+    fn eager_negate_retries_a_pattern_alternative_3410() {
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("-([[1]] as [$a] ?// [[$a]] | $a)").unwrap();
+        let got = eval_using::<JqSemantics, _>(&expr, index.root(json).value());
+        assert_eq!(
+            got.into_owned::<JqSemantics>().unwrap(),
+            Some(OwnedValue::Int(-1))
+        );
+
+        let bytes: &[u8] = b"{\"a\":\"\xff\"}";
+        let index = JsonIndex::build(bytes);
+        let expr = crate::jq::parse("-(.a as [$x] ?// $x | $x)").unwrap();
+        let got = eval_using::<JqSemantics, _>(&expr, index.root(bytes).value());
+        assert!(got.is_error());
     }
 
     #[test]

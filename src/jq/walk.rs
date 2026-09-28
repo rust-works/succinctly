@@ -1121,8 +1121,45 @@ pub fn stamp_loc_file(expr: &Expr, file: &Rc<str>) -> Expr {
 /// predicate that is called once per node either way. Same reasoning
 /// `eval_each`'s sink already uses.
 pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
-    if pred(expr) {
-        return true;
+    search_subexpr(expr, &mut |e| {
+        if pred(e) {
+            Visit::Found
+        } else {
+            Visit::Descend
+        }
+    })
+}
+
+/// What [`search_subexpr`]'s visitor decides about one node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Visit {
+    /// The node matches: the search answers `true`.
+    Found,
+    /// Neither the node nor anything inside it matches, so its children are
+    /// not walked -- for a visitor that already knows the subtree's answer,
+    /// such as a memo on an [`Expr::Shared`] argument (#3410).
+    Skip,
+    /// The node does not match; walk its children.
+    Descend,
+}
+
+/// [`any_subexpr`] with pruning.
+///
+/// `visit` sees each node before its children and may answer [`Visit::Skip`]
+/// to leave a subtree out. The one traversal both share, so the two cannot
+/// disagree about which children a variant has.
+///
+/// Generic over the visitor, unlike [`any_subexpr`]'s `dyn` predicate: it is
+/// instantiated for `any_subexpr`'s own adapter and for each pruning caller,
+/// so `any_subexpr` still makes one dynamic call per node, not two.
+pub(crate) fn search_subexpr<F: FnMut(&Expr) -> Visit + ?Sized>(
+    expr: &Expr,
+    visit: &mut F,
+) -> bool {
+    match visit(expr) {
+        Visit::Found => return true,
+        Visit::Skip => return false,
+        Visit::Descend => {}
     }
 
     match expr {
@@ -1134,9 +1171,9 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
         // to and that call's arguments; treating either as a leaf would
         // reintroduce exactly the "silently reported no match" bug this
         // module exists to prevent.
-        Expr::Shared(inner) => any_subexpr(inner, pred),
+        Expr::Shared(inner) => search_subexpr(inner, visit),
         Expr::DefCall { def, args, .. } => {
-            any_subexpr(&def.body, pred) || args.iter().any(|a| any_subexpr(a, pred))
+            search_subexpr(&def.body, visit) || args.iter().any(|a| search_subexpr(a, visit))
         }
         // Leaves: nothing nested to descend into.
         Expr::Identity
@@ -1161,9 +1198,9 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner)
         | Expr::Repeat(inner)
-        | Expr::Label { body: inner, .. } => any_subexpr(inner, pred),
+        | Expr::Label { body: inner, .. } => search_subexpr(inner, visit),
 
-        Expr::Error(inner) => inner.as_deref().is_some_and(|e| any_subexpr(e, pred)),
+        Expr::Error(inner) => inner.as_deref().is_some_and(|e| search_subexpr(e, visit)),
 
         Expr::Arithmetic { left, right, .. }
         | Expr::Compare { left, right, .. }
@@ -1221,10 +1258,11 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
             target: left,
             value: right,
             ..
-        } => any_subexpr(left, pred) || any_subexpr(right, pred),
+        } => search_subexpr(left, visit) || search_subexpr(right, visit),
 
         Expr::Try { expr, catch } => {
-            any_subexpr(expr, pred) || catch.as_deref().is_some_and(|c| any_subexpr(c, pred))
+            search_subexpr(expr, visit)
+                || catch.as_deref().is_some_and(|c| search_subexpr(c, visit))
         }
 
         Expr::If {
@@ -1232,26 +1270,26 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
             then_branch,
             else_branch,
         } => {
-            any_subexpr(cond, pred)
-                || any_subexpr(then_branch, pred)
-                || any_subexpr(else_branch, pred)
+            search_subexpr(cond, visit)
+                || search_subexpr(then_branch, visit)
+                || search_subexpr(else_branch, visit)
         }
 
         Expr::SliceExpr { target, start, end } => {
-            any_subexpr(target, pred)
-                || start.as_deref().is_some_and(|e| any_subexpr(e, pred))
-                || end.as_deref().is_some_and(|e| any_subexpr(e, pred))
+            search_subexpr(target, visit)
+                || start.as_deref().is_some_and(|e| search_subexpr(e, visit))
+                || end.as_deref().is_some_and(|e| search_subexpr(e, visit))
         }
 
         Expr::Range { from, to, step } => {
-            any_subexpr(from, pred)
-                || to.as_deref().is_some_and(|e| any_subexpr(e, pred))
-                || step.as_deref().is_some_and(|e| any_subexpr(e, pred))
+            search_subexpr(from, visit)
+                || to.as_deref().is_some_and(|e| search_subexpr(e, visit))
+                || step.as_deref().is_some_and(|e| search_subexpr(e, visit))
         }
 
         // A computed key (`{(expr): $x}`, #2734) holds a real `Expr` that
-        // `pred` must see, via `any_pattern_key` (#2872) -- re-entered with
-        // `any_subexpr` itself, not `pred` bare, since `any_pattern_key`
+        // `visit` must see, via `any_pattern_key` (#2872) -- re-entered with
+        // `search_subexpr` itself, not `visit` bare, since `any_pattern_key`
         // only tests each key's root and a hit like `input` can be nested
         // under it (`(input | tostring)`). Stale before #3017: this arm used
         // to skip `patterns` on the claim that it "holds only destructuring
@@ -1262,11 +1300,11 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
             body,
             ..
         } => {
-            any_subexpr(expr, pred)
-                || any_subexpr(body, pred)
+            search_subexpr(expr, visit)
+                || search_subexpr(body, visit)
                 || patterns
                     .iter()
-                    .any(|p| any_pattern_key(p, &mut |k| any_subexpr(k, pred)))
+                    .any(|p| any_pattern_key(p, &mut |k| search_subexpr(k, visit)))
         }
 
         Expr::Reduce {
@@ -1275,12 +1313,12 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
             init,
             update,
         } => {
-            any_subexpr(input, pred)
-                || any_subexpr(init, pred)
-                || any_subexpr(update, pred)
+            search_subexpr(input, visit)
+                || search_subexpr(init, visit)
+                || search_subexpr(update, visit)
                 || patterns
                     .iter()
-                    .any(|p| any_pattern_key(p, &mut |k| any_subexpr(k, pred)))
+                    .any(|p| any_pattern_key(p, &mut |k| search_subexpr(k, visit)))
         }
 
         Expr::Foreach {
@@ -1290,16 +1328,16 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
             update,
             extract,
         } => {
-            any_subexpr(input, pred)
-                || any_subexpr(init, pred)
-                || any_subexpr(update, pred)
-                || extract.as_deref().is_some_and(|e| any_subexpr(e, pred))
+            search_subexpr(input, visit)
+                || search_subexpr(init, visit)
+                || search_subexpr(update, visit)
+                || extract.as_deref().is_some_and(|e| search_subexpr(e, visit))
                 || patterns
                     .iter()
-                    .any(|p| any_pattern_key(p, &mut |k| any_subexpr(k, pred)))
+                    .any(|p| any_pattern_key(p, &mut |k| search_subexpr(k, visit)))
         }
 
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().any(|e| any_subexpr(e, pred)),
+        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().any(|e| search_subexpr(e, visit)),
 
         // Ignores `builtin_fallback` (unlike `map_subexprs`'s own `FuncCall`
         // arm, which recurses into it defensively) -- safe only because
@@ -1312,24 +1350,24 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
         // but a skipped body is by definition never evaluated, so this
         // arm's blind spot is unreachable in practice, not merely unlikely.
         Expr::FuncCall { args, .. } | Expr::NamespacedCall { args, .. } => {
-            args.iter().any(|e| any_subexpr(e, pred))
+            args.iter().any(|e| search_subexpr(e, visit))
         }
 
         Expr::Object(entries) => entries.iter().any(|entry| {
-            matches!(&entry.key, ObjectKey::Expr(k) if any_subexpr(k, pred))
-                || any_subexpr(&entry.value, pred)
+            matches!(&entry.key, ObjectKey::Expr(k) if search_subexpr(k, visit))
+                || search_subexpr(&entry.value, visit)
         }),
 
         Expr::StringInterpolation(parts) => parts
             .iter()
-            .any(|part| matches!(part, StringPart::Expr(e) if any_subexpr(e, pred))),
+            .any(|part| matches!(part, StringPart::Expr(e) if search_subexpr(e, visit))),
 
         Expr::Builtin(builtin) => match builtin_kids(builtin) {
             BuiltinKids::None => false,
-            BuiltinKids::One(a) => any_subexpr(a, pred),
-            BuiltinKids::Two(a, b) => any_subexpr(a, pred) || any_subexpr(b, pred),
+            BuiltinKids::One(a) => search_subexpr(a, visit),
+            BuiltinKids::Two(a, b) => search_subexpr(a, visit) || search_subexpr(b, visit),
             BuiltinKids::Three(a, b, c) => {
-                any_subexpr(a, pred) || any_subexpr(b, pred) || any_subexpr(c, pred)
+                search_subexpr(a, visit) || search_subexpr(b, visit) || search_subexpr(c, visit)
             }
         },
     }

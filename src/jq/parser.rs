@@ -7981,11 +7981,16 @@ impl<'a> Parser<'a> {
                     body: Box::new(body),
                 })
             }
-            _ => Ok(Expr::AsPattern {
-                expr: Box::new(expr),
-                patterns,
-                body: Box::new(body),
-            }),
+            _ => {
+                if patterns.len() > 1 {
+                    crate::jq::eval::note_alternative_bind_parsed();
+                }
+                Ok(Expr::AsPattern {
+                    expr: Box::new(expr),
+                    patterns,
+                    body: Box::new(body),
+                })
+            }
         }
     }
 
