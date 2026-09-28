@@ -6532,6 +6532,9 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let invert_dedup = patterns.len() > 1;
 
     for (i, pattern) in patterns.iter().enumerate() {
+        // #3293: announced before the pattern walk, so a retry whose
+        // pattern fails or matches nothing still supersedes a stash.
+        begin_pattern_alternative();
         let is_last = i == last_idx;
 
         // #2872: `body` runs once per binding set as the matcher completes
@@ -39359,6 +39362,9 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
         // so it cannot be the register's node whatever jq's pointer says.
         let refusal_is_exact = register.is_some_and(|reg| bound != reg);
         for (i, pattern) in patterns.iter().enumerate() {
+            // #3293: announced before the pattern walk, so a retry whose
+            // pattern fails or matches nothing still supersedes a stash.
+            begin_pattern_alternative();
             let is_last = i == last_idx;
             let seed = match register {
                 Some(reg) => PatternRegister {
@@ -40680,6 +40686,9 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             let last_idx = patterns.len() - 1;
             let mut ran_update = false;
             for (i, pattern) in patterns.iter().enumerate() {
+                // #3293: announced before the pattern walk, so a retry whose
+                // pattern fails or matches nothing still supersedes a stash.
+                begin_pattern_alternative();
                 let is_last = i == last_idx;
                 // Gated on `alternatives.is_some()` unlike `resolve_as_pattern`'s
                 // unconditional call (#3112): with one pattern (`alternatives ==
@@ -41081,6 +41090,9 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             let last_idx = patterns.len() - 1;
             let mut ran_update = false;
             for (i, pattern) in patterns.iter().enumerate() {
+                // #3293: announced before the pattern walk, so a retry whose
+                // pattern fails or matches nothing still supersedes a stash.
+                begin_pattern_alternative();
                 let is_last = i == last_idx;
                 // See `resolve_reduce`'s identical gate and its #3112 comment.
                 if alternatives.is_some() {
@@ -48509,7 +48521,8 @@ pub(crate) fn stop_with_eval_escape(slot: &mut Option<EvalEscape>, escape: EvalE
 /// [`stop_with_escape`], [`stop_with_escape_cell`], [`stop_with_error`] and
 /// [`stop_with_eval_escape`] cover the drivers whose slot holds a `Control`,
 /// an `EvalError`, or an `EvalEscape`; [`stop_with_downstream`] covers the
-/// one whose slot holds a whole `Flow`. The four owned-identity stages in
+/// one whose slot holds a whole `Flow`. [`StashedVerdict`] round-trips
+/// through `stop_with_escape_cell`/`stop_with_downstream` (#3293). The four owned-identity stages in
 /// `eval_generic.rs` share `stop_owned_identity_rest_escape`, an adapter over
 /// [`stop_with_escape`] that answers `Flow::Stopped` instead of
 /// `Demand::Stop` (#2830). The `Flow` kept by [`foreach_forks`] still calls
@@ -48605,16 +48618,19 @@ impl<T> StashedVerdict<T> {
     }
 
     /// Call at the top of every invocation of the driver's closure.
+    ///
+    /// A verdict still stashed here means the closure answered `Stop` and is
+    /// running again, which only a `?//` retry may cause -- anything else
+    /// would silently discard a real error, so it is asserted the way
+    /// [`resolve_terminal`]'s sink asserts it (#2691).
     pub(crate) fn begin(&self) {
-        self.slot.set(None);
-    }
-
-    /// Stash `verdict`, stamped with the current retry generation. Callers
-    /// go through [`Self::stop`]/[`Self::stop_with_downstream`], which also
-    /// classify the escape for `?//`.
-    fn stash(&self, verdict: T) {
-        self.at.set(pipe_retry_generation());
-        self.slot.set(Some(verdict));
+        if self.slot.take().is_some() {
+            debug_assert!(
+                terminal_retry::began_since(self.at.get()),
+                "#3293: a driver's closure ran again after stashing a verdict and \
+                 answering Stop, with no `?//` attempt in between"
+            );
+        }
     }
 
     /// Whether a verdict is currently stashed.
@@ -48644,11 +48660,11 @@ impl<T> StashedVerdict<T> {
 }
 
 impl StashedVerdict<Control> {
-    /// [`stop_with_escape`] into this slot.
+    /// [`stop_with_escape`] into this slot, stamped with the retry
+    /// generation.
     pub(crate) fn stop(&self, control: Control) -> Demand {
-        mark_nonretryable_escape(&control);
-        self.stash(control);
-        Demand::Stop
+        self.at.set(pipe_retry_generation());
+        stop_with_escape_cell(&self.slot, control)
     }
 
     /// [`Self::take`], then [`resume_from_escape`].
@@ -48659,13 +48675,14 @@ impl StashedVerdict<Control> {
 }
 
 impl StashedVerdict<Flow> {
-    /// [`stop_with_downstream`] into this slot.
+    /// [`stop_with_downstream`] into this slot, stamped with the retry
+    /// generation.
     pub(crate) fn stop_with_downstream(&self, flow: Flow) -> Demand {
-        if let Flow::Escaped(ref control) = flow {
-            mark_nonretryable_escape(control);
-        }
-        self.stash(flow);
-        Demand::Stop
+        let mut slot = None;
+        let demand = stop_with_downstream(&mut slot, flow);
+        self.at.set(pipe_retry_generation());
+        self.slot.set(slot);
+        demand
     }
 }
 
@@ -48680,6 +48697,24 @@ pub(crate) fn resume_from_escape(slot: Option<Control>, flow: Flow) -> Flow {
         }
         None => flow,
     }
+}
+
+/// Announce one `?//` alternative attempt to the retry generation
+/// ([`terminal_retry`]) *before* its pattern is walked (#3293).
+///
+/// [`clear_nonretryable_stop`] also bumps the generation, but it runs per
+/// binding set, so an alternative whose pattern fails to destructure, or
+/// yields no binding set at all, never announced itself. A driver that
+/// stashed a verdict for the abandoned alternative then read the retry as
+/// never having happened ([`retry_superseded`]): `-(1 as $a ?// [$b] | $b)`
+/// raised "null (null) cannot be negated" where jq 1.7.1 raises the second
+/// alternative's own "Cannot index number with number", and
+/// `-({"k":[1]} as {k: $a} ?// {(empty): $b} | $a)` raised where jq prints
+/// nothing. Every `?//` alternative loop calls this first; an extra bump is
+/// harmless to the generation's consumers, which only ask whether one
+/// happened.
+pub(crate) fn begin_pattern_alternative() {
+    terminal_retry::begin_attempt();
 }
 
 /// Clear the non-retryable-stop side channel on entry to one `?//`
@@ -48795,6 +48830,9 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
     let mut state = state_input;
 
     for (i, pattern) in patterns.iter().enumerate() {
+        // #3293: announced before the pattern walk, so a retry whose
+        // pattern fails or matches nothing still supersedes a stash.
+        begin_pattern_alternative();
         let is_last = i == last_idx;
 
         // #2872: one fold step per binding set the matcher completes, the
@@ -99871,6 +99909,11 @@ mod tests {
                 r#"[([[1]] as [$a] ?// $b | $a | if . == null then error("E2") else . end) | . + 1]"#,
                 &[][..],
                 "error: E2",
+            ),
+            (
+                r#"(1 as $a ?// [$b] | true) and error("E")"#,
+                &[][..],
+                "error: Cannot index number with number",
             ),
             (
                 r"[([[1]] as [$a] ?// $b | $a // empty) | . + 1]",

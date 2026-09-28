@@ -11013,6 +11013,9 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
     let invert_dedup = patterns.len() > 1;
 
     for (i, pattern) in patterns.iter().enumerate() {
+        // #3293: announced before the pattern walk, so a retry whose
+        // pattern fails or matches nothing still supersedes a stash.
+        crate::jq::eval::begin_pattern_alternative();
         let is_last = i == last_idx;
 
         // #2872: `body` runs once per binding set as the matcher completes
@@ -14158,21 +14161,19 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    // `Cell` for the same reason `each_range` uses one: `emit` and the three
-    // operand closures are live simultaneously and each must be able to
-    // record an escape it discovers on its own.
-    let escape = StashedEscape::new();
-    let sink_stopped = core::cell::Cell::new(false);
-    let sink_stopped_at = core::cell::Cell::new(crate::jq::eval::pipe_retry_generation());
-    // #3293: every operand closure below calls this first. A re-invocation of
-    // any of them after a stop is a `?//` retry inside that operand, and it
-    // supersedes both an escape and a consumer's stop the retried-past call
-    // recorded -- a stale stop would otherwise hide the error the retry's own
-    // bound raises (`[first(range(1 as $a ?// $b | $a // "x"))]`).
-    let begin = || {
-        escape.begin();
-        sink_stopped.set(false);
-    };
+    // Shared by `&` for the same reason `each_range` uses a `Cell`: `emit` and
+    // the three operand closures are live simultaneously and each must be
+    // able to record what ended the drive -- an escape it discovers, or the
+    // consumer's stop -- on its own.
+    //
+    // #3293: every operand closure below calls `verdict.begin()` first. A
+    // re-invocation of any of them after a stop is a `?//` retry inside that
+    // operand, and it supersedes the escape or consumer stop the
+    // retried-past call recorded -- a stale stop would otherwise hide the
+    // error the retry's own bound raises
+    // (`[first(range(1 as $a ?// $b | $a // "x"))]`).
+    let verdict: StashedVerdict<Flow> = StashedVerdict::new();
+    let stop = |control: Control| verdict.stop_with_downstream(Flow::Escaped(control));
 
     // See `each_range`'s own note (#3071): the 1-arg/2-arg call shapes (no
     // explicit step expression) select the float path's NaN-tolerant loop
@@ -14202,9 +14203,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
         };
         for v in values {
             if sink.push(GenericItem::Owned(v)) == Demand::Stop {
-                sink_stopped.set(true);
-                sink_stopped_at.set(crate::jq::eval::pipe_retry_generation());
-                return Demand::Stop;
+                return verdict.stop_with_downstream(Flow::Stopped { pending: None });
             }
         }
         // Truncation only raises once the sink has taken everything the
@@ -14212,20 +14211,20 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
         // rule, unchanged: `first(range(1e18))` stops early and never sees
         // this, `[range(1e18)]` does.
         if truncated {
-            return escape.stop(Control::Error(range_max_exceeded_error()));
+            return stop(Control::Error(range_max_exceeded_error()));
         }
         Demand::Continue
     };
 
     let from_flow = eval_each_generic::<S, V>(from, value.clone(), optional, cursor, &mut |item| {
-        begin();
+        verdict.begin();
         let from_owned = match generic_item_into_owned::<_, S>(item) {
             Ok(v) => v,
-            Err(control) => return escape.stop(control),
+            Err(control) => return stop(control),
         };
         let from_val = match range_num(&from_owned) {
             Ok(n) => n,
-            Err(e) => return escape.stop(Control::Error(e)),
+            Err(e) => return stop(Control::Error(e)),
         };
         // The one place `from`'s own literal spelling (if any) is still on
         // hand -- see `each_range`'s own note (#3103).
@@ -14251,12 +14250,12 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
 
         let to_flow =
             eval_each_generic::<S, V>(to_expr, value.clone(), optional, cursor, &mut |to_item| {
-                begin();
+                verdict.begin();
                 let to_val = match generic_item_into_owned::<_, S>(to_item)
                     .and_then(|v| range_num(&v).map_err(Control::Error))
                 {
                     Ok(n) => n,
-                    Err(control) => return escape.stop(control),
+                    Err(control) => return stop(control),
                 };
 
                 match step {
@@ -14268,12 +14267,12 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                             optional,
                             cursor,
                             &mut |step_item| {
-                                begin();
+                                verdict.begin();
                                 let step_val = match generic_item_into_owned::<_, S>(step_item)
                                     .and_then(|v| range_num(&v).map_err(Control::Error))
                                 {
                                     Ok(n) => n,
-                                    Err(control) => return escape.stop(control),
+                                    Err(control) => return stop(control),
                                 };
                                 emit(from_val, to_val, step_val, from_literal)
                             },
@@ -14281,7 +14280,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                         match step_flow {
                             Flow::Exhausted => Demand::Continue,
                             Flow::Stopped { .. } => Demand::Stop,
-                            Flow::Escaped(control) => escape.stop(control),
+                            Flow::Escaped(control) => stop(control),
                         }
                     }
                 }
@@ -14290,21 +14289,17 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
         match to_flow {
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => Demand::Stop,
-            Flow::Escaped(control) => escape.stop(control),
+            Flow::Escaped(control) => stop(control),
         }
     });
 
     let direct_retry = crate::jq::eval::direct_pattern_retry(from)
         || to.is_some_and(crate::jq::eval::direct_pattern_retry)
         || step.is_some_and(crate::jq::eval::direct_pattern_retry);
-    if sink_stopped.get()
-        && !crate::jq::eval::retry_superseded(&from_flow, sink_stopped_at.get(), direct_retry)
-    {
-        return Flow::Stopped { pending: None };
-    }
-    match escape.take(&from_flow, direct_retry) {
-        Some(control) => Flow::Escaped(control),
-        None => from_flow,
+    match verdict.take(&from_flow, direct_retry) {
+        Some(Flow::Escaped(control)) => Flow::Escaped(control),
+        Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
+        Some(Flow::Exhausted) | None => from_flow,
     }
 }
 
@@ -14714,6 +14709,11 @@ where
     // Tracked out-of-band for the usual reason: the sink can only answer
     // `Demand`, so "why did the pull stop" has to be recorded beside it.
     let escape = StashedEscape::new();
+    // Not folded into one `StashedVerdict<Flow>` the way `each_range_generic`
+    // is: this closure is on the stack once per level of a recursive `def`
+    // with `$` parameters, and the wider slot's temporaries cost enough native
+    // stack per level (debug build) that ADR-0025's floor refused before the
+    // frame guard did (`test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149`).
     let mut consumer_stopped_at: Option<u64> = None;
 
     let flow = settled_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
@@ -14790,6 +14790,11 @@ where
     // Tracked out-of-band for the usual reason: the sink can only answer
     // `Demand`, so "why did the pull stop" has to be recorded beside it.
     let escape = StashedEscape::new();
+    // Not folded into one `StashedVerdict<Flow>` the way `each_range_generic`
+    // is: this closure is on the stack once per level of a recursive `def`
+    // with `$` parameters, and the wider slot's temporaries cost enough native
+    // stack per level (debug build) that ADR-0025's floor refused before the
+    // frame guard did (`test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149`).
     let mut consumer_stopped_at: Option<u64> = None;
 
     let flow = settled_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
