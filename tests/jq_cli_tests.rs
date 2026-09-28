@@ -65625,6 +65625,10 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
         (r". as $x | [.,1] | del(.[-0.5] | $x)", r#"[{"a":1},1]"#),
         (r". as $x | [.,1] | del(.[0.5] | $x)", "[1]"),
         (r". as $x | [.,1] | (.[-0.5] | $x) = 5", "[5,1]"),
+        (
+            r". as $x | [.,1] | (.[-0.5] | $x) |= empty",
+            r#"[{"a":1},1]"#,
+        ),
         (r". as $x | [[.],1] | del(.[0.5][0] | $x)", "[[],1]"),
         // A tail after the write stage, handed on with the rewritten head.
         (r". as $x | [.] | (del(.[0] | $x) | length)", "0"),
@@ -65746,6 +65750,19 @@ fn test_del_fractional_index_matches_jv_dels_3302() -> Result<()> {
         ("[[1,2,3]]", "del(.[0.5][1], .[0.5][0])", "[[3]]"),
         ("[[1,2,3]]", "del(.[0.5], .[0][0])", "[]"),
         ("[10,20,30]", "del(.[1.5], .[1])", "[10,30]"),
+        // `|= empty` removes an emptied path with `delpaths([$p])`, so the
+        // same last-step rule applies, single path or several.
+        ("[10,20,30]", ".[-0.5] |= empty", "[10,20,30]"),
+        ("[10,20,30]", ".[-0.5] |= select(false)", "[10,20,30]"),
+        (
+            r#"{"a":[10,20,30]}"#,
+            ".a[-0.5] |= empty",
+            r#"{"a":[10,20,30]}"#,
+        ),
+        ("[10,20,30]", "(.[-0.5], .[1]) |= empty", "[10,30]"),
+        ("[10,20,30]", ".[0.5] |= empty", "[20,30]"),
+        ("[10,20,30]", ".[-1.5] |= empty", "[10,20]"),
+        ("[10,20,30]", ".[-0.5] |= . + 1", "[11,20,30]"),
         // A slice group alongside a fractional one still sorts after it.
         ("[[1,2,3],[4]]", "del(.[0.5:1][0], .[0][0])", "[[4]]"),
         ("[[1,2,3],[4]]", "del(.[0:1][0], .[0.5][0])", "[[4]]"),
@@ -65765,16 +65782,15 @@ fn test_del_fractional_index_matches_jv_dels_3302() -> Result<()> {
 /// answers exactly as it did before.
 #[test]
 fn test_del_fractional_index_yq_mode_unchanged_3302() -> Result<()> {
-    for (filter, expected) in [
-        ("del(.[-0.5])", "[20,30]"),
-        ("del(.[-0.5], .[1])", "[30]"),
-        ("del(.[0.5][0], .[0][0])", "[[2,3],20,30]"),
+    for (input, filter, expected) in [
+        ("[10,20,30]", "del(.[-0.5])", "[20,30]"),
+        ("[10,20,30]", "del(.[-0.5], .[1])", "[30]"),
+        (
+            "[[1,2,3],20,30]",
+            "del(.[0.5][0], .[0][0])",
+            "[[2,3],20,30]",
+        ),
     ] {
-        let input = if filter.contains("][") {
-            "[[1,2,3],20,30]"
-        } else {
-            "[10,20,30]"
-        };
         let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .args(["yq", "-o", "json", "-I", "0", filter])
             .stdin(Stdio::piped())
