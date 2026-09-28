@@ -61863,9 +61863,29 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // there. Depending on an explicitly unspecified choice would let a std
     // change silently break oracle parity.
     //
-    // The two arms jq special-cases before its loop need no special case here:
-    // an empty array leaves `hi` at -1 and yields -1, and a one-element array
-    // reduces to a single probe.
+    // The empty-array arm jq special-cases before its loop needs no special
+    // case here: it leaves `hi` at -1 and yields -1. The one-element arm
+    // does need one (#3414): jq's builtin.jq asks `$target == .[0]`, then
+    // `$target < .[0]` -- with `$target` on the LEFT of the `<` -- while the
+    // general loop below always keeps the array element on the left. The two
+    // shapes agree for every total order, but NaN's comparator isn't
+    // antisymmetric (#421: NaN sorts as Less than everything, itself
+    // included), so the argument order becomes observable exactly here:
+    // `[nan] | bsearch(nan)` is `-1` in jq (target < element) but was `-2`
+    // from this loop's element-on-the-left probe.
+    if elements.len() == 1 {
+        if S::DECNUMBER_LITERALS && same_nan_instance(&elements[0], &x) {
+            return QueryResult::Owned(OwnedValue::Int(0));
+        }
+        return QueryResult::Owned(OwnedValue::Int(
+            match compare_values::<S>(&x, &elements[0]) {
+                core::cmp::Ordering::Equal => 0,
+                core::cmp::Ordering::Less => -1,
+                core::cmp::Ordering::Greater => -2,
+            },
+        ));
+    }
+
     let mut lo: i64 = 0;
     let mut hi: i64 = elements.len() as i64 - 1;
     while lo <= hi {
@@ -88049,35 +88069,49 @@ mod tests {
     }
 
     #[test]
-    fn test_bsearch_single_nan_haystack_known_divergence_472() {
-        // Discovered while fixing #472, but a separate, narrower bug: not
-        // fixed by NaN-survival, and not a reindex-bridge problem at all.
-        //
-        // `compare_values` (shared with `sort`/`unique`/`group_by`, #421)
-        // treats every NaN as strictly less than every other value,
-        // including another NaN, so `builtin_bsearch`'s binary search always
-        // walks *past* a NaN run without ever reporting it "found" -- and
-        // for every haystack tested except a single-element one, that
-        // matches jq's own answer exactly: `[nan,nan]|bsearch(nan)` is `-3`
-        // in both, `[nan,nan,nan]|bsearch(nan)` is `-4` in both (see
-        // `test_nan_survives_reindex_bridge_472`).
-        //
-        // `[nan]|bsearch(nan)` alone is jq's `-1`, not `-2`. A single probe
-        // can only take one branch, so matching jq here would require
+    fn test_bsearch_single_nan_haystack_matches_jq_3414() {
+        // Was pinned as a "known divergence" from #472 (jq: -1, succinctly:
+        // -2), on the theory that matching jq here would need
         // `compare_values(NaN, NaN)` to answer `Greater` for a one-element
-        // haystack and `Less` for every longer one -- impossible for any
-        // comparator that doesn't see the surrounding array. This means
-        // jq's own answer isn't a coherent "insertion point" under any
-        // total order either; it's an artifact of whatever raw-double
-        // comparisons jq's particular C probe sequence happens to hit for a
-        // "sorted" array that (containing NaN) isn't actually well-ordered
-        // to begin with -- exactly the not-a-strict-weak-order territory
-        // `compare_values`'s own doc comment already flags. Not worth
-        // chasing bug-for-bug; pinning succinctly's current, consistent
-        // answer here rather than leaving it silently uncovered.
+        // haystack and `Less` for every longer one -- impossible for a
+        // single comparator with no view of the surrounding array.
+        //
+        // That theory assumed jq's one-element answer comes from the same
+        // comparator/probe shape as every other length. It doesn't: jq's
+        // own `builtin.jq` special-cases a one-element array *before* its
+        // general loop (`$target == .[0]`, then `$target < .[0]`, target on
+        // the LEFT), while the general loop -- and succinctly's binary
+        // search -- always keeps the array element on the left. The two
+        // shapes agree for every total order except NaN's, which isn't
+        // antisymmetric (#421), so the argument order is observable only in
+        // the one-element case (#3414). Fixed by giving `bsearch_one_target`
+        // that same one-element special case, not by changing
+        // `compare_values` itself.
         query!(b"null", "[nan] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
+            assert_eq!(idx, -1);
+        });
+
+        // Every other haystack length is unaffected (still `compare_values`'s
+        // general loop, matching jq already -- see
+        // `test_nan_survives_reindex_bridge_472`).
+        query!(b"null", "[1] | bsearch(nan)", QueryResult::Owned(OwnedValue::Int(idx)) => {
+            assert_eq!(idx, -1);
+        });
+        query!(b"null", "[nan] | bsearch(1)", QueryResult::Owned(OwnedValue::Int(idx)) => {
             assert_eq!(idx, -2);
         });
+
+        // The `same_nan_instance` branch (#3309) this arm shares with the
+        // general loop: `"NaN" | tonumber as $x | $x == $x` is `true` in jq
+        // (a bound instance equals itself), unlike two independent `nan`s
+        // above, so a one-element array probing itself is "found" at 0, not
+        // "not found" at -1. Verified live: `"NaN" | tonumber as $x | [$x] |
+        // bsearch($x)` is `0` in jq 1.7.1.
+        query!(br#""NaN""#, "tonumber as $x | [$x] | bsearch($x)",
+            QueryResult::Owned(OwnedValue::Int(idx)) => {
+                assert_eq!(idx, 0);
+            }
+        );
     }
 
     #[test]
