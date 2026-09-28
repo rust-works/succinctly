@@ -32798,12 +32798,16 @@ pub(crate) enum PathTrail {
         /// pathologically deep static chain (`path(.a.a.a...)`, a million
         /// `.a` segments) would recurse the native call stack until it
         /// overflows and aborts the process — silent and unrecoverable,
-        /// unlike a panic. `assert_value_tree_depth(depth)` at the top of
-        /// every function that recurses once per chain step converts that
-        /// crash into a clean, `catch_unwind`-caught CLI error, the same
-        /// guarantee `collect_paths`/`collect_tostream_events`/
-        /// `collect_leaf_paths` already give recursive value-tree walks
-        /// elsewhere in this file (#1005/#1021/#1025).
+        /// unlike a panic. A depth guard at the top of every function that
+        /// recurses once per chain step converts that crash into a clean
+        /// diagnostic instead: `walk_path` itself (the primary function this
+        /// field serves) uses the checked `check_value_tree_depth` since
+        /// #3275, returning an uncatchable `EvalError::resource_limit`
+        /// (#2132) with no panic and no `catch_unwind` involved; the
+        /// panicking `assert_value_tree_depth` remains the guard for
+        /// `collect_paths`/`collect_tostream_events`/`collect_leaf_paths`,
+        /// which give the same clean-diagnostic guarantee via a
+        /// `catch_unwind`-caught CLI error instead (#1005/#1021/#1025).
         depth: usize,
     },
 }
