@@ -125,6 +125,40 @@ fn test_yq_field_name_keeps_tab_cr_nbsp_3377() -> Result<()> {
     Ok(())
 }
 
+/// Pinned yq v4.53.3: a raw (unescaped) CR/LF byte inside a JSON string
+/// value is preserved losslessly, not folded to a space -- the leniency
+/// gap #3377's own test above deliberately routed around (see its doc
+/// comment). Inputs here use an actual Rust `\r`/`\n` escape, producing the
+/// literal control byte in the JSON text itself (unlike `#3377`'s
+/// `r#"...\r..."#` fixtures, whose `\r` is JSON's own two-character escape
+/// sequence, decoded by the parser rather than appearing as a raw byte).
+/// Covers both a raw byte as an object key (`keys`) and as an ordinary
+/// string value, plus the deeper bug: the same raw byte was folded in the
+/// value the evaluator uses for comparisons, not just in the value the
+/// formatter prints.
+#[test]
+fn test_yq_raw_cr_lf_in_json_string_value_not_folded_3380() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for (input, filter, expected) in [
+        ("{\"x\r\":7}", "keys", "[\"x\\r\"]\n"),
+        ("{\"a\":\"x\ry\"}", ".a", "\"x\\ry\"\n"),
+        ("{\"a\":\"x\ny\"}", ".a", "\"x\\ny\"\n"),
+        ("{\"a\":\"x\r\ny\"}", ".a", "\"x\\r\\ny\"\n"),
+        // The evaluator's own comparison must see the unfolded value, not
+        // just the formatter: a folded value would make the first line
+        // true and the second false, both backwards.
+        ("{\"a\":\"x\ry\"}", ".a == \"x y\"", "false\n"),
+        ("{\"a\":\"x\ry\"}", ".a == \"x\\ry\"", "true\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, args)?,
+            (expected.into(), String::new(), 0),
+            "{input:?} | {filter:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Captured from yq v4.53.3 with JSON input and compact JSON output.
 #[test]
 fn test_pick_keys_on_json_cli_3026() -> Result<()> {
