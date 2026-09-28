@@ -74964,8 +74964,9 @@ fn test_wrapper_stop_resets_across_retry_3293() -> Result<()> {
 /// continue shape reaches them through `input`: the consumer stops on the
 /// first alternative, a `?//` retry re-invokes it, and the retry's push is
 /// answered `Continue`. A stale flag panicked inside a slice bound (exit
-/// 101) and cut a following comma short elsewhere. Captured from jq 1.7.1
-/// with `-n` and stdin `"a" 1 2`.
+/// 101) and cut a following comma short elsewhere. Captured from jq 1.7.1,
+/// on the owned route (`-n`, stdin `"a" 1 2`) and the cursor route (stdin
+/// `[10,20,30] "a" 1`).
 #[test]
 fn test_counted_bool_consumers_reset_their_stop_across_retry_3293() -> Result<()> {
     for (filter, expected) in [
@@ -74999,6 +75000,33 @@ fn test_counted_bool_consumers_reset_their_stop_across_retry_3293() -> Result<()
             (stdout.trim_end(), code),
             (expected, 0),
             "`{filter}`: stderr {stderr:?}"
+        );
+    }
+    // The cursor route reaches the `eval_generic.rs` twins: the slice runs on
+    // the document itself, and `input` reads the rest of the stream.
+    for (filter, expected) in [
+        (
+            r"[.[(isempty([[1]] as [$a] ?// [[$a]] | $a) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[.[(any([[1]] as [$a] ?// [[$a]] | $a; true) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[.[(all([[1]] as [$a] ?// [[$a]] | $a; false) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[.[:(isempty([[1]] as [$a] ?// [[$a]] | $a) | input)]]",
+            "[[10]]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"[10,20,30] "a" 1"#))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}` (cursor route): stderr {stderr:?}"
         );
     }
     Ok(())

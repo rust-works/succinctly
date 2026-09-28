@@ -6890,9 +6890,10 @@ fn each_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // the wrapping sink's answer to *this* push supersedes the retried-past
         // one -- a stale flag reported `Stopped` to whatever encloses this call
         // after the retry, cutting a comma short (`[.[(limit(1; [[1]] as [$a] ?//
-        // [[$a]] | $a), 2):]]` is jq's `[[20,30],[30]]`). Every consumer
-        // that records the wrapping sink's stop (`first`/`nth`, `isempty`,
-        // `any`/`all`, `IN`, `repeat`) resets it the same way.
+        // [[$a]] | $a), 2):]]` is jq's `[[20,30],[30]]`). `first`/`nth`,
+        // `isempty`, `any`/`all` and `IN` reset theirs the same way (both
+        // evaluators), as `-`, `if` and `and`/`or` already did; `//` does not
+        // yet, and no probe has found it diverging.
         outer_stopped = false;
         count += 1;
         if sink(item) == Demand::Stop {
@@ -24805,8 +24806,17 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // wrapping stop resets it per invocation (#3293). A `Stopped` with an
         // empty stash would mean some enclosing driver still reports a stale
         // stop; finish with what was produced rather than abort the process
-        // over it (#3293 review: `isempty`/`any` did, before their reset).
-        Flow::Stopped { .. } => owned_vec_to_result(out),
+        // over it (#3293 review: `isempty`/`any` did, before their reset) --
+        // but loudly in a debug build, so a driver that regresses into a
+        // stale stop fails the suite instead of truncating the slice unseen.
+        Flow::Stopped { .. } => {
+            // omni-dev: coverage tolerate reason="unreachable: every consumer that records a wrapping stop resets it per invocation (#3293), so a stash-less Stopped needs one that regresses"
+            if cfg!(debug_assertions) {
+                unreachable!("a stash-less Stopped reached the slice collector (#3293)");
+            }
+            owned_vec_to_result(out)
+            // omni-dev: coverage end
+        }
         // #1528: `start`'s own trailing escape still has to reach the final
         // result -- a successful pull doesn't mean `start` itself didn't
         // escape after producing `out`'s own values (in yq mode it

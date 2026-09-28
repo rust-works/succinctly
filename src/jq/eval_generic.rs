@@ -10358,8 +10358,6 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
         let mut budget_control = None;
         let mut budget = super::eval::REPEAT_WIDTH_BUDGET;
         let flow = eval_each_owned::<S>(&f, &owned, optional, Reentry::Proven, &mut |v| {
-            // #3293: reset per invocation -- see `eval::each_limit`.
-            stopped = false;
             produced_any = true;
             if let Some(control) = super::eval::charge_budget(&mut budget, "repeat") {
                 stopped = true;
@@ -16355,8 +16353,17 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         // wrapping stop resets it per invocation (#3293). A `Stopped` with an
         // empty stash would mean some enclosing driver still reports a stale
         // stop; finish with what was produced rather than abort the process
-        // over it (#3293 review: `isempty`/`any` did, before their reset).
-        Flow::Stopped { .. } => owned_vec_to_generic_result(out),
+        // over it (#3293 review: `isempty`/`any` did, before their reset) --
+        // but loudly in a debug build, so a driver that regresses into a
+        // stale stop fails the suite instead of truncating the slice unseen.
+        Flow::Stopped { .. } => {
+            // omni-dev: coverage tolerate reason="unreachable: every consumer that records a wrapping stop resets it per invocation (#3293), so a stash-less Stopped needs one that regresses"
+            if cfg!(debug_assertions) {
+                unreachable!("a stash-less Stopped reached the slice collector (#3293)");
+            }
+            owned_vec_to_generic_result(out)
+            // omni-dev: coverage end
+        }
         // #1528: `start`'s own trailing escape still has to reach the final
         // result -- a successful pull doesn't mean `start` itself didn't
         // escape after producing `out`'s own values (in yq mode it
