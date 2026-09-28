@@ -6456,7 +6456,7 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // The guard pops the entry however the body leaves, error and
         // `break` included.
         let _embed = super::eval_generic::embed_table_push::<S>(origin.as_ref(), &bound_val);
-        let substituted_body = substitute_bound_var_from(expr, body, var, &bound_val, origin);
+        let substituted_body = substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
         eval_each::<W, S>(&substituted_body, value.clone(), optional, sink)
     })
 }
@@ -34541,7 +34541,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 trackable,
                 frame,
                 &mut |bound, origin| {
-                    let substituted = substitute_bound_var_at(
+                    let substituted = substitute_bound_var_at::<S>(
                         expr,
                         body,
                         var,
@@ -38097,7 +38097,7 @@ fn resolves_to_register<S: EvalSemantics>(
             .all(|e| resolves_to_register::<S>(e, trackable, reg, frame)),
         // #3279: every stage is proved against the same `reg`, since each
         // stage that resolves hands the next one `reg` again.
-        Expr::Pipe(stages) => stages
+        Expr::Pipe(stages) if S::TAG == EvalTag::Jq => stages
             .iter()
             .all(|e| resolves_to_register::<S>(e, trackable, reg, frame)),
         Expr::If {
@@ -38108,7 +38108,7 @@ fn resolves_to_register<S: EvalSemantics>(
             resolves_to_register::<S>(then_branch, trackable, reg, frame)
                 && resolves_to_register::<S>(else_branch, trackable, reg, frame)
         }
-        Expr::Try { expr, .. } if is_raise_free_identity_passthrough(expr) => {
+        Expr::Try { expr, .. } if is_raise_free_identity_passthrough::<S>(expr) => {
             resolves_to_register::<S>(expr, trackable, reg, frame)
         }
         // #3119 third review round: `trackable && reg.is_truthy()` alone
@@ -38127,7 +38127,7 @@ fn resolves_to_register<S: EvalSemantics>(
         // `{"a":{"p":1,"q":2}}` wrote `{"a":{"q":2}}` without this guard,
         // where jq refuses).
         Expr::Alternative(left, _)
-            if trackable && reg.is_truthy() && is_raise_free_identity_passthrough(left) =>
+            if trackable && reg.is_truthy() && is_raise_free_identity_passthrough::<S>(left) =>
         {
             resolves_to_register::<S>(left, trackable, reg, frame)
         }
@@ -39376,7 +39376,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 frame,
                 invert_dedup,
                 &mut |reg, bindings| {
-                    let substituted = bind_pattern_body(
+                    let substituted = bind_pattern_body::<S>(
                         source,
                         body,
                         pattern,
@@ -39534,7 +39534,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
 /// (`each_pattern_alternatives`). `bindings` arrive already deduplicated
 /// ([`each_pattern_walk`]).
 #[allow(clippy::too_many_arguments)] // STYLE-0004: one splice per alternative, the walk's own inputs
-fn bind_pattern_body(
+fn bind_pattern_body<S: EvalSemantics>(
     source: &Expr,
     body: &Expr,
     pattern: &Pattern,
@@ -39548,7 +39548,7 @@ fn bind_pattern_body(
         Pattern::Var(name) => {
             bound_names.push(name.clone());
             let origin = bindings.first().and_then(|b| b.origin.clone());
-            substitute_bound_var_at(source, body, name, bound, identity_at, origin, None)
+            substitute_bound_var_at::<S>(source, body, name, bound, identity_at, origin, None)
         }
         Pattern::Object(_) | Pattern::Array(_) => {
             bound_names.extend(bindings.iter().map(|b| b.name.clone()));
@@ -45940,7 +45940,15 @@ pub(crate) fn as_var_refs(
 /// | path($x)` on input `0` still raises `Invalid path expression` in real
 /// jq, even though the bound value trivially equals `.` there) -- matching
 /// jq's actual rule takes a syntactic passthrough, not mere value equality.
-pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
+pub(crate) fn is_identity_passthrough<S: EvalSemantics>(expr: &Expr) -> bool {
+    identity_passthrough(expr, S::TAG == EvalTag::Jq)
+}
+
+/// [`is_identity_passthrough`]'s grammar. `wide` admits #3279's `Pipe` arm
+/// (and, through [`raise_free_identity_passthrough`], an `if` with a total
+/// condition); it is jq mode only, where the shapes are captured, so yq's
+/// bind route is exactly what it was.
+fn identity_passthrough(expr: &Expr, wide: bool) -> bool {
     match unwrap_bind_source(expr) {
         Expr::Identity => true,
         // #2042: only a marker frozen from `.` itself is a passthrough of
@@ -45955,13 +45963,13 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
             then_branch,
             else_branch,
             ..
-        } => is_identity_passthrough(then_branch) && is_identity_passthrough(else_branch),
-        Expr::Try { expr, .. } => is_raise_free_identity_passthrough(expr),
+        } => identity_passthrough(then_branch, wide) && identity_passthrough(else_branch, wide),
+        Expr::Try { expr, .. } => raise_free_identity_passthrough(expr, wide),
         // #3129: see the `A // B` bullet above.
-        Expr::Alternative(left, _) => is_raise_free_identity_passthrough(left),
+        Expr::Alternative(left, _) => raise_free_identity_passthrough(left, wide),
         // #3279: a pipe of passthroughs of `.` is one -- each stage's input
         // is the previous stage's output, which is `.` again.
-        Expr::Pipe(stages) => stages.iter().all(is_identity_passthrough),
+        Expr::Pipe(stages) if wide => stages.iter().all(|e| identity_passthrough(e, wide)),
         _ => false,
     }
 }
@@ -45999,14 +46007,20 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
 /// `true` from here with no such deferred/redundant check of its own would
 /// still inherit this gap -- give it one, don't change this shared
 /// function.
-fn is_raise_free_identity_passthrough(expr: &Expr) -> bool {
+fn is_raise_free_identity_passthrough<S: EvalSemantics>(expr: &Expr) -> bool {
+    raise_free_identity_passthrough(expr, S::TAG == EvalTag::Jq)
+}
+
+/// [`is_raise_free_identity_passthrough`]'s grammar; `wide` as in
+/// [`identity_passthrough`].
+fn raise_free_identity_passthrough(expr: &Expr, wide: bool) -> bool {
     match unwrap_bind_source(expr) {
         Expr::Identity => true,
         Expr::TrackedVar(marker) => {
             matches!(marker.origin, Origin::Snapshot | Origin::SnapshotAt { .. })
         }
-        Expr::Try { expr, .. } => is_raise_free_identity_passthrough(expr),
-        Expr::Alternative(left, _) => is_raise_free_identity_passthrough(left),
+        Expr::Try { expr, .. } => raise_free_identity_passthrough(expr, wide),
+        Expr::Alternative(left, _) => raise_free_identity_passthrough(left, wide),
         // #3279: an `if` is raise-free, and yields at least one output, only
         // when its *condition* provably is too -- `try (if true then . else
         // . end) catch 1` binds `.`, while `try (if error("e") then . else .
@@ -46017,13 +46031,15 @@ fn is_raise_free_identity_passthrough(expr: &Expr) -> bool {
             cond,
             then_branch,
             else_branch,
-        } => {
+        } if wide => {
             cond_is_total_and_raise_free(cond)
-                && is_raise_free_identity_passthrough(then_branch)
-                && is_raise_free_identity_passthrough(else_branch)
+                && raise_free_identity_passthrough(then_branch, wide)
+                && raise_free_identity_passthrough(else_branch, wide)
         }
         // #3279: a pipe of raise-free, non-empty passthroughs is one too.
-        Expr::Pipe(stages) => stages.iter().all(is_raise_free_identity_passthrough),
+        Expr::Pipe(stages) if wide => stages
+            .iter()
+            .all(|e| raise_free_identity_passthrough(e, wide)),
         _ => false,
     }
 }
@@ -46144,14 +46160,14 @@ impl<'a> LazyMarker<'a> {
 /// (`substitute_bound_var`) had no callers left once #2889 Stage B gave
 /// `eval_as`/`each_as` a node, and was removed rather than kept as a
 /// same-shaped second entry point.
-pub(crate) fn substitute_bound_var_from(
+pub(crate) fn substitute_bound_var_from<S: EvalSemantics>(
     bind_expr: &Expr,
     body: &Expr,
     var_name: &str,
     bound: &OwnedValue,
     node: Option<BindOrigin>,
 ) -> Expr {
-    substitute_bound_var_at(bind_expr, body, var_name, bound, None, None, node)
+    substitute_bound_var_at::<S>(bind_expr, body, var_name, bound, None, None, node)
 }
 
 /// The [`Origin`] an identity-passthrough bind source freezes `.` with,
@@ -46220,7 +46236,7 @@ fn identity_bind_position<S: EvalSemantics>(
     // one grammar without the other stays inert here by construction,
     // instead of by a comment-documented invariant at a call site three
     // functions away.
-    if S::TAG != EvalTag::Jq || !is_identity_passthrough(source) {
+    if S::TAG != EvalTag::Jq || !is_identity_passthrough::<S>(source) {
         return None;
     }
     fn position(source: &Expr, trackable: bool, frame: &Frame) -> Option<Origin> {
@@ -46256,7 +46272,7 @@ fn identity_bind_position<S: EvalSemantics>(
                     _ => None,
                 }
             }
-            Expr::Try { expr, .. } if is_raise_free_identity_passthrough(expr) => {
+            Expr::Try { expr, .. } if raise_free_identity_passthrough(expr, true) => {
                 position(expr, trackable, frame)
             }
             Expr::Alternative(left, _) => position(left, trackable, frame),
@@ -46300,7 +46316,7 @@ fn identity_bind_position<S: EvalSemantics>(
 /// cursor routes only, never certified by `resolve_node`. With none of the
 /// three this is a plain, unwrapped literal substitution, same as
 /// `substitute_var`.
-fn substitute_bound_var_at(
+fn substitute_bound_var_at<S: EvalSemantics>(
     bind_expr: &Expr,
     body: &Expr,
     var_name: &str,
@@ -46309,7 +46325,7 @@ fn substitute_bound_var_at(
     origin: Option<Origin>,
     node: Option<BindOrigin>,
 ) -> Expr {
-    let origin = if is_identity_passthrough(bind_expr) {
+    let origin = if is_identity_passthrough::<S>(bind_expr) {
         debug_assert!(
             matches!(
                 identity_at,
@@ -46657,7 +46673,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #2889 Stage B: same registration, same bind-scoped guard, as
         // `each_as`/`each_as_generic` -- see `eval_generic::embed_table`.
         let _embed = super::eval_generic::embed_table_push::<S>(origin.as_ref(), &bound_val);
-        let substituted_body = substitute_bound_var_from(expr, body, var, &bound_val, origin);
+        let substituted_body = substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
         let body_result = eval_single::<W, S>(&substituted_body, value.clone(), optional);
         // The outputs already produced no longer vanish (#400, #494).
         if let Some(control) = push_owned_values::<_, S>(body_result, &mut all_results) {
@@ -103788,7 +103804,63 @@ mod tests {
             ("(if error(\"e\")? then . else . end) // 1", false),
         ] {
             let parsed = parse(src).unwrap();
-            assert_eq!(is_identity_passthrough(&parsed), want, "{src}");
+            assert_eq!(
+                is_identity_passthrough::<JqSemantics>(&parsed),
+                want,
+                "{src}"
+            );
+        }
+    }
+
+    /// #3279: the conditions an `if` may carry and still count as a raise-free
+    /// identity passthrough -- those that provably yield at least one output
+    /// and never raise, on any input -- and the ones that must stay out
+    /// because they can raise (`.a` on a number, `-.a`, a call) or yield
+    /// nothing (`empty`, `.[]` on `[]`).
+    #[test]
+    fn cond_is_total_and_raise_free_grammar_3279() {
+        for (src, want) in [
+            ("true", true),
+            (".", true),
+            ("$x", true),
+            ("not", true),
+            ("1 < 2", true),
+            (". == 1", true),
+            ("$__loc__", true),
+            ("true and false", true),
+            ("true or .", true),
+            ("(true, false)", true),
+            ("if . then true else not end", true),
+            ("(.)", true),
+            (".a", false),
+            ("-.a", false),
+            ("error(\"e\")", false),
+            ("empty", false),
+            ("f", false),
+            (".[]", false),
+            ("(1, error(\"e\"))", false),
+            (". + 1", false),
+            ("if . then .a else true end", false),
+            (".a == 1", false),
+        ] {
+            let parsed = parse(src).unwrap();
+            assert_eq!(cond_is_total_and_raise_free(&parsed), want, "{src}");
+        }
+        // Through the predicates it feeds: a pipe of passthroughs is one, and
+        // an `if` counts only with a condition in the grammar.
+        for (src, want) in [
+            (". | .", true),
+            (". | if true then . else . end", true),
+            ("try (. | if 1 < 2 then . else . end) catch 1", true),
+            ("try (. | if .a then . else . end) catch 1", false),
+            (". | 1", false),
+        ] {
+            let parsed = parse(src).unwrap();
+            assert_eq!(
+                is_identity_passthrough::<JqSemantics>(&parsed),
+                want,
+                "{src}"
+            );
         }
     }
 
@@ -106162,7 +106234,7 @@ mod tests {
         };
 
         // Shape: navigated bind source -> Origin::Untracked, node kept.
-        let navigated = substitute_bound_var_from(
+        let navigated = substitute_bound_var_from::<JqSemantics>(
             &parse(".a").unwrap(),
             &body,
             "y",
@@ -106175,20 +106247,31 @@ mod tests {
         assert_eq!(var.origin, Origin::Untracked);
         assert_eq!(var.node, Some(node.clone()));
         assert_eq!(var.value, inner);
-        assert!(!is_identity_passthrough(&navigated));
+        assert!(!is_identity_passthrough::<JqSemantics>(&navigated));
 
         // Shape: passthrough bind source -> Origin::Snapshot, node kept.
-        let passthrough =
-            substitute_bound_var_from(&parse(".").unwrap(), &body, "y", &root, Some(node.clone()));
+        let passthrough = substitute_bound_var_from::<JqSemantics>(
+            &parse(".").unwrap(),
+            &body,
+            "y",
+            &root,
+            Some(node.clone()),
+        );
         let Expr::TrackedVar(var) = &passthrough else {
             panic!("expected a TrackedVar, got {passthrough:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the let-else pattern fails to match (#2072)"
         };
         assert_eq!(var.origin, Origin::Snapshot);
         assert_eq!(var.node, Some(node));
-        assert!(is_identity_passthrough(&passthrough));
+        assert!(is_identity_passthrough::<JqSemantics>(&passthrough));
 
         // Shape: no node -> today's spelling, a literal AST.
-        let literal = substitute_bound_var_from(&parse(".a").unwrap(), &body, "y", &inner, None);
+        let literal = substitute_bound_var_from::<JqSemantics>(
+            &parse(".a").unwrap(),
+            &body,
+            "y",
+            &inner,
+            None,
+        );
         assert!(matches!(literal, Expr::Object(_)), "got {literal:?}");
 
         // Resolver: `path(<var>)` with the ambient input equal to the value.
@@ -106206,7 +106289,7 @@ mod tests {
         }
         // The same value, untracked, is a literal to the resolver whatever
         // node it carries -- refused, not certified by value equality.
-        let untracked_root = substitute_bound_var_from(
+        let untracked_root = substitute_bound_var_from::<JqSemantics>(
             &parse(".a").unwrap(),
             &body,
             "y",
