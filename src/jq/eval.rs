@@ -39456,6 +39456,21 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     register: Option<&OwnedValue>,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    // #3334: a comma source binds per leaf, so `head_resolves_to_register`,
+    // `identity_at` and `bound_is_frozen` below are each computed for the
+    // leaf that produced the value -- `(., 1)` tracks its first output --
+    // rather than once for the whole comma. See [`comma_leaves`].
+    if let Some(leaves) = comma_leaves::<S>(source) {
+        for leaf in leaves {
+            match resolve_as_pattern::<S>(
+                leaf, patterns, body, value, trackable, snapshot, frame, keep, register, sink,
+            ) {
+                ResolveFlow::Exhausted => {}
+                other => return other,
+            }
+        }
+        return ResolveFlow::Exhausted;
+    }
     // A subexp: evaluated by value, never a path witness (jq's
     // `subexp_nest > 0` -- the same rule `resolve_bind_source_witness`'s
     // `by_value` follows). `trackable` still gates demotion the same way
@@ -39487,11 +39502,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     // arm's pre-#3119 behavior for a bare `.`/`TrackedVar` head exactly.
     let head_resolves_to_register =
         register.is_some_and(|reg| resolves_to_register::<S>(head, trackable, reg, frame));
-    let bound_is_frozen = match head {
-        Expr::TrackedVar(_) => true,
-        Expr::Identity => !matches!(snapshot, Snapshot::No),
-        _ => false,
-    };
+    let bound_is_frozen = head_may_be_frozen(head, snapshot);
     for bound in &sources {
         // A shape `resolves_to_register` refuses (including one it was
         // never asked about, for `Expr::Identity`/`TrackedVar`) still gets
@@ -40371,6 +40382,42 @@ impl NavKind {
             ),
             Self::Iterate => matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)),
         }
+    }
+}
+
+/// Whether a destructuring source headed by `head` may produce a frozen
+/// value -- one jq could still hold as its path register by the pointer it
+/// was bound from -- for [`guess_refusal_of`]'s `frozen` (#3267, #3334).
+///
+/// True if *any* branch can: a `$var` marker, or `.` over a marked snapshot,
+/// reached through `if`, `try`, `//`, `,`, parens or a `Shared` argument.
+/// It used to recognize only a bare `$var`/`.`, so `(if true then $orig else
+/// $orig end) as {a:{b:$q}} | $q` under `try` had its refusal treated as
+/// exact: `try` caught it and `del` silently discarded the write jq makes.
+/// Answering `true` too often only turns a caught refusal into a loud one,
+/// and only when [`could_be_lost_register`] and the step's own
+/// `would_succeed_on` also hold -- the #3267 price the bare `$orig` head
+/// already pays, never a wrong answer.
+fn head_may_be_frozen(head: &Expr, snapshot: &Snapshot) -> bool {
+    match unwrap_bind_source(head) {
+        Expr::TrackedVar(_) => true,
+        Expr::Identity => !matches!(snapshot, Snapshot::No),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => head_may_be_frozen(then_branch, snapshot) || head_may_be_frozen(else_branch, snapshot),
+        Expr::Try { expr, catch } => {
+            head_may_be_frozen(expr, snapshot)
+                || catch
+                    .as_deref()
+                    .is_some_and(|c| head_may_be_frozen(c, snapshot))
+        }
+        Expr::Alternative(left, right) => {
+            head_may_be_frozen(left, snapshot) || head_may_be_frozen(right, snapshot)
+        }
+        Expr::Comma(exprs) => exprs.iter().any(|e| head_may_be_frozen(e, snapshot)),
+        _ => false,
     }
 }
 
