@@ -9339,6 +9339,10 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
         // `JsonFormatOpts::json_sourced`'s own doc comment) -- jq mode
         // never consults it.
         json_sourced: false,
+        // Only meaningful when actually colorizing below (#3413) -- a NaN's
+        // marker text is not valid JSON on its own, so it must never reach
+        // the non-colorized branch.
+        mark_nan_for_color: config.color_output,
     };
     let json = output::format_json(value, &opts);
 
