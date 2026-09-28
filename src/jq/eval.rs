@@ -62131,6 +62131,11 @@ impl PatternKey<'_> {
                     let idx = numeric_key_to_index(key).unwrap_or(i64::MAX);
                     Ok(numeric_path_component(idx, key))
                 }
+                // #3300: a slice descriptor, as `.[k]`'s own path step
+                // spells it.
+                OwnedValue::Object(desc) if S::TAG != EvalTag::Yq => {
+                    descriptor_path_component::<S>(desc, input)
+                }
                 other => Err(EvalError::cannot_index_with_type(
                     owned_type_name(input),
                     owned_type_name(other),
