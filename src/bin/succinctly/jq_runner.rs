@@ -11098,7 +11098,7 @@ mod tests {
                 assert!(err.is_err(), "seq={seq} compact={compact}");
                 assert_eq!(out, b"", "seq={seq} compact={compact}");
 
-                let good: &[u8] = br#"[1]"#;
+                let good: &[u8] = b"[1]";
                 let good_index = JsonIndex::build(good);
                 write_output_jq_value(
                     &mut out,
