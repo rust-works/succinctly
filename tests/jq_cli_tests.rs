@@ -50311,7 +50311,12 @@ type ModuleRow<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
 /// matrix: write the modules, run `succinctly jq -L <dir> -nc <extra...>
 /// <filter>`, and assert empty stdout, exit 3 and `want_stderr` byte for
 /// byte with `<DIR>` standing for the canonical module directory.
+///
+/// `HOME` points at an empty directory and `JQ_LIBRARY_PATH` is unset, so a
+/// developer's own `~/.jq` or library path can neither add a def nor add
+/// an error to the captured stderr (#3313 orders `~/.jq`'s errors too).
 fn run_module_rows(rows: &[ModuleRow], extra: &[&str]) -> Result<()> {
+    let empty_home = tempfile::tempdir()?;
     for (id, modules, filter, want_stderr) in rows {
         let temp_dir = tempfile::tempdir()?;
         for (name, contents) in *modules {
@@ -50322,6 +50327,8 @@ fn run_module_rows(rows: &[ModuleRow], extra: &[&str]) -> Result<()> {
             || {
                 let mut command = Command::new(succinctly_bin());
                 command
+                    .env("HOME", empty_home.path())
+                    .env_remove("JQ_LIBRARY_PATH")
                     .args(["jq", "-L"])
                     .arg(temp_dir.path())
                     .args(["-nc"])

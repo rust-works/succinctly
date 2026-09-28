@@ -115,16 +115,29 @@ pub struct ModuleLoader {
     /// `run id -> (decl_index, run id)` of that module's own dependencies
     /// (#2955), `decl_index` shared across `include`/`import` exactly as
     /// [`Import::decl_index`]/[`Include::decl_index`] number them. Read by
-    /// [`Self::hoist_order`], which sorts by `decl_index` before recursing --
+    /// [`Self::walk_modules`] (so by both [`Self::hoist_order`] and the
+    /// compile-error order, [`Self::error_report_rank`]), which sorts by
+    /// `decl_index` before recursing --
     /// insertion order alone is *not* declaration order here, because
     /// [`Self::module_dep_defs`] records all of a module's `include`s before
     /// any of its `import`s, regardless of how the two are interleaved in the
     /// source.
     deps_of: BTreeMap<u32, Vec<(usize, u32)>>,
     /// Each top-level `include`/non-data `import`'s `(decl_index, run id)`,
-    /// as [`Self::process_program`] resolved them -- kept for
-    /// [`Self::error_report_rank`], which runs only on the compile-error path.
+    /// exactly as [`Self::process_program`] resolved them via
+    /// [`Self::run_id_for`] while wrapping their runs -- kept rather than
+    /// re-derived from `Program`'s paths so [`Self::walk_modules`] does not
+    /// repeat those filesystem lookups.
     top_ids: Vec<(usize, u32)>,
+}
+
+/// How [`ModuleLoader::walk_modules`] reached a module.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModuleReach {
+    /// The module's first expansion, after all of its dependencies.
+    Expanded,
+    /// A reach as some module's dependency (any number of times).
+    AsDependency,
 }
 
 /// A [`ModuleLoader`] failure, structured enough to report in jq's own
@@ -1195,69 +1208,77 @@ impl ModuleLoader {
         Ok(sigs)
     }
 
-    /// The modules that need a link run (#2955), outermost first: a module
-    /// that some other module depends on, placed outside everything that
-    /// depends on it, each once, a diamond included.
+    /// The one depth-first walk over the module graph that both
+    /// [`Self::hoist_order`] and [`Self::error_report_rank`] read, so the
+    /// two cannot disagree on how the graph is traversed.
     ///
-    /// The walk visits each module's directives in **reverse** declaration
-    /// order and records a module after its own dependencies, so the runs are
-    /// wrapped -- and their bodies compiled, and any compile errors in them
-    /// reported -- in the order jq 1.7.1 reports them: a dependency's errors
-    /// before its includer's, the last-declared dependency's first, and a
-    /// chain's deepest module first (captured live for all three shapes). A
-    /// module that is also a top-level `include`/`import` is walked for its
-    /// dependencies but not recorded for itself unless something depends on
-    /// it: its top-level run already carries its defs. When something does,
-    /// it is recorded like any dependency, and its top-level run forwards to
-    /// the link run instead of carrying a second copy of the bodies (#3153,
-    /// [`Self::top_run_defs`]).
-    ///
-    /// `top_ids` is each top-level `include`/non-data `import`'s
-    /// `(decl_index, run id)`, exactly as [`Self::process_program`] already
-    /// resolved them via [`Self::run_id_for`] while wrapping their runs --
-    /// passed in rather than re-derived from `Program`'s paths so this does
-    /// not repeat the same `resolve_module_in`/`canonicalize` filesystem
-    /// lookups a second time for every call.
-    fn hoist_order(&self, top_ids: &[(usize, u32)]) -> Vec<u32> {
+    /// Top-level directives ([`Self::top_ids`]) are visited last-declared
+    /// first, and so is each module's own `deps_of`. Sorted here rather than
+    /// trusting `deps_of`' insertion order: `dependency_signatures` records a
+    /// module's includes before its imports (see `module_dep_defs`), which is
+    /// not source order when the two are interleaved; `decl_index` is. `on`
+    /// sees [`ModuleReach::Expanded`] once per module, after its
+    /// dependencies, and [`ModuleReach::AsDependency`] every time a module is
+    /// reached as some module's dependency, after that reach's expansion.
+    fn walk_modules(&self, on: &mut impl FnMut(u32, ModuleReach)) {
         fn visit(
             loader: &ModuleLoader,
             id: u32,
             as_dependency: bool,
             expanded: &mut BTreeSet<u32>,
-            recorded: &mut BTreeSet<u32>,
-            order: &mut Vec<u32>,
+            on: &mut impl FnMut(u32, ModuleReach),
         ) {
             if expanded.insert(id) {
                 if let Some(deps) = loader.deps_of.get(&id) {
-                    // Sorted here rather than relying on `deps`' insertion
-                    // order: `dependency_signatures` records a module's
-                    // includes before its imports (see `module_dep_defs`),
-                    // which is not source order when the two are
-                    // interleaved. `decl_index` is the true order; last
-                    // declared first, same rule as `top_ids` below.
                     let mut deps = deps.clone();
                     deps.sort_by_key(|(decl, _)| core::cmp::Reverse(*decl));
                     for (_, dep) in deps {
-                        visit(loader, dep, true, expanded, recorded, order);
+                        visit(loader, dep, true, expanded, on);
                     }
                 }
+                on(id, ModuleReach::Expanded);
             }
-            if as_dependency && recorded.insert(id) {
-                order.push(id);
+            if as_dependency {
+                on(id, ModuleReach::AsDependency);
             }
         }
 
         // Last declared first, exactly as their runs nest (`process_program`
         // wraps the last-declared include innermost).
-        let mut top: Vec<(usize, u32)> = top_ids.to_vec();
+        let mut top = self.top_ids.clone();
         top.sort_by_key(|(decl, _)| core::cmp::Reverse(*decl));
-
         let mut expanded = BTreeSet::new();
+        for (_, id) in top {
+            visit(self, id, false, &mut expanded, on);
+        }
+    }
+
+    /// The modules that need a link run (#2955), outermost first: a module
+    /// that some other module depends on, placed outside everything that
+    /// depends on it, each once, a diamond included.
+    ///
+    /// [`Self::walk_modules`] visits each module's directives in **reverse**
+    /// declaration order, and this records a module at its first reach *as a
+    /// dependency*, after its own dependencies, so the runs are wrapped --
+    /// and `resolve::check` meets their bodies -- a dependency before its
+    /// includer, the last-declared dependency first, and a chain's deepest
+    /// module first. That is jq 1.7.1's report order within the linked set;
+    /// across top-level modules the reporter restores jq's order by
+    /// [`Self::error_report_rank`] instead (#3313), since the wrap order
+    /// cannot follow it. A module that is also a top-level
+    /// `include`/`import` is walked for its dependencies but not recorded
+    /// for itself unless something depends on it: its top-level run already
+    /// carries its defs. When something does, it is recorded like any
+    /// dependency, and its top-level run forwards to the link run instead of
+    /// carrying a second copy of the bodies (#3153, [`Self::top_run_defs`]).
+    fn hoist_order(&self) -> Vec<u32> {
         let mut recorded = BTreeSet::new();
         let mut order = Vec::new();
-        for (_, id) in top {
-            visit(self, id, false, &mut expanded, &mut recorded, &mut order);
-        }
+        self.walk_modules(&mut |id, reach| {
+            if reach == ModuleReach::AsDependency && recorded.insert(id) {
+                order.push(id);
+            }
+        });
         order
     }
 
@@ -1272,42 +1293,18 @@ impl ModuleLoader {
     /// include "serr2"` (`serr2` a dependency of `cerr2`) reports `serr2`,
     /// then `other2`, then `cerr2`.
     ///
-    /// Not [`Self::hoist_order`], which answers a different question: that
-    /// walk records only modules something depends on, at their dependency
-    /// position, and decides where link runs are wrapped. The wrap order
-    /// cannot follow this one -- link runs must stay outermost (#2955,
+    /// The same walk as [`Self::hoist_order`], recorded at each module's
+    /// first expansion instead of its first reach as a dependency. The wrap
+    /// order cannot follow this one -- link runs must stay outermost (#2955,
     /// #3153) -- so the reporter reorders the collected errors instead.
     fn error_report_rank(&self) -> BTreeMap<u32, usize> {
-        fn visit(
-            loader: &ModuleLoader,
-            id: u32,
-            expanded: &mut BTreeSet<u32>,
-            rank: &mut BTreeMap<u32, usize>,
-        ) {
-            if !expanded.insert(id) {
-                return;
-            }
-            if let Some(deps) = loader.deps_of.get(&id) {
-                // Sorted for the reason `hoist_order`'s own walk sorts:
-                // `deps_of` lists includes before imports, not in source
-                // order.
-                let mut deps = deps.clone();
-                deps.sort_by_key(|(decl, _)| core::cmp::Reverse(*decl));
-                for (_, dep) in deps {
-                    visit(loader, dep, expanded, rank);
-                }
-            }
-            let next = rank.len();
-            rank.insert(id, next);
-        }
-
-        let mut top = self.top_ids.clone();
-        top.sort_by_key(|(decl, _)| core::cmp::Reverse(*decl));
-        let mut expanded = BTreeSet::new();
         let mut rank = BTreeMap::new();
-        for (_, id) in top {
-            visit(self, id, &mut expanded, &mut rank);
-        }
+        self.walk_modules(&mut |id, reach| {
+            if reach == ModuleReach::Expanded {
+                let next = rank.len();
+                rank.insert(id, next);
+            }
+        });
         rank
     }
 
@@ -1500,8 +1497,8 @@ impl ModuleLoader {
         // see `link_dependency_runs`. Both are computed before any top-level
         // run is wrapped, because a module that is linked *and* top-level
         // gets stubs rather than bodies in its top-level run (#3153).
-        let order = self.hoist_order(&top_ids);
         self.top_ids = top_ids;
+        let order = self.hoist_order();
         let linked: BTreeSet<u32> = order.iter().copied().collect();
         let wanted = if linked.is_empty() {
             BTreeSet::new()
@@ -3125,9 +3122,9 @@ impl ModuleSource {
 /// filter's. The sort is stable, so errors within one module keep the
 /// resolver's order, which already matches jq's.
 ///
-/// A module id missing from the rank map is sorted with `~/.jq`. Every run
-/// that carries a body is a top-level directive or reached from one, so
-/// that arm is defensive only.
+/// `~/.jq` (`AUTO_LOAD_RUN_ID`) is never in the rank map. A module id
+/// missing from it is sorted with `~/.jq`; every run that carries a body is
+/// a top-level directive or reached from one, so that is defensive only.
 fn jq_report_order<'e>(
     errors: &'e [jq::ResolveError],
     loader: &ModuleLoader,
@@ -3135,12 +3132,10 @@ fn jq_report_order<'e>(
     let mut ordered: Vec<&jq::ResolveError> = errors.iter().collect();
     if errors.iter().any(|e| e.origin().is_some()) {
         let rank = loader.error_report_rank();
-        ordered.sort_by_key(|e| match e.origin() {
-            Some(id) => match rank.get(&id) {
-                Some(&r) if id != AUTO_LOAD_RUN_ID => (0, r),
-                _ => (1, 0),
-            },
+        ordered.sort_by_cached_key(|e| match e.origin() {
             None => (2, 0),
+            Some(AUTO_LOAD_RUN_ID) => (1, 0),
+            Some(id) => rank.get(&id).map_or((1, 0), |&r| (0, r)),
         });
     }
     ordered
