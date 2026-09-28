@@ -15860,35 +15860,53 @@ fn test_slice_descriptor_end_bound_in_open_interval_folds_to_length_3396() -> Re
     Ok(())
 }
 
-/// #3396 residual: the same bug in a *computed* slice bound (`.[a:b]`,
-/// `E[S:T]`) and in a slice descriptor used as a direct *index* rather than
-/// through `getpath` (`.[{"start":s,"end":e}]`, #3300) is **not** fixed by
-/// this issue -- both routes go through `owned_bound_to_i64`, which rounds
-/// the bound to `i64` before any container length is known, destroying the
-/// sign a correct fold needs. A naive "treat it as an open end" fix (as this
-/// issue originally proposed) would regress yq's own object-child-count
-/// slicing (`SliceBounds::resolve_object_children`'s *omitted*-end default
-/// is the entry count `N`, but a *given* end bound -- which this would
-/// become -- must fold against the full child count `2N`). Fixing this
-/// properly needs a representation distinguishing "omitted" from "given,
-/// negative, rounds to the length" through `ComputedSliceBound` across both
-/// evaluators; tracked as a follow-up, not attempted here. Pinned as the
-/// current, still-diverging output rather than a jq match.
+/// #3404: the same fold-before-round rule as #3396, on the two routes that
+/// round a bound to `i64` before any length is known -- a *computed* slice
+/// bound (`.[a:b]`, `E[S:T]`, which is every fractional literal too, since
+/// only an integral one folds statically) and a slice descriptor used as a
+/// direct *index* (`.[{"start":s,"end":e}]`, #3300). `owned_bound_to_i64`
+/// carries a ceiled end in `(-1, 0)` as past-the-end, so it resolves to the
+/// length on read, write and delete alike, while `path()` still prints the
+/// bound as spelled. Every row verified live against jq 1.7.1.
 #[test]
-fn test_slice_computed_bound_and_direct_index_residual_3396() -> Result<()> {
-    for filter in ["-0.5", "-0.999"] {
-        let (stdout, stderr, code) =
-            run_jq_full(&["-c", &format!(".[0:({filter})]")], Some("[1,2,3,4]"))?;
-        // jq 1.7.1 answers "[1,2,3,4]" here; this is the current,
-        // still-diverging succinctly answer.
-        assert_eq!((stdout.trim_end(), code), ("[]", 0), "stderr: {stderr:?}");
+fn test_slice_computed_bound_and_direct_index_end_in_open_interval_3404() -> Result<()> {
+    let cases: &[(&str, &str, &str)] = &[
+        (".[0:(-0.5)]", "[1,2,3,4]", "[1,2,3,4]"),
+        (".[0:(-0.999)]", "[1,2,3,4]", "[1,2,3,4]"),
+        (".[0:-0.5]", "[1,2,3,4]", "[1,2,3,4]"),
+        (".[:-0.5]", "[1,2,3,4]", "[1,2,3,4]"),
+        (".[1:(-0.5)]", "[1,2,3,4]", "[2,3,4]"),
+        (r#".[{"start":0,"end":-0.5}]"#, "[1,2,3,4]", "[1,2,3,4]"),
+        (r#".[{"start":1,"end":-0.5}]"#, "\"abcd\"", r#""bcd""#),
+        (".[1:(-0.5)]", "\"abcd\"", r#""bcd""#),
+        (".[0:(-0.5)]", "[]", "[]"),
+        (r#".[0:(-0.5)] = ["x"]"#, "[1,2,3,4]", r#"["x"]"#),
+        (r#".[0:(-0.5)] |= ["x"]"#, "[1,2,3,4]", r#"["x"]"#),
+        ("del(.[0:(-0.5)])", "[1,2,3,4]", "[]"),
+        (
+            "path(.[0:(-0.5)])",
+            "[1,2,3,4]",
+            r#"[{"start":0,"end":-0.5}]"#,
+        ),
+        (
+            r#"path(.[{"start":0,"end":-0.5}])"#,
+            "[1,2,3,4]",
+            r#"[{"start":0,"end":-0.5}]"#,
+        ),
+        // Controls: an end at or past -1 already folded, and `-0` is not
+        // negative at all.
+        (".[0:(-1.5)]", "[1,2,3,4]", "[1,2,3]"),
+        (".[0:-0]", "[1,2,3,4]", "[]"),
+        (".[(-0.5):]", "[1,2,3,4]", "[4]"),
+    ];
+    for (filter, input, expected) in cases {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (*expected, 0),
+            "filter: {filter} input: {input} stderr: {stderr:?}"
+        );
     }
-
-    let (stdout, stderr, code) =
-        run_jq_full(&["-c", r#".[{"start":0,"end":-0.5}]"#], Some("[1,2,3,4]"))?;
-    // jq 1.7.1 answers "[1,2,3,4]" here too; same still-diverging answer.
-    assert_eq!((stdout.trim_end(), code), ("[]", 0), "stderr: {stderr:?}");
-
     Ok(())
 }
 
