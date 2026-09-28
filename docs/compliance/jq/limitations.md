@@ -7693,27 +7693,45 @@ inside, identity already implies equality, so this changes no other answer. A co
 is rebuilt (`map(.)`, `sort`, `[] + .`, `[.[]]`) is a new allocation in jq too and stays
 `false` in both; `contains`/`inside` and ordering have no identity check in either.
 
-| Filter (all `-n`)                                   | jq     | succinctly |
-|-----------------------------------------------------|--------|------------|
-| `[nan] \| . == .`, `{a:nan} \| . == .`              | `true` | `true`     |
-| `[nan] \| . as $a \| {x:$a,y:$a} \| .x == .y`       | `true` | `true`     |
-| `[nan] \| . as $a \| [$a,1,$a] \| unique \| length` | `2`    | `2`        |
-| `[nan] as $a \| $a == $a`                           | `true` | `false`    |
-| `[nan] \| [.] == [.]`, `[.,.] \| .[0] == .[1]`      | `true` | `false`    |
-| `[nan] \| . + [] == .`, `first(.) == .`             | `true` | `false`    |
-| `[nan] \| . as $a \| [$a] \| bsearch($a)`           | `0`    | `-1`       |
-| `[nan] \| .[0:] == .`                               | `true` | `false`    |
+| Filter (`-n` unless noted)                              | jq     | succinctly |
+|---------------------------------------------------------|--------|------------|
+| `[nan] \| . == .`, `{a:nan} \| . == .`                  | `true` | `true`     |
+| `[nan] \| . as $a \| {x:$a,y:$a} \| .x == .y`           | `true` | `true`     |
+| `[nan] \| . as $a \| [$a,1,$a] \| unique \| length`     | `2`    | `2`        |
+| `[nan] as $a \| $a == $a`                               | `true` | `false`    |
+| `[nan] \| [.] == [.]`, `[.,.] \| .[0] == .[1]`          | `true` | `false`    |
+| `[nan] \| . + [] == .`, `first(.) == .`                 | `true` | `false`    |
+| `[nan] \| . as $a \| [$a] \| .[] == $a`, `any(. == $a)` | `true` | `false`    |
+| `[nan] \| . as $a \| [$a,$a] \| group_by(.) \| length`  | `1`    | `2`        |
+| `[nan] \| . as $a \| [$a] \| indices([$a])`             | `[0]`  | `[]`       |
+| `[nan] \| . as $a \| [$a,$a] \| bsearch($a)`            | `0`    | `-3`       |
+| `[nan] \| .[0:] == .`                                   | `true` | `false`    |
+| `map(nan) \| . == .` on stdin `[1]`                     | `true` | `false`    |
+| `{a:[nan]} \| .a as $x \| .a \| path($x)`               | `[]`   | error      |
 
-The rows still `false` here are ones where succinctly has already split the sharing into two
-containers before `==` sees them. The reindex bridge is the main place: it serializes a value
-and re-materializes every node as a fresh container, which drops identity for an operand
-evaluated as `.` inside `+`, `[..]` or `first`, and for `bsearch`'s element list. `.[0:]` is a
-slice: a view onto the same array in jq, a copy here. Carrying identity across the bridge is
-the mechanism [#3189](https://github.com/rust-works/succinctly/issues/3189) and
-[#3305](https://github.com/rust-works/succinctly/issues/3305) need for `path()`, and #3069
-stays open for it. Ordering is unchanged in both: NaN sorts below NaN, itself included. A
-mixed-instance `sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends
-on the sort's comparison order in jq, and may group differently here.
+The shortcut only fires where `==` is handed two handles on one storage. Everywhere
+succinctly has already split the value into two containers first, jq's `true` is still
+`false` here, so the rows above are examples of a rule, not a closed list. The splits:
+
+- **The reindex bridge**, the main one. It serializes a value and re-materializes every node
+  as a fresh container. That covers an operand evaluated as `.` inside `+`, `[..]` or
+  `first`, and every builtin that walks a constructed array's elements as a document
+  (`.[]`, `any`, `IN`, `index`/`indices`, `group_by`/`unique_by`, `bsearch`'s element list).
+  Carrying identity across it is the mechanism
+  [#3189](https://github.com/rust-works/succinctly/issues/3189) and
+  [#3305](https://github.com/rust-works/succinctly/issues/3305) need for `path()`, and #3069
+  stays open for it.
+- **Document input.** The generic evaluator reads stdin as a cursor and materializes each
+  read separately, so `map(nan) | . == .` over a document is `false` although the same
+  filter under `-n` is `true`.
+- **Slices.** `.[0:]` is a view onto the same array in jq, and a copy here.
+- **Path tracking.** jq accepts `path($x)` where `$x` is `jv_identical` to the value at the
+  current path. succinctly certifies a bound variable by value or by its bind origin, so a
+  NaN-bearing `$x` bound from a navigated read refuses.
+
+Ordering is unchanged in both: NaN sorts below NaN, itself included. A mixed-instance
+`sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's
+comparison order in jq, and may group differently here.
 
 ### A malformed nested number raises when read; jq rejects the document (#966, #3034, #3222) — accepted uniform divergence
 
