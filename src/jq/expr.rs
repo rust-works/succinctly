@@ -1399,12 +1399,14 @@ impl Expr {
 /// It remembers `eval::needs_path_context` of its contents the same way: that
 /// walk also descends into every `Shared`, and a pipe asks it of each stage on
 /// every evaluation, so a pipe link over a recursion's chain (`f(n - 1 | .)`)
-/// walked the whole chain per link, cubic in the depth.
+/// walked the whole chain per link, cubic in the depth. And
+/// `eval::contains_retrying_pattern_bind`, for the same reason (#3410).
 #[derive(Clone)]
 pub struct SharedArg {
     expr: Expr,
     eager: core::cell::Cell<Option<bool>>,
     needs_path_context: core::cell::Cell<Option<bool>>,
+    retrying_bind: core::cell::Cell<Option<bool>>,
 }
 
 impl SharedArg {
@@ -1414,6 +1416,7 @@ impl SharedArg {
             expr,
             eager: core::cell::Cell::new(None),
             needs_path_context: core::cell::Cell::new(None),
+            retrying_bind: core::cell::Cell::new(None),
         }
     }
 
@@ -1427,6 +1430,7 @@ impl SharedArg {
     pub fn expr_mut(&mut self) -> &mut Expr {
         self.eager.set(None);
         self.needs_path_context.set(None);
+        self.retrying_bind.set(None);
         &mut self.expr
     }
 
@@ -1440,6 +1444,13 @@ impl SharedArg {
     /// on the first call.
     pub fn needs_path_context_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
         memo(&self.needs_path_context, || classify(&self.expr))
+    }
+
+    /// Whether this argument holds a `?//` bind, computing it with
+    /// `classify` on the first call (#3410): asked of every `[...]` body, it
+    /// would otherwise re-walk a recursion's whole argument chain each time.
+    pub fn retrying_bind_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
+        memo(&self.retrying_bind, || classify(&self.expr))
     }
 }
 
@@ -3051,10 +3062,24 @@ mod tests {
         let classified = SharedArg::new(Expr::Identity);
         assert!(classified.eager_or_init(|_| true));
         assert!(!classified.needs_path_context_or_init(|_| false));
+        assert!(classified.retrying_bind_or_init(|_| true));
         assert_eq!(fresh, classified);
         assert_eq!(format!("{fresh:?}"), format!("{classified:?}"));
         assert_eq!(format!("{fresh:?}"), format!("{:?}", Expr::Identity));
         assert_ne!(fresh, SharedArg::new(Expr::Literal(Literal::Null)));
+    }
+
+    /// #3410: the `?//` memo answers from its first classification until the
+    /// argument is rewritten, and a rewrite (`expr_mut`) forgets it -- a
+    /// stale `false` would send a body that now holds a `?//` down the eager,
+    /// non-retrying collector.
+    #[test]
+    fn shared_arg_retrying_bind_memo_is_reset_by_expr_mut_3410() {
+        let mut arg = SharedArg::new(Expr::Identity);
+        assert!(!arg.retrying_bind_or_init(|_| false));
+        assert!(!arg.retrying_bind_or_init(|_| unreachable!("answered from the memo")));
+        *arg.expr_mut() = Expr::Literal(Literal::Null);
+        assert!(arg.retrying_bind_or_init(|_| true));
     }
 
     #[test]

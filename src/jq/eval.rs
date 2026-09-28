@@ -3533,12 +3533,11 @@ fn collect_array_items<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> Result<Vec<OwnedValue>, QueryResult<'a, W>> {
-    // A label's break (or try's error) must reach a parenthesized `?//`
-    // through a live sink. Collecting its eager result first loses the
-    // retry, then either drops the later comma branch or catches the error.
-    if matches!(inner, Expr::Label { .. } | Expr::Try { .. })
-        && contains_retrying_pattern_bind(inner)
-    {
+    // A failure raised after a `?//` -- a label's break, a try's error, a
+    // negation or an object step on its output (#3410) -- must reach the
+    // bind through a live sink. Collecting its eager result first loses the
+    // retry.
+    if contains_retrying_pattern_bind(inner) {
         let mut items = Vec::new();
         let mut conversion_error = None;
         let flow = eval_each::<W, S>(inner, value, optional, &mut |item| match item
@@ -5561,7 +5560,8 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
     /// document, #1829), and [`builtin_inputs`] (from `each_inputs`, whose only
     /// push is a queued `OwnedValue`). Neither [`Self::into_owned_lossy`] nor
     /// [`Self::into_owned`] can therefore differ observably at any of
-    /// them.
+    /// them. A fourth, `negate_driving_operand_sink` (#3410), is fed only by
+    /// `each_negate`'s push of `arith_negate`'s owned result.
     ///
     /// Spelled as its own method rather than a bare [`Self::into_owned_lossy`]
     /// for two reasons. #2025 was filed against exactly these three sites on
@@ -10663,7 +10663,33 @@ fn eval_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // A `?//` in the operand has to see the negation's failure to retry
+    // (#3410), which an operand evaluated to completion first never shows it.
+    if contains_retrying_pattern_bind(operand) {
+        return negate_driving_operand_sink::<W, S>(operand, value, optional);
+    }
     negate_fanout_core::<W, S>(eval_single::<W, S>(operand, value, optional), optional)
+}
+
+/// [`eval_negate`] for an operand holding a `?//` (#3410): collect
+/// [`each_negate`], whose sink the bind sees fail. Kept out of line so the
+/// ordinary negation's frame, live once per level of a recursive `def`,
+/// does not grow for it (#3149).
+#[inline(never)]
+fn negate_driving_operand_sink<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    operand: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let mut out: Vec<OwnedValue> = Vec::new();
+    let flow = each_negate::<W, S>(operand, value, optional, &mut |item: Item<'a, W>| {
+        out.push(item.into_owned_from_owned_producer::<S>());
+        Demand::Continue
+    });
+    match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(out),
+        Flow::Escaped(control) => partial(out, control),
+    }
 }
 
 /// Shared body of `and`/`or` (#1405; extracted from the pre-existing
@@ -48643,22 +48669,57 @@ pub(crate) fn direct_pattern_retry(expr: &Expr) -> bool {
     matches!(unwrap_paren(expr), Expr::AsPattern { patterns, .. } if patterns.len() > 1)
 }
 
-/// The eager array collector needs a live sink only when downstream control
-/// can unwind into a `?//` bind inside its label/try body. Keep unrelated
-/// generators on the eager route, where their resource caps apply.
+/// Set once the parser has built a `?//` bind with more than one pattern in
+/// this process (#3410), so [`contains_retrying_pattern_bind`] can answer
+/// `false` without walking for the programs that have none.
+///
+/// A flag that only ever goes from `false` to `true`, so `Relaxed` suffices:
+/// a stale `false` could only be read by an evaluation of a program parsed
+/// before any `?//` was, which has none to find. An `Expr` built by hand
+/// rather than parsed never sets it and keeps the eager collector.
+static ALTERNATIVE_BIND_PARSED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Record that a `?//` with alternatives was parsed ([`ALTERNATIVE_BIND_PARSED`]).
+pub(crate) fn note_alternative_bind_parsed() {
+    ALTERNATIVE_BIND_PARSED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `expr` holds a `?//` bind anywhere -- the one shape whose
+/// retry needs a failure raised *after* it to reach it through a live sink.
+///
+/// The eager array collector answers with this: collected eagerly, an
+/// operand is finished before the construct around it fails, so `[-G]` or
+/// `[{a: G} | .a | -.]` never retried where jq does (#3410); before that fix
+/// this only looked through a label/try body's pipes and commas (#3293).
+/// Everything without a `?//` keeps the eager route, where its resource caps
+/// apply.
+///
+/// Asked on every evaluation of every `[...]`, so a `Shared` argument's
+/// answer is remembered on it (`SharedArg::retrying_bind_or_init`) rather
+/// than re-walked: a recursion's argument chain grows one link per level,
+/// and walking it per level is the quadratic term #2626 measured for
+/// `needs_path_context`.
 pub(crate) fn contains_retrying_pattern_bind(expr: &Expr) -> bool {
-    match expr {
-        Expr::AsPattern { patterns, body, .. } => {
-            patterns.len() > 1 || contains_retrying_pattern_bind(body)
-        }
-        Expr::Pipe(parts) | Expr::Comma(parts) => parts.iter().any(contains_retrying_pattern_bind),
-        Expr::Paren(inner)
-        | Expr::Array(inner)
-        | Expr::Optional(inner)
-        | Expr::Try { expr: inner, .. }
-        | Expr::Label { body: inner, .. } => contains_retrying_pattern_bind(inner),
-        _ => false,
+    use crate::jq::walk::{search_subexpr, Visit};
+    // No `?//` has been parsed, so there is none to find: the ordinary case
+    // pays one load, not a walk of the body and every def it calls (a
+    // per-evaluation walk measured +11% on `[range(200000) | [f]]` over a
+    // large `def f`).
+    if !ALTERNATIVE_BIND_PARSED.load(core::sync::atomic::Ordering::Relaxed) {
+        return false;
     }
+    search_subexpr(expr, &mut |e| match e {
+        Expr::AsPattern { patterns, .. } if patterns.len() > 1 => Visit::Found,
+        Expr::Shared(arg) => {
+            if arg.retrying_bind_or_init(contains_retrying_pattern_bind) {
+                Visit::Found
+            } else {
+                Visit::Skip
+            }
+        }
+        _ => Visit::Descend,
+    })
 }
 
 pub(crate) fn pipe_retry_generation() -> u64 {
@@ -73152,11 +73213,141 @@ mod tests {
         }
     }
 
+    /// #3410 in this evaluator: a `?//` retries past a failure raised by
+    /// `-`, arithmetic or `[...]` on its output, on both the eager route
+    /// (`eval_single`, `collect_array_items`) and the streaming one
+    /// (`eval_each`, `each_negate`, `binary_fanout_each_with`). Expected
+    /// values captured from jq 1.7.1.
+    #[test]
+    fn pattern_alternatives_retry_past_operator_failures_3410() {
+        fn run(filter: &str, input: &[u8]) -> (Vec<String>, Option<String>) {
+            let index = JsonIndex::build(input);
+            let cursor = index.root(input);
+            let expr = parse(filter).unwrap();
+            let mut out = Vec::new();
+            let flow = eval_each::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false, &mut |i| {
+                out.push(i.into_owned::<JqSemantics>().unwrap().to_json());
+                Demand::Continue
+            });
+            let error = match flow {
+                Flow::Escaped(Control::Error(e)) => Some(e.to_string()),
+                _ => None,
+            };
+            (out, error)
+        }
+        let g = "([[1]] as [$a] ?// [[$a]] | $a)";
+        let boom = r#"([["x"]] as [$a] ?// [[$a]] | $a | if type=="string" then error("boom") else . end)"#;
+        // (filter, input, outputs, error raised)
+        type Row<'r> = (String, &'r [u8], &'r [&'r str], Option<&'r str>);
+        let rows: &[Row<'_>] = &[
+            (format!("[-{g}]"), b"null", &["[-1]"], None),
+            // The `?//` reaches the collector as a function argument.
+            (format!("def f(x): [-x]; f({g})"), b"null", &["[-1]"], None),
+            (format!("[{g} + 1]"), b"null", &["[2]"], None),
+            (format!("[1 + {g}]"), b"null", &["[2]"], None),
+            (format!("[-{g}, 1 + {g}]"), b"null", &["[-1,2]"], None),
+            (format!("-{g}"), b"null", &["-1"], None),
+            (format!("{g} + 1"), b"null", &["2"], None),
+            // The last alternative yields nothing: the first attempt's
+            // error was spent by the retry all the same.
+            (
+                "[-([[1]] as [$a] ?// $b | $a // empty)]".into(),
+                b"null",
+                &["[]"],
+                None,
+            ),
+            (
+                "-([[1]] as [$a] ?// $b | $a // empty)".into(),
+                b"null",
+                &[],
+                None,
+            ),
+            // The retry raises its own error, which wins over the spent one.
+            (format!("[-{boom}]"), b"null", &[], Some("boom")),
+            (format!("[{boom} + 1]"), b"null", &[], Some("boom")),
+            (format!("-{boom}"), b"null", &[], Some("boom")),
+            // A downstream stop the retry consumed does not swallow the
+            // retried alternative's error.
+            (
+                "[first(-([1] as [$a] ?// $a | $a))]".into(),
+                br#""a""#,
+                &[],
+                Some("cannot be negated"),
+            ),
+        ];
+        for (filter, input, want, error) in rows {
+            let (got, raised) = run(filter, input);
+            assert_eq!(&got, want, "`{filter}`");
+            match error {
+                Some(e) => assert!(
+                    raised.as_deref().is_some_and(|r| r.contains(e)),
+                    "`{filter}`: {raised:?}"
+                ),
+                None => assert_eq!(raised, None, "`{filter}`"),
+            }
+            // The eager route answers the same.
+            let index = JsonIndex::build(input);
+            let expr = parse(filter).unwrap();
+            let eager =
+                eval_single::<Vec<u64>, JqSemantics>(&expr, index.root(input).value(), false);
+            match error {
+                Some(e) => assert!(
+                    matches!(&eager, QueryResult::Error(err) if err.to_string().contains(e)),
+                    "eager `{filter}`"
+                ),
+                None => assert_eq!(
+                    eager
+                        .collect_owned::<JqSemantics>()
+                        .iter()
+                        .map(OwnedValue::to_json)
+                        .collect::<Vec<_>>(),
+                    want.to_vec(),
+                    "eager `{filter}`"
+                ),
+            }
+        }
+    }
+
     /// #1519: `Builtin::FirstStream` is never constructed by the parser (a CLI
     /// `first(expr)` always reaches `Expr::FirstExpr`, see
     /// `builtin_first_stream_propagates_bare_halt`), so its own `?//` retry
     /// path is exercised directly here to keep it from drifting away from
     /// `eval_first_expr`'s.
+    /// #3410: an operand the fan-out cannot decode still raises through the
+    /// retry-aware slot, in jq mode's pairing loop and in yq mode's
+    /// empty-outer pass (the outer operand `empty`, so the left one is
+    /// driven alone).
+    #[test]
+    fn fanout_operand_decode_failure_escapes_through_the_retry_slot_3410() {
+        let bytes: &[u8] = b"{\"a\":\"\xff\"}";
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        // Either operand position, since which one drives the outer loop
+        // differs by mode (#2451).
+        for filter in ["(.a) + 1", "1 + (.a)"] {
+            let expr = parse(filter).unwrap();
+            let flow =
+                eval_each::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false, &mut |_| {
+                    Demand::Continue
+                });
+            assert!(
+                matches!(flow, Flow::Escaped(Control::Error(_))),
+                "jq `{filter}`"
+            );
+        }
+        for filter in ["(.a) + 1", "(.a) + empty", "empty + (.a)"] {
+            let expr = parse(filter).unwrap();
+            let flow =
+                eval_each::<Vec<u64>, YqSemantics>(&expr, cursor.value(), false, &mut |_| {
+                    Demand::Continue
+                });
+            assert!(
+                matches!(flow, Flow::Escaped(Control::Error(_))),
+                "yq `{filter}`"
+            );
+        }
+    }
+
     #[test]
     fn builtin_first_stream_retries_pattern_alternatives_1519() {
         let json_bytes: &[u8] = b"null";

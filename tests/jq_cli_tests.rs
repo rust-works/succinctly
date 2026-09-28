@@ -74834,3 +74834,207 @@ fn test_frozen_source_through_a_composite_head_refuses_loudly_3334() -> Result<(
     assert_eq!(out.trim(), "[]");
     Ok(())
 }
+
+/// A `?//` retries when a failure is raised anywhere after the bind, the
+/// consuming operator or collector included (#3410). With
+/// `G = ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)` the first
+/// alternative binds `$a` to `[1]`, which `-`/`+` refuse, and jq retries into
+/// the second (`$a` = `1`). Each row is captured from `/usr/bin/jq` 1.7.1 on
+/// input `[1]`: stdout (lines joined by a space), the number of attempts
+/// (`A`s on stderr), the error jq raises if any, and the exit code. Inside
+/// `[...]` succinctly never retried; bare, it retried but also printed the
+/// first attempt's error.
+#[test]
+fn test_alternative_destructuring_retries_past_an_operator_failure_3410() -> Result<()> {
+    let rows: &[(&str, &str, usize, &str, i32)] = &[
+        (
+            r#"[-([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
+            "[-1]",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"[(-([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a))]"#,
+            "[-1]",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"[.[]?, -([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
+            "[1,-1]",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"[-([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)] | length"#,
+            "1",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"[{a: ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)} | .a | -.]"#,
+            "[-1]",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) // 5 | -.]"#,
+            "[-1]",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) + 1]"#,
+            "[2]",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"[1 + ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
+            "[2]",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"[label $out | -([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
+            "[-1]",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"[try -([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) catch "c"]"#,
+            "[-1]",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"-([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)"#,
+            "-1",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) + 1"#,
+            "2",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"-([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a), 3"#,
+            "-1 3",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"{a: -([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)}"#,
+            r#"{"a":-1}"#,
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"[-([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)]"#,
+            "[]",
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"-([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)"#,
+            "",
+            2,
+            "",
+            0,
+        ),
+        ("[1 + ([[1]] as [$a] ?// $b | $a // empty)]", "[]", 0, "", 0),
+        (r#"[-(error("x") as [$a] ?// $b | 1)]"#, "", 0, "x", 5),
+        (
+            r#"[-([[1]] as [$a] ?// $b | ("A"|stderr) | $a)]"#,
+            "",
+            2,
+            "null (null) cannot be negated",
+            5,
+        ),
+        (
+            r#"[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) | -.]"#,
+            "[-1]",
+            2,
+            "",
+            0,
+        ),
+        // #3410 review: the retry's own error, not the spent one.
+        (
+            r#"[-([["x"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a | if type=="string" then error("boom") else . end)]"#,
+            "",
+            2,
+            "boom",
+            5,
+        ),
+        // #3410 review: the retry's own error, not the spent one.
+        (
+            r#"[([["x"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a | if type=="string" then error("boom") else . end) + 1]"#,
+            "",
+            2,
+            "boom",
+            5,
+        ),
+        // #3410 review: the retry's own error, not the spent one.
+        (
+            r#"-([["x"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a | if type=="string" then error("boom") else . end)"#,
+            "",
+            2,
+            "boom",
+            5,
+        ),
+        // #3410 review: the retry's own error, not the spent one.
+        (
+            r#"([["x"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a | if type=="string" then error("boom") else . end) | -."#,
+            "",
+            2,
+            "boom",
+            5,
+        ),
+        // #3410 review: the retry's own error, not the spent one.
+        (
+            r#"[first(-(.[0] as [$a] ?// $a | ("A"|stderr) | [$a]))]"#,
+            "",
+            1,
+            "array ([1]) cannot be negated",
+            5,
+        ),
+    ];
+    for (filter, stdout_expected, attempts, error, code_expected) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1]"))?;
+        assert_eq!(
+            (stdout.trim_end().replace('\n', " ").as_str(), code),
+            (*stdout_expected, *code_expected),
+            "`{filter}`: stderr={stderr:?}"
+        );
+        let (retries, diagnostic) = stderr.split_once("jq: error").unwrap_or((&stderr, ""));
+        assert_eq!(
+            retries.matches('A').count(),
+            *attempts,
+            "`{filter}`: stderr={stderr:?}"
+        );
+        assert!(diagnostic.contains(error), "`{filter}`: stderr={stderr:?}");
+        assert_eq!(
+            diagnostic.is_empty(),
+            error.is_empty(),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
