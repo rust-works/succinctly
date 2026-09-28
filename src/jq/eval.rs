@@ -10813,11 +10813,17 @@ fn boolean_fanout_each_with(
     // Why the fanout ended, recorded out-of-band because the driving closure
     // can only answer `Demand` -- the same shape `binary_fanout_each`'s own
     // `abort` uses.
-    let mut abort: Option<Control> = None;
+    let abort = StashedEscape::new();
     let mut outer_stopped = false;
     let mut left_seen = 0usize;
 
     let mut flow = each_operand(left, &mut |left_bit| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside
+        // `left`; it supersedes whatever the retried-past bit decided,
+        // including a consumer's stop that would otherwise hide the error
+        // the retry's own pairing raises.
+        abort.begin();
+        outer_stopped = false;
         left_seen += 1;
         boolean_pair_left_bit(
             left_bit,
@@ -10826,17 +10832,20 @@ fn boolean_fanout_each_with(
             rules,
             &each_operand,
             sink,
-            &mut abort,
+            &abort,
             &mut outer_stopped,
         )
     });
+    // #3293: a retry inside `left` that produced nothing never re-invoked
+    // the closure above.
+    abort.settle(&flow, direct_pattern_retry(left));
 
     // #2460/#2540 (yq mode only): the left operand produced *zero* outputs,
     // so it contributes one synthesized truthiness bit, which then runs
     // through the identical pairing body above rather than a second
     // spelling of it. See [`empty_boolean_operand_bit`] for which bit, and
     // why a literal/constructor operand is not "empty" at all.
-    if left_seen == 0 && abort.is_none() && matches!(flow, Flow::Exhausted) {
+    if left_seen == 0 && !abort.is_set() && matches!(flow, Flow::Exhausted) {
         if let Some(bit) = empty_boolean_operand_bit(left, rules) {
             let demand = boolean_pair_left_bit(
                 bit,
@@ -10845,17 +10854,17 @@ fn boolean_fanout_each_with(
                 rules,
                 &each_operand,
                 sink,
-                &mut abort,
+                &abort,
                 &mut outer_stopped,
             );
-            if demand == Demand::Stop && abort.is_none() {
+            if demand == Demand::Stop && !abort.is_set() {
                 flow = Flow::Stopped { pending: None };
             }
         }
     }
 
-    if abort.is_some() {
-        return resume_from_escape(abort, flow);
+    if abort.is_set() {
+        return abort.resume(flow, false);
     }
     // `and`/`or` never stop on their own account -- the short circuit skips
     // one *pairing*, it does not end the stream -- so every stop reaching
@@ -10877,7 +10886,7 @@ fn boolean_pair_left_bit(
     rules: BinaryFanoutRules,
     each_operand: &impl Fn(&Expr, &mut dyn FnMut(bool) -> Demand) -> Flow,
     sink: &mut dyn FnMut(bool) -> Demand,
-    abort: &mut Option<Control>,
+    abort: &StashedEscape,
     outer_stopped: &mut bool,
 ) -> Demand {
     // The short circuit: `false and _` / `true or _` contributes its own
@@ -10926,7 +10935,7 @@ fn boolean_pair_left_bit(
         // discarding the left operand's own trailing control -- the
         // sink-world spelling of the pre-WP2a `return (out, Some(control))`
         // (#400/#494).
-        Flow::Escaped(control) => stop_with_escape(abort, control),
+        Flow::Escaped(control) => abort.stop(control),
     }
 }
 
@@ -48366,6 +48375,28 @@ pub(crate) fn retry_consumed_stop(upstream: &Flow, stopped_at: u64, direct_retry
         && (terminal_retry::current() != stopped_at || (!cfg!(feature = "std") && direct_retry))
 }
 
+/// Whether a `?//` retry inside the driven generator superseded a verdict a
+/// driver stashed at generation `stashed_at` (#3293) -- the
+/// [`retry_consumed_stop`] rule, widened to a drive that ended in an escape.
+///
+/// A driver's closure answers `Stop` with the verdict stashed; if the `?//`
+/// retries and the next alternative never reaches the closure again, the
+/// drive ends in whatever that alternative did instead: nothing
+/// ([`Flow::Exhausted`]) or its own error ([`Flow::Escaped`]). Either one is
+/// the answer jq gives, and the stash belongs to an alternative it abandoned:
+/// `-([[1]] as [$a] ?// $b | $a | if . == null then error("E2") end)` raises
+/// `E2` in jq 1.7.1, not the first alternative's "cannot be negated". A drive
+/// that escapes with no retry since the stash cannot have a stash at all --
+/// the closure's `Stop` ends it as [`Flow::Stopped`] -- so the escape arm
+/// adds no ambiguity the exhausted arm does not already carry.
+pub(crate) fn retry_superseded(flow: &Flow, stashed_at: u64, direct_retry: bool) -> bool {
+    match flow {
+        Flow::Exhausted => retry_consumed_stop(flow, stashed_at, direct_retry),
+        Flow::Escaped(_) => retry_consumed_stop(&Flow::Exhausted, stashed_at, direct_retry),
+        Flow::Stopped { .. } => false,
+    }
+}
+
 /// In `no_std` there is no thread-local retry generation. A direct `?//`
 /// producer that received a sink stop and then exhausted has necessarily
 /// consumed that stop while advancing to another alternative.
@@ -48524,6 +48555,114 @@ pub(crate) fn stop_with_error(slot: &mut Option<EvalError>, error: EvalError) ->
         _ => unreachable!("stop_with_escape stores exactly the control it was handed"), // omni-dev: coverage tolerate-line reason="unreachable: stop_with_escape's only write is `slot.set(Some(control))` with the control it was handed, which is always the `Control::Error` built one line above (#2180)"
     }
     demand
+}
+
+/// A fan-out driver's out-of-band escape slot that a `?//` retry can
+/// supersede (#3293) -- the [`stop_with_escape`] idiom plus the two things a
+/// bare `Option<Control>` cannot tell apart on its own.
+///
+/// A driver stashes an escape and answers [`Demand::Stop`]. If a `?//`
+/// inside the generator it drives then retries past that stop (#1519), the
+/// stash describes an alternative jq has already abandoned, and it must not
+/// outrank what the retry went on to do. The retry takes one of two shapes:
+///
+/// - It produces another output, re-invoking the driver's closure. Calling
+///   [`Self::begin`] at the top of every invocation drops the stale stash,
+///   so the exit reflects the *last* invocation (#2952's reset, b2e641f81).
+///   A driver that also keeps a "consumer stopped" flag resets it at the same
+///   point, or that flag outranks a fresh escape instead.
+/// - It never reaches the closure again: it produces nothing, or raises
+///   inside the generator. No reset can happen, so [`Self::take`] recognises
+///   it from the drive's own verdict and the retry generation having moved
+///   since the stash ([`retry_superseded`]).
+///
+/// Captured against jq 1.7.1: `-([[1]] as [$a] ?// [[$a]] | $a)` is `-1`,
+/// and `-([[1]] as [$a] ?// $b | $a // empty)` is empty with exit 0.
+///
+/// The fields are `Cell`s so a driver whose closures nest (`each_range`'s
+/// three operand levels and its emitter) can share one slot by `&`. The slot
+/// is generic because some drivers stash a whole [`Flow`] (a consumer's stop
+/// as well as an escape) rather than a bare [`Control`]; [`StashedEscape`]
+/// names the common case.
+pub(crate) struct StashedVerdict<T> {
+    slot: core::cell::Cell<Option<T>>,
+    at: core::cell::Cell<u64>,
+}
+
+/// A [`StashedVerdict`] holding a bare [`Control`].
+pub(crate) type StashedEscape = StashedVerdict<Control>;
+
+impl<T> StashedVerdict<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slot: core::cell::Cell::new(None),
+            at: core::cell::Cell::new(0),
+        }
+    }
+
+    /// Call at the top of every invocation of the driver's closure.
+    pub(crate) fn begin(&self) {
+        self.slot.set(None);
+    }
+
+    /// Stash `verdict`, stamped with the current retry generation. Callers
+    /// go through [`Self::stop`]/[`Self::stop_with_downstream`], which also
+    /// classify the escape for `?//`.
+    fn stash(&self, verdict: T) {
+        self.at.set(pipe_retry_generation());
+        self.slot.set(Some(verdict));
+    }
+
+    /// Whether a verdict is currently stashed.
+    pub(crate) fn is_set(&self) -> bool {
+        let verdict = self.slot.take();
+        let set = verdict.is_some();
+        self.slot.set(verdict);
+        set
+    }
+
+    /// Drop the stash if a retry inside the generator that just returned
+    /// `flow` consumed it. `direct_retry` is [`direct_pattern_retry`] of
+    /// that generator's expression, the `no_std` stand-in for the
+    /// generation.
+    pub(crate) fn settle(&self, flow: &Flow, direct_retry: bool) {
+        if retry_superseded(flow, self.at.get(), direct_retry) {
+            self.slot.set(None);
+        }
+    }
+
+    /// The verdict the drive still owes, or `None` when a retry inside the
+    /// driven generator consumed it -- [`Self::settle`], then take.
+    pub(crate) fn take(self, flow: &Flow, direct_retry: bool) -> Option<T> {
+        self.settle(flow, direct_retry);
+        self.slot.into_inner()
+    }
+}
+
+impl StashedVerdict<Control> {
+    /// [`stop_with_escape`] into this slot.
+    pub(crate) fn stop(&self, control: Control) -> Demand {
+        mark_nonretryable_escape(&control);
+        self.stash(control);
+        Demand::Stop
+    }
+
+    /// [`Self::take`], then [`resume_from_escape`].
+    pub(crate) fn resume(self, flow: Flow, direct_retry: bool) -> Flow {
+        let control = self.take(&flow, direct_retry);
+        resume_from_escape(control, flow)
+    }
+}
+
+impl StashedVerdict<Flow> {
+    /// [`stop_with_downstream`] into this slot.
+    pub(crate) fn stop_with_downstream(&self, flow: Flow) -> Demand {
+        if let Flow::Escaped(ref control) = flow {
+            mark_nonretryable_escape(control);
+        }
+        self.stash(flow);
+        Demand::Stop
+    }
 }
 
 /// Take a driver's stashed escape back out as a [`Flow::Escaped`], or fall
