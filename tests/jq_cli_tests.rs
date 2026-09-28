@@ -31257,7 +31257,9 @@ fn test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149() ->
     // change.
     assert!(
         stderr.contains("d/3 exceeded maximum recursion depth")
-            || stderr.trim_end().ends_with("): exceeded maximum recursion depth"),
+            || stderr
+                .trim_end()
+                .ends_with("): exceeded maximum recursion depth"),
         "stderr: {stderr:?}"
     );
 
