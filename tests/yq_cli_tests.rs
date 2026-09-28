@@ -49090,3 +49090,15 @@ fn test_yq_rejects_generic_postfix_optional_3378() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3309 compares a parsed NaN by instance in jq mode only. yq mode keeps
+/// its own NaN equality, which matches yq v4.53.3: `.a == .a` and, unlike
+/// jq, `.a == .b` are both `true` for two `.nan` scalars.
+#[test]
+fn test_yq_nan_equality_unchanged_by_jq_instance_rule_3309() -> Result<()> {
+    for (filter, expected) in [(".a == .a", "true"), (".a == .b", "true")] {
+        let (stdout, code) = run_yq_stdin(filter, "a: .nan\nb: .nan\n", &[])?;
+        assert_eq!((stdout.trim_end(), code), (expected, 0), "`{filter}`");
+    }
+    Ok(())
+}

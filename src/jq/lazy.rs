@@ -39,7 +39,9 @@ use super::document::{
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
 use super::expr::Literal;
-use super::value::{assert_value_tree_depth, infinite_float_preview_text, ObjectMapOf, OwnedValue};
+use super::value::{
+    assert_value_tree_depth, infinite_float_preview_text, NumberRepr, ObjectMapOf, OwnedValue,
+};
 
 /// A JSON value for jq evaluation - lazy by default, materialized when needed.
 ///
@@ -215,6 +217,11 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             // above) means the parsed value is deliberately not read until
             // needed, regardless of whether a `NumberRepr` happens to
             // already be sitting on the node.
+            // A parsed NaN (#3309) has no spelling to defer: its text is
+            // jq's printing of it, so it takes the eager conversion.
+            Literal::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
+                JqValue::from_owned(OwnedValue::from(lit.clone()))
+            }
             Literal::NumberLiteral(_repr, text) => JqValue::NumberLiteral(text.as_str().into()),
             _ => JqValue::from_owned(OwnedValue::from(lit.clone())),
         }

@@ -4671,10 +4671,13 @@ impl From<Literal> for OwnedValue {
             Literal::NumberLiteral(repr, text) => {
                 // #2936: a `Literal` carries no mode, and the two modes read
                 // a >17-significant-digit float differently, so either
-                // mode's parse is a match.
+                // mode's parse is a match. A parsed NaN spliced back as a
+                // literal (`--argjson x NaN`, #3309) has no number spelling:
+                // its text is jq's printing of it.
                 debug_assert!(
                     Some(repr) == parse_i64_or_f64_in::<JqSemantics>(&text)
-                        || Some(repr) == parse_i64_or_f64_in::<YqSemantics>(&text),
+                        || Some(repr) == parse_i64_or_f64_in::<YqSemantics>(&text)
+                        || matches!(repr, NumberRepr::Float(f) if is_nan_instance(f) && text == "null"),
                     "Literal::NumberLiteral's repr {repr:?} doesn't match a fresh parse of its own text {text:?} under either mode"
                 );
                 Self::NumberLiteral(repr, text.into())
@@ -6285,6 +6288,108 @@ mod tests {
         ));
     }
 
+    /// jq compares a parsed NaN by instance (#3309): the same token is
+    /// equal, anything else -- another token, a computed NaN, yq's rule --
+    /// is not.
+    #[test]
+    fn test_nan_instance_equality_3309() {
+        let a = OwnedValue::document_nan_instance(false, 0x1000);
+        let a_again = OwnedValue::document_nan_instance(false, 0x1000);
+        let b = OwnedValue::document_nan_instance(false, 0x1001);
+        let computed = OwnedValue::Float(f64::NAN);
+        // Same token: one instance, under jq's rule only.
+        assert!(same_nan_instance(&a, &a_again));
+        assert!(owned_value_eq::<JqSemantics>(&a, &a_again));
+        assert!(owned_value_eq::<JqSemantics>(
+            &OwnedValue::array_from(vec![a.clone()]),
+            &OwnedValue::array_from(vec![a_again.clone()])
+        ));
+        // Different tokens, or a computed NaN on either side: never equal.
+        assert!(!owned_value_eq::<JqSemantics>(&a, &b));
+        assert!(!owned_value_eq::<JqSemantics>(&a, &computed));
+        assert!(!owned_value_eq::<JqSemantics>(&computed, &computed));
+        // Collapsing for arithmetic drops the identity.
+        let plain = a.clone().into_plain_number();
+        assert!(!owned_value_eq::<JqSemantics>(&plain, &plain.clone()));
+        // yq's strict rule never consults it.
+        assert!(!owned_value_eq::<YqSemantics>(&a, &a_again));
+        // Fresh instances are distinct from each other and from addresses.
+        let f1 = OwnedValue::fresh_nan_instance(false);
+        let f2 = OwnedValue::fresh_nan_instance(false);
+        assert!(owned_value_eq::<JqSemantics>(&f1, &f1.clone()));
+        assert!(!owned_value_eq::<JqSemantics>(&f1, &f2));
+        // Ordering is unchanged: NaN sorts below NaN, itself included.
+        assert_eq!(
+            jq_numeric_cmp(&a, &a_again),
+            Some(core::cmp::Ordering::Less)
+        );
+        // It prints as any NaN, and the sign survives.
+        assert_eq!(a.to_json(), "null");
+        assert!(matches!(
+            OwnedValue::document_nan_instance(true, 0x1000),
+            OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() && f.is_sign_negative()
+        ));
+    }
+
+    /// The reindex and input bridges carry a parsed NaN's instance through
+    /// their text (#3309); a computed NaN still writes the plain sentinel.
+    #[test]
+    fn test_nan_instance_survives_the_bridges_3309() {
+        let a = OwnedValue::document_nan_instance(true, 0x2468);
+        for text in [
+            a.to_json_for_reindex::<JqSemantics>().expect("in range"),
+            a.to_json_input_bridge(),
+        ] {
+            assert!(text.starts_with(&format!("{NAN_SENTINEL}e")), "{text}");
+            assert_eq!(
+                OwnedValue::from_number_bytes::<JqSemantics>(text.as_bytes()),
+                OwnedValue::Null,
+                "{text} is not user text"
+            );
+            let back = read_as_bridge_text::<JqSemantics>(&text);
+            assert!(same_nan_instance(&a, &back), "{text}: {back:?}");
+        }
+        assert_eq!(
+            OwnedValue::Float(f64::NAN)
+                .to_json_for_reindex::<JqSemantics>()
+                .expect("in range"),
+            NAN_SENTINEL
+        );
+        // A token whose bits are not a tagged NaN is not a NaN token.
+        for text in [
+            format!("{NAN_SENTINEL}e{}", f64::NAN.to_bits()),
+            format!("{NAN_SENTINEL}e1"),
+            format!("{NAN_SENTINEL}e"),
+            format!("{NAN_SENTINEL}e1x"),
+            format!("{NAN_SENTINEL}e99999999999999999999999"),
+        ] {
+            assert_eq!(parse_nan_instance_token(text.as_bytes()), None, "{text}");
+        }
+    }
+
+    /// A fresh parse re-keys every NaN it built, containers included, and
+    /// leaves a value without one untouched (#3309).
+    #[test]
+    fn test_with_fresh_nan_instances_rekeys_every_nan_3309() {
+        let a = OwnedValue::document_nan_instance(false, 0x10);
+        let mut fields = IndexMap::new();
+        fields.insert("k".to_string(), a.clone());
+        let value = OwnedValue::array_from(vec![
+            a.clone(),
+            OwnedValue::object_from(fields),
+            OwnedValue::Int(1),
+        ]);
+        let fresh = value.with_fresh_nan_instances();
+        let items = fresh.as_array().expect("array");
+        let nested = items[1].as_object().expect("object")["k"].clone();
+        assert!(!same_nan_instance(&items[0], &a));
+        assert!(!same_nan_instance(&nested, &a));
+        assert!(!same_nan_instance(&items[0], &nested));
+        assert_eq!(items[2], OwnedValue::Int(1));
+        let plain = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        assert_eq!(plain.clone().with_fresh_nan_instances(), plain);
+    }
+
     /// #3034: `from_number_bytes` reads user text, so the bridge's tokens are
     /// ordinary malformed spans there -- `Null`, exactly like their nearest
     /// non-token sibling spellings -- and only the bridge read
@@ -6326,17 +6431,21 @@ mod tests {
                 "{plus}"
             );
         }
-        // Real jq number spellings read identically on both routes.
-        for text in [
-            "nan",
-            "-Infinity",
-            "sNaN12",
-            "+1.5",
-            ".5",
-            "007",
-            "1.e5",
-            "1e0",
-        ] {
+        // Real jq number spellings read identically on both routes, except
+        // that a cursor read of a NaN spelling is a parse instance (#3309),
+        // the same NaN once collapsed.
+        for text in ["nan", "sNaN12"] {
+            let read = read_as_bridge_text::<JqSemantics>(text);
+            assert!(
+                matches!(&read, OwnedValue::NumberLiteral(NumberRepr::Float(f), t) if f.is_nan() && &**t == "null"),
+                "{text}: {read:?}"
+            );
+            assert!(
+                matches!(read.into_plain_number(), OwnedValue::Float(f) if f.is_nan()),
+                "{text}"
+            );
+        }
+        for text in ["-Infinity", "+1.5", ".5", "007", "1.e5", "1e0"] {
             assert_eq!(
                 format!("{:?}", read_as_bridge_text::<JqSemantics>(text)),
                 format!(

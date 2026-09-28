@@ -1181,8 +1181,7 @@ is the revert that established what the other one costs.
    (`[[.]] \| .[] \| sort \| .[0] \| path($x)`) still bridges: peeling that iterate per child
    is the shape #2889 measured at +20%. So does a container that also holds a NaN read from the
    input (`[.a, 1, $x] \| sort \| .[2] \| path($x)` with `.a` = `NaN`), which is not an identity
-   of the bridge. `unique` inherits the bridge's NaN comparison: jq merges two NaNs read from the
-   input, succinctly on both routes does not
+   of the bridge. `unique` compares such a NaN by instance on both routes, as jq does
    ([#3309](https://github.com/rust-works/succinctly/issues/3309)).
    **[#3179](https://github.com/rust-works/succinctly/issues/3179), now closed: an embed reached
    through a container built from an *ancestor* of the bound node.** `.a as $y | {k:.} | .k.a |
@@ -7623,26 +7622,35 @@ every spelling as real yq does, `-p json --slurp`/`--eval-all` and yq's `--argjs
 the non-finite words at their materializer (that mode has nowhere to put a NaN) and admit a
 leading `+` with the spelling dropped, like the `007`/`.5` they already take.
 
-**The residual — a literal NaN compared with itself.** jq's `jv_equal` short-circuits on
-pointer identity before comparing values, and a parsed number literal is an allocated `jv`,
-so the *same* document NaN is equal to itself there while a computed NaN is not:
+**A parsed NaN compared with itself — closed by
+[#3309](https://github.com/rust-works/succinctly/issues/3309), one container residual.**
+jq's `jv_equal` short-circuits on pointer identity before comparing values, and a parsed
+number literal is an allocated `jv`, so the *same* parsed NaN is equal to itself there while a
+computed NaN is not. succinctly now keeps that identity: a NaN jq mode parses (from a document,
+`tonumber`, `fromjson`, `--argjson`, `--slurp`) carries an instance token in its payload bits,
+and jq-mode `==` compares two such NaNs by token (`same_nan_instance`, `src/jq/value.rs`).
+Arithmetic collapses the literal, so a computed NaN never compares equal, and each parse makes
+new tokens, so two NaN tokens in the input stay distinct:
 
-| Filter                              | Input        | jq      | succinctly |
-|-------------------------------------|--------------|---------|------------|
-| `.[0] == .[0]`                      | `[nan]`      | `true`  | `false`    |
-| `.[0] as $x \| $x == $x`            | `[nan]`      | `true`  | `false`    |
-| `indices(.[0])`                     | `[nan,NaN]`  | `[0]`   | `[]`       |
-| `.[0] == .[1]`                      | `[nan,NaN]`  | `false` | `false`    |
-| `nan == nan`, `nan as $x \| $x == $x` | (any)      | `false` | `false`    |
-| `. == .`                            | `[nan]`      | `true`  | `false`    |
+| Filter                                | Input       | jq      | succinctly |
+|---------------------------------------|-------------|---------|------------|
+| `.[0] == .[0]`                        | `[nan]`     | `true`  | `true`     |
+| `.[0] as $x \| $x == $x`              | `[nan]`     | `true`  | `true`     |
+| `indices(.[0])`                       | `[nan,NaN]` | `[0]`   | `[0]`      |
+| `. == .`                              | `[nan]`     | `true`  | `true`     |
+| `[.[0],.[0]] \| unique`               | `[nan]`     | `[null]`| `[null]`   |
+| `.[0] == .[1]`                        | `[nan,NaN]` | `false` | `false`    |
+| `nan == nan`, `[.[0]+0] == [.[0]+0]`  | `[nan]`     | `false` | `false`    |
+| `[nan] \| . == .`                     | (any)       | `true`  | `false`    |
 
-The last row shows the class predates #2877: the identity short-circuit fires on any
-allocated value holding a NaN, the builtin's array included. `OwnedValue` has no notion of
-value identity (two copies of a NaN are indistinguishable from one), so matching this would
-need a representation change; recorded here on its merits, tracked as
-[#3069](https://github.com/rust-works/succinctly/issues/3069). It is observable only when a
-NaN is compared against the very same NaN; `sort`, `unique`, `group_by` and `<` already agree
-with jq.
+The last row is what remains
+([#3069](https://github.com/rust-works/succinctly/issues/3069)): jq's short-circuit also fires
+on an allocated *container* compared with itself, so an array or object holding a *computed*
+NaN equals itself (`[nan] as $a | $a == $a`, `{a:nan} | . == .`). A computed NaN has no
+instance here, and `OwnedValue` containers are compared by value. Ordering is unchanged in
+both: NaN sorts below NaN, itself included. A mixed-instance `sort`/`unique`/`group_by`
+(`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's comparison order in jq, and
+may group differently here.
 
 ### A malformed nested number raises when read; jq rejects the document (#966, #3034, #3222) — accepted uniform divergence
 

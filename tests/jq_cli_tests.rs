@@ -73568,3 +73568,151 @@ fn test_negative_out_of_range_middle_index_del_unaffected_3388() -> Result<()> {
     );
     Ok(())
 }
+
+/// jq 1.7.1 compares two *parsed* NaNs by instance (#3309): the same
+/// document position read twice is `==` itself, two NaN tokens are not, and
+/// every computed NaN equals nothing. Every expected value is captured from
+/// `/usr/bin/jq` 1.7.1. The rows that were already right are here too: they
+/// are what a spelling-based rule ("a NaN spelled in the input equals
+/// itself") would break. Mixed-instance rows whose answer depends on the
+/// sort's comparison order (`[.a,.b,.a] | unique`) are deliberately absent.
+const NAN_INSTANCE_ROWS_3309: &[(&str, &str)] = &[
+    ("[.a,.a] | unique", "[null]"),
+    ("[.a,.a,1] | unique | length", "2"),
+    ("[.a,.a] | group_by(.) | length", "1"),
+    ("[.a,.a] | unique_by(.)", "[null]"),
+    ("[{\"k\":.a},{\"k\":.a}] | unique", "[{\"k\":null}]"),
+    ("[{\"k\":.a},{\"k\":.a}] | group_by(.k) | length", "1"),
+    (".a == .a", "true"),
+    (".a != .a", "false"),
+    ("[.a] == [.a]", "true"),
+    ("{\"x\":.a} == {\"x\":.a}", "true"),
+    ("[.a,.a] - [.a]", "[]"),
+    (".a as $x | [.a,.a] | map(select(. == $x)) | length", "2"),
+    ("(.a) as $x | [$x,$x] | unique", "[null]"),
+    ("[.e[0],.e[0]] | unique", "[null]"),
+    (".n[0] == .n[0]", "true"),
+    ("[.n[]] | .[0] == .[0]", "true"),
+    ("[.n[]] | index(.[0])", "0"),
+    (".n | indices(.[0])", "[0]"),
+    (".a as $x | [$x] | contains([$x])", "true"),
+    (".a |= . | .a == .a", "true"),
+    ("walk(.) | .a == .a", "true"),
+    ("to_entries | .[0].value == .[0].value", "true"),
+    ("[.a + null, .a] | unique", "[null]"),
+    // Already right before #3309: distinct tokens and computed NaNs.
+    (".a == .b", "false"),
+    (".n | unique", "[null,null]"),
+    (".n[0] == .n[1]", "false"),
+    ("[.a,.b] | unique", "[null,null]"),
+    ("[.a+0,.a+0] | unique", "[null,null]"),
+    ("[-.a,-.a] | unique", "[null,null]"),
+    ("[(.a|sin),(.a|sin)] | unique", "[null,null]"),
+    ("[nan,nan] | unique", "[null,null]"),
+    ("[.a,nan] | unique", "[null,null]"),
+    (".a == nan", "false"),
+    // Each parse makes a new instance.
+    ("\"NaN\" | tonumber as $x | [$x,$x] | unique", "[null]"),
+    ("(\"NaN\" | fromjson) as $x | [$x,$x] | unique", "[null]"),
+    (
+        "\"NaN\" as $s | [($s|tonumber),($s|tonumber)] | unique",
+        "[null,null]",
+    ),
+    (
+        "\"NaN\" as $s | [($s|fromjson),($s|fromjson)] | unique",
+        "[null,null]",
+    ),
+    // Printing, type and ordering are unchanged.
+    (".a", "null"),
+    ("[.a,.a] | unique | tojson", "\"[null]\""),
+    (".a | tostring", "\"null\""),
+    ("\"\\(.a)\"", "\"null\""),
+    (".a | type", "\"number\""),
+    (".a | isnan", "true"),
+    (".a < .a", "true"),
+    ("[.a,1,.a] | sort", "[null,null,1]"),
+];
+
+const NAN_INSTANCE_INPUT_3309: &str = r#"{"a":NaN,"b":NaN,"n":[NaN,NaN],"e":[NaN,1]}"#;
+
+#[test]
+fn test_parsed_nan_compares_by_instance_3309() -> Result<()> {
+    for (filter, expected) in NAN_INSTANCE_ROWS_3309 {
+        let (stdout, stderr, code) =
+            run_jq_stdin_streams(filter, NAN_INSTANCE_INPUT_3309, &["-c"])?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (*expected, 0),
+            "stdin `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The same table through a file argument, which reaches the document by a
+/// different input route than stdin.
+#[test]
+fn test_parsed_nan_compares_by_instance_from_a_file_3309() -> Result<()> {
+    for (filter, expected) in NAN_INSTANCE_ROWS_3309 {
+        let (stdout, stderr, code, _) =
+            run_jq_over_files(&["-c", filter], &[NAN_INSTANCE_INPUT_3309])?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (*expected, 0),
+            "file `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Instances across the CLI's other parses (#3309): each input document,
+/// `--argjson`, `--jsonargs` text and `--slurp` element is its own parse.
+#[test]
+fn test_parsed_nan_instances_across_inputs_and_args_3309() -> Result<()> {
+    let cases: &[(&[&str], &str, &str)] = &[
+        (
+            &["-nc", "input as $a | input as $b | [$a==$b, $a==$a]"],
+            "NaN NaN",
+            "[false,true]",
+        ),
+        (&["-nc", "[inputs] | unique"], "NaN NaN", "[null,null]"),
+        (&["-sc", ".[0] == .[0]"], "NaN NaN", "true"),
+        (&["-sc", ".[0] == .[1]"], "NaN NaN", "false"),
+        (&["-sc", "[.[0],.[0]] | unique"], "NaN NaN", "[null]"),
+        (&["-sc", "unique"], "NaN NaN", "[null,null]"),
+        (&["-sc", "map(type)"], "NaN NaN", "[\"number\",\"number\"]"),
+        (
+            &["-nc", "--argjson", "x", "NaN", "[$x,$x] | unique"],
+            "",
+            "[null]",
+        ),
+        (
+            &[
+                "-nc",
+                "--argjson",
+                "x",
+                "NaN",
+                "--argjson",
+                "y",
+                "NaN",
+                "[$x==$y, $x==$x]",
+            ],
+            "",
+            "[false,true]",
+        ),
+        (
+            &["-nc", "--argjson", "x", "[NaN,NaN]", "$x | unique"],
+            "",
+            "[null,null]",
+        ),
+    ];
+    for (args, input, expected) in cases {
+        let (stdout, stderr, code) = run_jq_full(args, Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (*expected, 0),
+            "{args:?}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
