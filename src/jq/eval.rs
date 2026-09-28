@@ -4913,11 +4913,11 @@ fn item_to_owned<W: Clone + AsRef<[u64]>, S: EvalSemantics>(item: Item<'_, W>) -
 /// only in which generator's item they decoded.
 fn checked_or_stop<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     item: Item<'_, W>,
-    escape: &mut Option<Control>,
+    escape: &StashedEscape,
 ) -> Result<OwnedValue, Demand> {
     match item.into_owned::<S>() {
         Ok(v) => Ok(v),
-        Err(e) => Err(stop_with_escape(escape, Control::Error(e))),
+        Err(e) => Err(escape.stop(Control::Error(e))),
     }
 }
 
@@ -4939,7 +4939,7 @@ where
     B: FnMut(OwnedValue, OwnedValue) -> QueryResult<'a, W>,
 {
     let mut out: Vec<OwnedValue> = Vec::new();
-    let mut escape: Option<Control> = None;
+    let escape = StashedEscape::new();
 
     let outer_flow = eval_each::<W, S>(outer, value.clone(), optional, &mut |outer_item| {
         // #2952: reset before either closure below can set a fresh `escape`
@@ -4948,22 +4948,22 @@ where
         // equivalent to (and less omission-prone than) resetting on every
         // individual clean-outcome arm; a first pass here did the latter
         // and missed this whole function.
-        escape = None;
+        escape.begin();
         // #2023: same decode-failure raise as `fanout_arg`'s own lazy sink,
         // for both generators here.
-        let o = match checked_or_stop::<_, S>(outer_item, &mut escape) {
+        let o = match checked_or_stop::<_, S>(outer_item, &escape) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
         let inner_flow = eval_each::<W, S>(inner, value.clone(), optional, &mut |inner_item| {
             // #2952: same reset, for `inner`'s own `?//` retries.
-            escape = None;
-            let i = match checked_or_stop::<_, S>(inner_item, &mut escape) {
+            escape.begin();
+            let i = match checked_or_stop::<_, S>(inner_item, &escape) {
                 Ok(v) => v,
                 Err(demand) => return demand,
             };
             match push_owned_values::<_, S>(body(o.clone(), i), &mut out) {
-                Some(control) => stop_with_escape(&mut escape, control),
+                Some(control) => escape.stop(control),
                 None => Demand::Continue,
             }
         });
@@ -4972,14 +4972,15 @@ where
             // `body` already recorded its own control above.
             Flow::Stopped { .. } => Demand::Stop,
             // The inner generator's own control unwinds the outer loop too.
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            Flow::Escaped(control) => escape.stop(control),
         }
     });
 
     // A recorded `escape` always came with a `Demand::Stop`, so the outer
     // flow is `Stopped` whenever one exists; `Escaped` therefore carries the
     // outer generator's own control, which fires last.
-    match escape {
+    // #3293: a stash a `?//` retry inside `outer` superseded is dropped.
+    match escape.take(&outer_flow, direct_pattern_retry(outer)) {
         Some(control) => partial(out, control),
         None => match outer_flow {
             Flow::Escaped(control) => partial(out, control),
@@ -7102,8 +7103,11 @@ where
 {
     // Tracked out-of-band for the usual reason: the sink can only answer
     // `Demand`, so "why did the pull stop" has to be recorded beside it.
-    let mut escape: Option<Control> = None;
-    let mut consumer_stopped = false;
+    let escape = StashedEscape::new();
+    // A generation stamp beside the stash, not one `StashedVerdict<Flow>`:
+    // see `eval_generic::fanout_arg_each_generic`'s identical note (the wider
+    // slot cost native stack on the `$`-parameter recursion path).
+    let mut consumer_stopped_at: Option<u64> = None;
 
     let mut on_item = |item: Item<'_, W>| {
         // #2952: reset before anything below can set a fresh `escape` for
@@ -7124,7 +7128,10 @@ where
         // `[10,10]` -- the first alternative's `error("BODY")` retries
         // into the second, whose own `10` satisfies `limit(2)` before its
         // own `error("BODY")` is ever reached.
-        escape = None;
+        escape.begin();
+        // #3293: a stale consumer stop would likewise hide the error the
+        // retry's own call raises.
+        consumer_stopped_at = None;
         // Before `into_owned`: the cursor this reads lives on the borrowed
         // item, and materializing it is exactly what drops it.
         let origin = if WITH_ORIGIN {
@@ -7136,13 +7143,13 @@ where
         // argument value raises rather than silently becoming `""`.
         let owned = match item.into_owned::<S>() {
             Ok(v) => v,
-            Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+            Err(e) => return escape.stop(Control::Error(e)),
         };
         match body(owned, origin) {
             // This argument value's own walk finished; go on to the next.
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => {
-                consumer_stopped = true;
+                consumer_stopped_at = Some(pipe_retry_generation());
                 Demand::Stop
             }
             // A body error/break inside `arg_expr` -- e.g. `skip($n;
@@ -7154,7 +7161,7 @@ where
             // driving `arg_expr` (if any), which retries into the next
             // pattern and calls this sink again -- landing at the reset
             // above, which is what clears a *resolved* escape.
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            Flow::Escaped(control) => escape.stop(control),
         }
     };
     // #3296: a single-valued, effect-free source is evaluated to completion
@@ -7171,11 +7178,16 @@ where
         eval_each::<W, S>(arg_expr, value, optional, &mut on_item)
     };
 
-    match escape {
-        Some(_) => resume_from_escape(escape, flow),
+    let direct_retry = direct_pattern_retry(arg_expr);
+    match escape.take(&flow, direct_retry) {
+        Some(control) => resume_from_escape(Some(control), flow),
         // `pending` is dropped for the reason every other lazy consumer
         // drops it: it belongs to an eager fallback jq would never reach.
-        None if consumer_stopped => Flow::Stopped { pending: None },
+        None if consumer_stopped_at
+            .is_some_and(|at| !retry_superseded(&flow, at, direct_retry)) =>
+        {
+            Flow::Stopped { pending: None }
+        }
         None => flow,
     }
 }
