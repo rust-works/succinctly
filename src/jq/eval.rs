@@ -6532,9 +6532,7 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let invert_dedup = patterns.len() > 1;
 
     for (i, pattern) in patterns.iter().enumerate() {
-        // #3293: announced before the pattern walk, so a retry whose
-        // pattern fails or matches nothing still supersedes a stash.
-        begin_pattern_alternative();
+        begin_pattern_alternative(i); // #3293
         let is_last = i == last_idx;
 
         // #2872: `body` runs once per binding set as the matcher completes
@@ -39362,9 +39360,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
         // so it cannot be the register's node whatever jq's pointer says.
         let refusal_is_exact = register.is_some_and(|reg| bound != reg);
         for (i, pattern) in patterns.iter().enumerate() {
-            // #3293: announced before the pattern walk, so a retry whose
-            // pattern fails or matches nothing still supersedes a stash.
-            begin_pattern_alternative();
+            begin_pattern_alternative(i); // #3293
             let is_last = i == last_idx;
             let seed = match register {
                 Some(reg) => PatternRegister {
@@ -40686,9 +40682,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             let last_idx = patterns.len() - 1;
             let mut ran_update = false;
             for (i, pattern) in patterns.iter().enumerate() {
-                // #3293: announced before the pattern walk, so a retry whose
-                // pattern fails or matches nothing still supersedes a stash.
-                begin_pattern_alternative();
+                begin_pattern_alternative(i); // #3293
                 let is_last = i == last_idx;
                 // Gated on `alternatives.is_some()` unlike `resolve_as_pattern`'s
                 // unconditional call (#3112): with one pattern (`alternatives ==
@@ -41090,9 +41084,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             let last_idx = patterns.len() - 1;
             let mut ran_update = false;
             for (i, pattern) in patterns.iter().enumerate() {
-                // #3293: announced before the pattern walk, so a retry whose
-                // pattern fails or matches nothing still supersedes a stash.
-                begin_pattern_alternative();
+                begin_pattern_alternative(i); // #3293
                 let is_last = i == last_idx;
                 // See `resolve_reduce`'s identical gate and its #3112 comment.
                 if alternatives.is_some() {
@@ -48330,7 +48322,9 @@ mod nonretryable_stop {
 /// from the branch alone, so the retry announces itself here:
 /// [`begin_attempt`] bumps a generation on entry to every alternative
 /// attempt (from [`clear_nonretryable_stop`], which every such loop already
-/// calls), the sink records the generation when it refuses, and a
+/// calls, and from [`begin_pattern_alternative`] for a retry whose pattern
+/// yields no binding set, #3293), the sink records the generation when it
+/// refuses, and a
 /// re-invocation asserts the generation moved.
 ///
 /// The check is a `debug_assert!`: it fires in the suite and every debug
@@ -48699,8 +48693,10 @@ pub(crate) fn resume_from_escape(slot: Option<Control>, flow: Flow) -> Flow {
     }
 }
 
-/// Announce one `?//` alternative attempt to the retry generation
-/// ([`terminal_retry`]) *before* its pattern is walked (#3293).
+/// Announce a `?//` *retry* -- alternative `index` of a chain, when it is
+/// not the first -- to the retry generation ([`terminal_retry`]) before its
+/// pattern is walked (#3293). Every `?//` alternative loop calls this at the
+/// top of each iteration.
 ///
 /// [`clear_nonretryable_stop`] also bumps the generation, but it runs per
 /// binding set, so an alternative whose pattern fails to destructure, or
@@ -48710,19 +48706,24 @@ pub(crate) fn resume_from_escape(slot: Option<Control>, flow: Flow) -> Flow {
 /// raised "null (null) cannot be negated" where jq 1.7.1 raises the second
 /// alternative's own "Cannot index number with number", and
 /// `-({"k":[1]} as {k: $a} ?// {(empty): $b} | $a)` raised where jq prints
-/// nothing. Every `?//` alternative loop calls this first; an extra bump is
-/// harmless to the generation's consumers, which only ask whether one
-/// happened.
-pub(crate) fn begin_pattern_alternative() {
-    terminal_retry::begin_attempt();
+/// nothing. The first alternative is not a retry and does not bump here, so
+/// a single-pattern bind or fold step never moves the generation on its own
+/// account.
+pub(crate) fn begin_pattern_alternative(index: usize) {
+    if index > 0 {
+        terminal_retry::begin_attempt();
+    }
 }
 
 /// Clear the non-retryable-stop side channel on entry to one `?//`
 /// alternative's attempt. See [`nonretryable_stop`] for why the clear lives
 /// here rather than at whoever set the flag.
 ///
-/// Also the one place a `?//` attempt announces itself to
-/// [`resolve_terminal`]'s sink ([`terminal_retry::begin_attempt`], #2691).
+/// Also where a `?//` attempt announces itself to [`resolve_terminal`]'s
+/// sink ([`terminal_retry::begin_attempt`], #2691), once per binding set.
+/// A retry whose pattern yields no binding set never reaches this, so the
+/// same loops also call [`begin_pattern_alternative`] before the pattern
+/// walk (#3293); the two bumps together are what "a retry began" means.
 /// Every `?//` attempt loop that can re-drive a *sink* after a
 /// `Demand::Stop` calls this on entry -- [`each_pattern_alternatives`], its
 /// `eval_generic` twin, [`try_foreach_step_alternatives`], and the
@@ -48830,9 +48831,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
     let mut state = state_input;
 
     for (i, pattern) in patterns.iter().enumerate() {
-        // #3293: announced before the pattern walk, so a retry whose
-        // pattern fails or matches nothing still supersedes a stash.
-        begin_pattern_alternative();
+        begin_pattern_alternative(i); // #3293
         let is_last = i == last_idx;
 
         // #2872: one fold step per binding set the matcher completes, the
@@ -99909,6 +99908,11 @@ mod tests {
                 r#"[([[1]] as [$a] ?// $b | $a | if . == null then error("E2") else . end) | . + 1]"#,
                 &[][..],
                 "error: E2",
+            ),
+            (
+                r#"([1] as $a ?// {(empty): $b} | $a) and error("E")"#,
+                &[][..],
+                "",
             ),
             (
                 r#"(1 as $a ?// [$b] | true) and error("E")"#,

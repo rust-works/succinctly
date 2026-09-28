@@ -11013,9 +11013,7 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
     let invert_dedup = patterns.len() > 1;
 
     for (i, pattern) in patterns.iter().enumerate() {
-        // #3293: announced before the pattern walk, so a retry whose
-        // pattern fails or matches nothing still supersedes a stash.
-        crate::jq::eval::begin_pattern_alternative();
+        crate::jq::eval::begin_pattern_alternative(i); // #3293
         let is_last = i == last_idx;
 
         // #2872: `body` runs once per binding set as the matcher completes
