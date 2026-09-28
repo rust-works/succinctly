@@ -396,9 +396,9 @@ use super::expr::{
 };
 use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
-    infinite_float_preview_text, int_to_f64, jq_literal_int_to_f64, jq_numeric_cmp,
-    numeric_repr_cmp, jq_identical, owned_value_eq, owned_value_eq_at_depth_generic, ArrayVec,
-    NumberRepr, ObjectMap, OwnedValue,
+    infinite_float_preview_text, int_to_f64, jq_identical, jq_literal_int_to_f64, jq_numeric_cmp,
+    numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, ArrayVec, NumberRepr,
+    ObjectMap, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being

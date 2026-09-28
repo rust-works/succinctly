@@ -73838,7 +73838,10 @@ const CONTAINER_IDENTITY_ROWS_3069: &[(&str, &str)] = &[
     ("[nan] | . as $a | IN($a)", "true"),
     ("[nan] | . as $a | any([$a][]; . == $a)", "true"),
     ("[nan] | . as $a | try error($a) catch (. == $a)", "true"),
-    ("[nan] | . as $a | {} | setpath([\"a\"]; $a) | .a == $a", "true"),
+    (
+        "[nan] | . as $a | {} | setpath([\"a\"]; $a) | .a == $a",
+        "true",
+    ),
     ("[[nan]] | .[0] as $x | sort | .[0] == $x", "true"),
     ("[1] | .[0] = nan | . == .", "true"),
     ("[nan] | . as $a | ($a + []) == $a", "true"),
