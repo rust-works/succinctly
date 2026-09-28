@@ -31178,14 +31178,17 @@ fn fresh_run_len(steps: &[Expr]) -> usize {
 /// `Index` step -- see
 /// `test_update_index_bounds_check_deferred_behind_fresh_run_collapse_2115`.
 ///
-/// A still-eager check remains for whichever `Index` is dispatched
-/// *directly* by `update_path_steps`' own main loop (its `resolve_setpath_index`
-/// call has to run unconditionally there, to decide fresh-vs-already-exists
-/// in the first place) -- so a *leading* out-of-range/negative index, with
-/// no preceding fresh step to sweep it into this function, still errors
-/// eagerly today (`null | .[-1][1] |= empty` still raises, unlike
-/// `null | .a[-1][1] |= empty`), matching this fix's own pre-existing
-/// behavior for that narrower shape rather than newly diverging from it.
+/// #3388 closed the one remaining eager check this fix's own commit message
+/// once described as unaffected: a *leading* out-of-range/negative index,
+/// dispatched directly by `update_path_steps`' own main loop rather than
+/// swept into this function via an earlier fresh step, used to call
+/// `resolve_setpath_index` unconditionally there too -- `null | .[-1][1] |=
+/// empty` used to raise, unlike `null | .a[-1][1] |= empty` above. That main
+/// loop's own `Expr::Index` arm now routes a negative-out-of-range index
+/// through the identical fresh-run path this function serves, so both
+/// shapes defer the same way today -- see
+/// `test_negative_out_of_range_middle_index_defers_like_positive_3388` in
+/// `tests/jq_cli_tests.rs`.
 fn wrap_fresh(steps: &[Expr], value: OwnedValue) -> Result<OwnedValue, EvalError> {
     let mut value = value;
     for step in steps.iter().rev() {
@@ -93271,9 +93274,11 @@ mod tests {
     /// walker (which called `write_index` unconditionally for every `Index`
     /// component regardless of the eventual write outcome) raised "Out of
     /// bounds negative array index" instead. `wrap_fresh`'s own doc comment
-    /// has the full mechanism and the one remaining case this fix does *not*
-    /// close (a *leading* `Index`, with no preceding fresh step, still
-    /// checks eagerly -- unaffected by this fix either way).
+    /// has the full mechanism; at the time of this fix, a *leading* `Index`
+    /// with no preceding fresh step (dispatched directly by
+    /// `update_path_steps`' own main loop) still checked eagerly regardless
+    /// -- #3388 later closed that remaining case too, so both shapes defer
+    /// identically today.
     ///
     /// yq mode is unaffected: `undo_stranded` (`S::TAG != EvalTag::Yq`) is
     /// `false` there, so yq mode always falls through to `wrap_fresh`,
@@ -93291,6 +93296,16 @@ mod tests {
             (
                 b"null",
                 ".a[-1][1] |= 9",
+                Err("Out of bounds negative array index"),
+            ),
+            // #3388: the *leading*-Index shape this test once pinned as a
+            // permanent, unaffected limitation -- closed by routing
+            // update_path_steps' own main loop through the identical
+            // fresh-run path above, not just wrap_fresh's recursive calls.
+            (b"null", ".[-1][1] |= empty", Ok("null")),
+            (
+                b"null",
+                ".[-1][1] |= 9",
                 Err("Out of bounds negative array index"),
             ),
         ]);
