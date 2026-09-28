@@ -11216,6 +11216,12 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
         optional,
         cursor,
         &mut bounded(n, outer_budget, |item| {
+            // #3293: a re-invocation after a stop is a `?//` retry inside `expr`, and
+            // the wrapping sink's answer to *this* push supersedes the retried-past
+            // one -- a stale flag reported `Stopped` to whatever encloses this call
+            // after the retry, cutting a comma short (`[.[(first([[1]] as [$a] ?//
+            // [[$a]] | $a), 2):]]` is jq's `[[20,30],[30]]`).
+            outer_stopped = false;
             count += 1;
             if sink.push(item) == Demand::Stop {
                 outer_stopped = true;
@@ -11299,6 +11305,12 @@ fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
         optional,
         cursor,
         &mut bounded(skip + 1, Budget::Unbounded, |item| {
+            // #3293: a re-invocation after a stop is a `?//` retry inside `expr`, and
+            // the wrapping sink's answer to *this* push supersedes the retried-past
+            // one -- a stale flag reported `Stopped` to whatever encloses this call
+            // after the retry, cutting a comma short (`[.[(first([[1]] as [$a] ?//
+            // [[$a]] | $a), 2):]]` is jq's `[[20,30],[30]]`).
+            outer_stopped = false;
             let at_or_past = seen >= skip;
             seen += 1;
             if at_or_past {
@@ -16306,12 +16318,9 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         }
         match end_flow {
             Flow::Exhausted => Demand::Continue,
-            // A stop with no stash behind it (checked just above) is `end`'s
-            // own wrapper finishing -- `first`/`limit`/`nth` report their
-            // count stop as `Stopped`, after a retry inside them already
-            // superseded the stash (#3293 review: `.[:first([[0]] as [$a]
-            // ?// [[$a]] | $a)]` is jq's `[]`). Nothing to propagate.
-            Flow::Stopped { .. } => Demand::Continue,
+            // Only `escape!` stops the inner pull, and it has already
+            // stashed its control -- propagate the stop outward.
+            Flow::Stopped { .. } => Demand::Stop,
             // #2225: this `s`'s own `end` evaluation escaped after
             // producing some values -- in jq mode those are already
             // sliced into `out` (the pushes *are* the prefix, #1528); in
@@ -16340,12 +16349,12 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         // evaluated `end` or the target at all) must be `None`, not
         // `ManyOwned(vec![])`.
         Flow::Exhausted => owned_vec_to_generic_result(out),
-        // A stop with no stash behind it (the stash is checked above): a
-        // `first`/`limit`/`nth` wrapping `start` reports its own count stop
-        // as `Stopped` after a retry inside it superseded the stash (#3293
-        // review: `.[first([[0]] as [$a] ?// [[$a]] | $a):]` is jq's
-        // `[10,20,30]`). The pull is simply complete.
-        Flow::Stopped { .. } => owned_vec_to_generic_result(out),
+        // Our sinks are the only thing that can ask the pull to stop, and
+        // they only ever do so through `escape!`, which stashes a control
+        // that only a retry can supersede -- and a retry ends a drive
+        // `Exhausted`/`Escaped` (a wrapping `first`/`limit`/`nth` included,
+        // #3293) -- already returned above.
+        Flow::Stopped { .. } => unreachable!("sink always stashes a control before Demand::Stop"), // omni-dev: coverage tolerate-line reason="unreachable: escape! stashes a control before Demand::Stop, and only a retry ending Exhausted/Escaped supersedes it; already returned above (#2546, #3293)"
         // #1528: `start`'s own trailing escape still has to reach the final
         // result -- a successful pull doesn't mean `start` itself didn't
         // escape after producing `out`'s own values (in yq mode it
