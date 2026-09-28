@@ -65661,16 +65661,13 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
     // A component the door will not re-spell, so it declines and the bridge
     // refuses where jq answers: a slice after the embed (jq `[[2]]`; its
     // spelling `.[{"start":0,"end":1}]` is #3300).
-    for (input, filter, residual) in
-        [("[1,2]", r". as $x | [.] | del(.[0] | $x | .[0:1])", "#3300")]
-    {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(
-            (stdout.as_str(), code),
-            ("", 5),
-            "#3188 residual ({residual}): `{filter}`: stderr={stderr:?}"
-        );
-    }
+    let filter = r". as $x | [.] | del(.[0] | $x | .[0:1])";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2]"))?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("", 5),
+        "#3188 residual (#3300): `{filter}`: stderr={stderr:?}"
+    );
     Ok(())
 }
 
