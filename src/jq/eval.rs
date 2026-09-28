@@ -48356,14 +48356,18 @@ mod terminal_retry {
 /// A `?//` retry can consume the verdict a pipe driver stashed when its sink
 /// stopped. `Exhausted` alone is ambiguous: `limit` also returns it when its
 /// own count stop wins. A new alternative attempt after the stash identifies
-/// the retry that absorbed the verdict.
+/// the retry that absorbed the verdict. A retry that raises inside the
+/// upstream stage instead supersedes the verdict the same way (#3293,
+/// [`retry_superseded`]): `if ([[1]] as [$a] ?// $b | $a | if . == null then
+/// error("E2") else . end | type == "array") then error("E") else 2 end`
+/// raises `E2` in jq 1.7.1, not the abandoned alternative's `E`.
 pub(crate) fn pipe_terminal_after_retry(
     upstream: Flow,
     downstream: Option<Flow>,
     stopped_at: u64,
     direct_retry: bool,
 ) -> Flow {
-    if downstream.is_some() && retry_consumed_stop(&upstream, stopped_at, direct_retry) {
+    if downstream.is_some() && retry_superseded(&upstream, stopped_at, direct_retry) {
         upstream
     } else {
         downstream.unwrap_or(upstream)
@@ -99832,6 +99836,56 @@ mod tests {
             .map(OwnedValue::to_json)
             .collect();
         (values, end)
+    }
+
+    /// #3293: `boolean_fanout_each_with` and `pipe_terminal_after_retry` are
+    /// shared with the owned evaluator, so a `?//` retry must supersede a
+    /// stashed verdict on this route too. Captured from jq 1.7.1 with `-nc`:
+    /// the retry answers, the retry produces nothing, the retry raises inside
+    /// the generator, and a consumer's stop on the first alternative that
+    /// must not hide the retry's own error.
+    #[test]
+    fn test_retry_supersedes_stashed_verdict_on_owned_route_3293() {
+        for (filter, values, end) in [
+            (
+                r#"([1] as $a ?// $b | $a) and error("E")"#,
+                &["false"][..],
+                "",
+            ),
+            (
+                r#"([1] as $a ?// $b | $a // empty) and error("E")"#,
+                &[][..],
+                "",
+            ),
+            (
+                r#"(false, ([1] as $a ?// $b | $a)) and error("E")"#,
+                &["false", "false"][..],
+                "",
+            ),
+            (
+                r#"[first(([1] as $a ?// $b | $a | if . == null then error("E2") else . end) and true)]"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r#"[([[1]] as [$a] ?// $b | $a | if . == null then error("E2") else . end) | . + 1]"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r#"[([[1]] as [$a] ?// $b | $a // empty) | . + 1]"#,
+                &["[]"][..],
+                "",
+            ),
+        ] {
+            let (got, got_end) = outputs_and_end(b"null", filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(
+                (got.as_slice(), got_end.as_str()),
+                (values, end),
+                "`{filter}`"
+            );
+        }
     }
 
     /// #2918: `recurse`'s native order (each output of `f` descended into
