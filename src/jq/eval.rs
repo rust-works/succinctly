@@ -38048,8 +38048,8 @@ fn marker_identical<S: EvalSemantics>(
 /// recurses to, so a stale marker refuses wherever it's reached, not just
 /// at the top.
 ///
-/// Mirrors `is_identity_passthrough`'s grammar otherwise, with two
-/// differences. First: `Alternative` is gated on the *runtime* register
+/// Mirrors `is_identity_passthrough`'s grammar otherwise (#3279's `Pipe`
+/// arm included, jq mode only), with two differences. First: `Alternative` is gated on the *runtime* register
 /// being truthy (`A // B` only ever equals `.` exactly when `A` actually
 /// produced the value) rather than on `is_raise_free_identity_passthrough
 /// (left)` alone, which says nothing about which side's value reached
@@ -45923,9 +45923,12 @@ pub(crate) fn as_var_refs(
 ///   a fresh literal, or anything at all -- would be certified by value
 ///   alone (#3129: `del(.a | ((if empty then . else . end) // {"b":1}) as
 ///   $x | .k | $x | .b)` on `{"a":{"k":{"b":1}}}` wrote `{"a":{"k":{}}}`
-///   where jq 1.7.1 refuses). Requiring the narrower grammar closes it, at
-///   the deliberate, safe cost that `((if true then . else . end) // 1)` is
-///   refuse-only under this gate even though jq itself would answer it.
+///   where jq 1.7.1 refuses). Requiring the narrower grammar closes it; since
+///   #3279 that grammar admits an `if` whose condition is provably total and
+///   raise-free ([`cond_is_total_and_raise_free`]), so `((if true then .
+///   else . end) // 1)` answers as jq does while `if empty` still refuses.
+/// - `A | B | ...` (#3279, jq mode only), when every stage is a passthrough:
+///   each stage's input is the previous one's output, which is `.` again.
 ///   Within that narrower grammar, `B` only runs when `A` is
 ///   null/false/absent, which a recognized `A` (e.g. bare `.`) can
 ///   genuinely be at runtime, so admitting it at all is still a deliberate,
