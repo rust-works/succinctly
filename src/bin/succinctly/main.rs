@@ -1319,9 +1319,10 @@ fn looks_like_negative_filter(token: &str) -> bool {
 }
 
 /// If `err` is clap's refusal of an unrecognized `-`-leading argument that
-/// [`looks_like_negative_filter`], returns that token's index in `args` --
-/// the position `--` needs inserting before so a retried parse accepts it
-/// as the positional FILTER instead of an unknown flag.
+/// [`looks_like_negative_filter`], returns the positions in `args` `--`
+/// might need inserting before so a retried parse accepts the token as the
+/// positional FILTER instead of an unknown flag -- most-plausible position
+/// first (see below).
 ///
 /// Matches by *prefix*, not equality: when clap fails to bundle-parse a
 /// short-flag argument (`Parser::parse_short_arg`'s `NoMatchingArg` arm), it
@@ -1330,32 +1331,54 @@ fn looks_like_negative_filter(token: &str) -> bool {
 /// `"-."`, `-(1)` as `"-("`, `-$__loc__.line` as `"-$"`. That truncated form
 /// is always exactly two bytes (the leading `-` and one more character), so
 /// [`looks_like_negative_filter`] on it already answers the same question a
-/// check on the full token would (both read the same second character);
-/// only the position lookup below needs the prefix match to find the token
-/// clap actually meant.
-fn negative_filter_retry_index(args: &[String], err: &clap::error::Error) -> Option<usize> {
+/// check on the full token would (both read the same second character) --
+/// but more than one token can share that same two-byte prefix, and the
+/// prefix alone can't tell them apart.
+///
+/// Candidates come back **last-occurrence first**, never just the first
+/// match (code review on #3389): an option like `--arg`/`-L` that already
+/// takes `allow_hyphen_values` can have *already been given* a value
+/// sharing the bad token's prefix (`--arg x -1x`'s `-1x`), which sits
+/// earlier in `args` than the real, still-unclaimed FILTER token clap
+/// actually choked on. `parse_allowing_negative_filter` below tries each
+/// candidate in the order returned and keeps the first one that makes the
+/// whole thing parse -- correctness comes from that verification, not from
+/// this function guessing right, but trying later positions first means
+/// the common shape (FILTER after every flag) succeeds on the first retry
+/// rather than the last.
+fn negative_filter_retry_candidates(args: &[String], err: &clap::error::Error) -> Vec<usize> {
     if err.kind() != clap::error::ErrorKind::UnknownArgument {
-        return None;
+        return Vec::new();
     }
-    let clap::error::ContextValue::String(bad) = err.get(clap::error::ContextKind::InvalidArg)?
+    let Some(clap::error::ContextValue::String(bad)) =
+        err.get(clap::error::ContextKind::InvalidArg)
     else {
-        return None; // omni-dev: coverage tolerate-line reason="unreachable given clap 4.6's own unknown_argument() error constructor: every ErrorKind::UnknownArgument it builds sets ContextKind::InvalidArg to ContextValue::String(arg) in the same call, so this arm only guards a future clap release changing that invariant"
+        return Vec::new(); // omni-dev: coverage tolerate-line reason="unreachable given clap 4.6's own unknown_argument() error constructor: every ErrorKind::UnknownArgument it builds sets ContextKind::InvalidArg to ContextValue::String(arg) in the same call, so this arm only guards a future clap release changing that invariant"
     };
     if !looks_like_negative_filter(bad) {
-        return None;
+        return Vec::new();
     }
-    args.iter().position(|a| a.starts_with(bad.as_str()))
+    let mut positions: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.starts_with(bad.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    positions.reverse();
+    positions
 }
 
 /// Parses `args` as `P` (a jq-only [`clap::Parser`], see
 /// [`looks_like_negative_filter`]'s own doc comment for why `yq` needs no
-/// equivalent), retrying once with `--` spliced in immediately before a
-/// token [`negative_filter_retry_index`] identifies (#3389). Clap has no
-/// per-positional way to express jq's letter-vs-non-letter split --
-/// `allow_hyphen_values` is all-or-nothing on the FILTER positional, and
-/// would also swallow a genuine unknown-flag typo as the filter instead of
-/// erroring on it -- so this recovers from clap's own rejection after the
-/// fact instead of trying to configure it away.
+/// equivalent), retrying with `--` spliced in before each candidate
+/// [`negative_filter_retry_candidates`] returns, in order, until one
+/// actually parses (#3389). Clap has no per-positional way to express jq's
+/// letter-vs-non-letter split -- `allow_hyphen_values` is all-or-nothing on
+/// the FILTER positional, and would also swallow a genuine unknown-flag
+/// typo as the filter instead of erroring on it -- so this recovers from
+/// clap's own rejection after the fact instead of trying to configure it
+/// away. Every retry is itself verified by `try_parse_from`, never assumed
+/// correct from the candidate order alone.
 fn parse_allowing_negative_filter<P, I, T>(args: I) -> P
 where
     P: Parser,
@@ -1365,14 +1388,16 @@ where
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
     match P::try_parse_from(args.iter().cloned()) {
         Ok(cmd) => cmd,
-        Err(e) => match negative_filter_retry_index(&args, &e) {
-            Some(idx) => {
-                let mut fixed = args;
+        Err(e) => {
+            for idx in negative_filter_retry_candidates(&args, &e) {
+                let mut fixed = args.clone();
                 fixed.insert(idx, "--".to_string());
-                P::parse_from(fixed)
+                if let Ok(cmd) = P::try_parse_from(fixed) {
+                    return cmd;
+                }
             }
-            None => e.exit(),
-        },
+            e.exit()
+        }
     }
 }
 
@@ -1521,17 +1546,19 @@ fn parse_cli_allowing_negative_filter() -> Cli {
         Ok(cli) => cli,
         Err(e) => {
             let scoped = args.get(1).map(String::as_str) == Some("jq");
-            match scoped
-                .then(|| negative_filter_retry_index(&args, &e))
-                .flatten()
-            {
-                Some(idx) => {
-                    let mut fixed = args;
-                    fixed.insert(idx, "--".to_string());
-                    Cli::parse_from(fixed)
+            let candidates = if scoped {
+                negative_filter_retry_candidates(&args, &e)
+            } else {
+                Vec::new()
+            };
+            for idx in candidates {
+                let mut fixed = args.clone();
+                fixed.insert(idx, "--".to_string());
+                if let Ok(cli) = Cli::try_parse_from(fixed) {
+                    return cli;
                 }
-                None => e.exit(),
             }
+            e.exit()
         }
     }
 }
@@ -2681,7 +2708,7 @@ mod tests {
         }
     }
 
-    /// #3389: `negative_filter_retry_index` against real `clap::Error`
+    /// #3389: `negative_filter_retry_candidates` against real `clap::Error`
     /// values from `JqCommand::try_parse_from`, rather than only through a
     /// spawned subprocess (`tests/jq_cli_tests.rs`) -- this reaches the
     /// function's own defensive branches directly: a non-`UnknownArgument`
@@ -2690,28 +2717,41 @@ mod tests {
     /// `stop_with_escape`'s callers elsewhere in this codebase apply to
     /// their own out-of-band signals.
     #[test]
-    fn test_negative_filter_retry_index_3389() {
+    fn test_negative_filter_retry_candidates_3389() {
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
 
         let err = JqCommand::try_parse_from(["jq", "-x"]).unwrap_err();
         assert_eq!(
-            negative_filter_retry_index(&args(&["jq", "-x"]), &err),
-            None,
+            negative_filter_retry_candidates(&args(&["jq", "-x"]), &err),
+            Vec::<usize>::new(),
             "a genuine unknown flag must not retry"
         );
 
         let err = JqCommand::try_parse_from(["jq", "-1"]).unwrap_err();
         assert_eq!(
-            negative_filter_retry_index(&args(&["jq", "-1"]), &err),
-            Some(1),
+            negative_filter_retry_candidates(&args(&["jq", "-1"]), &err),
+            vec![1],
             "a filter-shaped rejection must retry at the token's own index"
         );
 
         let err = JqCommand::try_parse_from(["jq", "--help"]).unwrap_err();
         assert_eq!(
-            negative_filter_retry_index(&args(&["jq", "--help"]), &err),
-            None,
+            negative_filter_retry_candidates(&args(&["jq", "--help"]), &err),
+            Vec::<usize>::new(),
             "a non-UnknownArgument error kind must never retry"
+        );
+
+        // Code review on #3389: an earlier `allow_hyphen_values` option's
+        // own already-consumed value (`--arg x -1x`'s `-1x`) can share the
+        // bad token's two-byte prefix with the real, still-unclaimed
+        // FILTER (`-1`) that follows it. Candidates must be tried
+        // last-occurrence first, so the real FILTER position (index 3)
+        // comes before the decoy (index 2).
+        let err = JqCommand::try_parse_from(["jq", "--arg", "x", "-1x", "-1"]).unwrap_err();
+        assert_eq!(
+            negative_filter_retry_candidates(&args(&["jq", "--arg", "x", "-1x", "-1"]), &err),
+            vec![4, 3],
+            "the real FILTER position must be tried before the decoy"
         );
     }
 

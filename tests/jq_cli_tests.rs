@@ -2340,6 +2340,20 @@ fn test_negative_filter_program_accepted_without_dashdash_3389() -> Result<()> {
     Ok(())
 }
 
+/// #3389 code review: an earlier `allow_hyphen_values` option's own
+/// already-consumed value can share the bad token's two-byte prefix
+/// (`--arg x -1x`'s `-1x`) with the real, still-unclaimed FILTER that
+/// follows it (`-1`). A naive "insert `--` before the *first* token sharing
+/// the prefix" fix would splice it in front of `-1x` instead -- already
+/// correctly consumed as `--arg`'s value -- and the retry would still fail.
+/// Verified live against jq 1.7.1.
+#[test]
+fn test_negative_filter_not_confused_by_earlier_hyphen_value_3389() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["--arg", "x", "-1x", "-1"], Some("[1]"))?;
+    assert_eq!((stdout.trim_end(), code), ("-1", 0), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #3389 boundary sweep: the letter-vs-non-letter rule is per-character, not
 /// per-string, so this exercises the full boundary set the issue names
 /// (digit, `.`, `(`, `[`, `{`, `"`, a lone `-`) plus letters/`-` that must
