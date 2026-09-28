@@ -8052,99 +8052,167 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // that arity, not the runtime step value, decides the float path's
     // NaN-bound behavior.
     let implicit_step = step.is_none();
-    let mut emit = |from_val: RangeNum,
-                    to_val: RangeNum,
-                    step_val: RangeNum,
+    // `emit` is the *only* closure in this function that touches `sink` --
+    // it is called from three different nested closures below (`from`'s,
+    // `to`'s, `step`'s), and Rust's borrow checker requires exactly one
+    // live `&mut` capture of `sink` for the whole function, so the #3409
+    // slow path has to be reached through this same closure rather than a
+    // sibling one that would try to capture `sink` a second time.
+    //
+    // Takes raw `OwnedValue`s (not pre-classified `RangeNum`s) and
+    // classifies them itself (#3409): 1-arg/2-arg callers below already
+    // range_num-checked `from`/`to` before calling `emit` at all (and
+    // `return stop(...)` on failure without ever reaching this closure), so
+    // for them the classification here always succeeds and the slow arm is
+    // unreachable -- redundant but cheap (three enum matches per `range()`
+    // call, not per generated value). The range/3 caller does no such
+    // pre-check (jq's own `range/3` never validates types up front either;
+    // see `range_values_generic`'s doc comment), so for it this is the
+    // first and only classification, and either arm can fire.
+    let mut emit = |from: OwnedValue,
+                    to: OwnedValue,
+                    step: OwnedValue,
                     from_literal: Option<&OwnedValue>|
      -> Demand {
-        let (one, truncated) = match (from_val, to_val, step_val) {
-            // `eval_range_values` never falls back to `eval_range_values_f64`
-            // since #2219 -- an `i64` overflow now ends its loop and keeps
-            // whatever was already pushed, rather than bailing; see its own
-            // doc comment. `eval_range_values_f64` remains real production
-            // code, reachable only via the other match arm below (any
-            // non-integer operand). `from_literal` is forwarded on this arm
-            // too (#3103): an integer literal generally renders identically
-            // to its own `i64` (so `from_literal` is usually `None` here
-            // anyway), but `-0` is the one legal-JSON exception.
-            (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
-                eval_range_values::<W>(f, t, st, from_literal)
+        match (range_num(&from), range_num(&to), range_num(&step)) {
+            (Ok(from_val), Ok(to_val), Ok(step_val)) => {
+                let (one, truncated) = match (from_val, to_val, step_val) {
+                    // `eval_range_values` never falls back to
+                    // `eval_range_values_f64` since #2219 -- an `i64`
+                    // overflow now ends its loop and keeps whatever was
+                    // already pushed, rather than bailing; see its own doc
+                    // comment. `eval_range_values_f64` remains real
+                    // production code, reachable only via the other match
+                    // arm below (any non-integer operand). `from_literal` is
+                    // forwarded on this arm too (#3103): an integer literal
+                    // generally renders identically to its own `i64` (so
+                    // `from_literal` is usually `None` here anyway), but
+                    // `-0` is the one legal-JSON exception.
+                    (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
+                        eval_range_values::<W>(f, t, st, from_literal)
+                    }
+                    (f, t, st) => eval_range_values_f64::<W>(
+                        f.as_f64(),
+                        t.as_f64(),
+                        st.as_f64(),
+                        implicit_step,
+                        from_literal,
+                    ),
+                };
+                match drain_result(one, sink) {
+                    Flow::Exhausted if truncated => {
+                        stop(Control::Error(range_max_exceeded_error()))
+                    }
+                    Flow::Exhausted => Demand::Continue,
+                    Flow::Stopped { .. } => {
+                        verdict.stop_with_downstream(Flow::Stopped { pending: None })
+                    }
+                    // `owned_vec_to_result` never yields `Error`/`Break`/
+                    // `Halt`/`Partial`, so `drain_result` can only answer
+                    // `Exhausted` or `Stopped { pending: None }` here.
+                    Flow::Escaped(_) => unreachable!(
+                        "eval_range_values(_f64) never produces an Error/Break/Halt/Partial result"
+                    ),
+                }
             }
-            (f, t, st) => eval_range_values_f64::<W>(
-                f.as_f64(),
-                t.as_f64(),
-                st.as_f64(),
-                implicit_step,
-                from_literal,
-            ),
-        };
-        match drain_result(one, sink) {
-            Flow::Exhausted if truncated => stop(Control::Error(range_max_exceeded_error())),
-            Flow::Exhausted => Demand::Continue,
-            Flow::Stopped { .. } => verdict.stop_with_downstream(Flow::Stopped { pending: None }),
-            // `owned_vec_to_result` never yields `Error`/`Break`/`Halt`/
-            // `Partial`, so `drain_result` can only answer `Exhausted` or
-            // `Stopped { pending: None }` here.
-            Flow::Escaped(_) => unreachable!(
-                "eval_range_values(_f64) never produces an Error/Break/Halt/Partial result"
-            ),
+            // #3409: at least one operand isn't a plain number -- only
+            // reachable from range/3 (see this closure's own doc comment).
+            // Real jq's range/3 desugar never type-checks from/to/step
+            // itself; only the `+` that advances to the next value can
+            // raise, and only once a next value is actually demanded.
+            _ => {
+                let result = range_values_generic::<S>(from, &to, &step, &mut |v| match sink(
+                    Item::Owned(v),
+                ) {
+                    Demand::Continue => Demand::Continue,
+                    Demand::Stop => verdict.stop_with_downstream(Flow::Stopped { pending: None }),
+                });
+                match result {
+                    Ok(demand) => demand,
+                    Err(e) => stop(Control::Error(e)),
+                }
+            }
         }
     };
 
     let from_flow = eval_each::<W, S>(from, value.clone(), optional, &mut |from_item| {
         verdict.begin();
         let from_owned = item_to_owned::<_, S>(from_item);
-        let from_val = match range_num(&from_owned) {
-            Ok(n) => n,
-            Err(e) => {
-                return stop(Control::Error(e));
-            }
-        };
-        // The one place `from`'s own literal spelling (if any) is still on
-        // hand -- `range_num` above already degraded it to a spelling-less
-        // `RangeNum` (#3103).
-        let from_literal = range_from_literal_override(&from_owned);
 
         let Some(to_expr) = to else {
             // range(n) -- unreachable from any query today; see
             // `eval_range`'s own doc comment on this branch. This `from` is
             // always the synthesized integer `0`, never a literal, so no
-            // spelling to preserve either way.
+            // spelling to preserve either way. `range/1` is a native
+            // builtin like `range/2` (#3409's fallback is `range/3`-only),
+            // so it keeps the eager numeric check -- gating *before* `emit`
+            // is called, not relying on `emit`'s own internal
+            // classification, so a non-numeric `from` here still
+            // short-circuits immediately rather than falling into the slow
+            // path.
+            let from_val = match range_num(&from_owned) {
+                Ok(n) => n,
+                Err(e) => return stop(Control::Error(e)),
+            };
             return match from_val {
-                RangeNum::Int(t) => {
-                    emit(RangeNum::Int(0), RangeNum::Int(t), RangeNum::Int(1), None)
-                }
+                RangeNum::Int(t) => emit(
+                    OwnedValue::Int(0),
+                    OwnedValue::Int(t),
+                    OwnedValue::Int(1),
+                    None,
+                ),
                 RangeNum::Float(t) => emit(
-                    RangeNum::Float(0.0),
-                    RangeNum::Float(t),
-                    RangeNum::Float(1.0),
+                    OwnedValue::Float(0.0),
+                    OwnedValue::Float(t),
+                    OwnedValue::Float(1.0),
                     None,
                 ),
             };
         };
+        // The one place `from`'s own literal spelling (if any) is still on
+        // hand for the fast numeric path -- `range_num` degrades it to a
+        // spelling-less `RangeNum` (#3103). The slow generic path (#3409)
+        // never calls `range_num` on `from` at all, so it needs no override.
+        let from_literal = range_from_literal_override(&from_owned);
 
         let to_flow = eval_each::<W, S>(to_expr, value.clone(), optional, &mut |to_item| {
             verdict.begin();
-            let to_val = match range_num(&item_to_owned::<_, S>(to_item)) {
-                Ok(n) => n,
-                Err(e) => {
-                    return stop(Control::Error(e));
-                }
-            };
+            let to_owned = item_to_owned::<_, S>(to_item);
 
             match step {
-                None => emit(from_val, to_val, RangeNum::Int(1), from_literal),
+                // range/2: native builtin semantics, eager numeric check on
+                // both bounds -- #3409's fallback only applies to range/3's
+                // jq-defined desugar. Gated the same way as range/1 above:
+                // before `emit`, not inside it.
+                None => {
+                    if let Err(e) = range_num(&from_owned) {
+                        return stop(Control::Error(e));
+                    }
+                    if let Err(e) = range_num(&to_owned) {
+                        return stop(Control::Error(e));
+                    }
+                    emit(
+                        from_owned.clone(),
+                        to_owned,
+                        OwnedValue::Int(1),
+                        from_literal,
+                    )
+                }
                 Some(step_expr) => {
                     let step_flow =
                         eval_each::<W, S>(step_expr, value.clone(), optional, &mut |step_item| {
                             verdict.begin();
-                            let step_val = match range_num(&item_to_owned::<_, S>(step_item)) {
-                                Ok(n) => n,
-                                Err(e) => {
-                                    return stop(Control::Error(e));
-                                }
-                            };
-                            emit(from_val, to_val, step_val, from_literal)
+                            let step_owned = item_to_owned::<_, S>(step_item);
+                            // #3409: no pre-check here -- `emit` itself
+                            // decides fast vs. slow, matching jq's range/3,
+                            // which never type-checks from/to/step up front
+                            // either.
+                            emit(
+                                from_owned.clone(),
+                                to_owned.clone(),
+                                step_owned,
+                                from_literal,
+                            )
                         });
                     match step_flow {
                         Flow::Exhausted => Demand::Continue,
@@ -51407,6 +51475,94 @@ pub(crate) fn range_values_f64(
     (values, truncated)
 }
 
+/// `range/3`'s fallback once at least one of `from`/`to`/`step` fails
+/// [`range_num`] (#3409) -- shared by [`each_range`] and
+/// `eval_generic::each_range_generic` so this has exactly one
+/// implementation, not two that can drift.
+///
+/// Real jq's `range/3` is a jq-defined `def range($from; $upto; $by): if
+/// $by > 0 then $from | while(. < $upto; . + $by) elif $by < 0 then $from |
+/// while(. > $upto; . + $by) else empty end;` -- entirely built from the
+/// generic `<`/`>`/`+` operators, which (unlike `range/1`/`range/2`, native
+/// builtins that reject a non-numeric bound outright) never require
+/// `from`/`upto`/`by` to be numbers at all. `<`/`>` use jq's total type
+/// order and never raise; only `+` can, and only once a next value is
+/// actually demanded -- confirmed live against `/usr/bin/jq` 1.7.1:
+/// `first(range(0;3;"x"))` is `0` (the addition that would raise is never
+/// reached), `[range(0;3;"x")]` raises `number (0) and string ("x") cannot
+/// be added` (jq's own `+` error, not `Range bounds must be numeric`), and
+/// `[range("a";"z";1)]` raises after emitting `["a"]` -- `from` need not be
+/// numeric either.
+///
+/// Generalizes the same total-order-comparison approach
+/// `range_values_f64` already uses for the all-numeric-but-possibly-NaN
+/// case (#3102/#3227, via `cmp_f64`) from a bare `f64` to any `OwnedValue`,
+/// via [`compare_values`] and [`arith_add`] -- both already implement jq's
+/// exact comparison/addition semantics (decNumber literal comparison,
+/// yq's wrapping/append rules, ...) for every other caller, so this reuses
+/// them rather than re-deriving a third copy.
+///
+/// `from` is passed through to the sink unmodified for the first emitted
+/// value and needs no `range_from_literal_override`-style spelling
+/// preservation (#3103): unlike the fast numeric path, this never degrades
+/// `from` into a primitive before emitting it, so whatever spelling it
+/// already carries (including a `NumberLiteral`) survives automatically.
+///
+/// Capped at [`MAX_RANGE`] per call, same as the numeric paths -- real jq's
+/// `range` has no such cap, this is succinctly's own resource-exhaustion
+/// guard (#2089/#2131). The lookahead after the `MAX_RANGE`-th value keeps
+/// the same "truncated only if a genuine next value exists" precision the
+/// numeric paths have: it computes the next value anyway (needed either way
+/// to keep looping), so checking it costs one extra `compare_values` call,
+/// not a second traversal.
+pub(crate) fn range_values_generic<S: EvalSemantics>(
+    from: OwnedValue,
+    to: &OwnedValue,
+    step: &OwnedValue,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Result<Demand, EvalError> {
+    use core::cmp::Ordering;
+
+    let ascending = match compare_values::<S>(step, &OwnedValue::Int(0)) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        // `$by` compares equal to 0 under jq's total order (a bare number
+        // `0`, or any other value jq's ordering places exactly at the same
+        // rank -- in practice only the number 0 itself) -- jq's own `else
+        // empty` arm.
+        Ordering::Equal => return Ok(Demand::Continue),
+    };
+    let continues = |v: &OwnedValue, to: &OwnedValue| {
+        let ord = compare_values::<S>(v, to);
+        if ascending {
+            ord == Ordering::Less
+        } else {
+            ord == Ordering::Greater
+        }
+    };
+
+    let mut current = from;
+    let mut count: usize = 0;
+    loop {
+        if !continues(&current, to) {
+            return Ok(Demand::Continue);
+        }
+        if sink(current.clone()) == Demand::Stop {
+            return Ok(Demand::Stop);
+        }
+        count += 1;
+        let next = arith_add::<S>(current, step.clone())?;
+        if count >= MAX_RANGE {
+            return if continues(&next, to) {
+                Err(range_max_exceeded_error())
+            } else {
+                Ok(Demand::Continue)
+            };
+        }
+        current = next;
+    }
+}
+
 /// Builtin: recurse (recurse(.[]))
 fn builtin_recurse<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
@@ -86273,6 +86429,130 @@ mod tests {
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, Vec::<OwnedValue>::new());
             }
+        );
+    }
+
+    /// range/3's non-numeric operand handling (#3409): real jq's `range/3`
+    /// is a jq-defined `while`-based desugar built from the generic `<`/`>`/
+    /// `+` operators, so it never type-checks `from`/`upto`/`by` up front --
+    /// only `+` (advancing to the next value) can raise, and only once a
+    /// next value is actually demanded. Every row captured live against
+    /// `/usr/bin/jq` 1.7.1. `range/1`/`range/2` are native builtins with a
+    /// genuinely different (eager) contract and are pinned separately below
+    /// to confirm this fix left them alone.
+    #[test]
+    fn test_range_3_non_numeric_operand_matches_jq_generic_while_desugar_3409() {
+        // `first`/`limit(1;...)` never reach the `+` that would raise --
+        // `from` is passed straight through as the first value, unmodified
+        // (unlike the fast path, the slow path never degrades it to a
+        // plain `Int`/`Float`), so a `NumberLiteral`-spelled `0` in the
+        // filter text surfaces as `NumberLiteral`, not `Int` -- same as
+        // `test_first_last_expr_comma_generator_argument`'s own pattern.
+        query!(br"null", r#"first(range(0;3;"x"))"#,
+            QueryResult::Owned(
+                OwnedValue::Int(0) | OwnedValue::NumberLiteral(NumberRepr::Int(0), _)
+            ) => {}
+        );
+        query!(br"null", r#"[limit(1; range(0;3;"x"))]"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(0)]);
+            }
+        );
+        // Collecting every value forces the second `+`, which raises with
+        // `+`'s own error -- not "Range bounds must be numeric".
+        query!(br"null", r#"[range(0;3;"x")]"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "number (0) and string (\"x\") cannot be added");
+            }
+        );
+        query!(br"null", r"[range(0; 3; [1])]",
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "number (0) and array ([1]) cannot be added");
+            }
+        );
+        // `from` need not be numeric either -- the loop condition is a
+        // total-order comparison, not a type check.
+        query!(br"null", r#"[limit(1;range("a";"z";1))]"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::String("a".into())]);
+            }
+        );
+        query!(br"null", r#"[range("a";"z";1)]"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "string (\"a\") and number (1) cannot be added");
+            }
+        );
+        // `null` is `+`'s identity element on either side -- no error, and
+        // (since it never changes `current`) an infinite loop a demand-driven
+        // consumer must still be able to stop.
+        query!(br"null", r"[range(0;3;null)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, Vec::<OwnedValue>::new());
+            }
+        );
+        query!(br"null", r"[limit(3;range(5;0;null))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(5), OwnedValue::Int(5), OwnedValue::Int(5)]);
+            }
+        );
+        // A step that total-orders equal to `0` (only the number `0`
+        // itself, since jq's ordering has no other value at that rank)
+        // takes jq's `else empty` arm.
+        query!(br"null", r"[limit(3;range(0;5;0))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, Vec::<OwnedValue>::new());
+            }
+        );
+        // range/1 and range/2 are native builtins (unlike range/3's
+        // jq-defined desugar) and keep their pre-existing eager numeric
+        // check -- unaffected by this fix.
+        query!(br"null", r#"[range(0;"x")]"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "Range bounds must be numeric");
+            }
+        );
+        query!(br"null", r#"[range("x";2)]"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "Range bounds must be numeric");
+            }
+        );
+        query!(br"null", r#"[limit(1;range(0;"x"))]"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "Range bounds must be numeric");
+            }
+        );
+        // All-numeric range/3 calls are unaffected: same fast path, same
+        // answer.
+        query!(br"null", r"[range(5;0;-1)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![
+                    OwnedValue::Int(5), OwnedValue::Int(4), OwnedValue::Int(3),
+                    OwnedValue::Int(2), OwnedValue::Int(1),
+                ]);
+            }
+        );
+    }
+
+    /// The `MAX_RANGE` resource guard (#2089/#2131) applies to
+    /// [`range_values_generic`]'s slow path too (#3409): capped the same
+    /// way the numeric paths are, and with the same "only raise if a
+    /// consumer that wants everything actually hits the cap" rule --
+    /// `first` stops long before the cap and must never see it.
+    #[test]
+    fn test_range_3_non_numeric_operand_respects_max_range_cap_3409() {
+        query!(
+            br"null",
+            r#"[range(0; "zzzzzzzzzzzzzzzzzzzzzzzzzz"; 1)]"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert!(e.is_resource_limit(), "{e:?}");
+            }
+        );
+        query!(
+            br"null",
+            r#"first(range(0; "zzzzzzzzzzzzzzzzzzzzzzzzzz"; 1))"#,
+            QueryResult::Owned(
+                OwnedValue::Int(0) | OwnedValue::NumberLiteral(NumberRepr::Int(0), _)
+            ) => {}
         );
     }
 
