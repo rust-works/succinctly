@@ -2418,17 +2418,17 @@ $ echo '[1,2,3]' | sjq -c 'first(. as [$a] ?// $b |
 [101,102,103]                                                            # falls through, exit 0
 ```
 
-Bare `keys_unsorted` — no stage after it — does raise, but only part-way through: it streams,
-and finds a non-string key once its `[` is already out, so a **truncated** array can reach
-stdout beside the exit 5. Pre-checking would mean a second walk over every key on a path
-`scripts/perf-guard.py` measures.
-
-A malformed object *nested* inside a well-formed one is found only once its parent's opening
-bytes are written, so that case truncates the same way:
+Bare `keys_unsorted` — no stage after it — does raise, but only part-way through: it
+renders as it walks, and finds a non-string key once its `[` is already rendered. Pre-checking
+would mean a second walk over every key on a path `scripts/perf-guard.py` measures. A malformed
+object *nested* inside a well-formed one is likewise found only once its parent's opening bytes
+are rendered. Both used to leave that truncated prefix on stdout. Since
+[#3265](https://github.com/rust-works/succinctly/issues/3265) a record renders into a buffer
+and reaches stdout only whole, so neither prints anything:
 
 ```
-$ echo '{invalid}'        | sjq -c .   # (nothing),  exit 5
-$ echo '{"a": {invalid}}' | sjq -c .   # `{"a":`,    exit 5
+$ echo '{invalid}'        | sjq -c .   # (nothing), exit 5
+$ echo '{"a": {invalid}}' | sjq -c .   # (nothing), exit 5 (was `{"a":` before #3265)
 ```
 
 **Bare `.[]` and the identity printer now raise too (#1641).** Both were previously misdiagnosed
@@ -2453,14 +2453,14 @@ member anywhere in the object, including *after* a valid field, raises before an
 
 `print_json`'s `StandardJson::Error` arm (`jq_runner.rs`) — reached by the identity path on a
 structurally malformed *value* (`[xyz123]`, `[tru]`) rather than a malformed *member* — now raises
-through the same `MalformedJsonError` convention the object-member check above uses. This one
-**does** truncate, the same accepted trade `keys_unsorted` and a nested `{invalid}` already make
-above: the writer streams child cursors as it walks, so an earlier sibling and the opening bracket
-are already out by the time a later error is found:
+through the same `MalformedJsonError` convention the object-member check above uses. The
+writer renders child cursors as it walks, so an earlier sibling and the opening bracket are
+already rendered by the time a later error is found. That used to truncate on stdout (`[`,
+`[1,`); since #3265 the record is buffered, so nothing is printed:
 
 ```
-$ echo '[xyz123]'  | sjq -c .   # `[`,   exit 5 now (was: [null],       exit 0)
-$ echo '[1,zzz,3]' | sjq -c .   # `[1,`, exit 5 now (was: [1,null,3], exit 0)
+$ echo '[xyz123]'  | sjq -c .   # (nothing), exit 5 (was: [null],     exit 0)
+$ echo '[1,zzz,3]' | sjq -c .   # (nothing), exit 5 (was: [1,null,3], exit 0)
 ```
 
 This exact fix was tried once before and reverted: the earlier attempt predated
@@ -2589,9 +2589,9 @@ gets the same protection a CLI user does, not just `sjq -c .`. The residual gaps
 the ones already named above for the unpaired-member class, since both checks now ride the
 same walks: `obj | map(f)` (`LazySource::Values`, left open by #1641), `keys_unsorted`'s
 still-deliberately-unchecked positional fast paths (`.[0]`, `first`, `.[n]`, tracked
-separately as #1629 -- `last` is no longer one of these, see below), and bare
-`keys_unsorted`'s streaming truncation (a partial array can reach stdout beside the exit 5,
-for the same "cannot rewind a byte-at-a-time writer" reason).
+separately as #1629 -- `last` is no longer one of these, see below). Bare `keys_unsorted`'s
+streaming truncation used to be a third; since #3265 its record is buffered and a partial array
+no longer reaches stdout.
 
 **Partly covered: `succinctly::jq::eval`'s own separate evaluator.** `src/jq/eval.rs` defines
 a second, independent `pub fn eval` — the function `succinctly::jq::eval` actually re-exports,
@@ -3130,7 +3130,7 @@ of raising. Pinned as still open by
 
 ### Partial output before the error, on the two genuinely streaming writers
 
-Two of the newly-checked paths can write real, already-confirmed-good
+One of the newly-checked paths can write real, already-confirmed-good
 output to stdout before the trailing-comma fault surfaces -- not a new
 divergence, but the same one already pinned for `limit(3;.[])` on
 `[1,2,,4]` (see "A truncating consumer of a plain array `.[]` skips a
@@ -3142,7 +3142,7 @@ the walk exhausts.
 $ echo '[1,]'     | jq  -c '.[]'            # (parses nothing) exit 5
 $ echo '[1,]'     | sjq -c '.[]'            # 1, then error, exit 5
 $ echo '{"a":1,}' | jq  -c 'keys_unsorted'   # (parses nothing) exit 5
-$ echo '{"a":1,}' | sjq -c 'keys_unsorted'   # ["a" (no closing bracket), then error, exit 5
+$ echo '{"a":1,}' | sjq -c 'keys_unsorted'   # (nothing), exit 5 -- was ["a" before #3265
 ```
 
 Real jq's parser is atomic (whole-document parse before any evaluation, so
@@ -3151,7 +3151,9 @@ validates incrementally as each element/writer step confirms itself good.
 Pinned by
 `test_jq_lazy_array_iterate_trailing_comma_streams_confirmed_prefix_first_2261`
 and
-`test_jq_lazy_keys_array_trailing_comma_leaves_truncated_bracket_2261`.
+`test_jq_lazy_keys_array_trailing_comma_writes_no_partial_record_2261` (which since #3265
+pins the second row's empty stdout: `keys_unsorted` is one record, rendered before it is
+written, where `.[]`'s `1` is an earlier complete result).
 Every other path this section fixed (`length`, `to_entries`, `keys`, `.a`,
 `keys_unsorted[]`/`| last`/`[-1]`) resolves to a single owned result or a
 fully-collected `Vec` before printing anything, so a mid-walk failure there
@@ -6128,24 +6130,24 @@ Pinned by `test_unbuffered_interleaves_stdout_and_stderr_1653`,
 `test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677`
 ([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)).
 
-The same trade-off also covers a fault found *partway through writing a single result's
-own value*, not just one discovered by a later top-level result's generator advance —
-`print_json`/`write_output_jq_value` stream byte-by-byte with no rewind, so `{"a": [,]}`
-under bare `.` writes `{"a":` before its own recursive walk reaches the stray comma nested
-inside the empty array and raises (#2210), the identical shape `test_jq_identity_on_
-malformed_array_element_errors_1641` above already pins for `[xyz123]`/`[tru]`/
-`[1,zzz,3]`/`{"a": xyz123}` — a bareword-garbage token instead of a stray comma, reaching
-the fault through the same writer the same way. A first pass at this fix buffered
-`write_output_jq_value`'s per-call output and only committed it to real stdout once known
-good (mirroring `evaluate_m2_fast_path`'s own identical contract for its own single-result
-case) — reverted once the existing #1641 test above caught it as a real regression against
-an already-established, deliberately tested contract for this exact writer, not a
-previously-undocumented gap. It would also have needed carving out `--unbuffered`, whose
-own flush (`write_terminator`) is embedded inside this same call tree keyed on whatever
-writer it's given — buffering would make that flush a silent no-op on a temporary buffer
-instead of the real, immediate per-value flush `--unbuffered` promises, breaking its
-interleaving guarantee with side effects from later results. Pinned by
-`test_jq_general_streaming_path_leaks_prefix_before_nested_comma_fault_2210`
+This covers only results *before* the faulty one. A fault found partway through writing a
+single result leaves nothing of that result on stdout
+([#3265](https://github.com/rust-works/succinctly/issues/3265)). `write_output_jq_value`
+renders the record into a buffer and copies it to stdout only once the render succeeds, so
+`{"a": [,]}`, `[1,zzz,3]` and `{"a":1.2.3}` under `.` print nothing, as in jq, rather than
+`{"a":`, `[1,` and `{"a":`. The `--seq` RS is written after the render, so a rejected record
+leaves none. This is the per-value buffer the M2 fast path (`JsonCursor::stream_json`) already
+keeps for the same query. It costs one rendered record of memory, and the buffer is released
+after any record over 8 MiB.
+
+#2210 tried the same buffer and reverted it, for two reasons that no longer hold. First, the
+#1641 test pinned the truncated prefix. That pinned the old trade, not jq's behaviour, and
+#3265 flipped it. Second, `--unbuffered`'s flush was said to be inside the buffered call tree.
+It isn't: `write_terminator` runs on the real writer after the body is copied, so each record
+is still flushed as it is written. Pinned by `test_print_json_writes_no_partial_record_3265`,
+`test_print_json_multi_result_keeps_earlier_complete_results_3265`,
+`test_jq_identity_on_malformed_array_element_errors_1641` and
+`test_jq_general_streaming_path_writes_no_prefix_before_nested_comma_fault_2210`
 ([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)).
 
 ## Deliberate divergences (ADR-0018 rule 4)

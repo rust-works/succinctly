@@ -2698,8 +2698,8 @@ fn identity_exit_status_value(json_bytes: &[u8]) -> OwnedValue {
 /// fault the same walk can find: a missing/doubled `,`/`:`. Both share the
 /// "ask only once the walk is done" contract -- this writer cannot rewind,
 /// so either fault surfaces only here, potentially behind an
-/// already-written partial `[`/array -- see `JqValue::LazyKeysArray`'s own
-/// doc comment for why that trade is accepted.
+/// already-rendered partial `[`/array. Since #3265 that is rendered into
+/// the record buffer, not stdout, so the raise leaves nothing behind.
 ///
 /// #2261: also checks [`DistinctKeyCursors::trailing_gap_ok`] -- a trailing
 /// stray `,` after the object's own real last key (`{"a":1,}`), same "ask
@@ -7020,9 +7020,9 @@ fn m2_json_fallback_safe(expr: &Expr) -> bool {
 /// **Why fall back rather than report directly** (#1576 review): jq's own
 /// `print_json`/`to_owned_cursor`/`DistinctKeyCursors` stack has
 /// accumulated years of issue-specific, sometimes deliberately
-/// *inconsistent* malformed-input handling (#1641 wants a truncated
-/// partial prefix for a bad *value*; #1676 wants zero output for a bad
-/// *delimiter*; #1642's `DisplayKeyGuard` catches a narrower colliding-
+/// *inconsistent* malformed-input handling (#1641 raises on a bad *value*,
+/// and since #3265 leaves none of that record on stdout; #1676 wants zero
+/// output for a bad *delimiter*; #1642's `DisplayKeyGuard` catches a narrower colliding-
 /// decode-failure-key case none of this writer's checks replicate) --
 /// re-deriving every one of those exactly in this new writer is its own,
 /// separately-scoped effort. Falling back to the already-correct general
@@ -8133,10 +8133,10 @@ impl LiteralFormatter for PreserveFormatter {
 /// preceded by nothing (#1643).
 ///
 /// Called from the array arm's own validation pass, before any of `[`'s
-/// contents are written -- same discipline as the object arm just below,
-/// and for the same reason (its own comment there explains it): a
-/// malformed array must not leave a partial `[` on `out` when the error
-/// surfaces.
+/// contents are written -- same discipline as the object arm just below.
+/// Since #3265 `out` is a per-record buffer, so this no longer decides what
+/// reaches stdout; it fails fast, before rendering a container that cannot
+/// print.
 ///
 /// Returns the element's own `text_position()` on success, so the caller
 /// can cache it and hand it to `print_json` as `known_text_pos` once the
@@ -8610,11 +8610,9 @@ where
                     } else {
                         // #1643: validate every element's preceding
                         // delimiter *before* writing anything, same
-                        // discipline as the object arm below and for the
-                        // same reason (its own comment explains why: a
-                        // malformed document must not leave a partial `{`
-                        // -- or here, `[` -- already on `out` when the
-                        // error surfaces).
+                        // discipline as the object arm below. Since #3265
+                        // `out` is a per-record buffer, so this fails fast
+                        // rather than guarding stdout.
                         //
                         // Walked exactly once: a first cut called
                         // `elements.cursor_iter()` a second time for the
@@ -9035,10 +9033,9 @@ where
             // every key -- and `keys_unsorted` over a 2 MB `wide` document is
             // one of the workloads `scripts/perf-guard.py` pins precisely
             // because it is sensitive to exactly that. The per-key arms below
-            // raise instead, which can leave a truncated array on stdout
-            // alongside the exit 5. That divergence is recorded in
-            // `docs/compliance/jq/limitations.md`; it is the same trade the
-            // YAML streaming path already makes, and for the same reason.
+            // raise instead, after the bracket and earlier keys are
+            // rendered. Since #3265 that render goes to the record buffer in
+            // `write_output_jq_value`, so stdout gets none of it.
             if let Some(tail) = fields.unpaired_tail() {
                 return Err(
                     MalformedJsonError::new(EvalError::malformed_json_text(tail.text())).into(),
@@ -9062,8 +9059,8 @@ where
                     }
                     doc_text = Some(key_cursor.text());
                     let SJ::String(k) = key else {
-                        // Reachable, and the reason this writer can leave
-                        // a truncated `[` behind: the check above it is the
+                        // Reachable, and the reason this raise comes after
+                        // the `[` is rendered: the check above it is the
                         // O(1) `unpaired_tail` one, which catches `{invalid}`
                         // but says nothing about a key's *type*. Catching
                         // that before the bracket would need a second walk
@@ -9101,8 +9098,8 @@ where
                     doc_text = Some(key_cursor.text());
                     out.write_all(next_indent.as_bytes())?;
                     let SJ::String(k) = key else {
-                        // Reachable, and the reason this writer can leave
-                        // a truncated `[` behind: the check above it is the
+                        // Reachable, and the reason this raise comes after
+                        // the `[` is rendered: the check above it is the
                         // O(1) `unpaired_tail` one, which catches `{invalid}`
                         // but says nothing about a key's *type*. Catching
                         // that before the bracket would need a second walk
@@ -11062,6 +11059,109 @@ mod tests {
             format!("{}\n", OwnedValue::Float(f64::INFINITY).to_json()),
             "{token}"
         );
+    }
+
+    /// #3265: a record whose value fails to decode partway through writes
+    /// nothing, not even the `--seq` RS that would otherwise lead it (the
+    /// #1830 rule). The CLI can't reach this under `--seq`, whose own input
+    /// handling drops a malformed document first, so it is pinned here.
+    /// A good record through the same scratch buffer afterwards is written
+    /// whole, so the failed render leaves nothing behind in the buffer.
+    #[test]
+    fn write_output_jq_value_writes_nothing_for_a_failed_record_3265() {
+        for seq in [false, true] {
+            for compact in [true, false] {
+                let config = OutputConfig {
+                    compact,
+                    raw_output: true,
+                    join_output: false,
+                    raw_output0: false,
+                    ascii_output: false,
+                    color_output: false,
+                    color_scheme: ColorScheme::default(),
+                    sort_keys: false,
+                    indent_string: if compact { String::new() } else { "  ".into() },
+                    unbuffered: false,
+                    seq,
+                    convention: JsonConvention::JqCompat,
+                };
+                let mut scratch = Vec::new();
+                let bad: &[u8] = br#"{"a":[1,{"b":tru}]}"#;
+                let bad_index = JsonIndex::build(bad);
+                let mut out = Vec::new();
+                let err = write_output_jq_value(
+                    &mut out,
+                    &JqValue::Cursor(bad_index.root(bad)),
+                    &config,
+                    &mut scratch,
+                );
+                assert!(err.is_err(), "seq={seq} compact={compact}");
+                assert_eq!(out, b"", "seq={seq} compact={compact}");
+
+                let good: &[u8] = br#"[1]"#;
+                let good_index = JsonIndex::build(good);
+                write_output_jq_value(
+                    &mut out,
+                    &JqValue::Cursor(good_index.root(good)),
+                    &config,
+                    &mut scratch,
+                )
+                .expect("a well-formed record prints");
+                let body = if compact { "[1]" } else { "[\n  1\n]" };
+                let rs = if seq { "\u{1e}" } else { "" };
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    format!("{rs}{body}\n"),
+                    "seq={seq} compact={compact}"
+                );
+            }
+        }
+    }
+
+    /// #3265: a record bigger than `MAX_RETAINED_RECORD_SCRATCH` is written
+    /// whole, and its buffer is released afterwards rather than kept for the
+    /// rest of the stream. A small record keeps the buffer for reuse.
+    #[test]
+    fn write_output_jq_value_releases_an_oversized_scratch_3265() {
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: false,
+            convention: JsonConvention::JqCompat,
+        };
+        let big = format!("\"{}\"", "x".repeat(MAX_RETAINED_RECORD_SCRATCH));
+        let mut scratch = Vec::new();
+        let mut out = Vec::new();
+        let index = JsonIndex::build(big.as_bytes());
+        write_output_jq_value(
+            &mut out,
+            &JqValue::Cursor(index.root(big.as_bytes())),
+            &config,
+            &mut scratch,
+        )
+        .expect("a large string prints");
+        assert_eq!(out.len(), big.len() + 1);
+        assert_eq!(&out[..big.len()], big.as_bytes());
+        assert_eq!(scratch.capacity(), 0, "the oversized buffer is dropped");
+
+        let small: &[u8] = b"[1]";
+        let index = JsonIndex::build(small);
+        write_output_jq_value(
+            &mut out,
+            &JqValue::Cursor(index.root(small)),
+            &config,
+            &mut scratch,
+        )
+        .expect("a small record prints");
+        assert!(scratch.capacity() > 0, "a small buffer is kept for reuse");
     }
 
     /// #1192: `generic_result_to_jq_values`'s own `One`/`Many` arms --
