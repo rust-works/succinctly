@@ -501,7 +501,11 @@ CI works around but this repo's own docs don't all say consistently:
   `broadword-yaml` added (the YAML backend selectors are cfg-exclusive, so
   no single build reaches neon/broadword/scalar at once; see
   `.github/workflows/ci.yml`'s own comment above the `clippy-all-variants`
-  matrix entry for the exact commands). When validating clippy locally for
+  matrix entry for the exact commands). Both feature lists have exactly one
+  source of truth, `scripts/lib/clippy-variants.sh` (#3354) — `ci.yml`,
+  `scripts/build.sh`, and `scripts/test.sh` all source it rather than each
+  holding their own copy; update that file, not the prose here, if the list
+  ever changes. When validating clippy locally for
   any change touching `src/yaml/simd/*.rs` or `src/bits/popcount.rs`, run
   every invocation ci.yml runs for your architecture, not just
   `--all-features` — and see [docs/guides/developer.md](docs/guides/developer.md)'s

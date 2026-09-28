@@ -341,10 +341,14 @@ jobs:
           # cache, so chaining them is safe.
           - name: clippy-all-variants
             clippy: true
+            # The two feature lists below live in scripts/lib/clippy-variants.sh,
+            # not here (#3354) -- scripts/build.sh and scripts/test.sh, and the
+            # x86_64 `clippy` job's own second step, source the same file.
             testCmd: |
               cargo clippy --all-targets --all-features -- -D warnings
-              cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
-              cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+              source scripts/lib/clippy-variants.sh
+              cargo clippy --all-targets --features "$CLIPPY_CORE_FEATURES" -- -D warnings
+              cargo clippy --all-targets --features "$CLIPPY_ARM_BROADWORD_FEATURES" -- -D warnings
     env:
       # ARM SIMD CI leg (#194, mirroring the x86 pattern from #193): the SVE2
       # suites self-skip (with a visible `SKIPPED` line) when a CPU feature is
@@ -809,9 +813,14 @@ jobs:
       # so this step now covers both blind spots at once (#388).
       # `popcount_words_portable`, gated *by* `portable-popcount`, stays covered by
       # the `--all-features` step above.
+      #
+      # The feature list itself lives in scripts/lib/clippy-variants.sh, not here
+      # (#3354) -- scripts/build.sh and scripts/test.sh source the same file.
       - name: Run Clippy (YAML SIMD + AVX-512 popcount backend selected)
         if: needs.gate.outputs.code == 'true'
-        run: cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+        run: |
+          source scripts/lib/clippy-variants.sh
+          cargo clippy --all-targets --features "$CLIPPY_CORE_FEATURES" -- -D warnings
 
   fmt:
     name: Format
