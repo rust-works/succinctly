@@ -99987,6 +99987,25 @@ mod tests {
     #[test]
     fn test_retry_supersedes_stashed_verdict_on_owned_route_3293() {
         for (filter, values, end) in [
+            // Slice 2: the `eval.rs` twins themselves, driven through
+            // `first` -- a bare top-level operand here takes the eager
+            // `eval_single` arm, which materializes it first (#3410's family).
+            (r"first(-([[1]] as [$a] ?// [[$a]] | $a))", &["-1"][..], ""),
+            (
+                r#"first({"a":5} | .[([["a"]] as [$a] ?// [[$a]] | $a)])"#,
+                &["5"][..],
+                "",
+            ),
+            (
+                r"first(-(1 as $a ?// [$b] | $b))",
+                &[][..],
+                "error: Cannot index number with number",
+            ),
+            (
+                r#"[limit(1; if ([1] as $a ?// $b | $a) then 1 else error("E") end)]"#,
+                &[][..],
+                "error: E",
+            ),
             (
                 r#"([1] as $a ?// $b | $a) and error("E")"#,
                 &["false"][..],
