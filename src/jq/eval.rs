@@ -78900,9 +78900,17 @@ mod tests {
 
     #[test]
     fn test_if_no_else() {
-        // if without else (defaults to null)
-        query!(br#"{"a": false}"#, "if .a then 1 end",
-            QueryResult::Owned(OwnedValue::Null) => {}
+        // jq 1.7 defines `if A then B end` as `if A then B else . end` — the
+        // falsy branch passes the input through unchanged, not null. It comes
+        // back as `One` (the original document, unmaterialized) rather than
+        // `Owned`, since the identity branch never constructs a new value.
+        query!(br"1", "if false then 5 end",
+            QueryResult::One(v) => {
+                assert!(matches!(
+                    to_owned_lossy::<JqSemantics, Vec<u64>>(&v),
+                    OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+                ));
+            }
         );
 
         query!(br#"{"a": true}"#, "if .a then 1 end",
