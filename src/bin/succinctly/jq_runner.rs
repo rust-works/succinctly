@@ -9239,6 +9239,84 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
 mod tests {
     use super::*;
 
+    /// #3313: `error_report_rank`'s walk, pinned on a hand-built module graph
+    /// independently of the CLI.
+    mod error_report_rank_3313 {
+        use super::*;
+
+        fn call(origin: Option<u32>, name: &str) -> jq::ResolveError {
+            jq::ResolveError::Call(jq::UnresolvedCall {
+                name: name.to_string(),
+                arity: 0,
+                origin,
+                occurrence_index: 0,
+                module_def: None,
+            })
+        }
+
+        /// `cerr`(1) includes `serr`(2); the program includes `cerr`,
+        /// `other`(3), `serr` in that order. jq reports `serr`, `other`,
+        /// `cerr`: `serr` is ranked at its first reach as a top-level
+        /// directive, not at its later position as `cerr`'s dependency.
+        #[test]
+        fn a_module_is_ranked_at_its_first_reach() {
+            let mut loader = ModuleLoader::new(&[]);
+            loader.deps_of.insert(1, vec![(0, 2)]);
+            loader.top_ids = vec![(0, 1), (1, 3), (2, 2)];
+            let rank = loader.error_report_rank();
+            assert_eq!(rank, BTreeMap::from([(2, 0), (3, 1), (1, 2)]));
+        }
+
+        /// A module's dependencies come before it, last-declared first, and a
+        /// shared dependency (`base`, 3, under `l`(1) and `r`(2)) once.
+        #[test]
+        fn dependencies_precede_their_module_last_declared_first() {
+            let mut loader = ModuleLoader::new(&[]);
+            loader.deps_of.insert(1, vec![(0, 3)]);
+            loader.deps_of.insert(2, vec![(0, 3)]);
+            loader.deps_of.insert(4, vec![(0, 1), (1, 2)]);
+            loader.top_ids = vec![(0, 4)];
+            let rank = loader.error_report_rank();
+            assert_eq!(rank, BTreeMap::from([(3, 0), (2, 1), (1, 2), (4, 3)]));
+        }
+
+        /// Modules by rank, then `~/.jq` alongside any module the walk never
+        /// reached (defensive), then the main filter; stable within each.
+        #[test]
+        fn report_order_groups_modules_home_and_main() {
+            let mut loader = ModuleLoader::new(&[]);
+            loader.top_ids = vec![(0, 1), (1, 2)];
+            let errors = [
+                call(None, "main"),
+                call(Some(AUTO_LOAD_RUN_ID), "home"),
+                call(Some(1), "first_a"),
+                call(Some(9), "unranked"),
+                call(Some(2), "second"),
+                call(Some(1), "first_b"),
+            ];
+            let names: Vec<&str> = jq_report_order(&errors, &loader)
+                .into_iter()
+                .map(|e| match e {
+                    jq::ResolveError::Call(c) => c.name.as_str(),
+                    other => panic!("only calls were built: {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                names,
+                ["second", "first_a", "first_b", "home", "unranked", "main"]
+            );
+        }
+
+        /// No module error at all: the order is the resolver's, untouched.
+        #[test]
+        fn report_order_leaves_main_only_errors_alone() {
+            let loader = ModuleLoader::new(&[]);
+            let errors = [call(None, "b"), call(None, "a")];
+            let ordered = jq_report_order(&errors, &loader);
+            assert_eq!(ordered, [&errors[0], &errors[1]]);
+        }
+    }
+
     /// #3261 review: `nesting_depth_panic_message`'s whole point is telling
     /// apart two panics that share the identical message template
     /// (`assert_depth`, `src/jq/value.rs`) except for the interpolated
