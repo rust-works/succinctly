@@ -33671,6 +33671,48 @@ mod tests {
         assert!(result.is_error());
     }
 
+    /// #3309: `tonumber` on a document NaN is a passthrough, so it hands
+    /// back the same parse instance `.a` reads, and `==` agrees.
+    #[test]
+    fn test_tonumber_passes_a_document_nan_instance_through_3309() {
+        let json = br#"{"a": NaN, "b": NaN}"#;
+        let index = JsonIndex::build(json);
+        for (filter, expected) in [
+            ("(.a | tonumber) == .a", true),
+            ("(.a | tonumber) == .b", false),
+        ] {
+            let expr = crate::jq::parse(filter).unwrap();
+            let result = eval_with_cursor(&expr, index.root(json));
+            assert_eq!(
+                result.into_owned::<JqSemantics>().unwrap(),
+                Some(OwnedValue::Bool(expected)),
+                "{filter}"
+            );
+        }
+    }
+
+    /// #3309: only a JSON number token has an address to key a NaN by -- any
+    /// other JSON value, and every YAML value (yq never compares by
+    /// instance), answers `None`.
+    #[test]
+    fn test_number_token_address_is_json_numbers_only_3309() {
+        let json = br#"["s", NaN]"#;
+        let index = JsonIndex::build(json);
+        let first = index.root(json).first_child().expect("an element");
+        assert_eq!(first.value().number_token_address(), None);
+        let second = first.next_sibling().expect("a second element");
+        assert!(second.value().number_token_address().is_some());
+
+        let yaml = b"a: .nan\n";
+        let index = crate::yaml::YamlIndex::build(yaml).unwrap();
+        let doc = index.root(yaml).first_child().expect("a document");
+        let nan = doc
+            .first_child()
+            .and_then(|k| k.next_sibling())
+            .expect("a value");
+        assert_eq!(nan.value().number_token_address(), None);
+    }
+
     #[test]
     fn test_arithmetic_semantics_are_threaded() {
         // The generic evaluator delegates arithmetic to the full evaluator; the

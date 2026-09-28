@@ -1471,7 +1471,7 @@ mod tests {
     fn test_nan_instance_stays_a_nan_3309() {
         let instance = OwnedValue::fresh_nan_instance(false);
         let OwnedValue::NumberLiteral(repr, text) = instance.clone() else {
-            panic!("a NaN instance is a literal");
+            panic!("a NaN instance is a literal"); // omni-dev: coverage tolerate-line reason="failure message for the shape the test asserts"
         };
         let from_literal: JqValue<'_, Vec<u64>> =
             JqValue::from_literal(&Literal::NumberLiteral(repr, text.to_string()));
