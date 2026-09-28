@@ -3171,7 +3171,9 @@ fn query_result_to_generic<V: DocumentValue, S: EvalSemantics>(
 /// exceptions are all numeric, because `to_json_for_reindex` is a *formatter*
 /// as much as a serializer:
 ///
-/// - A **NaN** `NumberLiteral` is replaced by `NAN_SENTINEL`.
+/// - A **NaN** `NumberLiteral` is replaced by a bridge token (`NAN_SENTINEL`
+///   plus its bits, #3309), which reads back as the same instance but not as
+///   the source spelling.
 ///
 /// A bare **`Float`** used to head this list: the formatter re-spelled a
 /// finite one by a mode-forked rule (#953) and it came back as a

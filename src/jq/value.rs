@@ -4128,8 +4128,10 @@ pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
                     return numeric_repr_eq_strict(x, y);
                 }
                 if S::DECNUMBER_LITERALS {
-                    return same_nan_instance(a, b)
-                        || jq_numeric_cmp(a, b) == Some(core::cmp::Ordering::Equal);
+                    // A NaN is never `Equal` to the comparator, so the
+                    // instance check only runs on pairs it already refused.
+                    return jq_numeric_cmp(a, b) == Some(core::cmp::Ordering::Equal)
+                        || same_nan_instance(a, b);
                 }
             }
             a == b
