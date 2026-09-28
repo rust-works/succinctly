@@ -29033,13 +29033,15 @@ fn test_home_jq_def_does_not_seed_a_modules_own_shadow_candidates_2950() -> Resu
     Ok(())
 }
 
-/// #2950: a genuine module cycle reached only through the new discovery
-/// pass (rather than the pre-existing `module_dep_defs` load) is still
-/// caught by the `loading` guard -- confirming the guard's coverage was
-/// widened to include the discovery pass, not bypassed by it. `ca`/`cb`
-/// include each other; real jq hangs on this input (confirmed live, not
-/// asserted here), so this pins succinctly's own clean-refusal behavior
-/// instead of a byte-for-byte oracle match.
+/// #2950: a genuine module cycle is still caught cleanly once
+/// `load_and_bind_module` derives its shadow-candidate names from
+/// `module_dep_defs`'s own `deps` result rather than a second, independent
+/// traversal (an earlier version of this fix took the second-traversal
+/// shape; see `test_module_cycle_chain_stays_linear_cost_2950` below for
+/// why that was reverted). `ca`/`cb` include each other; real jq hangs on
+/// this input (confirmed live, not asserted here), so this pins
+/// succinctly's own clean-refusal behavior instead of a byte-for-byte
+/// oracle match.
 #[test]
 fn test_module_cycle_reached_through_discovery_pass_still_detected_2950() -> Result<()> {
     let (stdout, stderr, code) = run_jq_with_modules(
@@ -29055,6 +29057,91 @@ fn test_module_cycle_reached_through_discovery_pass_still_detected_2950() -> Res
         stderr.contains("module cycle detected"),
         "stderr: {stderr:?}"
     );
+    Ok(())
+}
+
+/// #2950 (code review): a shadow-candidate discovery pass that re-attempts
+/// every `include` independently of `module_dep_defs`'s own attempt
+/// doubles the cost of resolving a *failing* include at every level of a
+/// chain -- `module_dep_defs` is the only pass that can ever observe a
+/// failure, so a second independent attempt at the same directives has
+/// nothing to save by existing, and the doubling compounds
+/// multiplicatively with depth: empirically O(2^depth) instead of
+/// O(depth) for a chain N levels deep that fails at the bottom (measured
+/// live in review: N=16 already took several seconds; N=18+ did not
+/// finish in a 10s timeout). This is the exact class of hang
+/// `test_module_cycle_is_a_compile_error_not_a_hang_2865` and
+/// `test_transitive_include_chain_does_not_blow_up_2865` exist to rule
+/// out, just untested at a depth where the earlier (reverted) shape's
+/// blowup was actually visible -- those two only cover a handful of
+/// levels.
+///
+/// Pins two shapes at N=20, both of which take well under a second on the
+/// fixed implementation (names derived from `module_dep_defs`'s own
+/// result, no second traversal): a linear chain ending in a missing
+/// module, and a genuine N-module cycle. `Instant`-based, not exact-timed,
+/// since CI runner speed varies -- the bound is generous specifically to
+/// separate "linear/small-constant cost" from "exponential", not to pin a
+/// tight budget.
+#[test]
+fn test_module_cycle_chain_stays_linear_cost_2950() -> Result<()> {
+    const N: usize = 20;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let mut chain_modules: Vec<(String, String)> = (1..N)
+        .map(|i| {
+            (
+                format!("m{i}"),
+                format!("include \"m{}\";\ndef h{i}: h{};\n", i + 1, i + 1),
+            )
+        })
+        .collect();
+    chain_modules.push((
+        format!("m{N}"),
+        "include \"missing\";\ndef last: 1;\n".to_string(),
+    ));
+    let modules: Vec<(&str, &str)> = chain_modules
+        .iter()
+        .map(|(name, contents)| (name.as_str(), contents.as_str()))
+        .collect();
+
+    let start = std::time::Instant::now();
+    let (_stdout, stderr, code) = run_jq_with_modules(&modules, &["-nc", r#"include "m1"; h1"#])?;
+    assert!(
+        start.elapsed() < BUDGET,
+        "linear failing chain took {:?}, expected well under {BUDGET:?} (exponential blowup?)",
+        start.elapsed()
+    );
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module not found: missing"),
+        "stderr: {stderr:?}"
+    );
+
+    let mut cycle_modules = chain_modules.clone();
+    cycle_modules.pop();
+    cycle_modules.push((
+        format!("m{N}"),
+        "include \"m1\";\ndef last: 1;\n".to_string(),
+    ));
+    let modules: Vec<(&str, &str)> = cycle_modules
+        .iter()
+        .map(|(name, contents)| (name.as_str(), contents.as_str()))
+        .collect();
+
+    let start = std::time::Instant::now();
+    let (_stdout, stderr, code) = run_jq_with_modules(&modules, &["-nc", r#"include "m1"; h1"#])?;
+    assert!(
+        start.elapsed() < BUDGET,
+        "N={N} module cycle took {:?}, expected well under {BUDGET:?} (exponential blowup?)",
+        start.elapsed()
+    );
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module cycle detected"),
+        "stderr: {stderr:?}"
+    );
+
     Ok(())
 }
 

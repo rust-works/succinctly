@@ -1041,18 +1041,44 @@ impl ModuleLoader {
 
         let own_id = self.run_id_for(module_path);
         self.loading.push((canonical, module_path.to_string()));
+        let deps = self.module_dep_defs(&program, own_id);
+        self.loading.pop();
+        let (deps, data_bindings) = deps?;
 
         // #2950: mirror `run_jq`'s own top-level two-phase parse (#2395) so a
         // `def` arriving through *this module's own* `include` can shadow a
         // builtin inside the module's body too -- #2865 put such a def in
         // scope there, but the module was still parsed with no knowledge of
-        // it. `include_derived_def_names` deliberately excludes
-        // `auto_loaded_defs` and does no failure tracking of its own; see its
-        // own doc comment for why. Sitting after the `loading` push above, so
-        // a self-referential cycle reached through this discovery is caught
-        // exactly as `module_dep_defs`'s own recursive load below would catch
-        // it.
-        let module_def_names = self.include_derived_def_names(&program);
+        // it. The candidate names are read directly out of `deps`, already
+        // computed by `module_dep_defs` just above (which already attempted
+        // every include/import this module names, and is the only pass that
+        // does): `include`-origin groups carry `alias: None`, matching
+        // `module_dep_defs`'s own `defs.push((id, None, sigs))` for an
+        // `include` versus `Some(alias)` for an `import` -- exactly
+        // `unqualified_def_names`'s own "includes only, imports are
+        // namespaced and do not shadow" rule, one level down.
+        //
+        // Deliberately *not* a second, independent traversal (an earlier
+        // version of this fix was): re-attempting every include here as its
+        // own pass, on top of `module_dep_defs`'s own attempt moments
+        // earlier, doubled the cost of resolving a *failing* include at
+        // every level -- module_dep_defs is the only pass that can ever
+        // actually observe a failure (this derivation only runs after `?`
+        // has already confirmed every directive resolved), so a second
+        // independent attempt at the same directives had nothing to save by
+        // existing and compounded multiplicatively with chain/cycle depth
+        // (empirically O(2^depth) instead of O(depth) for a chain that
+        // fails N levels deep, caught in code review). Reading the names
+        // back out of `deps` costs nothing further: the directive list
+        // (`program.includes`/`program.imports`) a re-parse widens is
+        // identical to what produced `deps`, since widening only changes
+        // how the body's own calls resolve, never which modules the
+        // directives themselves name.
+        let module_def_names: BTreeSet<String> = deps
+            .iter()
+            .filter(|(_, alias, _)| alias.is_none())
+            .flat_map(|(_, _, sigs)| sigs.iter().map(|(name, _)| name.clone()))
+            .collect();
         let program = if module_def_names.is_empty() {
             program
         } else {
@@ -1073,10 +1099,6 @@ impl ModuleLoader {
         // silently re-stamp an inner module's already-correct `$__loc__` with
         // *this* module's path, regressing #2774.
         let own = extract_and_stamp_func_defs(&program.expr, file_path);
-
-        let deps = self.module_dep_defs(&program, own_id);
-        self.loading.pop();
-        let (deps, data_bindings) = deps?;
         // Last alias wins (confirmed live, same rule a repeated `--arg`/
         // `--argjson` name already follows): fold before substituting, not
         // once per binding, since a name `substitute_vars` has already
@@ -1401,39 +1423,6 @@ impl ModuleLoader {
             Some((_, e)) => Err(e),
             None => Ok(names),
         }
-    }
-
-    /// The def names a module's *own* `include`s bring into its scope
-    /// (#2950) -- the include-only half of [`Self::unqualified_def_names`]'s
-    /// rule, but deliberately narrower in two ways that rule out of scope
-    /// here:
-    ///
-    /// - No `auto_loaded_defs` (`~/.jq`) seed: `~/.jq`'s defs only ever wrap
-    ///   the *top-level* filter's own expr (`process_program`'s
-    ///   `AUTO_LOAD_RUN_ID` wrap), never a module's own body, so seeding them
-    ///   into a module's shadow-candidate set would widen it with names that
-    ///   are never actually bound in that module's scope.
-    /// - No failure tracking: an include that fails to load here simply
-    ///   contributes no names. Its failure is left for
-    ///   [`Self::module_dep_defs`]'s own pass, moments later in
-    ///   [`Self::load_and_bind_module`], to discover and report through the
-    ///   established #2857 "last unresolvable directive in source order"
-    ///   rule -- this discovery-only pass must not pre-empt or perturb that
-    ///   selection by surfacing (or ordering) a failure of its own.
-    ///
-    /// Callers must run this only while the module in question is already on
-    /// [`Self::loading`] (`load_and_bind_module` pushes before calling this),
-    /// the same cycle guard `module_dep_defs`'s own recursive load relies on
-    /// -- a self-referential include reached through this discovery pass is
-    /// otherwise indistinguishable from a genuine one.
-    fn include_derived_def_names(&mut self, program: &Program) -> BTreeSet<String> {
-        let mut names = BTreeSet::new();
-        for include in &program.includes {
-            if let Ok(defs) = self.ensure_module_loaded(&include.path) {
-                names.extend(defs.iter().map(|(name, _, _)| name.clone()));
-            }
-        }
-        names
     }
 
     /// Process imports and includes, returning the modified expression with all functions defined.
