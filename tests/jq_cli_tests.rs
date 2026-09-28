@@ -73820,13 +73820,7 @@ fn test_negate_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
                 "array ([1]) cannot be negated",
                 5,
             ),
-            (
-                r#"-(1, [1])"#,
-                "-1\n",
-                "",
-                "array ([1]) cannot be negated",
-                5,
-            ),
+            (r"-(1, [1])", "-1\n", "", "array ([1]) cannot be negated", 5),
             (
                 r#"-(1 as $x ?// $y | ("A"|stderr) | ("h"|halt_error(3)))"#,
                 "",
@@ -74181,7 +74175,7 @@ fn test_arithmetic_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
                 5,
             ),
             (
-                r#"[1] - (1, 2)"#,
+                r"[1] - (1, 2)",
                 "",
                 "",
                 "array ([1]) and number (1) cannot be subtracted",
