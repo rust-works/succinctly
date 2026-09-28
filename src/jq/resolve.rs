@@ -253,6 +253,19 @@ pub enum ResolveError {
     Break(UnresolvedLabel),
 }
 
+impl ResolveError {
+    /// The module run this error was written in, or `None` for the main
+    /// filter -- every kind's own `origin`. The jq CLI regroups a
+    /// multi-module report by it (#3313).
+    pub fn origin(&self) -> Option<u32> {
+        match self {
+            Self::Call(e) => e.origin,
+            Self::Var(e) => e.origin,
+            Self::Break(e) => e.origin,
+        }
+    }
+}
+
 /// Every builtin the pinned jq (1.7.1) defines, as `(name, arity)`.
 ///
 /// succinctly lowers the builtins it implements to typed `Builtin::*`

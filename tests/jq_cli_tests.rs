@@ -50311,7 +50311,12 @@ type ModuleRow<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
 /// matrix: write the modules, run `succinctly jq -L <dir> -nc <extra...>
 /// <filter>`, and assert empty stdout, exit 3 and `want_stderr` byte for
 /// byte with `<DIR>` standing for the canonical module directory.
+///
+/// `HOME` points at an empty directory and `JQ_LIBRARY_PATH` is unset, so a
+/// developer's own `~/.jq` or library path can neither add a def nor add
+/// an error to the captured stderr (#3313 orders `~/.jq`'s errors too).
 fn run_module_rows(rows: &[ModuleRow], extra: &[&str]) -> Result<()> {
+    let empty_home = tempfile::tempdir()?;
     for (id, modules, filter, want_stderr) in rows {
         let temp_dir = tempfile::tempdir()?;
         for (name, contents) in *modules {
@@ -50322,6 +50327,8 @@ fn run_module_rows(rows: &[ModuleRow], extra: &[&str]) -> Result<()> {
             || {
                 let mut command = Command::new(succinctly_bin());
                 command
+                    .env("HOME", empty_home.path())
+                    .env_remove("JQ_LIBRARY_PATH")
                     .args(["jq", "-L"])
                     .arg(temp_dir.path())
                     .args(["-nc"])
@@ -50348,9 +50355,10 @@ fn run_module_rows(rows: &[ModuleRow], extra: &[&str]) -> Result<()> {
 /// first, and a chain's deepest module first. All shapes captured whole from
 /// the pinned binary.
 ///
-/// That order is not chosen by the resolver: it is the order the linked
-/// runs are wrapped in (`ModuleLoader::hoist_order`), outermost first, and
-/// `resolve::check` walks the chain from the outside in. The copying loader
+/// Within the linked set that order is the order the linked runs are
+/// wrapped in (`ModuleLoader::hoist_order`), outermost first, as
+/// `resolve::check` walks the chain from the outside in; across top-level
+/// modules the reporter restores jq's walk order (#3313). The copying loader
 /// printed the includer's own error first, then its dependencies in
 /// declaration order (`A G K` for the first row, against jq's `K G A`).
 ///
@@ -50411,6 +50419,112 @@ fn test_dependency_errors_report_in_jq_order_2955() -> Result<()> {
         ),
     ];
     run_module_rows(rows, &[])
+}
+
+/// The fixture modules #3313's rows run over, each with its own compile
+/// error: a chain (`dep` <- `mid` <- `top3`, `c1` <- `dl`/`dr`), a diamond
+/// (`base` <- `l`/`r`), the #3153 family (`serr2` <- `cerr2`, `other2`),
+/// one dependency reached by `include` and by `import` (`x1`, `x2`, `imp`),
+/// and a `$var` and a `break $label` error behind a dependency.
+const MODULES_3313: &[(&str, &str)] = &[
+    ("dep", "def d: nodep;\n"),
+    ("mid", "include \"dep\"; def m: d;\n"),
+    ("a", "def a: noa;\n"),
+    ("top3", "include \"mid\"; def t: m, notop3;\n"),
+    ("base", "def b0: nobase;\n"),
+    ("l", "include \"base\"; def l: b0, nol;\n"),
+    ("r", "include \"base\"; def r: b0, nor;\n"),
+    ("imp", "import \"dep\" as dp; def im: dp::d, noim;\n"),
+    ("serr2", "def bad: nope; def ok: 1; def bad2: nope2;\n"),
+    (
+        "cerr2",
+        "include \"serr2\"; def u: ok; def ub: bad; def cb: nocerr2;\n",
+    ),
+    ("other2", "def z: alsonope;\n"),
+    ("depv", "def dv: $novar;\n"),
+    ("midv", "include \"depv\"; def mv: dv;\n"),
+    ("av", "def av: nocallav;\n"),
+    ("deplb", "def lb: break $nolabel;\n"),
+    ("midlb", "include \"deplb\"; def ml: lb;\n"),
+    ("x1", "include \"dep\"; def x1: d, nox1;\n"),
+    ("x2", "import \"dep\" as dd; def x2: dd::d, nox2;\n"),
+    ("c1", "include \"mid\"; def c1: m, noc1;\n"),
+    ("dl", "include \"c1\"; def dl: c1, nodl;\n"),
+    ("dr", "include \"c1\"; def dr: c1, nodr;\n"),
+];
+
+/// #3313: a multi-module program's compile errors come out in jq 1.7.1's
+/// walk order -- top-level directives last-declared first, each module's
+/// dependencies before it, each module once at its *first* reach -- not
+/// every linked dependency first. Every row captured whole from the pinned
+/// binary. The link runs stay wrapped outermost (#2955); the reporter
+/// reorders by `ModuleLoader::error_report_rank`.
+#[test]
+fn test_module_errors_follow_jq_walk_order_3313() -> Result<()> {
+    let rows: &[ModuleRow] = &[
+        ("the issue's swap: a later include reports first", MODULES_3313, "include \"mid\"; include \"a\"; [a, m]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: 2 compile errors\n"),
+        ("its mirror, already in order", MODULES_3313, "include \"a\"; include \"mid\"; [a, m]", "jq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: 2 compile errors\n"),
+        ("a module's error follows its dependency's, after a later sibling", MODULES_3313, "include \"top3\"; include \"a\"; [t, a]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: error: notop3/0 is not defined at <DIR>/top3.jq, line 1:\ninclude \"mid\"; def t: m, notop3;                         \njq: 3 compile errors\n"),
+        ("the same, declared the other way round", MODULES_3313, "include \"a\"; include \"top3\"; [t, a]", "jq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: error: notop3/0 is not defined at <DIR>/top3.jq, line 1:\ninclude \"mid\"; def t: m, notop3;                         \njq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: 3 compile errors\n"),
+        ("a diamond over one base", MODULES_3313, "include \"l\"; include \"r\"; [l, r]", "jq: error: nobase/0 is not defined at <DIR>/base.jq, line 1:\ndef b0: nobase;        \njq: error: nor/0 is not defined at <DIR>/r.jq, line 1:\ninclude \"base\"; def r: b0, nor;                           \njq: error: nol/0 is not defined at <DIR>/l.jq, line 1:\ninclude \"base\"; def l: b0, nol;                           \njq: 3 compile errors\n"),
+        ("a diamond with a module between its arms", MODULES_3313, "include \"l\"; include \"a\"; include \"r\"; [l, r, a]", "jq: error: nobase/0 is not defined at <DIR>/base.jq, line 1:\ndef b0: nobase;        \njq: error: nor/0 is not defined at <DIR>/r.jq, line 1:\ninclude \"base\"; def r: b0, nor;                           \njq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nol/0 is not defined at <DIR>/l.jq, line 1:\ninclude \"base\"; def l: b0, nol;                           \njq: 4 compile errors\n"),
+        ("an import and an include share one declaration order", MODULES_3313, "import \"mid\" as mi; include \"a\"; [a, mi::m]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: 2 compile errors\n"),
+        ("two imports", MODULES_3313, "import \"mid\" as mi; import \"a\" as aa; [aa::a, mi::m]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: 2 compile errors\n"),
+        ("an included module that imports its dependency", MODULES_3313, "include \"imp\"; include \"a\"; [im, a]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: error: noim/0 is not defined at <DIR>/imp.jq, line 1:\nimport \"dep\" as dp; def im: dp::d, noim;                                   \njq: 3 compile errors\n"),
+        ("#3153 family: a dependency that is also top-level, first", MODULES_3313, "include \"cerr2\"; include \"serr2\"; include \"other2\"; [z, ub, bad2]", "jq: error: alsonope/0 is not defined at <DIR>/other2.jq, line 1:\ndef z: alsonope;       \njq: error: nope/0 is not defined at <DIR>/serr2.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;         \njq: error: nope2/0 is not defined at <DIR>/serr2.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;                                    \njq: 3 compile errors\n"),
+        ("#3153 family: dependency first, includer last", MODULES_3313, "include \"serr2\"; include \"other2\"; include \"cerr2\"; [z, ub, bad2, cb]", "jq: error: nope/0 is not defined at <DIR>/serr2.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;         \njq: error: nope2/0 is not defined at <DIR>/serr2.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;                                    \njq: error: nocerr2/0 is not defined at <DIR>/cerr2.jq, line 1:\ninclude \"serr2\"; def u: ok; def ub: bad; def cb: nocerr2;                                                 \njq: error: alsonope/0 is not defined at <DIR>/other2.jq, line 1:\ndef z: alsonope;       \njq: 4 compile errors\n"),
+        ("#3153 family: reported at first reach, not at its dependency position", MODULES_3313, "include \"cerr2\"; include \"other2\"; include \"serr2\"; [z, ub, bad2, cb]", "jq: error: nope/0 is not defined at <DIR>/serr2.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;         \njq: error: nope2/0 is not defined at <DIR>/serr2.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;                                    \njq: error: alsonope/0 is not defined at <DIR>/other2.jq, line 1:\ndef z: alsonope;       \njq: error: nocerr2/0 is not defined at <DIR>/cerr2.jq, line 1:\ninclude \"serr2\"; def u: ok; def ub: bad; def cb: nocerr2;                                                 \njq: 4 compile errors\n"),
+        ("#3153 family through imports", MODULES_3313, "import \"serr2\" as s; import \"cerr2\" as c; include \"other2\"; [z, c::ub, s::bad2]", "jq: error: alsonope/0 is not defined at <DIR>/other2.jq, line 1:\ndef z: alsonope;       \njq: error: nope/0 is not defined at <DIR>/serr2.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;         \njq: error: nope2/0 is not defined at <DIR>/serr2.jq, line 1:\ndef bad: nope; def ok: 1; def bad2: nope2;                                    \njq: 3 compile errors\n"),
+        ("a $var error moves with its module", MODULES_3313, "include \"midv\"; include \"av\"; [av, mv]", "jq: error: nocallav/0 is not defined at <DIR>/av.jq, line 1:\ndef av: nocallav;        \njq: error: $novar is not defined at <DIR>/depv.jq, line 1:\ndef dv: $novar;        \njq: 2 compile errors\n"),
+        ("a break $label error moves with its module", MODULES_3313, "include \"midlb\"; include \"av\"; [av, ml]", "jq: error: nocallav/0 is not defined at <DIR>/av.jq, line 1:\ndef av: nocallav;        \njq: error: $*label-nolabel is not defined at <DIR>/deplb.jq, line 1:\ndef lb: break $nolabel;        \njq: 2 compile errors\n"),
+        ("one dependency shared by an include and an import", MODULES_3313, "include \"x1\"; include \"x2\"; include \"a\"; [x1, x2, a]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: error: nox2/0 is not defined at <DIR>/x2.jq, line 1:\nimport \"dep\" as dd; def x2: dd::d, nox2;                                   \njq: error: nox1/0 is not defined at <DIR>/x1.jq, line 1:\ninclude \"dep\"; def x1: d, nox1;                          \njq: 4 compile errors\n"),
+        ("the same, the other way round", MODULES_3313, "include \"x2\"; include \"x1\"; include \"a\"; [x1, x2, a]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: error: nox1/0 is not defined at <DIR>/x1.jq, line 1:\ninclude \"dep\"; def x1: d, nox1;                          \njq: error: nox2/0 is not defined at <DIR>/x2.jq, line 1:\nimport \"dep\" as dd; def x2: dd::d, nox2;                                   \njq: 4 compile errors\n"),
+        ("a three-deep chain under a diamond", MODULES_3313, "include \"dl\"; include \"dr\"; include \"a\"; [dl, dr, a]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: error: noc1/0 is not defined at <DIR>/c1.jq, line 1:\ninclude \"mid\"; def c1: m, noc1;                          \njq: error: nodr/0 is not defined at <DIR>/dr.jq, line 1:\ninclude \"c1\"; def dr: c1, nodr;                          \njq: error: nodl/0 is not defined at <DIR>/dl.jq, line 1:\ninclude \"c1\"; def dl: c1, nodl;                          \njq: 5 compile errors\n"),
+        ("the same diamond with a module between its arms", MODULES_3313, "include \"dr\"; include \"a\"; include \"dl\"; [dl, dr, a]", "jq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: error: noc1/0 is not defined at <DIR>/c1.jq, line 1:\ninclude \"mid\"; def c1: m, noc1;                          \njq: error: nodl/0 is not defined at <DIR>/dl.jq, line 1:\ninclude \"c1\"; def dl: c1, nodl;                          \njq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodr/0 is not defined at <DIR>/dr.jq, line 1:\ninclude \"c1\"; def dr: c1, nodr;                          \njq: 5 compile errors\n"),
+        ("a module imported and included", MODULES_3313, "import \"mid\" as mi; include \"mid\"; include \"a\"; [a, m]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: 2 compile errors\n"),
+    ];
+    run_module_rows(rows, &[])
+}
+
+/// #3313: `~/.jq`'s compile errors come after every module's and before the
+/// main filter's, as in jq 1.7.1; succinctly reported them ahead of every
+/// `include`d module's. Captured whole from the pinned binary, with `HOME`
+/// pointing at a scratch directory.
+#[test]
+fn test_home_jq_errors_follow_module_errors_3313() -> Result<()> {
+    for (id, filter, want_stderr) in [
+        ("~/.jq after every module, before the main filter", "include \"a\"; def t: topmissing; [t, a, hj]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nohome/0 is not defined at <HOME>/.jq, line 1:\ndef hj: nohome;        \njq: error: topmissing/0 is not defined at <top-level>, line 1:\ninclude \"a\"; def t: topmissing; [t, a, hj]                    \njq: 3 compile errors\n"),
+        ("~/.jq after a dependency chain", "include \"mid\"; include \"a\"; def t: topmissing; [t, a, m, hj]", "jq: error: noa/0 is not defined at <DIR>/a.jq, line 1:\ndef a: noa;       \njq: error: nodep/0 is not defined at <DIR>/dep.jq, line 1:\ndef d: nodep;       \njq: error: nohome/0 is not defined at <HOME>/.jq, line 1:\ndef hj: nohome;        \njq: error: topmissing/0 is not defined at <top-level>, line 1:\ninclude \"mid\"; include \"a\"; def t: topmissing; [t, a, m, hj]                                   \njq: 4 compile errors\n"),
+    ] {
+        let temp_dir = tempfile::tempdir()?;
+        for (name, contents) in MODULES_3313 {
+            std::fs::write(temp_dir.path().join(format!("{name}.jq")), contents)?;
+        }
+        let temp_home = tempfile::tempdir()?;
+        std::fs::write(temp_home.path().join(".jq"), "def hj: nohome;\n")?;
+        let dir = std::fs::canonicalize(temp_dir.path())?;
+        let home = std::fs::canonicalize(temp_home.path())?;
+        let module_dir = temp_dir.path().to_string_lossy().into_owned();
+        let (output, code) = spawn_jq_with_env(
+            &["-L", &module_dir, "-nc", filter],
+            "HOME",
+            &home,
+            None,
+        )?;
+        let want_stderr = want_stderr
+            .replace("<DIR>", &dir.to_string_lossy())
+            .replace("<HOME>", &home.to_string_lossy());
+        assert_eq!(
+            (
+                String::from_utf8(output.stdout)?.as_str(),
+                String::from_utf8(output.stderr)?.as_str(),
+                code
+            ),
+            ("", want_stderr.as_str(), 3),
+            "{id}: {filter}"
+        );
+    }
+    Ok(())
 }
 
 /// #2955: a dependency module is linked **once** and reached through

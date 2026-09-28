@@ -8303,9 +8303,9 @@ A dependency reached from two defs was copied into both, and each copy's body wa
 `jq: 2 compile errors`, the second without a line. Since #2955 the body exists once and is
 checked once, so `include "mid"; a, b` with `mid` = `include "dep"; def a: g; def b: g;` and
 `dep` = `def g: $nosuch;` reports jq's one error. Cross-module errors also come out in jq
-1.7.1's order now — a dependency's before its includer's, the last-declared dependency's
-first, a chain's deepest first — because that is the order the linked runs are wrapped in.
-Both pinned in `tests/jq_cli_tests.rs` (`_3058`, `_2955`).
+1.7.1's order — a dependency's before its includer's, the last-declared dependency's first,
+a chain's deepest first — pinned in `tests/jq_cli_tests.rs` (`_3058`, `_2955`), and since
+#3313 across top-level modules too (below).
 
 **A module that is both top-level and a dependency — closed (#3153).** Such a module used to
 carry two full copies of its bodies: one in its top-level run and one in its linked run. Its
@@ -8322,10 +8322,25 @@ calls `q::…`, but the linked run carries every body `c` reaches. That row matc
 pinned in `test_top_level_module_that_is_also_linked_errors_3153`, and
 `top_level_and_linked_module_is_emitted_once_3153` counts the copies.
 
-This does not make module error *order* match jq in general. A linked module's errors are
-still reported before every top-level module's, where jq interleaves them by its own
-binding order. That divergence predates this change and is tracked as
-[#3313](https://github.com/rust-works/succinctly/issues/3313).
+**Module error order across top-level directives — closed
+([#3313](https://github.com/rust-works/succinctly/issues/3313)).** A linked module's errors
+used to be reported before every top-level module's, and `~/.jq`'s before every `include`d
+module's, because `resolve::check` reports in wrap order and the link runs have to be wrapped
+outermost. jq 1.7.1 reports in a depth-first post-order walk instead: top-level directives
+last-declared first (`include` and `import` share one declaration order), each module's own
+dependencies before it, each module once at its *first* reach, then `~/.jq`, then the main
+filter. `include "mid"; include "a"` (`mid` including `dep`) printed `dep`'s error before
+`a`'s. jq prints `a`'s first. The wrap order is unchanged; the reporter stable-sorts the
+collected errors by that walk (`ModuleLoader::error_report_rank`, `jq_report_order`).
+Pinned in `test_module_errors_follow_jq_walk_order_3313` and
+`test_home_jq_errors_follow_module_errors_3313`.
+
+**Still open: a main-body error suppresses def-body errors in jq
+([#3391](https://github.com/rust-works/succinctly/issues/3391)).** When the main program's
+body has an undefined name, jq 1.7.1 reports only the body's errors and drops every
+def-body error, a module's or the main program's own (`def t: topmissing; t, bodymissing`
+reports `bodymissing` alone, `1 compile error`). succinctly reports all of them. The exit
+code is the same.
 
 The stubs point *into* the linked run, not the other way round, because that run is wrapped
 outermost and so is visible from every stub whatever order the directives are declared in.
