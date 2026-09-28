@@ -35550,96 +35550,73 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             )
         }
 
-        // #2760: on an untracked input, every navigating stage inside
-        // `and`/`or`/unary minus was falling to the eager catch-all below,
-        // which evaluates by value and never checks navigation at all --
-        // the same accept-where-jq-refuses shape #2689 closed for `[E]`.
-        // Gated to `S::TAG == EvalTag::Jq` first, mirroring the `Array` arm's
-        // own `array_resolves_live` guard just above: real yq's `and`/`or`
-        // ARE real operators (unlike `empty`/`leaf_paths`, which its lexer
-        // rejects outright), so this isn't an ADR-0018 extension exemption
-        // -- without the guard, this arm changes yq-mode behavior too, and
-        // diverges from the pinned oracle (confirmed live against yq
-        // v4.53.3: `del(1 | (.a and true) | select(false))` on `a: false`
-        // silently no-ops in real yq, exit 0; this arm without the guard
-        // raised "attempt to access element \"a\" of 1", exit 1 -- caught in
-        // review before merge). Leaving yq mode on the pre-existing eager
-        // catch-all is not a new divergence: that catch-all's own behavior
-        // is unchanged by this fix, so yq mode's `and`/`or` fidelity (or
-        // lack of it) here is exactly what it was on `main`.
+        // `and`/`or`/unary minus in path position, jq mode (#2760, #3289).
         //
-        // Then gated to `!trackable` deliberately: a **trackable** input's
-        // `and`/`or` has a materially different, deeper correctness gap
-        // (jq's path-mode refuses whenever *more than one* operand
-        // genuinely navigates the register -- `path((.a and .b) | empty)`
-        // on `{"a":1}` raises even though both sides read cleanly by value;
-        // `path((.a and 5) | empty)` does not, because only one side
-        // navigates -- confirmed live against jq 1.7.1). That is a
-        // "detect a register conflict between two live operands" problem,
-        // not "resolve one operand instead of evaluating it by value", and
-        // is out of this fix's scope; filed as #3289. `right` runs only for
-        // the `left` outputs that need it (jq's own short-circuit) -- a
-        // nested `resolve_node_sink` call inside the outer sink, the same
-        // shape `resolve_index_expr_sink` already drives for `E[K]`'s
-        // per-pair `key`/`target`.
+        // jq's `gen_and`/`gen_or` are not subexps: `L and R` is `DUP; L;
+        // JUMP_F; POP; R; ...; LOADK true|false`. `L` runs on the input and
+        // moves the path register wherever it navigates; `R` runs on the
+        // *original* input (the `DUP`ed copy) while the register stays where
+        // `L` left it, so any navigation inside `R` is checked against that
+        // register; and the result is a fresh boolean at the register's
+        // position, which `PATH_END` accepts only when it is `jv_identical`
+        // to what the register holds. In register terms `L and R` is the pipe
+        // `. as $in | L | <if truthy> $in | R | <bool>`, with the short-circuit
+        // taken per `L` branch. Live against jq 1.7.1:
+        // `path((.a and .b) | empty)` on `{"a":1}` refuses near `"b"` (`R`
+        // navigates off a register `L` moved), `path(.a and .b)` on
+        // `{"a":false}` is `["a"]` (short-circuited at `L`'s register, and
+        // `false` is identical to it), and `path(.a and 5)` on `{"a":0}`
+        // refuses (`true` is not identical to `0`).
         //
-        // Both operands resolve through plain `resolve_node_sink` with no
-        // `TrackedVar` guard at all, mirroring `//`'s own arm
-        // ([`resolve_alternative_sink`]) just below -- `resolve_node_sink`'s
-        // own `Expr::TrackedVar` arm already certifies (or correctly
-        // declines to) a marked `$var` using the very `snapshot`/`frame`
-        // this call carries, the same as it would for any other direct
-        // resolution; unlike #2689's `[E]` array arm, this one never
-        // *claims* a register from what it resolves (every emitted branch
-        // is a fresh `untracked_at_register` boolean regardless), so #2759's
-        // register-claim rationale for excluding `TrackedVar` there does not
-        // carry over here. Two earlier drafts got this wrong in opposite
-        // directions, both caught live in review: gating the *whole* arm on
-        // both operands being `TrackedVar`-free let a marked `$var` on
-        // either side blind checking for its untainted sibling too
-        // (`. as {a:$v0} | ($v0 and .k)` stopped checking `.k`); a
-        // follow-up that instead scanned each operand's *whole subtree* for
-        // a `TrackedVar` before deciding whether to resolve it live broke on
-        // a compound operand containing one only in part
-        // (`. as {a:$v0} | ((.a and $v0) and .k)` stopped checking `.a`'s
-        // own navigation, nested two `and`s deep, because the scan saw
-        // `$v0` anywhere inside the left operand and gave up on all of it).
-        // Both are symptoms of the same mistake: deciding an operand's
-        // fate from outside `resolve_node_sink` instead of letting its own
-        // recursive dispatch -- which reaches this very arm again for a
-        // nested `and`/`or`, and the dedicated `TrackedVar` arm for a bare
-        // one -- decide per node, the way every other composite arm here
-        // already does.
+        // So each arm resolves `L` live, then per branch either emits the
+        // short-circuit constant at `L`'s register or resolves `R` from the
+        // restored input ([`resolve_from_restored_input`]) and emits each of
+        // its booleans at that branch's register
+        // ([`computed_at_branch_register`]). Unary minus has one operand and
+        // no short-circuit: it resolves live and emits each negated value at
+        // its branch's register.
         //
-        // Confirmed live against jq 1.7.1: `path(. as {a:$v0} | (.a and
-        // true) | empty)` on `{"a":false}` raises "near attempt to access
-        // element \"a\"" (exit 5); this arm was added because succinctly
-        // answered exit 0 for it, evaluating `.a` by value through the
-        // eager catch-all instead of checking its navigation.
-        Expr::And(left, right) if S::TAG == EvalTag::Jq && !trackable => {
+        // Both trackability states take these arms (#2760 fixed only the
+        // untracked one, which fell to the eager catch-all below and never
+        // checked navigation at all; #3289 is the trackable one, which fell
+        // there too). No `TrackedVar` guard on either operand: the resolver's
+        // own `Expr::TrackedVar` arm certifies a marked `$var` per node, the
+        // lesson #2760's review learned from two drafts that scanned an
+        // operand from outside (`. as {a:$v0} | ((.a and $v0) and .k)` must
+        // still check `.a`).
+        //
+        // Gated to `S::TAG == EvalTag::Jq`: real yq's `and`/`or` are real
+        // operators whose eager catch-all behaviour these arms would change
+        // (live against yq v4.53.3, `del(1 | (.a and true) | select(false))`
+        // on `a: false` is a silent no-op), and yq has no unary minus at all,
+        // so its `-E == E * -1` extension (docs/compliance/yq/limitations.md)
+        // must keep both spellings on the same path.
+        Expr::And(left, right) | Expr::Or(left, right) if S::TAG == EvalTag::Jq => {
+            // `and` short-circuits on a falsy `L`, `or` on a truthy one; in
+            // both cases the short-circuit value *is* `L`'s truthiness.
+            let short_circuit_on = matches!(expr, Expr::Or(..));
             let mut inner_flow: Option<ResolveFlow> = None;
             let flow =
                 resolve_node_sink::<S>(left, value, trackable, snapshot, frame, keep, &mut |l| {
-                    if !l.value.is_truthy() {
-                        return sink(untracked_at_register(
-                            Cow::Owned(OwnedValue::Bool(false)),
-                            false,
-                            value,
+                    let truthy = l.value.is_truthy();
+                    if truthy == short_circuit_on {
+                        return sink(computed_at_branch_register(
+                            OwnedValue::Bool(truthy),
+                            l,
+                            frame,
                         ));
                     }
-                    match resolve_node_sink::<S>(
+                    match resolve_from_restored_input::<S>(
                         right,
+                        l,
                         value,
                         trackable,
                         snapshot,
                         frame,
                         keep,
                         &mut |r| {
-                            sink(untracked_at_register(
-                                Cow::Owned(OwnedValue::Bool(r.value.is_truthy())),
-                                false,
-                                value,
-                            ))
+                            let bit = r.value.is_truthy();
+                            sink(computed_at_branch_register(OwnedValue::Bool(bit), r, frame))
                         },
                     ) {
                         ResolveFlow::Exhausted => Demand::Continue,
@@ -35651,69 +35628,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 });
             inner_flow.unwrap_or(flow)
         }
-        // #2760: mirror image of `And` just above -- `or` short-circuits on
-        // a truthy `left` instead of a falsy one. See `And`'s own comment
-        // for the `S::TAG == EvalTag::Jq`/`!trackable` scope and why there
-        // is no `TrackedVar` guard.
-        Expr::Or(left, right) if S::TAG == EvalTag::Jq && !trackable => {
-            let mut inner_flow: Option<ResolveFlow> = None;
-            let flow =
-                resolve_node_sink::<S>(left, value, trackable, snapshot, frame, keep, &mut |l| {
-                    if l.value.is_truthy() {
-                        return sink(untracked_at_register(
-                            Cow::Owned(OwnedValue::Bool(true)),
-                            false,
-                            value,
-                        ));
-                    }
-                    match resolve_node_sink::<S>(
-                        right,
-                        value,
-                        trackable,
-                        snapshot,
-                        frame,
-                        keep,
-                        &mut |r| {
-                            sink(untracked_at_register(
-                                Cow::Owned(OwnedValue::Bool(r.value.is_truthy())),
-                                false,
-                                value,
-                            ))
-                        },
-                    ) {
-                        ResolveFlow::Exhausted => Demand::Continue,
-                        other => {
-                            inner_flow = Some(other);
-                            Demand::Stop
-                        }
-                    }
-                });
-            inner_flow.unwrap_or(flow)
-        }
-        // #2760: unary minus has one operand, always evaluated -- no
-        // short-circuit, and (see `And`'s own comment) no `TrackedVar`
-        // guard either; still gated to `S::TAG == EvalTag::Jq` and
-        // `!trackable` for the same reasons `And`/`Or` are. Real yq has no
-        // unary-minus operator at all (confirmed live: `yq '(- .a)'` errors
-        // "'-' expects 2 args but there is 1"), so succinctly's `-E` in yq
-        // mode is a documented extension (docs/compliance/yq/limitations.md)
-        // and exempt from ADR-0018's divergence rule on that count alone --
-        // but leaving this arm reachable in yq mode still broke succinctly's
-        // own documented equivalence `-E == E * -1` (used by that same
-        // limitations-doc section) on an untracked-and-navigating operand,
-        // since `Expr::Arithmetic`'s `* -1` path is untouched by this fix:
-        // caught in review before merge. Gating to jq mode keeps both
-        // spellings on the same (unchanged) eager catch-all in yq mode.
-        // Its wrong answer wasn't a missing refusal (it
-        // already raised) but the *wrong* error: evaluating `.a` by value
-        // first reports "boolean (false) cannot be negated" where jq's live
-        // path-tracked evaluation reaches `.a`'s own navigation refusal
-        // first. Resolving `inner` live surfaces that refusal the same way
-        // every other arm here does. Reset the negation escape on each
-        // branch: `?//` can retry after a failed alternative and resolve a
-        // later one. A final `arith_negate` error still escapes through the
+        // See the `And`/`Or` arm just above. Reset the negation escape on
+        // each branch: `?//` can retry after a failed alternative and resolve
+        // a later one. A final `arith_negate` error still escapes through the
         // shared stop classifier so `?//` sees its proper retryability.
-        Expr::Negate(inner) if S::TAG == EvalTag::Jq && !trackable => {
+        Expr::Negate(inner) if S::TAG == EvalTag::Jq => {
             let mut negate_escape: Option<EvalEscape> = None;
             let flow = resolve_node_sink::<S>(
                 inner,
@@ -35724,10 +35643,8 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 keep,
                 &mut |branch| {
                     negate_escape = None;
-                    match arith_negate::<S>(branch.value.into_owned()) {
-                        Ok(negated) => {
-                            sink(untracked_at_register(Cow::Owned(negated), false, value))
-                        }
+                    match arith_negate::<S>(branch.value.clone().into_owned()) {
+                        Ok(negated) => sink(computed_at_branch_register(negated, branch, frame)),
                         Err(e) => stop_with_eval_escape(&mut negate_escape, e.into()),
                     }
                 },
@@ -37353,6 +37270,97 @@ fn untracked_at_register<'a>(
     PathBranch::untracked(computed).with_register(trackable.then(|| Cow::Borrowed(value)))
 }
 
+/// A value `and`/`or`/unary minus computed, emitted where `at`'s path
+/// register stands (#3289) -- the per-branch form of
+/// [`untracked_at_register`], which records the register a stage *entered*
+/// with; here the operand has already moved it, so the register is `at`'s
+/// own: its value when `at` is trackable, else whatever register it
+/// carries.
+///
+/// The result is trackable again only when it is identical to that register
+/// ([`register_identical`], with no snapshot: a fresh `true`/`false`/number
+/// is never a frozen binding), which is jq's `PATH_END` check: `path(.a and
+/// .b)` on `{"a":false}` is `["a"]`, while `path(.a and 5)` on `{"a":0}`
+/// refuses. That conjunct is the only way these arms accept, so a `0`/`"x"`
+/// register stays refused.
+fn computed_at_branch_register<'a>(
+    computed: OwnedValue,
+    at: PathBranch<'a>,
+    frame: &Frame,
+) -> PathBranch<'a> {
+    let register = if at.trackable {
+        Some(at.value)
+    } else {
+        at.register
+    };
+    match register {
+        Some(reg) if register_identical(&reg, frame, &computed, &Snapshot::No) => {
+            PathBranch::new(at.path, Cow::Owned(computed), true)
+        }
+        register => PathBranch::passthrough(at.path, Cow::Owned(computed), false, Snapshot::No)
+            .with_register(register),
+    }
+}
+
+/// Resolve `expr` against the *original* input `value` after `left`, one
+/// branch of an `and`/`or` operand, has moved the path register (#3289):
+/// jq's `DUP`ed input, run with the register wherever `left` left it.
+///
+/// A branch that is still at the root path left the register where the
+/// arm entered, so `expr` resolves exactly as it would have without `left`.
+/// Otherwise `expr` runs as a pipe seeded at `left`'s path, holding the
+/// input as its value and `left`'s register -- the seed #2649's
+/// `Expr::AsPattern` arm builds for a body whose pattern moved the
+/// register, so a navigation in `expr` refuses with jq's own "near attempt
+/// to access" whenever the input is not the register, and a `$var` or the
+/// transparent `getpath` re-establishes through the carried-register rules.
+/// The input can only be identical to a non-root register by
+/// `null`/`true`/`false` kind, so no snapshot mark is attached.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambient state plus the moved branch.
+fn resolve_from_restored_input<'a, S: EvalSemantics>(
+    expr: &Expr,
+    left: PathBranch<'a>,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    if left.path.depth() == 0 {
+        return resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink);
+    }
+    let register = if left.trackable {
+        Some(left.value)
+    } else {
+        left.register
+    };
+    // An `expr` that provably cannot move the register (`.`, a literal, a
+    // `$var`, `(.a,.b) and .`'s `.`) never checks it either: jq computes its
+    // outputs while the register stays where `left` put it, and only their
+    // truthiness reaches the result. Seeding a pipe here instead would read a
+    // bare `.` on the untracked seed as the whole of `path()` and refuse
+    // "with result" the input (`((.a,.b) and .) |= 3` on `{"a":"s"}` is jq's
+    // "with result true", not the input).
+    if cannot_move_register(expr) {
+        let path = left.path;
+        return resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, &mut |r| {
+            sink(
+                PathBranch::passthrough(Rc::clone(&path), r.value, false, Snapshot::No)
+                    .with_register(register.clone()),
+            )
+        });
+    }
+    let seed = match register {
+        Some(reg) if null_bool_identical(value, &reg) => {
+            PathBranch::new(left.path, Cow::Borrowed(value), true)
+        }
+        register => PathBranch::passthrough(left.path, Cow::Borrowed(value), false, Snapshot::No)
+            .with_register(register),
+    };
+    resolve_seq_from_seed::<S>(core::slice::from_ref(expr), seed, frame, keep, sink)
+}
+
 /// Shared tail for every "drain an argument fully via a discarding sink,
 /// then forward one computed value" arm in [`resolve_node_sink`] (`Array`,
 /// `LastExpr`/`LastStream`, `IsEmpty`, `UpperIndexStream` -- #2746): once the
@@ -37713,6 +37721,16 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
             array_contents_are_checked(f)
         }
         Expr::Paren(e) => array_contents_are_checked(e),
+        // #3289: `resolve_node_sink` resolves `and`/`or`/unary minus live in
+        // jq mode, checking each operand's navigation against the register
+        // as jq does, so they are checked exactly when their operands are.
+        // Confirmed live against jq 1.7.1: `path(. as $x | [.a and 5] | $x)`
+        // and `path(. as $x | [-.a] | $x)` on `{"a":1}` are `[]`, while
+        // `path([.a and .b] | empty)` still refuses near `"b"`.
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            array_contents_are_checked(l) && array_contents_are_checked(r)
+        }
+        Expr::Negate(e) => array_contents_are_checked(e),
         // #2764: a primitive postfix `?` (`.a?`, `INDEX_OPT`) is not `try` at
         // all -- it is resolved natively by `resolve_optional_sink`'s own
         // primitive arm, so the claim still depends on whether the
@@ -45506,7 +45524,19 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // only when its input *is* the register), so the static predicate is
     // joined by [`getpath_preserves_register`] and this is computed after
     // the branch is in hand rather than from `element` alone.
-    let stage_preserves_register = cannot_move_register(element)
+    // #3289: `and`/`or`/unary minus resolve every operand live and emit each
+    // result at the register its own branch left (`computed_at_branch_register`),
+    // path components included, so the step itself says where the register
+    // is -- including a position its operand navigated to, which `navigated`
+    // below would otherwise read as a refused navigation and drop. jq mode
+    // only, like the arms themselves.
+    let stage_reports_register = S::TAG == EvalTag::Jq
+        && matches!(
+            unwrap_paren(element),
+            Expr::And(..) | Expr::Or(..) | Expr::Negate(..)
+        );
+    let stage_preserves_register = stage_reports_register
+        || cannot_move_register(element)
         // #3263: an array resolved live whose contents the resolver checks as
         // jq does, and jq's collect backtracks the register to where it began.
         || matches!(element, Expr::Array(inner)
@@ -45587,6 +45617,8 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // forward.
         let register = if trackable {
             None
+        } else if stage_reports_register {
+            step_register
         } else {
             carry_register(
                 &facts,
