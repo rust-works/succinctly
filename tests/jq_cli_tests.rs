@@ -75459,3 +75459,51 @@ fn test_alternative_destructuring_retries_past_an_operator_failure_3410() -> Res
     }
     Ok(())
 }
+
+/// #3334 coverage follow-up: `comma_leaves` only splits a *top-level* comma
+/// bind source, so a comma nested one level down (under a `Pipe`, which
+/// `is_pure_navigation_node` also admits) still reaches the pre-#3334
+/// whole-comma witness machinery -- `resolve_bind_source_in`'s own
+/// `Err((prefix, escape))` arm and `resolve_bind_source_sink`'s trailing-
+/// escape branch, both documented with this exact shape
+/// (`resolve_bind_source_witness`'s own doc comment). Splitting
+/// `(.a, error("x"))` at the top level (the existing
+/// `path((.a, error("x")) as $y | .a | $y)` row elsewhere in this file)
+/// no longer exercises either: `.a` and `error("x")` each resolve as their
+/// own single-leaf, non-forking source post-#3334, so nesting the comma
+/// under `.a |` instead (never split, since only the *top* of the source is
+/// checked) is what still reaches them. Captured from jq 1.7.1.
+#[test]
+fn test_comma_nested_under_pipe_bind_source_streams_prefix_before_error_3334() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(
+        &["-c", r#"path((.a | (., error("x"))) as $y | .a | $y)"#],
+        Some(r#"{"a":5}"#),
+    )?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert_eq!(
+        out, "[\"a\"]\n",
+        "the first leg's bind must stream before the error"
+    );
+    assert!(stderr.contains("): x"), "{stderr:?}");
+    Ok(())
+}
+
+/// #3334 coverage follow-up: `resolves_to_register`'s own `Expr::Comma` arm
+/// is reached only by a comma nested under another head -- `resolve_as_pattern`
+/// splits a *top-level* comma before ever asking it (`comma_leaves`), so the
+/// existing `(.,.) as [$z] ?// {a:$q} | $q` row (`test_comma_fanned_source_
+/// recognizes_every_identity_branch_3127`) no longer reaches this arm either,
+/// same root cause as the sibling test above. Nesting the comma under an
+/// `if` (never split, since only the source's own top is checked) is what
+/// still reaches it. Captured from jq 1.7.1.
+#[test]
+fn test_comma_nested_under_if_bind_source_classified_per_leaf_3334() -> Result<()> {
+    let (out, code) = run_jq_stdin(
+        r"[path((if true then (.,.) else . end) as {a:$q} ?// $q | $q)]",
+        r#"{"a":1}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[[\"a\"],[\"a\"]]\n");
+    Ok(())
+}
