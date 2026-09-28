@@ -8,7 +8,9 @@
 # `clippy`/`clippy-all-variants` jobs all source this file rather than each
 # holding their own copy. Update here only.
 #
-# Sourced, not executed. The sourcing script owns `set -euo pipefail`.
+# Sourced, not executed. Plain variable assignments only -- no `set -e`/`-u`
+# requirement of its own, since the sourcing script's own settings (e.g.
+# `scripts/build.sh`/`scripts/test.sh`'s `set -e`) already govern this file.
 
 # The core list every platform runs: excludes `scalar-yaml` (which compiles
 # out every YAML SIMD backend) and `portable-popcount` (which, together with
