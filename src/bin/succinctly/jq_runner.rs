@@ -3833,6 +3833,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // Set up output writer
     let stdout = std::io::stdout();
     let mut out = LoudFlushWriter::new(stdout.lock());
+    // One record's rendered body, reused across records (#3265).
+    let mut record_scratch = Vec::new();
 
     // Track last output for exit status
     let mut last_output: Option<OwnedValue> = None;
@@ -4241,7 +4243,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                             &mut out,
                             || at.clone(),
                             |o| match &result {
-                                OutputItem::Lazy(v) => write_output_jq_value(o, v, &output_config),
+                                OutputItem::Lazy(v) => {
+                                    write_output_jq_value(o, v, &output_config, &mut record_scratch)
+                                }
                                 OutputItem::Owned(v) => {
                                     write_output_owned_value(o, v, &output_config)
                                 }
@@ -7621,10 +7625,15 @@ fn reject_raw_output0_nul(s: &str, config: &OutputConfig) -> Result<()> {
 }
 
 /// Write a single output JqValue (preserves number formatting when possible).
+///
+/// All or nothing per record: a value that fails to decode leaves none of
+/// the record on `out` (#3265). `scratch` is the caller's reusable buffer
+/// for that; its contents on entry and on return are unspecified.
 fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     out: &mut Out,
     value: &JqValue<'_, Wrd>,
     config: &OutputConfig,
+    scratch: &mut Vec<u8>,
 ) -> Result<()> {
     // Raw-output string, if any -- resolved and NUL-checked before
     // writing *any* byte of this record, including the `--seq` RS
@@ -7661,10 +7670,56 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     } else {
         None
     };
+
+    // #3265: a JSON body is rendered into `scratch` in full, and only copied
+    // to `out` once it has rendered without error. `print_json` checks each
+    // container's structure before writing its opening bracket, but a
+    // child's *value* is only decoded when the walk reaches it, so a
+    // malformed scalar (`{"a":tru}`, `{"a":1.2.3}`) raised after the
+    // enclosing brackets, keys and earlier siblings were already on stdout.
+    // jq parses a document before printing any of it, so it writes nothing.
+    // A per-level pre-check cannot close this: in `[[1],[tru]]` the inner
+    // level only checks its own children, after `[[1],` is written. This is
+    // the per-value buffer the M2 fast path (`JsonCursor::stream_json`)
+    // already keeps for the same query, applied to the general path.
+    //
+    // The body is rendered *before* the prologue, so a rejected record
+    // leaves no `--seq` RS either (the #1830 rule). That order is safe
+    // because the prologue writes nothing but the RS for a record that is
+    // not a raw string. A raw string never reaches this buffer: it is
+    // already decoded, so nothing after the NUL check can fail.
+    // `write_terminator` stays on `out`, so `--unbuffered` still flushes
+    // once per record.
+    scratch.clear();
+    if !is_raw_record(&as_str, config) {
+        render_json_body(scratch, value, config)?;
+    }
     if write_output_raw_prologue(out, as_str, config)? {
         return Ok(());
     }
+    out.write_all(scratch)?;
+    // Don't pin one huge record's buffer for the rest of a long stream.
+    if scratch.capacity() > MAX_RETAINED_RECORD_SCRATCH {
+        *scratch = Vec::new();
+    }
+    write_terminator(out, config)?;
+    Ok(())
+}
 
+/// The largest record buffer [`write_output_jq_value`] keeps between
+/// records. A larger one is dropped after its record is written, so peak
+/// RSS is one rendered record either way, but a stream's steady state isn't
+/// its largest record.
+const MAX_RETAINED_RECORD_SCRATCH: usize = 8 << 20;
+
+/// [`write_output_jq_value`]'s JSON body, written to `out` with no prologue
+/// or terminator. It can fail after writing part of the body, which is why
+/// its caller hands it a buffer rather than stdout (#3265).
+fn render_json_body<Out: Write, Wrd: Clone + AsRef<[u64]>>(
+    out: &mut Out,
+    value: &JqValue<'_, Wrd>,
+    config: &OutputConfig,
+) -> Result<()> {
     // `JqCompat` uses the jq-compatible formatter (reformats numbers); a
     // source-preserving convention uses the preserve formatter (keeps the
     // original number format).
@@ -7741,8 +7796,6 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
             .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?;
         out.write_all(format_json(&owned, config).as_bytes())?;
     }
-
-    write_terminator(out, config)?;
     Ok(())
 }
 
@@ -7812,7 +7865,11 @@ fn write_output_raw_prologue<Out: Write>(
     config: &OutputConfig,
 ) -> Result<bool> {
     let was_raw_shaped = as_str.is_some();
-    let raw_str = if config.ascii_output { None } else { as_str };
+    let raw_str = if is_raw_record(&as_str, config) {
+        as_str
+    } else {
+        None
+    };
     if let Some(s) = &raw_str {
         reject_raw_output0_nul(s, config)?;
     }
@@ -7826,6 +7883,15 @@ fn write_output_raw_prologue<Out: Write>(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Whether [`write_output_raw_prologue`] writes this record as a raw string
+/// rather than leaving a JSON body to its caller: it is raw-shaped, and `-a`
+/// doesn't override that (#2662). One definition, so
+/// [`write_output_jq_value`]'s choice of whether to render a body first
+/// can't drift from the prologue's.
+fn is_raw_record(as_str: &Option<Cow<'_, str>>, config: &OutputConfig) -> bool {
+    as_str.is_some() && !config.ascii_output
 }
 
 /// The `-r`/`-j`/`--raw-output0` string of an owned value, or `None` when
@@ -10840,9 +10906,10 @@ mod tests {
                     .map(|e| e.to_string());
 
                 let mut via_rebuild = Vec::new();
-                let rebuild_err = write_output_jq_value(&mut via_rebuild, &rebuilt, config)
-                    .err()
-                    .map(|e| e.to_string());
+                let rebuild_err =
+                    write_output_jq_value(&mut via_rebuild, &rebuilt, config, &mut Vec::new())
+                        .err()
+                        .map(|e| e.to_string());
 
                 let flags = describe_config_3009(config);
                 assert_eq!(
@@ -10988,7 +11055,7 @@ mod tests {
             convention: JsonConvention::JqCompat,
         };
         let mut out = Vec::new();
-        write_output_jq_value(&mut out, &JqValue::Cursor(cursor), &config)
+        write_output_jq_value(&mut out, &JqValue::Cursor(cursor), &config, &mut Vec::new())
             .expect("a bridge-text cursor prints cleanly");
         assert_eq!(
             String::from_utf8(out).unwrap(),
