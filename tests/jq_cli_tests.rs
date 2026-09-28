@@ -66300,6 +66300,15 @@ fn test_object_index_key_is_a_slice_descriptor_3300() -> Result<()> {
         ("[1]", 0),
         "#3300 (input bridge): stderr={stderr:?}"
     );
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "-c", "input | try .[1][.[0]] catch ."],
+        Some(r#"[{"start":"a","end":1},[1,2]]"#),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        (r#""Array/string slice indices must be integers""#, 0),
+        "#3300 (input bridge, non-number bound): stderr={stderr:?}"
+    );
     Ok(())
 }
 
