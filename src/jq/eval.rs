@@ -100002,11 +100002,6 @@ mod tests {
                 "error: Cannot index number with number",
             ),
             (
-                r#"[limit(1; if ([1] as $a ?// $b | $a) then 1 else error("E") end)]"#,
-                &[][..],
-                "error: E",
-            ),
-            (
                 r#"([1] as $a ?// $b | $a) and error("E")"#,
                 &["false"][..],
                 "",
@@ -100054,6 +100049,14 @@ mod tests {
                 (values, end),
                 "`{filter}`"
             );
+        }
+        // `limit`'s retry-after-count-stop rule reads the retry generation,
+        // which `no_std` does not have (see `each_take_n`).
+        #[cfg(feature = "std")]
+        {
+            let filter = r#"[limit(1; if ([1] as $a ?// $b | $a) then 1 else error("E") end)]"#;
+            let (got, got_end) = outputs_and_end(b"null", filter);
+            assert_eq!((got.len(), got_end.as_str()), (0, "error: E"), "`{filter}`");
         }
     }
 
