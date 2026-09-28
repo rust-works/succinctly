@@ -14682,7 +14682,11 @@ where
 /// [`generic_item_into_owned_with_origin`] in place of
 /// [`generic_item_into_owned`]. Not shared with [`each_as_pattern_generic`]
 /// -- a pattern bind has no single node to name, so it fans out through
-/// plain [`fanout_arg_each_generic`] instead.
+/// plain [`fanout_arg_each_generic`] instead. Since #3295, both escape arms
+/// route through [`stop_with_escape`] and so share `fanout_arg_each_generic`'s
+/// classification: a `Halt` or decode failure escaping here is marked
+/// non-retryable, the same as every other stop this file and `eval.rs`
+/// hand to a pattern-alternative retry decision.
 fn fanout_arg_each_generic_with_origin<S: EvalSemantics, V: DocumentValue, B>(
     arg_expr: &Expr,
     value: V,
@@ -14707,10 +14711,7 @@ where
         escape = None;
         let (owned, origin) = match generic_item_into_owned_with_origin::<_, S>(item) {
             Ok(pair) => pair,
-            Err(control) => {
-                escape = Some(control);
-                return Demand::Stop;
-            }
+            Err(control) => return stop_with_escape(&mut escape, control),
         };
         match body(owned, origin) {
             // This bound value's own walk finished; go on to the next one.
@@ -14722,10 +14723,7 @@ where
                 consumer_stopped = true;
                 Demand::Stop
             }
-            Flow::Escaped(control) => {
-                escape = Some(control);
-                Demand::Stop
-            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
 
