@@ -4967,6 +4967,12 @@ where
                 None => Demand::Continue,
             }
         });
+        // #3293: a retry inside `inner` that produced nothing never re-invoked
+        // the closure above to reset `escape`.
+        escape.settle(&inner_flow, direct_pattern_retry(inner));
+        if escape.is_set() {
+            return Demand::Stop;
+        }
         match inner_flow {
             Flow::Exhausted => Demand::Continue,
             // `body` already recorded its own control above.
@@ -7179,8 +7185,9 @@ where
     };
 
     let direct_retry = direct_pattern_retry(arg_expr);
-    match escape.take(&flow, direct_retry) {
-        Some(control) => resume_from_escape(Some(control), flow),
+    let control = escape.take(&flow, direct_retry);
+    match control {
+        Some(_) => resume_from_escape(control, flow),
         // `pending` is dropped for the reason every other lazy consumer
         // drops it: it belongs to an eager fallback jq would never reach.
         None if consumer_stopped_at
@@ -7960,15 +7967,16 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// unchanged from `eval_range`'s own doc comment: `from` outer, `to`
 /// middle, `step` inner, mirroring jq's own `def range($from; $upto; $by)`.
 ///
-/// Two distinct reasons the nest can stop, tracked out-of-band (the driving
-/// closures can only answer `Demand`) -- the same shape
-/// [`fanout_two_args_lazy`]'s `escape` uses, one level deeper:
+/// Two distinct reasons the nest can stop, recorded out-of-band in one
+/// [`StashedVerdict<Flow>`] (the driving closures can only answer `Demand`,
+/// and one invocation records at most one of them; every operand closure
+/// resets it first, so a `?//` retry inside a bound supersedes it, #3293):
 ///
-/// * `sink_stopped` -- the *wrapping* `sink` returned [`Demand::Stop`] after
+/// * a consumer stop -- the *wrapping* `sink` returned [`Demand::Stop`] after
 ///   receiving a generated value: the consumer has what it wants, so every
 ///   remaining bound value at every nesting level is left unevaluated.
 ///   Always collapses to `Flow::Stopped { pending: None }`.
-/// * `escape` -- a bound value failed [`range_num`]'s numeric check (rule 3:
+/// * an escape -- a bound value failed [`range_num`]'s numeric check (rule 3:
 ///   `range((1,"x"))` prints `0` then raises), or a nested `eval_each` call
 ///   on `to`/`step` itself returned `Flow::Escaped` (rule 4: a `halt`/
 ///   `break`/`error` from inside a bound's own generator, deferred until
@@ -8406,7 +8414,8 @@ fn counted_bool_flow_to_result<'a, W>(
 /// jq's answer, not a dropped trailing control: `[limit(1; if ([1] as $a ?//
 /// $b | $a) then 1 else error("E") end)]` raises `E` in jq 1.7.1. Without a
 /// retry the escape can only be an eager fallback's trailing control, which
-/// is still dropped. `no_std` has no retry generation, so it keeps dropping.
+/// is still dropped. `no_std` has no retry generation, so there only a
+/// direct `?//` generator ([`direct_pattern_retry`]) is recognised.
 fn each_take_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
@@ -8424,7 +8433,8 @@ fn each_take_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Demand::Continue
         }
     });
-    let retried = stopped_at.is_some_and(|at| pipe_retry_generation() != at);
+    let retried =
+        stopped_at.is_some_and(|at| retry_superseded(&flow, at, direct_pattern_retry(expr)));
     (taken, flow, retried)
 }
 
@@ -48455,7 +48465,9 @@ pub(crate) fn pipe_terminal_after_retry(
     }
 }
 
-pub(crate) fn retry_consumed_stop(upstream: &Flow, stopped_at: u64, direct_retry: bool) -> bool {
+/// [`retry_superseded`]'s exhausted half; not called directly since #3293,
+/// so the rule has one entry point.
+fn retry_consumed_stop(upstream: &Flow, stopped_at: u64, direct_retry: bool) -> bool {
     matches!(upstream, Flow::Exhausted)
         && (terminal_retry::current() != stopped_at || (!cfg!(feature = "std") && direct_retry))
 }
@@ -48615,9 +48627,9 @@ pub(crate) fn stop_with_downstream(slot: &mut Option<Flow>, flow: Flow) -> Deman
     Demand::Stop
 }
 
-/// [`stop_with_escape`] for [`each_range`], whose out-of-band slot is a
-/// `Cell<Option<Control>>` (its emit closure is called from two nested sink
-/// levels, so the slot is shared by `&` rather than `&mut`).
+/// [`stop_with_escape`] for a `Cell<Option<Control>>` slot -- the one
+/// [`StashedVerdict::stop`] keeps, shared by `&` so drivers whose closures
+/// nest (`each_range`'s operand levels and emitter) can all reach it.
 pub(crate) fn stop_with_escape_cell(
     slot: &core::cell::Cell<Option<Control>>,
     control: Control,
