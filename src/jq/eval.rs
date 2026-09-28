@@ -4913,11 +4913,11 @@ fn item_to_owned<W: Clone + AsRef<[u64]>, S: EvalSemantics>(item: Item<'_, W>) -
 /// only in which generator's item they decoded.
 fn checked_or_stop<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     item: Item<'_, W>,
-    escape: &mut Option<Control>,
+    escape: &StashedEscape,
 ) -> Result<OwnedValue, Demand> {
     match item.into_owned::<S>() {
         Ok(v) => Ok(v),
-        Err(e) => Err(stop_with_escape(escape, Control::Error(e))),
+        Err(e) => Err(escape.stop(Control::Error(e))),
     }
 }
 
@@ -4939,7 +4939,7 @@ where
     B: FnMut(OwnedValue, OwnedValue) -> QueryResult<'a, W>,
 {
     let mut out: Vec<OwnedValue> = Vec::new();
-    let mut escape: Option<Control> = None;
+    let escape = StashedEscape::new();
 
     let outer_flow = eval_each::<W, S>(outer, value.clone(), optional, &mut |outer_item| {
         // #2952: reset before either closure below can set a fresh `escape`
@@ -4948,38 +4948,45 @@ where
         // equivalent to (and less omission-prone than) resetting on every
         // individual clean-outcome arm; a first pass here did the latter
         // and missed this whole function.
-        escape = None;
+        escape.begin();
         // #2023: same decode-failure raise as `fanout_arg`'s own lazy sink,
         // for both generators here.
-        let o = match checked_or_stop::<_, S>(outer_item, &mut escape) {
+        let o = match checked_or_stop::<_, S>(outer_item, &escape) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
         let inner_flow = eval_each::<W, S>(inner, value.clone(), optional, &mut |inner_item| {
             // #2952: same reset, for `inner`'s own `?//` retries.
-            escape = None;
-            let i = match checked_or_stop::<_, S>(inner_item, &mut escape) {
+            escape.begin();
+            let i = match checked_or_stop::<_, S>(inner_item, &escape) {
                 Ok(v) => v,
                 Err(demand) => return demand,
             };
             match push_owned_values::<_, S>(body(o.clone(), i), &mut out) {
-                Some(control) => stop_with_escape(&mut escape, control),
+                Some(control) => escape.stop(control),
                 None => Demand::Continue,
             }
         });
+        // #3293: a retry inside `inner` that produced nothing never re-invoked
+        // the closure above to reset `escape`.
+        escape.settle(&inner_flow, direct_pattern_retry(inner));
+        if escape.is_set() {
+            return Demand::Stop;
+        }
         match inner_flow {
             Flow::Exhausted => Demand::Continue,
             // `body` already recorded its own control above.
             Flow::Stopped { .. } => Demand::Stop,
             // The inner generator's own control unwinds the outer loop too.
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            Flow::Escaped(control) => escape.stop(control),
         }
     });
 
     // A recorded `escape` always came with a `Demand::Stop`, so the outer
     // flow is `Stopped` whenever one exists; `Escaped` therefore carries the
     // outer generator's own control, which fires last.
-    match escape {
+    // #3293: a stash a `?//` retry inside `outer` superseded is dropped.
+    match escape.take(&outer_flow, direct_pattern_retry(outer)) {
         Some(control) => partial(out, control),
         None => match outer_flow {
             Flow::Escaped(control) => partial(out, control),
@@ -6306,8 +6313,11 @@ fn each_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let mut escape: Option<Control> = None;
+    let escape = StashedEscape::new();
     let cond_flow = eval_each::<W, S>(cond, value.clone(), optional, &mut |item| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside the
+        // driven operand; it supersedes whatever the retried-past call decided.
+        escape.begin();
         let branch = if item.is_truthy() {
             then_branch
         } else {
@@ -6316,11 +6326,11 @@ fn each_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match eval_each::<W, S>(branch, value.clone(), optional, sink) {
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => Demand::Stop,
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            Flow::Escaped(control) => escape.stop(control),
         }
     });
 
-    resume_from_escape(escape, cond_flow)
+    escape.resume(cond_flow, direct_pattern_retry(cond))
 }
 
 /// Lazy twin of [`eval_try`]: pushes `expr`'s own outputs straight to `sink`,
@@ -7099,8 +7109,11 @@ where
 {
     // Tracked out-of-band for the usual reason: the sink can only answer
     // `Demand`, so "why did the pull stop" has to be recorded beside it.
-    let mut escape: Option<Control> = None;
-    let mut consumer_stopped = false;
+    let escape = StashedEscape::new();
+    // A generation stamp beside the stash, not one `StashedVerdict<Flow>`:
+    // see `eval_generic::fanout_arg_each_generic`'s identical note (the wider
+    // slot cost native stack on the `$`-parameter recursion path).
+    let mut consumer_stopped_at: Option<u64> = None;
 
     let mut on_item = |item: Item<'_, W>| {
         // #2952: reset before anything below can set a fresh `escape` for
@@ -7121,7 +7134,10 @@ where
         // `[10,10]` -- the first alternative's `error("BODY")` retries
         // into the second, whose own `10` satisfies `limit(2)` before its
         // own `error("BODY")` is ever reached.
-        escape = None;
+        escape.begin();
+        // #3293: a stale consumer stop would likewise hide the error the
+        // retry's own call raises.
+        consumer_stopped_at = None;
         // Before `into_owned`: the cursor this reads lives on the borrowed
         // item, and materializing it is exactly what drops it.
         let origin = if WITH_ORIGIN {
@@ -7133,13 +7149,13 @@ where
         // argument value raises rather than silently becoming `""`.
         let owned = match item.into_owned::<S>() {
             Ok(v) => v,
-            Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+            Err(e) => return escape.stop(Control::Error(e)),
         };
         match body(owned, origin) {
             // This argument value's own walk finished; go on to the next.
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => {
-                consumer_stopped = true;
+                consumer_stopped_at = Some(pipe_retry_generation());
                 Demand::Stop
             }
             // A body error/break inside `arg_expr` -- e.g. `skip($n;
@@ -7151,7 +7167,7 @@ where
             // driving `arg_expr` (if any), which retries into the next
             // pattern and calls this sink again -- landing at the reset
             // above, which is what clears a *resolved* escape.
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            Flow::Escaped(control) => escape.stop(control),
         }
     };
     // #3296: a single-valued, effect-free source is evaluated to completion
@@ -7168,11 +7184,17 @@ where
         eval_each::<W, S>(arg_expr, value, optional, &mut on_item)
     };
 
-    match escape {
-        Some(_) => resume_from_escape(escape, flow),
+    let direct_retry = direct_pattern_retry(arg_expr);
+    let control = escape.take(&flow, direct_retry);
+    match control {
+        Some(_) => resume_from_escape(control, flow),
         // `pending` is dropped for the reason every other lazy consumer
         // drops it: it belongs to an eager fallback jq would never reach.
-        None if consumer_stopped => Flow::Stopped { pending: None },
+        None if consumer_stopped_at
+            .is_some_and(|at| !retry_superseded(&flow, at, direct_retry)) =>
+        {
+            Flow::Stopped { pending: None }
+        }
         None => flow,
     }
 }
@@ -7630,11 +7652,15 @@ fn each_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let mut outer_stopped = false;
-    let mut escape: Option<Control> = None;
+    let escape = StashedEscape::new();
     let flow = eval_each::<W, S>(operand, value, optional, &mut |item| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside the
+        // driven operand; it supersedes whatever the retried-past call decided.
+        escape.begin();
+        outer_stopped = false;
         let owned = match item.into_owned::<S>() {
             Ok(v) => v,
-            Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+            Err(e) => return escape.stop(Control::Error(e)),
         };
         match arith_negate::<S>(owned) {
             Ok(negated) => {
@@ -7645,13 +7671,14 @@ fn each_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Demand::Continue
                 }
             }
-            Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
+            Err(e) => escape.stop(Control::Error(e)),
         }
     });
 
     if outer_stopped {
         return flow;
     }
+    let escape = escape.take(&flow, direct_pattern_retry(operand));
     let control = escape.or(match flow {
         Flow::Exhausted | Flow::Stopped { .. } => None,
         Flow::Escaped(control) => Some(control),
@@ -7703,8 +7730,11 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let mut escape: Option<Control> = None;
+    let escape = StashedEscape::new();
     let flow = eval_each::<W, S>(key, value.clone(), false, &mut |item| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside the
+        // driven operand; it supersedes whatever the retried-past call decided.
+        escape.begin();
         let k = match item {
             // STYLE-0012: this materializes the *key* generator's output,
             // evaluated with a hardcoded `optional: false` in the `eval_each`
@@ -7713,7 +7743,7 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // reason, as `eval_index_expr`'s own `Item::Borrowed` arm.
             Item::Borrowed(v) => match to_owned_key_shape::<_, S>(&v) {
                 Ok(k) => k,
-                Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+                Err(e) => return escape.stop(Control::Error(e)),
             },
             Item::Owned(o) => o,
         };
@@ -7722,11 +7752,11 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match drain_result(one_key_result, sink) {
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => Demand::Stop,
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            Flow::Escaped(control) => escape.stop(control),
         }
     });
 
-    resume_from_escape(escape, flow)
+    escape.resume(flow, direct_pattern_retry(key))
 }
 
 /// Demand-forwarding twin of [`build_string_parts`] (#2180 WP2b), jq mode
@@ -7766,20 +7796,23 @@ fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             each_string_parts::<W, S>(rest, value, optional, slots, sink)
         }
         StringPart::Expr(expr) => {
-            let mut escape: Option<Control> = None;
+            let escape = StashedEscape::new();
             let flow = eval_each::<W, S>(expr, value.clone(), optional, &mut |item| {
+                // #3293: a re-invocation after a stop is a `?//` retry inside the
+                // driven operand; it supersedes whatever the retried-past call decided.
+                escape.begin();
                 let owned = match item.into_owned::<S>() {
                     Ok(v) => v,
-                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+                    Err(e) => return escape.stop(Control::Error(e)),
                 };
                 slots[idx] = owned_to_string::<S>(&owned);
                 match each_string_parts::<W, S>(rest, value.clone(), optional, slots, sink) {
                     Flow::Exhausted => Demand::Continue,
                     Flow::Stopped { .. } => Demand::Stop,
-                    Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+                    Flow::Escaped(control) => escape.stop(control),
                 }
             });
-            resume_from_escape(escape, flow)
+            escape.resume(flow, direct_pattern_retry(expr))
         }
     }
 }
@@ -7840,14 +7873,17 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             each_object_value::<W, S>(name.clone(), &entry.value, rest, value, optional, acc, sink)
         }
         ObjectKey::Expr(key_expr) => {
-            let mut escape: Option<Control> = None;
+            let escape = StashedEscape::new();
             let flow = eval_each::<W, S>(key_expr, value.clone(), optional, &mut |item| {
+                // #3293: a re-invocation after a stop is a `?//` retry inside the
+                // driven operand; it supersedes whatever the retried-past call decided.
+                escape.begin();
                 // #2022: `into_owned`, not the lossy conversion -- an
                 // undecodable computed key must raise, matching
                 // `stream_outputs`'s own checked conversion.
                 let key_owned = match item.into_owned::<S>() {
                     Ok(v) => v,
-                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+                    Err(e) => return escape.stop(Control::Error(e)),
                 };
                 let key_str = match &key_owned {
                     OwnedValue::String(s) => s.clone(),
@@ -7860,10 +7896,9 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // everything) is deliberately not reproduced.
                                 return Demand::Continue; // omni-dev: coverage tolerate-line reason="unreachable: `optional` is never `true` here. `eval_each` is entered with a forced `true` at exactly one site (`Expr::Optional` over an `IndexExpr`/`SliceExpr`), and both of those evaluate their target (`eval_index_expr`) and their key (`eval_each(key, .., false)`) with a hardcoded `false`, so only the final index/slice step ever sees it -- nothing carries it down to an `Expr::Object` (#2180)"
                             }
-                            return stop_with_escape(
-                                &mut escape,
-                                Control::Error(EvalError::cannot_use_as_object_key(&key_owned)),
-                            );
+                            return escape.stop(Control::Error(
+                                EvalError::cannot_use_as_object_key(&key_owned),
+                            ));
                         }
                     },
                 };
@@ -7878,10 +7913,10 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 ) {
                     Flow::Exhausted => Demand::Continue,
                     Flow::Stopped { .. } => Demand::Stop,
-                    Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+                    Flow::Escaped(control) => escape.stop(control),
                 }
             });
-            resume_from_escape(escape, flow)
+            escape.resume(flow, direct_pattern_retry(key_expr))
         }
     }
 }
@@ -7903,12 +7938,15 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     acc: &mut Vec<(String, OwnedValue)>,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let mut escape: Option<Control> = None;
+    let escape = StashedEscape::new();
     let flow = eval_each::<W, S>(value_expr, value.clone(), optional, &mut |item| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside the
+        // driven operand; it supersedes whatever the retried-past call decided.
+        escape.begin();
         // #2022: same checked conversion as the key slot above.
         let val_owned = match item.into_owned::<S>() {
             Ok(v) => v,
-            Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+            Err(e) => return escape.stop(Control::Error(e)),
         };
         acc.push((key.clone(), val_owned));
         let result = each_object_entries::<W, S>(rest, value.clone(), optional, acc, sink);
@@ -7916,10 +7954,10 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match result {
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => Demand::Stop,
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            Flow::Escaped(control) => escape.stop(control),
         }
     });
-    resume_from_escape(escape, flow)
+    escape.resume(flow, direct_pattern_retry(value_expr))
 }
 
 /// Demand-driven twin of [`eval_range`] (#1556): drives `from`, `to`, and
@@ -7929,15 +7967,16 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// unchanged from `eval_range`'s own doc comment: `from` outer, `to`
 /// middle, `step` inner, mirroring jq's own `def range($from; $upto; $by)`.
 ///
-/// Two distinct reasons the nest can stop, tracked out-of-band (the driving
-/// closures can only answer `Demand`) -- the same shape
-/// [`fanout_two_args_lazy`]'s `escape` uses, one level deeper:
+/// Two distinct reasons the nest can stop, recorded out-of-band in one
+/// [`StashedVerdict<Flow>`] (the driving closures can only answer `Demand`,
+/// and one invocation records at most one of them; every operand closure
+/// resets it first, so a `?//` retry inside a bound supersedes it, #3293):
 ///
-/// * `sink_stopped` -- the *wrapping* `sink` returned [`Demand::Stop`] after
+/// * a consumer stop -- the *wrapping* `sink` returned [`Demand::Stop`] after
 ///   receiving a generated value: the consumer has what it wants, so every
 ///   remaining bound value at every nesting level is left unevaluated.
 ///   Always collapses to `Flow::Stopped { pending: None }`.
-/// * `escape` -- a bound value failed [`range_num`]'s numeric check (rule 3:
+/// * an escape -- a bound value failed [`range_num`]'s numeric check (rule 3:
 ///   `range((1,"x"))` prints `0` then raises), or a nested `eval_each` call
 ///   on `to`/`step` itself returned `Flow::Escaped` (rule 4: a `halt`/
 ///   `break`/`error` from inside a bound's own generator, deferred until
@@ -7968,9 +8007,12 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // own, which a shared `&mut Option<Control>` can't give more than one
     // of simultaneously (#2089: `emit` gained its own write here once
     // `eval_range_values`/`_f64` could raise on `MAX_RANGE`).
-    let escape: core::cell::Cell<Option<Control>> = core::cell::Cell::new(None);
-    let mut sink_stopped = false;
-    let mut sink_stopped_at = pipe_retry_generation();
+    // #3293: one slot for the escape or the consumer's stop, reset at the top
+    // of every operand closure -- see `eval_generic::each_range_generic`'s
+    // identical fold for why a stale one of either kind must not survive a
+    // `?//` retry inside an operand.
+    let verdict: StashedVerdict<Flow> = StashedVerdict::new();
+    let stop = |control: Control| verdict.stop_with_downstream(Flow::Escaped(control));
 
     // One (from, to, step) combination's values, forwarded to the wrapping
     // `sink`. Reuses `eval_range_values`/`_f64` and `drain_result` verbatim
@@ -8020,15 +8062,9 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ),
         };
         match drain_result(one, sink) {
-            Flow::Exhausted if truncated => {
-                stop_with_escape_cell(&escape, Control::Error(range_max_exceeded_error()))
-            }
+            Flow::Exhausted if truncated => stop(Control::Error(range_max_exceeded_error())),
             Flow::Exhausted => Demand::Continue,
-            Flow::Stopped { .. } => {
-                sink_stopped = true;
-                sink_stopped_at = pipe_retry_generation();
-                Demand::Stop
-            }
+            Flow::Stopped { .. } => verdict.stop_with_downstream(Flow::Stopped { pending: None }),
             // `owned_vec_to_result` never yields `Error`/`Break`/`Halt`/
             // `Partial`, so `drain_result` can only answer `Exhausted` or
             // `Stopped { pending: None }` here.
@@ -8039,11 +8075,12 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let from_flow = eval_each::<W, S>(from, value.clone(), optional, &mut |from_item| {
+        verdict.begin();
         let from_owned = item_to_owned::<_, S>(from_item);
         let from_val = match range_num(&from_owned) {
             Ok(n) => n,
             Err(e) => {
-                return stop_with_escape_cell(&escape, Control::Error(e));
+                return stop(Control::Error(e));
             }
         };
         // The one place `from`'s own literal spelling (if any) is still on
@@ -8070,10 +8107,11 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
 
         let to_flow = eval_each::<W, S>(to_expr, value.clone(), optional, &mut |to_item| {
+            verdict.begin();
             let to_val = match range_num(&item_to_owned::<_, S>(to_item)) {
                 Ok(n) => n,
                 Err(e) => {
-                    return stop_with_escape_cell(&escape, Control::Error(e));
+                    return stop(Control::Error(e));
                 }
             };
 
@@ -8082,10 +8120,11 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Some(step_expr) => {
                     let step_flow =
                         eval_each::<W, S>(step_expr, value.clone(), optional, &mut |step_item| {
+                            verdict.begin();
                             let step_val = match range_num(&item_to_owned::<_, S>(step_item)) {
                                 Ok(n) => n,
                                 Err(e) => {
-                                    return stop_with_escape_cell(&escape, Control::Error(e));
+                                    return stop(Control::Error(e));
                                 }
                             };
                             emit(from_val, to_val, step_val, from_literal)
@@ -8093,7 +8132,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     match step_flow {
                         Flow::Exhausted => Demand::Continue,
                         Flow::Stopped { .. } => Demand::Stop,
-                        Flow::Escaped(control) => stop_with_escape_cell(&escape, control),
+                        Flow::Escaped(control) => stop(control),
                     }
                 }
             }
@@ -8102,7 +8141,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match to_flow {
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => Demand::Stop,
-            Flow::Escaped(control) => stop_with_escape_cell(&escape, control),
+            Flow::Escaped(control) => stop(control),
         }
     });
 
@@ -8111,12 +8150,10 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let direct_retry = direct_pattern_retry(from)
         || to.is_some_and(direct_pattern_retry)
         || step.is_some_and(direct_pattern_retry);
-    if sink_stopped && !retry_consumed_stop(&from_flow, sink_stopped_at, direct_retry) {
-        return Flow::Stopped { pending: None };
-    }
-    match escape.into_inner() {
-        Some(control) => Flow::Escaped(control),
-        None => from_flow,
+    match verdict.take(&from_flow, direct_retry) {
+        Some(Flow::Escaped(control)) => Flow::Escaped(control),
+        Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
+        Some(Flow::Exhausted) | None => from_flow,
     }
 }
 
@@ -8370,22 +8407,35 @@ fn counted_bool_flow_to_result<'a, W>(
 /// jq never asks for more and the control is dropped, but a generator that
 /// ended early still surfaces it (`[limit(3; 1,2,error("x"),4)]` raises,
 /// `limit(2; 1,2,error("x"))` does not).
+///
+/// The third value says whether a `?//` retry began after the count stopped
+/// the generator (#3293). The generator only runs past that stop when a
+/// `?//` inside it retries (#1519), and an escape from *that* alternative is
+/// jq's answer, not a dropped trailing control: `[limit(1; if ([1] as $a ?//
+/// $b | $a) then 1 else error("E") end)]` raises `E` in jq 1.7.1. Without a
+/// retry the escape can only be an eager fallback's trailing control, which
+/// is still dropped. `no_std` has no retry generation, so there only a
+/// direct `?//` generator ([`direct_pattern_retry`]) is recognised.
 fn each_take_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
     n: usize,
-) -> (Vec<Item<'a, W>>, Flow) {
+) -> (Vec<Item<'a, W>>, Flow, bool) {
     let mut taken: Vec<Item<'a, W>> = Vec::new();
+    let mut stopped_at: Option<u64> = None;
     let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
         taken.push(item);
         if taken.len() >= n {
+            stopped_at = Some(pipe_retry_generation());
             Demand::Stop
         } else {
             Demand::Continue
         }
     });
-    (taken, flow)
+    let retried =
+        stopped_at.is_some_and(|at| retry_superseded(&flow, at, direct_pattern_retry(expr)));
+    (taken, flow, retried)
 }
 
 /// Pull outputs until index `n`, keeping the ones at or past it — jq's `nth`,
@@ -10266,10 +10316,10 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// (#1247/#1620), so this always escapes via `Flow::Escaped` regardless.
 fn checked_fanout_operand<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     item: Item<'_, W>,
-    abort: &mut Option<Flow>,
+    abort: &StashedVerdict<Flow>,
 ) -> Result<OwnedValue, Demand> {
     item.into_owned::<S>()
-        .map_err(|e| stop_with_downstream(abort, Flow::Escaped(Control::Error(e))))
+        .map_err(|e| abort.stop_with_downstream(Flow::Escaped(Control::Error(e))))
 }
 
 fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -10323,7 +10373,9 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Why the fanout ended, recorded out-of-band because the driver closure
     // can only answer `Demand` — the same shape as `eval_each_pipe`'s
     // `downstream` and `any_all_gen_cond`'s `probe_escape`.
-    let mut abort: Option<Flow> = None;
+    // #3293: every closure below resets this first -- see
+    // `eval_generic::binary_fanout_each_generic_with`'s identical reset.
+    let abort: StashedVerdict<Flow> = StashedVerdict::new();
     // #2460: how many outputs each operand actually produced, so a *zero*
     // count can be answered from `yq_empty_operand_output` instead of
     // silently contributing no pairings. `None` in jq mode, where `1 + empty`
@@ -10342,16 +10394,18 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let outer = each_operand(outer_expr, &mut |outer_item: Item<'a, W>| {
+        abort.begin();
         outer_seen += 1;
-        let outer_val = match checked_fanout_operand::<_, S>(outer_item, &mut abort) {
+        let outer_val = match checked_fanout_operand::<_, S>(outer_item, &abort) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
 
         let mut inner_seen = 0usize;
         let inner = each_operand(inner_expr, &mut |inner_item: Item<'a, W>| {
+            abort.begin();
             inner_seen += 1;
-            let inner_val = match checked_fanout_operand::<_, S>(inner_item, &mut abort) {
+            let inner_val = match checked_fanout_operand::<_, S>(inner_item, &abort) {
                 Ok(v) => v,
                 Err(demand) => return demand,
             };
@@ -10387,19 +10441,21 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // evidence as `catch_error_under_optional`'s own doc
                     // comment, despite living outside the path-context
                     // evaluator itself.
-                    abort = Some(if optional {
+                    abort.stop_with_downstream(if optional {
                         Flow::Exhausted
                     } else {
                         Flow::Escaped(Control::Error(e))
-                    });
-                    Demand::Stop
+                    })
                 }
             }
         });
 
         // A `combine` failure has already decided; the `Stopped` it induces
         // in the inner loop must not overwrite that verdict.
-        if abort.is_some() {
+        // #3293: a retry inside `inner_expr` that produced nothing never
+        // re-invoked the closure above to reset `abort`.
+        abort.settle(&inner, direct_pattern_retry(inner_expr));
+        if abort.is_set() {
             return Demand::Stop;
         }
 
@@ -10411,7 +10467,7 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             if let Some(op) = rules.empty {
                 if let Some(v) = yq_empty_operand_output(op, Some(&outer_val)) {
                     if matches!(sink(Item::Owned(v)), Demand::Stop) {
-                        return stop_with_downstream(&mut abort, Flow::Stopped { pending: None });
+                        return abort.stop_with_downstream(Flow::Stopped { pending: None });
                     }
                 }
             }
@@ -10426,7 +10482,7 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // raises rather than answering `true`). `Stopped` is the
             // consumer's own demand, which ends the outer loop for the same
             // reason `eval_each_pipe`'s downstream stop ends stage 1.
-            other => stop_with_downstream(&mut abort, other),
+            other => abort.stop_with_downstream(other),
         }
     });
 
@@ -10467,6 +10523,7 @@ fn binary_fanout_each_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #2693 gave the family its own arm. `while` has no lazy arm, so it is
     // what the current pair uses -- see
     // `test_short_circuit_side_effect_leaks_820_932_987`.
+    let abort = abort.take(&outer, direct_pattern_retry(outer_expr));
     if let (Some(op), 0, None, Flow::Exhausted) = (rules.empty, outer_seen, &abort, &outer) {
         // #2460 (yq mode only): the *outer* operand produced nothing, so the
         // loop above never ran and the inner one was never evaluated at all.
@@ -10528,11 +10585,13 @@ fn empty_outer_operand_pass<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     op: EmptyOperandOp,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let mut abort: Option<Flow> = None;
+    let abort: StashedVerdict<Flow> = StashedVerdict::new();
     let mut other_seen = 0usize;
     let flow = each_operand(other, &mut |other_item: Item<'a, W>| {
+        // #3293: see `binary_fanout_each_with`'s own reset.
+        abort.begin();
         other_seen += 1;
-        let other_val = match checked_fanout_operand::<_, S>(other_item, &mut abort) {
+        let other_val = match checked_fanout_operand::<_, S>(other_item, &abort) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
@@ -10541,7 +10600,7 @@ fn empty_outer_operand_pass<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => Demand::Continue,
         }
     });
-    if let Some(flow) = abort {
+    if let Some(flow) = abort.take(&flow, direct_pattern_retry(other)) {
         return flow;
     }
     if other_seen == 0 && matches!(flow, Flow::Exhausted) {
@@ -48406,7 +48465,9 @@ pub(crate) fn pipe_terminal_after_retry(
     }
 }
 
-pub(crate) fn retry_consumed_stop(upstream: &Flow, stopped_at: u64, direct_retry: bool) -> bool {
+/// [`retry_superseded`]'s exhausted half; not called directly since #3293,
+/// so the rule has one entry point.
+fn retry_consumed_stop(upstream: &Flow, stopped_at: u64, direct_retry: bool) -> bool {
     matches!(upstream, Flow::Exhausted)
         && (terminal_retry::current() != stopped_at || (!cfg!(feature = "std") && direct_retry))
 }
@@ -48566,9 +48627,9 @@ pub(crate) fn stop_with_downstream(slot: &mut Option<Flow>, flow: Flow) -> Deman
     Demand::Stop
 }
 
-/// [`stop_with_escape`] for [`each_range`], whose out-of-band slot is a
-/// `Cell<Option<Control>>` (its emit closure is called from two nested sink
-/// levels, so the slot is shared by `&` rather than `&mut`).
+/// [`stop_with_escape`] for a `Cell<Option<Control>>` slot -- the one
+/// [`StashedVerdict::stop`] keeps, shared by `&` so drivers whose closures
+/// nest (`each_range`'s operand levels and emitter) can all reach it.
 pub(crate) fn stop_with_escape_cell(
     slot: &core::cell::Cell<Option<Control>>,
     control: Control,
@@ -49905,8 +49966,8 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Pull at most `n`, then stop the generator. Was: evaluate to completion
     // and `.take(n)` the result, which had already run the branches past `n`
     // and fired their side effects (#820).
-    let (taken, flow) = each_take_n::<W, S>(expr, value, optional, n);
-    let satisfied = taken.len() >= n;
+    let (taken, flow, retried) = each_take_n::<W, S>(expr, value, optional, n);
+    let satisfied = taken.len() >= n && !retried;
     // #2024: the mainline `Stopped`/`Exhausted` arms below return `result`
     // straight through, so a mixed `Owned`/`Borrowed` `taken` batch (e.g.
     // `limit(2; 1, .a)`, a literal alongside a field navigation) must
@@ -59663,8 +59724,8 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `Builtin::Limit` is the internal spelling of the same `limit(n; f)`,
             // differing from `eval_limit` only in always materializing its answer.
             // Same sink, same trailing-control rule (#820).
-            let (taken, flow) = each_take_n::<W, S>(expr, value.clone(), optional, n);
-            let satisfied = taken.len() >= n;
+            let (taken, flow, retried) = each_take_n::<W, S>(expr, value.clone(), optional, n);
+            let satisfied = taken.len() >= n && !retried;
             // #1989: `into_owned`, not `into_owned_lossy` -- these values
             // *are* the query's output, so an undecodable string here was
             // emitted as `""` rather than raising (`Item::into_owned_lossy`'s
@@ -99938,6 +99999,20 @@ mod tests {
     #[test]
     fn test_retry_supersedes_stashed_verdict_on_owned_route_3293() {
         for (filter, values, end) in [
+            // Slice 2: the `eval.rs` twins themselves, driven through
+            // `first` -- a bare top-level operand here takes the eager
+            // `eval_single` arm, which materializes it first (#3410's family).
+            (r"first(-([[1]] as [$a] ?// [[$a]] | $a))", &["-1"][..], ""),
+            (
+                r#"first({"a":5} | .[([["a"]] as [$a] ?// [[$a]] | $a)])"#,
+                &["5"][..],
+                "",
+            ),
+            (
+                r"first(-(1 as $a ?// [$b] | $b))",
+                &[][..],
+                "error: Cannot index number with number",
+            ),
             (
                 r#"([1] as $a ?// $b | $a) and error("E")"#,
                 &["false"][..],
@@ -99986,6 +100061,14 @@ mod tests {
                 (values, end),
                 "`{filter}`"
             );
+        }
+        // `limit`'s retry-after-count-stop rule reads the retry generation,
+        // which `no_std` does not have (see `each_take_n`).
+        #[cfg(feature = "std")]
+        {
+            let filter = r#"[limit(1; if ([1] as $a ?// $b | $a) then 1 else error("E") end)]"#;
+            let (got, got_end) = outputs_and_end(b"null", filter);
+            assert_eq!((got.len(), got_end.as_str()), (0, "error: E"), "`{filter}`");
         }
     }
 
