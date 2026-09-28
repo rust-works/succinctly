@@ -9298,7 +9298,7 @@ mod tests {
                 .into_iter()
                 .map(|e| match e {
                     jq::ResolveError::Call(c) => c.name.as_str(),
-                    other => panic!("only calls were built: {other:?}"),
+                    other => panic!("only calls were built: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable: this test builds only ResolveError::Call values (#3313)"
                 })
                 .collect();
             assert_eq!(
