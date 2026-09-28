@@ -4048,7 +4048,12 @@ pub(crate) fn is_nan_sentinel(bytes: &[u8]) -> bool {
 /// arithmetic produced, and `owned_value_align_hash` must agree with it).
 /// jq-mode `==` does **not** stop here: [`owned_value_eq`] routes a jq-mode
 /// numeric pair through [`jq_numeric_cmp`] (#2906), and a yq-mode one
-/// through [`numeric_repr_eq_strict`].
+/// through [`numeric_repr_eq_strict`]. jq-mode `==` also answers `true` for
+/// one value *instance* ([`jq_identical`]: a parsed NaN, #3309, or one
+/// container's storage, #3069) where this `PartialEq` still says a NaN is
+/// never equal, so the two differ on a NaN-bearing value compared with
+/// itself. Code that needs jq's answer must call [`owned_value_eq`], not
+/// `==`, `Vec::contains` or `dedup`.
 ///
 /// `NumberLiteral` compares purely on its parsed [`NumberRepr`], never on the
 /// source text -- two spellings of the same number (`1.0` and `1e0`) are
@@ -4086,10 +4091,12 @@ pub(crate) fn numeric_repr_eq_strict(a: NumberRepr, b: NumberRepr) -> bool {
 /// Structural rules (`Null`/`Bool`/`String`/`Array`/`Object`) are
 /// identical in both modes -- only how two *numbers* compare differs, so
 /// this mirrors [`OwnedValue`]'s own `PartialEq`
-/// (`owned_value_eq_at_depth`) exactly, just threading `S` into the
-/// recursion so strictness applies at every nesting depth, not only the
-/// top: `[2.0] == [2]` and `{"a":2.0} == {"a":2}` are `false` in yq,
-/// matching jq's `true` when `S` isn't strict.
+/// (`owned_value_eq_at_depth`), just threading `S` into the recursion so
+/// strictness applies at every nesting depth, not only the top: `[2.0] ==
+/// [2]` and `{"a":2.0} == {"a":2}` are `false` in yq, matching jq's `true`
+/// when `S` isn't strict. The one other departure is jq's instance check
+/// ([`jq_identical`]), run before the contents are compared: it makes a
+/// NaN-bearing value equal to itself, which `PartialEq` never does.
 pub(crate) fn owned_value_eq<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -> bool {
     owned_value_eq_at_depth_generic::<S>(a, b, 0)
 }
@@ -4105,13 +4112,9 @@ pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
         // looking inside it (#3069). Without a NaN inside, identity already
         // implies structural equality, so this only changes an answer where
         // one sits in the container; elsewhere it is a shortcut.
-        (OwnedValue::Array(a), OwnedValue::Array(b))
-            if S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY && a.ptr_eq(b) =>
-        {
-            true
-        }
-        (OwnedValue::Object(a), OwnedValue::Object(b))
-            if S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY && a.ptr_eq(b) =>
+        (OwnedValue::Array(_), OwnedValue::Array(_))
+        | (OwnedValue::Object(_), OwnedValue::Object(_))
+            if jq_identical::<S>(a, b) =>
         {
             true
         }
@@ -4145,7 +4148,7 @@ pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
                     // A NaN is never `Equal` to the comparator, so the
                     // instance check only runs on pairs it already refused.
                     return jq_numeric_cmp(a, b) == Some(core::cmp::Ordering::Equal)
-                        || same_nan_instance(a, b);
+                        || jq_identical::<S>(a, b);
                 }
             }
             a == b
@@ -4251,9 +4254,11 @@ pub(crate) fn same_nan_instance(a: &OwnedValue, b: &OwnedValue) -> bool {
 /// parsed NaN ([`same_nan_instance`], #3309), or two handles on one array or
 /// object's storage (#3069). Always `false` in yq mode.
 ///
-/// For a caller that orders with [`compare_values`](super::eval) but must
-/// answer `==` first, as jq's `bsearch` does: the order never reports two
-/// NaN-holding values `Equal`, identical or not.
+/// The one definition of that check: [`owned_value_eq_at_depth_generic`]
+/// runs it before comparing contents, and a caller that orders with
+/// `compare_values` but must answer `==` first (jq's `bsearch`) runs it at
+/// its probe, since the order never reports two NaN-holding values `Equal`,
+/// identical or not.
 pub(crate) fn jq_identical<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -> bool {
     if !S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY {
         return false;
