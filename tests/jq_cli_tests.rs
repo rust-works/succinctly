@@ -58783,6 +58783,7 @@ fn test_and_or_negate_path_keeps_refusing_a_non_identical_register_3289() -> Res
 /// live -- refusing where jq refuses, with jq's message -- and leaves the
 /// register where its operand did, so a later `$y` re-establishes it.
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // jq object literal `{b:2}`, not a format arg
 fn test_and_or_negate_path_negate_resolves_live_on_a_trackable_input_3289() -> Result<()> {
     assert_path_rows_3289(&[
         (
