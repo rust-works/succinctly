@@ -2231,7 +2231,12 @@ answers `["b"]` — and classified the two residuals appended below):
     `and`/`or`, `,` and `if` over them — *is* proved, so
     `path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)`
     is jq's `["a","k","b"]`, `((if true then . else . end) // 1)` answers, and a pipe of
-    passthroughs (`(. | .)`, `(. | if true then . else . end)`) counts as one (jq mode only).
+    passthroughs (`(. | .)`, `(. | if true then . else . end)`) counts as one. The widening is
+    jq mode only, and only for marker-free shapes in a plain `as` bind: a marker inside it
+    (`(try (if true then $o else $o end) catch 1)`), a `?//` alternative and a destructuring
+    head keep the pre-#3279 grammar and stay refuse-only, because widening them wrote where jq
+    refuses (a null/false marker made `//` bind its right side; a `?//` chain deleted the
+    whole document).
     A condition outside the grammar (`.a`, `.x == 1`, a call) still binds a plain value, and
     so do sources the grammar cannot see at all (`select(true)`, `first(.)`, `. as $y | $y`).
     When such a `$x` is then navigated *inside* a `try`

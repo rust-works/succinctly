@@ -34541,7 +34541,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 trackable,
                 frame,
                 &mut |bound, origin| {
-                    let substituted = substitute_bound_var_at::<S>(
+                    let substituted = substitute_bound_var_at(
                         expr,
                         body,
                         var,
@@ -34549,6 +34549,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                         identity_at.clone(),
                         origin,
                         None,
+                        S::TAG == EvalTag::Jq,
                     );
                     resolve_node_sink::<S>(
                         &substituted,
@@ -38095,11 +38096,6 @@ fn resolves_to_register<S: EvalSemantics>(
         Expr::Comma(exprs) => exprs
             .iter()
             .all(|e| resolves_to_register::<S>(e, trackable, reg, frame)),
-        // #3279: every stage is proved against the same `reg`, since each
-        // stage that resolves hands the next one `reg` again.
-        Expr::Pipe(stages) if S::TAG == EvalTag::Jq => stages
-            .iter()
-            .all(|e| resolves_to_register::<S>(e, trackable, reg, frame)),
         Expr::If {
             then_branch,
             else_branch,
@@ -38108,7 +38104,14 @@ fn resolves_to_register<S: EvalSemantics>(
             resolves_to_register::<S>(then_branch, trackable, reg, frame)
                 && resolves_to_register::<S>(else_branch, trackable, reg, frame)
         }
-        Expr::Try { expr, .. } if is_raise_free_identity_passthrough::<S>(expr) => {
+        // #3279 review: the narrow (pre-#3279) grammar, deliberately. This
+        // is an immediate certification with no later value check, and
+        // proving a `?//` head identical here lets a pattern's first step
+        // succeed where it used to refuse and retry: `del((. | .) as {a:$v}
+        // ?// $v | $v.x?, $v)` then deleted the whole document where jq
+        // edits `.a`, and `[path((. | .) as {a:$v0} ?// $v0 | .c)]` refused
+        // where jq answers `[["c"]]`.
+        Expr::Try { expr, .. } if raise_free_identity_passthrough(expr, false) => {
             resolves_to_register::<S>(expr, trackable, reg, frame)
         }
         // #3119 third review round: `trackable && reg.is_truthy()` alone
@@ -38127,7 +38130,7 @@ fn resolves_to_register<S: EvalSemantics>(
         // `{"a":{"p":1,"q":2}}` wrote `{"a":{"q":2}}` without this guard,
         // where jq refuses).
         Expr::Alternative(left, _)
-            if trackable && reg.is_truthy() && is_raise_free_identity_passthrough::<S>(left) =>
+            if trackable && reg.is_truthy() && raise_free_identity_passthrough(left, false) =>
         {
             resolves_to_register::<S>(left, trackable, reg, frame)
         }
@@ -39376,7 +39379,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 frame,
                 invert_dedup,
                 &mut |reg, bindings| {
-                    let substituted = bind_pattern_body::<S>(
+                    let substituted = bind_pattern_body(
                         source,
                         body,
                         pattern,
@@ -39534,7 +39537,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
 /// (`each_pattern_alternatives`). `bindings` arrive already deduplicated
 /// ([`each_pattern_walk`]).
 #[allow(clippy::too_many_arguments)] // STYLE-0004: one splice per alternative, the walk's own inputs
-fn bind_pattern_body<S: EvalSemantics>(
+fn bind_pattern_body(
     source: &Expr,
     body: &Expr,
     pattern: &Pattern,
@@ -39548,7 +39551,13 @@ fn bind_pattern_body<S: EvalSemantics>(
         Pattern::Var(name) => {
             bound_names.push(name.clone());
             let origin = bindings.first().and_then(|b| b.origin.clone());
-            substitute_bound_var_at::<S>(source, body, name, bound, identity_at, origin, None)
+            // #3279 review: a `?//` alternative keeps the pre-#3279 grammar.
+            // `?//` retries onto a bare `$v` alternative after the first one's
+            // body refuses, and binding a newly admitted `(. | .)` source
+            // there as a passthrough of the root let `del((. | .) as {a:$v}
+            // ?// $v | $v.x?, $v)` delete the whole document where jq edits
+            // `.a` (the bare `.` source already does, a pre-existing gap).
+            substitute_bound_var_at(source, body, name, bound, identity_at, origin, None, false)
         }
         Pattern::Object(_) | Pattern::Array(_) => {
             bound_names.extend(bindings.iter().map(|b| b.name.clone()));
@@ -45900,7 +45909,7 @@ pub(crate) fn as_var_refs(
 ///   branch -- this predicate does not evaluate `c`.
 /// - `try A catch B`, requiring **only** `A` -- unlike `if`, `B` can be
 ///   ignored rather than also required, *provided `A` cannot raise*
-///   ([`is_raise_free_identity_passthrough`]): then `B` is provably never
+///   ([`raise_free_identity_passthrough`]): then `B` is provably never
 ///   reached (`. as $x | (try $x catch "whatever") as $y | ...` still tracks
 ///   `$y` even though `"whatever"` alone would not qualify on its own). An
 ///   `if` inside `A` breaks that -- its *condition* is arbitrary, so
@@ -45913,7 +45922,7 @@ pub(crate) fn as_var_refs(
 ///   The same hole reached `A // B` through a catch-less `try` on its left
 ///   (`try` yields nothing on the error, so `//` runs `B`); requiring the
 ///   `try` body itself to be raise-free closes both.
-/// - `A // B`, requiring [`is_raise_free_identity_passthrough`] of `A` --
+/// - `A // B`, requiring [`raise_free_identity_passthrough`] of `A` --
 ///   **not** the wider grammar this function itself admits, since `//` runs
 ///   `B` whenever `A` yields **nothing**, the same escape a catch-less
 ///   `try` has (above), not only when `A` raises. An `if` on `A`'s side
@@ -45972,7 +45981,9 @@ fn identity_passthrough(expr: &Expr, wide: bool) -> bool {
         Expr::Alternative(left, _) => raise_free_identity_passthrough(left, wide),
         // #3279: a pipe of passthroughs of `.` is one -- each stage's input
         // is the previous stage's output, which is `.` again.
-        Expr::Pipe(stages) if wide => stages.iter().all(|e| identity_passthrough(e, wide)),
+        Expr::Pipe(stages) if wide && !mentions_marker(expr) => {
+            stages.iter().all(|e| identity_passthrough(e, wide))
+        }
         _ => false,
     }
 }
@@ -46010,12 +46021,10 @@ fn identity_passthrough(expr: &Expr, wide: bool) -> bool {
 /// `true` from here with no such deferred/redundant check of its own would
 /// still inherit this gap -- give it one, don't change this shared
 /// function.
-fn is_raise_free_identity_passthrough<S: EvalSemantics>(expr: &Expr) -> bool {
-    raise_free_identity_passthrough(expr, S::TAG == EvalTag::Jq)
-}
-
-/// [`is_raise_free_identity_passthrough`]'s grammar; `wide` as in
-/// [`identity_passthrough`].
+///
+/// `wide` as in [`identity_passthrough`]: jq mode admits #3279's `if` and
+/// pipe arms, yq mode and [`resolves_to_register`] (an immediate
+/// certification) never do.
 fn raise_free_identity_passthrough(expr: &Expr, wide: bool) -> bool {
     match unwrap_bind_source(expr) {
         Expr::Identity => true,
@@ -46034,22 +46043,37 @@ fn raise_free_identity_passthrough(expr: &Expr, wide: bool) -> bool {
             cond,
             then_branch,
             else_branch,
-        } if wide => {
+        } if wide && !mentions_marker(expr) => {
             cond_is_total_and_raise_free(cond)
                 && raise_free_identity_passthrough(then_branch, wide)
                 && raise_free_identity_passthrough(else_branch, wide)
         }
         // #3279: a pipe of raise-free, non-empty passthroughs is one too.
-        Expr::Pipe(stages) if wide => stages
+        Expr::Pipe(stages) if wide && !mentions_marker(expr) => stages
             .iter()
             .all(|e| raise_free_identity_passthrough(e, wide)),
         _ => false,
     }
 }
 
+/// Whether `expr` holds a variable marker anywhere (#3279 review).
+///
+/// #3279's `if` and pipe arms assume every `.` they see is the frame's own
+/// `.`, which is what makes `//`'s right side safe (#3129: it runs only when
+/// that `.` is null/false, and a value below it can only be null). A marker
+/// breaks that: `(if true then $x else . end) // {"b":1}` and `($x | (. //
+/// {"b":1}))` run `B` whenever `$x`'s value is null/false, whatever the
+/// register holds, and `B`'s fresh value then certified by value against an
+/// equal document node -- `del(.k | ... as $v | $v | .b)` wrote where jq
+/// refuses. So the widened arms admit marker-free shapes only; a marker
+/// source keeps the pre-#3279 grammar.
+fn mentions_marker(expr: &Expr) -> bool {
+    crate::jq::walk::any_subexpr(expr, &mut |e| matches!(e, Expr::TrackedVar(_)))
+}
+
 /// Whether `cond` provably yields at least one output and never raises, on
 /// any input (#3279) -- what an `if` condition must satisfy for the `if` to
-/// count as raise-free in [`is_raise_free_identity_passthrough`]. A closed,
+/// count as raise-free in [`raise_free_identity_passthrough`]. A closed,
 /// conservative grammar: literals, `.`, variables and `$__loc__`, and `not`,
 /// comparisons (`jv_cmp` is total, so `{} < []` does not raise), `and`,
 /// `or`, `,` and `if` over them. Field and index access (`.a` raises on a
@@ -46170,7 +46194,16 @@ pub(crate) fn substitute_bound_var_from<S: EvalSemantics>(
     bound: &OwnedValue,
     node: Option<BindOrigin>,
 ) -> Expr {
-    substitute_bound_var_at::<S>(bind_expr, body, var_name, bound, None, None, node)
+    substitute_bound_var_at(
+        bind_expr,
+        body,
+        var_name,
+        bound,
+        None,
+        None,
+        node,
+        S::TAG == EvalTag::Jq,
+    )
 }
 
 /// The [`Origin`] an identity-passthrough bind source freezes `.` with,
@@ -46208,7 +46241,7 @@ pub(crate) fn substitute_bound_var_from<S: EvalSemantics>(
 ///   positions (`. as $p | .a | (if true then $p else . end) as $x`) answer
 ///   `None`, a refusal where jq answers, listed with the refuse-only rows.
 /// - `try A catch B`: `A`'s, only when `A` is raise-free
-///   ([`is_raise_free_identity_passthrough`], the same gate
+///   ([`raise_free_identity_passthrough`], the same gate
 ///   `is_identity_passthrough` applies) -- an `if` condition inside `A` can
 ///   raise, and the handler's value is then a fresh construction that has
 ///   no position (#2978 review: `path(.a | (try (if error("e") then . else
@@ -46319,7 +46352,8 @@ fn identity_bind_position<S: EvalSemantics>(
 /// cursor routes only, never certified by `resolve_node`. With none of the
 /// three this is a plain, unwrapped literal substitution, same as
 /// `substitute_var`.
-fn substitute_bound_var_at<S: EvalSemantics>(
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the bind's source, body, value and three witnesses, plus the grammar width
+fn substitute_bound_var_at(
     bind_expr: &Expr,
     body: &Expr,
     var_name: &str,
@@ -46327,8 +46361,11 @@ fn substitute_bound_var_at<S: EvalSemantics>(
     identity_at: Option<Origin>,
     origin: Option<Origin>,
     node: Option<BindOrigin>,
+    // Whether #3279's widened passthrough grammar applies: jq mode, except
+    // a `?//` alternative, which keeps the pre-#3279 grammar.
+    wide: bool,
 ) -> Expr {
-    let origin = if is_identity_passthrough::<S>(bind_expr) {
+    let origin = if identity_passthrough(bind_expr, wide) {
         debug_assert!(
             matches!(
                 identity_at,

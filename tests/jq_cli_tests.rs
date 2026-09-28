@@ -66606,6 +66606,15 @@ fn test_object_index_key_yq_mode_unchanged_3300() -> Result<()> {
 /// discarded. A raising, empty or navigating condition still binds by value
 /// and refuses (#2978, #3119, #3129). Every row captured live against jq
 /// 1.7.1.
+///
+/// Deliberately refuse-only, as on `main` (#3279 review): a shape holding a
+/// marker (`(try (if true then $o else $o end) catch 1) as $v0`, jq `["b"]`)
+/// and a `?//` alternative (`(try (if true then . else . end) catch 1) as
+/// [$p] ?// $v0`, jq `["b"]`) keep the pre-#3279 grammar, because widening
+/// either wrote where jq refuses. So does a destructuring head
+/// (`((if true then . else . end) // {..}) as {p:$x}`, jq `{"a":{"q":2}}`):
+/// `resolves_to_register` certifies it immediately, with no later value
+/// check, and its widening let a `?//` chain delete the whole document.
 #[test]
 fn test_try_wrapped_if_bind_source_keeps_register_3279() -> Result<()> {
     for (input, filter, expected) in [
@@ -66625,12 +66634,9 @@ fn test_try_wrapped_if_bind_source_keeps_register_3279() -> Result<()> {
         ("{\"a\":1,\"b\":2}", "del((try (if true and false then . else . end) catch 1) as $v0 | try $v0.b)", "{\"a\":1}"),
         ("{\"a\":1,\"b\":2}", "del((try (if $__loc__ then . else . end) catch 1) as $v0 | try $v0.b)", "{\"a\":1}"),
         ("{\"a\":1,\"b\":2}", "del((try (if (if true then 1 else 2 end) then . else . end) catch 1) as $v0 | try $v0.b)", "{\"a\":1}"),
-        ("{\"a\":1,\"b\":2}", "path((try (if true then . else . end) catch 1) as [$p] ?// $v0 | $v0.b)", "[\"b\"]"),
-        ("{\"a\":1,\"b\":2}", "path(. as $o | (try (if true then $o else $o end) catch 1) as $v0 | $v0.b)", "[\"b\"]"),
         ("{\"a\":1,\"b\":2}", "[path((try (if (true,false) then . else . end) catch 1) as $v0 | $v0.b)]", "[[\"b\"],[\"b\"]]"),
         ("{\"a\":1,\"b\":2}", ". as $o | 5 | [path((try (if true then . else . end) catch 1) as $v0 | $v0)]", "[[]]"),
         ("{\"a\":1,\"b\":2}", "[path((try (if empty then . else . end)) as $v0 | $v0.b)]", "[]"),
-        ("{\"a\":{\"p\":1,\"q\":2}}", "del(.a | ((if true then . else . end) // {\"p\":100,\"q\":200}) as {p:$x} | $x)", "{\"a\":{\"q\":2}}"),
         ("{\"a\":{\"x\":1,\"y\":2}}", ". as $x | .a | (if true then $x else $x end) as {x:$q} | $q", "null"),
         ("{\"a\":1,\"b\":2}", "path((try (if -1 then . else . end) catch 1) as $v0 | $v0.b)", "[\"b\"]"),
     ] {
@@ -66669,6 +66675,68 @@ fn test_try_wrapped_if_bind_source_keeps_register_3279() -> Result<()> {
         assert!(
             stderr.contains(message),
             "#3279: `{filter}` on {input}: expected {message:?}, stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3279 review: the widening must neither write where jq refuses nor
+/// start refusing where jq and `main` answer. A marker routed through `//`
+/// (`(if true then $x else . end) // B`, `$x | (. // B)`) with a null/false
+/// `$x` bound `B`'s fresh value and deleted through it; a `?//` chain over a
+/// newly admitted head deleted or replaced the whole document; and proving
+/// such a head identical made a pattern body refuse where `?//` used to
+/// retry. The first and last groups match jq; the `?//` corruption rows
+/// keep `main`'s refusal (jq edits `.a`; the bare `.` source already
+/// corrupts, a pre-existing gap), never a write.
+#[test]
+fn test_try_if_widening_does_not_leak_3279() -> Result<()> {
+    for (input, filter, expected, expected_code) in [
+        ("null", ". as $x | {\"k\":{\"b\":1}} | del(.k | ((if true then $x else . end) // {\"b\":1}) as $v | $v | .b)", "", 5),
+        ("null", ". as $x | {\"k\":{\"b\":1}} | del(.k | ($x | (. // {\"b\":1})) as $v | $v | .b)", "", 5),
+        ("false", ". as $x | {\"k\":{\"b\":1}} | del(.k | ((if true then $x else . end) // {\"b\":1}) as $v | $v | .b)", "", 5),
+        ("{\"n\":null,\"k\":{\"b\":1}}", ". as $r | .n | . as $x | $r | del(.k | ((if true then $x else . end) // {\"b\":1}) as $v | $v | .b)", "", 5),
+        ("{\"a\":\"s\",\"c\":\"s\"}", "[path((. | .) as {a:$v0} ?// $v0 | .c)]", "[[\"c\"]]", 0),
+        ("{\"a\":\"s\",\"c\":\"s\"}", "[path((try (if true then . else . end) catch 1) as {a:$v0} ?// $v0 | .c)]", "[[\"c\"]]", 0),
+        ("{\"a\":\"s\",\"c\":\"s\"}", "[path(((if true then . else . end) // 1) as {a:$v0} ?// $v0 | .c)]", "[[\"c\"]]", 0),
+        ("{\"a\":\"s\",\"c\":\"s\"}", "((. | .) as {a:$v0} ?// $v0 | .c) = 9", "{\"a\":\"s\",\"c\":9}", 0),
+        ("{\"a\": 1, \"c\": 1, \"d\": {\"b\": 1}, \"x\": {\"a\": 1, \"c\": 1}}", "path((try (if not then . else . end) catch {\"b\":1}) as $v0 | .x | (. | if .a then . else . end) as $v1 ?// {a:$v1} | try ($v1 | .b?) | ([.,.] | .[1]))", "", 0),
+        ("{\"a\": [{\"b\": 1}], \"c\": [1], \"d\": 2, \"x\": {\"a\": [{\"b\": 1}], \"c\": 1}}", "path((try (if $__loc__ then . else . end) catch {\"b\":1}) as {a:$v0} ?// $v0 | .x.a | ((if true then . else . end) // $v0) as $v1 | .b? | (try ($v1 | .b?) catch .) | (.a | $v1 | getpath([\"a\"]) | .b?))", "", 0),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, expected_code),
+            "#3279 review: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    for (input, filter) in [
+        (
+            "{\"a\":2,\"b\":3}",
+            "del((. | .) as {a:$v} ?// $v | $v.x?, $v)",
+        ),
+        (
+            "{\"a\":2,\"b\":3}",
+            "del((try (if true then . else . end) catch 1) as {a:$v0} ?// $v0 | ($v0[0]?, $v0))",
+        ),
+        (
+            "{\"a\":2}",
+            "((. | .) as {a:$v0} ?// $v0 | ($v0[0]?, $v0)) = 9",
+        ),
+        (
+            "{\"a\":2,\"b\":3}",
+            "(((if true then . else . end) // 0) as {a:$v} ?// $v | $v.x?, $v) |= 5",
+        ),
+        (
+            "{\"a\":2}",
+            "[path((. | .) as {a:$v0} ?// $v0 | ($v0[0]?, $v0))]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3279 review: `{filter}` on {input} must refuse, not write: stderr={stderr:?}"
         );
     }
     Ok(())
