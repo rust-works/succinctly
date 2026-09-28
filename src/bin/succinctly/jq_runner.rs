@@ -1035,21 +1035,70 @@ impl ModuleLoader {
 
         let program = jq::parse_program(&contents).map_err(|e| ModuleLoadError::Parse {
             path: canonical.clone(),
-            contents,
+            contents: contents.clone(),
             error: e,
         })?;
-
-        // Stamp `$__loc__` BEFORE wrapping, never after: `stamp_loc_file`
-        // overwrites `file` unconditionally, so a wrap-then-stamp order would
-        // silently re-stamp an inner module's already-correct `$__loc__` with
-        // *this* module's path, regressing #2774.
-        let own = extract_and_stamp_func_defs(&program.expr, file_path);
 
         let own_id = self.run_id_for(module_path);
         self.loading.push((canonical, module_path.to_string()));
         let deps = self.module_dep_defs(&program, own_id);
         self.loading.pop();
         let (deps, data_bindings) = deps?;
+
+        // #2950: mirror `run_jq`'s own top-level two-phase parse (#2395) so a
+        // `def` arriving through *this module's own* `include` can shadow a
+        // builtin inside the module's body too -- #2865 put such a def in
+        // scope there, but the module was still parsed with no knowledge of
+        // it. The candidate names are read directly out of `deps`, already
+        // computed by `module_dep_defs` just above (which already attempted
+        // every include/import this module names, and is the only pass that
+        // does): `include`-origin groups carry `alias: None`, matching
+        // `module_dep_defs`'s own `defs.push((id, None, sigs))` for an
+        // `include` versus `Some(alias)` for an `import` -- exactly
+        // `unqualified_def_names`'s own "includes only, imports are
+        // namespaced and do not shadow" rule, one level down.
+        //
+        // Deliberately *not* a second, independent traversal (an earlier
+        // version of this fix was): re-attempting every include here as its
+        // own pass, on top of `module_dep_defs`'s own attempt moments
+        // earlier, doubled the cost of resolving a *failing* include at
+        // every level -- module_dep_defs is the only pass that can ever
+        // actually observe a failure (this derivation only runs after `?`
+        // has already confirmed every directive resolved), so a second
+        // independent attempt at the same directives had nothing to save by
+        // existing and compounded multiplicatively with chain/cycle depth
+        // (empirically O(2^depth) instead of O(depth) for a chain that
+        // fails N levels deep, caught in code review). Reading the names
+        // back out of `deps` costs nothing further: the directive list
+        // (`program.includes`/`program.imports`) a re-parse widens is
+        // identical to what produced `deps`, since widening only changes
+        // how the body's own calls resolve, never which modules the
+        // directives themselves name.
+        let module_def_names: BTreeSet<String> = deps
+            .iter()
+            .filter(|(_, alias, _)| alias.is_none())
+            .flat_map(|(_, _, sigs)| sigs.iter().map(|(name, _)| name.clone()))
+            .collect();
+        let program = if module_def_names.is_empty() {
+            program
+        } else {
+            // Widening is monotone, the same reasoning `run_jq`'s own
+            // fallback comment gives in full: this can only succeed wherever
+            // the plain parse above did.
+            jq::parse_program_with_extra_shadowable_defs(
+                &contents,
+                jq::ParserMode::Jq,
+                false,
+                &module_def_names,
+            )
+            .unwrap_or(program) // omni-dev: coverage tolerate-line reason="unreachable: widening the shadow-candidate set never rejects a program the first parse accepted, for the identical reason run_jq's own analogous fallback (#2395) is tolerated -- see that line's own comment (#2950)"
+        };
+
+        // Stamp `$__loc__` BEFORE wrapping, never after: `stamp_loc_file`
+        // overwrites `file` unconditionally, so a wrap-then-stamp order would
+        // silently re-stamp an inner module's already-correct `$__loc__` with
+        // *this* module's path, regressing #2774.
+        let own = extract_and_stamp_func_defs(&program.expr, file_path);
         // Last alias wins (confirmed live, same rule a repeated `--arg`/
         // `--argjson` name already follows): fold before substituting, not
         // once per binding, since a name `substitute_vars` has already
