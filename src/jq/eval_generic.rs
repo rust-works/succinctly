@@ -7372,7 +7372,7 @@ fn owned_identity_bind_door_applies(stages: &[Expr]) -> bool {
     let binds_for_resolver = stages.iter().any(|stage| {
         crate::jq::walk::any_subexpr(stage, &mut |e| match e {
             Expr::As { expr, var, body } => {
-                !is_identity_passthrough(expr)
+                !is_identity_passthrough::<JqSemantics>(expr)
                     && bind_body_reaches_resolver_by_navigation(body, var)
             }
             _ => false,
@@ -10900,7 +10900,8 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
             // see `embed_table`. The guard pops the entry however the body
             // leaves, error and `break` included.
             let _embed = embed_table_push::<S>(origin.as_ref(), &bound_val);
-            let substituted_body = substitute_bound_var_from(expr, body, var, &bound_val, origin);
+            let substituted_body =
+                substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
             eval_each_generic::<S, V>(&substituted_body, value.clone(), optional, cursor, sink)
         },
     )
@@ -26559,7 +26560,7 @@ fn eval_owned_identity_as<S: EvalSemantics, V: DocumentValue>(
     for (bound, origin) in bound_values {
         // `bind`, not the rewritten source: `is_identity_passthrough` is a
         // question about what the user wrote.
-        let substituted = substitute_bound_var_from(bind, body, var, &bound, origin);
+        let substituted = substitute_bound_var_from::<S>(bind, body, var, &bound, origin);
         match eval_owned_identity_spliced::<S, V>(
             &substituted,
             rest,

@@ -66596,6 +66596,222 @@ fn test_object_index_key_yq_mode_unchanged_3300() -> Result<()> {
 }
 
 // ============================================================================
+// #3279: a `try`-wrapped `if` as a bind source keeps the path register
+// ============================================================================
+
+/// An `if` whose condition provably yields an output and never raises
+/// (`true`, `1 < 2`, `not`, `$__loc__`, ...), inside a `try` or on `//`'s
+/// left, and a pipe of passthroughs, bind `.` itself -- so `$v0.b` resolves
+/// in `path()` and writes through it under `try` instead of being silently
+/// discarded. A raising, empty or navigating condition still binds by value
+/// and refuses (#2978, #3119, #3129). Every row captured live against jq
+/// 1.7.1.
+///
+/// Deliberately refuse-only, as on `main` (#3279 review): a shape holding a
+/// marker (`(try (if true then $o else $o end) catch 1) as $v0`, jq `["b"]`)
+/// and a `?//` alternative (`(try (if true then . else . end) catch 1) as
+/// [$p] ?// $v0`, jq `["b"]`) keep the pre-#3279 grammar, because widening
+/// either wrote where jq refuses. So does a destructuring head
+/// (`((if true then . else . end) // {..}) as {p:$x}`, jq `{"a":{"q":2}}`):
+/// `resolves_to_register` certifies it immediately, with no later value
+/// check, and its widening let a `?//` chain delete the whole document.
+#[test]
+fn test_try_wrapped_if_bind_source_keeps_register_3279() -> Result<()> {
+    for (input, filter, expected) in [
+        ("{\"a\":1,\"b\":2}", "path((try (if true then . else . end) catch 1) as $v0 | $v0.b)", "[\"b\"]"),
+        ("{\"a\":1,\"b\":2}", "del((try (if true then . else . end) catch 1) as $v0 | try $v0.b)", "{\"a\":1}"),
+        ("{\"a\":1,\"b\":2}", "((try (if true then . else . end) catch 1) as $v0 | try ($v0 | .b)) = 9", "{\"a\":1,\"b\":9}"),
+        ("{\"a\":1,\"b\":2}", "path((try (if true then . else . end)) as $v0 | $v0.b)", "[\"b\"]"),
+        ("{\"a\":1,\"b\":2}", "[path((try (. | if true then . else . end) catch 1) as $v0 | $v0)]", "[[]]"),
+        ("{\"a\":1,\"b\":2}", "path((if true then . else . end) as $v0 | $v0.b)", "[\"b\"]"),
+        ("{\"a\":1,\"b\":2}", "path((try . catch 1) as $v0 | $v0.b)", "[\"b\"]"),
+        ("{\"a\":1,\"b\":2}", "del((. | .) as $v0 | try $v0.b)", "{\"a\":1}"),
+        ("{\"a\":1,\"b\":2}", "del((. | if true then . else . end) as $v0 | try $v0.b)", "{\"a\":1}"),
+        ("{\"a\":1,\"b\":2}", "del(((if true then . else . end) // 1) as $v0 | try $v0.b)", "{\"a\":1}"),
+        ("{\"a\":1,\"b\":2}", "del((try (if 1 < 2 then . else . end) catch 1) as $v0 | try $v0.b)", "{\"a\":1}"),
+        ("{\"a\":1,\"b\":2}", "del((try (if .==1 then . else . end) catch 1) as $v0 | try $v0.b)", "{\"a\":1}"),
+        ("{\"a\":1,\"b\":2}", "del((try (if not then . else . end) catch 1) as $v0 | try $v0.b)", "{\"a\":1}"),
+        ("{\"a\":1,\"b\":2}", "del((try (if true and false then . else . end) catch 1) as $v0 | try $v0.b)", "{\"a\":1}"),
+        ("{\"a\":1,\"b\":2}", "del((try (if $__loc__ then . else . end) catch 1) as $v0 | try $v0.b)", "{\"a\":1}"),
+        ("{\"a\":1,\"b\":2}", "del((try (if (if true then 1 else 2 end) then . else . end) catch 1) as $v0 | try $v0.b)", "{\"a\":1}"),
+        ("{\"a\":1,\"b\":2}", "[path((try (if (true,false) then . else . end) catch 1) as $v0 | $v0.b)]", "[[\"b\"],[\"b\"]]"),
+        ("{\"a\":1,\"b\":2}", ". as $o | 5 | [path((try (if true then . else . end) catch 1) as $v0 | $v0)]", "[[]]"),
+        ("{\"a\":1,\"b\":2}", "[path((try (if empty then . else . end)) as $v0 | $v0.b)]", "[]"),
+        ("{\"a\":{\"x\":1,\"y\":2}}", ". as $x | .a | (if true then $x else $x end) as {x:$q} | $q", "null"),
+        ("{\"a\":1,\"b\":2}", "path((try (if -1 then . else . end) catch 1) as $v0 | $v0.b)", "[\"b\"]"),
+        // A two-stage passthrough pipe on the register: the bare value
+        // rule (no single stage to take a position from), which jq agrees
+        // with here.
+        (
+            r#"{"a":1}"#,
+            "path((if true then . else . end | if 1 then . else . end) as $v | $v.a)",
+            r#"["a"]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3279: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    for (input, filter, message) in [
+        ("{\"a\":1,\"b\":2}", "path((try (if error(\"e\") then . else . end) catch {\"b\":1}) as $v0 | $v0.b)", "Invalid path expression near attempt to access element \"b\" of {\"b\":1}"),
+        ("{\"a\":1,\"b\":2}", "[path(((if empty then . else . end) // {\"b\":1}) as $v0 | $v0.b)]", "Invalid path expression near attempt to access element \"b\" of {\"b\":1}"),
+        ("{\"a\":{\"k\":{\"b\":1}}}", "del(.a | (try (if error(\"e\") then . else . end) catch {\"b\":1}) as $x | .k | $x | .b)", "Invalid path expression near attempt to access element \"b\" of {\"b\":1}"),
+        ("{\"a\":{\"k\":{\"b\":1}}}", "del(.a | ((if empty then . else . end) // {\"b\":1}) as $x | .k | $x | .b)", "Invalid path expression near attempt to access element \"b\" of {\"b\":1}"),
+        ("{\"a\":{\"p\":1,\"q\":2}}", "del(.a | ((if empty then . else . end) // {\"p\":100,\"q\":200}) as {p:$x} | $x)", "Invalid path expression near attempt to access element \"p\" of {\"p\":100,\"q\":200}"),
+        ("{\"a\":{\"x\":1,\"y\":2}}", "path(. as $x | .a | ($x | if true then . else . end) as $y | $y | .x)", "Invalid path expression near attempt to access element \"x\" of {\"a\":{\"x\":1,\"y\":2}}"),
+        ("{\"a\":{\"x\":1,\"y\":2}}", "path(. as $x | .a | (. | $x) as $y | $y | .a)", "Invalid path expression near attempt to access element \"a\" of {\"a\":{\"x\":1,\"y\":2}}"),
+        ("{\"a\":1,\"b\":2}", "path((try (if .a.q then . else . end) catch {\"b\":5}) as $v0 | $v0.b)", "Invalid path expression near attempt to access element \"b\" of {\"b\":5}"),
+        ("{\"a\":{\"b\":{\"c\":1}}}", "del(.a | {b:{c:1}} | (. | if true then . else . end) as $x | $x)", "Invalid path expression with result {\"b\":{\"c\":1}}"),
+        ("{\"a\":{\"b\":{\"c\":1}}}", "del(.a | {b:{c:1}} | (. | .) as $x | $x | .b)", "Invalid path expression near attempt to access element \"b\" of {\"b\":{\"c\":1}}"),
+        // A two-stage passthrough pipe off the register: a computed `.`,
+        // so the bind is `Untracked` and never certified, as jq refuses.
+        (
+            r#"{"a":1}"#,
+            "path(5 | (if true then . else . end | if 1 then . else . end) as $v | $v)",
+            "Invalid path expression with result 5",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3279: `{filter}` on {input} must still refuse: stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(message),
+            "#3279: `{filter}` on {input}: expected {message:?}, stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3279 review: the widening must neither write where jq refuses nor
+/// start refusing where jq and `main` answer. A marker routed through `//`
+/// (`(if true then $x else . end) // B`, `$x | (. // B)`) with a null/false
+/// `$x` bound `B`'s fresh value and deleted through it; a `?//` chain over a
+/// newly admitted head deleted or replaced the whole document; and proving
+/// such a head identical made a pattern body refuse where `?//` used to
+/// retry. The first and last groups match jq; the `?//` corruption rows
+/// keep `main`'s refusal (jq edits `.a`; the bare `.` source already
+/// corrupts, a pre-existing gap), never a write.
+#[test]
+fn test_try_if_widening_does_not_leak_3279() -> Result<()> {
+    for (input, filter, expected, expected_code) in [
+        ("null", ". as $x | {\"k\":{\"b\":1}} | del(.k | ((if true then $x else . end) // {\"b\":1}) as $v | $v | .b)", "", 5),
+        ("null", ". as $x | {\"k\":{\"b\":1}} | del(.k | ($x | (. // {\"b\":1})) as $v | $v | .b)", "", 5),
+        ("false", ". as $x | {\"k\":{\"b\":1}} | del(.k | ((if true then $x else . end) // {\"b\":1}) as $v | $v | .b)", "", 5),
+        ("{\"n\":null,\"k\":{\"b\":1}}", ". as $r | .n | . as $x | $r | del(.k | ((if true then $x else . end) // {\"b\":1}) as $v | $v | .b)", "", 5),
+        ("{\"a\":\"s\",\"c\":\"s\"}", "[path((. | .) as {a:$v0} ?// $v0 | .c)]", "[[\"c\"]]", 0),
+        ("{\"a\":\"s\",\"c\":\"s\"}", "[path((try (if true then . else . end) catch 1) as {a:$v0} ?// $v0 | .c)]", "[[\"c\"]]", 0),
+        ("{\"a\":\"s\",\"c\":\"s\"}", "[path(((if true then . else . end) // 1) as {a:$v0} ?// $v0 | .c)]", "[[\"c\"]]", 0),
+        ("{\"a\":\"s\",\"c\":\"s\"}", "((. | .) as {a:$v0} ?// $v0 | .c) = 9", "{\"a\":\"s\",\"c\":9}", 0),
+        ("{\"a\": 1, \"c\": 1, \"d\": {\"b\": 1}, \"x\": {\"a\": 1, \"c\": 1}}", "path((try (if not then . else . end) catch {\"b\":1}) as $v0 | .x | (. | if .a then . else . end) as $v1 ?// {a:$v1} | try ($v1 | .b?) | ([.,.] | .[1]))", "", 0),
+        ("{\"a\": [{\"b\": 1}], \"c\": [1], \"d\": 2, \"x\": {\"a\": [{\"b\": 1}], \"c\": 1}}", "path((try (if $__loc__ then . else . end) catch {\"b\":1}) as {a:$v0} ?// $v0 | .x.a | ((if true then . else . end) // $v0) as $v1 | .b? | (try ($v1 | .b?) catch .) | (.a | $v1 | getpath([\"a\"]) | .b?))", "", 0),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, expected_code),
+            "#3279 review: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    for (input, filter) in [
+        (
+            "{\"a\":2,\"b\":3}",
+            "del((. | .) as {a:$v} ?// $v | $v.x?, $v)",
+        ),
+        (
+            "{\"a\":2,\"b\":3}",
+            "del((try (if true then . else . end) catch 1) as {a:$v0} ?// $v0 | ($v0[0]?, $v0))",
+        ),
+        (
+            "{\"a\":2}",
+            "((. | .) as {a:$v0} ?// $v0 | ($v0[0]?, $v0)) = 9",
+        ),
+        (
+            "{\"a\":2,\"b\":3}",
+            "(((if true then . else . end) // 0) as {a:$v} ?// $v | $v.x?, $v) |= 5",
+        ),
+        (
+            "{\"a\":2}",
+            "[path((. | .) as {a:$v0} ?// $v0 | ($v0[0]?, $v0))]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3279 review: `{filter}` on {input} must refuse, not write: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// yq has no `try`/`if` of its own to capture (real yq's lexer rejects
+/// both), so #3279's jq-mode widening is pinned not to leak: `succinctly
+/// yq` answers exactly as before.
+#[test]
+fn test_try_wrapped_if_bind_source_yq_unchanged_3279() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args([
+            "yq",
+            "-o",
+            "json",
+            "-I",
+            "0",
+            "(try (if true then . else . end) catch 1) as $v0 | $v0.b",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .expect("piped")
+                .write_all(b"a: 1\nb: 2\n")?;
+            child.wait_with_output()
+        })?;
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim_end(),
+        "2",
+        "#3279 (yq): {output:?}"
+    );
+    // Path position, where the widening lives: yq keeps refusing (real yq
+    // no-ops a write through a variable; a refusal is the safe side of
+    // that divergence, a write the corrupting one).
+    for filter in [
+        "del((try (if true then . else . end) catch 1) as $v0 | $v0.b)",
+        "del((. | .) as $v0 | $v0.b)",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(b"a: 1\nb: 2\n")?;
+                child.wait_with_output()
+            })?;
+        assert!(
+            output.stdout.is_empty()
+                && String::from_utf8_lossy(&output.stderr).contains("Invalid path expression"),
+            "#3279 (yq): `{filter}`: {output:?}"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
 // #3036: #2642's fabrication through the routes that never cross a funnel
 // ============================================================================
 

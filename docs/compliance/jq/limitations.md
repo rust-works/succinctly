@@ -2220,18 +2220,30 @@ answers `["b"]` — and classified the two residuals appended below):
   handler's fresh `{"b":1}` as a value-certified snapshot of `.` — and
   `del(.a | (try (if error("e") then . else . end) catch {"b":1}) as $x | .k | $x | .b)` on
   `{"a":{"k":{"b":1}}}` wrote `{"a":{"k":{}}}` where jq refuses. A `try` body must now be
-  raise-free (the same grammar minus `if`) for the `try` to count as a passthrough; the same
+  raise-free (the same grammar minus `if`, save one whose condition is provably total and
+  raise-free, #3279) for the `try` to count as a passthrough; the same
   gate keeps `SnapshotAt` from being minted for it.
 
   **What still refuses** after #2978, each a refusal where jq answers, never a fabricated path:
-  - a `try` whose body holds an `if` whose condition happens *not* to raise —
-    `path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)`,
-    `["a","k","b"]` in jq. The raise-free gate above is static and cannot tell it from the
-    raising twin, so the bind is a plain value. Note that when such a `$x` is then navigated
-    *inside* a `try` (`((try (if .a then . else . end) catch 1) as $v | try ($v | .b?)) |= .`),
-    the plain value's refusal is caught by that `try` exactly as jq's own path errors are, and
-    the write jq performs (`"b":null`) is silently skipped rather than refused — the same
-    static gate, surfacing through `try` instead of as an exit 5 (found by #3133's fuzz);
+  - a `try` whose body holds an `if` whose condition the static gate cannot prove total and
+    raise-free. Since [#3279](https://github.com/rust-works/succinctly/issues/3279) a
+    condition in a closed grammar — literals, `.`, variables, `$__loc__`, `not`, comparisons,
+    `and`/`or`, `,` and `if` over them — *is* proved, so
+    `path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)`
+    is jq's `["a","k","b"]`, `((if true then . else . end) // 1)` answers, and a pipe of
+    passthroughs (`(. | .)`, `(. | if true then . else . end)`) counts as one. The widening is
+    jq mode only, and only for marker-free shapes in a plain `as` bind: a marker inside it
+    (`(try (if true then $o else $o end) catch 1)`), a `?//` alternative and a destructuring
+    head keep the pre-#3279 grammar and stay refuse-only, because widening them wrote where jq
+    refuses (a null/false marker made `//` bind its right side; a `?//` chain deleted the
+    whole document).
+    A condition outside the grammar (`.a`, `.x == 1`, a call) still binds a plain value, and
+    so do sources the grammar cannot see at all (`select(true)`, `first(.)`, `. as $y | $y`).
+    When such a `$x` is then navigated *inside* a `try`
+    (`del((try (if .a then . else . end) catch 1) as $v | try $v.b)`, jq `{"a":1}`), the plain
+    value's refusal is caught by that `try` exactly as jq's own path errors are, and the write
+    jq performs is **silently skipped** rather than refused — tracked as
+    [#3402](https://github.com/rust-works/succinctly/issues/3402);
   - an `if` bind source whose arms sit at *different* positions —
     `path(. as $p | .a | (if true then $p else . end) as $x | $x | getpath(["a"]) | .b)`,
     `["a","b"]` in jq. `identity_bind_position` is static (the condition is not evaluated),
