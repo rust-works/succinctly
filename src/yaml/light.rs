@@ -3751,10 +3751,10 @@ fn transcode_double_quoted_to_json(
                 }
                 i += 1;
             }
-            b'\r' | b'\n' if json_sourced => {
+            b if is_line_break(b) && json_sourced => {
                 // #3380: literal content, not a fold candidate -- see this
                 // function's own doc comment.
-                write_json_escape(output, bytes[i] as char);
+                write_json_escape(output, b as char);
                 i += 1;
             }
             b'\r' | b'\n' => {
@@ -4580,11 +4580,10 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                 }
                 i += 1;
             }
-            b'\r' | b'\n' if json_sourced => {
+            b if is_line_break(b) && json_sourced => {
                 // #3380: literal content, not a fold candidate -- see this
                 // function's own doc comment.
-                stream_json_escape(out, bytes[i] as char)
-                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                stream_json_escape(out, b as char).map_err(|_| YamlStringError::InvalidUtf8)?;
                 i += 1;
             }
             b'\r' | b'\n' => {
@@ -6274,10 +6273,10 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
                 }
                 i += 1;
             }
-            b'\r' | b'\n' if json_sourced => {
+            b if is_line_break(b) && json_sourced => {
                 // #3380: literal content, not a fold candidate -- see this
                 // function's own doc comment.
-                result.push(bytes[i] as char);
+                result.push(b as char);
                 i += 1;
             }
             b'\r' | b'\n' => {
@@ -13207,6 +13206,25 @@ mod tests {
     fn test_transcode_double_quoted_json_sourced_escaped_cr_unaffected_3380() {
         let json = get_json_via_transcode_json_sourced(b"\"x\\ry\"");
         assert_eq!(json, "\"x\\ry\"");
+    }
+
+    /// Streaming counterpart of the three `get_json_via_transcode_json_sourced`
+    /// tests above -- `stream_transcode_double_quoted_to_json`'s own
+    /// `json_sourced` arm had no *direct* test (only indirect coverage via
+    /// the CLI integration test in `tests/yq_cli_tests.rs`, which happens
+    /// to route through this same streaming path). Same pattern as
+    /// `test_stream_transcode_double_quoted_next_line_and_nbsp_escape`
+    /// above, but on a `build_json_sourced` index.
+    #[test]
+    fn test_stream_transcode_double_quoted_json_sourced_raw_cr_lf_not_folded_3380() {
+        let yaml = b"{\"a\":\"x\ry\",\"b\":\"x\ny\",\"c\":\"x\r\ny\"}";
+        let index = YamlIndex::build_json_sourced(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_json_document(&mut out, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(out, "{\"a\":\"x\\ry\",\"b\":\"x\\ny\",\"c\":\"x\\r\\ny\"}");
     }
 
     #[test]
