@@ -4539,6 +4539,10 @@ fn output_value<W: Write>(
             // The dummy existed only because the two axes were stored
             // separately; absorbing both into one value removes it.
             convention: JsonConvention::Preserve,
+            // #3413 is scoped to jq mode's own `-C` colors, verified against
+            // jq 1.7.1; real yq's own NaN color convention (if any) hasn't
+            // been checked against its oracle, so this stays `false` here.
+            mark_nan_for_color: false,
         },
     );
 

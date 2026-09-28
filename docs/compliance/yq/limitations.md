@@ -4338,6 +4338,34 @@ Scalar `tostring` agrees in both (the #2902 fix above); the container spellings 
 trailing newline are pre-existing and not attempted there. The `tojson` tests in
 `tests/yq_cli_tests.rs` compare trimmed output for this reason.
 
+## `succinctly yq -o=json -C` colorizes with jq's own scheme, not real yq's (pre-existing, recorded while verifying #3413)
+
+`succinctly yq`'s JSON output colorizing (`-o=json -C`, and the JSON side of `-P -C`) reuses
+`colorize_json` -- the same tokenizer and `ColorScheme::default()` `succinctly jq` uses --
+rather than a yq-specific scheme, confirmed by `test_colorized_json_output_is_token_aware`'s
+own comment ("goes through the shared jq colorizer"). This predates #3413; #3413 only changed
+which color that shared default assigns to `null` (`1;30` to jq 1.7.1's own `0;90`), which
+this entry's own scope doesn't touch. Real yq v4.53.3's `-o=json -C`/`--colors -o=json` output
+is a different scheme entirely -- confirmed live:
+
+```console
+$ printf 'a: null\nb: true\n' | yq --colors -o=json '.'
+{
+  "a": null,
+  "b": true
+}
+```
+
+(the real bytes carry `\x1b[36m`/`\x1b[0m` around each *key*, and `\x1b[95m` around `true` --
+but `null` itself is never colored at all, unlike `succinctly yq`'s bright-black wrap adopted
+from jq). No rule-4 condition licenses this on its own merits (the output is readable, nothing
+is corrupted, and matching real yq's own JSON-coloring scheme is not a resource cost anyone has
+measured) -- it is recorded here because it was never written down, not because it was newly
+decided. Given `succinctly yq`'s YAML-target coloring is a separate code path
+(`colorize_yaml`) with its own scheme, closing this would mean either giving JSON-target output
+its own yq-specific colorizer or accepting the jq-styled one as a permanent, documented
+extension under ADR-0018 rule 5 -- a decision this entry doesn't make, only surfaces.
+
 ## Evaluator resource caps apply in yq mode too, and are uncatchable (#2132)
 
 The five caps `succinctly jq` documents -- `MAX_RANGE`, `WHILE_UNTIL_MAX_STEPS`,

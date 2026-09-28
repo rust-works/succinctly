@@ -8627,6 +8627,17 @@ a closing delimiter (`\x1b[1;39m\x1b[1;39m}` for `}`/`]`), a quirk of its
 color-of-every-token-with-conditional-reset writer; succinctly emits each SGR once. Renders
 are identical.
 
+**`null`'s default color, and NaN's own double wrap (#3413).** jq 1.7.1's default color for
+`null` is `0;90` (bright black), confirmed live on both the macOS system build and the Linux
+release binary -- not `1;30` as an earlier default-colors table here assumed. A NaN -- from
+`nan`, from `"NaN" | tonumber`, or read from a document via the `#3222`/`#472` bridge --
+renders as the literal text `null` (JSON has no NaN), but jq wraps that "null" in its
+*number* color first and its null color second (`\x1b[0;39m\x1b[0;90mnull\x1b[0m\x1b[0m`),
+distinguishing it from a real null even though the printed word is identical. succinctly
+matches both: `default_colors::NULL` uses `0;90`, and `colorize_json` recognizes a NaN's
+render (an internal marker text `format_json` substitutes for `null` only when colorizing,
+stripped before any byte reaches the user) to apply the same double wrap.
+
 ## Depends On
 
 - [ADR-0018](../../adrs/adr-0018.md) - the fidelity rule this page enumerates exceptions to

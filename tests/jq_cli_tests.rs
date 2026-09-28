@@ -7184,8 +7184,46 @@ fn test_jq_colors_invalid_spec_warns_and_uses_defaults() -> Result<()> {
     );
     let stdout = String::from_utf8(output.stdout)?;
     assert!(
-        stdout.contains("\x1b[1;30mnull\x1b[0m"),
+        stdout.contains("\x1b[0;90mnull\x1b[0m"),
         "null should use the default color: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_jq_colors_nan_double_wrap_3413() -> Result<()> {
+    // jq wraps a NaN's `null` spelling in its number color, then its null
+    // color -- confirmed live against jq 1.7.1 on both the macOS and Linux
+    // release binaries: `nan` prints `\e[0;39m\e[0;90mnull\e[0m\e[0m`. A
+    // real `null` alongside it keeps the plain single wrap, and both a
+    // computed `nan` and one read from input (`"NaN" | tonumber`) take the
+    // same path.
+    for filter in ["nan", "\"NaN\" | tonumber"] {
+        let (stdout, _stderr, code) = run_jq_full(&["-C", "-n", filter], None)?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(
+            stdout.trim_end(),
+            "\x1b[0;39m\x1b[0;90mnull\x1b[0m\x1b[0m",
+            "{filter}: {stdout:?}"
+        );
+    }
+
+    // A real null and a NaN side by side keep their own, different wraps --
+    // confirms the two are told apart positionally, not merely in isolation.
+    let (stdout, _stderr, code) = run_jq_full(&["-Cc", "-n", "[null, nan, 1]"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim_end(),
+        concat!(
+            "\x1b[1;39m[\x1b[0m",
+            "\x1b[0;90mnull\x1b[0m",
+            "\x1b[1;39m,\x1b[0m",
+            "\x1b[0;39m\x1b[0;90mnull\x1b[0m\x1b[0m",
+            "\x1b[1;39m,\x1b[0m",
+            "\x1b[0;39m1\x1b[0m",
+            "\x1b[1;39m]\x1b[0m",
+        ),
+        "{stdout:?}"
     );
     Ok(())
 }

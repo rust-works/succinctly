@@ -508,7 +508,26 @@ pub struct JsonFormatOpts<'a> {
     /// spellings applies), not another spelling of the preserve-vs-reformat
     /// split (#2874).
     pub json_sourced: bool,
+    /// Emit [`NAN_COLOR_MARKER`] instead of the literal `null` for a NaN
+    /// number, so [`colorize_json`] can tell a NaN's `null` spelling apart
+    /// from a genuine one and wrap it in jq's number-then-null color pair
+    /// (#3413) rather than the plain null color. `false` everywhere except
+    /// the one color-output call site: the marker is not valid JSON on its
+    /// own, so any caller that renders this text without also colorizing it
+    /// must never set this.
+    pub mark_nan_for_color: bool,
 }
+
+/// [`JsonFormatOpts::mark_nan_for_color`]'s placeholder: the render-time
+/// analogue of [`crate::jq::value::NAN_SENTINEL`]'s parse-time one (#3413) --
+/// same problem (smuggle "this is a NaN" through a text round-trip to a
+/// reader with no access to the original value), different pipeline. Unlike
+/// that sentinel, this one doesn't need to be digit-led: `colorize_json`
+/// only ever re-lexes text `format_json_impl` itself produced, which never
+/// emits any bare n-leading token except `null` and this marker, so the two
+/// are unambiguous by construction, not by coincidence. Stripped and
+/// recolored (as `null`) before the text ever reaches a user.
+const NAN_COLOR_MARKER: &str = "nan";
 
 /// Escape a JSON string body per the opts' control-escape style and ASCII mode.
 fn escape_json_body(s: &str, opts: &JsonFormatOpts) -> String {
@@ -572,7 +591,14 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
         OwnedValue::Int(i) => i.to_string(),
         OwnedValue::Float(f) => {
             if f.is_nan() {
-                "null".to_string() // JSON doesn't support NaN
+                // JSON doesn't support NaN; it prints as "null", but jq
+                // colors it differently from a real null (#3413) -- see
+                // `mark_nan_for_color`'s own doc comment.
+                if opts.mark_nan_for_color {
+                    NAN_COLOR_MARKER.to_string()
+                } else {
+                    "null".to_string()
+                }
             } else {
                 // #2874: an exhaustive match on the convention rather than a
                 // chain of `== ControlEscape::Yq` tests, so a fourth variant
@@ -642,7 +668,14 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
         }
         OwnedValue::NumberLiteral(repr, literal) => {
             if value.as_f64().is_some_and(f64::is_nan) {
-                "null".to_string() // JSON doesn't support NaN
+                // Same NaN-vs-null color distinction as the `Float` arm
+                // above (#3413) -- a parsed NaN literal takes this arm
+                // instead, but renders identically either way.
+                if opts.mark_nan_for_color {
+                    NAN_COLOR_MARKER.to_string()
+                } else {
+                    "null".to_string()
+                }
             } else {
                 // #2874: the point of the exercise. This is the
                 // preserve-vs-reformat decision itself, and it is now an
@@ -792,7 +825,7 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
 /// These match jq's default colors.
 mod default_colors {
     pub const RESET: &str = "\x1b[0m";
-    pub const NULL: &str = "\x1b[1;30m"; // Bold black (gray) - jq default
+    pub const NULL: &str = "\x1b[0;90m"; // Bright black (gray) - jq 1.7.1 default (#3413)
     pub const FALSE: &str = "\x1b[0;39m"; // Default - jq default
     pub const TRUE: &str = "\x1b[0;39m"; // Default - jq default
     pub const NUMBER: &str = "\x1b[0;39m"; // Default - jq default
@@ -1026,17 +1059,39 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
                     result.push_str(&scheme.reset);
                 }
                 'n' => {
-                    // null
-                    result.push_str(&scheme.null);
-                    result.push(c);
-                    while let Some(&next) = chars.peek() {
-                        if next.is_alphabetic() {
-                            result.push(chars.next().unwrap());
-                        } else {
-                            break;
+                    // `null`, or `NAN_COLOR_MARKER` ("nan") standing in for a
+                    // NaN number that must print as "null" but color
+                    // differently (#3413; the render-time analogue of
+                    // `jq::value::NAN_SENTINEL`'s parse-time NaN marker,
+                    // same problem, different pipeline). The two share no
+                    // other letter, and `format_json_impl` never emits any
+                    // other bare n-leading token here, so one peek at the
+                    // second character is sufficient -- no need to buffer
+                    // the whole word just to compare it afterward.
+                    if chars.peek() == Some(&'a') {
+                        chars.next(); // 'a'
+                        chars.next(); // 'n'
+                                      // jq wraps a NaN's "null" spelling in its number
+                                      // color, then its null color, confirmed live against
+                                      // jq 1.7.1 on both Linux and macOS: `nan` prints
+                                      // `\e[0;39m\e[0;90mnull\e[0m\e[0m`.
+                        result.push_str(&scheme.number);
+                        result.push_str(&scheme.null);
+                        result.push_str("null");
+                        result.push_str(&scheme.reset);
+                        result.push_str(&scheme.reset);
+                    } else {
+                        result.push_str(&scheme.null);
+                        result.push(c);
+                        while let Some(&next) = chars.peek() {
+                            if next.is_alphabetic() {
+                                result.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
                         }
+                        result.push_str(&scheme.reset);
                     }
-                    result.push_str(&scheme.reset);
                 }
                 '0'..='9' | '-' | '.' | 'e' | 'E' | '+' => {
                     result.push_str(&scheme.number);
@@ -1186,7 +1241,9 @@ mod tests {
     }
 
     /// The jq default spec, spelled out. Parsing this must be a no-op.
-    const DEFAULT_SPEC: &str = "1;30:0;39:0;39:0;39:0;32:1;39:1;39:1;34";
+    /// Null color is `0;90`, matching jq 1.7.1's own default (#3413,
+    /// confirmed live against both the macOS and Linux release binaries).
+    const DEFAULT_SPEC: &str = "0;90:0;39:0;39:0;39:0;32:1;39:1;39:1;34";
 
     /// The two upstreams disagree on the exit code for an uncaught error, and
     /// both runners route through this mapping. Pinning it here keeps the jq
@@ -1363,6 +1420,7 @@ mod tests {
         let value = OwnedValue::Object(obj.into());
 
         let opts = JsonFormatOpts {
+            mark_nan_for_color: false,
             indent: "",
             sort_keys: true,
             ascii: false,
@@ -1381,6 +1439,7 @@ mod tests {
     #[test]
     fn test_format_json_float_jq_mode_shortest() {
         let opts = JsonFormatOpts {
+            mark_nan_for_color: false,
             indent: "",
             sort_keys: false,
             ascii: false,
@@ -1418,6 +1477,7 @@ mod tests {
     #[test]
     fn test_format_json_yq_mode_computed_float_scientific_notation_997() {
         let opts = JsonFormatOpts {
+            mark_nan_for_color: false,
             indent: "",
             sort_keys: false,
             ascii: false,
@@ -1513,6 +1573,7 @@ mod tests {
             OwnedValue::String("a\x08\u{85}é".to_string()),
         );
         let opts = JsonFormatOpts {
+            mark_nan_for_color: false,
             indent: "",
             sort_keys: false,
             ascii: true,
@@ -1533,6 +1594,7 @@ mod tests {
         // `jq_runner.rs`'s CLI formatters -- this is the third formatter
         // that needed the identical split.
         let opts = JsonFormatOpts {
+            mark_nan_for_color: false,
             indent: "",
             sort_keys: false,
             ascii: false,
@@ -1586,6 +1648,7 @@ mod tests {
             JsonConvention::JqCompat,
         ] {
             let opts = JsonFormatOpts {
+                mark_nan_for_color: false,
                 indent: "",
                 sort_keys: false,
                 ascii: false,
@@ -1615,6 +1678,7 @@ mod tests {
         // `\u0008`.
         let value = OwnedValue::String("a\u{8}b".to_string());
         let opts = |convention| JsonFormatOpts {
+            mark_nan_for_color: false,
             indent: "",
             sort_keys: false,
             ascii: false,
@@ -1645,6 +1709,7 @@ mod tests {
         // already handles this correctly), not `DBL_MAX` text or "null" --
         // confirmed live against jq 1.7.1, `1e400 | .` echoes `1E+400`.
         let opts = JsonFormatOpts {
+            mark_nan_for_color: false,
             indent: "",
             sort_keys: false,
             ascii: false,
@@ -1676,6 +1741,7 @@ mod tests {
     #[test]
     fn test_format_json_empty_containers() {
         let pretty = JsonFormatOpts {
+            mark_nan_for_color: false,
             indent: "  ",
             sort_keys: false,
             ascii: false,
@@ -1698,6 +1764,7 @@ mod tests {
         );
         let value = OwnedValue::Object(obj.into());
         let opts = JsonFormatOpts {
+            mark_nan_for_color: false,
             indent: "  ",
             sort_keys: false,
             ascii: true,
@@ -1736,6 +1803,67 @@ mod tests {
             out.contains("\x1b[0;32m\"a\\\"b\"\x1b[0m"),
             "escaped string: {out:?}"
         );
+    }
+
+    /// #3413: a NaN's `null` spelling colors differently from a real `null`
+    /// -- jq wraps it in the number color, then the null color, confirmed
+    /// live against jq 1.7.1 on both the macOS and Linux release binaries
+    /// (`\e[0;39m\e[0;90mnull\e[0m\e[0m`). `format_json`'s NaN branches emit
+    /// [`NAN_COLOR_MARKER`] instead of a bare `null` when
+    /// `mark_nan_for_color` is set, and `colorize_json` is what turns that
+    /// back into the correctly-colored literal `null` text.
+    #[test]
+    fn test_colorize_json_nan_marker_gets_the_jq_double_wrap_3413() {
+        let scheme = ColorScheme::default();
+        assert_eq!(
+            colorize_json(NAN_COLOR_MARKER, &scheme),
+            "\x1b[0;39m\x1b[0;90mnull\x1b[0m\x1b[0m"
+        );
+        // A real `null` alongside a NaN marker: each keeps its own color,
+        // proving the two are told apart positionally, not just in isolation.
+        assert_eq!(
+            colorize_json(&format!("[null,{NAN_COLOR_MARKER},1,null]"), &scheme),
+            concat!(
+                "\x1b[1;39m[\x1b[0m",
+                "\x1b[0;90mnull\x1b[0m",
+                "\x1b[1;39m,\x1b[0m",
+                "\x1b[0;39m\x1b[0;90mnull\x1b[0m\x1b[0m",
+                "\x1b[1;39m,\x1b[0m",
+                "\x1b[0;39m1\x1b[0m",
+                "\x1b[1;39m,\x1b[0m",
+                "\x1b[0;90mnull\x1b[0m",
+                "\x1b[1;39m]\x1b[0m",
+            )
+        );
+    }
+
+    /// #3413: `format_json` emits [`NAN_COLOR_MARKER`] for a NaN only when
+    /// `mark_nan_for_color` asks for it -- the marker is not valid JSON on
+    /// its own, so the default (non-colorizing) behavior must still be the
+    /// plain `null` text every other caller of `format_json` relies on.
+    #[test]
+    fn test_format_json_nan_marker_gated_by_option_3413() {
+        let nan = OwnedValue::Float(f64::NAN);
+        let mut opts = JsonFormatOpts {
+            indent: "",
+            sort_keys: false,
+            ascii: false,
+            convention: JsonConvention::JqCompat,
+            json_sourced: false,
+            mark_nan_for_color: false,
+        };
+        assert_eq!(format_json(&nan, &opts), "null");
+        opts.mark_nan_for_color = true;
+        assert_eq!(format_json(&nan, &opts), NAN_COLOR_MARKER);
+
+        // The `NumberLiteral` arm (a parsed NaN, not a computed one) takes
+        // the same path.
+        let nan_literal =
+            OwnedValue::NumberLiteral(succinctly::jq::NumberRepr::Float(f64::NAN), "nan".into());
+        opts.mark_nan_for_color = false;
+        assert_eq!(format_json(&nan_literal, &opts), "null");
+        opts.mark_nan_for_color = true;
+        assert_eq!(format_json(&nan_literal, &opts), NAN_COLOR_MARKER);
     }
 
     /// #3110: the `:` takes the object color and the `,` its enclosing
@@ -1823,6 +1951,7 @@ mod tests {
         use succinctly::jq::MAX_VALUE_TREE_DEPTH;
 
         let opts = JsonFormatOpts {
+            mark_nan_for_color: false,
             indent: "",
             sort_keys: false,
             ascii: false,

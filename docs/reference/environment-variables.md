@@ -243,18 +243,18 @@ The format is eight `:`-separated [SGR](https://en.wikipedia.org/wiki/ANSI_escap
 null:false:true:numbers:strings:arrays:objects:objectkeys
 ```
 
-| Field | Meaning     | Default | Renders as        |
-|-------|-------------|---------|-------------------|
-| 1     | `null`      | `1;30`  | Bold black (gray) |
-| 2     | `false`     | `0;39`  | Terminal default  |
-| 3     | `true`      | `0;39`  | Terminal default  |
-| 4     | Numbers     | `0;39`  | Terminal default  |
-| 5     | Strings     | `0;32`  | Green             |
-| 6     | Arrays      | `1;39`  | Bold default      |
-| 7     | Objects     | `1;39`  | Bold default      |
-| 8     | Object keys | `1;34`  | Bold blue         |
+| Field | Meaning     | Default | Renders as           |
+|-------|-------------|---------|----------------------|
+| 1     | `null`      | `0;90`  | Bright black (gray)  |
+| 2     | `false`     | `0;39`  | Terminal default     |
+| 3     | `true`      | `0;39`  | Terminal default     |
+| 4     | Numbers     | `0;39`  | Terminal default     |
+| 5     | Strings     | `0;32`  | Green                |
+| 6     | Arrays      | `1;39`  | Bold default         |
+| 7     | Objects     | `1;39`  | Bold default         |
+| 8     | Object keys | `1;34`  | Bold blue            |
 
-The full default is `1;30:0;39:0;39:0;39:0;32:1;39:1;39:1;34`. The reset sequence is not configurable.
+The full default is `0;90:0;39:0;39:0;39:0;32:1;39:1;39:1;34`. The reset sequence is not configurable.
 
 ```bash
 # Red null, everything else left at its default. Spell the defaults out: an empty

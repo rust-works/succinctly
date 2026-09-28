@@ -9260,7 +9260,7 @@ fn test_colorized_json_output_is_token_aware() -> Result<()> {
         "whole-token true missing: {output:?}"
     );
     assert!(
-        output.contains("\u{1b}[1;30mnull\u{1b}[0m"),
+        output.contains("\u{1b}[0;90mnull\u{1b}[0m"),
         "whole-token null missing: {output:?}"
     );
     // ...never the old per-letter coloring that painted stray `t`/`r`/`u`/`e`.
