@@ -798,6 +798,19 @@ is the revert that established what the other one costs.
    oracle matrix per arm — left for a follow-up rather than attempted alongside the
    already-substantial change above.
 
+   **`and`/`or`/unary minus track the register the way jq's bytecode does** (closed by
+   [#3289](https://github.com/rust-works/succinctly/issues/3289), after #2689 and #2760).
+   jq's `and`/`or` are not subexps: `L` moves the register, `R` runs on the `DUP`ed input with
+   the register where `L` left it, and the result is a fresh boolean *at* that register, which
+   `PATH_END` accepts only when it is `jv_identical` to it. The resolver models exactly that,
+   per `L` branch and in both trackability states: `path((.a and .b) \| empty)` on `{"a":1}`
+   refuses near `"b"`, `path(.a and .b)` on `{"a":false}` is `["a"]` (so `del`/`=`/`|=` write
+   there), `path(.a and 5)` on `{"a":0}` refuses, and a later `$var` re-establishes the
+   register the operator left (`path(.a as $y \| -.a \| $y)` is `["a"]`). A generated sweep
+   over operands, inputs and path contexts matches jq 1.7.1 everywhere except the array
+   `getpath` shape described below. yq mode keeps its eager evaluation (real yq's `and`/`or`
+   no-op there, and it has no unary minus).
+
    The register is also carried **only across stages this resolver can prove did not move
    it** (`cannot_move_register`, `src/jq/eval.rs`) — the same allowlist now gates both
    `resolve_seq`'s plain-pipe carrying *and* #2046's fold-seeded carrying, since both reach
@@ -823,7 +836,9 @@ is the revert that established what the other one costs.
    [#3263](https://github.com/rust-works/succinctly/issues/3263) an array carries the register
    too when the resolver both resolves it live and checks everything jq checks inside it:
    navigation, `..`, `select`, an `if`'s branches, both of jq's `?`s and `try`/`catch`,
-   `recurse(f)`/`recurse(f; cond)` (#2764), and pipes, commas and subexp shapes of those.
+   `recurse(f)`/`recurse(f; cond)` (#2764), `and`/`or`/unary minus over checked operands
+   ([#3289](https://github.com/rust-works/succinctly/issues/3289)), and pipes, commas and
+   subexp shapes of those.
    [#3283](https://github.com/rust-works/succinctly/issues/3283)/[#3284](https://github.com/rust-works/succinctly/issues/3284)
    widened that list further: `builtin_navigation`'s value-independent members (bare
    `first`/`last`/`add`/`any`/`all`/`flatten`, no argument — jq's internal `.[0]`/`.[]` is

@@ -58628,25 +58628,319 @@ fn test_and_or_tracked_var_nested_in_compound_operand_does_not_blind_sibling_nav
     Ok(())
 }
 
-/// #2760's own scope boundary, recorded so it stays a deliberate choice: a
-/// **trackable** input's `and`/`or` has a materially different gap (jq's
-/// path-mode refuses whenever more than one operand genuinely navigates the
-/// register, not merely whenever one does) that this fix does not attempt.
-/// Confirmed unchanged before and after this fix, both diverging from jq
-/// 1.7.1 the same way. If this ever starts passing, the scope comment on
-/// the `And`/`Or`/`Negate` arms in `src/jq/eval.rs` needs updating, not
-/// just this assertion.
-#[test]
-fn test_and_or_trackable_input_register_conflict_remains_unfixed_2760() -> Result<()> {
-    let (stdout, stderr, code) =
-        run_jq_full(&["-c", "path((.a and .b) | empty)"], Some(r#"{"a":1}"#))?;
-    assert_eq!(
-        code, 0,
-        "trackable-input and/or register-conflict gap is scoped out of #2760; \
-         if this now fails, the gap may have been closed -- update this test \
-         and the arm's own scope comment together. stdout={stdout:?} stderr={stderr:?}"
-    );
+/// #3289: `(input, filter, stdout, error message, exit code)`, every value
+/// captured from jq 1.7.1 with `-c`; an empty message means no stderr.
+type PathRow3289 = (&'static str, &'static str, &'static str, &'static str, i32);
+
+fn assert_path_rows_3289(rows: &[PathRow3289]) -> Result<()> {
+    for &(input, filter, stdout, message, exit) in rows {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (stdout, exit),
+            "`{filter}` on {input}: stderr {err:?}"
+        );
+        if message.is_empty() {
+            assert!(
+                err.is_empty(),
+                "`{filter}` on {input}: unexpected stderr {err:?}"
+            );
+        } else {
+            assert!(
+                err.contains(message),
+                "`{filter}` on {input}: stderr {err:?} lacks {message:?}"
+            );
+        }
+    }
     Ok(())
+}
+
+/// #3289 (classes A, C, D): jq refuses these because `R` navigates off a
+/// register `L` already moved (`and`/`or` are not subexps: `R` runs on the
+/// `DUP`ed input with the register where `L` left it). succinctly accepted
+/// them on a trackable input, or refused with its by-value "with result"
+/// message, or raised past a catching `?`.
+#[test]
+fn test_and_or_negate_path_refuses_where_the_register_moved_3289() -> Result<()> {
+    assert_path_rows_3289(&[
+        (r#"{"a":1}"#, r"path((.a and .b) | empty)", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":1}", 5),
+        (r#"{"a":1}"#, r"path((.a and .a) | empty)", "", "Invalid path expression near attempt to access element \"a\" of {\"a\":1}", 5),
+        (r#"{"a":false}"#, r"path((.a or .b) | empty)", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":false}", 5),
+        (r#"{"a":null,"b":2}"#, r"path((.a or .b) | empty)", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":null,\"b\":2}", 5),
+        (r"[1,2]", r"path((.[0] and .[1]) | empty)", "", "Invalid path expression near attempt to access element 1 of [1,2]", 5),
+        (r#"{"a":{"b":1}}"#, r"path((.a.b and .a) | empty)", "", "Invalid path expression near attempt to access element \"a\" of {\"a\":{\"b\":1}}", 5),
+        (r#"{"a":1}"#, r#"path((getpath(["a"]) and .b) | empty)"#, "", "Invalid path expression near attempt to access element \"b\" of {\"a\":1}", 5),
+        (r#"{"a":1}"#, r"path((.a and (.b,.c)) | empty)", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":1}", 5),
+        (r#"{"a":1}"#, r"path((.a and (.a and 5)) | empty)", "", "Invalid path expression near attempt to access element \"a\" of {\"a\":1}", 5),
+        (r#"{"a":1}"#, r"path((.a and .b?) | empty)", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":1}", 5),
+        (r#"{"a":1}"#, r"path((.a and .b) // 1 | empty)", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":1}", 5),
+        (r#"{"a":1}"#, r"path(first(.a and .b) | empty)", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":1}", 5),
+        (r#"{"a":1}"#, r"path([.a and .b] | empty)", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":1}", 5),
+        (r#"{"a":null}"#, r"path((.a or .a) | empty)", "", "Invalid path expression near attempt to access element \"a\" of {\"a\":null}", 5),
+        (r#"{"a":1}"#, r"del(.a and .b)", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":1}", 5),
+        (r#"{"a":1}"#, r"(.a and .b) |= 3", "", "Invalid path expression near attempt to access element \"b\" of {\"a\":1}", 5),
+        (r#"{"a":1}"#, r"path(.a, (.a and .b))", "[\"a\"]\n", "Invalid path expression near attempt to access element \"b\" of {\"a\":1}", 5),
+        (r#"{"a":true,"b":true}"#, r"path(.a and (.a|.b))", "", "Invalid path expression near attempt to access element \"a\" of {\"a\":true,\"b\":true}", 5),
+        (r#"{"a":1}"#, r"path((.a and .b)?)", "", "", 0),
+    ])
+}
+
+/// #3289 (class B): jq accepts -- and so writes -- where the boolean lands on
+/// a register it is `jv_identical` to (`null`/`true`/`false` by kind), and
+/// where a later `$var` re-establishes the register the operator left.
+/// succinctly refused every one; ADR-0018 gives no condition to refuse a
+/// write jq performs, so these must match.
+#[test]
+fn test_and_or_negate_path_accepts_where_the_result_is_the_register_3289() -> Result<()> {
+    assert_path_rows_3289(&[
+        (r#"{"a":false}"#, r"path(.a and .b)", "[\"a\"]\n", "", 0),
+        (r#"{"a":false}"#, r"path(.a or false)", "[\"a\"]\n", "", 0),
+        (r#"{"a":true}"#, r"path(.a and 5)", "[\"a\"]\n", "", 0),
+        (r#"{"a":true}"#, r"path(.a or true)", "[\"a\"]\n", "", 0),
+        (r#"{"a":true}"#, r"path(5 and .a)", "[\"a\"]\n", "", 0),
+        (r#"{"a":false}"#, r"del(.a and .b)", "{}\n", "", 0),
+        (r#"{"a":false}"#, r"del(.a and false)", "{}\n", "", 0),
+        (r#"{"a":true}"#, r"del(.a or .a)", "{}\n", "", 0),
+        (r#"{"a":false}"#, r"(.a and .b) |= 3", "{\"a\":3}\n", "", 0),
+        (r#"{"a":false}"#, r"(.a and .b) = 3", "{\"a\":3}\n", "", 0),
+        (r#"{"a":true}"#, r"(.a and true) |= 3", "{\"a\":3}\n", "", 0),
+        (
+            r#"{"a":1}"#,
+            r"path(.a as $y | (.a and 5) | $y)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(. as $n | (.a or .b) | $n)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | (. or .a) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [.a and 5] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3289's negative control: a number or string register is never identical
+/// to a fresh boolean, so these stay refused -- the conjunct that keeps the
+/// class-B acceptance from turning into a write jq refuses.
+#[test]
+fn test_and_or_negate_path_keeps_refusing_a_non_identical_register_3289() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":0}"#,
+            r"path(.a and 5)",
+            "",
+            "Invalid path expression with result true",
+            5,
+        ),
+        (
+            r#"{"a":"x"}"#,
+            r"path(.a or true)",
+            "",
+            "Invalid path expression with result true",
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"del(.a and false)",
+            "",
+            "Invalid path expression with result false",
+            5,
+        ),
+        (
+            r#"{"a":0}"#,
+            r"del(.a and false)",
+            "",
+            "Invalid path expression with result false",
+            5,
+        ),
+        (
+            r#"{"a":"x"}"#,
+            r"(.a and .b) |= 3",
+            "",
+            "Invalid path expression near attempt to access element \"b\" of {\"a\":\"x\"}",
+            5,
+        ),
+    ])
+}
+
+/// #3289 (class E): unary minus on a trackable input resolves its operand
+/// live -- refusing where jq refuses, with jq's message -- and leaves the
+/// register where its operand did, so a later `$y` re-establishes it.
+#[test]
+fn test_and_or_negate_path_negate_resolves_live_on_a_trackable_input_3289() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(-(.a | {b:2} | .b) | empty)",
+            "",
+            "Invalid path expression near attempt to access element \"b\" of {\"b\":2}",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(-(. as $x | .a | $x | .a) | empty)",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of {\"a\":1}",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(-(1|.a) | empty)",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of 1",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(-(1|.a))",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of 1",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(-(1|.a)) |= 3",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of 1",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(-(.a and .b) | empty)",
+            "",
+            "Invalid path expression near attempt to access element \"b\" of {\"a\":1}",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(.a as $y | -.a | $y)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (r#"{"a":1}"#, r"path(. as $x | [-.a] | $x)", "[]\n", "", 0),
+    ])
+}
+
+/// #3289: rows that already matched jq 1.7.1 and must not change -- a
+/// non-navigating operand on either side, `try`/`?`/`//` around the
+/// operator, `if`'s and `select`'s subexp condition, value mode, and the
+/// short-circuit (an `error("x")` in the untaken slot never runs).
+#[test]
+fn test_and_or_negate_path_unchanged_rows_still_match_3289() -> Result<()> {
+    assert_path_rows_3289(&[
+        (r#"{"a":1}"#, r"path((.a and 5) | empty)", "", "", 0),
+        (r#"{"a":1}"#, r"path((5 and .a) | empty)", "", "", 0),
+        (r#"{"a":1}"#, r"path((. and .a) | empty)", "", "", 0),
+        (r#"{"a":1}"#, r"path((.a and .) | empty)", "", "", 0),
+        (r#"{"a":1}"#, r"path(((.a,.b) and 5) | empty)", "", "", 0),
+        (
+            r#"{"a":1}"#,
+            r#"path((.a and getpath(["b"])) | empty)"#,
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path((.a and (try .b catch 5)) | empty)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path((.a and ((.b)? // 3)) | empty)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(try (.a and .b) catch 0 | empty)",
+            "",
+            "",
+            0,
+        ),
+        (r#"{"a":1}"#, r"path(.a // (.a and .b) | empty)", "", "", 0),
+        (
+            r#"{"a":1}"#,
+            r"path(if (.a and .b) then . else . end)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r#"{"a":1}"#, r"path(select(.a and .b))", "", "", 0),
+        (r#"{"a":1}"#, r"path({x:(.a and .b)} | empty)", "", "", 0),
+        (r#"{"a":1}"#, r"path((.a and .b) as $x | .)", "[]\n", "", 0),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | (5 and 6) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | (.a and 5) | $x)",
+            "",
+            "Invalid path expression with result {\"a\":1}",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(-.a)",
+            "",
+            "Invalid path expression with result -1",
+            5,
+        ),
+        (
+            r#"{"a":{"x":1}}"#,
+            r"path(-.a | .x)",
+            "",
+            "object ({\"x\":1}) cannot be negated",
+            5,
+        ),
+        (r#"{"a":1}"#, r"path(-(.a,.a) | empty)", "", "", 0),
+        (r#"{"a":1}"#, r"[.a and .b]", "[false]\n", "", 0),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [.a and (.a|first)] | $x)",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of {\"a\":1}",
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r#"path(.a and error("x"))"#,
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r#"path(.a or error("x"))"#,
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+    ])
 }
 
 /// #2760 seen from the side that does damage: `del()` and `|=` consume the
