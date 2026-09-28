@@ -73006,3 +73006,80 @@ fn test_unknown_format_name_grammar_matches_jq_cli_3357() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// #3388: a negative out-of-range *middle* index must not raise eagerly
+// ============================================================================
+
+/// `update_path_steps`'s `Expr::Index` arm called `resolve_setpath_index`
+/// unconditionally on a middle step, raising `Out of bounds negative array
+/// index` before the filter even ran -- jq only bounds-checks an index when a
+/// value is actually written, the same rule a *positive* out-of-range middle
+/// index (`.[5]`) already got right by deferring through the fresh-run path.
+/// Every row captured live against jq 1.7.1. Found by a differential fuzz of
+/// `(paths) |= empty` while working on #3302; independent of that fix.
+#[test]
+fn test_negative_out_of_range_middle_index_defers_like_positive_3388() -> Result<()> {
+    for (input, filter, expected) in [
+        // The reported repro table.
+        ("[[1,2,3]]", ".[-2][0] |= empty", "[[1,2,3]]"),
+        ("[[1,2,3]]", ".[-2].a |= empty", "[[1,2,3]]"),
+        ("[[1,2,3]]", "(.[-2][0], .[0][0]) |= empty", "[[2,3]]"),
+        ("[[1,2,3]]", ".[5][0] |= empty", "[[1,2,3]]"),
+        // A genuinely valid negative index (in range once folded) is
+        // unaffected -- both a no-op filter and a real write still land.
+        (
+            "[[1,2,3],[4,5,6],[7,8,9]]",
+            ".[-1][0] |= empty",
+            "[[1,2,3],[4,5,6],[8,9]]",
+        ),
+        (
+            "[[1,2,3],[4,5,6],[7,8,9]]",
+            ".[-1][0] |= 99",
+            "[[1,2,3],[4,5,6],[99,8,9]]",
+        ),
+        // Both steps of a two-level chain out of range, still a no-op.
+        ("[[1]]", ".[-3][-3] |= empty", "[[1]]"),
+        // A negative out-of-range *leaf* step already deferred correctly.
+        ("[1]", ".[-2] |= empty", "[1]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3388: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The bounds check still fires -- with the same message as before -- once
+/// the filter actually produces a value to write, whether reached through
+/// `|=` or plain assignment.
+#[test]
+fn test_negative_out_of_range_middle_index_still_raises_on_real_write_3388() -> Result<()> {
+    for filter in [".[-2][0] |= 5", ".[-2][0] = 5", ".[-2] |= 5"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[[1,2,3]]"))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout:?} stderr={stderr:?}");
+        assert!(
+            stderr.contains("Out of bounds negative array index"),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// `del()` on the identical shape already matched jq before this fix (it
+/// never resolves the index eagerly) -- pinned here so a future change to
+/// the shared middle-step machinery can't quietly break this while fixing
+/// something else.
+#[test]
+fn test_negative_out_of_range_middle_index_del_unaffected_3388() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "del(.[-2][0])"], Some("[[1,2,3]]"))?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        ("[[1,2,3]]", 0),
+        "stderr={stderr:?}"
+    );
+    Ok(())
+}
