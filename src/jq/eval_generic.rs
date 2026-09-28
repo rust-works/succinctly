@@ -14209,67 +14209,66 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     // pre-check (jq's own `range/3` never validates types up front either;
     // see `range_values_generic`'s doc comment), so for it this is the
     // first and only classification, and either arm can fire.
-    let mut emit =
-        |from: &OwnedValue,
-         to: &OwnedValue,
-         step: &OwnedValue,
-         from_literal: Option<&OwnedValue>|
-         -> Demand {
-            match (range_num(from), range_num(to), range_num(step)) {
-                (Ok(from_val), Ok(to_val), Ok(step_val)) => {
-                    let (values, truncated) = match (from_val, to_val, step_val) {
-                        // `from_literal` is forwarded on this arm too (#3103):
-                        // an integer literal generally renders identically to
-                        // its own `i64` (so `from_literal` is usually `None`
-                        // here anyway), but `-0` is the one legal-JSON
-                        // exception -- see `each_range`'s own note.
-                        (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
-                            range_values_int(f, t, st, from_literal)
-                        }
-                        (f, t, st) => range_values_f64(
-                            f.as_f64(),
-                            t.as_f64(),
-                            st.as_f64(),
-                            implicit_step,
-                            from_literal,
-                        ),
-                    };
-                    for v in values {
-                        if sink.push(GenericItem::Owned(v)) == Demand::Stop {
-                            return verdict.stop_with_downstream(Flow::Stopped { pending: None });
-                        }
+    let mut emit = |from: &OwnedValue,
+                    to: &OwnedValue,
+                    step: &OwnedValue,
+                    from_literal: Option<&OwnedValue>|
+     -> Demand {
+        match (range_num(from), range_num(to), range_num(step)) {
+            (Ok(from_val), Ok(to_val), Ok(step_val)) => {
+                let (values, truncated) = match (from_val, to_val, step_val) {
+                    // `from_literal` is forwarded on this arm too (#3103):
+                    // an integer literal generally renders identically to
+                    // its own `i64` (so `from_literal` is usually `None`
+                    // here anyway), but `-0` is the one legal-JSON
+                    // exception -- see `each_range`'s own note.
+                    (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
+                        range_values_int(f, t, st, from_literal)
                     }
-                    // Truncation only raises once the sink has taken everything
-                    // the capped batch held and still wants more --
-                    // `each_range`'s #2089 rule, unchanged: `first(range(1e18))`
-                    // stops early and never sees this, `[range(1e18)]` does.
-                    if truncated {
-                        return stop(Control::Error(range_max_exceeded_error()));
+                    (f, t, st) => range_values_f64(
+                        f.as_f64(),
+                        t.as_f64(),
+                        st.as_f64(),
+                        implicit_step,
+                        from_literal,
+                    ),
+                };
+                for v in values {
+                    if sink.push(GenericItem::Owned(v)) == Demand::Stop {
+                        return verdict.stop_with_downstream(Flow::Stopped { pending: None });
                     }
-                    Demand::Continue
                 }
-                // #3409: at least one operand isn't a plain number -- only
-                // reachable from range/3 (see this closure's own doc comment).
-                // Real jq's range/3 desugar never type-checks from/to/step
-                // itself; only the `+` that advances to the next value can
-                // raise, and only once a next value is actually demanded.
-                _ => {
-                    let result =
-                        crate::jq::eval::range_values_generic::<S>(from.clone(), to, step, &mut |v| {
-                            match sink.push(GenericItem::Owned(v)) {
-                                Demand::Continue => Demand::Continue,
-                                Demand::Stop => {
-                                    verdict.stop_with_downstream(Flow::Stopped { pending: None })
-                                }
+                // Truncation only raises once the sink has taken everything
+                // the capped batch held and still wants more --
+                // `each_range`'s #2089 rule, unchanged: `first(range(1e18))`
+                // stops early and never sees this, `[range(1e18)]` does.
+                if truncated {
+                    return stop(Control::Error(range_max_exceeded_error()));
+                }
+                Demand::Continue
+            }
+            // #3409: at least one operand isn't a plain number -- only
+            // reachable from range/3 (see this closure's own doc comment).
+            // Real jq's range/3 desugar never type-checks from/to/step
+            // itself; only the `+` that advances to the next value can
+            // raise, and only once a next value is actually demanded.
+            _ => {
+                let result =
+                    crate::jq::eval::range_values_generic::<S>(from.clone(), to, step, &mut |v| {
+                        match sink.push(GenericItem::Owned(v)) {
+                            Demand::Continue => Demand::Continue,
+                            Demand::Stop => {
+                                verdict.stop_with_downstream(Flow::Stopped { pending: None })
                             }
-                        });
-                    match result {
-                        Ok(demand) => demand,
-                        Err(e) => stop(Control::Error(e)),
-                    }
+                        }
+                    });
+                match result {
+                    Ok(demand) => demand,
+                    Err(e) => stop(Control::Error(e)),
                 }
             }
-        };
+        }
+    };
 
     let from_flow = eval_each_generic::<S, V>(from, value.clone(), optional, cursor, &mut |item| {
         verdict.begin();
@@ -14333,12 +14332,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                         if let Err(e) = range_num(&to_owned) {
                             return stop(Control::Error(e));
                         }
-                        emit(
-                        &from_owned,
-                        &to_owned,
-                        &OwnedValue::Int(1),
-                            from_literal,
-                        )
+                        emit(&from_owned, &to_owned, &OwnedValue::Int(1), from_literal)
                     }
                     Some(step_expr) => {
                         let step_flow = eval_each_generic::<S, V>(
@@ -14356,12 +14350,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                                 // decides fast vs. slow, matching jq's
                                 // range/3, which never type-checks from/to/
                                 // step up front either.
-                                emit(
-                                &from_owned,
-                                &to_owned,
-                                &step_owned,
-                                    from_literal,
-                                )
+                                emit(&from_owned, &to_owned, &step_owned, from_literal)
                             },
                         );
                         match step_flow {

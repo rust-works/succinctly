@@ -8123,12 +8123,15 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // itself; only the `+` that advances to the next value can
             // raise, and only once a next value is actually demanded.
             _ => {
-                let result = range_values_generic::<S>(from.clone(), to, step, &mut |v| match sink(
-                    Item::Owned(v),
-                ) {
-                    Demand::Continue => Demand::Continue,
-                    Demand::Stop => verdict.stop_with_downstream(Flow::Stopped { pending: None }),
-                });
+                let result =
+                    range_values_generic::<S>(from.clone(), to, step, &mut |v| match sink(
+                        Item::Owned(v),
+                    ) {
+                        Demand::Continue => Demand::Continue,
+                        Demand::Stop => {
+                            verdict.stop_with_downstream(Flow::Stopped { pending: None })
+                        }
+                    });
                 match result {
                     Ok(demand) => demand,
                     Err(e) => stop(Control::Error(e)),
@@ -8193,12 +8196,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     if let Err(e) = range_num(&to_owned) {
                         return stop(Control::Error(e));
                     }
-                    emit(
-                        &from_owned,
-                        &to_owned,
-                        &OwnedValue::Int(1),
-                        from_literal,
-                    )
+                    emit(&from_owned, &to_owned, &OwnedValue::Int(1), from_literal)
                 }
                 Some(step_expr) => {
                     let step_flow =
@@ -8209,12 +8207,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // decides fast vs. slow, matching jq's range/3,
                             // which never type-checks from/to/step up front
                             // either.
-                            emit(
-                                &from_owned,
-                                &to_owned,
-                                &step_owned,
-                                from_literal,
-                            )
+                            emit(&from_owned, &to_owned, &step_owned, from_literal)
                         });
                     match step_flow {
                         Flow::Exhausted => Demand::Continue,
