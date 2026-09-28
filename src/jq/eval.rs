@@ -2443,6 +2443,20 @@ fn to_owned_key_shape<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> Result<OwnedValue, EvalError> {
     match value {
         StandardJson::Array(_) => Ok(OwnedValue::array()),
+        // #3300: jq reads an object key's `start` and `end` as a slice
+        // descriptor (`.[1][.[0]]` on `[{"start":0,"end":1},[1,2]]` is
+        // `[1]`), so jq mode keeps those two members and nothing else. Each
+        // is itself only shape-copied: a container bound can only fail
+        // classification.
+        StandardJson::Object(fields) if S::TAG != EvalTag::Yq => {
+            let mut desc = IndexMap::new();
+            for name in ["start", "end"] {
+                if let Some(bound) = fields.clone().find(name)? {
+                    desc.insert(name.into(), to_owned_key_shape::<W, S>(&bound)?);
+                }
+            }
+            Ok(OwnedValue::Object(desc.into()))
+        }
         StandardJson::Object(_) => Ok(OwnedValue::Object(IndexMap::new().into())),
         other => to_owned::<S, _>(other),
     }
@@ -23344,6 +23358,27 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 None => QueryResult::One(StandardJson::Null),
             }
         }
+        // #3300: an object key is jq's slice descriptor, so
+        // `.[{"start":1,"end":2}]` is `.[1:2]` -- the same target-kind-first
+        // gate `E[S:T]` uses, then the literal-bounds slice. yq has no such
+        // key and keeps raising.
+        OwnedValue::Object(desc) if S::TAG != EvalTag::Yq => {
+            let (start, end) = descriptor_slice_bounds(desc);
+            let kind = SliceTargetKind::of_type_name(type_name(&target));
+            match resolve_computed_slice_bounds::<S>(kind, &start, &end) {
+                Ok((start, end)) => {
+                    let slice = Expr::Slice {
+                        start,
+                        end,
+                        start_key: None,
+                        end_key: None,
+                    };
+                    eval_single::<W, S>(&slice, target, optional)
+                }
+                Err(_) if optional => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            }
+        }
         // #2482 (yq mode): a computed key (`.s[$k]`) on a scalar target is
         // the same empty-not-error rule as the literal-field/literal-index
         // siblings above -- see `yq_field_index_on_scalar_is_empty`.
@@ -23454,11 +23489,17 @@ fn yq_negative_index_error<S: EvalSemantics>(
 /// Mirrors the borrowed path's rules exactly: missing key and out-of-bounds
 /// index both yield null, null input passes through for a valid key kind, and
 /// an invalid key kind errors even on null.
-pub(crate) fn index_one_owned(
+pub(crate) fn index_one_owned<S: EvalSemantics>(
     target: &OwnedValue,
     key: &OwnedValue,
     optional: bool,
 ) -> Result<Option<OwnedValue>, EvalError> {
+    // #3300: an object key is jq's slice descriptor on an array, string or
+    // `null` target -- see `index_one`'s own arm. yq keeps the arms below.
+    if let (OwnedValue::Object(desc), false) = (key, S::TAG == EvalTag::Yq) {
+        let (start, end) = descriptor_slice_bounds(desc);
+        return slice_owned_value_read_computed::<S>(target, &start, &end, optional);
+    }
     match (key, target) {
         (OwnedValue::String(s), OwnedValue::Object(map)) => {
             Ok(Some(map.get(s).cloned().unwrap_or(OwnedValue::Null)))
@@ -23965,7 +24006,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 }
                             },
                             accumulator: owned.as_mut().expect("promoted by the block above"),
-                            fold: |t| index_one_owned(t, k, optional),
+                            fold: |t| index_one_owned::<S>(t, k, optional),
                         }
                     }
                 };
@@ -24025,22 +24066,37 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // still survive as `Partial`, matching real jq's
                                 // output instead of vanishing.
                                 QueryResult::Error(e) => escape_with_prefix!(Control::Error(e)),
+                                // #3300: a slice-descriptor key builds a fresh
+                                // slice, promoting the accumulator the way
+                                // `eval_comma` folds an owned sibling in.
+                                QueryResult::Owned(v) => {
+                                    if let Err((prefix, e)) = promote_and_extend::<_, S>(
+                                        &mut borrowed,
+                                        &mut owned,
+                                        core::iter::once(v),
+                                    ) {
+                                        let control = Control::Error(e);
+                                        mark_nonretryable_escape(&control);
+                                        terminal = Some(partial(prefix, control));
+                                        return Demand::Stop;
+                                    }
+                                }
                                 // #2182: was a wildcard `_ =>` -- verified by tracing
-                                // both of `index_one`'s callees (`index_object_by_name`,
-                                // `index_array_by_position`) exhaustively: every arm in
-                                // both resolves to `One`/`None`/`Error`, so this is a
-                                // provably closed set today. Spelled out per-variant so
-                                // a future `QueryResult` variant this callee starts
-                                // returning is a compile error here, not a silent
-                                // absorption into a catch-all.
+                                // `index_one`'s callees (`index_object_by_name`,
+                                // `index_array_by_position`, and since #3300 the
+                                // literal-bounds `Expr::Slice`) exhaustively: every
+                                // arm resolves to `One`/`Owned`/`None`/`Error`, so
+                                // this is a provably closed set today. Spelled out
+                                // per-variant so a future `QueryResult` variant this
+                                // callee starts returning is a compile error here,
+                                // not a silent absorption into a catch-all.
                                 QueryResult::OneCursor(_)
                                 | QueryResult::Many(_)
-                                | QueryResult::Owned(_)
                                 | QueryResult::ManyOwned(_)
                                 | QueryResult::Break(_)
                                 | QueryResult::Halt(_)
                                 | QueryResult::Partial(..) => {
-                                    unreachable!("index_one yields only One/None/Error")
+                                    unreachable!("index_one yields only One/Owned/None/Error")
                                 }
                             }
                         }
@@ -24103,7 +24159,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             if let Some(e) = yq_negative_index_error::<S>(t, k) {
                                 escape_with_prefix!(Control::Error(e));
                             }
-                            match index_one_owned(t, k, optional) {
+                            match index_one_owned::<S>(t, k, optional) {
                                 Ok(Some(v)) => owned.as_mut().expect("still Some").push(v),
                                 Ok(None) => {}
                                 // Same reasoning as the `Borrowed` arm above: a
@@ -24679,6 +24735,28 @@ pub(crate) fn owned_bound_to_i64(
     round: fn(f64) -> f64,
 ) -> Result<Option<i64>, EvalError> {
     Ok(SliceBounds::resolved_bound(v)?.map(|f| round(f) as i64))
+}
+
+/// The two bounds of a slice *descriptor* used as an index key,
+/// `.[{"start":s,"end":e}]` (#3300): jq's `jv_get` hands an object key on an
+/// array or string to the same `parse_slice` `.[s:e]` reaches, so the
+/// bounds are [`ComputedSliceBound`]s exactly as `E[S:T]` pulls them --
+/// floored start, ceiled end, and a failure carried rather than raised, so
+/// [`resolve_computed_slice_bounds`] rules on it after the target's kind.
+///
+/// A *missing* `start` or `end` fails like a non-number does (jq's
+/// `jv_object_get` answers an invalid value, which `parse_slice` rejects):
+/// `[1,2,3] | .[{"start":1}]` is `Array/string slice indices must be
+/// integers`, while `null | .[{"start":1}]` is `null`. Extra keys are
+/// never looked at.
+pub(crate) fn descriptor_slice_bounds(
+    desc: &IndexMap<String, OwnedValue>,
+) -> (ComputedSliceBound, ComputedSliceBound) {
+    let bound = |name: &str, round: fn(f64) -> f64| match desc.get(name) {
+        Some(v) => owned_bound_to_i64(v, round),
+        None => Err(EvalError::slice_indices_not_integers()),
+    };
+    (bound("start", f64::floor), bound("end", f64::ceil))
 }
 
 /// One computed slice bound as `E[S:T]` carries it from the bound generator
@@ -35327,7 +35405,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                                 break 'outputs;
                             }
                         };
-                        let indexed = match index_one_owned(&current, key, false) {
+                        let indexed = match index_one_owned::<S>(&current, key, false) {
                             Ok(indexed) => indexed,
                             Err(e) => {
                                 arg_escape = Some(e.into());
@@ -38877,7 +38955,7 @@ impl PatternMode for PathPatternMode<'_> {
     type Reg = PatternRegister;
     type Binding = PatternBinding;
 
-    fn step(
+    fn step<S: EvalSemantics>(
         &self,
         key: &PatternKey<'_>,
         input: &OwnedValue,
@@ -38904,8 +38982,8 @@ impl PatternMode for PathPatternMode<'_> {
                 &element, input,
             ));
         }
-        let component = key.component(input)?;
-        let child = key.child(input)?;
+        let component = key.component::<S>(input)?;
+        let child = key.child::<S>(input)?;
         let moved = PatternRegister {
             path: PathPrefix::extend(&reg.path, component),
             value: child.clone(),
@@ -42993,7 +43071,7 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
             let next_value: Cow<'a, OwnedValue> = if scalar_noop {
                 target_value.clone()
             } else {
-                Cow::Owned(match index_one_owned(target_value, k, false) {
+                Cow::Owned(match index_one_owned::<S>(target_value, k, false) {
                     Ok(v) => v.expect("non-optional index yields a value or errors"),
                     Err(_) if optional => continue,
                     Err(e) => escape!(e.into()),
@@ -61926,7 +62004,7 @@ impl PatternKey<'_> {
     /// between them -- value mode used to short-circuit a `null` target
     /// before evaluating any key (#1239), which is why `null | . as
     /// {(error("E")):$q} | $q` answered `null` where jq raises `E`.
-    fn child(&self, input: &OwnedValue) -> Result<OwnedValue, EvalError> {
+    fn child<S: EvalSemantics>(&self, input: &OwnedValue) -> Result<OwnedValue, EvalError> {
         match (self, input) {
             (Self::Field(key), OwnedValue::Object(obj)) => {
                 Ok(obj.get(*key).cloned().unwrap_or(OwnedValue::Null))
@@ -61948,7 +62026,7 @@ impl PatternKey<'_> {
                 owned_type_name(input),
                 "number",
             )),
-            (Self::Computed(key), _) => match index_one_owned(input, key, false) {
+            (Self::Computed(key), _) => match index_one_owned::<S>(input, key, false) {
                 Ok(Some(v)) => Ok(v),
                 Ok(None) => unreachable!("index_one_owned(.., optional: false) never suppresses"), // omni-dev: coverage tolerate-line reason="unreachable: `optional: false` makes index_one_owned answer Ok(Some)/Err only (#2872)"
                 Err(e) => Err(e),
@@ -61960,7 +62038,7 @@ impl PatternKey<'_> {
     /// a string key is a field, a numeric key an index that keeps its own
     /// spelling exactly as `.[EXPR]` does (`numeric_path_component`, #1088),
     /// and any other kind is [`Self::child`]'s error.
-    fn component(&self, input: &OwnedValue) -> Result<Expr, EvalError> {
+    fn component<S: EvalSemantics>(&self, input: &OwnedValue) -> Result<Expr, EvalError> {
         match self {
             Self::Field(key) => Ok(Expr::Field((*key).to_string())),
             Self::Position(i) => Ok(Expr::Index { idx: *i, key: None }),
@@ -61999,7 +62077,7 @@ trait PatternMode {
     /// is the first step its container performs (object entry 0, the last
     /// array element); every later entry steps from the container again,
     /// which path mode's identity check has to know.
-    fn step(
+    fn step<S: EvalSemantics>(
         &self,
         key: &PatternKey<'_>,
         input: &OwnedValue,
@@ -62029,14 +62107,14 @@ impl PatternMode for ValuePatternMode {
     type Reg = ();
     type Binding = (String, OwnedValue);
 
-    fn step(
+    fn step<S: EvalSemantics>(
         &self,
         key: &PatternKey<'_>,
         input: &OwnedValue,
         _reg: &(),
         _first: bool,
     ) -> Result<(OwnedValue, ()), EvalError> {
-        Ok((key.child(input)?, ()))
+        Ok((key.child::<S>(input)?, ()))
     }
 
     fn bind(&self, name: &str, value: &OwnedValue, _reg: &()) -> Self::Binding {
@@ -62088,7 +62166,7 @@ fn walk_pattern_each<M: PatternMode, S: EvalSemantics>(
 ) -> Flow {
     if !pattern_has_computed_key(pattern) {
         let mark = out.len();
-        let flow = match walk_pattern_once(mode, pattern, input, reg, out) {
+        let flow = match walk_pattern_once::<M, S>(mode, pattern, input, reg, out) {
             Ok(reg) => sink(reg, out),
             Err(e) => Flow::Escaped(Control::Error(e)),
         };
@@ -62125,7 +62203,7 @@ fn pattern_has_computed_key(pattern: &Pattern) -> bool {
 /// loop over each container's entries, recursing only into a nested
 /// sub-pattern (bounded by the parser's `MAX_PATTERN_DEPTH`). Bindings are
 /// pushed to `out` and left there for the caller to unwind.
-fn walk_pattern_once<M: PatternMode>(
+fn walk_pattern_once<M: PatternMode, S: EvalSemantics>(
     mode: &M,
     pattern: &Pattern,
     input: &OwnedValue,
@@ -62145,7 +62223,8 @@ fn walk_pattern_once<M: PatternMode>(
                 let ObjectKey::Literal(key) = &entry.key else {
                     unreachable!("the caller checked for computed keys") // omni-dev: coverage tolerate-line reason="unreachable: every caller gates on `pattern_has_computed_key` being false (#2872)"
                 };
-                let (child, moved) = mode.step(&PatternKey::Field(key), input, &reg, i == 0)?;
+                let (child, moved) =
+                    mode.step::<S>(&PatternKey::Field(key), input, &reg, i == 0)?;
                 // `{$b: P}` binds `$b` to the matched value *before* running
                 // `P` against that same value -- one `INDEX` step in jq's
                 // compilation (#2649) -- so the bind sits ahead of `P`'s own
@@ -62154,7 +62233,7 @@ fn walk_pattern_once<M: PatternMode>(
                 if let Some(bind) = &entry.bind {
                     out.push(mode.bind(bind, &child, &moved));
                 }
-                reg = walk_pattern_once(mode, &entry.pattern, &child, moved, out)?;
+                reg = walk_pattern_once::<M, S>(mode, &entry.pattern, &child, moved, out)?;
             }
             Ok(reg)
         }
@@ -62162,8 +62241,8 @@ fn walk_pattern_once<M: PatternMode>(
             let mut reg = reg;
             for (i, element) in elements.iter().enumerate().rev() {
                 let key = PatternKey::Position(i as i64);
-                let (child, moved) = mode.step(&key, input, &reg, i + 1 == elements.len())?;
-                reg = walk_pattern_once(mode, element, &child, moved, out)?;
+                let (child, moved) = mode.step::<S>(&key, input, &reg, i + 1 == elements.len())?;
+                reg = walk_pattern_once::<M, S>(mode, element, &child, moved, out)?;
             }
             Ok(reg)
         }
@@ -62195,7 +62274,7 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
         if pattern_has_computed_key(&entry.pattern) {
             break;
         }
-        let (child, moved) = match mode.step(&PatternKey::Field(key), input, &reg, first) {
+        let (child, moved) = match mode.step::<S>(&PatternKey::Field(key), input, &reg, first) {
             Ok(stepped) => stepped,
             Err(e) => {
                 out.truncate(mark);
@@ -62205,7 +62284,7 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
         if let Some(bind) = &entry.bind {
             out.push(mode.bind(bind, &child, &moved));
         }
-        reg = match walk_pattern_once(mode, &entry.pattern, &child, moved, out) {
+        reg = match walk_pattern_once::<M, S>(mode, &entry.pattern, &child, moved, out) {
             Ok(reg) => reg,
             Err(e) => {
                 out.truncate(mark);
@@ -62221,7 +62300,7 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
         return flow;
     };
     let mut per_key = |key: PatternKey<'_>, out: &mut Vec<M::Binding>| -> Flow {
-        let (child, moved) = match mode.step(&key, input, &reg, first) {
+        let (child, moved) = match mode.step::<S>(&key, input, &reg, first) {
             Ok(stepped) => stepped,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
@@ -62298,14 +62377,14 @@ fn walk_array_elements<M: PatternMode, S: EvalSemantics>(
     let mut end = elements.len();
     while end > 0 && !pattern_has_computed_key(&elements[end - 1]) {
         let key = PatternKey::Position(end as i64 - 1);
-        let (child, moved) = match mode.step(&key, input, &reg, first) {
+        let (child, moved) = match mode.step::<S>(&key, input, &reg, first) {
             Ok(stepped) => stepped,
             Err(e) => {
                 out.truncate(mark);
                 return Flow::Escaped(Control::Error(e));
             }
         };
-        reg = match walk_pattern_once(mode, &elements[end - 1], &child, moved, out) {
+        reg = match walk_pattern_once::<M, S>(mode, &elements[end - 1], &child, moved, out) {
             Ok(reg) => reg,
             Err(e) => {
                 out.truncate(mark);
@@ -62321,7 +62400,7 @@ fn walk_array_elements<M: PatternMode, S: EvalSemantics>(
         return flow;
     };
     let key = PatternKey::Position(rest.len() as i64);
-    let (child, moved) = match mode.step(&key, input, &reg, first) {
+    let (child, moved) = match mode.step::<S>(&key, input, &reg, first) {
         Ok(stepped) => stepped,
         Err(e) => {
             out.truncate(mark);
