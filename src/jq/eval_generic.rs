@@ -71,15 +71,15 @@ use super::eval::{
     reroot_markers, resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty,
     select_emits, settle_then_replay, settles_before_consumer, shared_arg_depth_refusal,
     slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
-    stop_with_downstream, stop_with_error, stop_with_escape, stop_with_escape_cell,
-    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
-    substitute_vars, suppresses, tonumber_from_str, try_payload_root, vec_with_capacity,
-    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
-    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
-    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RootWitness, SliceTargetKind,
-    YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
+    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
+    try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
+    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
+    yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
+    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
+    Reentry, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
+    WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -10528,11 +10528,17 @@ fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut outer_stopped = false;
-    let mut escape: Option<Control> = None;
+    let escape = StashedEscape::new();
     let cond_flow = eval_each_generic::<S, V>(cond, value.clone(), optional, cursor, &mut |item| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside
+        // `cond`; it supersedes whatever the retried-past call decided --
+        // including a consumer's stop, which would otherwise hide an error
+        // the retry's own branch raises.
+        escape.begin();
+        outer_stopped = false;
         let truthy = match generic_item_truthiness::<_, S>(item) {
             Ok(b) => b,
-            Err(control) => return stop_with_escape(&mut escape, control),
+            Err(control) => return escape.stop(control),
         };
         let branch = if truthy { then_branch } else { else_branch };
         match eval_each_generic::<S, V>(branch, value.clone(), optional, cursor, sink) {
@@ -10541,14 +10547,14 @@ fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
                 outer_stopped = true;
                 Demand::Stop
             }
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            Flow::Escaped(control) => escape.stop(control),
         }
     });
 
     if outer_stopped {
         return cond_flow;
     }
-    match escape {
+    match escape.take(&cond_flow, crate::jq::eval::direct_pattern_retry(cond)) {
         Some(control) => Flow::Escaped(control),
         None => cond_flow,
     }
@@ -11007,6 +11013,7 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
     let invert_dedup = patterns.len() > 1;
 
     for (i, pattern) in patterns.iter().enumerate() {
+        crate::jq::eval::begin_pattern_alternative(i); // #3293
         let is_last = i == last_idx;
 
         // #2872: `body` runs once per binding set as the matcher completes
@@ -12225,10 +12232,13 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    let mut escape: Option<Control> = None;
+    let escape = StashedEscape::new();
 
-    let flow =
-        eval_each_generic::<S, V>(key, value.clone(), false, cursor, &mut |item| match item {
+    let flow = eval_each_generic::<S, V>(key, value.clone(), false, cursor, &mut |item| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside `key`;
+        // it supersedes whatever the retried-past call decided.
+        escape.begin();
+        match item {
             GenericItem::One(v) => {
                 // STYLE-0012: this materializes the *key* generator's output,
                 // evaluated with a hardcoded `optional: false` in the
@@ -12238,7 +12248,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                 // `eval_index_expr_generic`'s own `One` arm.
                 let k = match to_owned_key_shape::<_, S>(&v) {
                     Ok(k) => k,
-                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+                    Err(e) => return escape.stop(Control::Error(e)),
                 };
                 if process_index_key::<S, V>(
                     target,
@@ -12247,7 +12257,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                     optional,
                     cursor,
                     sink,
-                    &mut escape,
+                    &escape,
                 ) {
                     Demand::Continue
                 } else {
@@ -12258,7 +12268,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                 // STYLE-0012: key generator -- see the `One` arm above.
                 let k = match to_owned_key_shape_cursor::<_, S>(&c) {
                     Ok(k) => k,
-                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+                    Err(e) => return escape.stop(Control::Error(e)),
                 };
                 if process_index_key::<S, V>(
                     target,
@@ -12267,7 +12277,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                     optional,
                     cursor,
                     sink,
-                    &mut escape,
+                    &escape,
                 ) {
                     Demand::Continue
                 } else {
@@ -12280,7 +12290,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
             | GenericItem::LazySeq(_)) => {
                 let ks = match generic_item_to_result(item).collect_owned::<S>() {
                     Ok(ks) => ks,
-                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+                    Err(e) => return escape.stop(Control::Error(e)),
                 };
                 for k in &ks {
                     if !process_index_key::<S, V>(
@@ -12290,16 +12300,17 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                         optional,
                         cursor,
                         sink,
-                        &mut escape,
+                        &escape,
                     ) {
                         return Demand::Stop;
                     }
                 }
                 Demand::Continue
             }
-        });
+        }
+    });
 
-    resume_from_escape(escape, flow)
+    escape.resume(flow, crate::jq::eval::direct_pattern_retry(key))
 }
 
 /// One already-computed key, indexed against `target` via
@@ -12319,7 +12330,7 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
-    escape: &mut Option<Control>,
+    escape: &StashedEscape,
 ) -> bool {
     let literal_key = owned_to_expr(k);
     let one_key_result = eval_index_expr::<S, V>(target, &literal_key, value, optional, cursor);
@@ -12327,7 +12338,7 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
         Flow::Exhausted => true,
         Flow::Stopped { .. } => false,
         Flow::Escaped(control) => {
-            stop_with_escape(escape, control);
+            escape.stop(control);
             false
         }
     }
@@ -12399,12 +12410,16 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
             sink,
         ),
         ObjectKey::Expr(key_expr) => {
-            let mut escape: Option<Control> = None;
+            let escape = StashedEscape::new();
             let flow =
                 eval_each_generic::<S, V>(key_expr, value.clone(), optional, cursor, &mut |item| {
+                    // #3293: a re-invocation after a stop is a `?//` retry
+                    // inside `key_expr`; it supersedes whatever the
+                    // retried-past call decided.
+                    escape.begin();
                     let key_owned = match generic_item_into_owned::<_, S>(item) {
                         Ok(v) => v,
-                        Err(control) => return stop_with_escape(&mut escape, control),
+                        Err(control) => return escape.stop(control),
                     };
                     match each_object_value_generic::<S, V>(
                         ObjectKeySlot::Computed(key_owned),
@@ -12418,10 +12433,10 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
                     ) {
                         Flow::Exhausted => Demand::Continue,
                         Flow::Stopped { .. } => Demand::Stop,
-                        Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+                        Flow::Escaped(control) => escape.stop(control),
                     }
                 });
-            resume_from_escape(escape, flow)
+            escape.resume(flow, crate::jq::eval::direct_pattern_retry(key_expr))
         }
     }
 }
@@ -12452,12 +12467,16 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
     acc: &mut Vec<(String, OwnedValue)>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    let mut escape: Option<Control> = None;
+    let escape = StashedEscape::new();
     let flow =
         eval_each_generic::<S, V>(value_expr, value.clone(), optional, cursor, &mut |item| {
+            // #3293: a re-invocation after a stop is a `?//` retry inside
+            // `value_expr`; it supersedes whatever the retried-past call
+            // decided.
+            escape.begin();
             let val_owned = match generic_item_into_owned::<_, S>(item) {
                 Ok(v) => v,
-                Err(control) => return stop_with_escape(&mut escape, control),
+                Err(control) => return escape.stop(control),
             };
             let key_str = match &key {
                 ObjectKeySlot::Literal(s) => s.clone(),
@@ -12469,10 +12488,9 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
                             if optional {
                                 return Demand::Continue;
                             }
-                            return stop_with_escape(
-                                &mut escape,
-                                Control::Error(EvalError::cannot_use_as_object_key(key_owned)),
-                            );
+                            return escape.stop(Control::Error(
+                                EvalError::cannot_use_as_object_key(key_owned),
+                            ));
                         }
                     },
                 },
@@ -12490,10 +12508,10 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
             match result {
                 Flow::Exhausted => Demand::Continue,
                 Flow::Stopped { .. } => Demand::Stop,
-                Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+                Flow::Escaped(control) => escape.stop(control),
             }
         });
-    resume_from_escape(escape, flow)
+    escape.resume(flow, crate::jq::eval::direct_pattern_retry(value_expr))
 }
 
 /// Generic-evaluator twin of `eval::eval_each_pipe` (#1461): the "stop
@@ -13578,7 +13596,10 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
     // flag as `eval::binary_fanout_each` -- see
     // `eval::read_only_operand_strategy` and `eval::yq_read_only_context`.
     let each_operand = read_only_operand_strategy_generic(rules, each_operand);
-    let mut abort: Option<Flow> = None;
+    // #3293: every closure below resets this first -- a re-invocation after
+    // a stop is a `?//` retry inside that operand, and it supersedes the
+    // retried-past call's verdict (see `eval::StashedVerdict`).
+    let abort: StashedVerdict<Flow> = StashedVerdict::new();
     // #2460: how many outputs each operand produced, so a *zero* count is
     // answered from `yq_empty_operand_output` rather than contributing no
     // pairings -- the same rule, from the same definition, that
@@ -13595,18 +13616,20 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
     };
 
     let outer = each_operand(outer_expr, &mut |outer_item: GenericItem<V>| {
+        abort.begin();
         outer_seen += 1;
         let outer_val = match generic_item_into_owned::<_, S>(outer_item) {
             Ok(v) => v,
-            Err(control) => return stop_with_downstream(&mut abort, Flow::Escaped(control)),
+            Err(control) => return abort.stop_with_downstream(Flow::Escaped(control)),
         };
 
         let mut inner_seen = 0usize;
         let inner = each_operand(inner_expr, &mut |inner_item: GenericItem<V>| {
+            abort.begin();
             inner_seen += 1;
             let inner_val = match generic_item_into_owned::<_, S>(inner_item) {
                 Ok(v) => v,
-                Err(control) => return stop_with_downstream(&mut abort, Flow::Escaped(control)),
+                Err(control) => return abort.stop_with_downstream(Flow::Escaped(control)),
             };
             let (left_val, right_val) = if rules.left_major {
                 (outer_val.clone(), inner_val)
@@ -13624,18 +13647,18 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
                 // fanout rather than skipping just that pairing, whatever was
                 // already pushed stands, and `optional` decides whether the
                 // failure itself survives.
-                Err(e) => {
-                    abort = Some(if optional {
-                        Flow::Exhausted
-                    } else {
-                        Flow::Escaped(Control::Error(e))
-                    });
-                    Demand::Stop
-                }
+                Err(e) => abort.stop_with_downstream(if optional {
+                    Flow::Exhausted
+                } else {
+                    Flow::Escaped(Control::Error(e))
+                }),
             }
         });
 
-        if abort.is_some() {
+        // #3293: a retry inside `inner_expr` that produced nothing never
+        // re-invoked the closure above to reset `abort`.
+        abort.settle(&inner, crate::jq::eval::direct_pattern_retry(inner_expr));
+        if abort.is_set() {
             return Demand::Stop;
         }
 
@@ -13647,7 +13670,7 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
             if let Some(op) = rules.empty {
                 if let Some(v) = yq_empty_operand_output(op, Some(&outer_val)) {
                     if matches!(sink.push(GenericItem::Owned(v)), Demand::Stop) {
-                        return stop_with_downstream(&mut abort, Flow::Stopped { pending: None });
+                        return abort.stop_with_downstream(Flow::Stopped { pending: None });
                     }
                 }
             }
@@ -13655,10 +13678,11 @@ fn binary_fanout_each_generic_with<V: DocumentValue, S: EvalSemantics>(
 
         match inner {
             Flow::Exhausted => Demand::Continue,
-            other => stop_with_downstream(&mut abort, other),
+            other => abort.stop_with_downstream(other),
         }
     });
 
+    let abort = abort.take(&outer, crate::jq::eval::direct_pattern_retry(outer_expr));
     if let (Some(op), 0, None, Flow::Exhausted) = (rules.empty, outer_seen, &abort, &outer) {
         // #2460 (yq mode only): the *outer* operand produced nothing, so the
         // loop never ran and the inner one was never evaluated at all --
@@ -13718,20 +13742,22 @@ fn empty_outer_operand_pass_generic<V: DocumentValue, S: EvalSemantics>(
     op: EmptyOperandOp,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    let mut abort: Option<Flow> = None;
+    let abort: StashedVerdict<Flow> = StashedVerdict::new();
     let mut other_seen = 0usize;
     let flow = each_operand(other, &mut |other_item: GenericItem<V>| {
+        // #3293: see `binary_fanout_each_generic_with`'s own reset.
+        abort.begin();
         other_seen += 1;
         let other_val = match generic_item_into_owned::<_, S>(other_item) {
             Ok(v) => v,
-            Err(control) => return stop_with_downstream(&mut abort, Flow::Escaped(control)),
+            Err(control) => return abort.stop_with_downstream(Flow::Escaped(control)),
         };
         match yq_empty_operand_output(op, Some(&other_val)) {
             Some(v) => sink.push(GenericItem::Owned(v)),
             None => Demand::Continue,
         }
     });
-    if let Some(flow) = abort {
+    if let Some(flow) = abort.take(&flow, crate::jq::eval::direct_pattern_retry(other)) {
         return flow;
     }
     if other_seen == 0 && matches!(flow, Flow::Exhausted) {
@@ -14133,12 +14159,19 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    // `Cell` for the same reason `each_range` uses one: `emit` and the three
-    // operand closures are live simultaneously and each must be able to
-    // record an escape it discovers on its own.
-    let escape: core::cell::Cell<Option<Control>> = core::cell::Cell::new(None);
-    let mut sink_stopped = false;
-    let mut sink_stopped_at = crate::jq::eval::pipe_retry_generation();
+    // Shared by `&` for the same reason `each_range` uses a `Cell`: `emit` and
+    // the three operand closures are live simultaneously and each must be
+    // able to record what ended the drive -- an escape it discovers, or the
+    // consumer's stop -- on its own.
+    //
+    // #3293: every operand closure below calls `verdict.begin()` first. A
+    // re-invocation of any of them after a stop is a `?//` retry inside that
+    // operand, and it supersedes the escape or consumer stop the
+    // retried-past call recorded -- a stale stop would otherwise hide the
+    // error the retry's own bound raises
+    // (`[first(range(1 as $a ?// $b | $a // "x"))]`).
+    let verdict: StashedVerdict<Flow> = StashedVerdict::new();
+    let stop = |control: Control| verdict.stop_with_downstream(Flow::Escaped(control));
 
     // See `each_range`'s own note (#3071): the 1-arg/2-arg call shapes (no
     // explicit step expression) select the float path's NaN-tolerant loop
@@ -14168,9 +14201,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
         };
         for v in values {
             if sink.push(GenericItem::Owned(v)) == Demand::Stop {
-                sink_stopped = true;
-                sink_stopped_at = crate::jq::eval::pipe_retry_generation();
-                return Demand::Stop;
+                return verdict.stop_with_downstream(Flow::Stopped { pending: None });
             }
         }
         // Truncation only raises once the sink has taken everything the
@@ -14178,19 +14209,20 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
         // rule, unchanged: `first(range(1e18))` stops early and never sees
         // this, `[range(1e18)]` does.
         if truncated {
-            return stop_with_escape_cell(&escape, Control::Error(range_max_exceeded_error()));
+            return stop(Control::Error(range_max_exceeded_error()));
         }
         Demand::Continue
     };
 
     let from_flow = eval_each_generic::<S, V>(from, value.clone(), optional, cursor, &mut |item| {
+        verdict.begin();
         let from_owned = match generic_item_into_owned::<_, S>(item) {
             Ok(v) => v,
-            Err(control) => return stop_with_escape_cell(&escape, control),
+            Err(control) => return stop(control),
         };
         let from_val = match range_num(&from_owned) {
             Ok(n) => n,
-            Err(e) => return stop_with_escape_cell(&escape, Control::Error(e)),
+            Err(e) => return stop(Control::Error(e)),
         };
         // The one place `from`'s own literal spelling (if any) is still on
         // hand -- see `each_range`'s own note (#3103).
@@ -14216,11 +14248,12 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
 
         let to_flow =
             eval_each_generic::<S, V>(to_expr, value.clone(), optional, cursor, &mut |to_item| {
+                verdict.begin();
                 let to_val = match generic_item_into_owned::<_, S>(to_item)
                     .and_then(|v| range_num(&v).map_err(Control::Error))
                 {
                     Ok(n) => n,
-                    Err(control) => return stop_with_escape_cell(&escape, control),
+                    Err(control) => return stop(control),
                 };
 
                 match step {
@@ -14232,11 +14265,12 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                             optional,
                             cursor,
                             &mut |step_item| {
+                                verdict.begin();
                                 let step_val = match generic_item_into_owned::<_, S>(step_item)
                                     .and_then(|v| range_num(&v).map_err(Control::Error))
                                 {
                                     Ok(n) => n,
-                                    Err(control) => return stop_with_escape_cell(&escape, control),
+                                    Err(control) => return stop(control),
                                 };
                                 emit(from_val, to_val, step_val, from_literal)
                             },
@@ -14244,7 +14278,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                         match step_flow {
                             Flow::Exhausted => Demand::Continue,
                             Flow::Stopped { .. } => Demand::Stop,
-                            Flow::Escaped(control) => stop_with_escape_cell(&escape, control),
+                            Flow::Escaped(control) => stop(control),
                         }
                     }
                 }
@@ -14253,21 +14287,17 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
         match to_flow {
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => Demand::Stop,
-            Flow::Escaped(control) => stop_with_escape_cell(&escape, control),
+            Flow::Escaped(control) => stop(control),
         }
     });
 
     let direct_retry = crate::jq::eval::direct_pattern_retry(from)
         || to.is_some_and(crate::jq::eval::direct_pattern_retry)
         || step.is_some_and(crate::jq::eval::direct_pattern_retry);
-    if sink_stopped
-        && !crate::jq::eval::retry_consumed_stop(&from_flow, sink_stopped_at, direct_retry)
-    {
-        return Flow::Stopped { pending: None };
-    }
-    match escape.into_inner() {
-        Some(control) => Flow::Escaped(control),
-        None => from_flow,
+    match verdict.take(&from_flow, direct_retry) {
+        Some(Flow::Escaped(control)) => Flow::Escaped(control),
+        Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
+        Some(Flow::Exhausted) | None => from_flow,
     }
 }
 
@@ -14294,11 +14324,15 @@ fn each_negate_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut outer_stopped = false;
-    let mut escape: Option<Control> = None;
+    let escape = StashedEscape::new();
     let flow = eval_each_generic::<S, V>(operand, value, optional, cursor, &mut |item| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside
+        // `operand`; it supersedes whatever the retried-past call decided.
+        escape.begin();
+        outer_stopped = false;
         let owned = match generic_item_into_owned::<_, S>(item) {
             Ok(v) => v,
-            Err(control) => return stop_with_escape(&mut escape, control),
+            Err(control) => return escape.stop(control),
         };
         match crate::jq::eval::arith_negate::<S>(owned) {
             Ok(negated) => {
@@ -14309,13 +14343,14 @@ fn each_negate_generic<S: EvalSemantics, V: DocumentValue>(
                     Demand::Continue
                 }
             }
-            Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
+            Err(e) => escape.stop(Control::Error(e)),
         }
     });
 
     if outer_stopped {
         return flow;
     }
+    let escape = escape.take(&flow, crate::jq::eval::direct_pattern_retry(operand));
     let control = escape.or(match flow {
         Flow::Exhausted | Flow::Stopped { .. } => None,
         Flow::Escaped(control) => Some(control),
@@ -14671,8 +14706,13 @@ where
 {
     // Tracked out-of-band for the usual reason: the sink can only answer
     // `Demand`, so "why did the pull stop" has to be recorded beside it.
-    let mut escape: Option<Control> = None;
-    let mut consumer_stopped = false;
+    let escape = StashedEscape::new();
+    // Not folded into one `StashedVerdict<Flow>` the way `each_range_generic`
+    // is: this closure is on the stack once per level of a recursive `def`
+    // with `$` parameters, and the wider slot's temporaries cost enough native
+    // stack per level (debug build) that ADR-0025's floor refused before the
+    // frame guard did (`test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149`).
+    let mut consumer_stopped_at: Option<u64> = None;
 
     let flow = settled_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
         // #2952: reset before anything below can set a fresh `escape` for
@@ -14688,10 +14728,13 @@ where
         // `[10,10]` -- the first alternative's `error("BODY")` retries
         // into the second, whose own `10` satisfies `limit(2)` before its
         // own `error("BODY")` is ever reached.
-        escape = None;
+        escape.begin();
+        // #3293: a stale consumer stop would hide the error the retry's own
+        // call raises, the reverse of #2952.
+        consumer_stopped_at = None;
         let owned = match generic_item_into_owned::<_, S>(item) {
             Ok(owned) => owned,
-            Err(control) => return stop_with_escape(&mut escape, control),
+            Err(control) => return escape.stop(control),
         };
         match body(owned) {
             // This `n`'s own walk finished; go on to the next one.
@@ -14700,18 +14743,23 @@ where
             // argument generator's, exactly as it does inside
             // `each_limit_generic`'s own inner sink.
             Flow::Stopped { .. } => {
-                consumer_stopped = true;
+                consumer_stopped_at = Some(crate::jq::eval::pipe_retry_generation());
                 Demand::Stop
             }
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            Flow::Escaped(control) => escape.stop(control),
         }
     });
 
-    match escape {
+    let direct_retry = crate::jq::eval::direct_pattern_retry(arg_expr);
+    match escape.take(&flow, direct_retry) {
         Some(control) => Flow::Escaped(control),
         // `pending` is dropped for the reason every other lazy consumer
         // drops it: it belongs to an eager fallback jq would never reach.
-        None if consumer_stopped => Flow::Stopped { pending: None },
+        None if consumer_stopped_at
+            .is_some_and(|at| !crate::jq::eval::retry_superseded(&flow, at, direct_retry)) =>
+        {
+            Flow::Stopped { pending: None }
+        }
         None => flow,
     }
 }
@@ -14739,8 +14787,13 @@ where
 {
     // Tracked out-of-band for the usual reason: the sink can only answer
     // `Demand`, so "why did the pull stop" has to be recorded beside it.
-    let mut escape: Option<Control> = None;
-    let mut consumer_stopped = false;
+    let escape = StashedEscape::new();
+    // Not folded into one `StashedVerdict<Flow>` the way `each_range_generic`
+    // is: this closure is on the stack once per level of a recursive `def`
+    // with `$` parameters, and the wider slot's temporaries cost enough native
+    // stack per level (debug build) that ADR-0025's floor refused before the
+    // frame guard did (`test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149`).
+    let mut consumer_stopped_at: Option<u64> = None;
 
     let flow = settled_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
         // #2952: reset before anything below can set a fresh `escape` for
@@ -14748,10 +14801,13 @@ where
         // top-of-closure reset and `eval::fanout_arg_each_inner`'s doc
         // comment for why a later, clean call can follow one that escaped
         // (a `?//` inside `arg_expr` retrying past it).
-        escape = None;
+        escape.begin();
+        // #3293: a stale consumer stop would hide the error the retry's own
+        // call raises, the reverse of #2952.
+        consumer_stopped_at = None;
         let (owned, origin) = match generic_item_into_owned_with_origin::<_, S>(item) {
             Ok(pair) => pair,
-            Err(control) => return stop_with_escape(&mut escape, control),
+            Err(control) => return escape.stop(control),
         };
         match body(owned, origin) {
             // This bound value's own walk finished; go on to the next one.
@@ -14760,18 +14816,23 @@ where
             // argument generator's, exactly as it does in
             // `fanout_arg_each_generic` above.
             Flow::Stopped { .. } => {
-                consumer_stopped = true;
+                consumer_stopped_at = Some(crate::jq::eval::pipe_retry_generation());
                 Demand::Stop
             }
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            Flow::Escaped(control) => escape.stop(control),
         }
     });
 
-    match escape {
+    let direct_retry = crate::jq::eval::direct_pattern_retry(arg_expr);
+    match escape.take(&flow, direct_retry) {
         Some(control) => Flow::Escaped(control),
         // `pending` is dropped for the reason every other lazy consumer
         // drops it: it belongs to an eager fallback jq would never reach.
-        None if consumer_stopped => Flow::Stopped { pending: None },
+        None if consumer_stopped_at
+            .is_some_and(|at| !crate::jq::eval::retry_superseded(&flow, at, direct_retry)) =>
+        {
+            Flow::Stopped { pending: None }
+        }
         None => flow,
     }
 }
