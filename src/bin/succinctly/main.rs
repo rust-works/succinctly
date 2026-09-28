@@ -1394,7 +1394,7 @@ where
                 fixed.insert(idx, "--".to_string());
                 if let Ok(cmd) = P::try_parse_from(fixed) {
                     return cmd;
-                }
+                } // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_accepted_via_sjq_multicall_alias_3389's '-x' row demonstrably reaches the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
             }
             e.exit()
         }
@@ -1556,7 +1556,7 @@ fn parse_cli_allowing_negative_filter() -> Cli {
                 fixed.insert(idx, "--".to_string());
                 if let Ok(cli) = Cli::try_parse_from(fixed) {
                     return cli;
-                }
+                } // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_boundary_characters_3389's '-x'/'-n1'/'--bogus' rows demonstrably reach the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
             }
             e.exit()
         }
