@@ -74820,5 +74820,17 @@ fn test_frozen_source_through_a_composite_head_refuses_loudly_3334() -> Result<(
             "{filter}: {stderr:?}"
         );
     }
+
+    // A `catch` handler's `.` is the error payload, not a frozen input, so
+    // its refusal stays catchable and matches jq's `[]` (#3334 review).
+    let (out, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"[path(. as $orig | has("k") | $orig | try ((try error({"a":{"b":1}}) catch .) as {a:{b:$q}} | $q))]"#,
+        ],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0, "{stderr:?}");
+    assert_eq!(out.trim(), "[]");
     Ok(())
 }

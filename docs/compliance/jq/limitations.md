@@ -828,7 +828,17 @@ is the revert that established what the other one costs.
    `del(. as $orig \| has("k") \| try ((if true then $orig else $orig end) as {a:{b:$q}} \| $q))`
    on `{"a":{"b":1}}` echoed the document where jq returns `{"a":{}}`. Each now refuses
    loudly, exactly as the bare `$orig` head does. On `{"a":5}`, where jq's own walk fails and
-   jq answers `[]`, that is the bare head's documented price, not a new one.
+   jq answers `[]`, that is the bare head's documented price. The frozen test is static and
+   answers "any branch may be frozen", so one more row pays that price: a branch jq takes that
+   holds a fresh value equal to the frozen one.
+   `del(. as $orig \| has("k") \| try ((if false then $orig else {"a":{"b":1}} end) as {a:{b:$q}} \| $q))`
+   echoes the document in jq and refuses loudly here. Where a static test can't decide, a
+   loud refusal is the ADR-0018 rule 4 direction. A `catch` handler's `.` is the error
+   payload, not the frozen input, so it is not counted.
+
+   Heads the frozen test does not recognize still lose the write under `try`, as they did
+   before #3334: `($orig \| .)`, `first($orig)`, `($orig?)` and similar. Tracked in
+   [#3423](https://github.com/rust-works/succinctly/issues/3423).
 
    One residual keeps the silent drop. A *terminal* refusal (the pipe's last value is a `$var`,
    with no navigation after it) is still decided where the per-branch knowledge is gone, so a
@@ -1735,9 +1745,12 @@ is the revert that established what the other one costs.
    `del((., 1) as $x \| try $x.a)` discarded its write at exit 0. Both `as` and destructuring
    now split a top-level comma source per leaf (jq mode only: yq does not fan out an `as`
    source), and a comma nested under `if`/`try`/`//` is recognized when every leaf is a
-   passthrough. One refuse-only residual: an *asymmetric* comma nested under another head,
-   `(if true then (., 1) else . end) as $x \| $x`, refuses on its first output, where jq
-   succeeds on it and refuses on the second. Pinned by
+   passthrough. One residual: an *asymmetric* comma nested under another head is not split.
+   `(if true then (., 1) else . end) as $x \| $x` refuses on its first output, where jq
+   succeeds on it and refuses on the second. Under `try` that refusal is caught, so
+   `del((if true then (., 1) else . end) as $x \| try $x.a)` still discards the write jq
+   makes, as it did before #3334. Tracked in
+   [#3423](https://github.com/rust-works/succinctly/issues/3423). Pinned by
    `test_comma_bind_source_is_classified_per_branch_3334`.
 3. **jq's pointer-identity artifacts on `*`/`+` with an empty operand** —
    `path(. as $x \| reduce (1) as $i (0; $x + {}))` on `{"a":1}` is `[]` in jq; succinctly

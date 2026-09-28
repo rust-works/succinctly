@@ -33641,22 +33641,37 @@ fn unwrap_bind_source(expr: &Expr) -> &Expr {
 /// as $x | $x` prints the document once), so the desugaring would be wrong
 /// there.
 fn comma_leaves<S: EvalSemantics>(expr: &Expr) -> Option<Vec<&Expr>> {
-    fn push<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
-        match unwrap_bind_source(expr) {
-            Expr::Comma(exprs) => {
-                for e in exprs {
-                    push(e, out);
-                }
-            }
-            leaf => out.push(leaf),
-        }
-    }
     if S::TAG != EvalTag::Jq || !matches!(unwrap_bind_source(expr), Expr::Comma(_)) {
         return None;
     }
+    // An explicit stack, not recursion: a recursive def can nest its
+    // argument as deep as it likes, and this walk has no native-stack floor
+    // of its own (ADR-0025).
     let mut leaves = Vec::new();
-    push(expr, &mut leaves);
+    let mut pending = vec![expr];
+    while let Some(next) = pending.pop() {
+        match unwrap_bind_source(next) {
+            Expr::Comma(exprs) => pending.extend(exprs.iter().rev()),
+            leaf => leaves.push(leaf),
+        }
+    }
     Some(leaves)
+}
+
+/// Runs `resolve_leaf` once per [`comma_leaves`] leaf, in order, stopping at
+/// the first flow that is not [`ResolveFlow::Exhausted`] -- a sink's stop or
+/// an escape ends the whole source, as it ends jq's `FORK` (#3334).
+fn resolve_each_leaf<'e>(
+    leaves: Vec<&'e Expr>,
+    mut resolve_leaf: impl FnMut(&'e Expr) -> ResolveFlow,
+) -> ResolveFlow {
+    for leaf in leaves {
+        match resolve_leaf(leaf) {
+            ResolveFlow::Exhausted => {}
+            other => return other,
+        }
+    }
+    ResolveFlow::Exhausted
 }
 
 /// The three outcomes of one sink-driven path resolution — the same
@@ -34680,17 +34695,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         //
         // #3334: a comma source binds per leaf -- see [`comma_leaves`].
         Expr::As { expr, var, body } => match comma_leaves::<S>(expr) {
-            Some(leaves) => {
-                for leaf in leaves {
-                    match resolve_as_source_sink::<S>(
-                        leaf, var, body, value, trackable, snapshot, frame, keep, sink,
-                    ) {
-                        ResolveFlow::Exhausted => {}
-                        other => return other,
-                    }
-                }
-                ResolveFlow::Exhausted
-            }
+            Some(leaves) => resolve_each_leaf(leaves, |leaf| {
+                resolve_as_source_sink::<S>(
+                    leaf, var, body, value, trackable, snapshot, frame, keep, sink,
+                )
+            }),
             None => resolve_as_source_sink::<S>(
                 expr, var, body, value, trackable, snapshot, frame, keep, sink,
             ),
@@ -39448,15 +39457,11 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     // leaf that produced the value -- `(., 1)` tracks its first output --
     // rather than once for the whole comma. See [`comma_leaves`].
     if let Some(leaves) = comma_leaves::<S>(source) {
-        for leaf in leaves {
-            match resolve_as_pattern::<S>(
+        return resolve_each_leaf(leaves, |leaf| {
+            resolve_as_pattern::<S>(
                 leaf, patterns, body, value, trackable, snapshot, frame, keep, register, sink,
-            ) {
-                ResolveFlow::Exhausted => {}
-                other => return other,
-            }
-        }
-        return ResolveFlow::Exhausted;
+            )
+        });
     }
     // A subexp: evaluated by value, never a path witness (jq's
     // `subexp_nest > 0` -- the same rule `resolve_bind_source_witness`'s
@@ -40394,11 +40399,14 @@ fn head_may_be_frozen(head: &Expr, snapshot: &Snapshot) -> bool {
             else_branch,
             ..
         } => head_may_be_frozen(then_branch, snapshot) || head_may_be_frozen(else_branch, snapshot),
+        // The handler's `.` is the error payload, not the frame's input, so
+        // only a `$var` it names can be frozen there (#3334 review: `try
+        // error({..}) catch .` binds a fresh payload).
         Expr::Try { expr, catch } => {
             head_may_be_frozen(expr, snapshot)
                 || catch
                     .as_deref()
-                    .is_some_and(|c| head_may_be_frozen(c, snapshot))
+                    .is_some_and(|c| head_may_be_frozen(c, &Snapshot::No))
         }
         Expr::Alternative(left, right) => {
             head_may_be_frozen(left, snapshot) || head_may_be_frozen(right, snapshot)
@@ -46197,7 +46205,9 @@ fn identity_passthrough(expr: &Expr, wide: bool) -> bool {
         // `as` source. A top-level comma source is split per leaf before
         // this is asked (`comma_leaves`); this answers one nested under
         // another head, `if true then (.,.) else . end`.
-        Expr::Comma(exprs) if wide => exprs.iter().all(|e| identity_passthrough(e, wide)),
+        Expr::Comma(exprs) if wide => {
+            !exprs.is_empty() && exprs.iter().all(|e| identity_passthrough(e, wide))
+        }
         _ => false,
     }
 }
@@ -46268,9 +46278,13 @@ fn raise_free_identity_passthrough(expr: &Expr, wide: bool) -> bool {
             .all(|e| raise_free_identity_passthrough(e, wide)),
         // #3334: so is a comma of them -- it has at least two outputs, and
         // none can raise. Marker-free only, as the `if` and pipe arms are.
-        Expr::Comma(exprs) if wide && !mentions_marker(expr) => exprs
-            .iter()
-            .all(|e| raise_free_identity_passthrough(e, wide)),
+        // (An empty comma yields nothing, so it is neither.)
+        Expr::Comma(exprs) if wide && !mentions_marker(expr) => {
+            !exprs.is_empty()
+                && exprs
+                    .iter()
+                    .all(|e| raise_free_identity_passthrough(e, wide))
+        }
         _ => false,
     }
 }
@@ -109323,7 +109337,8 @@ mod tests {
             ("if true then . else 1 end", true),
             ("if true then 1 else . end", true),
             ("try . catch 1", true),
-            ("try 1 catch .", true),
+            // The handler's `.` is the error payload, never frozen.
+            ("try 1 catch .", false),
             (". // 1", true),
             ("1 // .", true),
             ("(1, .)", true),
@@ -109339,6 +109354,22 @@ mod tests {
                 "{filter} unmarked"
             );
         }
+    }
+
+    /// #3334 review: an empty comma yields nothing, so it is not an identity
+    /// passthrough in either grammar (the `//`/`try` soundness arguments
+    /// rest on at least one output). The codebase does build them, e.g.
+    /// `Array(Comma([]))`.
+    #[test]
+    fn test_empty_comma_is_not_a_passthrough_3334() {
+        let empty = Expr::Comma(Vec::new());
+        assert!(!identity_passthrough(&empty, true));
+        assert!(!raise_free_identity_passthrough(&empty, true));
+        let two = parse("(., .)").unwrap();
+        assert!(identity_passthrough(&two, true));
+        assert!(raise_free_identity_passthrough(&two, true));
+        // yq mode keeps the pre-#3334 grammar.
+        assert!(!identity_passthrough(&two, false));
     }
 
     /// #3133: a pipe nested under `try`/`?` in a pattern body used to carry
