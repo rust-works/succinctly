@@ -7664,7 +7664,8 @@ the non-finite words at their materializer (that mode has nowhere to put a NaN) 
 leading `+` with the spelling dropped, like the `007`/`.5` they already take.
 
 **A parsed NaN compared with itself — closed by
-[#3309](https://github.com/rust-works/succinctly/issues/3309), one container residual.**
+[#3309](https://github.com/rust-works/succinctly/issues/3309); a container compared with
+itself — narrowed by [#3069](https://github.com/rust-works/succinctly/issues/3069).**
 jq's `jv_equal` short-circuits on pointer identity before comparing values, and a parsed
 number literal is an allocated `jv`, so the *same* parsed NaN is equal to itself there while a
 computed NaN is not. succinctly now keeps that identity: a NaN jq mode parses (from a document,
@@ -7682,16 +7683,37 @@ new tokens, so two NaN tokens in the input stay distinct:
 | `[.[0],.[0]] \| unique`               | `[nan]`     | `[null]`| `[null]`   |
 | `.[0] == .[1]`                        | `[nan,NaN]` | `false` | `false`    |
 | `nan == nan`, `[.[0]+0] == [.[0]+0]`  | `[nan]`     | `false` | `false`    |
-| `[nan] \| . == .`                     | (any)       | `true`  | `false`    |
 
-The last row is what remains
-([#3069](https://github.com/rust-works/succinctly/issues/3069)): jq's short-circuit also fires
-on an allocated *container* compared with itself, so an array or object holding a *computed*
-NaN equals itself (`[nan] as $a | $a == $a`, `{a:nan} | . == .`). A computed NaN has no
-instance here, and `OwnedValue` containers are compared by value. Ordering is unchanged in
-both: NaN sorts below NaN, itself included. A mixed-instance `sort`/`unique`/`group_by`
-(`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's comparison order in jq, and
-may group differently here.
+jq's short-circuit also fires on an allocated *container* compared with itself, so an array
+or object holding a *computed* NaN equals itself. jq-mode equality now does the same
+(#3069, `EvalSemantics::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY`): two handles on one
+`OwnedValue` array or object storage (`ptr_eq`) are equal without looking inside, at any
+depth, and `bsearch`'s `==` probe asks the same question (`jq_identical`). Without a NaN
+inside, identity already implies equality, so this changes no other answer. A container that
+is rebuilt (`map(.)`, `sort`, `[] + .`, `[.[]]`) is a new allocation in jq too and stays
+`false` in both; `contains`/`inside` and ordering have no identity check in either.
+
+| Filter (all `-n`)                                   | jq     | succinctly |
+|-----------------------------------------------------|--------|------------|
+| `[nan] \| . == .`, `{a:nan} \| . == .`              | `true` | `true`     |
+| `[nan] \| . as $a \| {x:$a,y:$a} \| .x == .y`       | `true` | `true`     |
+| `[nan] \| . as $a \| [$a,1,$a] \| unique \| length` | `2`    | `2`        |
+| `[nan] as $a \| $a == $a`                           | `true` | `false`    |
+| `[nan] \| [.] == [.]`, `[.,.] \| .[0] == .[1]`      | `true` | `false`    |
+| `[nan] \| . + [] == .`, `first(.) == .`             | `true` | `false`    |
+| `[nan] \| . as $a \| [$a] \| bsearch($a)`           | `0`    | `-1`       |
+| `[nan] \| .[0:] == .`                               | `true` | `false`    |
+
+The rows still `false` here are ones where succinctly has already split the sharing into two
+containers before `==` sees them. The reindex bridge is the main place: it serializes a value
+and re-materializes every node as a fresh container, which drops identity for an operand
+evaluated as `.` inside `+`, `[..]` or `first`, and for `bsearch`'s element list. `.[0:]` is a
+slice: a view onto the same array in jq, a copy here. Carrying identity across the bridge is
+the mechanism [#3189](https://github.com/rust-works/succinctly/issues/3189) and
+[#3305](https://github.com/rust-works/succinctly/issues/3305) need for `path()`, and #3069
+stays open for it. Ordering is unchanged in both: NaN sorts below NaN, itself included. A
+mixed-instance `sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends
+on the sort's comparison order in jq, and may group differently here.
 
 ### A malformed nested number raises when read; jq rejects the document (#966, #3034, #3222) — accepted uniform divergence
 
