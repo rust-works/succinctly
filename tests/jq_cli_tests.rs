@@ -74651,6 +74651,387 @@ fn test_skip_count_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(None, "", RETRY_ROWS_SKIP_COUNT_3293)
 }
 
+/// #3293 slice 3: a `?//` retry inside a slice bound supersedes the escape
+/// the retried-past alternative left in the slice collector's stash
+/// (`eval_slice_expr`, both evaluators) -- the retry answering, producing
+/// nothing, raising, or failing to destructure -- over `[10,20,30]`. The
+/// controls pin what moving the stash apart from the output prefix must
+/// keep: a prefix produced before a later bound's error, a generator in
+/// either bound, a slice error with no `?//`, a `halt_error` that must not
+/// retry, and a short-circuiting wrapper around the retrying bound. Every
+/// value captured from jq 1.7.1.
+const RETRY_ROWS_SLICE_BOUND_3293: &[RetryRow3293] = &[
+    (
+        r#".[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a):]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#".[:([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[:([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty)]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[:([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#".[:([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):1]"#,
+        "[10]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):1]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):1]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a):1]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[.[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]]"#,
+        "[[10,20,30]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[.[([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[.[([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):]]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[.[([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a):]]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[.[(0,"x"):]]"#,
+        "",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#".[(0,1):(2,"x")]"#,
+        "[10,20]\n",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (r#".[:(1,error("t"))]"#, "[10]\n", "", "t", 5),
+    (
+        r#".["x":]"#,
+        "",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (r".[1:(2,3)]", "[20]\n[20,30]\n", "", "", 0),
+    (
+        r#".[(1 as $x ?// $y | ("A"|stderr) | ("h"|halt_error(3))):]"#,
+        "",
+        "A",
+        "h",
+        3,
+    ),
+    (
+        r#".[(0, ([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)):]"#,
+        "[10,20,30]\n[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // #3293 review: a `first`/`limit`/`nth` around the retrying bound
+    // reports its own count stop as `Stopped` after the retry superseded
+    // the stash -- a panic in the first version of this fix.
+    (
+        r#".[first([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[:first([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[limit(1; [[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[nth(0; [[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[.[(limit(1; [[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)):]]"#,
+        "[[10,20,30]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[limit(2; [[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a, 1):]"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[first([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    // #3293 review: a comma after the wrapper, or a filter that drops the
+    // retried value -- `first`/`limit`/`nth` used to report a stale
+    // `Stopped` after a retry, cutting the comma short.
+    (
+        r"[.[(first([[1]] as [$a] ?// [[$a]] | $a), 2):]]",
+        "[[20,30],[30]]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#".[(limit(2; ([[1]] as [$a] ?// [[$a]] | $a)), "x"):]"#,
+        "[20,30]\n",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[.[0:first(([[0]] as [$a] ?// [[$a]] | $a)), "x"]]"#,
+        "",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r"[.[:(first([[1]] as [$a] ?// [[$a]] | $a), 2)]]",
+        "[[10],[10,20]]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r".[:(first([[1]] as [$a] ?// $b | $a) | select(. != null))]",
+        "",
+        "",
+        "",
+        0,
+    ),
+    (
+        r".[(limit(1; [[1]] as [$a] ?// $b | $a) | select(. != null)):]",
+        "",
+        "",
+        "",
+        0,
+    ),
+    (
+        r".[:(first([[null]] as [$a] ?// [[$a]] | $a) // 9)]",
+        "",
+        "",
+        "",
+        0,
+    ),
+    (
+        r"[.[(nth(0; [[1]] as [$a] ?// [[$a]] | $a), 2):]]",
+        "[[20,30],[30]]\n",
+        "",
+        "",
+        0,
+    ),
+];
+
+#[test]
+fn test_slice_bound_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_SLICE_BOUND_3293)
+}
+
+/// #3293 review: `first`/`limit`/`nth` reset the wrapping sink's stop per
+/// invocation, so after a `?//` retry inside them they report their own
+/// completion rather than a stale `Stopped`. The #1519 rows pin that an
+/// enclosing consumer that really did stop still makes jq's second answer.
+/// Every value captured from jq 1.7.1 with `-nc`.
+const RETRY_ROWS_WRAPPER_STOP_3293: &[RetryRow3293] = &[
+    (
+        r#"-(first([["a"]] as [$a] ?// $b | $a) | select(. != null))"#,
+        "",
+        "",
+        "",
+        0,
+    ),
+    (r"[first(first(1 as $x ?// $y | 1))]", "[1,1]\n", "", "", 0),
+    (r"[first(nth(0; 1 as $x ?// $y | 1))]", "[1,1]\n", "", "", 0),
+    (
+        r"[isempty(first(1 as $x ?// $y | 1))]",
+        "[false,false]\n",
+        "",
+        "",
+        0,
+    ),
+    (r"[limit(1; 1 as $x ?// $y | 5)]", "[5,5]\n", "", "", 0),
+    (r"[first(1 as $x ?// $y | 5, 6)]", "[5,5]\n", "", "", 0),
+];
+
+#[test]
+fn test_wrapper_stop_resets_across_retry_3293() -> Result<()> {
+    assert_retry_rows_3293(None, "", RETRY_ROWS_WRAPPER_STOP_3293)
+}
+
+/// #3293 review: `isempty`/`any`/`all` record the wrapping sink's stop and
+/// reset it per invocation, like `first`/`limit`/`nth`. The stop-then-
+/// continue shape reaches them through `input`: the consumer stops on the
+/// first alternative, a `?//` retry re-invokes it, and the retry's push is
+/// answered `Continue`. A stale flag panicked inside a slice bound (exit
+/// 101) and cut a following comma short elsewhere. Captured from jq 1.7.1,
+/// on the owned route (`-n`, stdin `"a" 1 2`) and the cursor route (stdin
+/// `[10,20,30] "a" 1`).
+#[test]
+fn test_counted_bool_consumers_reset_their_stop_across_retry_3293() -> Result<()> {
+    for (filter, expected) in [
+        (
+            r"[10,20,30] | [.[(isempty([[1]] as [$a] ?// [[$a]] | $a) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[10,20,30] | [.[(any([[1]] as [$a] ?// [[$a]] | $a; true) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[10,20,30] | [.[(all([[1]] as [$a] ?// [[$a]] | $a; false) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[10,20,30] | [.[:(isempty([[1]] as [$a] ?// [[$a]] | $a) | input)]]",
+            "[[10]]",
+        ),
+        (
+            r#"[(isempty([[1]] as [$a] ?// [[$a]] | $a) | (input | if . == "a" then error("x") else . end)), 9]"#,
+            "[1,9]",
+        ),
+        (
+            r"[(any([[1]] as [$a] ?// [[$a]] | $a; true) | input), 9]",
+            r#"["a",1,9]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], Some(r#""a" 1 2"#))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}`: stderr {stderr:?}"
+        );
+    }
+    // The cursor route reaches the `eval_generic.rs` twins: the slice runs on
+    // the document itself, and `input` reads the rest of the stream.
+    for (filter, expected) in [
+        (
+            r"[.[(isempty([[1]] as [$a] ?// [[$a]] | $a) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[.[(any([[1]] as [$a] ?// [[$a]] | $a; true) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[.[(all([[1]] as [$a] ?// [[$a]] | $a; false) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[.[:(isempty([[1]] as [$a] ?// [[$a]] | $a) | input)]]",
+            "[[10]]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"[10,20,30] "a" 1"#))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}` (cursor route): stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3293 slice 2: every table above again, with the operand's input built
 /// under `-n` so it is an owned value and the query runs on `eval.rs`'s
 /// evaluator -- the twins of the cursor-route sinks those tables pin. A
@@ -74669,6 +75050,8 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("{} | ", RETRY_ROWS_PIPE_FIRST_STAGE_3293),
         ("{} | ", RETRY_ROWS_LIMIT_COUNT_STOP_3293),
         ("{} | ", RETRY_ROWS_SKIP_COUNT_3293),
+        ("[10,20,30] | ", RETRY_ROWS_SLICE_BOUND_3293),
+        ("{} | ", RETRY_ROWS_WRAPPER_STOP_3293),
     ] {
         assert_retry_rows_3293(None, prefix, rows)?;
     }

@@ -6886,6 +6886,15 @@ fn each_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut count = 0usize;
     let mut outer_stopped = false;
     let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside `expr`, and
+        // the wrapping sink's answer to *this* push supersedes the retried-past
+        // one -- a stale flag reported `Stopped` to whatever encloses this call
+        // after the retry, cutting a comma short (`[.[(limit(1; [[1]] as [$a] ?//
+        // [[$a]] | $a), 2):]]` is jq's `[[20,30],[30]]`). `first`/`nth`,
+        // `isempty`, `any`/`all` and `IN` reset theirs the same way (both
+        // evaluators), as `-`, `if` and `and`/`or` already did; `//` does not
+        // yet, and no probe has found it diverging.
+        outer_stopped = false;
         count += 1;
         if sink(item) == Demand::Stop {
             outer_stopped = true;
@@ -7020,6 +7029,8 @@ fn take_at_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
     let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
+        // #3293: reset per invocation -- see `each_limit`.
+        outer_stopped = false;
         let at_or_past = seen >= skip;
         seen += 1;
         if at_or_past {
@@ -7335,6 +7346,8 @@ fn each_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> Flow {
     let mut outer_stopped = false;
     let flow = eval_each::<W, S>(expr, value, optional, &mut |_item| {
+        // #3293: reset per invocation -- see `each_limit`.
+        outer_stopped = false;
         if sink(Item::Owned(OwnedValue::Bool(false))) == Demand::Stop {
             outer_stopped = true;
         }
@@ -7383,6 +7396,8 @@ fn each_any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // element `gen` yields is a computed value, so `cond` runs on it through
     // the demoting entry.
     let flow = eval_each_owned::<S>(gen, &owned, optional, Reentry::Proven, &mut |elem| {
+        // #3293: reset per invocation -- see `each_limit`.
+        outer_stopped = false;
         match any_all_probe_element::<S>(cond, &elem, target_truthy) {
             Ok(true) => {
                 probe_escape = None;
@@ -7430,6 +7445,8 @@ fn each_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut outer_stopped = false;
     // #3036: `current` is this arm's own input, unrebuilt -- bridged.
     let flow = eval_each_owned::<S>(s, &current, optional, Reentry::Proven, &mut |candidate| {
+        // #3293: reset per invocation -- see `each_limit`.
+        outer_stopped = false;
         if owned_value_eq::<S>(&candidate, &current) {
             if sink(Item::Owned(OwnedValue::Bool(true))) == Demand::Stop {
                 outer_stopped = true;
@@ -24495,10 +24512,14 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // the target's kind in jq mode and raised at the pull site in yq mode.
     let mut out: Vec<OwnedValue> = Vec::new();
 
-    // `terminal` is the sinks' escape hatch (#2138's shape): a sink can only
-    // answer `Demand`, so a definitive `QueryResult` is parked here,
+    // The sinks' escape hatch (#2138's shape): a sink can only answer
+    // `Demand`, so the control that ended the pull is stashed here,
     // `Demand::Stop` ends the pull, and it is read once the pull returns.
-    let mut terminal: Option<QueryResult<'a, W>> = None;
+    // #3293: stashed apart from `out`, so a `?//` retry inside either bound
+    // can supersede it without taking the outputs already produced with it
+    // (see `StashedVerdict`); one invocation of either sink records at most
+    // one.
+    let stash = StashedEscape::new();
 
     // The shared exit every escape arm below funnels through, so folding
     // the running `out` in as a `Partial` prefix can't drift between arms
@@ -24506,14 +24527,12 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `escape_with_prefix!` one function above (that macro's own
     // borrowed/owned promotion has nothing to do here: `out` is always
     // `Vec<OwnedValue>`, never a separate borrowed accumulator). Runs from
-    // inside a sink, so it parks its answer in `terminal` and stops the
-    // pull rather than `return`ing a `QueryResult` directly.
+    // inside a sink, so it stashes its control and stops the pull rather
+    // than `return`ing a `QueryResult` directly; the running
+    // `out` is folded in as the `Partial` prefix once the pull returns.
     macro_rules! escape {
         ($control:expr) => {{
-            let control = $control;
-            mark_nonretryable_escape(&control);
-            terminal = Some(partial(core::mem::take(&mut out), control));
-            return Demand::Stop;
+            return stash.stop($control);
         }};
     }
 
@@ -24730,17 +24749,32 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }};
     }
 
+    // `end`'s own `?//` fallback for the retry generation, decided once.
+    let end_direct_retry = end.as_deref().is_some_and(direct_pattern_retry);
     let mut start_sink = |s: ComputedSliceBound| -> Demand {
+        // #3293: a re-invocation after a stop is a `?//` retry inside
+        // `start`; it supersedes whatever the retried-past call decided.
+        stash.begin();
         // #2225: T (`end`) evaluated fresh for this `s`, not once overall.
         let mut end_sink = |e: ComputedSliceBound| -> Demand {
+            // #3293: likewise for a retry inside `end`.
+            stash.begin();
             process_pair!(&s, &e);
             Demand::Continue
         };
-        match each_slice_bound::<W, S>(end, value.clone(), f64::ceil, &mut end_sink) {
+        let end_flow = each_slice_bound::<W, S>(end, value.clone(), f64::ceil, &mut end_sink);
+        // #3293: a retry inside `end` that produced nothing never re-invoked
+        // `end_sink` to reset the stash.
+        stash.settle(&end_flow, end_direct_retry);
+        if stash.is_set() {
+            return Demand::Stop;
+        }
+        match end_flow {
             Flow::Exhausted => Demand::Continue,
-            // Only `escape!` stops the inner pull, and it has already parked
-            // `terminal` -- propagate the stop outward.
-            Flow::Stopped { .. } => Demand::Stop,
+            // Only `escape!` stops the inner pull, and its stash was returned
+            // just above; a stash-less stop is a stale enclosing driver's
+            // (#3293), left for the pull's own exit to judge.
+            Flow::Stopped { .. } => Demand::Stop, // omni-dev: coverage tolerate-line reason="unreachable: a real stop always comes with a stash, returned above (#3293)"
             // #2225: this `s`'s own T evaluation escaped after producing
             // some values -- in jq mode those are already sliced into
             // `out` (the pushes *are* the prefix, #1528; verified live: T
@@ -24755,21 +24789,35 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let flow = each_slice_bound::<W, S>(start, value.clone(), f64::floor, &mut start_sink);
 
-    // A per-pair escape always parks its answer here before stopping the
+    // A per-pair escape always stashes its control before stopping the
     // pull -- checked first, it outranks anything the start stream's own
-    // tail could still report.
-    if let Some(result) = terminal {
-        return result;
+    // tail could still report, unless a retry inside `start` superseded it.
+    let direct_retry = start.as_deref().is_some_and(direct_pattern_retry);
+    if let Some(control) = stash.take(&flow, direct_retry) {
+        return partial(out, control);
     }
     match flow {
         // An empty `start` stream never evaluated `end` or the target at
         // all, and collapses to `None` here like any other zero-result
         // pull.
         Flow::Exhausted => owned_vec_to_result(out),
-        // Our sinks are the only thing that can ask the pull to stop, and
-        // they only ever do so through `escape!`, which sets `terminal` --
-        // already returned above.
-        Flow::Stopped { .. } => unreachable!("sink always sets `terminal` before Demand::Stop"), // omni-dev: coverage tolerate-line reason="unreachable: escape! sets `terminal` before Demand::Stop; already returned above (#2546)"
+        // Our sinks only ask the pull to stop through `escape!`, which
+        // stashes a control that only a retry can supersede, and a retry ends
+        // a drive `Exhausted`/`Escaped` -- every consumer that records a
+        // wrapping stop resets it per invocation (#3293). A `Stopped` with an
+        // empty stash would mean some enclosing driver still reports a stale
+        // stop; finish with what was produced rather than abort the process
+        // over it (#3293 review: `isempty`/`any` did, before their reset) --
+        // but loudly in a debug build, so a driver that regresses into a
+        // stale stop fails the suite instead of truncating the slice unseen.
+        Flow::Stopped { .. } => {
+            // omni-dev: coverage tolerate reason="unreachable: every consumer that records a wrapping stop resets it per invocation (#3293), so a stash-less Stopped needs one that regresses"
+            if cfg!(debug_assertions) {
+                unreachable!("a stash-less Stopped reached the slice collector (#3293)");
+            }
+            owned_vec_to_result(out)
+            // omni-dev: coverage end
+        }
         // #1528: `start`'s own trailing escape still has to reach the final
         // result -- a successful pull doesn't mean `start` itself didn't
         // escape after producing `out`'s own values (in yq mode it
