@@ -74138,6 +74138,11 @@ mod tests {
     /// the `NumberLiteral`-vs-`Int` representation claim
     /// (`produces_fresh_value`) is diffed on the marker's own value, not
     /// only the input's.
+    ///
+    /// The marker's values and the inputs are built separately, so `$y` and
+    /// `.` never share storage: the bridge re-materializes its input and
+    /// drops that identity (#3069's residual, pinned below), which would
+    /// make the two routes disagree on a container holding a NaN.
     #[test]
     fn eval_owned_pure_agrees_with_the_reindex_bridge_on_tracked_vars_2042() {
         let shapes = [
@@ -74168,11 +74173,12 @@ mod tests {
             },
             Origin::Untracked,
         ];
+        let bounds = pure_value_matrix();
         let values = pure_value_matrix();
         for src in shapes {
             let parsed = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             for origin in &origins {
-                for bound in &values {
+                for bound in &bounds {
                     let marker = LazyMarker::new(bound, origin.clone(), None);
                     let expr = substitute_var_impl(&parsed, "y", bound, Some(&marker));
                     assert!(
@@ -74216,6 +74222,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #3069: `$y` bound to the very storage `.` holds is `==` to it in jq,
+    /// even with a NaN inside (`jv_equal` checks `jv_identical` first). The
+    /// owned route keeps that storage and answers jq's `true`; the reindex
+    /// bridge re-materializes its input and still answers `false`, the
+    /// residual `docs/compliance/jq/limitations.md` records. yq compares
+    /// structurally on both routes.
+    #[cfg(not(feature = "unshared-containers"))]
+    #[test]
+    fn eval_owned_pure_keeps_container_identity_the_bridge_drops_3069() {
+        let value = OwnedValue::object_from([(
+            "a".to_string(),
+            OwnedValue::object_from([("b".to_string(), OwnedValue::Float(f64::NAN))]),
+        )]);
+        let parsed = parse("$y == .").unwrap();
+        let marker = LazyMarker::new(&value, Origin::Snapshot, None);
+        let expr = substitute_var_impl(&parsed, "y", &value, Some(&marker));
+        let jq_true = debug_normalize(QueryResult::<Vec<u64>>::Owned(OwnedValue::Bool(true)));
+        let jq_false = debug_normalize(QueryResult::<Vec<u64>>::Owned(OwnedValue::Bool(false)));
+        assert_eq!(
+            debug_normalize(eval_owned_input::<Vec<u64>, JqSemantics>(
+                &expr,
+                &value,
+                false,
+                Reentry::REBUILT,
+            )),
+            jq_true
+        );
+        assert_eq!(
+            debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                &expr, &value, false
+            )),
+            jq_false
+        );
+        assert_eq!(
+            debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
+                &expr,
+                &value,
+                false,
+                Reentry::REBUILT,
+            )),
+            jq_false
+        );
     }
 
     /// #2048: the fast path must stay *closed*. Anything that can fan out,
