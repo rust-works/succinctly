@@ -376,6 +376,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             b'"' => YamlValue::String(YamlString::DoubleQuoted {
                 text: self.text,
                 start: effective_text_pos,
+                json_sourced: self.index.canonicalize_numbers(),
             }),
             b'\'' => YamlValue::String(YamlString::SingleQuoted {
                 text: self.text,
@@ -3624,21 +3625,41 @@ fn write_json_escape(output: &mut String, ch: char) {
 /// a literal line break — in which case YAML line folding (spec 7.3) discards
 /// the run. Escaped whitespace (`\t`, `\ `) never reaches this helper: escape
 /// arms emit it directly, so it is always preserved as content.
+///
+/// `json_sourced` (#3380): never reports "at a break" -- a raw `\r`/`\n`
+/// never folds for JSON-sourced content (see [`transcode_double_quoted_to_json`]'s
+/// own doc comment), so there is no fold ahead for a whitespace run to be
+/// discarded before.
 #[inline]
-fn scan_ws_run(bytes: &[u8], i: usize) -> (usize, bool) {
+fn scan_ws_run(bytes: &[u8], i: usize, json_sourced: bool) -> (usize, bool) {
     let mut j = i;
     while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
         j += 1;
     }
-    (j, j < bytes.len() && is_line_break(bytes[j]))
+    (
+        j,
+        !json_sourced && j < bytes.len() && is_line_break(bytes[j]),
+    )
 }
 
 /// Transcode a double-quoted YAML string directly to JSON output.
 /// Avoids intermediate String allocation by decoding YAML escapes and
 /// re-encoding as JSON escapes in a single pass.
+///
+/// `json_sourced` (#3380): a raw, unescaped `\r`/`\n` byte is a genuine
+/// multi-line-source line break in real YAML, so folding it per YAML 7.3 is
+/// correct there -- but the same byte inside a *JSON* string value is just
+/// literal content the source never intended as a fold candidate (JSON
+/// strings are always one physical line; the byte only reaches here because
+/// `-p=json` input is parsed by this same YAML-flow-grammar reader, #996).
+/// Confirmed live against yq v4.53.3: it preserves the byte losslessly
+/// rather than folding it. When set, a raw `\r`/`\n` is JSON-escaped as
+/// ordinary content instead, matching every other raw control byte this
+/// function already preserves (tab, U+00A0, ...).
 fn transcode_double_quoted_to_json(
     output: &mut String,
     bytes: &[u8],
+    json_sourced: bool,
 ) -> Result<(), YamlStringError> {
     output.push('"');
     let mut i = 0;
@@ -3730,6 +3751,12 @@ fn transcode_double_quoted_to_json(
                 }
                 i += 1;
             }
+            b if is_line_break(b) && json_sourced => {
+                // #3380: literal content, not a fold candidate -- see this
+                // function's own doc comment.
+                write_json_escape(output, b as char);
+                i += 1;
+            }
             b'\r' | b'\n' => {
                 // Line folding: handle newlines - fold to space or preserve empty lines
                 i = transcode_fold_line_break_to_json(bytes, i, output);
@@ -3742,7 +3769,7 @@ fn transcode_double_quoted_to_json(
             b'\t' => {
                 // Literal whitespace run: folded away before a literal line
                 // break, otherwise content (tabs escaped for JSON)
-                let (j, at_break) = scan_ws_run(bytes, i);
+                let (j, at_break) = scan_ws_run(bytes, i, json_sourced);
                 if !at_break {
                     for &b in &bytes[i..j] {
                         if b == b'\t' {
@@ -3773,7 +3800,7 @@ fn transcode_double_quoted_to_json(
                 // line break (the span can only end in spaces; tabs break it)
                 let mut end = i;
                 if i < bytes.len() {
-                    let (j, at_break) = scan_ws_run(bytes, i);
+                    let (j, at_break) = scan_ws_run(bytes, i, json_sourced);
                     if at_break {
                         while end > start && bytes[end - 1] == b' ' {
                             end -= 1;
@@ -3825,7 +3852,7 @@ fn transcode_single_quoted_to_json(
             b'\t' => {
                 // Literal whitespace run: folded away before a literal line
                 // break, otherwise content (tabs escaped for JSON)
-                let (j, at_break) = scan_ws_run(bytes, i);
+                let (j, at_break) = scan_ws_run(bytes, i, false);
                 if !at_break {
                     for &b in &bytes[i..j] {
                         if b == b'\t' {
@@ -3860,7 +3887,7 @@ fn transcode_single_quoted_to_json(
                 // line break (the span can only end in spaces; tabs break it)
                 let mut end = i;
                 if i < bytes.len() {
-                    let (j, at_break) = scan_ws_run(bytes, i);
+                    let (j, at_break) = scan_ws_run(bytes, i, false);
                     if at_break {
                         while end > start && bytes[end - 1] == b' ' {
                             end -= 1;
@@ -3952,7 +3979,11 @@ fn write_yaml_string_to_json_at(
     s: &YamlString<'_>,
 ) -> Result<bool, YamlStringError> {
     match s {
-        YamlString::DoubleQuoted { text, start } => {
+        YamlString::DoubleQuoted {
+            text,
+            start,
+            json_sourced,
+        } => {
             let end = YamlString::find_double_quote_end(text, *start);
             let bytes = &text[*start + 1..end - 1]; // Strip quotes
 
@@ -3963,7 +3994,7 @@ fn write_yaml_string_to_json_at(
                 write_json_string(output, s);
             } else {
                 // Transcode directly: YAML escapes → JSON escapes
-                transcode_double_quoted_to_json(output, bytes)?;
+                transcode_double_quoted_to_json(output, bytes, *json_sourced)?;
             }
             Ok(true) // Always a string, no type detection
         }
@@ -4420,9 +4451,13 @@ fn stream_json_escape<Out: core::fmt::Write>(out: &mut Out, ch: char) -> core::f
 }
 
 /// Stream transcode a double-quoted YAML string to JSON.
+///
+/// `json_sourced` (#3380): see [`transcode_double_quoted_to_json`]'s own
+/// doc comment -- this is its streaming twin and must stay in sync.
 fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
     out: &mut Out,
     bytes: &[u8],
+    json_sourced: bool,
 ) -> Result<(), YamlStringError> {
     out.write_char('"')
         .map_err(|_| YamlStringError::InvalidUtf8)?;
@@ -4545,6 +4580,12 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                 }
                 i += 1;
             }
+            b if is_line_break(b) && json_sourced => {
+                // #3380: literal content, not a fold candidate -- see this
+                // function's own doc comment.
+                stream_json_escape(out, b as char).map_err(|_| YamlStringError::InvalidUtf8)?;
+                i += 1;
+            }
             b'\r' | b'\n' => {
                 i = stream_transcode_fold_line_break(bytes, i, out)?;
             }
@@ -4556,7 +4597,7 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
             b'\t' => {
                 // Literal whitespace run: folded away before a literal line
                 // break, otherwise content (tabs escaped for JSON)
-                let (j, at_break) = scan_ws_run(bytes, i);
+                let (j, at_break) = scan_ws_run(bytes, i, json_sourced);
                 if !at_break {
                     for &b in &bytes[i..j] {
                         if b == b'\t' {
@@ -4587,7 +4628,7 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                 // line break (the span can only end in spaces; tabs break it)
                 let mut end = i;
                 if i < bytes.len() {
-                    let (j, at_break) = scan_ws_run(bytes, i);
+                    let (j, at_break) = scan_ws_run(bytes, i, json_sourced);
                     if at_break {
                         while end > start && bytes[end - 1] == b' ' {
                             end -= 1;
@@ -4640,7 +4681,7 @@ fn stream_transcode_single_quoted_to_json<Out: core::fmt::Write>(
             b'\t' => {
                 // Literal whitespace run: folded away before a literal line
                 // break, otherwise content (tabs escaped for JSON)
-                let (j, at_break) = scan_ws_run(bytes, i);
+                let (j, at_break) = scan_ws_run(bytes, i, false);
                 if !at_break {
                     for &b in &bytes[i..j] {
                         if b == b'\t' {
@@ -4671,7 +4712,7 @@ fn stream_transcode_single_quoted_to_json<Out: core::fmt::Write>(
                 // line break (the span can only end in spaces; tabs break it)
                 let mut end = i;
                 if i < bytes.len() {
-                    let (j, at_break) = scan_ws_run(bytes, i);
+                    let (j, at_break) = scan_ws_run(bytes, i, false);
                     if at_break {
                         while end > start && bytes[end - 1] == b' ' {
                             end -= 1;
@@ -4739,7 +4780,11 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
     s: &YamlString<'_>,
 ) -> Result<bool, StreamFailure> {
     match s {
-        YamlString::DoubleQuoted { text, start } => {
+        YamlString::DoubleQuoted {
+            text,
+            start,
+            json_sourced,
+        } => {
             let end = YamlString::find_double_quote_end(text, *start);
             let bytes = &text[*start + 1..end - 1];
 
@@ -4757,7 +4802,7 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
                 // little), so reserving it up front avoids the realloc
                 // chain `String::new()` would pay for (#1622).
                 let mut committed = String::with_capacity(bytes.len() + 2);
-                stream_transcode_double_quoted_to_json(&mut committed, bytes)
+                stream_transcode_double_quoted_to_json(&mut committed, bytes, *json_sourced)
                     .map_err(decode_failure)?;
                 out.write_str(&committed)?;
             }
@@ -5639,7 +5684,24 @@ pub enum ChompingIndicator {
 #[derive(Clone, Debug)]
 pub enum YamlString<'a> {
     /// Double-quoted string (escapes need decoding)
-    DoubleQuoted { text: &'a [u8], start: usize },
+    DoubleQuoted {
+        text: &'a [u8],
+        start: usize,
+        /// Set from `YamlIndex::canonicalize_numbers` (`pub(crate)`, so not
+        /// linked here) at construction (#996: JSON is a syntactic subset
+        /// of YAML's flow grammar, so `-p=json` input still parses as a
+        /// double-quoted scalar here). A raw, unescaped `\r`/`\n` byte inside a genuine
+        /// YAML double-quoted scalar is a real multi-line-source line
+        /// break that YAML 7.3's folding rule must collapse to a space --
+        /// but the same byte inside a *JSON* string value is just literal
+        /// content the source never intended as a fold candidate at all
+        /// (confirmed live against yq v4.53.3: it preserves the byte
+        /// losslessly). This flag lets `as_str`'s decode and the M2 JSON
+        /// transcoders (`light.rs`'s `transcode_double_quoted_to_json`/
+        /// `stream_transcode_double_quoted_to_json`) skip YAML's fold for
+        /// exactly this case instead of applying it unconditionally (#3380).
+        json_sourced: bool,
+    },
     /// Single-quoted string (' needs unescaping)
     SingleQuoted { text: &'a [u8], start: usize },
     /// Unquoted (plain) string - may span multiple lines
@@ -5679,7 +5741,7 @@ impl<'a> YamlString<'a> {
     /// Get the raw bytes of the string (including quotes if applicable).
     pub fn raw_bytes(&self) -> &'a [u8] {
         match self {
-            YamlString::DoubleQuoted { text, start } => {
+            YamlString::DoubleQuoted { text, start, .. } => {
                 let end = Self::find_double_quote_end(text, *start);
                 &text[*start..end]
             }
@@ -5719,7 +5781,11 @@ impl<'a> YamlString<'a> {
     /// or a `Cow::Owned` for strings that need escape decoding.
     pub fn as_str(&self) -> Result<Cow<'a, str>, YamlStringError> {
         match self {
-            YamlString::DoubleQuoted { text, start } => {
+            YamlString::DoubleQuoted {
+                text,
+                start,
+                json_sourced,
+            } => {
                 let end = Self::find_double_quote_end(text, *start);
                 let bytes = &text[*start + 1..end - 1]; // Strip quotes
                                                         // Need decoding if contains escapes or newlines (multiline folding)
@@ -5728,7 +5794,7 @@ impl<'a> YamlString<'a> {
                         core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                     Ok(Cow::Borrowed(s))
                 } else {
-                    decode_double_quoted(bytes).map(Cow::Owned)
+                    decode_double_quoted(bytes, *json_sourced).map(Cow::Owned)
                 }
             }
             YamlString::SingleQuoted { text, start } => {
@@ -6118,7 +6184,18 @@ impl core::fmt::Display for YamlStringError {
 /// - Multiple consecutive line breaks: first becomes space, rest become \n
 /// - Leading whitespace on continuation lines is trimmed
 /// - `\` at end of line escapes the line break entirely (no space added)
-fn decode_double_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
+///
+/// `json_sourced` (#3380): a raw, unescaped `\r`/`\n` byte is a genuine
+/// multi-line-source line break in real YAML, so folding it per the rules
+/// above is correct there -- but the same byte inside a *JSON* string value
+/// is just literal content the source never intended as a fold candidate
+/// (JSON strings are always one physical line; the byte only reaches here
+/// because `-p=json` input is parsed by this same YAML-flow-grammar reader,
+/// #996). Confirmed live against yq v4.53.3: it preserves the byte
+/// losslessly rather than folding it. When set, a raw `\r`/`\n` is pushed
+/// as one literal character instead, matching every other raw control byte
+/// this function already preserves verbatim (tab, U+00A0, ...).
+fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, YamlStringError> {
     let mut result = String::with_capacity(bytes.len());
     let mut i = 0;
 
@@ -6196,6 +6273,12 @@ fn decode_double_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                 }
                 i += 1;
             }
+            b if is_line_break(b) && json_sourced => {
+                // #3380: literal content, not a fold candidate -- see this
+                // function's own doc comment.
+                result.push(b as char);
+                i += 1;
+            }
             b'\r' | b'\n' => {
                 // Line folding: handle newlines
                 i = fold_quoted_line_break(bytes, i, &mut result);
@@ -6208,9 +6291,10 @@ fn decode_double_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                 }
                 // Trailing literal whitespace folds away before a literal
                 // line break; escaped whitespace was pushed by the escape
-                // arms and is never trimmed
+                // arms and is never trimmed. Never trimmed when
+                // `json_sourced`: there is no fold ahead to trim for (#3380).
                 let mut end = i;
-                if i < bytes.len() && is_line_break(bytes[i]) {
+                if !json_sourced && i < bytes.len() && is_line_break(bytes[i]) {
                     while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
                         end -= 1;
                     }
@@ -9644,6 +9728,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"hello\\nworld\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "hello\nworld");
     }
@@ -9668,6 +9753,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"hello\\tworld\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "hello\tworld");
     }
@@ -9677,6 +9763,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"line\\rbreak\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "line\rbreak");
     }
@@ -9686,6 +9773,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"path\\\\to\\\\file\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "path\\to\\file");
     }
@@ -9695,6 +9783,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"say \\\"hello\\\"\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "say \"hello\"");
     }
@@ -9704,6 +9793,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"null\\0char\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "null\0char");
     }
@@ -9713,6 +9803,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"bell\\achar\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "bell\x07char");
     }
@@ -9722,6 +9813,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"back\\bspace\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "back\x08space");
     }
@@ -9731,6 +9823,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"form\\ffeed\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "form\x0Cfeed");
     }
@@ -9740,6 +9833,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"vert\\vtab\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "vert\x0Btab");
     }
@@ -9749,6 +9843,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"esc\\echar\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "esc\x1Bchar");
     }
@@ -9759,6 +9854,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"caf\\xe9\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "café");
     }
@@ -9769,11 +9865,13 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"caf\\u00e9\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "café");
         let s2 = YamlString::DoubleQuoted {
             text: b"\"\\u1234\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s2.as_str().unwrap(), "\u{1234}");
     }
@@ -11022,6 +11120,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"spaced\\ word\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "spaced word");
     }
@@ -11031,6 +11130,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"path\\/to\\/file\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "path/to/file");
     }
@@ -11040,6 +11140,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"next\\Nline\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "next\u{0085}line");
     }
@@ -11049,6 +11150,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"non\\_break\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "non\u{00A0}break");
     }
@@ -11058,6 +11160,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"line\\Lsep\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "line\u{2028}sep");
     }
@@ -11067,6 +11170,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"para\\Psep\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "para\u{2029}sep");
     }
@@ -11076,6 +11180,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"hex\\x41char\"", // \x41 = 'A'
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "hexAchar");
     }
@@ -11085,6 +11190,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"ctrl\\x07char\"", // \x07 = bell
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "ctrl\x07char");
     }
@@ -11094,6 +11200,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"euro\\u20ACsign\"", // € = U+20AC
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "euro€sign");
     }
@@ -11103,6 +11210,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"emoji\\U0001F600face\"", // 😀 = U+1F600
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "emoji😀face");
     }
@@ -11112,6 +11220,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"line1\\nline2\\ttabbed\\\\slash\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "line1\nline2\ttabbed\\slash");
     }
@@ -11122,6 +11231,7 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"line one\\\n  line two\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "line oneline two");
     }
@@ -11131,8 +11241,73 @@ mod tests {
         let s = YamlString::DoubleQuoted {
             text: b"\"line one\\\r\n  line two\"",
             start: 0,
+            json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "line oneline two");
+    }
+
+    /// #3380: a raw (unescaped) CR/LF byte inside a JSON string value is
+    /// literal content, not a YAML line-fold candidate -- confirmed live
+    /// against yq v4.53.3, which preserves it losslessly. Without
+    /// `json_sourced`, the identical byte sequence in a genuine
+    /// double-quoted YAML scalar folds per YAML 7.3 (see
+    /// `test_decode_double_quoted_escaped_crlf_continuation` above and
+    /// `transcode_double_quoted_to_json`'s own genuine-YAML-fold coverage
+    /// for that side).
+    #[test]
+    fn test_decode_double_quoted_json_sourced_raw_cr_not_folded_3380() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"x\ry\"",
+            start: 0,
+            json_sourced: true,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "x\ry");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_json_sourced_raw_lf_not_folded_3380() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"x\ny\"",
+            start: 0,
+            json_sourced: true,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "x\ny");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_json_sourced_raw_crlf_not_folded_3380() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"x\r\ny\"",
+            start: 0,
+            json_sourced: true,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "x\r\ny");
+    }
+
+    /// The same raw byte, at the very same fixture, still folds when
+    /// `json_sourced` is false -- the flag is what changes the outcome,
+    /// not some other difference between these tests.
+    #[test]
+    fn test_decode_double_quoted_non_json_sourced_raw_cr_still_folds_3380() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"x\ry\"",
+            start: 0,
+            json_sourced: false,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "x y");
+    }
+
+    /// Trailing whitespace before the raw byte must not be trimmed either
+    /// when `json_sourced`: with no fold ahead, there is nothing to trim
+    /// it before (#3380's `scan_ws_run` gate).
+    #[test]
+    fn test_decode_double_quoted_json_sourced_trailing_space_before_raw_cr_kept_3380() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"x  \ry\"",
+            start: 0,
+            json_sourced: true,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "x  \ry");
     }
 
     #[test]
@@ -12989,6 +13164,69 @@ mod tests {
         assert_eq!(transcoded, "\"hello\\nworld\"");
     }
 
+    /// Helper: get the JSON output for a JSON-sourced (`-p=json`) top-level
+    /// double-quoted scalar, via `to_json_document` (the same M2 path
+    /// `get_json_via_transcode` exercises for genuine YAML). `bytes` must
+    /// be a single, complete JSON string literal, e.g. `b"\"x\ry\""`.
+    fn get_json_via_transcode_json_sourced(bytes: &[u8]) -> String {
+        let index = YamlIndex::build_json_sourced(bytes).unwrap();
+        let root = index.root(bytes);
+        root.to_json_document()
+    }
+
+    /// #3380: a raw (unescaped) CR/LF byte inside a JSON-sourced
+    /// double-quoted scalar is literal content, not a YAML line-fold
+    /// candidate -- confirmed live against yq v4.53.3, which preserves it
+    /// losslessly (`printf '"x\ry"' | yq -p=json -o=json` => `"x\ry"`).
+    /// Contrast with `test_transcode_double_quoted_multiline_folding` just
+    /// above: the identical byte in a genuine (non-JSON-sourced) YAML
+    /// double-quoted scalar still folds to a space.
+    #[test]
+    fn test_transcode_double_quoted_json_sourced_raw_cr_not_folded_3380() {
+        let json = get_json_via_transcode_json_sourced(b"\"x\ry\"");
+        assert_eq!(json, "\"x\\ry\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_json_sourced_raw_lf_not_folded_3380() {
+        let json = get_json_via_transcode_json_sourced(b"\"x\ny\"");
+        assert_eq!(json, "\"x\\ny\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_json_sourced_raw_crlf_not_folded_3380() {
+        let json = get_json_via_transcode_json_sourced(b"\"x\r\ny\"");
+        assert_eq!(json, "\"x\\r\\ny\"");
+    }
+
+    /// A JSON-sourced document's genuine escape sequences (`\r`/`\n`, the
+    /// two-character form) are untouched by #3380's fix -- only a *raw*
+    /// literal byte changes behavior.
+    #[test]
+    fn test_transcode_double_quoted_json_sourced_escaped_cr_unaffected_3380() {
+        let json = get_json_via_transcode_json_sourced(b"\"x\\ry\"");
+        assert_eq!(json, "\"x\\ry\"");
+    }
+
+    /// Streaming counterpart of the three `get_json_via_transcode_json_sourced`
+    /// tests above -- `stream_transcode_double_quoted_to_json`'s own
+    /// `json_sourced` arm had no *direct* test (only indirect coverage via
+    /// the CLI integration test in `tests/yq_cli_tests.rs`, which happens
+    /// to route through this same streaming path). Same pattern as
+    /// `test_stream_transcode_double_quoted_next_line_and_nbsp_escape`
+    /// above, but on a `build_json_sourced` index.
+    #[test]
+    fn test_stream_transcode_double_quoted_json_sourced_raw_cr_lf_not_folded_3380() {
+        let yaml = b"{\"a\":\"x\ry\",\"b\":\"x\ny\",\"c\":\"x\r\ny\"}";
+        let index = YamlIndex::build_json_sourced(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_json_document(&mut out, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert_eq!(out, "{\"a\":\"x\\ry\",\"b\":\"x\\ny\",\"c\":\"x\\r\\ny\"}");
+    }
+
     #[test]
     fn test_transcode_single_quoted_simple() {
         let yaml = b"'hello world'";
@@ -13044,6 +13282,40 @@ mod tests {
         let decoded = get_json_via_decode(yaml);
         assert_eq!(transcoded, decoded);
         assert_eq!(transcoded, "\"hello\\nworld\"");
+    }
+
+    /// A literal tab mid-string (not immediately followed by a line break)
+    /// is content, not a candidate for the fold-away rule the multiline
+    /// tests above exercise -- `transcode_single_quoted_to_json`'s own `\t`
+    /// arm had no direct test until #3380's mechanical `scan_ws_run`
+    /// signature change (unrelated to this arm's behavior) flagged it as
+    /// an untested new line. A lone tab alone would take
+    /// `write_yaml_string_to_json_at`'s no-decoding-needed fast path
+    /// without ever reaching this function at all -- the `''` forces the
+    /// same "needs decoding" branch `test_transcode_single_quoted_escape`
+    /// above exercises, so the tab is actually handled by the code under
+    /// test here.
+    #[test]
+    fn test_transcode_single_quoted_tab_not_at_line_break() {
+        let yaml = b"'it''s a\tb'";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"it's a\\tb\"");
+    }
+
+    /// Streaming counterpart of the test above --
+    /// `stream_transcode_single_quoted_to_json`'s own `\t` arm, same gap.
+    #[test]
+    fn test_stream_transcode_single_quoted_tab_not_at_line_break() {
+        let yaml = b"s: 'it''s a\tb'\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_json_document(&mut out, IndentSpec::COMPACT, false)
+            .unwrap();
+        assert!(out.contains("\"s\":\"it's a\\tb\""), "got {out}");
     }
 
     #[test]
