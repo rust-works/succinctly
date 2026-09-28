@@ -78921,6 +78921,45 @@ mod tests {
     }
 
     #[test]
+    fn test_if_no_else_elif_chain() {
+        // Every `elif` branch falls through to the same `else .` desugaring
+        // once its own condition is falsy too, per jq 1.7.1:
+        // `1 | if false then 2 elif false then 3 end` => `1`.
+        query!(br"1", "if false then 2 elif false then 3 end",
+            QueryResult::One(v) => {
+                assert!(matches!(
+                    to_owned_lossy::<JqSemantics, Vec<u64>>(&v),
+                    OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+                ));
+            }
+        );
+    }
+
+    #[test]
+    fn test_if_no_else_path_mode() {
+        // path(if false then .a end) is [] in jq 1.7.1: the identity
+        // else-branch contributes no path steps, matching path(.).
+        query!(br#"{"a": 1}"#, "path(if false then .a end)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
+
+        query!(br#"{"a": 1}"#, "path(if false then .a elif false then .b end)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
+
+        query!(br#"{"a": 1}"#, "path(if true then .a end)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0], OwnedValue::String("a".into()));
+            }
+        );
+    }
+
+    #[test]
     fn test_if_with_expressions() {
         // if with arithmetic in branches
         query!(br#"{"x": 5}"#, "if .x > 0 then .x * 2 else .x end",

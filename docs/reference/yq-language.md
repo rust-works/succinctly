@@ -482,6 +482,14 @@ succinctly yq 'at_offset(10)' config.yaml
 succinctly yq 'at_position(5; 3)' config.yaml
 ```
 
+### `if` with no `else`
+
+Real yq's lexer rejects `if` outright, so `succinctly yq`'s support for it is itself an
+extension (see the construct list just below). It matches jq 1.7's own definition rather
+than inventing a separate yq answer: `if A then B end` desugars to `if A then B else . end`,
+so a falsy condition passes the input through unchanged, not `null` (#3408) —
+`printf 'a: false\n' | succinctly yq '.a | if . then "x" end'` is `false`, not `null`.
+
 ### Path context through jq-only constructs
 
 A `key`/`parent`/`path`/`file_index` read *after* a construct real yq's lexer rejects
