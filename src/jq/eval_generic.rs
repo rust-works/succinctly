@@ -16101,10 +16101,10 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     // jq`/`succinctly yq` invocation hits.
     let mut out: Vec<OwnedValue> = Vec::new();
 
-    // `terminal` is the sinks' escape hatch (#2138's shape): a sink can only
-    // answer `Demand`, so a definitive `GenericResult` is parked here,
+    // The sinks' escape hatch (#2138's shape): a sink can only answer
+    // `Demand`, so the control that ended the pull is stashed here,
     // `Demand::Stop` ends the pull, and it is read once the pull returns.
-    // #3293: the escape that ended the pull, stashed apart from `out` so a
+    // #3293: stashed apart from `out` so a
     // `?//` retry inside either bound can supersede it without taking the
     // outputs already produced with it (see `eval::StashedVerdict`). One
     // invocation of either sink records at most one.
@@ -16115,9 +16115,10 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     // -- the single-accumulator counterpart of `eval_index_expr`'s
     // `escape_generic!` above (that macro's own cursor/owned promotion has
     // nothing to do here: `out` is always `Vec<OwnedValue>`, never a
-    // separate cursor accumulator). Runs from inside a sink, so it parks
-    // its answer in `terminal` and stops the pull rather than `return`ing
-    // a `GenericResult` directly.
+    // separate cursor accumulator). Runs from inside a sink, so it stashes
+    // its control and stops the pull rather than `return`ing a
+    // `GenericResult` directly; the running `out` is folded in as the
+    // `Partial` prefix once the pull returns.
     macro_rules! escape {
         ($control:expr) => {{
             return stash.stop($control);
@@ -16280,6 +16281,10 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         }};
     }
 
+    // `end`'s own `?//` fallback for the retry generation, decided once.
+    let end_direct_retry = end
+        .as_deref()
+        .is_some_and(crate::jq::eval::direct_pattern_retry);
     let mut start_sink = |s: ComputedSliceBound| -> Demand {
         // #3293: a re-invocation after a stop is a `?//` retry inside
         // `start`; it supersedes whatever the retried-past call decided.
@@ -16295,19 +16300,18 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
             each_slice_bound_generic::<S, V>(end, value.clone(), cursor, f64::ceil, &mut end_sink);
         // #3293: a retry inside `end` that produced nothing never re-invoked
         // `end_sink` to reset the stash.
-        stash.settle(
-            &end_flow,
-            end.as_deref()
-                .is_some_and(crate::jq::eval::direct_pattern_retry),
-        );
+        stash.settle(&end_flow, end_direct_retry);
         if stash.is_set() {
             return Demand::Stop;
         }
         match end_flow {
             Flow::Exhausted => Demand::Continue,
-            // Only `escape!` stops the inner pull, and it has already
-            // stashed its control -- propagate the stop outward.
-            Flow::Stopped { .. } => Demand::Stop,
+            // A stop with no stash behind it (checked just above) is `end`'s
+            // own wrapper finishing -- `first`/`limit`/`nth` report their
+            // count stop as `Stopped`, after a retry inside them already
+            // superseded the stash (#3293 review: `.[:first([[0]] as [$a]
+            // ?// [[$a]] | $a)]` is jq's `[]`). Nothing to propagate.
+            Flow::Stopped { .. } => Demand::Continue,
             // #2225: this `s`'s own `end` evaluation escaped after
             // producing some values -- in jq mode those are already
             // sliced into `out` (the pushes *are* the prefix, #1528); in
@@ -16336,11 +16340,12 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         // evaluated `end` or the target at all) must be `None`, not
         // `ManyOwned(vec![])`.
         Flow::Exhausted => owned_vec_to_generic_result(out),
-        // Our sinks are the only thing that can ask the pull to stop, and
-        // they only ever do so through `escape!`, which stashes a control
-        // that only a retry (which never ends `Stopped`) can supersede --
-        // already returned above.
-        Flow::Stopped { .. } => unreachable!("sink always stashes a control before Demand::Stop"), // omni-dev: coverage tolerate-line reason="unreachable: escape! stashes a control before Demand::Stop, and only a retry ending Exhausted/Escaped supersedes it; already returned above (#2546, #3293)"
+        // A stop with no stash behind it (the stash is checked above): a
+        // `first`/`limit`/`nth` wrapping `start` reports its own count stop
+        // as `Stopped` after a retry inside it superseded the stash (#3293
+        // review: `.[first([[0]] as [$a] ?// [[$a]] | $a):]` is jq's
+        // `[10,20,30]`). The pull is simply complete.
+        Flow::Stopped { .. } => owned_vec_to_generic_result(out),
         // #1528: `start`'s own trailing escape still has to reach the final
         // result -- a successful pull doesn't mean `start` itself didn't
         // escape after producing `out`'s own values (in yq mode it
