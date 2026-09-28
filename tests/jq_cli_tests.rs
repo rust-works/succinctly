@@ -31899,12 +31899,15 @@ fn test_func_def_arity_overload_through_path_context_evaluator_1376() -> Result<
 /// #1819 moved that guard's own ceiling from `MAX_NESTING_DEPTH` (256) to
 /// `MAX_VALUE_TREE_DEPTH` (384) -- this test's 500-deep input still clears
 /// either ceiling, so it keeps demonstrating the same rejection, just with
-/// the new number.
+/// the new number. The guard fires 384 levels into the render; since #3265
+/// that render is buffered, so none of those `[` reach stdout (jq 1.7.1,
+/// whose parser refuses past 256 levels, prints nothing either).
 #[test]
 fn test_identity_query_rejects_adversarial_nesting_998() -> Result<()> {
     let input = nested_arrays(500);
-    let (_stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
     assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert_eq!(stdout, "", "no partial record (#3265)");
     assert!(
         stderr.contains("nesting depth exceeds limit of 384"),
         "stderr: {stderr:?}"
@@ -34033,10 +34036,9 @@ fn test_jq_malformed_object_length_agrees_across_spellings_1194() -> Result<()> 
 
 /// A malformed *number* nested inside an already-recognized container used
 /// to degrade to `null` at exit 0 (#966), the opposite of #1194's malformed
-/// member. #3222 gave both one convention: reading the value raises. The
-/// streaming printer has already written the member's key when it meets the
-/// value, as it has for a malformed keyword (`{"a":tru}`); only the exit
-/// status and the absence of a made-up `null` are pinned here.
+/// member. #3222 gave both one convention: reading the value raises. Since
+/// #3265 the record is rendered before any of it is written, so the member's
+/// key doesn't reach stdout either: nothing does, as in jq 1.7.1.
 ///
 /// `[xyz123]` used to sit in this same table (a structurally malformed
 /// *value*, not a malformed number, degrading to `[null]`) -- it moved out
@@ -34047,7 +34049,7 @@ fn test_jq_malformed_nested_number_raises_like_1194_3222() -> Result<()> {
     let input = r#"{"a": 1.2.3}"#;
     let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
     assert_eq!(code, 5, "{input}: out: {out:?}");
-    assert!(!out.contains("null"), "{input}: out: {out:?}");
+    assert_eq!(out, "", "{input}");
     assert!(stderr.contains("Invalid JSON text"), "{stderr}");
 
     Ok(())
@@ -34092,25 +34094,15 @@ fn test_jq_bare_iterate_over_malformed_object_errors_1641() -> Result<()> {
 /// #1641: `print_json`'s `StandardJson::Error` arm (`jq_runner.rs`) now
 /// raises through the same `MalformedJsonError` convention the sibling
 /// object-member check above it already uses, instead of silently printing
-/// `null`. Unlike the bare-`.[]` fix above, this writer streams byte-by-byte
-/// with no rewind, so the accepted trade is a **truncated** prefix on
-/// stdout -- the same trade already shipped for `keys_unsorted`'s
-/// non-string-key case and a nested `{invalid}` -- plus a clean diagnostic
-/// and jq's own exit 5, rather than a silently wrong `null`.
+/// `null`. This test used to pin the well-formed prefix the writer had
+/// already streamed (`[1,` for `[1,zzz,3]`) as an accepted trade. #3265
+/// renders the record before writing it, so stdout is empty, as in jq 1.7.1.
 #[test]
 fn test_jq_identity_on_malformed_array_element_errors_1641() -> Result<()> {
-    for (input, prefix) in [
-        ("[xyz123]", "["),
-        ("[tru]", "["),
-        ("[1,zzz,3]", "[1,"),
-        (r#"{"a": xyz123}"#, r#"{"a":"#),
-    ] {
+    for input in ["[xyz123]", "[tru]", "[1,zzz,3]", r#"{"a": xyz123}"#] {
         let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
-        assert_eq!(
-            out, prefix,
-            "{input} should truncate to exactly its well-formed prefix"
-        );
+        assert_eq!(out, "", "{input} should print nothing of the record");
         assert!(
             !stderr.is_empty(),
             "{input} should carry a diagnostic: {stderr:?}"
@@ -34294,9 +34286,9 @@ fn test_identity_writer_streams_or_materializes_by_gate_2720() -> Result<()> {
     // The streaming branch still validates the whole object before it
     // writes `{` (#1194/#1677/#2261), so a malformed top-level member is
     // refused with nothing on stdout, exactly as the materialized branch
-    // refuses it. (A malformed *nested* object is refused when the writer
-    // reaches it, after its parent's prefix -- the writer's pre-existing
-    // partial-output model, unchanged here.)
+    // refuses it. A malformed *nested* object is refused when the writer
+    // reaches it, and since #3265 its parent's prefix stays in the record
+    // buffer, so stdout is empty there too.
     for (input, args) in [
         (r#"{"a":1,}"#, &["."][..]),
         (r#"{"a":1,}"#, &["-c", "."][..]),
@@ -34324,13 +34316,12 @@ fn test_identity_writer_streams_or_materializes_by_gate_2720() -> Result<()> {
         assert_eq!(code, 5, "{input} {args:?}: stdout={stdout} stderr={stderr}");
         assert!(stdout.is_empty(), "{input} {args:?} wrote {stdout:?}");
     }
-    // The streaming `keys_unsorted` writer refuses through the same scan,
-    // after the prefix it had already emitted (its own pre-existing model).
+    // The streaming `keys_unsorted` writer refuses through the same scan.
     let (_, stderr, code) = run_jq_full(&["keys_unsorted"], Some(r#"{"a":,1}"#))?;
     assert_eq!(code, 5, "stderr={stderr}");
     let (stdout, _, code) = run_jq_full(&["."], Some(r#"{"a":{"b":1,}}"#))?;
     assert_eq!(code, 5);
-    assert_eq!(stdout, "{\n  \"a\": ");
+    assert_eq!(stdout, "", "no partial record (#3265)");
     Ok(())
 }
 
@@ -34649,22 +34640,16 @@ fn test_jq_lazy_array_iterate_trailing_comma_streams_confirmed_prefix_first_2261
 }
 
 /// #2261: bare `keys_unsorted` over `{"a":1,}` -- the CLI's own
-/// `JqValue::LazyKeysArray` writer (`jq_runner.rs`) streams straight to
-/// stdout with no `Vec<String>`/rewind buffer (#685), and the same
-/// `bail_if_keys_malformed` check this fix extended only runs once that
-/// walk exhausts -- so it can leave a truncated `[` behind, exactly as its
-/// own doc comment already documents for the #1194/#1677 faults it caught
-/// before this fix (a non-string key, a missing/doubled `,`/`:`). This is
-/// that same, pre-existing trade extended to the new trailing-comma fault,
-/// not a new one.
+/// `JqValue::LazyKeysArray` writer (`jq_runner.rs`) walks the keys with no
+/// `Vec<String>` (#685), and the `bail_if_keys_malformed` check this fix
+/// extended only runs once that walk exhausts. It used to leave a truncated
+/// `["a"` on stdout. Since #3265 the record renders into a buffer first, so
+/// stdout is empty, as in jq 1.7.1.
 #[test]
-fn test_jq_lazy_keys_array_trailing_comma_leaves_truncated_bracket_2261() -> Result<()> {
+fn test_jq_lazy_keys_array_trailing_comma_writes_no_partial_record_2261() -> Result<()> {
     let (out, stderr, code) = run_jq_full(&["-c", "keys_unsorted"], Some(r#"{"a":1,}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
-    assert_eq!(
-        out, r#"["a""#,
-        "truncated bracket should still reach stdout"
-    );
+    assert_eq!(out, "", "no partial record (#3265)");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
     Ok(())
 }
@@ -35606,41 +35591,83 @@ fn test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677() -> R
     Ok(())
 }
 
-/// #2210: `{"a": [,]}` under bare `.` is the identical shape
-/// `test_jq_identity_on_malformed_array_element_errors_1641` above already
-/// pins (a fault found partway through `write_output_jq_value`'s own
-/// byte-by-byte, no-rewind write of a *single* top-level result) -- a
-/// stray comma nested inside an empty array instead of a bareword-garbage
-/// token, reaching the fault through the same writer the same way. This
-/// was unreachable through this exact shape before #1576's own M2
-/// nested-empty-container fix started correctly declining it (M2 used to
-/// silently accept `{"a": [,]}` as `{"a":[]}`, exit 0, never falling back
-/// to the general path at all). Investigated whether this specific
-/// single-result shape could be fixed by buffering the write (mirroring
-/// `evaluate_m2_fast_path`'s own identical contract for its own
-/// single-result case) rather than merely pinned as more of the same
-/// trade-off -- reverted once `test_jq_identity_on_malformed_array_
-/// element_errors_1641`'s own pre-existing assertions caught it as a
-/// regression against that already-established, deliberately tested
-/// contract, not a previously-undocumented gap. See
-/// `docs/compliance/jq/limitations.md`'s "A fault found by walking to it
-/// leaves the prefix on stdout" for the full writeup.
+/// #2210: `{"a": [,]}` under bare `.` is the shape
+/// `test_jq_identity_on_malformed_array_element_errors_1641` above pins (a
+/// fault found partway through `write_output_jq_value`'s write of a
+/// *single* top-level result), with a stray comma nested inside an empty
+/// array instead of a bareword token. It reaches the general path because
+/// #1576's M2 nested-empty-container check declines it. #2210 tried
+/// buffering the record and reverted when the #1641 test's prefix pins
+/// failed. #3265 made the buffer the contract and flipped those pins: jq
+/// 1.7.1 prints nothing here, and so does succinctly.
 #[test]
-fn test_jq_general_streaming_path_leaks_prefix_before_nested_comma_fault_2210() -> Result<()> {
+fn test_jq_general_streaming_path_writes_no_prefix_before_nested_comma_fault_2210() -> Result<()> {
     let (out, stderr, code) = run_jq_full(&["-c", "."], Some(r#"{"a": [,]}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
-    assert_eq!(out, "{\"a\":", "unexpected output {out:?}");
+    assert_eq!(out, "", "unexpected output {out:?}");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
 
     // `-S` forces the fully materializing path, which validates before
-    // printing anything -- confirms the two paths' outputs genuinely
-    // differ only in the accepted prefix, not in whether the fault is
-    // caught at all.
+    // printing anything. The two paths now agree on stdout as well as on
+    // the diagnostic.
     let (out, stderr, code) = run_jq_full(&["-c", "-S", "."], Some(r#"{"a": [,]}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
     assert!(out.is_empty(), "unexpected output {out:?}");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
 
+    Ok(())
+}
+
+/// #3265: a value that fails to decode partway through a single result
+/// leaves nothing of that result on stdout: no bracket, key or earlier
+/// sibling. jq parses the document before printing any of it. Every row's
+/// stdout was captured from jq 1.7.1 as empty, with exit 5. The nested rows
+/// are why the fix is a per-record buffer, not a per-level pre-check: the
+/// inner level only checks its own children, after the outer level has
+/// written `[[1],`. `-c .` with no other flag takes the M2 fast path first
+/// and falls back to the general writer on the malformed value.
+#[test]
+fn test_print_json_writes_no_partial_record_3265() -> Result<()> {
+    for (args, input) in [
+        (&["-c", "."][..], r#"{"a":tru}"#),
+        (&["-c", "."], "[1,2,tru]"),
+        (&["-c", "."], r#"{"a":1.2.3}"#),
+        (&["-c", "."], "[[1],[tru]]"),
+        (&["-c", "."], r#"{"a":{"b":[1,{"c":1.2.3}]}}"#),
+        (&["."], r#"{"a":[1,2],"b":{"c":1.2.3}}"#),
+        (&["--tab", "."], "[1,2,tru]"),
+        (&["--indent", "0", "."], "[1,2,tru]"),
+        (&["-r", "."], "[1,2,tru]"),
+        (&["-j", "."], "[1,2,tru]"),
+        (&["-c", ".a"], r#"{"a":[1,tru]}"#),
+        (&["--arg", "x", "1", "-c", "."], r#"{"a":tru}"#),
+        (&["--unbuffered", "-c", "."], r#"{"a":tru}"#),
+    ] {
+        let (out, stderr, code) = run_jq_full(args, Some(input))?;
+        assert_eq!(
+            code, 5,
+            "{args:?} {input}: out: {out:?}, stderr: {stderr:?}"
+        );
+        assert_eq!(out, "", "{args:?} {input}");
+        assert!(stderr.contains("Invalid"), "{args:?} {input}: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #3265's residual: earlier *complete* results of a multi-result filter
+/// still print before a later one fails. jq 1.7.1 prints nothing here,
+/// because it parses the whole document before evaluating; closing that
+/// needs whole-document validation up front (#1653/#1597/#1677). The failing
+/// result itself leaves nothing: no `[2,`. `--unbuffered` still flushes the
+/// good record before the diagnostic.
+#[test]
+fn test_print_json_multi_result_keeps_earlier_complete_results_3265() -> Result<()> {
+    for args in [&["-c", ".[]"][..], &["--unbuffered", "-c", ".[]"]] {
+        let (out, stderr, code) = run_jq_full(args, Some("[[1],[2,tru]]"))?;
+        assert_eq!(code, 5, "{args:?}: out: {out:?}, stderr: {stderr:?}");
+        assert_eq!(out, "[1]\n", "{args:?}");
+        assert!(stderr.contains("Invalid"), "{args:?}: {stderr:?}");
+    }
     Ok(())
 }
 
