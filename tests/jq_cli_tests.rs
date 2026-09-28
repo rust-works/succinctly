@@ -58921,13 +58921,6 @@ fn test_and_or_negate_path_unchanged_rows_still_match_3289() -> Result<()> {
         (r#"{"a":1}"#, r"path(-(.a,.a) | empty)", "", "", 0),
         (r#"{"a":1}"#, r"[.a and .b]", "[false]\n", "", 0),
         (
-            r#"{"a":1}"#,
-            r"path(. as $x | [.a and (.a|first)] | $x)",
-            "",
-            "Invalid path expression near attempt to access element \"a\" of {\"a\":1}",
-            5,
-        ),
-        (
             r#"{"a":false}"#,
             r#"path(.a and error("x"))"#,
             "[\"a\"]\n",
@@ -58942,6 +58935,189 @@ fn test_and_or_negate_path_unchanged_rows_still_match_3289() -> Result<()> {
             0,
         ),
     ])
+}
+
+/// #3289 review: rows the first version of this fix got wrong, now matching
+/// jq 1.7.1 exactly -- an operand jq navigates inside but the resolver
+/// evaluates by value (`first`, `last`) around a `$var` re-establish, a
+/// wrapper (`try`, `?`) around an `and` whose moved register must survive
+/// to a later `$y`, a `?//` retry inside an operand, a full array slice
+/// (`.[0:]` is the input itself to jq), and a register the stage carried in.
+#[test]
+fn test_and_or_negate_path_review_rows_match_jq_3289() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r"[1]",
+            r"del(. as $x | (-first) | $x)",
+            "",
+            "Invalid path expression with result [1]",
+            5,
+        ),
+        (
+            r"[1]",
+            r"del(. as $x | (first and .) | $x)",
+            "",
+            "Invalid path expression with result [1]",
+            5,
+        ),
+        (
+            r"[1,2]",
+            r"(. as $x | -first | $x | .[1]) |= 9",
+            "",
+            "Invalid path expression near attempt to access element 1 of [1,2]",
+            5,
+        ),
+        (
+            r#"{"a":[1],"b":2}"#,
+            r"(.a as $y | .a | -last | $y) |= 9",
+            "",
+            "Invalid path expression with result [1]",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"(.a as $y | .a | try (.a and true) | try ($y | .b)) |= 9",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"(.a as $y | .a | (.a and true)? | try ($y | .b)) |= 9",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(((.a|first) or .b)?)",
+            "",
+            "Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"null",
+            r"del(((.a|first) or .b)?)",
+            "",
+            "Invalid path expression with result false",
+            5,
+        ),
+        (r"null", r"path(((.a|first) or .a)|empty)", "", "", 0),
+        (
+            r"[1]",
+            r#"del(-(. as [$a] ?// $a | if ($a|type) == "number" then "s" else empty end))"#,
+            "[1]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r#"path((. as [$a] ?// $a | if ($a|type) == "number" then 1 else empty end) and error("boom"))"#,
+            "",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"(. as $x | [first and .[1]] | $x | .[1]) |= 9",
+            "",
+            "Invalid path expression near attempt to access element 1 of [1,2]",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | 5 | (-.) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(.a as $y | .a | 5 | (1 and 2) | $y) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(. as {a:$v} | (5 and 6) | $v) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(.a as $y | .a | tostring | (length and true) | $y)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del((first|.a) or true | select(false))",
+            "[{\"a\":1}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r#"try path(-(first|.a) | empty) catch "caught""#,
+            "",
+            "",
+            0,
+        ),
+        (r"[1,2]", r"del((.[0:] and .[1]) | empty)", "[1,2]\n", "", 0),
+        (
+            r#"{"a":{"b":true}}"#,
+            r"path(.a as $y | .a | (($y|.b) and true))",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3289 review: shapes where the first version of this fix *wrote* where
+/// jq 1.7.1 refuses -- an operand jq navigates inside but the resolver
+/// evaluates by value (`first`, `any`, `nth(0)`, `last`), which moves jq's
+/// register where this resolver cannot see it. Each must refuse and write
+/// nothing; the message can still differ (an operand the resolver cannot
+/// follow keeps the by-value "with result" refusal), which is the safe
+/// direction.
+#[test]
+fn test_and_or_negate_path_never_writes_where_jq_refuses_3289() -> Result<()> {
+    for (input, filter) in [
+        (r"[true]", r"del(first and .[0])"),
+        (r"[true]", r"(first and .[0]) |= 5"),
+        (
+            r#"{"items":[{"on":true}]}"#,
+            r"del(.items | (first and .[0].on))",
+        ),
+        (r#"{"a":true}"#, r"del(any and .a)"),
+        (r"[true]", r"del((first|tostring) and .[0])"),
+        (r"[1]", r"del(. as $x | (-first) | $x)"),
+        (r"[1]", r"del(. as $x | (first and .) | $x)"),
+        (r"[1,2]", r"(. as $x | -first | $x | .[1]) |= 9"),
+        (r#"{"a":[1],"b":2}"#, r"(.a as $y | .a | -last | $y) |= 9"),
+        (r#"{"a":true}"#, r"del(.a | [true] | (nth(0) and true))"),
+        (r"[true]", r"path(. as $x | [first and .[0]] | $x)"),
+        (r"[1,2]", r"(. as $x | [first and .[1]] | $x | .[1]) |= 9"),
+        (
+            r"[true]",
+            r"del(first((. as [$a] ?// {b:$a} | $a) and true))",
+        ),
+        (r"null", r"path(((.a|first) or .b)?)"),
+        (r"null", r"del(((.a|first) or .b)?)"),
+        (r#"{"a":1}"#, r"path(. as $x | [.a and (.a|first)] | $x)"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "`{filter}` on {input}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
 }
 
 /// #2760 seen from the side that does damage: `del()` and `|=` consume the
