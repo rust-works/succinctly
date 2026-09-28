@@ -2428,6 +2428,61 @@ fn test_negative_filter_unary_minus_as_binding_residual_3397() -> Result<()> {
     Ok(())
 }
 
+/// #3389's fix has two call sites: `succinctly jq`'s own subcommand
+/// dispatch (`parse_cli_allowing_negative_filter`, exercised by every test
+/// above) and the `sjq`/`jq` multi-call alias dispatch
+/// (`parse_allowing_negative_filter`, reached only when argv[0]'s file name
+/// is `sjq` or `jq` -- `try_multicall`). A symlink named `sjq` pointing at
+/// the built binary reproduces that argv[0] the same way
+/// `install-aliases` does for real users.
+#[test]
+#[cfg(unix)]
+fn test_negative_filter_accepted_via_sjq_multicall_alias_3389() -> Result<()> {
+    let alias_dir = tempfile::tempdir()?;
+    let alias_path = alias_dir.path().join("sjq");
+    std::os::unix::fs::symlink(succinctly_bin(), &alias_path)?;
+
+    // An ordinary filter that clap accepts on the first attempt -- the
+    // retry helper's own happy path, distinct from the retry rows below.
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(&alias_path);
+            command.args(["-c", "."]);
+            command
+        },
+        Some(b"[1]"),
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!((stdout.trim_end(), code), ("[1]", 0), "stderr: {stderr:?}");
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(&alias_path);
+            command.args(["-c", "-1"]);
+            command
+        },
+        Some(b"[1]"),
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!((stdout.trim_end(), code), ("-1", 0), "stderr: {stderr:?}");
+
+    // A genuine unknown flag must still error through this path too.
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(&alias_path);
+            command.args(["-c", "-x"]);
+            command
+        },
+        Some(b"[1]"),
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("unexpected argument"), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// A string containing a backslash escape sequence, alongside a
 /// leading-zero number that triggers normalization -- confirms the escape
 /// handling inside `normalize_leading_zero_numbers`'s string-tracking

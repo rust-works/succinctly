@@ -1339,7 +1339,7 @@ fn negative_filter_retry_index(args: &[String], err: &clap::error::Error) -> Opt
     }
     let clap::error::ContextValue::String(bad) = err.get(clap::error::ContextKind::InvalidArg)?
     else {
-        return None;
+        return None; // omni-dev: coverage tolerate-line reason="unreachable given clap 4.6's own unknown_argument() error constructor: every ErrorKind::UnknownArgument it builds sets ContextKind::InvalidArg to ContextValue::String(arg) in the same call, so this arm only guards a future clap release changing that invariant"
     };
     if !looks_like_negative_filter(bad) {
         return None;
@@ -2649,6 +2649,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #3389: every character named in the issue's own boundary table, plus
+    /// the edge cases the CLI-level tests in `tests/jq_cli_tests.rs` can't
+    /// isolate as cleanly as a direct unit test can (a token that doesn't
+    /// start with `-` at all, and an empty string).
+    #[test]
+    fn test_looks_like_negative_filter_3389() {
+        for filter_like in [
+            "-1",
+            "-1.5",
+            "-.[0]",
+            "-(1)",
+            "-$__loc__.line",
+            "-[]",
+            "-{}",
+            "-\"a\"",
+            "-",
+        ] {
+            assert!(
+                looks_like_negative_filter(filter_like),
+                "{filter_like:?} should read as a filter"
+            );
+        }
+        for option_like in ["-x", "-n1", "-c", "--bogus", "--", "abc", ""] {
+            assert!(
+                !looks_like_negative_filter(option_like),
+                "{option_like:?} should read as an option"
+            );
+        }
+    }
+
+    /// #3389: `negative_filter_retry_index` against real `clap::Error`
+    /// values from `JqCommand::try_parse_from`, rather than only through a
+    /// spawned subprocess (`tests/jq_cli_tests.rs`) -- this reaches the
+    /// function's own defensive branches directly: a non-`UnknownArgument`
+    /// error kind (here, `--help`'s `DisplayHelp`) must never trigger a
+    /// retry, matching the same "only this one error shape" discipline
+    /// `stop_with_escape`'s callers elsewhere in this codebase apply to
+    /// their own out-of-band signals.
+    #[test]
+    fn test_negative_filter_retry_index_3389() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        let err = JqCommand::try_parse_from(["jq", "-x"]).unwrap_err();
+        assert_eq!(
+            negative_filter_retry_index(&args(&["jq", "-x"]), &err),
+            None,
+            "a genuine unknown flag must not retry"
+        );
+
+        let err = JqCommand::try_parse_from(["jq", "-1"]).unwrap_err();
+        assert_eq!(
+            negative_filter_retry_index(&args(&["jq", "-1"]), &err),
+            Some(1),
+            "a filter-shaped rejection must retry at the token's own index"
+        );
+
+        let err = JqCommand::try_parse_from(["jq", "--help"]).unwrap_err();
+        assert_eq!(
+            negative_filter_retry_index(&args(&["jq", "--help"]), &err),
+            None,
+            "a non-UnknownArgument error kind must never retry"
+        );
     }
 
     /// The flag spelling a user would actually type, for a test-failure
