@@ -46204,6 +46204,13 @@ fn identity_passthrough(expr: &Expr, wide: bool) -> bool {
         Expr::Pipe(stages) if wide && !mentions_marker(expr) => {
             stages.iter().all(|e| identity_passthrough(e, wide))
         }
+        // #3334: every output of a comma is one of its leaves', so it is a
+        // passthrough when every leaf is -- the `if` arm's rule over n
+        // branches. jq mode only, like the pipe arm: yq does not fan out an
+        // `as` source. A top-level comma source is split per leaf before
+        // this is asked (`comma_leaves`); this answers one nested under
+        // another head, `if true then (.,.) else . end`.
+        Expr::Comma(exprs) if wide => exprs.iter().all(|e| identity_passthrough(e, wide)),
         _ => false,
     }
 }
@@ -46270,6 +46277,11 @@ fn raise_free_identity_passthrough(expr: &Expr, wide: bool) -> bool {
         }
         // #3279: a pipe of raise-free, non-empty passthroughs is one too.
         Expr::Pipe(stages) if wide && !mentions_marker(expr) => stages
+            .iter()
+            .all(|e| raise_free_identity_passthrough(e, wide)),
+        // #3334: so is a comma of them -- it has at least two outputs, and
+        // none can raise. Marker-free only, as the `if` and pipe arms are.
+        Expr::Comma(exprs) if wide && !mentions_marker(expr) => exprs
             .iter()
             .all(|e| raise_free_identity_passthrough(e, wide)),
         _ => false,
@@ -46512,21 +46524,13 @@ fn identity_bind_position<S: EvalSemantics>(
                 then_branch,
                 else_branch,
                 ..
-            } => {
-                let then_at = position(then_branch, trackable, frame);
-                let else_at = position(else_branch, trackable, frame);
-                match (then_at, else_at) {
-                    // Both arms prove the same thing.
-                    (a, b) if a == b => a,
-                    // One arm is a computed `.`: the bind may be that, so
-                    // it can only be certified as it would be (#3133).
-                    (Some(Origin::Untracked), _) | (_, Some(Origin::Untracked)) => {
-                        Some(Origin::Untracked)
-                    }
-                    // Two positions that differ, or a position beside a
-                    // bare snapshot: the bare value rule.
-                    _ => None,
-                }
+            } => common_position(
+                [then_branch, else_branch].map(|arm| position(arm, trackable, frame)),
+            ),
+            // #3334: a comma nested under another head (`if true then (.,.)
+            // else . end`); a top-level one is split per leaf before this.
+            Expr::Comma(exprs) => {
+                common_position(exprs.iter().map(|e| position(e, trackable, frame)))
             }
             Expr::Try { expr, .. } if raise_free_identity_passthrough(expr, true) => {
                 position(expr, trackable, frame)
@@ -46549,6 +46553,30 @@ fn identity_bind_position<S: EvalSemantics>(
                 }
             }
             _ => None,
+        }
+    }
+    /// What several branches' positions certify together, for an `if`'s
+    /// two arms or a comma's leaves: the position only when every branch
+    /// proves the same one.
+    fn common_position(branches: impl IntoIterator<Item = Option<Origin>>) -> Option<Origin> {
+        let mut branches = branches.into_iter();
+        let first = branches.next()?;
+        let mut all_equal = true;
+        let mut any_untracked = matches!(first, Some(Origin::Untracked));
+        for branch in branches {
+            all_equal &= branch == first;
+            any_untracked |= matches!(branch, Some(Origin::Untracked));
+        }
+        if any_untracked {
+            // One branch is a computed `.`: the bind may be that, so it can
+            // only be certified as it would be (#3133).
+            Some(Origin::Untracked)
+        } else if all_equal {
+            first
+        } else {
+            // Two positions that differ, or a position beside a bare
+            // snapshot: the bare value rule.
+            None
         }
     }
     position(source, trackable, frame)
