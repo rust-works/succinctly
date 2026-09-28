@@ -100365,7 +100365,9 @@ mod tests {
         let json_bytes: &[u8] = br"null";
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        let path_expr = parse(".[({})]").unwrap();
+        // `true`, not `{}`: an object key is a slice descriptor since #3300,
+        // and `null | del(.[{}])` is `null` in jq, not an error.
+        let path_expr = parse(".[(true)]").unwrap();
         let value_expr = Expr::Literal(Literal::Int(1));
         match eval_assign::<Vec<u64>, JqSemantics>(&path_expr, &value_expr, cursor.value(), true) {
             QueryResult::None => {}
@@ -100379,7 +100381,9 @@ mod tests {
         let json_bytes: &[u8] = br"null";
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        let path_expr = parse(".[({})]").unwrap();
+        // `true`, not `{}`: an object key is a slice descriptor since #3300,
+        // and `null | del(.[{}])` is `null` in jq, not an error.
+        let path_expr = parse(".[(true)]").unwrap();
         let filter_expr = Expr::Identity;
         match eval_update::<Vec<u64>, JqSemantics>(
             &path_expr,
@@ -100401,7 +100405,9 @@ mod tests {
         let json_bytes: &[u8] = br"null";
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        let path_expr = parse(".[({})]").unwrap();
+        // `true`, not `{}`: an object key is a slice descriptor since #3300,
+        // and `null | del(.[{}])` is `null` in jq, not an error.
+        let path_expr = parse(".[(true)]").unwrap();
         match builtin_del::<Vec<u64>, JqSemantics>(&path_expr, cursor.value(), true) {
             QueryResult::None => {}
             other => panic!("expected None, got {other:?}"),
