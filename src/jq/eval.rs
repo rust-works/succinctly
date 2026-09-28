@@ -30905,9 +30905,22 @@ fn update_path_steps<S: EvalSemantics>(
                 // through `write_index`'s own padding path for no reason.
                 // See the `Field` arm above for why each `arr`/`map` borrow
                 // in this arm is scoped as narrowly as possible.
+                //
+                // #3388: a negative index that's still out of range after
+                // folding against the array's length (`.[-2]` on a 1-element
+                // array) must not raise *here* -- jq only bounds-checks an
+                // index when a value is actually written, the same rule
+                // that already lets a positive out-of-range middle index
+                // (`.[5]`) defer through the fresh-run path below instead of
+                // raising eagerly. `None` routes a negative-out-of-range
+                // index through that identical fresh-run path: `write_index`
+                // below re-resolves `*idx` itself and raises there instead,
+                // but only once `wrote` confirms the filter actually
+                // produced a value to land.
                 let actual_idx = match &*root {
+                    OwnedValue::Array(arr) if *idx < 0 && arr.len() as i64 + *idx < 0 => None,
                     OwnedValue::Array(arr) => {
-                        resolve_setpath_index(&OwnedValue::Int(*idx), arr.len())?
+                        Some(resolve_setpath_index(&OwnedValue::Int(*idx), arr.len())?)
                     }
                     _ if here || noop_scalar => return Ok(false),
                     _ => {
@@ -30918,7 +30931,7 @@ fn update_path_steps<S: EvalSemantics>(
                         .into());
                     }
                 };
-                {
+                if let Some(actual_idx) = actual_idx {
                     let OwnedValue::Array(arr) = &*root else {
                         unreachable!("actual_idx was only resolved for an Array root")
                     };
