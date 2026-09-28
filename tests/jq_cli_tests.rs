@@ -73595,6 +73595,11 @@ const NAN_INSTANCE_ROWS_3309: &[(&str, &str)] = &[
     ("[.n[]] | .[0] == .[0]", "true"),
     ("[.n[]] | index(.[0])", "0"),
     (".n | indices(.[0])", "[0]"),
+    // `bsearch` probes with `==` before `<` (jq's builtin.jq).
+    ("[.a] | bsearch(.[0])", "0"),
+    (".n | bsearch(.[1])", "1"),
+    (".e | bsearch(.[0])", "0"),
+    ("[.a,.b] | bsearch(.[1])", "1"),
     (".a as $x | [$x] | contains([$x])", "true"),
     (".a |= . | .a == .a", "true"),
     ("walk(.) | .a == .a", "true"),

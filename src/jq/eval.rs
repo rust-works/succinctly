@@ -385,8 +385,8 @@ use super::expr::{
 use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
     infinite_float_preview_text, int_to_f64, jq_literal_int_to_f64, jq_numeric_cmp,
-    numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, ArrayVec, NumberRepr,
-    ObjectMap, OwnedValue,
+    numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, same_nan_instance, ArrayVec,
+    NumberRepr, ObjectMap, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -18956,7 +18956,7 @@ fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
         // Each parse makes new NaN instances (#3309), whatever address the
         // text it indexed happens to have.
         return super::eval_generic::to_owned::<JqSemantics, _>(&index.root(bytes).value())
-            .map(OwnedValue::with_fresh_nan_instances)
+            .map(|value| value.with_fresh_nan_instances(bytes))
             .map_err(|e| e.to_string());
     }
 
@@ -61405,6 +61405,13 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // copy that used to live here lacked `(Array, Array)` and
         // `(Object, Object)` arms, so every pair of containers compared Equal
         // and `bsearch` reported absent values as found (#384).
+        //
+        // jq's probe asks `==` first (`$monkey == $target`), and `==` holds
+        // for one parsed NaN compared with itself (#3309) where the order
+        // answers `Less`.
+        if S::DECNUMBER_LITERALS && same_nan_instance(&elements[mid as usize], &x) {
+            return QueryResult::Owned(OwnedValue::Int(mid));
+        }
         match compare_values::<S>(&elements[mid as usize], &x) {
             core::cmp::Ordering::Equal => return QueryResult::Owned(OwnedValue::Int(mid)),
             core::cmp::Ordering::Less => lo = mid + 1,
