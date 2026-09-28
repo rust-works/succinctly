@@ -14210,12 +14210,12 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     // see `range_values_generic`'s doc comment), so for it this is the
     // first and only classification, and either arm can fire.
     let mut emit =
-        |from: OwnedValue,
-         to: OwnedValue,
-         step: OwnedValue,
+        |from: &OwnedValue,
+         to: &OwnedValue,
+         step: &OwnedValue,
          from_literal: Option<&OwnedValue>|
          -> Demand {
-            match (range_num(&from), range_num(&to), range_num(&step)) {
+            match (range_num(from), range_num(to), range_num(step)) {
                 (Ok(from_val), Ok(to_val), Ok(step_val)) => {
                     let (values, truncated) = match (from_val, to_val, step_val) {
                         // `from_literal` is forwarded on this arm too (#3103):
@@ -14255,7 +14255,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                 // raise, and only once a next value is actually demanded.
                 _ => {
                     let result =
-                        crate::jq::eval::range_values_generic::<S>(from, &to, &step, &mut |v| {
+                        crate::jq::eval::range_values_generic::<S>(from.clone(), to, step, &mut |v| {
                             match sink.push(GenericItem::Owned(v)) {
                                 Demand::Continue => Demand::Continue,
                                 Demand::Stop => {
@@ -14294,15 +14294,15 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
             };
             return match from_val {
                 RangeNum::Int(t) => emit(
-                    OwnedValue::Int(0),
-                    OwnedValue::Int(t),
-                    OwnedValue::Int(1),
+                    &OwnedValue::Int(0),
+                    &OwnedValue::Int(t),
+                    &OwnedValue::Int(1),
                     None,
                 ),
                 RangeNum::Float(t) => emit(
-                    OwnedValue::Float(0.0),
-                    OwnedValue::Float(t),
-                    OwnedValue::Float(1.0),
+                    &OwnedValue::Float(0.0),
+                    &OwnedValue::Float(t),
+                    &OwnedValue::Float(1.0),
                     None,
                 ),
             };
@@ -14334,9 +14334,9 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                             return stop(Control::Error(e));
                         }
                         emit(
-                            from_owned.clone(),
-                            to_owned,
-                            OwnedValue::Int(1),
+                        &from_owned,
+                        &to_owned,
+                        &OwnedValue::Int(1),
                             from_literal,
                         )
                     }
@@ -14357,9 +14357,9 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                                 // range/3, which never type-checks from/to/
                                 // step up front either.
                                 emit(
-                                    from_owned.clone(),
-                                    to_owned.clone(),
-                                    step_owned,
+                                &from_owned,
+                                &to_owned,
+                                &step_owned,
                                     from_literal,
                                 )
                             },

@@ -7994,7 +7994,9 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///   remaining bound value at every nesting level is left unevaluated.
 ///   Always collapses to `Flow::Stopped { pending: None }`.
 /// * an escape -- a bound value failed [`range_num`]'s numeric check (rule 3:
-///   `range((1,"x"))` prints `0` then raises), or a nested `eval_each` call
+///   `range((1,"x"))` prints `0` then raises; `range/1`/`range/2` only --
+///   `range/3` never raises it, #3409, and `range/2` classifies `from` only
+///   after `to` has been evaluated, as jq does), or a nested `eval_each` call
 ///   on `to`/`step` itself returned `Flow::Escaped` (rule 4: a `halt`/
 ///   `break`/`error` from inside a bound's own generator, deferred until
 ///   the prefix already produced is delivered).
@@ -8069,12 +8071,12 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // pre-check (jq's own `range/3` never validates types up front either;
     // see `range_values_generic`'s doc comment), so for it this is the
     // first and only classification, and either arm can fire.
-    let mut emit = |from: OwnedValue,
-                    to: OwnedValue,
-                    step: OwnedValue,
+    let mut emit = |from: &OwnedValue,
+                    to: &OwnedValue,
+                    step: &OwnedValue,
                     from_literal: Option<&OwnedValue>|
      -> Demand {
-        match (range_num(&from), range_num(&to), range_num(&step)) {
+        match (range_num(from), range_num(to), range_num(step)) {
             (Ok(from_val), Ok(to_val), Ok(step_val)) => {
                 let (one, truncated) = match (from_val, to_val, step_val) {
                     // `eval_range_values` never falls back to
@@ -8121,7 +8123,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // itself; only the `+` that advances to the next value can
             // raise, and only once a next value is actually demanded.
             _ => {
-                let result = range_values_generic::<S>(from, &to, &step, &mut |v| match sink(
+                let result = range_values_generic::<S>(from.clone(), to, step, &mut |v| match sink(
                     Item::Owned(v),
                 ) {
                     Demand::Continue => Demand::Continue,
@@ -8156,15 +8158,15 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             return match from_val {
                 RangeNum::Int(t) => emit(
-                    OwnedValue::Int(0),
-                    OwnedValue::Int(t),
-                    OwnedValue::Int(1),
+                    &OwnedValue::Int(0),
+                    &OwnedValue::Int(t),
+                    &OwnedValue::Int(1),
                     None,
                 ),
                 RangeNum::Float(t) => emit(
-                    OwnedValue::Float(0.0),
-                    OwnedValue::Float(t),
-                    OwnedValue::Float(1.0),
+                    &OwnedValue::Float(0.0),
+                    &OwnedValue::Float(t),
+                    &OwnedValue::Float(1.0),
                     None,
                 ),
             };
@@ -8192,9 +8194,9 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         return stop(Control::Error(e));
                     }
                     emit(
-                        from_owned.clone(),
-                        to_owned,
-                        OwnedValue::Int(1),
+                        &from_owned,
+                        &to_owned,
+                        &OwnedValue::Int(1),
                         from_literal,
                     )
                 }
@@ -8208,9 +8210,9 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // which never type-checks from/to/step up front
                             // either.
                             emit(
-                                from_owned.clone(),
-                                to_owned.clone(),
-                                step_owned,
+                                &from_owned,
+                                &to_owned,
+                                &step_owned,
                                 from_literal,
                             )
                         });
