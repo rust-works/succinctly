@@ -24495,10 +24495,14 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // the target's kind in jq mode and raised at the pull site in yq mode.
     let mut out: Vec<OwnedValue> = Vec::new();
 
-    // `terminal` is the sinks' escape hatch (#2138's shape): a sink can only
-    // answer `Demand`, so a definitive `QueryResult` is parked here,
+    // The sinks' escape hatch (#2138's shape): a sink can only answer
+    // `Demand`, so the control that ended the pull is stashed here,
     // `Demand::Stop` ends the pull, and it is read once the pull returns.
-    let mut terminal: Option<QueryResult<'a, W>> = None;
+    // #3293: stashed apart from `out`, so a `?//` retry inside either bound
+    // can supersede it without taking the outputs already produced with it
+    // (see `StashedVerdict`); one invocation of either sink records at most
+    // one.
+    let stash = StashedEscape::new();
 
     // The shared exit every escape arm below funnels through, so folding
     // the running `out` in as a `Partial` prefix can't drift between arms
@@ -24507,13 +24511,11 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // borrowed/owned promotion has nothing to do here: `out` is always
     // `Vec<OwnedValue>`, never a separate borrowed accumulator). Runs from
     // inside a sink, so it parks its answer in `terminal` and stops the
-    // pull rather than `return`ing a `QueryResult` directly.
+    // pull rather than `return`ing a `QueryResult` directly; the running
+    // `out` is folded in as the `Partial` prefix once the pull returns.
     macro_rules! escape {
         ($control:expr) => {{
-            let control = $control;
-            mark_nonretryable_escape(&control);
-            terminal = Some(partial(core::mem::take(&mut out), control));
-            return Demand::Stop;
+            return stash.stop($control);
         }};
     }
 
@@ -24731,15 +24733,27 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     let mut start_sink = |s: ComputedSliceBound| -> Demand {
+        // #3293: a re-invocation after a stop is a `?//` retry inside
+        // `start`; it supersedes whatever the retried-past call decided.
+        stash.begin();
         // #2225: T (`end`) evaluated fresh for this `s`, not once overall.
         let mut end_sink = |e: ComputedSliceBound| -> Demand {
+            // #3293: likewise for a retry inside `end`.
+            stash.begin();
             process_pair!(&s, &e);
             Demand::Continue
         };
-        match each_slice_bound::<W, S>(end, value.clone(), f64::ceil, &mut end_sink) {
+        let end_flow = each_slice_bound::<W, S>(end, value.clone(), f64::ceil, &mut end_sink);
+        // #3293: a retry inside `end` that produced nothing never re-invoked
+        // `end_sink` to reset the stash.
+        stash.settle(&end_flow, end.as_deref().is_some_and(direct_pattern_retry));
+        if stash.is_set() {
+            return Demand::Stop;
+        }
+        match end_flow {
             Flow::Exhausted => Demand::Continue,
-            // Only `escape!` stops the inner pull, and it has already parked
-            // `terminal` -- propagate the stop outward.
+            // Only `escape!` stops the inner pull, and it has already
+            // stashed its control -- propagate the stop outward.
             Flow::Stopped { .. } => Demand::Stop,
             // #2225: this `s`'s own T evaluation escaped after producing
             // some values -- in jq mode those are already sliced into
@@ -24755,11 +24769,12 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let flow = each_slice_bound::<W, S>(start, value.clone(), f64::floor, &mut start_sink);
 
-    // A per-pair escape always parks its answer here before stopping the
+    // A per-pair escape always stashes its control before stopping the
     // pull -- checked first, it outranks anything the start stream's own
-    // tail could still report.
-    if let Some(result) = terminal {
-        return result;
+    // tail could still report, unless a retry inside `start` superseded it.
+    let direct_retry = start.as_deref().is_some_and(direct_pattern_retry);
+    if let Some(control) = stash.take(&flow, direct_retry) {
+        return partial(out, control);
     }
     match flow {
         // An empty `start` stream never evaluated `end` or the target at
@@ -24767,9 +24782,10 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // pull.
         Flow::Exhausted => owned_vec_to_result(out),
         // Our sinks are the only thing that can ask the pull to stop, and
-        // they only ever do so through `escape!`, which sets `terminal` --
+        // they only ever do so through `escape!`, which stashes a control
+        // that only a retry (which never ends `Stopped`) can supersede --
         // already returned above.
-        Flow::Stopped { .. } => unreachable!("sink always sets `terminal` before Demand::Stop"), // omni-dev: coverage tolerate-line reason="unreachable: escape! sets `terminal` before Demand::Stop; already returned above (#2546)"
+        Flow::Stopped { .. } => unreachable!("sink always stashes a control before Demand::Stop"), // omni-dev: coverage tolerate-line reason="unreachable: escape! stashes a control before Demand::Stop, and only a retry ending Exhausted/Escaped supersedes it; already returned above (#2546, #3293)"
         // #1528: `start`'s own trailing escape still has to reach the final
         // result -- a successful pull doesn't mean `start` itself didn't
         // escape after producing `out`'s own values (in yq mode it
