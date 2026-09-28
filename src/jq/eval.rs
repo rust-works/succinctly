@@ -33617,6 +33617,63 @@ fn unwrap_bind_source(expr: &Expr) -> &Expr {
     }
 }
 
+/// The top-level `,` leaves of a bind source, in order, or `None` when the
+/// source is not a comma (or in yq mode) (#3334).
+///
+/// In jq an `as` source is a subexp, and `FORK` runs branch A's outputs to
+/// exhaustion before starting branch B, so `(A, B) as P | body` is
+/// observationally `(A as P | body), (B as P | body)`: the same outputs in
+/// the same order, a trailing error in A stopping before B, `?//` retrying
+/// per source output. The source never moves the register, so this holds in
+/// path mode too. The resolver's source classifiers
+/// ([`identity_bind_position`], [`resolves_to_register`],
+/// [`head_may_be_frozen`]) answer once per source expression, but a comma's
+/// outputs come from different leaves: `(., 1)` has one register-identical
+/// output and one that isn't. Binding per leaf lets each one be classified
+/// by the existing single-source rules, exactly per output, with no
+/// provenance carried through the evaluated source.
+///
+/// Peels `Paren`/`Shared` ([`unwrap_bind_source`]) and flattens nested
+/// top-level commas. A comma nested under anything else (`if`, `try`, `//`)
+/// is left to the classifiers' own `Comma` arms.
+///
+/// jq mode only: yq v4.53.3 does not fan out an `as` source at all (`(.,.)
+/// as $x | $x` prints the document once), so the desugaring would be wrong
+/// there.
+fn comma_leaves<S: EvalSemantics>(expr: &Expr) -> Option<Vec<&Expr>> {
+    if S::TAG != EvalTag::Jq || !matches!(unwrap_bind_source(expr), Expr::Comma(_)) {
+        return None;
+    }
+    // An explicit stack, not recursion: a recursive def can nest its
+    // argument as deep as it likes, and this walk has no native-stack floor
+    // of its own (ADR-0025).
+    let mut leaves = Vec::new();
+    let mut pending = vec![expr];
+    while let Some(next) = pending.pop() {
+        match unwrap_bind_source(next) {
+            Expr::Comma(exprs) => pending.extend(exprs.iter().rev()),
+            leaf => leaves.push(leaf),
+        }
+    }
+    Some(leaves)
+}
+
+/// Runs `resolve_leaf` once per [`comma_leaves`] leaf, in order, stopping at
+/// the first flow that is not [`ResolveFlow::Exhausted`] -- a sink's stop or
+/// an escape ends the whole source, as it ends jq's `FORK` (#3334).
+fn resolve_each_leaf<'e>(
+    leaves: Vec<&'e Expr>,
+    mut resolve_leaf: impl FnMut(&'e Expr) -> ResolveFlow,
+) -> ResolveFlow {
+    for leaf in leaves {
+        match resolve_leaf(leaf) {
+            ResolveFlow::Exhausted => {}
+            other => return other,
+        }
+    }
+    ResolveFlow::Exhausted
+}
+
 /// The three outcomes of one sink-driven path resolution — the same
 /// three [`Flow`] already has for value-mode evaluation ([`Demand`] is
 /// shared verbatim), minus the `pending` field: a path resolution's
@@ -34635,38 +34692,18 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // (`frame.at`, by #2042's invariant) -- computed once per `As`
         // node, not per bound value, since it depends on neither the value
         // nor the witness. See [`identity_bind_position`].
-        Expr::As { expr, var, body } => {
-            let identity_at = identity_bind_position::<S>(expr, trackable, frame);
-            resolve_bind_source_sink::<S>(
-                expr,
-                body,
-                var,
-                value,
-                trackable,
-                frame,
-                &mut |bound, origin| {
-                    let substituted = substitute_bound_var_at(
-                        expr,
-                        body,
-                        var,
-                        &bound,
-                        identity_at.clone(),
-                        origin,
-                        None,
-                        S::TAG == EvalTag::Jq,
-                    );
-                    resolve_node_sink::<S>(
-                        &substituted,
-                        value,
-                        trackable,
-                        snapshot,
-                        frame,
-                        keep,
-                        sink,
-                    )
-                },
-            )
-        }
+        //
+        // #3334: a comma source binds per leaf -- see [`comma_leaves`].
+        Expr::As { expr, var, body } => match comma_leaves::<S>(expr) {
+            Some(leaves) => resolve_each_leaf(leaves, |leaf| {
+                resolve_as_source_sink::<S>(
+                    leaf, var, body, value, trackable, snapshot, frame, keep, sink,
+                )
+            }),
+            None => resolve_as_source_sink::<S>(
+                expr, var, body, value, trackable, snapshot, frame, keep, sink,
+            ),
+        },
         // #2649: `SRC as PATTERN | body`, jq's destructuring bind. Like `As`
         // above, jq evaluates SRC with tracking suspended, so the source
         // itself never moves the register -- but the *pattern* is compiled
@@ -38159,11 +38196,11 @@ fn marker_identical<S: EvalSemantics>(
 /// produced the value) rather than on `is_raise_free_identity_passthrough
 /// (left)` alone, which says nothing about which side's value reached
 /// `bound` -- the same #3129 lesson applied to an immediate, non-deferred
-/// certification instead of a later one. Second (#3127): this function has
-/// an `Expr::Comma` arm and `is_identity_passthrough` does not -- a gap
-/// this function's own review found and fixed here, `is_identity_passthrough`'s
-/// still open as #3334, so this "mirrors ... otherwise" claim is accurate
-/// only up to that one recorded exception.
+/// certification instead of a later one. Second (#3127): this function's
+/// `Expr::Comma` arm is not gated to jq mode, where `is_identity_passthrough`'s
+/// (#3334) is. A top-level comma source never reaches either: jq mode splits
+/// it per leaf first ([`comma_leaves`]), so the arm answers a comma nested
+/// under another head.
 fn resolves_to_register<S: EvalSemantics>(
     expr: &Expr,
     trackable: bool,
@@ -38176,27 +38213,13 @@ fn resolves_to_register<S: EvalSemantics>(
         // own `TrackedVar` arm, so a future refinement of this rule can't
         // apply to one and silently miss the other.
         Expr::TrackedVar(marker) => marker_identical::<S>(marker, reg, frame),
-        // #3127: every branch of a comma-fanned source is its own separate
-        // output (`eval_owned_expr_fork`'s `sources`), so this is sound
-        // exactly when every branch is -- `(.,.)` (both `Identity`) proves
-        // every output register-identical this way; `(., 1)` does not (`1`
-        // fails its own arm), and correctly falls through to the per-bound
-        // null/bool fallback below for the branch that does resolve, same
-        // conservative "guess" this function already makes for any shape
-        // it doesn't recognize (see this function's own doc comment) --
-        // this arm only turns a previously-unrecognized shape into one that
-        // sometimes proves `true`, never the reverse. Confirmed live: jq
-        // agrees `[path((.,.) as [$z] ?// {a:$q} | $q)]` is `[["a"],["a"]]`
-        // (this arm's only caller, `resolve_as_pattern`, is reached through
-        // `?//`/destructuring, never a bare `. as $x | body` -- that
-        // simpler form's own identical gap, in the unrelated
-        // `is_identity_passthrough` mechanism, is #3334, not fixed here),
-        // and still refuses `(., 1) as [$z] ?// {a:$q} | $q` on the
-        // *second* output only (jq's own message names `1`, not the whole
-        // document) -- where this arm's own `false` for that mixed shape
-        // leaves the existing per-bound fallback to (wrongly) refuse the
-        // first, resolvable branch too, a real, tracked divergence (#3334)
-        // this fix does not reach.
+        // #3127: every output of a comma is one of its leaves', so this is
+        // sound exactly when every leaf is -- `(.,.)` proves every output
+        // register-identical; `(., 1)` does not, and falls to the per-bound
+        // null/bool fallback. Since #3334 `resolve_as_pattern` splits a
+        // top-level comma per leaf before asking ([`comma_leaves`]), so
+        // `(., 1)` is judged leaf by leaf there and this arm only answers a
+        // comma nested under another head (`if true then (.,.) else . end`).
         Expr::Comma(exprs) => exprs
             .iter()
             .all(|e| resolves_to_register::<S>(e, trackable, reg, frame)),
@@ -39052,6 +39075,45 @@ fn resolve_bind_source_in<S: EvalSemantics>(
 /// demand-driven consumer (a fold source, #2235) `path(reduce
 /// ((.[]|stderr) as $x | $x) as $i (.; error("u")))` writes `1` to stderr
 /// in jq, where collecting the source first wrote `123`.
+/// `source as $var | body` in path position, for one source: the
+/// [`resolve_node_sink`] `As` arm's body, which runs it once per
+/// [`comma_leaves`] leaf when the source is a comma (#3334).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambients, as `resolve_node_sink`
+fn resolve_as_source_sink<'a, S: EvalSemantics>(
+    source: &Expr,
+    var: &str,
+    body: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let identity_at = identity_bind_position::<S>(source, trackable, frame);
+    resolve_bind_source_sink::<S>(
+        source,
+        body,
+        var,
+        value,
+        trackable,
+        frame,
+        &mut |bound, origin| {
+            let substituted = substitute_bound_var_at(
+                source,
+                body,
+                var,
+                &bound,
+                identity_at.clone(),
+                origin,
+                None,
+                S::TAG == EvalTag::Jq,
+            );
+            resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
+        },
+    )
+}
+
 fn resolve_bind_source_sink<S: EvalSemantics>(
     source: &Expr,
     body: &Expr,
@@ -39390,6 +39452,17 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     register: Option<&OwnedValue>,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    // #3334: a comma source binds per leaf, so `head_resolves_to_register`,
+    // `identity_at` and `bound_is_frozen` below are each computed for the
+    // leaf that produced the value -- `(., 1)` tracks its first output --
+    // rather than once for the whole comma. See [`comma_leaves`].
+    if let Some(leaves) = comma_leaves::<S>(source) {
+        return resolve_each_leaf(leaves, |leaf| {
+            resolve_as_pattern::<S>(
+                leaf, patterns, body, value, trackable, snapshot, frame, keep, register, sink,
+            )
+        });
+    }
     // A subexp: evaluated by value, never a path witness (jq's
     // `subexp_nest > 0` -- the same rule `resolve_bind_source_witness`'s
     // `by_value` follows). `trackable` still gates demotion the same way
@@ -39421,11 +39494,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     // arm's pre-#3119 behavior for a bare `.`/`TrackedVar` head exactly.
     let head_resolves_to_register =
         register.is_some_and(|reg| resolves_to_register::<S>(head, trackable, reg, frame));
-    let bound_is_frozen = match head {
-        Expr::TrackedVar(_) => true,
-        Expr::Identity => !matches!(snapshot, Snapshot::No),
-        _ => false,
-    };
+    let bound_is_frozen = head_may_be_frozen(head, snapshot);
     for bound in &sources {
         // A shape `resolves_to_register` refuses (including one it was
         // never asked about, for `Expr::Identity`/`TrackedVar`) still gets
@@ -40305,6 +40374,45 @@ impl NavKind {
             ),
             Self::Iterate => matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)),
         }
+    }
+}
+
+/// Whether a destructuring source headed by `head` may produce a frozen
+/// value -- one jq could still hold as its path register by the pointer it
+/// was bound from -- for [`guess_refusal_of`]'s `frozen` (#3267, #3334).
+///
+/// True if *any* branch can: a `$var` marker, or `.` over a marked snapshot,
+/// reached through `if`, `try`, `//`, `,`, parens or a `Shared` argument.
+/// It used to recognize only a bare `$var`/`.`, so `(if true then $orig else
+/// $orig end) as {a:{b:$q}} | $q` under `try` had its refusal treated as
+/// exact: `try` caught it and `del` silently discarded the write jq makes.
+/// Answering `true` too often only turns a caught refusal into a loud one,
+/// and only when [`could_be_lost_register`] and the step's own
+/// `would_succeed_on` also hold -- the #3267 price the bare `$orig` head
+/// already pays, never a wrong answer.
+fn head_may_be_frozen(head: &Expr, snapshot: &Snapshot) -> bool {
+    match unwrap_bind_source(head) {
+        Expr::TrackedVar(_) => true,
+        Expr::Identity => !matches!(snapshot, Snapshot::No),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => head_may_be_frozen(then_branch, snapshot) || head_may_be_frozen(else_branch, snapshot),
+        // The handler's `.` is the error payload, not the frame's input, so
+        // only a `$var` it names can be frozen there (#3334 review: `try
+        // error({..}) catch .` binds a fresh payload).
+        Expr::Try { expr, catch } => {
+            head_may_be_frozen(expr, snapshot)
+                || catch
+                    .as_deref()
+                    .is_some_and(|c| head_may_be_frozen(c, &Snapshot::No))
+        }
+        Expr::Alternative(left, right) => {
+            head_may_be_frozen(left, snapshot) || head_may_be_frozen(right, snapshot)
+        }
+        Expr::Comma(exprs) => exprs.iter().any(|e| head_may_be_frozen(e, snapshot)),
+        _ => false,
     }
 }
 
@@ -46091,6 +46199,15 @@ fn identity_passthrough(expr: &Expr, wide: bool) -> bool {
         Expr::Pipe(stages) if wide && !mentions_marker(expr) => {
             stages.iter().all(|e| identity_passthrough(e, wide))
         }
+        // #3334: every output of a comma is one of its leaves', so it is a
+        // passthrough when every leaf is -- the `if` arm's rule over n
+        // branches. jq mode only, like the pipe arm: yq does not fan out an
+        // `as` source. A top-level comma source is split per leaf before
+        // this is asked (`comma_leaves`); this answers one nested under
+        // another head, `if true then (.,.) else . end`.
+        Expr::Comma(exprs) if wide => {
+            !exprs.is_empty() && exprs.iter().all(|e| identity_passthrough(e, wide))
+        }
         _ => false,
     }
 }
@@ -46159,6 +46276,15 @@ fn raise_free_identity_passthrough(expr: &Expr, wide: bool) -> bool {
         Expr::Pipe(stages) if wide && !mentions_marker(expr) => stages
             .iter()
             .all(|e| raise_free_identity_passthrough(e, wide)),
+        // #3334: so is a comma of them -- it has at least two outputs, and
+        // none can raise. Marker-free only, as the `if` and pipe arms are.
+        // (An empty comma yields nothing, so it is neither.)
+        Expr::Comma(exprs) if wide && !mentions_marker(expr) => {
+            !exprs.is_empty()
+                && exprs
+                    .iter()
+                    .all(|e| raise_free_identity_passthrough(e, wide))
+        }
         _ => false,
     }
 }
@@ -46399,21 +46525,13 @@ fn identity_bind_position<S: EvalSemantics>(
                 then_branch,
                 else_branch,
                 ..
-            } => {
-                let then_at = position(then_branch, trackable, frame);
-                let else_at = position(else_branch, trackable, frame);
-                match (then_at, else_at) {
-                    // Both arms prove the same thing.
-                    (a, b) if a == b => a,
-                    // One arm is a computed `.`: the bind may be that, so
-                    // it can only be certified as it would be (#3133).
-                    (Some(Origin::Untracked), _) | (_, Some(Origin::Untracked)) => {
-                        Some(Origin::Untracked)
-                    }
-                    // Two positions that differ, or a position beside a
-                    // bare snapshot: the bare value rule.
-                    _ => None,
-                }
+            } => common_position(
+                [then_branch, else_branch].map(|arm| position(arm, trackable, frame)),
+            ),
+            // #3334: a comma nested under another head (`if true then (.,.)
+            // else . end`); a top-level one is split per leaf before this.
+            Expr::Comma(exprs) => {
+                common_position(exprs.iter().map(|e| position(e, trackable, frame)))
             }
             Expr::Try { expr, .. } if raise_free_identity_passthrough(expr, true) => {
                 position(expr, trackable, frame)
@@ -46436,6 +46554,30 @@ fn identity_bind_position<S: EvalSemantics>(
                 }
             }
             _ => None,
+        }
+    }
+    /// What several branches' positions certify together, for an `if`'s
+    /// two arms or a comma's leaves: the position only when every branch
+    /// proves the same one.
+    fn common_position(branches: impl IntoIterator<Item = Option<Origin>>) -> Option<Origin> {
+        let mut branches = branches.into_iter();
+        let first = branches.next()?;
+        let mut all_equal = true;
+        let mut any_untracked = matches!(first, Some(Origin::Untracked));
+        for branch in branches {
+            all_equal &= branch == first;
+            any_untracked |= matches!(branch, Some(Origin::Untracked));
+        }
+        if any_untracked {
+            // One branch is a computed `.`: the bind may be that, so it can
+            // only be certified as it would be (#3133).
+            Some(Origin::Untracked)
+        } else if all_equal {
+            first
+        } else {
+            // Two positions that differ, or a position beside a bare
+            // snapshot: the bare value rule.
+            None
         }
     }
     position(source, trackable, frame)
@@ -109107,13 +109249,9 @@ mod tests {
     /// answered `[]` at exit 0 in the write-adjacent `?`-wrapped shape the
     /// issue's own repro uses.
     ///
-    /// `(., 1)` (row 3) is the asymmetric control this fix deliberately
-    /// leaves unrecognized: `1` doesn't resolve on its own, so the `&&`
-    /// answers `false` for the whole comma and the existing per-bound
-    /// fallback is what's left to judge each branch -- same as before this
-    /// fix, and still a real, separately-tracked gap (#3334; a per-branch,
-    /// not per-head, provenance question) that this issue's own narrow fix
-    /// does not attempt.
+    /// `(., 1)`, the asymmetric source, is pinned by #3334's own tests: that
+    /// fix splits a comma source per leaf, so each output is judged by the
+    /// leaf that produced it.
     #[test]
     fn test_comma_fanned_source_recognizes_every_identity_branch_3127() {
         for (doc, filter, want) in [
@@ -109127,14 +109265,8 @@ mod tests {
                 r"[path(((.,.) as [$z] ?// {a:$q} | ($q, 0))?)]",
                 Err(r"Invalid path expression with result 0"),
             ),
-            // The asymmetric source (`.` resolves, `1` does not) is
-            // deliberately *not* pinned here: `resolves_to_register`'s own
-            // `&&` still answers `false` for the whole comma in that case,
-            // and the pre-existing per-bound fallback then refuses the
-            // resolvable branch too -- a real, separately-tracked
-            // divergence from jq (#3334), not something this fix reaches.
-            // Pinning succinctly's own current (wrong) answer as "expected"
-            // here would misrepresent it as verified-correct.
+            // The asymmetric source (`.` resolves, `1` does not) is pinned
+            // by `test_comma_bind_source_is_classified_per_branch_3334`.
         ] {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
@@ -109168,6 +109300,76 @@ mod tests {
             .map(OwnedValue::to_json)
             .collect();
         assert_eq!(got, vec![r#"{"b":[3]}"#.to_string()]);
+    }
+
+    /// #3334: `comma_leaves` flattens a top-level comma through parens and
+    /// nested commas, in order, leaves a comma nested under another head
+    /// alone, and answers `None` for a non-comma source or in yq mode.
+    #[test]
+    fn test_comma_leaves_flattens_top_level_commas_3334() {
+        let leaves = |filter: &str| {
+            let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            comma_leaves::<JqSemantics>(&expr).map(|ls| ls.into_iter().cloned().collect::<Vec<_>>())
+        };
+        assert_eq!(
+            leaves("(., (1, (.a, .b)))"),
+            Some(vec![
+                parse(".").unwrap(),
+                parse("1").unwrap(),
+                parse(".a").unwrap(),
+                parse(".b").unwrap(),
+            ])
+        );
+        assert_eq!(leaves("."), None);
+        assert_eq!(leaves("if true then (.,.) else . end"), None);
+        assert_eq!(comma_leaves::<YqSemantics>(&parse("(.,.)").unwrap()), None);
+    }
+
+    /// #3334: `head_may_be_frozen` answers true when any branch of an `if`,
+    /// `try`, `//` or comma head can yield a frozen value -- `.` over a
+    /// marked snapshot here -- and false when none can.
+    #[test]
+    fn test_head_may_be_frozen_looks_through_composite_heads_3334() {
+        let marked = Snapshot::Marked(Origin::Snapshot);
+        for (filter, when_marked) in [
+            (".", true),
+            ("(.)", true),
+            ("if true then . else 1 end", true),
+            ("if true then 1 else . end", true),
+            ("try . catch 1", true),
+            // The handler's `.` is the error payload, never frozen.
+            ("try 1 catch .", false),
+            (". // 1", true),
+            ("1 // .", true),
+            ("(1, .)", true),
+            ("1", false),
+            ("(1, 2)", false),
+            ("if . then 1 else 2 end", false),
+            (".a", false),
+        ] {
+            let expr = parse(filter).unwrap();
+            assert_eq!(head_may_be_frozen(&expr, &marked), when_marked, "{filter}");
+            assert!(
+                !head_may_be_frozen(&expr, &Snapshot::No),
+                "{filter} unmarked"
+            );
+        }
+    }
+
+    /// #3334 review: an empty comma yields nothing, so it is not an identity
+    /// passthrough in either grammar (the `//`/`try` soundness arguments
+    /// rest on at least one output). The codebase does build them, e.g.
+    /// `Array(Comma([]))`.
+    #[test]
+    fn test_empty_comma_is_not_a_passthrough_3334() {
+        let empty = Expr::Comma(Vec::new());
+        assert!(!identity_passthrough(&empty, true));
+        assert!(!raise_free_identity_passthrough(&empty, true));
+        let two = parse("(., .)").unwrap();
+        assert!(identity_passthrough(&two, true));
+        assert!(raise_free_identity_passthrough(&two, true));
+        // yq mode keeps the pre-#3334 grammar.
+        assert!(!identity_passthrough(&two, false));
     }
 
     /// #3133: a pipe nested under `try`/`?` in a pattern body used to carry
