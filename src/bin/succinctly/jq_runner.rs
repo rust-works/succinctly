@@ -121,6 +121,10 @@ pub struct ModuleLoader {
     /// any of its `import`s, regardless of how the two are interleaved in the
     /// source.
     deps_of: BTreeMap<u32, Vec<(usize, u32)>>,
+    /// Each top-level `include`/non-data `import`'s `(decl_index, run id)`,
+    /// as [`Self::process_program`] resolved them -- kept for
+    /// [`Self::error_report_rank`], which runs only on the compile-error path.
+    top_ids: Vec<(usize, u32)>,
 }
 
 /// A [`ModuleLoader`] failure, structured enough to report in jq's own
@@ -859,6 +863,7 @@ impl ModuleLoader {
             run_origins,
             next_run_id: AUTO_LOAD_RUN_ID + 1,
             deps_of: BTreeMap::new(),
+            top_ids: Vec::new(),
         }
     }
 
@@ -1256,6 +1261,56 @@ impl ModuleLoader {
         order
     }
 
+    /// Each module's position in jq 1.7.1's compile-error report (#3313).
+    ///
+    /// jq reports modules in a depth-first post-order walk: top-level
+    /// directives last-declared first (`include` and `import` share one
+    /// `decl_index` sequence), each module's own dependencies before the
+    /// module, also last-declared first, and each module once, at its
+    /// *first* reach. Captured live, including the row that separates first
+    /// reach from dependency position: `include "cerr2"; include "other2";
+    /// include "serr2"` (`serr2` a dependency of `cerr2`) reports `serr2`,
+    /// then `other2`, then `cerr2`.
+    ///
+    /// Not [`Self::hoist_order`], which answers a different question: that
+    /// walk records only modules something depends on, at their dependency
+    /// position, and decides where link runs are wrapped. The wrap order
+    /// cannot follow this one -- link runs must stay outermost (#2955,
+    /// #3153) -- so the reporter reorders the collected errors instead.
+    fn error_report_rank(&self) -> BTreeMap<u32, usize> {
+        fn visit(
+            loader: &ModuleLoader,
+            id: u32,
+            expanded: &mut BTreeSet<u32>,
+            rank: &mut BTreeMap<u32, usize>,
+        ) {
+            if !expanded.insert(id) {
+                return;
+            }
+            if let Some(deps) = loader.deps_of.get(&id) {
+                // Sorted for the reason `hoist_order`'s own walk sorts:
+                // `deps_of` lists includes before imports, not in source
+                // order.
+                let mut deps = deps.clone();
+                deps.sort_by_key(|(decl, _)| core::cmp::Reverse(*decl));
+                for (_, dep) in deps {
+                    visit(loader, dep, expanded, rank);
+                }
+            }
+            let next = rank.len();
+            rank.insert(id, next);
+        }
+
+        let mut top = self.top_ids.clone();
+        top.sort_by_key(|(decl, _)| core::cmp::Reverse(*decl));
+        let mut expanded = BTreeSet::new();
+        let mut rank = BTreeMap::new();
+        for (_, id) in top {
+            visit(self, id, &mut expanded, &mut rank);
+        }
+        rank
+    }
+
     /// Every def name this program's modules will put into the main filter's
     /// scope *unqualified*, for seeding the parser's shadow-candidate set
     /// (#2395).
@@ -1446,6 +1501,7 @@ impl ModuleLoader {
         // run is wrapped, because a module that is linked *and* top-level
         // gets stubs rather than bodies in its top-level run (#3153).
         let order = self.hoist_order(&top_ids);
+        self.top_ids = top_ids;
         let linked: BTreeSet<u32> = order.iter().copied().collect();
         let wanted = if linked.is_empty() {
             BTreeSet::new()
@@ -3064,6 +3120,32 @@ impl ModuleSource {
     }
 }
 
+/// `errors` in jq 1.7.1's report order (#3313): every module's errors by
+/// [`ModuleLoader::error_report_rank`], then `~/.jq`'s, then the main
+/// filter's. The sort is stable, so errors within one module keep the
+/// resolver's order, which already matches jq's.
+///
+/// A module id missing from the rank map is sorted with `~/.jq`. Every run
+/// that carries a body is a top-level directive or reached from one, so
+/// that arm is defensive only.
+fn jq_report_order<'e>(
+    errors: &'e [jq::ResolveError],
+    loader: &ModuleLoader,
+) -> Vec<&'e jq::ResolveError> {
+    let mut ordered: Vec<&jq::ResolveError> = errors.iter().collect();
+    if errors.iter().any(|e| e.origin().is_some()) {
+        let rank = loader.error_report_rank();
+        ordered.sort_by_key(|e| match e.origin() {
+            Some(id) => match rank.get(&id) {
+                Some(&r) if id != AUTO_LOAD_RUN_ID => (0, r),
+                _ => (1, 0),
+            },
+            None => (2, 0),
+        });
+    }
+    ordered
+}
+
 fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &ModuleLoader) {
     // #3085: a file may be spliced in by several import/include directives,
     // and the resolver visits every copy, but jq diagnoses each physical
@@ -3104,7 +3186,7 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     // module's own table instead, built lazily from that module's source.
     let break_sites = jq::collect_break_sites(filter, jq::ParserMode::Jq, true);
 
-    for error in errors {
+    for error in jq_report_order(errors, loader) {
         match error {
             jq::ResolveError::Call(jq::UnresolvedCall {
                 name,
