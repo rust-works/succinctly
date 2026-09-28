@@ -2930,10 +2930,13 @@ impl OwnedValue {
         if let Some(f) = n.bridge_value() {
             return Self::from_bridge_float(f);
         }
-        let bytes = n.raw_bytes();
-        match Self::from_number_bytes::<S>(bytes) {
+        match Self::from_number_bytes::<S>(n.raw_bytes()) {
+            // `token_address` is `None` only for a bridge token, which
+            // returned above.
             Self::Float(f) if S::DECNUMBER_LITERALS && f.is_nan() => {
-                Self::document_nan_instance(f.is_sign_negative(), bytes.as_ptr() as usize)
+                n.token_address().map_or(Self::Float(f), |address| {
+                    Self::document_nan_instance(f.is_sign_negative(), address)
+                })
             }
             other => other,
         }
@@ -2990,11 +2993,13 @@ impl OwnedValue {
     /// That parse keyed each NaN by its token's address, which is unique
     /// only while the text is alive: the next `fromjson` of the same string,
     /// or of a new one the allocator placed at the same address, would key
-    /// its NaNs identically, where jq makes new instances. Leaves `self`
-    /// untouched, and walks nothing, when it holds no NaN.
+    /// its NaNs identically, where jq makes new instances. `text` is what
+    /// `self` was parsed from: when it cannot spell a NaN
+    /// ([`may_spell_nan`](crate::json::validate::may_spell_nan)), the
+    /// ordinary case, `self` comes back untouched without a walk.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_fresh_nan_instances(self) -> Self {
+    pub fn with_fresh_nan_instances(self, text: &[u8]) -> Self {
         fn holds_nan_instance(value: &OwnedValue) -> bool {
             match value {
                 OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => f.is_nan(),
@@ -3015,7 +3020,7 @@ impl OwnedValue {
             }
         }
         let mut value = self;
-        if holds_nan_instance(&value) {
+        if crate::json::validate::may_spell_nan(text) && holds_nan_instance(&value) {
             refresh(&mut value);
         }
         value
@@ -3511,7 +3516,7 @@ impl OwnedValue {
             format_number_jq_compat,
             jq_bare_float_display,
             infinite_float_preview_text,
-            "null",
+            printed_nan,
         )
     }
 
@@ -3552,7 +3557,7 @@ impl OwnedValue {
             format_number_jq_compat,
             jq_bare_float_display,
             overflow_literal_text,
-            NAN_SENTINEL,
+            nan_instance_token,
         )
     }
 
@@ -3576,7 +3581,7 @@ impl OwnedValue {
             crate::jq::stream::real_output_finite_literal,
             jq_bare_float_display,
             infinite_float_preview_text,
-            "null",
+            printed_nan,
         )
     }
 
@@ -3626,7 +3631,7 @@ impl OwnedValue {
             crate::jq::stream::real_output_finite_literal,
             crate::yaml::format_float_yq,
             yq_infinite_float_json_text,
-            "null",
+            printed_nan,
         )
     }
 
@@ -3655,7 +3660,7 @@ impl OwnedValue {
         finite_literal: fn(&[u8]) -> String,
         float_fmt: fn(f64) -> String,
         infinite_fmt: fn(bool) -> &'static str,
-        nan_text: &'static str,
+        nan_fmt: fn(f64) -> String,
     ) -> String {
         assert_value_tree_depth(depth);
         match self {
@@ -3666,25 +3671,20 @@ impl OwnedValue {
             Self::Float(f) => {
                 if f.is_nan() {
                     // JSON doesn't support NaN: `"null"` for output, the
-                    // bridge token for `to_json_input_bridge` (#2877).
-                    nan_text.into()
+                    // bridge token for `to_json_input_bridge` (#2877). A
+                    // computed NaN has no instance, whatever payload
+                    // arithmetic left in it (#3309), so it goes in canonical.
+                    nan_fmt(f64::NAN)
                 } else if f.is_infinite() {
                     infinite_fmt(f.is_sign_negative()).into()
                 } else {
                     float_fmt(*f)
                 }
             }
-            // A parsed NaN (#3309) prints as a computed one does. Written
-            // for the input bridge (`nan_text` is its sentinel), it takes the
-            // bridge token that reads back as the same instance, so a
+            // A parsed NaN (#3309) prints as a computed one does. The input
+            // bridge's `nan_fmt` writes its instance into the token, so a
             // `--slurp` of `NaN` still has `.[0] == .[0]`.
-            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
-                if nan_text == NAN_SENTINEL {
-                    nan_instance_token(*f)
-                } else {
-                    nan_text.into()
-                }
-            }
+            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => nan_fmt(*f),
             // An infinite `NumberLiteral` reaching here is always a genuine
             // document literal, which still has its own source text to
             // fall back to -- `1e400 | .` (identity, no computation) echoes
@@ -3712,7 +3712,7 @@ impl OwnedValue {
                             finite_literal,
                             float_fmt,
                             infinite_fmt,
-                            nan_text,
+                            nan_fmt,
                         )
                     })
                     .collect();
@@ -3730,7 +3730,7 @@ impl OwnedValue {
                                 finite_literal,
                                 float_fmt,
                                 infinite_fmt,
-                                nan_text
+                                nan_fmt
                             )
                         )
                     })
@@ -3824,7 +3824,7 @@ impl OwnedValue {
             // display spelling -- see that function's doc for why the token
             // is unparseable as an ordinary number. Same in both modes; the
             // spelling is re-derived from the `f64` downstream, per mode.
-            // `infinite_fmt` and `nan_text` are unreachable from here --
+            // `infinite_fmt` and `nan_fmt` are unreachable from here --
             // every NaN/infinite case is already handled by the arms above,
             // before this fallback -- so which are passed only matters for
             // reading. `check_value_tree_depth` above already validated
@@ -3835,7 +3835,7 @@ impl OwnedValue {
                 format_number_jq_compat,
                 crate::json::validate::computed_float_token,
                 infinite_float_preview_text,
-                "null",
+                printed_nan,
             ),
         })
     }
@@ -4154,11 +4154,19 @@ const NAN_INSTANCE_FRESH: u64 = 1 << 49;
 const NAN_INSTANCE_TOKEN_MASK: u64 = NAN_INSTANCE_FRESH - 1;
 
 /// The identity of a NaN token read from a document: its first byte's
-/// address. Folded into the token bits so a pointer wider than them still
-/// keeps its high bits.
+/// address. The top byte is dropped first, since AArch64's top-byte-ignore
+/// lets tag bits differ between two pointers to one byte (and MTE sets
+/// them), and what remains is folded into the token bits so an address
+/// wider than them (a 57-bit address space) still keeps its high bits.
+/// User-space addresses on today's 48-bit layouts fit the token unchanged.
 fn address_nan_token(address: usize) -> u64 {
-    let address = address as u64;
+    let address = address as u64 & ((1 << 56) - 1);
     (address ^ (address >> 49)) & NAN_INSTANCE_TOKEN_MASK
+}
+
+/// `to_json`'s NaN text: `null`, what jq prints for every NaN.
+fn printed_nan(_: f64) -> String {
+    "null".into()
 }
 
 /// Whether `f` is a NaN carrying a parse identity in its payload.
@@ -6381,7 +6389,16 @@ mod tests {
             OwnedValue::object_from(fields),
             OwnedValue::Int(1),
         ]);
-        let fresh = value.with_fresh_nan_instances();
+        // Text that cannot spell a NaN is trusted to have made none.
+        assert!(same_nan_instance(
+            &value
+                .clone()
+                .with_fresh_nan_instances(b"[1]")
+                .as_array()
+                .expect("array")[0],
+            &a
+        ));
+        let fresh = value.with_fresh_nan_instances(b"[NaN]");
         let items = fresh.as_array().expect("array");
         let nested = items[1].as_object().expect("object")["k"].clone();
         assert!(!same_nan_instance(&items[0], &a));
@@ -6389,7 +6406,7 @@ mod tests {
         assert!(!same_nan_instance(&items[0], &nested));
         assert_eq!(items[2], OwnedValue::Int(1));
         let plain = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
-        assert_eq!(plain.clone().with_fresh_nan_instances(), plain);
+        assert_eq!(plain.clone().with_fresh_nan_instances(b"[nan]"), plain);
     }
 
     /// #3034: `from_number_bytes` reads user text, so the bridge's tokens are

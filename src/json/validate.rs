@@ -1172,6 +1172,26 @@ pub fn jq_special_number(bytes: &[u8]) -> Option<f64> {
         .then_some(f64::NAN)
 }
 
+/// Whether `text` could hold a [`jq_special_number`] NaN anywhere.
+///
+/// Every NaN spelling contains `nan`, in any case, so a byte scan lets a
+/// caller skip walking a value parsed from `text` for NaNs when there can be
+/// none (#3309). `true` for text that merely mentions it (`"banana"`).
+///
+/// # Example
+///
+/// ```
+/// use succinctly::json::validate::may_spell_nan;
+///
+/// assert!(may_spell_nan(b"[1,-sNaN12]"));
+/// assert!(may_spell_nan(br#"{"k":"banana"}"#));
+/// assert!(!may_spell_nan(br#"{"n":null,"x":[1e3,-Infinity]}"#));
+/// ```
+#[must_use]
+pub fn may_spell_nan(text: &[u8]) -> bool {
+    text.windows(3).any(|w| w.eq_ignore_ascii_case(b"nan"))
+}
+
 /// `bytes` without its leading `+`, when a digit or `.` follows it (#2877).
 ///
 /// `None` otherwise -- including for a bare `+`, a doubled sign (`+-1`,

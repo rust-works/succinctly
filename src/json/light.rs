@@ -2700,6 +2700,22 @@ impl<'a> JsonNumber<'a> {
             .or_else(|| crate::json::validate::parse_computed_float_token(bytes))
     }
 
+    /// The address of the token's first byte in the document text: the
+    /// identity jq gives a NaN it parsed (#3309), since every read of one
+    /// position answers the same address and no other live token does.
+    /// `None` for a reindex bridge token, which stands for a computed value.
+    ///
+    /// The one definition both keying routes use
+    /// (`OwnedValue::from_json_number` and `DocumentValue::number_token_address`),
+    /// so a document NaN gets the same instance whichever materializes it.
+    #[must_use]
+    pub fn token_address(&self) -> Option<usize> {
+        if self.bridge_value().is_some() {
+            return None;
+        }
+        Some(self.raw_bytes().as_ptr() as usize)
+    }
+
     /// [`bridge_value`](Self::bridge_value) restricted to the NaN/infinity
     /// tokens (#472/#1083): `None` for the computed-float token and for
     /// everything read outside the bridge. For the cursor builtins that
@@ -3879,9 +3895,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
 
     fn number_token_address(&self) -> Option<usize> {
         match self {
-            StandardJson::Number(n) if n.bridge_value().is_none() => {
-                Some(n.raw_bytes().as_ptr() as usize)
-            }
+            StandardJson::Number(n) => n.token_address(),
             _ => None,
         }
     }
