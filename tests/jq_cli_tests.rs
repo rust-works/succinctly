@@ -74020,6 +74020,13 @@ fn test_object_construction_retry_supersedes_stashed_sink_verdict_3293() -> Resu
         None,
         &[
             (
+                r#"{(([["x"]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)): 1}"#,
+                "",
+                "A",
+                "",
+                0,
+            ),
+            (
                 r#"{(([["x"]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)): 1}"#,
                 "",
                 "A",
@@ -74297,6 +74304,13 @@ fn test_and_or_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
         None,
         &[
             (
+                r#"([1] as $a ?// {(empty): $b} | ("A"|stderr) | $a) and error("E")"#,
+                "",
+                "A",
+                "",
+                0,
+            ),
+            (
                 r#"([1] as $a ?// {k: $b} | ("A"|stderr) | $a) and error("E")"#,
                 "",
                 "A",
@@ -74454,6 +74468,13 @@ fn test_skip_count_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(
         None,
         &[
+            (
+                r#"[skip(([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a | length); 10, error("B"))]"#,
+                "[]\n",
+                "A",
+                "",
+                0,
+            ),
             (
                 r#"[skip(([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a | length); 10, error("B"))]"#,
                 "",
