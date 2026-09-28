@@ -74476,17 +74476,15 @@ fn test_pipe_first_stage_retry_supersedes_stashed_sink_verdict_3293() -> Result<
 /// #3293: a `?//` retry inside `limit`'s generator, after its count stopped it supersedes the verdict the
 /// retried-past alternative left in `limit`'s eager route (`each_take_n`)'s stash.
 ///
-/// Rows, as the sink allows, cover each way the retry can end: answering
-/// after the first alternative's error; producing nothing, including a
-/// pattern that yields no binding set, so the sink is never re-invoked;
-/// raising inside the generator, including a pattern that fails to
-/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
-/// the first alternative that must not hide the retry's own error. The
-/// controls are every alternative failing (the last one's error surfaces)
-/// and, in some tables, the same error with no `?//` at all.
+/// Once `limit`'s count stops its generator, the generator only runs again
+/// if a `?//` inside it retries (#1519), and whatever that alternative then
+/// raises -- in the generator, or after it exhausts -- is jq's answer rather
+/// than a dropped trailing control.
 ///
-/// The last two rows are controls: an eager trailing control after the count
-/// is still dropped, and a clean retry still answers twice (#1519).
+/// The first three rows raise inside the retried alternative; the fourth
+/// exhausts it and then reaches the generator's own trailing `error("x")`.
+/// The last two are controls: an eager trailing control after the count is
+/// still dropped, and a clean retry still answers twice (#1519).
 const RETRY_ROWS_LIMIT_COUNT_STOP_3293: &[RetryRow3293] = &[
     (
         r#"[limit(1; if ([1] as $a ?// $b | ("A"|stderr) | $a) then 1 else error("E") end)]"#,
@@ -74507,6 +74505,13 @@ const RETRY_ROWS_LIMIT_COUNT_STOP_3293: &[RetryRow3293] = &[
         "",
         "AA",
         "E",
+        5,
+    ),
+    (
+        r#"[limit(1; ([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty), error("x"))]"#,
+        "",
+        "AA",
+        "x",
         5,
     ),
     (r#"[limit(2; 1, 2, error("x"))]"#, "[1,2]\n", "", "", 0),
