@@ -113,8 +113,8 @@ impl SliceBounds {
     /// near-identical ones, per this crate's own "duplicated predicates
     /// diverge silently" lesson.
     fn resolve_with_end_default(&self, len: usize, end_default: f64) -> Range<usize> {
-        let start = clamp(self.start.map_or(0.0, f64::floor), len);
-        let end = clamp(self.end.map_or(end_default, f64::ceil), len);
+        let start = clamp(self.start.unwrap_or(0.0), len, f64::floor);
+        let end = clamp(self.end.unwrap_or(end_default), len, f64::ceil);
         start..end.max(start)
     }
 
@@ -150,24 +150,39 @@ fn bound(slot: Option<&OwnedValue>) -> Result<Option<f64>, EvalError> {
     }
 }
 
-/// Fold a resolved bound against `len` and clamp it into `0..=len`.
+/// Fold a bound against `len`, round it (`round` is [`f64::floor`] for a
+/// start bound, [`f64::ceil`] for an end bound), and clamp the result into
+/// `0..=len`.
+///
+/// **Fold before rounding, on the sign of the raw bound** (#3396): jq's own
+/// `parse_slice` folds a negative bound against the length first and rounds
+/// second (`ceil(-0.5 + 4)` is `4`). Rounding first and testing the
+/// *rounded* value's sign — this function's own shape before #3396 — breaks
+/// for an end bound in `(-1, 0)`: `ceil(-0.5)` is `-0.0`, which is not
+/// negative, so the fold that should have turned it into `len` never runs
+/// and it clamps to `0` instead. A start bound was never affected by this,
+/// since `floor` commutes with an integer offset regardless of which order
+/// runs (`floor(x + len) == floor(x) + len`); `ceil` has the identical
+/// identity, but the old code never reached it because it decided whether
+/// to fold from the wrong (post-rounding) value in the first place.
 ///
 /// Written over `f64` so that a bound too large for a `usize` saturates at
 /// `len` instead of wrapping: `[1,2,3] | .[1:1e100]` is `[2,3]`, and a NaN
 /// bound — reachable only through a runtime descriptor — falls to `0`, since
 /// every comparison against it is false.
-fn clamp(bound: f64, len: usize) -> usize {
+fn clamp(bound: f64, len: usize, round: fn(f64) -> f64) -> usize {
     let folded = if bound < 0.0 {
         bound + len as f64
     } else {
         bound
     };
-    if folded < 0.0 || folded.is_nan() {
+    let rounded = round(folded);
+    if rounded < 0.0 || rounded.is_nan() {
         0
-    } else if folded >= len as f64 {
+    } else if rounded >= len as f64 {
         len
     } else {
-        folded as usize
+        rounded as usize
     }
 }
 
@@ -289,6 +304,68 @@ mod tests {
             end: Some(-1.5),
         };
         assert_eq!(b.resolve(5), 1..4);
+    }
+
+    /// #3396: an end bound strictly between -1 and 0 must fold against the
+    /// length before rounding, exactly like any other negative end bound --
+    /// `ceil(-0.5 + 4)` is `4`, matching jq 1.7.1's `.[0:(-0.5)]` on a
+    /// 4-element array (`[1,2,3,4]`, the whole thing, not `[]`). Before this
+    /// fix, `ceil(-0.5)` (`-0.0`) was tested for sign *after* rounding, which
+    /// is never negative, so the fold never ran and the bound clamped to `0`.
+    #[test]
+    fn end_bound_strictly_between_negative_one_and_zero_folds_before_rounding_3396() {
+        for end in [-0.5, -0.999, -0.001, -f64::EPSILON] {
+            let b = SliceBounds {
+                start: Some(0.0),
+                end: Some(end),
+            };
+            assert_eq!(b.resolve(4), 0..4, "end={end}");
+        }
+    }
+
+    /// #3396 control: a start bound in the same open interval was never
+    /// affected (`floor` commutes with an integer offset regardless of
+    /// evaluation order), and an end bound at or past the `-1` boundary
+    /// already folded correctly before this fix -- both must stay unchanged.
+    #[test]
+    fn end_bound_boundary_and_start_bound_unaffected_by_3396() {
+        // -1 exactly: ceil(-1) = -1, already negative, already folded
+        // correctly pre-#3396.
+        assert_eq!(
+            SliceBounds {
+                start: Some(0.0),
+                end: Some(-1.0)
+            }
+            .resolve(4),
+            0..3
+        );
+        // A start bound in (-1, 0): floor(-0.5) = -1, already negative.
+        assert_eq!(
+            SliceBounds {
+                start: Some(-0.5),
+                end: None
+            }
+            .resolve(4),
+            3..4
+        );
+    }
+
+    /// #3396: the same fold-before-round fix applies to
+    /// [`SliceBounds::resolve_object_children`]'s own end-default path
+    /// (yq-mode object-child slicing), not just [`SliceBounds::resolve`] --
+    /// both share [`SliceBounds::resolve_with_end_default`]'s body. A given
+    /// end bound in (-1, 0) folds against the full child count `2N`
+    /// (matching how any other given end bound resolves here), landing
+    /// exactly at `2N` -- not `N`, the *omitted*-end default this same
+    /// function uses for a different reason (see its own doc comment).
+    #[test]
+    fn resolve_object_children_end_bound_in_open_interval_folds_against_child_count_3396() {
+        let b = SliceBounds {
+            start: Some(0.0),
+            end: Some(-0.5),
+        };
+        // 3 entries -> 6 children; a given -0.5 end folds to 6, not 3.
+        assert_eq!(b.resolve_object_children(3), 0..6);
     }
 
     #[test]

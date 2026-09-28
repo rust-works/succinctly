@@ -15800,6 +15800,98 @@ fn test_getpath_reports_invalid_string_slice_descriptor_error() -> Result<()> {
     Ok(())
 }
 
+/// #3396: a slice-descriptor end bound strictly between -1 and 0 must fold
+/// against the container length before rounding, the same as any other
+/// negative end bound -- `getpath`/`setpath`/`delpaths` all resolve a
+/// `{"start":s,"end":e}` path component through the shared, pure-`f64`
+/// [`crate::jq::slice::SliceBounds`] machinery, which this issue fixed.
+/// Every row verified live against jq 1.7.1.
+#[test]
+fn test_slice_descriptor_end_bound_in_open_interval_folds_to_length_3396() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"getpath([{"start":0,"end":-0.5}])"#],
+        Some("[1,2,3,4]"),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        ("[1,2,3,4]", 0),
+        "stderr: {stderr:?}"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"setpath([{"start":0,"end":-0.5}]; ["z"])"#],
+        Some("[1,2,3,4]"),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        (r#"["z"]"#, 0),
+        "stderr: {stderr:?}"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"delpaths([[{"start":0,"end":-0.5}]])"#],
+        Some("[1,2,3,4]"),
+    )?;
+    assert_eq!((stdout.trim_end(), code), ("[]", 0), "stderr: {stderr:?}");
+
+    // A string target goes through the sibling `(String, Object)` arm.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"getpath([{"start":0,"end":-0.5}])"#],
+        Some("\"abcd\""),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        (r#""abcd""#, 0),
+        "stderr: {stderr:?}"
+    );
+
+    // Control: an end bound at or past -1 already folded correctly and must
+    // stay unchanged.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"getpath([{"start":0,"end":-1.5}])"#],
+        Some("[1,2,3,4]"),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        ("[1,2,3]", 0),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #3396 residual: the same bug in a *computed* slice bound (`.[a:b]`,
+/// `E[S:T]`) and in a slice descriptor used as a direct *index* rather than
+/// through `getpath` (`.[{"start":s,"end":e}]`, #3300) is **not** fixed by
+/// this issue -- both routes go through `owned_bound_to_i64`, which rounds
+/// the bound to `i64` before any container length is known, destroying the
+/// sign a correct fold needs. A naive "treat it as an open end" fix (as this
+/// issue originally proposed) would regress yq's own object-child-count
+/// slicing (`SliceBounds::resolve_object_children`'s *omitted*-end default
+/// is the entry count `N`, but a *given* end bound -- which this would
+/// become -- must fold against the full child count `2N`). Fixing this
+/// properly needs a representation distinguishing "omitted" from "given,
+/// negative, rounds to the length" through `ComputedSliceBound` across both
+/// evaluators; tracked as a follow-up, not attempted here. Pinned as the
+/// current, still-diverging output rather than a jq match.
+#[test]
+fn test_slice_computed_bound_and_direct_index_residual_3396() -> Result<()> {
+    for filter in ["-0.5", "-0.999"] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", &format!(".[0:({filter})]")], Some("[1,2,3,4]"))?;
+        // jq 1.7.1 answers "[1,2,3,4]" here; this is the current,
+        // still-diverging succinctly answer.
+        assert_eq!((stdout.trim_end(), code), ("[]", 0), "stderr: {stderr:?}");
+    }
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#".[{"start":0,"end":-0.5}]"#], Some("[1,2,3,4]"))?;
+    // jq 1.7.1 answers "[1,2,3,4]" here too; same still-diverging answer.
+    assert_eq!((stdout.trim_end(), code), ("[]", 0), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
 #[test]
 fn test_test_builtin_propagates_halt_in_pattern_argument() -> Result<()> {
     // `builtin_test_regex`'s pattern-argument arm (the `test(re)` builtin,
