@@ -31608,38 +31608,141 @@ fn test_path_cursor_native_deep_static_chain_reports_cleanly_not_stack_overflow_
 /// unbounded-recursion shape, guarded there by the file-appropriate
 /// `MAX_VALUE_TREE_DEPTH` (384) instead of `MAX_NESTING_DEPTH`.
 ///
-/// Unlike the sibling test above, this route is *not* wrapped by the CLI's
-/// `catch_unwind`: `nesting_depth_panic_message`'s own doc comment records
-/// that a `MAX_VALUE_TREE_DEPTH` panic is a deliberately different failure
-/// class from `MAX_NESTING_DEPTH`'s own, so this CLI's `catch_unwind` sites
-/// leave it uncaught here on purpose, matching this route specifically. So
-/// this test asserts only that the failure is an ordinary, bounded Rust
-/// panic -- a clean depth-limit message, deterministic, no corrupted
-/// process state -- rather than a stack overflow (unrecoverable, no
-/// message, `SIGABRT`); it does not (and, per the above, should not) assert
-/// a specific caught-and-reformatted exit code the way the cursor-native
-/// sibling above does.
+/// Until #3275 this route was *not* wrapped by the CLI's `catch_unwind` and
+/// panicked uncaught (exit 101) rather than reporting the clean diagnostic
+/// `MAX_VALUE_TREE_DEPTH`'s other call sites already gave. #3275 converted
+/// `walk_path`'s guard from `assert_value_tree_depth` (panicking) to
+/// `check_value_tree_depth` (a checked, uncatchable `resource_limit`,
+/// #2132), since `walk_path`/`walk_pipe` already return a `Result` every
+/// external caller propagates -- the same pattern #3261 used for the
+/// reindex bridge below. This test now asserts the same clean exit-5
+/// contract that sibling gets, not just "no stack overflow".
 ///
-/// `reduce range(400) as $i (null; [.])` no longer illustrates the same
-/// point: that shape hits `MAX_VALUE_TREE_DEPTH` through a *different* call
+/// `reduce range(400) as $i (null; [.])` illustrates a *different* call
 /// site (`OwnedValue::to_json_for_reindex`'s per-iteration reindex bridge,
-/// not this one's `walk_path`/`step_into`), which #3261 fixed to pre-check
-/// depth and return a catchable `EvalError` instead of panicking --
-/// `test_reduce_growth_past_value_tree_depth_reports_cleanly_3261` now pins
-/// its exit-5 diagnostic. This route remains genuinely unfixed: `path()`'s
-/// non-cursor-native walk still panics on the exact same guard.
+/// not this one's `walk_path`/`step_into`), which #3261 fixed first --
+/// `test_reduce_growth_past_value_tree_depth_reports_cleanly_3261` pins
+/// its exit-5 diagnostic. Only `succinctly yq`'s own YAML-emission pipeline
+/// remains unfixed on this guard, tracked separately as #3278.
 #[test]
-fn test_path_non_cursor_native_deep_static_chain_panics_cleanly_not_stack_overflow_2058(
+fn test_path_non_cursor_native_deep_static_chain_reports_clean_error_not_panic_2058_3275(
 ) -> Result<()> {
     let filter = format!("path({}[0:1])", ".a".repeat(500));
     let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
-    assert_ne!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "stdout: {stdout:?}");
     assert!(
         stderr.contains("nesting depth exceeds limit of 384"),
         "stderr: {stderr:?}"
     );
     assert!(
-        !stderr.contains("stack overflow") && !stderr.contains("fatal runtime error"),
+        !stderr.contains("panicked at")
+            && !stderr.contains("RUST_BACKTRACE")
+            && !stderr.contains("stack overflow")
+            && !stderr.contains("fatal runtime error"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #3275: the depth error `path()`'s non-cursor-native walk now reports is
+/// [`EvalError::resource_limit`]-tagged and therefore uncatchable (#2132) --
+/// `try`/`catch`, a bare `?`, and a demand-driven consumer like `first(f)`
+/// (the `each_path_on_owned` streaming arm) must all still exit 5 with the
+/// diagnostic rather than silently answering something else.
+#[test]
+fn test_path_non_cursor_native_depth_error_is_uncatchable_3275() -> Result<()> {
+    let deep = format!("path({}[0:1])", ".a".repeat(500));
+    for filter in [
+        format!(r#"try {deep} catch "x""#),
+        format!("{deep}?"),
+        format!("[{deep}?]"),
+        format!("first({deep})"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout:?} stderr={stderr:?}");
+        assert_eq!(stdout, "", "`{filter}`: stdout={stdout:?}");
+        assert!(
+            stderr.contains("nesting depth exceeds limit of 384"),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3275 boundary: 383 static components plus a trailing slice is exactly
+/// at, not past, `MAX_VALUE_TREE_DEPTH` (384) and must still answer the
+/// same path jq does; one more component crosses it.
+#[test]
+fn test_path_non_cursor_native_depth_boundary_3275() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", &format!("path({}[0:1])", ".a".repeat(383))],
+        Some("{}"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    let mut expected: Vec<serde_json::Value> = (0..383).map(|_| "a".into()).collect();
+    expected.push(serde_json::json!({"start": 0, "end": 1}));
+    assert_eq!(
+        stdout.trim_end(),
+        serde_json::Value::Array(expected).to_string(),
+        "stderr: {stderr:?}"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", &format!("path({}[0:1])", ".a".repeat(384))],
+        Some("{}"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #3275 error ordering (#2680's rule): a position reached *before* the
+/// depth error still gets emitted, since it comes first in `path()`'s own
+/// generator order -- the same "never un-emit an output already produced"
+/// contract `walk_pipe`'s doc comment already documents for other errors.
+#[test]
+fn test_path_non_cursor_native_depth_error_preserves_earlier_output_3275() -> Result<()> {
+    let filter = format!("path(.a, ({}) [0:1])", ".a".repeat(500));
+    let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"["a"]"#, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #3275, yq mode: `path(f)` is gated behind `--jq-extensions` (#1512; real
+/// yq rejects `path(...)` outright as a bad expression, so this is
+/// succinctly extension surface, not a divergence). The same `eval.rs`
+/// walker is reached through `S = YqSemantics`, and used to panic here too.
+#[test]
+fn test_path_non_cursor_native_depth_error_yq_mode_3275() -> Result<()> {
+    let filter = format!("path({}[0:1])", ".a".repeat(500));
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.arg("yq")
+                .args(["--jq-extensions", "-o", "json", &filter]);
+            cmd
+        },
+        Some(b"{}\n"),
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_ne!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("RUST_BACKTRACE"),
         "stderr: {stderr:?}"
     );
     Ok(())

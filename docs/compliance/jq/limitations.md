@@ -4423,15 +4423,18 @@ Three differences remain, all in the direction of erroring rather than aborting:
   every other succinctly-only cap uses -- this constant has no jq counterpart, so a
   `try`/`catch`/`?` written against jq semantics cannot have meant "accept a truncated
   value here either"; a `try (reduce range(400) as $i (null; [.])) catch "x"` still exits 5
-  with the diagnostic, not `"x"`). Two call sites still panic uncaught rather than exiting
-  5: `path()`'s non-cursor-native walk (`eval.rs`'s `walk_path`/`step_into`, reached when a
-  trailing `Expr::Slice` routes around the cursor-native evaluator, #2061), and
-  `succinctly yq`'s own YAML-emission pipeline (`yq_runner.rs`'s `emit_yaml_value_at_depth`
-  and four sibling `assert_value_tree_depth` call sites, reached by a write (`=`/`|=`/`+=`)
-  whose right-hand side constructs a deep value directly rather than through the reindex
-  bridge). Both hit the identical guard and are deliberately left unfixed here, tracked
-  separately as #3275 (`path()`) and #3278 (yq emission) -- see
-  `test_path_non_cursor_native_deep_static_chain_panics_cleanly_not_stack_overflow_2058`.
+  with the diagnostic, not `"x"`). `path()`'s non-cursor-native walk (`eval.rs`'s
+  `walk_path`/`step_into`, reached when a trailing `Expr::Slice` routes around the
+  cursor-native evaluator, #2061) used to panic uncaught here too; #3275 converted its
+  guard to the same checked, uncatchable `resource_limit` (`path(.a × 500 [0:1])` now exits
+  5 with the diagnostic instead of panicking, including through `try`/`catch`, `?` and
+  `first(f)`) -- see
+  `test_path_non_cursor_native_deep_static_chain_reports_clean_error_not_panic_2058_3275`.
+  One call site still panics uncaught rather than exiting 5: `succinctly yq`'s own
+  YAML-emission pipeline (`yq_runner.rs`'s `emit_yaml_value_at_depth` and four sibling
+  `assert_value_tree_depth` call sites, reached by a write (`=`/`|=`/`+=`) whose right-hand
+  side constructs a deep value directly rather than through the reindex bridge), tracked
+  separately as #3278.
 - **A self-recursive comma generator streams for thousands of elements, not
   indefinitely.** `def naturals: 0, (naturals|.+1); [limit(100000; naturals)]` errors
   (`naturals/0 exceeded maximum recursion depth`) somewhere between 10,000 and 20,000
