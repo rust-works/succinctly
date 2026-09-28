@@ -73721,3 +73721,689 @@ fn test_parsed_nan_instances_across_inputs_and_args_3309() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3293: one row of a `?//`-retry table -- `(filter, stdout, stderr
+/// trace, error message, exit code)`, every value captured from jq 1.7.1.
+/// Each filter writes `A` to stderr once per `?//` attempt, so the trace
+/// pins how many alternatives ran; the error message (empty for none) must
+/// follow it.
+type RetryRow3293 = (&'static str, &'static str, &'static str, &'static str, i32);
+
+/// Runs every row with `-nc`, or with `-c` over `input` when one is given
+/// (a document input keeps the operand on the cursor route; a value built
+/// under `-n` is owned and takes `eval.rs`'s evaluator instead).
+fn assert_retry_rows_3293(input: Option<&str>, rows: &[RetryRow3293]) -> Result<()> {
+    for &(filter, stdout, trace, message, exit) in rows {
+        let args = if input.is_some() {
+            ["-c", filter]
+        } else {
+            ["-nc", filter]
+        };
+        let (out, err, code) = run_jq_full(&args, input)?;
+        assert_eq!(
+            (out.as_str(), code),
+            (stdout, exit),
+            "`{filter}`: stderr {err:?}"
+        );
+        let rest = err
+            .strip_prefix(trace)
+            .unwrap_or_else(|| panic!("`{filter}`: stderr {err:?} should start with {trace:?}"));
+        assert!(
+            !rest.starts_with('A'),
+            "`{filter}`: more `?//` attempts than {trace:?}: {err:?}"
+        );
+        if message.is_empty() {
+            assert!(rest.is_empty(), "`{filter}`: unexpected stderr {err:?}");
+        } else {
+            assert!(
+                rest.contains(message),
+                "`{filter}`: stderr {err:?} lacks {message:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3293: a `?//` retry inside unary minus supersedes the verdict the
+/// retried-past alternative left in `each_negate_generic`'s stash.
+///
+/// The rows cover, as the sink allows: the retry answering after the first
+/// alternative's error; the retry producing nothing, so the sink is never
+/// re-invoked; the retry raising inside the generator; a consumer's stop on
+/// the first alternative that must not hide the retry's own error; and
+/// controls -- every alternative failing (the last one's error surfaces), no
+/// `?//` at all, and a `halt_error` that must not retry.
+#[test]
+fn test_negate_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        None,
+        &[
+            (
+                r#"-([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)"#,
+                "-1\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"-([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)"#,
+                "",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"-([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"[first(-(([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else 1 end))]"#,
+                "",
+                "AA",
+                "array ([]) cannot be negated",
+                5,
+            ),
+            (
+                r#"[first(-([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end))]"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"-([1] as $x ?// $y | ("A"|stderr) | [1])"#,
+                "",
+                "AA",
+                "array ([1]) cannot be negated",
+                5,
+            ),
+            (
+                r#"-(1, [1])"#,
+                "-1\n",
+                "",
+                "array ([1]) cannot be negated",
+                5,
+            ),
+            (
+                r#"-(1 as $x ?// $y | ("A"|stderr) | ("h"|halt_error(3)))"#,
+                "",
+                "A",
+                "h",
+                3,
+            ),
+        ],
+    )
+}
+
+/// #3293: a `?//` retry inside an `if` condition supersedes the verdict the
+/// retried-past alternative left in `each_if_generic`'s stash.
+///
+/// The rows cover, as the sink allows: the retry answering after the first
+/// alternative's error; the retry producing nothing, so the sink is never
+/// re-invoked; the retry raising inside the generator; a consumer's stop on
+/// the first alternative that must not hide the retry's own error; and
+/// controls -- every alternative failing (the last one's error surfaces), no
+/// `?//` at all, and a `halt_error` that must not retry.
+#[test]
+fn test_if_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        None,
+        &[
+            (
+                r#"if (([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) | type == "array") then error("E") else 2 end"#,
+                "2\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"if (([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) | type == "array") then error("E") else 2 end"#,
+                "",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"if (([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | type == "array") then error("E") else 2 end"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"[first(if ([1] as $a ?// $b | ("A"|stderr) | $a) then 1 else error("E") end)]"#,
+                "",
+                "AA",
+                "E",
+                5,
+            ),
+            (
+                r#"[limit(1; if ([1] as $a ?// $b | ("A"|stderr) | $a) then 1 else error("E") end)]"#,
+                "",
+                "AA",
+                "E",
+                5,
+            ),
+            (
+                r#"[first(if ([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) then 1 else 2 end)]"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"if ([1] as $x ?// $y | ("A"|stderr) | true) then error("E") else 2 end"#,
+                "",
+                "AA",
+                "E",
+                5,
+            ),
+        ],
+    )
+}
+
+/// #3293: a `?//` retry inside a computed index supersedes the verdict the
+/// retried-past alternative left in `each_index_expr_generic`'s stash.
+///
+/// The rows cover, as the sink allows: the retry answering after the first
+/// alternative's error; the retry producing nothing, so the sink is never
+/// re-invoked; the retry raising inside the generator; a consumer's stop on
+/// the first alternative that must not hide the retry's own error; and
+/// controls -- every alternative failing (the last one's error surfaces), no
+/// `?//` at all, and a `halt_error` that must not retry.
+#[test]
+fn test_computed_index_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        Some(r#"{"a":5}"#),
+        &[
+            (
+                r#".[([["a"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
+                "5\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#".[([["a"]] as [$a] ?// $b | ("A"|stderr) | $a // empty)]"#,
+                "",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#".[([["a"]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"[first(.[(([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else "a" end)])]"#,
+                "",
+                "AA",
+                "Cannot index object with array",
+                5,
+            ),
+            (
+                r#".[(["a"] as $x ?// $y | ("A"|stderr) | ["a"])]"#,
+                "",
+                "AA",
+                "Cannot index object with array",
+                5,
+            ),
+        ],
+    )
+}
+
+/// #3293: a `?//` retry inside a computed object key or value supersedes the verdict the
+/// retried-past alternative left in `each_object_entries_generic`/`each_object_value_generic`'s stash.
+///
+/// The rows cover, as the sink allows: the retry answering after the first
+/// alternative's error; the retry producing nothing, so the sink is never
+/// re-invoked; the retry raising inside the generator; a consumer's stop on
+/// the first alternative that must not hide the retry's own error; and
+/// controls -- every alternative failing (the last one's error surfaces), no
+/// `?//` at all, and a `halt_error` that must not retry.
+#[test]
+fn test_object_construction_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        None,
+        &[
+            (
+                r#"{(([["x"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)): 1}"#,
+                "{\"x\":1}\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"{(([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)): 1}"#,
+                "",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"{(([["x"]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)): 1}"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"{a: 1} | {a: ([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("V") else . end), b: 2}"#,
+                "{\"a\":[1],\"b\":2}\n",
+                "A",
+                "",
+                0,
+            ),
+            (
+                r#"{k: ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)}"#,
+                "{\"k\":[1]}\n",
+                "A",
+                "",
+                0,
+            ),
+            (
+                r#"[first({(((([1] as $a ?// $b | ("A"|stderr) | $a)) | if . == null then 1 else "k" end)): 1})]"#,
+                "",
+                "AA",
+                "Cannot use number (1) as object key",
+                5,
+            ),
+            (
+                r#"{(["x"] as $x ?// $y | ("A"|stderr) | ["x"]): 1}"#,
+                "",
+                "AA",
+                "Cannot use array ([\"x\"]) as object key",
+                5,
+            ),
+        ],
+    )
+}
+
+/// #3293: a `?//` retry inside a `range` bound supersedes the verdict the
+/// retried-past alternative left in `each_range_generic`'s stash.
+///
+/// The rows cover, as the sink allows: the retry answering after the first
+/// alternative's error; the retry producing nothing, so the sink is never
+/// re-invoked; the retry raising inside the generator; a consumer's stop on
+/// the first alternative that must not hide the retry's own error; and
+/// controls -- every alternative failing (the last one's error surfaces), no
+/// `?//` at all, and a `halt_error` that must not retry.
+///
+/// A retry inside the *step* is not pinned here: jq emits `from` before it
+/// type-checks the step (`[range(0; 3; [1])]` raises after `0`), which
+/// succinctly does not, independently of #3293.
+#[test]
+fn test_range_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        None,
+        &[
+            (
+                r#"range(([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a))"#,
+                "0\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"range(([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty))"#,
+                "",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"range(([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end))"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"[first(range(([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then "x" else 1 end))]"#,
+                "",
+                "AA",
+                "Range bounds must be numeric",
+                5,
+            ),
+            (
+                r#"[first(range(1 as $a ?// $b | $a // "x"))]"#,
+                "",
+                "",
+                "Range bounds must be numeric",
+                5,
+            ),
+            (
+                r#"[first(range(([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)))]"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"[range(0; ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a))]"#,
+                "[0]\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"range(1 as $x ?// $y | ("A"|stderr) | [1])"#,
+                "",
+                "AA",
+                "Range bounds must be numeric",
+                5,
+            ),
+        ],
+    )
+}
+
+/// #3293: a `?//` retry inside an arithmetic operand supersedes the verdict the
+/// retried-past alternative left in `binary_fanout_each_generic_with`'s stash.
+///
+/// The rows cover, as the sink allows: the retry answering after the first
+/// alternative's error; the retry producing nothing, so the sink is never
+/// re-invoked; the retry raising inside the generator; a consumer's stop on
+/// the first alternative that must not hide the retry's own error; and
+/// controls -- every alternative failing (the last one's error surfaces), no
+/// `?//` at all, and a `halt_error` that must not retry.
+#[test]
+fn test_arithmetic_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        None,
+        &[
+            (
+                r#"([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) + 1"#,
+                "2\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"1 + ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)"#,
+                "2\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) + 1"#,
+                "",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"1 + ([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)"#,
+                "",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) + 1"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"1 + ([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"[first(1 + (([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else 1 end))]"#,
+                "",
+                "AA",
+                "number (1) and array ([]) cannot be added",
+                5,
+            ),
+            (
+                r#"[first((([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else 1 end) - 1)]"#,
+                "",
+                "AA",
+                "array ([]) and number (1) cannot be subtracted",
+                5,
+            ),
+            (
+                r#"(1 as $x ?// $y | ("A"|stderr) | [1]) + 1"#,
+                "",
+                "AA",
+                "array ([1]) and number (1) cannot be added",
+                5,
+            ),
+            (
+                r#"[1] - (1, 2)"#,
+                "",
+                "",
+                "array ([1]) and number (1) cannot be subtracted",
+                5,
+            ),
+        ],
+    )
+}
+
+/// #3293: a `?//` retry inside an `and`/`or` operand supersedes the verdict the
+/// retried-past alternative left in `eval::boolean_fanout_each_with`'s stash.
+///
+/// The rows cover, as the sink allows: the retry answering after the first
+/// alternative's error; the retry producing nothing, so the sink is never
+/// re-invoked; the retry raising inside the generator; a consumer's stop on
+/// the first alternative that must not hide the retry's own error; and
+/// controls -- every alternative failing (the last one's error surfaces), no
+/// `?//` at all, and a `halt_error` that must not retry.
+///
+/// The `and`/`or` loop is shared with `eval.rs`, so the owned evaluator
+/// takes the same fix.
+#[test]
+fn test_and_or_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        None,
+        &[
+            (
+                r#"([1] as $a ?// $b | ("A"|stderr) | $a) and error("E")"#,
+                "false\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"([1] as $a ?// $b | ("A"|stderr) | $a // empty) and error("E")"#,
+                "",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"(false, ([1] as $a ?// $b | ("A"|stderr) | $a)) and error("E")"#,
+                "false\nfalse\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"([1] as $a ?// $b | ("A"|stderr) | $a) or error("E")"#,
+                "true\n",
+                "A",
+                "",
+                0,
+            ),
+            (
+                r#"[first(([1] as $a ?// $b | ("A"|stderr) | $a) and 1)]"#,
+                "[true,false]\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"[first(([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) and true)]"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"(1 as $x ?// $y | ("A"|stderr) | true) and error("E")"#,
+                "",
+                "AA",
+                "E",
+                5,
+            ),
+        ],
+    )
+}
+
+/// #3293: a `?//` retry inside the first stage of a pipe supersedes the verdict the
+/// retried-past alternative left in the pipe driver's stash.
+///
+/// The rows cover, as the sink allows: the retry answering after the first
+/// alternative's error; the retry producing nothing, so the sink is never
+/// re-invoked; the retry raising inside the generator; a consumer's stop on
+/// the first alternative that must not hide the retry's own error; and
+/// controls -- every alternative failing (the last one's error surfaces), no
+/// `?//` at all, and a `halt_error` that must not retry.
+///
+/// Both pipe drivers (`eval.rs` and `eval_generic.rs`) end through
+/// `eval::pipe_terminal_after_retry`, which now uses `retry_superseded`.
+#[test]
+fn test_pipe_first_stage_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        None,
+        &[
+            (
+                r#"[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | . + 1]"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"(([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | -.)"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"[first((([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | .), 3)]"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+            (
+                r#"[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) | . + 1]"#,
+                "[]\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) | -.]"#,
+                "[-1]\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"[first((([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then error("P") else . end) | ., 9)]"#,
+                "",
+                "AA",
+                "P",
+                5,
+            ),
+        ],
+    )
+}
+
+/// #3293: a `?//` retry inside `skip`'s count argument supersedes the verdict the
+/// retried-past alternative left in `fanout_arg_each_generic`'s stash.
+///
+/// The rows cover, as the sink allows: the retry answering after the first
+/// alternative's error; the retry producing nothing, so the sink is never
+/// re-invoked; the retry raising inside the generator; a consumer's stop on
+/// the first alternative that must not hide the retry's own error; and
+/// controls -- every alternative failing (the last one's error surfaces), no
+/// `?//` at all, and a `halt_error` that must not retry.
+///
+/// `skip` is jq 1.8, so these rows were captured from jq 1.7.1 with jq's own
+/// `skip` definition prepended, as #2952's tests were.
+#[test]
+fn test_skip_count_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        None,
+        &[
+            (
+                r#"[skip(([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty | length); 10, error("B"))]"#,
+                "[]\n",
+                "AA",
+                "",
+                0,
+            ),
+            (
+                r#"[first(skip(([1] as $a ?// $b | ("A"|stderr) | if $a then 0 else -1 end); 10))]"#,
+                "",
+                "AA",
+                "skip doesn't support negative count",
+                5,
+            ),
+            (
+                r#"[first(skip(([1] as $a ?// $b | ("A"|stderr) | if $a then 0 else error("E2") end); 10))]"#,
+                "",
+                "AA",
+                "E2",
+                5,
+            ),
+        ],
+    )
+}
+
+/// #3293, yq mode: the sinks #3293 changed are shared with `succinctly yq`,
+/// where `?//` does not exist (yq v4.53.3's lexer rejects it), so the retry
+/// reset must leave yq output alone -- including #2460's empty-operand rows,
+/// which run through the rewritten arithmetic and `and`/`or` stashes. Every
+/// row captured from yq v4.53.3.
+#[test]
+fn test_retry_sink_reset_leaves_yq_mode_unchanged_3293() -> Result<()> {
+    let input = "a: 1\nb: true\nk: a\n";
+    for (filter, expected) in [
+        (".a + 1", "2"),
+        ("1 + .a", "2"),
+        (".a + .missing", "1"),
+        (".b and .a", "true"),
+        (".b or false", "true"),
+        ("(.missing | key) and true", "false"),
+        (r#"{"k": .a}"#, r#"{"k":1}"#),
+        (".[.k]", "1"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            expected,
+            "#3293 (yq): `{filter}`: stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
