@@ -2922,8 +2922,8 @@ impl OwnedValue {
     /// `Float` (#2902), never a `NumberLiteral`.
     ///
     /// Under jq's number model a NaN spelled in the document (`NaN`, `-nan`,
-    /// `sNaN`, ...) comes out as a [`nan_instance`](Self::nan_instance) keyed
-    /// by the address of its token (#3309), so reading one position twice
+    /// `sNaN`, ...) comes out as a parse instance keyed by the address of its
+    /// token (#3309), so reading one position twice
     /// yields two values `==` agrees are the same instance. A bridge NaN is
     /// a computed one and stays a bare `Float`.
     pub fn from_json_number<S: EvalSemantics>(n: &crate::json::light::JsonNumber<'_>) -> Self {
