@@ -31246,8 +31246,18 @@ fn test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149() ->
         None,
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    // Either refusal is the clean one this pins. In a debug build ADR-0025's
+    // native-stack floor binds before the frame guard (13,333 levels on an
+    // M4 Pro), and the floor is checked both at the `DefCall` (named, `d/3
+    // ...`) and at an argument read (unnamed); which of the two sees the
+    // crossing first depends only on where the budget lands inside one
+    // level's frames. Sweeping the registered budget on `main` itself flips
+    // between them (#3293: unnamed at 200 and 800 MB, named at 300-700), and
+    // Linux ARM64 landed on the unnamed side after an unrelated frame-layout
+    // change.
     assert!(
-        stderr.contains("d/3 exceeded maximum recursion depth"),
+        stderr.contains("d/3 exceeded maximum recursion depth")
+            || stderr.trim_end().ends_with("): exceeded maximum recursion depth"),
         "stderr: {stderr:?}"
     );
 
