@@ -74651,6 +74651,171 @@ fn test_skip_count_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(None, "", RETRY_ROWS_SKIP_COUNT_3293)
 }
 
+/// #3293 slice 3: a `?//` retry inside a slice bound supersedes the escape
+/// the retried-past alternative left in the slice collector's stash
+/// (`eval_slice_expr`, both evaluators) -- the retry answering, producing
+/// nothing, raising, or failing to destructure -- over `[10,20,30]`. The
+/// controls pin what moving the stash apart from the output prefix must
+/// keep: a prefix produced before a later bound's error, a generator in
+/// either bound, a slice error with no `?//`, and a `halt_error` that must
+/// not retry. Every value captured from jq 1.7.1.
+const RETRY_ROWS_SLICE_BOUND_3293: &[RetryRow3293] = &[
+    (
+        r#".[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a):]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#".[:([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[:([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty)]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[:([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#".[:([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):1]"#,
+        "[10]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):1]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):1]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a):1]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[.[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]]"#,
+        "[[10,20,30]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[.[([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[.[([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):]]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[.[([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a):]]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[.[(0,"x"):]]"#,
+        "",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#".[(0,1):(2,"x")]"#,
+        "[10,20]\n",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (r#".[:(1,error("t"))]"#, "[10]\n", "", "t", 5),
+    (
+        r#".["x":]"#,
+        "",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (r".[1:(2,3)]", "[20]\n[20,30]\n", "", "", 0),
+    (
+        r#".[(1 as $x ?// $y | ("A"|stderr) | ("h"|halt_error(3))):]"#,
+        "",
+        "A",
+        "h",
+        3,
+    ),
+    (
+        r#".[(0, ([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)):]"#,
+        "[10,20,30]\n[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+#[test]
+fn test_slice_bound_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_SLICE_BOUND_3293)
+}
+
 /// #3293 slice 2: every table above again, with the operand's input built
 /// under `-n` so it is an owned value and the query runs on `eval.rs`'s
 /// evaluator -- the twins of the cursor-route sinks those tables pin. A
@@ -74669,6 +74834,7 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("{} | ", RETRY_ROWS_PIPE_FIRST_STAGE_3293),
         ("{} | ", RETRY_ROWS_LIMIT_COUNT_STOP_3293),
         ("{} | ", RETRY_ROWS_SKIP_COUNT_3293),
+        ("[10,20,30] | ", RETRY_ROWS_SLICE_BOUND_3293),
     ] {
         assert_retry_rows_3293(None, prefix, rows)?;
     }
