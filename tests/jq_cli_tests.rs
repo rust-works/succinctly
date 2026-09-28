@@ -73902,6 +73902,31 @@ fn test_container_identity_must_not_change_3069() -> Result<()> {
     Ok(())
 }
 
+/// The #3069 shortcut through document input, which the generic evaluator
+/// reads as a cursor rather than an `OwnedValue` (the tables above all run
+/// under `-n`). Stdin is `[1]`; every value captured from `/usr/bin/jq`
+/// 1.7.1. The last two rows build new containers and must stay `false`.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_container_identity_through_document_input_3069() -> Result<()> {
+    for (filter, expected) in [
+        (".[0] = nan | . == .", "true"),
+        ("map(nan) | . as $a | $a == $a", "true"),
+        ("[.[] | nan] | . as $a | {x:$a,y:$a} | .x == .y", "true"),
+        ("{a: map(nan)} | .a == .a", "true"),
+        ("map(nan) | [] + . == .", "false"),
+        ("map(nan) | sort == .", "false"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "[1]", &["-c"])?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3293: one row of a `?//`-retry table -- `(filter, stdout, stderr
 /// trace, error message, exit code)`, every value captured from jq 1.7.1.
 /// Each filter writes `A` to stderr once per `?//` attempt, so the trace
