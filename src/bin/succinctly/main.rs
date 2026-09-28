@@ -1293,6 +1293,89 @@ fn parse_size(s: &str) -> Result<usize, String> {
 /// detects the alias from argv[0] and dispatches directly to the
 /// appropriate subcommand, bypassing the top-level Cli parser.
 ///
+/// Whether `token` is one of jq's own "not actually an option" spellings
+/// for a `-`-leading FILTER argument (#3389). jq 1.7.1's own CLI parser
+/// decides this from the character right after the leading `-`: a letter
+/// or another `-` still reads as an option (`-n`, `-c`, `--slurp`, and a
+/// genuine unknown flag like `-x`, which must keep erroring rather than
+/// silently becoming the filter), anything else (a digit, `.`, `(`, `$`,
+/// `[`, `{`, `"`, or a lone `-`) is the start of a filter expression jq
+/// goes on to parse (`-1`, `-.[0]`, `-(1)`, `-$__loc__.line`). Confirmed
+/// live against jq 1.7.1 that this rule, not `allow_hyphen_values`-style
+/// blanket acceptance, is the actual boundary.
+///
+/// `succinctly yq`'s own FILTER needs no such rule: real yq's cobra parser
+/// always treats a `-`-leading argument's remaining bytes as shorthand
+/// flags and errors on anything it can't resolve that way (`yq '-1'` fails
+/// with "unknown shorthand flag: '1' in -1", confirmed live against yq
+/// v4.53.3) -- `succinctly yq` already matches that (rejecting without
+/// `--`), so this helper and its callers below are jq-only.
+fn looks_like_negative_filter(token: &str) -> bool {
+    let mut chars = token.chars();
+    if chars.next() != Some('-') {
+        return false;
+    }
+    !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '-')
+}
+
+/// If `err` is clap's refusal of an unrecognized `-`-leading argument that
+/// [`looks_like_negative_filter`], returns that token's index in `args` --
+/// the position `--` needs inserting before so a retried parse accepts it
+/// as the positional FILTER instead of an unknown flag.
+///
+/// Matches by *prefix*, not equality: when clap fails to bundle-parse a
+/// short-flag argument (`Parser::parse_short_arg`'s `NoMatchingArg` arm), it
+/// reports only `-` plus the first character it couldn't resolve as a short
+/// flag, not the argument's full text -- `-.[0]` surfaces as `InvalidArg`
+/// `"-."`, `-(1)` as `"-("`, `-$__loc__.line` as `"-$"`. That truncated form
+/// is always exactly two bytes (the leading `-` and one more character), so
+/// [`looks_like_negative_filter`] on it already answers the same question a
+/// check on the full token would (both read the same second character);
+/// only the position lookup below needs the prefix match to find the token
+/// clap actually meant.
+fn negative_filter_retry_index(args: &[String], err: &clap::error::Error) -> Option<usize> {
+    if err.kind() != clap::error::ErrorKind::UnknownArgument {
+        return None;
+    }
+    let clap::error::ContextValue::String(bad) = err.get(clap::error::ContextKind::InvalidArg)?
+    else {
+        return None;
+    };
+    if !looks_like_negative_filter(bad) {
+        return None;
+    }
+    args.iter().position(|a| a.starts_with(bad.as_str()))
+}
+
+/// Parses `args` as `P` (a jq-only [`clap::Parser`], see
+/// [`looks_like_negative_filter`]'s own doc comment for why `yq` needs no
+/// equivalent), retrying once with `--` spliced in immediately before a
+/// token [`negative_filter_retry_index`] identifies (#3389). Clap has no
+/// per-positional way to express jq's letter-vs-non-letter split --
+/// `allow_hyphen_values` is all-or-nothing on the FILTER positional, and
+/// would also swallow a genuine unknown-flag typo as the filter instead of
+/// erroring on it -- so this recovers from clap's own rejection after the
+/// fact instead of trying to configure it away.
+fn parse_allowing_negative_filter<P, I, T>(args: I) -> P
+where
+    P: Parser,
+    I: IntoIterator<Item = T>,
+    T: Into<String>,
+{
+    let args: Vec<String> = args.into_iter().map(Into::into).collect();
+    match P::try_parse_from(args.iter().cloned()) {
+        Ok(cmd) => cmd,
+        Err(e) => match negative_filter_retry_index(&args, &e) {
+            Some(idx) => {
+                let mut fixed = args;
+                fixed.insert(idx, "--".to_string());
+                P::parse_from(fixed)
+            }
+            None => e.exit(),
+        },
+    }
+}
+
 /// Returns `Some(exit_code)` if a multi-call alias was detected,
 /// or `None` to fall through to normal `Cli::parse()`.
 fn try_multicall() -> Result<Option<i32>> {
@@ -1310,7 +1393,7 @@ fn try_multicall() -> Result<Option<i32>> {
 
     match name {
         "sjq" | "jq" => {
-            let cmd = JqCommand::parse_from(
+            let cmd: JqCommand = parse_allowing_negative_filter(
                 std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
             );
             Ok(Some(jq_runner::run_jq(cmd)?))
@@ -1423,13 +1506,43 @@ fn exit_after_run(exit_code: i32) -> ! {
     std::process::exit(exit_code)
 }
 
+/// [`Cli::parse`], plus the same `succinctly jq` retry
+/// [`parse_allowing_negative_filter`] gives the `sjq`/`jq` multicall path
+/// (#3389). Gated on `argv[1] == "jq"` (the `succinctly jq ...` spelling's
+/// subcommand token) rather than applying the retry to every subcommand:
+/// the retry only ever fires on a narrowly-shaped clap error already, but
+/// scoping it here too keeps `succinctly json`/`dsv`/`yaml`/`dev`/... error
+/// behavior provably untouched rather than merely unlikely to change.
+/// `succinctly yq` needs no equivalent gate on `"yq"` -- see
+/// `looks_like_negative_filter`'s own doc comment for why.
+fn parse_cli_allowing_negative_filter() -> Cli {
+    let args: Vec<String> = std::env::args().collect();
+    match Cli::try_parse_from(args.iter().cloned()) {
+        Ok(cli) => cli,
+        Err(e) => {
+            let scoped = args.get(1).map(String::as_str) == Some("jq");
+            match scoped
+                .then(|| negative_filter_retry_index(&args, &e))
+                .flatten()
+            {
+                Some(idx) => {
+                    let mut fixed = args;
+                    fixed.insert(idx, "--".to_string());
+                    Cli::parse_from(fixed)
+                }
+                None => e.exit(),
+            }
+        }
+    }
+}
+
 fn run_main() -> Result<()> {
     // Multi-call binary: check if invoked via a known alias name (e.g., sjq, syq)
     if let Some(exit_code) = try_multicall()? {
         exit_after_run(exit_code);
     }
 
-    let cli = Cli::parse();
+    let cli = parse_cli_allowing_negative_filter();
 
     match cli.command {
         Command::Jq(args) => {

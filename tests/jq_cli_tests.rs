@@ -2292,6 +2292,142 @@ fn test_library_path_hyphen_prefixed_directory_1203() -> Result<()> {
     Ok(())
 }
 
+/// #3389: jq 1.7.1 accepts a *positional program* starting with `-` when the
+/// character right after the dash is not a letter (or another `-`) --
+/// `jq '-1'`, `jq '-.[0]'`, `jq '-(1)'` all run without needing `--`, since
+/// jq only treats a `-`-leading argument as an option when the rest of it
+/// could plausibly *be* one. succinctly's clap-based CLI previously rejected
+/// every one of these as an unknown argument (clap has no per-positional way
+/// to express jq's letter-vs-non-letter split; `allow_hyphen_values` is
+/// all-or-nothing and would also swallow a genuine unknown-flag typo like
+/// `-x` as the filter instead of erroring on it, which must keep erroring).
+/// Every row here is captured live against `/usr/bin/jq` 1.7.1, input `[1]`.
+#[test]
+fn test_negative_filter_program_accepted_without_dashdash_3389() -> Result<()> {
+    for filter in ["-1", "-.[0]", "-(1)", "-$__loc__.line"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1]"))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            ("-1", 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+
+    // `-n` (a real flag) ahead of the filter must not change the outcome.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-n", "-1"], None)?;
+    assert_eq!((stdout.trim_end(), code), ("-1", 0), "stderr: {stderr:?}");
+
+    // `--` must keep working exactly as before -- the retry is an addition,
+    // not a replacement for the existing escape hatch.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--", "-1"], Some("[1]"))?;
+    assert_eq!((stdout.trim_end(), code), ("-1", 0), "stderr: {stderr:?}");
+
+    // A genuine unknown flag must keep erroring, never silently become the
+    // filter -- this is the reason `allow_hyphen_values` alone isn't the
+    // fix (it can't tell `-x` apart from `-1`, both being "hyphen values").
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-x"], Some("[1]"))?;
+    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("unexpected argument") || stderr.contains("unrecognized"),
+        "stderr: {stderr:?}"
+    );
+
+    // `-e` is a real flag (`--exit-status`) with no filter following it --
+    // the program defaults to `.`, exactly as without this fix.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-e"], Some("1"))?;
+    assert_eq!((stdout.trim_end(), code), ("1", 0), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #3389 boundary sweep: the letter-vs-non-letter rule is per-character, not
+/// per-string, so this exercises the full boundary set the issue names
+/// (digit, `.`, `(`, `[`, `{`, `"`, a lone `-`) plus letters/`-` that must
+/// keep failing. Every row's stdout/stderr/exit code is captured live
+/// against `/usr/bin/jq` 1.7.1 (input `null`) -- unary negation on a
+/// non-numeric value is always a runtime error in jq, so several "accepted"
+/// rows still exit non-zero, just with jq's own diagnostic rather than the
+/// CLI's "unexpected argument" refusal.
+#[test]
+fn test_negative_filter_boundary_characters_3389() -> Result<()> {
+    // (filter, expected stdout, expected exit code, a substring expected
+    // only in stderr when exit != 0).
+    let accepted = [
+        ("-1", "-1", 0, ""),
+        ("-1.5", "-1.5", 0, ""),
+        ("-.", "", 5, "null (null) cannot be negated"),
+        ("-[]", "", 5, "array ([]) cannot be negated"),
+        ("-{}", "", 5, "object ({}) cannot be negated"),
+        ("-\"a\"", "", 5, "string (\"a\") cannot be negated"),
+    ];
+    for (filter, expected_stdout, expected_code, expected_stderr_substr) in accepted {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected_stdout, expected_code),
+            "`{filter}`: stderr={stderr:?}"
+        );
+        if !expected_stderr_substr.is_empty() {
+            assert!(
+                stderr.contains(expected_stderr_substr),
+                "`{filter}`: stderr={stderr:?}"
+            );
+        }
+        // Whatever the runtime outcome, none of these were the CLI's own
+        // "unexpected argument" refusal -- that's the behavior under test.
+        assert!(
+            !stderr.contains("unexpected argument") && !stderr.contains("Usage: succinctly jq"),
+            "`{filter}`: should be accepted as FILTER, not refused by the CLI; stderr={stderr:?}"
+        );
+    }
+
+    // A lone "-" is accepted as the FILTER text (not refused as an unknown
+    // argument) but then fails to *parse* as a filter at all -- both jq and
+    // succinctly error here, with different wording (a pre-existing,
+    // unrelated compile-error-message divergence for empty filter text, not
+    // a CLI-argument-acceptance one).
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-"], Some("null"))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert_ne!(code, 0);
+    assert!(
+        !stderr.contains("unexpected argument") && !stderr.contains("Usage: succinctly jq"),
+        "stderr: {stderr:?}"
+    );
+
+    // Still rejected: second character is a letter or another `-`, so
+    // clap's own short-flag-bundle parsing (or long-flag matching) is
+    // exactly right here and must be left alone.
+    for filter in ["-x", "-n1", "--bogus"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_ne!(code, 0, "`{filter}`: stdout={stdout:?}");
+        assert!(
+            stderr.contains("unexpected argument"),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3389 residual, tracked separately as #3397 (a pre-existing parser-
+/// precedence bug, not a CLI-parsing one): jq's unary minus binds looser
+/// than an `as`-binding's whole pipe (`-EXPR as $x | BODY` parses as
+/// `-(EXPR as $x | BODY)`, negating every output `BODY` produces), where
+/// succinctly binds it to the leading `EXPR` only. This filter was one of
+/// the boundary cases in #3389's own repro table; the CLI now accepts it
+/// (this issue's whole point), but its *result* still diverges from jq for
+/// the unrelated reason #3397 tracks. Pinned here as the current, known-
+/// divergent output rather than a jq match, so a future #3397 fix updates
+/// this test rather than silently drifting past it.
+#[test]
+fn test_negative_filter_unary_minus_as_binding_residual_3397() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-0.5 as $i | ($i, 100)"], Some("null"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    // jq 1.7.1 answers "-0.5\n-100" (negates the whole bind-and-pipe); this
+    // is the current, still-diverging succinctly answer (#3397).
+    assert_eq!(stdout, "-0.5\n100\n");
+    Ok(())
+}
+
 /// A string containing a backslash escape sequence, alongside a
 /// leading-zero number that triggers normalization -- confirms the escape
 /// handling inside `normalize_leading_zero_numbers`'s string-tracking
