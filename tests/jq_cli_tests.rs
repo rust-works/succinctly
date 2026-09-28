@@ -74959,6 +74959,51 @@ fn test_wrapper_stop_resets_across_retry_3293() -> Result<()> {
     assert_retry_rows_3293(None, "", RETRY_ROWS_WRAPPER_STOP_3293)
 }
 
+/// #3293 review: `isempty`/`any`/`all` record the wrapping sink's stop and
+/// reset it per invocation, like `first`/`limit`/`nth`. The stop-then-
+/// continue shape reaches them through `input`: the consumer stops on the
+/// first alternative, a `?//` retry re-invokes it, and the retry's push is
+/// answered `Continue`. A stale flag panicked inside a slice bound (exit
+/// 101) and cut a following comma short elsewhere. Captured from jq 1.7.1
+/// with `-n` and stdin `"a" 1 2`.
+#[test]
+fn test_counted_bool_consumers_reset_their_stop_across_retry_3293() -> Result<()> {
+    for (filter, expected) in [
+        (
+            r"[10,20,30] | [.[(isempty([[1]] as [$a] ?// [[$a]] | $a) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[10,20,30] | [.[(any([[1]] as [$a] ?// [[$a]] | $a; true) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[10,20,30] | [.[(all([[1]] as [$a] ?// [[$a]] | $a; false) | input):]]",
+            "[[20,30]]",
+        ),
+        (
+            r"[10,20,30] | [.[:(isempty([[1]] as [$a] ?// [[$a]] | $a) | input)]]",
+            "[[10]]",
+        ),
+        (
+            r#"[(isempty([[1]] as [$a] ?// [[$a]] | $a) | (input | if . == "a" then error("x") else . end)), 9]"#,
+            "[1,9]",
+        ),
+        (
+            r"[(any([[1]] as [$a] ?// [[$a]] | $a; true) | input), 9]",
+            r#"["a",1,9]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], Some(r#""a" 1 2"#))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}`: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3293 slice 2: every table above again, with the operand's input built
 /// under `-n` so it is an owned value and the query runs on `eval.rs`'s
 /// evaluator -- the twins of the cursor-route sinks those tables pin. A
