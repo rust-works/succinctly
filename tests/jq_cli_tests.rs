@@ -66639,6 +66639,14 @@ fn test_try_wrapped_if_bind_source_keeps_register_3279() -> Result<()> {
         ("{\"a\":1,\"b\":2}", "[path((try (if empty then . else . end)) as $v0 | $v0.b)]", "[]"),
         ("{\"a\":{\"x\":1,\"y\":2}}", ". as $x | .a | (if true then $x else $x end) as {x:$q} | $q", "null"),
         ("{\"a\":1,\"b\":2}", "path((try (if -1 then . else . end) catch 1) as $v0 | $v0.b)", "[\"b\"]"),
+        // A two-stage passthrough pipe on the register: the bare value
+        // rule (no single stage to take a position from), which jq agrees
+        // with here.
+        (
+            r#"{"a":1}"#,
+            "path((if true then . else . end | if 1 then . else . end) as $v | $v.a)",
+            r#"["a"]"#,
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
