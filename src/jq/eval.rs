@@ -74139,10 +74139,12 @@ mod tests {
     /// (`produces_fresh_value`) is diffed on the marker's own value, not
     /// only the input's.
     ///
-    /// The marker's values and the inputs are built separately, so `$y` and
-    /// `.` never share storage: the bridge re-materializes its input and
-    /// drops that identity (#3069's residual, pinned below), which would
-    /// make the two routes disagree on a container holding a NaN.
+    /// `$y` ranges over both the input's own handles (the common `. as $y`
+    /// case, sharing storage with `.`) and a separately built copy of each.
+    /// The one pairing exempt from agreement is jq mode with `$y` holding
+    /// the input's very storage and a NaN inside it: the owned route answers
+    /// jq's instance rule there and the bridge, which re-materializes its
+    /// input, does not (#3069's residual, pinned below).
     #[test]
     fn eval_owned_pure_agrees_with_the_reindex_bridge_on_tracked_vars_2042() {
         let shapes = [
@@ -74173,12 +74175,20 @@ mod tests {
             },
             Origin::Untracked,
         ];
-        let bounds = pure_value_matrix();
         let values = pure_value_matrix();
+        let copies = pure_value_matrix();
+        let bounds: Vec<&OwnedValue> = values.iter().chain(copies.iter()).collect();
+        fn holds_nan(value: &OwnedValue) -> bool {
+            match value {
+                OwnedValue::Array(items) => items.iter().any(holds_nan),
+                OwnedValue::Object(map) => map.values().any(holds_nan),
+                other => other.as_f64().is_some_and(f64::is_nan),
+            }
+        }
         for src in shapes {
             let parsed = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             for origin in &origins {
-                for bound in &bounds {
+                for &bound in &bounds {
                     let marker = LazyMarker::new(bound, origin.clone(), None);
                     let expr = substitute_var_impl(&parsed, "y", bound, Some(&marker));
                     assert!(
@@ -74200,10 +74210,12 @@ mod tests {
                             Vec<u64>,
                             JqSemantics,
                         >(&expr, value, false));
-                        assert_eq!(
-                            fast, bridge,
-                            "jq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
-                        );
+                        if !(jq_identical::<JqSemantics>(bound, value) && holds_nan(bound)) {
+                            assert_eq!(
+                                fast, bridge,
+                                "jq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
+                            );
+                        }
                         let fast = debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
                             &expr,
                             value,
@@ -74225,11 +74237,14 @@ mod tests {
     }
 
     /// #3069: `$y` bound to the very storage `.` holds is `==` to it in jq,
-    /// even with a NaN inside (`jv_equal` checks `jv_identical` first). The
-    /// owned route keeps that storage and answers jq's `true`; the reindex
-    /// bridge re-materializes its input and still answers `false`, the
-    /// residual `docs/compliance/jq/limitations.md` records. yq compares
-    /// structurally on both routes.
+    /// even with a NaN inside (`jv_equal` checks `jv_identical` first), and
+    /// the owned route answers that `true`. yq compares structurally.
+    ///
+    /// The bridge assertion is **not** a spec: it records the known residual
+    /// (`docs/compliance/jq/limitations.md`) that the reindex bridge
+    /// re-materializes its input and loses the identity. When the bridge
+    /// learns to carry it (#3069 Phase 2, with #3189/#3305), flip it to `true`
+    /// and drop the exemption in the #2042 matrix above.
     #[cfg(not(feature = "unshared-containers"))]
     #[test]
     fn eval_owned_pure_keeps_container_identity_the_bridge_drops_3069() {
@@ -74255,7 +74270,8 @@ mod tests {
             debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
                 &expr, &value, false
             )),
-            jq_false
+            jq_false,
+            "known #3069 residual: if the bridge now keeps identity, expect `true` here"
         );
         assert_eq!(
             debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
