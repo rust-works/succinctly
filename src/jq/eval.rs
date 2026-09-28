@@ -8899,9 +8899,10 @@ fn write_target_mut(head: &mut Expr) -> Option<&mut Box<Expr>> {
 
 /// A path `path(f)` produced, as the static navigation that reaches it
 /// (`["a", 0]` is `.a | .[0]`, `[]` is `.`), or `None` unless every
-/// component is a string or an integral number. A fractional index is not the integer it
-/// truncates to (`.[-0.5]` is not `.[0]` to jq's `del`), and a slice has no
-/// step the evaluator can index by (#3300), so neither is re-spelled.
+/// component is a string or a finite number. A fractional index is not the
+/// integer it truncates to (`.[-0.5]` is not `.[0]` to jq's `del`), so it is
+/// re-spelled with its exact key (#3302). A slice has no step the evaluator
+/// can index by (#3300), so it is not re-spelled.
 fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
     let OwnedValue::Array(components) = path else {
         return None; // omni-dev: coverage tolerate-line reason="unreachable: every value path_over_owned hands back is a path() output, which is always an array (#3188)"
@@ -8923,6 +8924,17 @@ fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
                 Some(Expr::Index {
                     idx: *f as i64,
                     key: None,
+                })
+            }
+            // A fractional index keeps its exact value as the key: `del`'s
+            // last step resolves `.[-0.5]` to nothing, not to its truncation
+            // `.[0]` (#3302), while every other step navigates by `idx`.
+            OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
+                if f.is_finite() =>
+            {
+                Some(Expr::Index {
+                    idx: f.trunc() as i64,
+                    key: Some(NumberKey::Float(*f)),
                 })
             }
             _ => None,
@@ -20007,6 +20019,30 @@ fn resolve_delete_index(key: &OwnedValue, len: usize) -> DeleteIndexResolution {
         Ok(i) => DeleteIndexResolution::PositiveOutOfRange(i),
         Err(_) => DeleteIndexResolution::Skip,
     }
+}
+
+/// jq's `jv_dels` index rule for the *last* component of a deleted path
+/// (#3302): the sign comes from the double, and the length offset is added to
+/// its truncation. That differs from [`resolve_delete_index`]'s
+/// truncate-then-sign rule only for `-1 < key < 0`, which names `len`
+/// (nothing): jq 1.7.1's `[10,20,30] | del(.[-0.5])` is unchanged, while
+/// `.[-0.5]` reads `10` and `del(.[-0.5][0])` deletes inside element 0. A
+/// middle step keeps [`resolve_delete_index`] (`jv_get`/`jv_set`'s rule).
+///
+/// `-0.0` is not negative, so it still deletes element 0, as in jq. yq mode
+/// keeps [`resolve_delete_index`] unchanged: real yq rejects every fractional
+/// index, which is a separate gap.
+fn resolve_dels_index(key: &OwnedValue, len: usize, yq_mode: bool) -> DeleteIndexResolution {
+    let negative_fraction = match key {
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
+            *f < 0.0 && *f > -1.0
+        }
+        _ => false,
+    };
+    if negative_fraction && !yq_mode {
+        return DeleteIndexResolution::PositiveOutOfRange(len);
+    }
+    resolve_delete_index(key, len)
 }
 
 /// Builtin: getpath(path) - get value at path
@@ -52786,8 +52822,9 @@ fn delete_keys(
                         // only when the negative-raise check above didn't
                         // already return, so `Skip` here only ever means
                         // NaN or (in jq mode) a negative-OOB index that
-                        // stays a no-op.
-                        match resolve_delete_index(key, arr.len()) {
+                        // stays a no-op. Every key here is a path's *last*
+                        // component, so jq's `jv_dels` rule applies (#3302).
+                        match resolve_dels_index(key, arr.len(), yq_mode) {
                             DeleteIndexResolution::InRange(idx) => indices.push(idx),
                             DeleteIndexResolution::PositiveOutOfRange(target_len)
                                 if yq_mode && keys.len() == 1 =>
@@ -52935,8 +52972,39 @@ fn delete_at_path_through_absent(
 /// ordering or identity beyond the `PartialEq` above.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ArrayStep {
-    Index(i64),
+    /// `idx` is the truncated index every navigation uses. `frac` is the
+    /// `f64::to_bits` of the exact key when it is non-integral and the trie
+    /// was built for jq mode (#3302); see [`array_index_step`].
+    Index {
+        idx: i64,
+        frac: Option<u64>,
+    },
     Slice(Option<i64>, Option<i64>),
+}
+
+/// The [`ArrayStep`] a static `Expr::Index { idx, key }` component becomes.
+///
+/// jq groups `delpaths` continuations by `jv_equal` on the exact key, so
+/// `.[0.5]` and `.[0]` are two groups that each re-read element 0, and a
+/// last-step `.[-0.5]` names nothing while `.[0]` names element 0 (#3302).
+/// jq mode therefore keeps a non-integral key's exact value on the edge. yq
+/// mode leaves `frac` unset, which keeps its grouping as it was: real yq
+/// rejects fractional indices outright, a separate gap.
+fn array_index_step(idx: i64, key: Option<&NumberKey>, yq_mode: bool) -> ArrayStep {
+    let frac = key
+        .map(NumberKey::value)
+        .filter(|f| !yq_mode && f.is_finite() && f.fract() != 0.0)
+        .map(f64::to_bits);
+    ArrayStep::Index { idx, frac }
+}
+
+/// The key an [`ArrayStep::Index`] names: its exact non-integral value when
+/// it kept one, otherwise the plain integer.
+fn array_index_step_key(idx: i64, frac: Option<u64>) -> OwnedValue {
+    match frac {
+        Some(bits) => OwnedValue::Float(f64::from_bits(bits)),
+        None => OwnedValue::Int(idx),
+    }
 }
 
 /// The root of every [`DeleteTrie`]: the document itself, before any step.
@@ -53109,16 +53177,20 @@ struct DeleteTrieBuilder {
     /// Reused across [`Self::push_component`] calls so flattening one chain
     /// component doesn't allocate per node.
     scratch: Vec<DeleteStep>,
+    /// Whether the trie is for yq mode, which keys array edges by the
+    /// truncated index alone (see [`array_index_step`]).
+    yq_mode: bool,
 }
 
 impl DeleteTrieBuilder {
-    fn new() -> Self {
+    fn new(yq_mode: bool) -> Self {
         Self {
             trie: DeleteTrie {
                 nodes: vec![DeleteTrieNode::new(DELETE_TRIE_ROOT, 0, true, false)],
             },
             memo: BTreeMap::new(),
             scratch: Vec::new(),
+            yq_mode,
         }
     }
 
@@ -53192,7 +53264,10 @@ impl DeleteTrieBuilder {
             // that made the gap possible; #1827's
             // `test_multi_target_del_reaches_array_step_dispatch_1827` is
             // the test that covers this site.
-            Expr::Index { idx, .. } => self.array_child(parent, ArrayStep::Index(*idx), optional),
+            Expr::Index { idx, key } => {
+                let step = array_index_step(*idx, key.as_ref(), self.yq_mode);
+                self.array_child(parent, step, optional)
+            }
             Expr::Slice { start, end, .. } => {
                 self.array_child(parent, ArrayStep::Slice(*start, *end), optional)
             }
@@ -53572,9 +53647,11 @@ fn delete_trie_object(
 }
 
 /// jq's `jv_sort` order for an array `del()` continuation's own step, used
-/// to reorder `delete_trie_array`'s `index_groups` when a slice
-/// continuation is present (#2929): `Index(a)` vs `Index(b)` compares `a`
-/// numerically; every `Index` sorts before every `Slice`; `Slice(s1, e1)`
+/// to reorder `delete_trie_array`'s `index_groups` when a slice or
+/// fractional-index continuation is present (#2929, #3302): `Index(a)` vs
+/// `Index(b)` compares the exact keys numerically, as `(truncation,
+/// fractional part)`, which orders `-0.5 < 0 < 0.5` even though all three
+/// truncate to `0`; every `Index` sorts before every `Slice`; `Slice(s1, e1)`
 /// vs `Slice(s2, e2)` compares `e1` with `e2` first, then `s1` with `s2`,
 /// with `None` sorting before `Some(n)` — exactly `Option<i64>`'s derived
 /// `Ord`, which the `(Option<i64>, Option<i64>)` tail of the returned tuple
@@ -53588,10 +53665,18 @@ fn delete_trie_object(
 /// `OwnedValue` and this is a hot sort key, not a one-off comparison. If
 /// jq's own slice-descriptor ordering ever changes, both sites need the
 /// same update.
-fn jq_delpaths_array_step_key(step: &ArrayStep) -> (u8, i64, Option<i64>, Option<i64>) {
+fn jq_delpaths_array_step_key(step: &ArrayStep) -> (u8, i64, i64, Option<i64>, Option<i64>) {
     match *step {
-        ArrayStep::Index(idx) => (0, idx, None, None),
-        ArrayStep::Slice(s, e) => (1, 0, e, s),
+        ArrayStep::Index { idx, frac } => {
+            // `f64::total_cmp`'s bit mapping, so the fraction sorts as an
+            // integer. A fractional key is finite, so `total_cmp` and `<`
+            // agree on it.
+            let fraction = frac.map_or(0.0, |bits| f64::from_bits(bits).fract());
+            let bits = fraction.to_bits() as i64;
+            let ordered = bits ^ ((((bits >> 63) as u64) >> 1) as i64);
+            (0, idx, ordered, None, None)
+        }
+        ArrayStep::Slice(s, e) => (1, 0, 0, e, s),
     }
 }
 
@@ -53695,7 +53780,10 @@ fn delete_trie_array(
         // confirmed live), not a no-op -- narrowing here keeps that
         // correct if the parser gap ever closes, rather than silently
         // no-oping a case real yq still rejects.
-        if yq_mode && matches!(step, ArrayStep::Index(_)) && is_yq_field_index_noop_scalar(&value) {
+        if yq_mode
+            && matches!(step, ArrayStep::Index { .. })
+            && is_yq_field_index_noop_scalar(&value)
+        {
             return Ok(value);
         }
         return Err(match step {
@@ -53705,7 +53793,7 @@ fn delete_trie_array(
             ArrayStep::Slice(..) => {
                 EvalError::cannot_index_with_type(owned_type_name(&value), "object")
             }
-            ArrayStep::Index(_) => {
+            ArrayStep::Index { .. } => {
                 EvalError::cannot_index_with_type(owned_type_name(&value), "number")
             }
         });
@@ -53717,18 +53805,21 @@ fn delete_trie_array(
         // `end` first, then `start`, `null` sorting before a number) — only
         // observable when a slice continuation is present, since deleting
         // inside one splices a shorter sub-array back and shifts every
-        // later position (#2929). `index_groups` order otherwise (first
-        // resolved path wins) stays put: it's jq's own error-priority order
-        // (#1301) and reordering it unconditionally would regress that.
-        // Gating on "has a slice group" also keeps a filtered-descent
-        // node's index-only `index_groups` (which can run to millions of
-        // entries, #1690) off the sort.
+        // later position (#2929) — or when a fractional-index continuation
+        // is, since `.[0.5]` and `.[0]` are separate groups that both
+        // rewrite element 0, and jq runs them in key order (#3302).
+        // `index_groups` order otherwise (first resolved path wins) stays
+        // put: it's jq's own error-priority order (#1301) and reordering it
+        // unconditionally would regress that. Gating on "has a slice or
+        // fractional group" also keeps a filtered-descent node's index-only
+        // `index_groups` (which can run to millions of entries, #1690) off
+        // the sort.
         let sorted_index_groups;
         let index_groups: &[usize] = if !yq_mode
             && node.index_groups.iter().any(|&slot| {
                 matches!(
                     node.indices.get_index(slot).map(|(step, _)| step),
-                    Some(ArrayStep::Slice(..))
+                    Some(ArrayStep::Slice(..) | ArrayStep::Index { frac: Some(_), .. })
                 )
             }) {
             let mut sorted = node.index_groups.clone();
@@ -53759,7 +53850,10 @@ fn delete_trie_array(
                 continue;
             }
             match step {
-                ArrayStep::Index(idx) => {
+                // A middle step: jq reads it with `jv_get`, which truncates
+                // before applying the sign, so a fractional key resolves
+                // through its truncation `idx` like a read does (#3302).
+                ArrayStep::Index { idx, .. } => {
                     let key = OwnedValue::Int(*idx);
                     // #2268: real yq raises here too -- confirmed live,
                     // `del(.a[-5].x, .c)` on `{"a":[1,2],"c":3}` raises the
@@ -53839,7 +53933,7 @@ fn delete_trie_array(
         .iter()
         .filter(|(_, &child)| trie.node(child).terminal)
         .map(|(step, _)| match step {
-            ArrayStep::Index(idx) => OwnedValue::Int(*idx),
+            ArrayStep::Index { idx, frac } => array_index_step_key(*idx, *frac),
             ArrayStep::Slice(s, e) => slice::literal_component(*s, *e),
         })
         .collect();
@@ -54351,7 +54445,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Owned(result);
             }
 
-            let mut builder = DeleteTrieBuilder::new();
+            let mut builder = DeleteTrieBuilder::new(S::TAG == EvalTag::Yq);
             let mut failed = None;
             for (index, branch) in branches.iter().enumerate() {
                 // #1116's chained-scalar-slice rule, generalized by #1219 to
@@ -54625,7 +54719,10 @@ fn delete_at_path(
                 name,
             )),
         },
-        Expr::Index { idx, .. } => {
+        Expr::Index {
+            idx,
+            key: number_key,
+        } => {
             // #2323: real yq vivifies a `null` root into `[]` ahead of an
             // `Index`/`Iterate` step (confirmed live: `null | del(.[2])` is
             // `[null,null]`, `?` included -- `null | del(.[2]?)` vivifies
@@ -54659,7 +54756,16 @@ fn delete_at_path(
                     // existing no-op below (`Skip` here only ever means NaN,
                     // since a real negative-OOB index already raised above,
                     // when it was going to).
-                    match resolve_delete_index(&key, arr.len()) {
+                    //
+                    // #3302: this arm is always a path's last step, so jq
+                    // mode resolves the exact key (`-0.5`, not its truncation
+                    // `0`) under `jv_dels`' rule.
+                    let exact = if yq_mode {
+                        key
+                    } else {
+                        index_component_value(*idx, number_key.as_ref())
+                    };
+                    match resolve_dels_index(&exact, arr.len(), yq_mode) {
                         DeleteIndexResolution::InRange(actual_idx) => {
                             arr.remove(actual_idx);
                         }
@@ -98861,7 +98967,7 @@ mod tests {
 
     /// Build a single-step [`DeleteTrie`] whose one edge is `component`.
     fn one_step_trie(component: Expr) -> DeleteTrie {
-        let mut builder = DeleteTrieBuilder::new();
+        let mut builder = DeleteTrieBuilder::new(false);
         builder
             .insert_expr(&component)
             .expect("supported component");
@@ -100217,13 +100323,13 @@ mod tests {
         // process crash an `unreachable!()` would give (#1098).
         let unsupported = Expr::Literal(Literal::Null);
 
-        let mut builder = DeleteTrieBuilder::new();
+        let mut builder = DeleteTrieBuilder::new(false);
         let err = builder
             .insert_expr(&unsupported)
             .expect_err("not a delete target");
         assert_eq!(err.message, "cannot use expression as delete target");
 
-        let mut builder = DeleteTrieBuilder::new();
+        let mut builder = DeleteTrieBuilder::new(false);
         let chain =
             PathPrefix::from_components([Expr::Field("a".to_string()), unsupported.clone()]);
         let err = builder
@@ -100249,7 +100355,7 @@ mod tests {
         // `paths.iter().any(|path| path.len() == start)` arm did.
         // Exercised directly, the same way the parser-unreachable
         // `builtin_*` functions above are.
-        let mut builder = DeleteTrieBuilder::new();
+        let mut builder = DeleteTrieBuilder::new(false);
         builder
             .insert_expr(&Expr::Identity)
             .expect("Identity flattens to no steps at all");
