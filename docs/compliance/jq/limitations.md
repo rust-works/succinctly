@@ -8162,6 +8162,31 @@ whole document that a streaming arm never read, and the M2 path was gated to kee
 from disagreeing. The gate is gone; the entry under "Real-time stdout/stderr interleaving"
 records the 19 rows that moved away from jq and the spelling rule it left in place.
 
+[#3266](https://github.com/rust-works/succinctly/issues/3266) closed a gap this rule had left
+open in the *library* entry point: `succinctly::jq::eval` (`eval.rs`'s own `path`/`getpath`
+implementations, `builtin_path`/`getpath_one_path`) called `to_owned` on the whole input up
+front before walking it, so `path(.a)` on `{"a":1,"b":tru}`'s element raised there even though
+it never reads `b`, where the generic evaluator — what the CLI actually uses for these four
+builtins — already answered `["a"]`. `eval()` now routes `path(f)`/`paths`/`leaf_paths`/
+`getpath(p)` onto the generic evaluator the same way it already routed `key`/`parent`/
+`file_index` (spine 2416), so the rule holds for `succinctly::jq::eval` too, not only the CLI.
+
+**A collection decodes its elements unless it is a single cursor source — recorded, not
+converged (#3266's own review, tracked separately as
+[#3427](https://github.com/rust-works/succinctly/issues/3427)).** `[.] | length` and
+`[limit(1; .)] | length` on an unreadable element answer `1` in the generic evaluator (and
+now in `eval()` too — see above), because a single-source array/generator collection stays a
+lazy `LazySeq` of cursors and so never decodes the element just to count it. `[., 1] | length`
+and `{a: .} | length` on the same element raise in *both* evaluators, because a multi-element
+or object-construction collection eagerly materializes each member into an `OwnedValue`,
+which decodes it. Per this section's own rule ("a value is validated when, and only when,
+something decodes it"), none of the three needs to decode `.` to answer a length — but two of
+the three do, purely because of which internal representation their own arity happened to
+get. This is out of policy against this amendment's uniformity rule, not a new divergence
+class of its own: no jq oracle exists for any of these rows either (the document is rejected
+at parse time), so it is recorded here on the same footing as the rest of this section rather
+than converged, since no single rule yet exists to converge onto — see #3427 for why.
+
 ### `break $x` shadowed by a `def error:` observes arbitrary ambient pipe state, not jq's own context-independent `{"__jq":N}` sentinel (#2687, #2840)
 
 [#2687](https://github.com/rust-works/succinctly/issues/2687): real jq does not treat `break`

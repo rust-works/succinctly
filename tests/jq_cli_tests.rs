@@ -24522,6 +24522,28 @@ fn test_array_iteration_raises_at_the_malformed_number_3222() -> Result<()> {
     Ok(())
 }
 
+/// #3266's own recorded, unconverged split (tracked separately as #3427):
+/// whether a collection of an unreadable value raises depends on the
+/// collection's own internal representation, not on anything the filter's
+/// semantics would predict. `[.] | length` stays a single-source `LazySeq`
+/// of cursors and never decodes the element to count it; `[., 1] | length`
+/// materializes each element into an `OwnedValue`, which decodes it. Neither
+/// *should* need to read `.` just to report a length -- but the CLI's own
+/// two collection shapes disagree with each other on the same value.
+#[test]
+fn test_collection_decode_split_on_unreadable_value_3266() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0] | [.] | length"], Some("[1.2.3]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    assert_eq!(stderr, "");
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0] | [., 1] | length"], Some("[1.2.3]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("invalid numeric literal"), "{stderr}");
+    Ok(())
+}
+
 /// Bare identity (`.`, no computation at all) also sanitizes now --
 /// confirms the M2 raw-copy fast path (`StandardJson::stream_json`) isn't
 /// actually reachable in default (jq-compat) mode:

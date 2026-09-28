@@ -47,7 +47,9 @@ use super::document::{
 use super::glob::yq_match_key;
 use super::math;
 use super::slice::{self, SliceBounds};
-use super::walk::{any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs};
+use super::walk::{
+    any_subexpr, contains_builtin, map_builtin_subexprs, map_pattern_subexprs, map_subexprs,
+};
 
 /// Which `EvalSemantics` implementor a value carries, as a runtime tag.
 ///
@@ -2968,6 +2970,37 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `expr` contains `path(f)`, `paths`, `leaf_paths`, or `getpath(p)`
+/// anywhere in the tree -- builtins the generic evaluator's `path_walk_generic`
+/// family (and its siblings) navigate without reading any node they don't
+/// visit, per the #2103/#2692 ADR-0018 amendment's own #2168 instance. This
+/// evaluator's own `builtin_path`/`getpath_one_path` instead call `to_owned`
+/// on the whole input up front, decoding an unvisited sibling too (#3266) --
+/// `eval()` routes a query built from these onto the generic evaluator
+/// instead, the same way [`needs_path_context`] already does for
+/// `key`/`parent`/`file_index`.
+///
+/// `paths(f)` (`Builtin::PathsFilter`) is deliberately excluded: it
+/// evaluates `f` on every value, which reads. `del`/`delpaths`/`to_entries`/
+/// `pick` are excluded for the same reason -- each builds its output from
+/// the values themselves, not just their positions.
+///
+/// Semantics-generic by construction: `expr` carries no `S`, and `eval`'s own
+/// call site threads whichever `S` it was given through to
+/// `eval_with_cursor_using::<S, _>` unchanged, exactly as its
+/// `needs_path_context` call already does. `JsonIndex` (the only cursor this
+/// applies to today) is JSON-only, so there is no YAML-sourced malformed
+/// scalar to repeat #3266's sibling test against under yq semantics -- an
+/// equivalent gap for `YamlIndex`, if one exists, is a separate question.
+pub(crate) fn navigates_without_reading(expr: &Expr) -> bool {
+    contains_builtin(expr, |b| {
+        matches!(
+            b,
+            Builtin::Path(_) | Builtin::Paths | Builtin::LeafPaths | Builtin::GetPath(_)
+        )
+    })
 }
 
 /// Whether any `\(...)` slot in a string interpolation needs path context
@@ -26315,6 +26348,22 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 
 /// Evaluate a jq expression against a JSON cursor.
 ///
+/// This is the entry point the CLI does **not** use directly — `succinctly jq`
+/// evaluates through [`crate::jq::eval_generic::eval_with_cursor_using`] instead, so the
+/// two can disagree on a value this evaluator's own `path`/`paths`/
+/// `leaf_paths`/`getpath` implementations decode but the generic evaluator's
+/// cursor-native walkers don't. Two consequences follow from that:
+///
+/// - A query built from `path`/`paths`/`leaf_paths`/`getpath` is routed onto
+///   the generic evaluator internally (#3266), so it agrees with the CLI even
+///   though this function stays the entry.
+/// - A query that **collects** an unreadable value (`[., 1] | length`,
+///   `{a: .} | length`) still raises here where a single-source collection
+///   (`[.] | length`) does not — collecting into an `OwnedValue` decodes,
+///   whichever evaluator does it, and the generic evaluator has the same
+///   split internally (see `eval_generic::eval_with_cursor_using`'s own
+///   rustdoc, and [#3427](https://github.com/rust-works/succinctly/issues/3427)).
+///
 /// # Examples
 ///
 /// ```ignore
@@ -26344,7 +26393,15 @@ pub fn eval<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // navigation, absent nodes, constructs it has no native arm for), and
     // does so through [`eval_full`], never through here, so the two cannot
     // recurse into each other.
-    if needs_path_context(expr) {
+    //
+    // `path(f)`/`paths`/`leaf_paths`/`getpath(p)` route the same way for a
+    // second reason (#3266): this evaluator's own path builtins decode the
+    // whole input up front, so an unread sibling that the index can't parse
+    // (a malformed nested number, an unquoted keyword) makes them raise
+    // where the generic evaluator's cursor-native walkers -- which never
+    // read what they don't visit, per the #2103/#2692 ADR-0018 amendment --
+    // answer normally.
+    if needs_path_context(expr) || navigates_without_reading(expr) {
         return generic_to_query_result::<_, S>(
             super::eval_generic::eval_with_cursor_using::<S, _>(expr, cursor),
         );
@@ -72376,25 +72433,40 @@ mod tests {
         }
     }
 
-    /// #1755's rule on #2908's new lazy `path()` route: an undecodable root
-    /// raises there too, not only through the collecting `builtin_path`.
+    /// #1755's rule as it stood before #3266: an undecodable root raised
+    /// through `path()`'s lazy `eval_each` route (`limit`/`first`) the same
+    /// way it did through the collecting `builtin_path`, because both took
+    /// this evaluator's own path implementation, which called `to_owned` on
+    /// the ambient value up front.
     ///
-    /// `limit`/`first` are what reach the `eval_each` arm; the bare spelling
-    /// still takes `builtin_path`, and both must answer the same way.
+    /// #3266 routes every `path(f)` onto the generic evaluator instead,
+    /// whose cursor-native walker never reads a position it doesn't
+    /// navigate through -- and `path(.)`'s position *is* the root, so
+    /// nothing is navigated at all. All three `path(.)`-only spellings now
+    /// answer `[]` uniformly, matching #2168's rule ("navigation validates
+    /// only what it navigates") for the identity position the same way it
+    /// already applied to a navigated one. `limit(1; path(.a, .b))` on a
+    /// string root still raises, but as the type error indexing a string
+    /// always is (`Cannot index string with string`) -- not a decode
+    /// failure -- since `.a` is invalid regardless of the root's decode
+    /// status.
     #[test]
-    fn each_path_raises_on_undecodable_root_2908() {
-        for expr in [
-            "limit(1; path(.))",
-            "first(path(.))",
-            "limit(1; path(.a, .b))",
-            "path(.)",
-        ] {
+    fn each_path_matches_the_2168_rule_at_the_root_3266() {
+        for expr in ["limit(1; path(.))", "first(path(.))", "path(.)"] {
             query!(
                 &b"\"\xff\xfe\""[..],
                 expr,
-                QueryResult::Error(e) if e.is_decode_failure() => {}
+                QueryResult::Owned(OwnedValue::Array(path)) => assert!(path.is_empty(), "{expr}")
             );
         }
+        query!(
+            &b"\"\xff\xfe\""[..],
+            "limit(1; path(.a, .b))",
+            QueryResult::Error(e) => {
+                assert!(!e.is_decode_failure(), "{}", e.message);
+                assert!(e.message.contains("Cannot index string with string"), "{}", e.message);
+            }
+        );
     }
 
     /// #1755 positive control: valid data through each of the recurse/walk
@@ -73268,19 +73340,21 @@ mod tests {
     }
 
     /// #1755: the "misc bucket" slice -- `INDEX`/`INDEX(stream;...)`,
-    /// `getpath`, `any`/`all` (bare and `(cond)`/`(gen;cond)` forms),
-    /// `eval_pipe`'s path-context entry, `combinations`/`combinations(n)`,
+    /// `any`/`all` (bare and `(cond)`/`(gen;cond)` forms), `eval_pipe`'s
+    /// path-context entry, `combinations`/`combinations(n)`,
     /// `debug`/`debug(msg)`/`stderr`/`halt_error`, `transpose`, `shuffle`,
     /// and `pivot` all convert their starting value (or an element of it)
     /// via a single `to_owned_lossy` call -- an undecodable value must raise
     /// there, not silently become `""` and feed the rest of the builtin as
-    /// if it were the real value.
+    /// if it were the real value. `getpath` was part of this bucket until
+    /// #3266 moved it (and the rest of the `path` family) onto the generic
+    /// evaluator's cursor-native walker -- see `getpath([])`'s own row
+    /// below, kept as a positive assertion rather than deleted.
     #[test]
     fn test_misc_bucket_raises_on_decode_failure_1755() {
         for (json, expr) in [
             (&b"[\"\xff\xfe\"]"[..], "INDEX(.)"),
             (&b"[\"\xff\xfe\"]"[..], "INDEX(.[]; .)"),
-            (&b"\"\xff\xfe\""[..], "getpath([])"),
             (&b"[\"\xff\xfe\"]"[..], "any"),
             (&b"[\"\xff\xfe\"]"[..], "all"),
             (&b"[\"\xff\xfe\"]"[..], "any(.>0)"),
@@ -73319,6 +73393,20 @@ mod tests {
             ".[] | key",
             QueryResult::Owned(OwnedValue::Int(0)) => {}
         );
+
+        // `getpath([])` was in the list above until #3266, for the same
+        // reason `.[] | key` left it at #2168: an empty path performs no
+        // navigation at all -- it is exactly `.` (see `path.rs`'s own
+        // "no-key getpath([]) ... is exactly `.`" note) -- so it now echoes
+        // the root's raw bytes rather than raising. #3266 routed `getpath`
+        // onto the generic evaluator's cursor-native walker, which answers
+        // this as an `OneCursor`, matching `.` itself.
+        let index = JsonIndex::build(&b"\"\xff\xfe\""[..]);
+        let cursor = index.root(&b"\"\xff\xfe\""[..]);
+        match eval::<Vec<u64>, JqSemantics>(&parse("getpath([])").unwrap(), cursor) {
+            QueryResult::OneCursor(_) | QueryResult::One(_) => {}
+            other => panic!("getpath([]) on an undecodable root: {other:?}"),
+        }
 
         // `eval_single`'s yq-mode object slice arm is gated on
         // `S::TAG == EvalTag::Yq`, so `yq_query!`'s error pattern (which
@@ -73455,8 +73543,11 @@ mod tests {
         query!(br#"[{"a":1},{"a":2}]"#, "INDEX(.[]; .a)",
             QueryResult::Owned(OwnedValue::Object(m)) => { assert_eq!(m.len(), 2); }
         );
+        // `OneCursor` added alongside `One`/`Owned` (#3266): `getpath` now
+        // routes through the generic evaluator, which can answer a scalar
+        // node as a cursor instead of materializing it.
         query!(br#"{"a":{"b":1}}"#, "getpath([\"a\",\"b\"])",
-            QueryResult::One(_) | QueryResult::Owned(_) => {}
+            QueryResult::One(_) | QueryResult::Owned(_) | QueryResult::OneCursor(_) => {}
         );
         query!(br"[1,2]", "any",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
@@ -85219,37 +85310,29 @@ mod tests {
 
     #[test]
     fn test_builtin_getpath() {
-        query!(br#"{"a": {"b": 42}}"#, r#"getpath(["a", "b"])"#,
-            QueryResult::Owned(v) => {
-                assert_eq!(v, OwnedValue::Int(42));
-            }
-        );
-
-        query!(br"[1, 2, 3]", r"getpath([1])",
-            QueryResult::Owned(v) => {
-                assert_eq!(v, OwnedValue::Int(2));
-            }
-        );
-
-        // Negative index support
-        query!(br"[1, 2, 3]", r"getpath([-1])",
-            QueryResult::Owned(v) => {
-                assert_eq!(v, OwnedValue::Int(3));
-            }
-        );
-
-        query!(br"[1, 2, 3]", r"getpath([-2])",
-            QueryResult::Owned(v) => {
-                assert_eq!(v, OwnedValue::Int(2));
-            }
-        );
-
-        // Nested with negative index
-        query!(br#"{"a": [10, 20, 30]}"#, r#"getpath(["a", -1])"#,
-            QueryResult::Owned(v) => {
-                assert_eq!(v, OwnedValue::Int(30));
-            }
-        );
+        // `normalize`, not a direct `Owned` match (#3266): `getpath(p)` now
+        // routes through the generic evaluator, which can answer a scalar
+        // node as `OneCursor` rather than materializing it into `Owned` --
+        // an efficient, value-preserving representation change, not a
+        // different answer (see `eval_with_cursor_using`'s own rustdoc).
+        for (json, filter, expected) in [
+            (
+                br#"{"a": {"b": 42}}"# as &[u8],
+                r#"getpath(["a", "b"])"#,
+                42,
+            ),
+            (br"[1, 2, 3]", r"getpath([1])", 2),
+            (br"[1, 2, 3]", r"getpath([-1])", 3),
+            (br"[1, 2, 3]", r"getpath([-2])", 2),
+            (br#"{"a": [10, 20, 30]}"#, r#"getpath(["a", -1])"#, 30),
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr = parse(filter).unwrap();
+            let (values, tag) = normalize(eval::<Vec<u64>, JqSemantics>(&expr, cursor));
+            assert_eq!(tag, "ok", "{filter}");
+            assert_eq!(values, vec![OwnedValue::Int(expected)], "{filter}");
+        }
     }
 
     // =========================================================================
@@ -92905,12 +92988,18 @@ mod tests {
 
     #[test]
     fn test_getpath() {
-        // getpath returns Owned Int, not One StandardJson
-        query!(br#"{"a": {"b": 42}}"#, r#"getpath(["a", "b"])"#,
-            QueryResult::Owned(v) => {
-                assert_eq!(v, OwnedValue::Int(42));
-            }
-        );
+        // `getpath` used to always answer `Owned`, never a cursor -- since
+        // #3266 routes it through the generic evaluator, a scalar node can
+        // come back as `OneCursor` instead (an efficient, value-preserving
+        // representation, not a different answer), so this compares through
+        // `normalize` rather than matching `Owned` directly.
+        let index = JsonIndex::build(br#"{"a": {"b": 42}}"#);
+        let cursor = index.root(br#"{"a": {"b": 42}}"#);
+        let expr = parse(r#"getpath(["a", "b"])"#).unwrap();
+        let (values, tag) = normalize(eval::<Vec<u64>, JqSemantics>(&expr, cursor));
+        assert_eq!(tag, "ok");
+        assert_eq!(values, vec![OwnedValue::Int(42)]);
+
         // Non-existent path returns null
         query!(br#"{"a": 1}"#, r#"getpath(["missing"])"#,
             QueryResult::Owned(OwnedValue::Null) => {}
@@ -104128,21 +104217,24 @@ mod tests {
         }
     }
 
-    /// #1746 review: `path(...)` itself (`builtin_path`'s own top-level
-    /// `to_owned` call) needs a direct repro -- `eval_assign`'s
-    /// tests above exercise `=`/`|=`, not `path()`.
+    /// #1746 review pinned `path(...)`'s own top-level `to_owned` call
+    /// (`builtin_path`) raising here -- it read the whole document, an
+    /// undecodable *sibling* `.b` included, just to answer `path(.a)`.
+    /// #3266 fixed exactly this: `path(f)` now routes onto the generic
+    /// evaluator's cursor-native walker, which never reads a sibling it
+    /// doesn't navigate through, so this answers `["a"]` instead of raising.
     #[test]
-    fn eval_rs_builtin_path_raises_decode_failure_1746() {
+    fn eval_rs_builtin_path_ignores_a_malformed_sibling_3266() {
         let json: &[u8] = br#"{"a":1,"b":"\ud800"}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("path(.a)").unwrap();
         match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
-            QueryResult::Error(e) => assert!(
-                e.is_decode_failure(),
-                "expected a decode-failure error, got: {e:?}"
-            ),
-            other => panic!("expected a decode-failure error, got: {other:?}"),
+            QueryResult::Owned(OwnedValue::Array(path)) => {
+                let path: &[OwnedValue] = path.as_ref();
+                assert_eq!(path, &[OwnedValue::String("a".into())]);
+            }
+            other => panic!("expected [\"a\"], got: {other:?}"),
         }
     }
 
@@ -104740,6 +104832,103 @@ mod tests {
         });
         assert!(matches!(flow, ResolveFlow::Stopped), "{flow:?}");
         assert_eq!(calls, 1);
+    }
+
+    /// `{"k":{"k":...{}...}}`, `depth` levels of `"k"` nesting, terminating
+    /// in `{}` -- moved here from `tests/jq_recurse_depth_tests.rs` (#3266).
+    fn linear_nest_3266(depth: usize) -> String {
+        format!("{}{{}}{}", "{\"k\":".repeat(depth), "}".repeat(depth))
+    }
+
+    /// The paths `path(..)`/`path(recurse(...))` visit on
+    /// `linear_nest_3266(depth)`, derived independently of any evaluator:
+    /// the root (`[]`), then one more `"k"` per level down to the innermost
+    /// `{}`.
+    fn expected_paths_3266(depth: usize) -> Vec<String> {
+        (0..=depth)
+            .map(|i| format!("[{}]", vec!["\"k\""; i].join(",")))
+            .collect()
+    }
+
+    /// #661/#626, moved here from `tests/jq_recurse_depth_tests.rs` (#3266):
+    /// that file's own de-risk step for #626 (threading a
+    /// `Cow<'a, OwnedValue>` lifetime through `PathBranch`/`resolve_node` to
+    /// kill the O(subtree) clone-per-node cost in
+    /// `resolve_recursive_descent_sink`/`resolve_recurse_sink`) drove both
+    /// code paths to depth 300 through the public `eval()` entry point.
+    /// #3266 routes every `path(f)` from `eval()` onto the generic
+    /// evaluator instead, whose own native-recursive path walker caps out
+    /// at 255 (`eval_generic::MAX_NESTING_DEPTH`, confirmed live) -- well
+    /// short of 300, and this evaluator's `resolve_recursive_descent_sink`/
+    /// `resolve_recurse_sink` are no longer reachable from `eval()` for a
+    /// `path(...)`-wrapped filter at all. This moved copy calls `eval_full`
+    /// directly instead, preserving #626's original at-depth correctness
+    /// coverage for the code it actually touched; the external test file
+    /// keeps a reduced-depth pin of what the *public* `eval()` API can do
+    /// today.
+    ///
+    /// Depth 300 is chosen deliberately beyond what real jq's own JSON
+    /// parser accepts (jq-1.7.1 raises "Exceeds depth limit for parsing"
+    /// around depth ~128 on this document shape), so this is a pure
+    /// internal correctness pin against a programmatically-derived expected
+    /// value, not an oracle comparison -- there is no jq to compare against
+    /// at this depth. Every existing recurse/`..` golden fixture nests
+    /// three levels deep at most, so nothing else would catch a lifetime
+    /// bug that only corrupts or truncates output once recursion goes
+    /// deeper than a handful of frames.
+    fn run_paths_via_eval_full_3266(json: &str, filter: &str, depth: usize) -> Vec<String> {
+        let bytes = json.as_bytes();
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        let expr = parse(filter).expect("parse failed");
+        let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
+        assert!(
+            !result.is_error(),
+            "`{filter}` errored on the depth-{depth} document: {result:?}"
+        );
+        result
+            .collect_owned::<JqSemantics>()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect()
+    }
+
+    /// Bare `..` -- the `resolve_recursive_descent_sink` path.
+    #[test]
+    fn recursive_descent_correct_at_depth_via_eval_full_3266() {
+        const DEPTH: usize = 300;
+        let json = linear_nest_3266(DEPTH);
+        assert_eq!(
+            run_paths_via_eval_full_3266(&json, "path(..)", DEPTH),
+            expected_paths_3266(DEPTH)
+        );
+    }
+
+    /// Bare `recurse` -- shares `resolve_recursive_descent_sink` with `..`
+    /// (per the dispatch comment in `resolve_node_sink`), pinned separately
+    /// in case a future refactor splits the two.
+    #[test]
+    fn bare_recurse_correct_at_depth_via_eval_full_3266() {
+        const DEPTH: usize = 300;
+        let json = linear_nest_3266(DEPTH);
+        assert_eq!(
+            run_paths_via_eval_full_3266(&json, "path(recurse)", DEPTH),
+            expected_paths_3266(DEPTH)
+        );
+    }
+
+    /// `recurse(f; cond)` -- the `resolve_recurse_sink` stack-based path.
+    /// `cond` stops exactly at the `{}` leaf (its `.k` is `null`, not an
+    /// object), producing the same path set as the bare form on this
+    /// document.
+    #[test]
+    fn parameterized_recurse_correct_at_depth_via_eval_full_3266() {
+        const DEPTH: usize = 300;
+        let json = linear_nest_3266(DEPTH);
+        assert_eq!(
+            run_paths_via_eval_full_3266(&json, r#"path(recurse(.k; type=="object"))"#, DEPTH),
+            expected_paths_3266(DEPTH)
+        );
     }
 
     /// #1021: `walk_impl` (backs `walk(f)`) had no depth guard at all
@@ -107387,6 +107576,20 @@ mod tests {
     fn test_path_bind_origin_matrix_accepts_2042() {
         // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
         let rows: &[(&[u8], &str, &str)] = &[
+            // value-mode-binding-same-node, refuse-only until #3266: `eval()`
+            // used to answer this through its own dedicated path resolver,
+            // whose bind-origin tracking never covers a value-mode `as`
+            // binding (`.a as $y` binds by value, not by path). #3266 routes
+            // `path(f)` onto the generic evaluator's cursor-native walker
+            // instead, which resolves `$y` back to the node it was bound
+            // from directly -- no bind-origin tracking involved -- so this
+            // row now answers like jq without needing the resolver to change
+            // at all.
+            (
+                br#"{"a":{"b":1}}"#,
+                ".a as $y | path(.a | $y)",
+                r#"[["a"]]"#,
+            ),
             // #3049: `fromjson` does not move the register. The marker can
             // restore it after the reconstructed value, as jq does.
             (
@@ -107844,27 +108047,28 @@ mod tests {
 
     /// Deliberately refuse-only rows (jq answers, succinctly refuses), each
     /// pinned so that closing one is a visible edit here rather than a
-    /// silent flip: a value-mode binding has no path (`eval_as` never
-    /// resolves its source; the accepting-direction twin of #2642),
-    /// a `def` inside `path()` resolves as an opaque leaf,
-    /// and a source navigating inside a construction is refused by the
-    /// resolver where jq's suspended tracking allows it, so it binds a
-    /// plain value. The last four rows (#2042 review) are not about the
-    /// origin at all: three are carried-register gaps a root `. as $x`
-    /// marker hits identically (`path(. as $x | try error("x") catch $x)`,
+    /// silent flip: a `def` inside `path()` resolves as an opaque leaf, and a
+    /// source navigating inside a construction is refused by the resolver
+    /// where jq's suspended tracking allows it, so it binds a plain value.
+    /// The last four rows (#2042 review) are not about the origin at all:
+    /// three are carried-register gaps a root `. as $x` marker hits
+    /// identically (`path(. as $x | try error("x") catch $x)`,
     /// `path(. as $x | . as [$q] ?// $q | $x)` and
     /// `path(. as $x | 5 | reduce (1) as $i (0; $x))` all refuse where jq
     /// answers `[]`), and one is slice spelling.
+    ///
+    /// A value-mode binding (`eval_as` never resolves its source; the
+    /// accepting-direction twin of #2642) used to be a ninth reason: `.a as
+    /// $y | path(.a | $y)` refused here because this evaluator's own path
+    /// resolver has no bind-origin tracking for a value-mode `as`. #3266
+    /// moved that row to the accepting matrix -- `path(f)` now runs on the
+    /// generic evaluator's cursor-native walker, which resolves `$y` to the
+    /// node it was bound from directly, with no bind-origin tracking (and
+    /// hence no such gap) at all.
     #[test]
     fn test_path_bind_origin_matrix_refuse_only_2042() {
         // (input, filter, what jq 1.7.1 answers)
         let rows: &[(&[u8], &str, &str)] = &[
-            // value-mode-binding-same-node
-            (
-                br#"{"a":{"b":1}}"#,
-                ".a as $y | path(.a | $y)",
-                r#"[["a"]]"#,
-            ),
             // source-rebuilt-container
             (
                 br#"{"a":{"b":1}}"#,
@@ -108513,11 +108717,22 @@ mod tests {
         assert_eq!(var.value, inner);
 
         // Resolver: `path(<var>)` with the ambient input equal to the value.
+        //
+        // `eval_full`, not `eval` (#3266): `eval()`'s own top-level dispatch
+        // now routes every `path(f)` onto the generic evaluator, but a raw
+        // `Expr::TrackedVar` like the ones built above is never something a
+        // real, freshly-parsed filter contains -- eval.rs's own bind-time
+        // substitution splices it in only *during* its own resolver's
+        // execution (`resolve_bind_source_witness`), never before. This test
+        // exercises that resolver's own contract directly by hand-building
+        // the post-substitution AST, so it has to enter through the same
+        // route the resolver's real callers do internally, not through the
+        // now-rerouted top-level entry.
         let index = JsonIndex::build(doc);
         let path_of = |var: Expr| {
             let cursor = index.root(doc);
             let expr = Expr::Builtin(Builtin::Path(Box::new(var)));
-            eval::<Vec<u64>, JqSemantics>(&expr, cursor)
+            eval_full::<Vec<u64>, JqSemantics>(&expr, cursor)
         };
         // A tracked root snapshot certifies against the root: `path(. as $x
         // | $x)` is `[]` in jq 1.7.1.
@@ -113584,6 +113799,11 @@ mod tests {
         // decodes nothing; #2168: navigation validates only what it
         // navigates). `.` and `values` pass the value on to whatever reads it
         // next, the printer included, so they are pinned by the CLI sweep.
+        //
+        // `path(.)`/`[paths]` used to be excluded from the `eval` half too --
+        // `eval()` collected them into owned values before #3266 routed the
+        // whole path family onto the generic evaluator, so they now answer
+        // on this route the same way `key`/`parent` already did.
         const NON_READERS: &[&str] = &[
             "not",
             "if . then 1 else 2 end",
@@ -113594,21 +113814,24 @@ mod tests {
             "isvalid(.)",
             "empty",
             "1",
+            "path(.)",
+            "[paths]",
             // `eval` collects these into owned values -- it materializes,
             // and materializing validates, as `-s` and `-S` do -- so only
             // the generic evaluator, the one the CLI routes them to, is held
-            // to answering here.
+            // to answering here. `#3266` review: recorded explicitly rather
+            // than silently skipped, so a later convergence has to flip this
+            // pin on purpose. `[., 1] | length` and `{a: .} | length` raise
+            // in *both* evaluators -- a different, still-open incoherence
+            // inside the generic evaluator's own collection representations,
+            // filed separately as #3427 rather than converged here.
             "[limit(1; .)] | length",
             "[.] | length",
-            "path(.)",
-            "[paths]",
+            "[., 1] | length",
+            "{a: .} | length",
         ];
-        const MATERIALIZED_BY_EVAL: &[&str] = &[
-            "[limit(1; .)] | length",
-            "[.] | length",
-            "path(.)",
-            "[paths]",
-        ];
+        const MATERIALIZED_BY_EVAL: &[&str] = &["[limit(1; .)] | length", "[.] | length"];
+        const RAISES_IN_BOTH: &[&str] = &["[., 1] | length", "{a: .} | length"];
         let good = b"[1]";
         let good_index = JsonIndex::build(good);
         let good_element = good_index.root(good).first_child().expect("one element");
@@ -113621,7 +113844,40 @@ mod tests {
                 .expect("one element");
             for filter in NON_READERS {
                 let expr = parse(filter).expect("filter parses");
-                if !MATERIALIZED_BY_EVAL.contains(filter) {
+                if RAISES_IN_BOTH.contains(filter) {
+                    match eval::<Vec<u64>, JqSemantics>(&expr, element) {
+                        QueryResult::Error(e) => assert!(
+                            e.is_decode_failure(),
+                            "`{filter}` on {json}: expected a decode failure, got {e:?}"
+                        ),
+                        other => {
+                            panic!("`{filter}` on {json}: expected `eval` to raise, got {other:?}")
+                        }
+                    }
+                    match crate::jq::eval_generic::eval_with_cursor_using::<JqSemantics, _>(
+                        &expr, element,
+                    ) {
+                        crate::jq::eval_generic::GenericResult::Error(e) => assert!(
+                            e.is_decode_failure(),
+                            "`{filter}` on {json}: expected a decode failure, got {e:?}"
+                        ),
+                        other => panic!(
+                            "`{filter}` on {json}: expected `eval_using` to raise, got {other:?}"
+                        ),
+                    }
+                    continue;
+                }
+                if MATERIALIZED_BY_EVAL.contains(filter) {
+                    match eval::<Vec<u64>, JqSemantics>(&expr, element) {
+                        QueryResult::Error(e) => assert!(
+                            e.is_decode_failure(),
+                            "`{filter}` on {json}: expected a decode failure, got {e:?}"
+                        ),
+                        other => {
+                            panic!("`{filter}` on {json}: expected `eval` to raise, got {other:?}")
+                        }
+                    }
+                } else {
                     let concrete = normalize(eval::<Vec<u64>, JqSemantics>(&expr, element));
                     let expected = normalize(eval::<Vec<u64>, JqSemantics>(&expr, good_element));
                     if concrete != expected {
@@ -113650,6 +113906,165 @@ mod tests {
         assert!(
             disagreed.is_empty(),
             "a non-reader read the value: {disagreed:#?}"
+        );
+    }
+
+    /// #3266: `getpath([])`, `path(.a)` and `[paths] | length` on a value
+    /// with a malformed *sibling* (not the value itself, and not visited by
+    /// any of these three) must not raise in either evaluator, and each
+    /// answer is asserted exactly -- not just "didn't raise" -- so a
+    /// regression that changes the *value* rather than just avoiding a raise
+    /// is still caught. The acceptance-criteria table this pins is #3266's
+    /// own implementation-plan comment.
+    #[test]
+    fn navigation_ignores_an_unread_malformed_sibling_3266() {
+        fn eval_using<'a>(
+            expr: &Expr,
+            cursor: JsonCursor<'a, Vec<u64>>,
+        ) -> QueryResult<'a, Vec<u64>> {
+            generic_to_query_result::<_, JqSemantics>(
+                crate::jq::eval_generic::eval_with_cursor_using::<JqSemantics, _>(expr, cursor),
+            )
+        }
+
+        let malformed = br#"[{"a":1,"b":tru}]"#;
+        let index = JsonIndex::build(malformed);
+        let object = index.root(malformed).first_child().expect("one element");
+        let field_a = object.first_child().expect("field a's value");
+
+        for (evaluator, run) in [
+            (
+                "eval",
+                eval::<Vec<u64>, JqSemantics>
+                    as for<'a> fn(&'a Expr, JsonCursor<'a, Vec<u64>>) -> QueryResult<'a, Vec<u64>>,
+            ),
+            ("eval_using", eval_using),
+        ] {
+            match run(&parse("getpath([]) | not").unwrap(), field_a) {
+                QueryResult::Owned(OwnedValue::Bool(b)) => {
+                    assert!(!b, "{evaluator}: getpath([])|not");
+                }
+                other => panic!("{evaluator}: getpath([])|not gave {other:?}"),
+            }
+            match run(&parse("path(.a)").unwrap(), object) {
+                QueryResult::Owned(OwnedValue::Array(arr)) => {
+                    let arr: &[OwnedValue] = arr.as_ref();
+                    assert_eq!(
+                        arr,
+                        &[OwnedValue::String("a".into())],
+                        "{evaluator}: path(.a)"
+                    );
+                }
+                other => panic!("{evaluator}: path(.a) gave {other:?}"),
+            }
+            match run(&parse("[paths] | length").unwrap(), object) {
+                QueryResult::Owned(OwnedValue::Int(n)) => {
+                    assert_eq!(n, 2, "{evaluator}: [paths]|length");
+                }
+                other => panic!("{evaluator}: [paths]|length gave {other:?}"),
+            }
+        }
+    }
+
+    /// #3266 negative controls: each of these reads the malformed value
+    /// (`paths(f)` evaluates `f` on it; `del`/`to_entries`/`pick` build their
+    /// output from it), so [`navigates_without_reading`] deliberately excludes
+    /// them, and both evaluators still raise. This pins the *current* state,
+    /// not a claim that it's correct -- #3427 tracks whether it should
+    /// change.
+    #[test]
+    fn navigation_negative_controls_still_raise_3266() {
+        let malformed = br#"[{"a":1,"b":tru}]"#;
+        let index = JsonIndex::build(malformed);
+        let element = index.root(malformed).first_child().expect("one element");
+
+        for filter in [
+            r#"[paths(type == "number")]"#,
+            r#"[paths(type == "object")]"#,
+            "del(.a)",
+            "to_entries",
+            "pick(.a)",
+        ] {
+            let expr = parse(filter).expect("filter parses");
+            match eval::<Vec<u64>, JqSemantics>(&expr, element) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "`{filter}`: {e:?}");
+                }
+                other => panic!("`{filter}`: expected `eval` to raise, got {other:?}"),
+            }
+            match crate::jq::eval_generic::eval_with_cursor_using::<JqSemantics, _>(&expr, element)
+            {
+                crate::jq::eval_generic::GenericResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "`{filter}`: {e:?}");
+                }
+                other => panic!("`{filter}`: expected `eval_using` to raise, got {other:?}"),
+            }
+        }
+    }
+
+    /// Must-not-change gate for #3266's routing change: on well-formed
+    /// input, `path`/`paths`/`leaf_paths`/`getpath` moving from this
+    /// evaluator's own `eval_full` onto the generic evaluator's cursor entry
+    /// must not change a single answer. Compares `eval()`'s new route
+    /// directly against `eval_full` (the pre-#3266 route) over a small
+    /// corpus, rather than against a hand-written expected value, so the
+    /// two routes' own possible disagreement is exactly what this catches.
+    #[test]
+    fn path_family_routing_change_preserves_well_formed_answers_3266() {
+        const DOCS: &[&[u8]] = &[
+            b"null",
+            b"{}",
+            b"[]",
+            b"[1,2,3]",
+            br#"{"a":{"b":{"c":1}},"d":[1,2,{"e":3}]}"#,
+            br#"{"a":1,"a":2}"#,
+            br#"[null,true,false,1,"s",[1],{"k":1}]"#,
+            b"[nan]",
+        ];
+        const FILTERS: &[&str] = &[
+            "path(.)",
+            "path(.a)",
+            "path(.a.b)",
+            "path(.a?)",
+            "path(..)",
+            "[paths]",
+            "[paths(scalars)]",
+            "[leaf_paths]",
+            "getpath([])",
+            r#"getpath(["a"])"#,
+            r#"getpath(["a","b"])"#,
+            "getpath([0])",
+        ];
+        let mut mismatches = Vec::new();
+        for doc in DOCS {
+            let index = JsonIndex::build(doc);
+            let cursor = index.root(doc);
+            for filter in FILTERS {
+                let Ok(expr) = parse(filter) else {
+                    continue;
+                };
+                // Debug-string comparison, not `PartialEq` -- a NaN literal
+                // (`[nan]`'s own element) never equals itself by value, which
+                // would otherwise flag an identical answer as a mismatch.
+                let new_route = format!(
+                    "{:?}",
+                    normalize(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                );
+                let old_route = format!(
+                    "{:?}",
+                    normalize(eval_full::<Vec<u64>, JqSemantics>(&expr, cursor))
+                );
+                if new_route != old_route {
+                    mismatches.push(format!(
+                        "`{filter}` on {:?}: new={new_route} old={old_route}",
+                        core::str::from_utf8(doc).unwrap()
+                    ));
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "routing change moved an answer: {mismatches:#?}"
         );
     }
 }

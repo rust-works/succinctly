@@ -5016,6 +5016,18 @@ pub fn eval<V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
 
 /// Evaluate an expression against a document value with explicit semantics.
 ///
+/// **This entry receives an already-decoded `V`, unlike
+/// [`eval_with_cursor_using`] (what the CLI calls) and [`crate::jq::eval`],
+/// which both receive a cursor.** Building that `V` decoded the value before
+/// this function ever runs, so even a filter that would otherwise navigate
+/// or test truthiness without reading (`not`, `path(.)`) raises on a value
+/// the index couldn't parse (a malformed nested number, an unquoted keyword)
+/// -- the decode failure happened one step earlier, at the caller's own
+/// `V::from(...)`/decode call, not inside this function (#3266). A caller
+/// who wants the CLI's answer on such input should call
+/// [`eval_with_cursor_using`] instead, starting from a cursor rather than an
+/// already-decoded value.
+///
 /// Arithmetic that falls back to the full evaluator (division, modulo, overflow)
 /// follows `S`, so yq keeps yq numeric behavior instead of jq's.
 ///
@@ -5859,6 +5871,23 @@ pub fn eval_with_cursor<C: DocumentCursor>(expr: &Expr, cursor: C) -> GenericRes
 }
 
 /// Evaluate an expression against a cursor with explicit semantics.
+///
+/// **This is the entry the CLI (`succinctly jq`/`succinctly yq`) actually
+/// calls.** A library caller who wants CLI-identical answers should start
+/// from a cursor and call this function (or [`crate::jq::eval`], which now
+/// routes `path`/`paths`/`leaf_paths`/`getpath` here internally, #3266) --
+/// not [`eval_using`], which receives an already-decoded value and so raises
+/// earlier than either cursor entry does on a value the index couldn't
+/// parse.
+///
+/// A collection this evaluator builds from a cursor still decodes its
+/// elements unless it can stay a single-source `LazySeq`: `[.] | length` on
+/// such a value answers, but `[., 1] | length` and `{a: .} | length` raise,
+/// because the latter two materialize each element into an `OwnedValue`
+/// where the former stays a lazy cursor sequence. This is a real,
+/// currently-unconverged split inside this evaluator, not a bug in whichever
+/// caller notices it -- see
+/// [#3427](https://github.com/rust-works/succinctly/issues/3427).
 ///
 /// Like [`eval_with_cursor`] but arithmetic follows `S` (jq vs yq), so yq's
 /// modulo/division/overflow behavior is preserved on the cursor path.
