@@ -73405,7 +73405,7 @@ mod tests {
         let cursor = index.root(&b"\"\xff\xfe\""[..]);
         match eval::<Vec<u64>, JqSemantics>(&parse("getpath([])").unwrap(), cursor) {
             QueryResult::OneCursor(_) | QueryResult::One(_) => {}
-            other => panic!("getpath([]) on an undecodable root: {other:?}"),
+            other => panic!("getpath([]) on an undecodable root: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion above, only formatted if the match doesn't hit the expected arm (#3266)"
         }
 
         // `eval_single`'s yq-mode object slice arm is gated on
@@ -104234,7 +104234,7 @@ mod tests {
                 let path: &[OwnedValue] = path.as_ref();
                 assert_eq!(path, &[OwnedValue::String("a".into())]);
             }
-            other => panic!("expected [\"a\"], got: {other:?}"),
+            other => panic!("expected [\"a\"], got: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion above (#3266)"
         }
     }
 
@@ -113850,9 +113850,10 @@ mod tests {
                             e.is_decode_failure(),
                             "`{filter}` on {json}: expected a decode failure, got {e:?}"
                         ),
+                        // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- failure message for the assertion above, only reached if RAISES_IN_BOTH's `eval` half stops raising (#3266)"
                         other => {
                             panic!("`{filter}` on {json}: expected `eval` to raise, got {other:?}")
-                        }
+                        } // omni-dev: coverage end
                     }
                     match crate::jq::eval_generic::eval_with_cursor_using::<JqSemantics, _>(
                         &expr, element,
@@ -113861,9 +113862,11 @@ mod tests {
                             e.is_decode_failure(),
                             "`{filter}` on {json}: expected a decode failure, got {e:?}"
                         ),
+                        // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- failure message for the assertion above, only reached if RAISES_IN_BOTH's `eval_using` half stops raising (#3266)"
                         other => panic!(
                             "`{filter}` on {json}: expected `eval_using` to raise, got {other:?}"
                         ),
+                        // omni-dev: coverage end
                     }
                     continue;
                 }
@@ -113873,9 +113876,10 @@ mod tests {
                             e.is_decode_failure(),
                             "`{filter}` on {json}: expected a decode failure, got {e:?}"
                         ),
+                        // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- failure message for the assertion above, only reached if MATERIALIZED_BY_EVAL's `eval` half stops raising (#3266)"
                         other => {
                             panic!("`{filter}` on {json}: expected `eval` to raise, got {other:?}")
-                        }
+                        } // omni-dev: coverage end
                     }
                 } else {
                     let concrete = normalize(eval::<Vec<u64>, JqSemantics>(&expr, element));
@@ -113944,7 +113948,7 @@ mod tests {
                 QueryResult::Owned(OwnedValue::Bool(b)) => {
                     assert!(!b, "{evaluator}: getpath([])|not");
                 }
-                other => panic!("{evaluator}: getpath([])|not gave {other:?}"),
+                other => panic!("{evaluator}: getpath([])|not gave {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- failure message for the assertion above (#3266)"
             }
             match run(&parse("path(.a)").unwrap(), object) {
                 QueryResult::Owned(OwnedValue::Array(arr)) => {
@@ -113955,13 +113959,13 @@ mod tests {
                         "{evaluator}: path(.a)"
                     );
                 }
-                other => panic!("{evaluator}: path(.a) gave {other:?}"),
+                other => panic!("{evaluator}: path(.a) gave {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- failure message for the assertion above (#3266)"
             }
             match run(&parse("[paths] | length").unwrap(), object) {
                 QueryResult::Owned(OwnedValue::Int(n)) => {
                     assert_eq!(n, 2, "{evaluator}: [paths]|length");
                 }
-                other => panic!("{evaluator}: [paths]|length gave {other:?}"),
+                other => panic!("{evaluator}: [paths]|length gave {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- failure message for the assertion above (#3266)"
             }
         }
     }
@@ -113990,14 +113994,14 @@ mod tests {
                 QueryResult::Error(e) => {
                     assert!(e.is_decode_failure(), "`{filter}`: {e:?}");
                 }
-                other => panic!("`{filter}`: expected `eval` to raise, got {other:?}"),
+                other => panic!("`{filter}`: expected `eval` to raise, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- failure message for the assertion above, only reached if a negative-control filter stops raising through eval (#3266)"
             }
             match crate::jq::eval_generic::eval_with_cursor_using::<JqSemantics, _>(&expr, element)
             {
                 crate::jq::eval_generic::GenericResult::Error(e) => {
                     assert!(e.is_decode_failure(), "`{filter}`: {e:?}");
                 }
-                other => panic!("`{filter}`: expected `eval_using` to raise, got {other:?}"),
+                other => panic!("`{filter}`: expected `eval_using` to raise, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- failure message for the assertion above, only reached if a negative-control filter stops raising through eval_using (#3266)"
             }
         }
     }
@@ -114041,7 +114045,7 @@ mod tests {
             let cursor = index.root(doc);
             for filter in FILTERS {
                 let Ok(expr) = parse(filter) else {
-                    continue;
+                    continue; // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every FILTERS entry is a hardcoded, always-valid path-family filter (#3266)"
                 };
                 // Debug-string comparison, not `PartialEq` -- a NaN literal
                 // (`[nan]`'s own element) never equals itself by value, which
@@ -114055,10 +114059,12 @@ mod tests {
                     normalize(eval_full::<Vec<u64>, JqSemantics>(&expr, cursor))
                 );
                 if new_route != old_route {
+                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if the routing change actually moved an answer on well-formed input (#3266)"
                     mismatches.push(format!(
                         "`{filter}` on {:?}: new={new_route} old={old_route}",
                         core::str::from_utf8(doc).unwrap()
                     ));
+                    // omni-dev: coverage end
                 }
             }
         }
