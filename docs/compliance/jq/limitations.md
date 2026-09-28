@@ -1230,12 +1230,11 @@ is the revert that established what the other one costs.
      where jq reports the second path's `Cannot index object with number`);
    - a resolved component the door will not re-spell: a slice after the embed
      (`[.] \| del(.[0] \| $x \| .[0:1])` on `[1,2]`, jq `[[2]]`; its spelling
-     `.[{"start":0,"end":1}]` is [#3300](https://github.com/rust-works/succinctly/issues/3300)),
-     and a fractional index (`[.,1] \| del(.[-0.5] \| $x)`, jq `[{"a":1},1]`). A fractional
-     index is not the integer it truncates to -- succinctly's own `del(.[-0.5])` deletes
-     element 0 where jq deletes nothing ([#3302](https://github.com/rust-works/succinctly/issues/3302))
-     -- so re-spelling it would trade this refusal for a wrong answer. Integral floats
-     (`.[0.0]`, `.[-1.0]`) are re-spelled as their integer and answer.
+     `.[{"start":0,"end":1}]` is [#3300](https://github.com/rust-works/succinctly/issues/3300)).
+     Integral floats (`.[0.0]`, `.[-1.0]`) are re-spelled as their integer, and a fractional
+     index keeps its exact key (`[.,1] \| del(.[-0.5] \| $x)` answers jq's `[{"a":1},1]`),
+     since `del`'s last step resolves `.[-0.5]` to nothing rather than to element 0
+     ([#3302](https://github.com/rust-works/succinctly/issues/3302)).
 
    **[#3036](https://github.com/rust-works/succinctly/issues/3036), now closed: the same
    fabrication through the routes that never cross a funnel.** #2642's check ran only where

@@ -65619,6 +65619,17 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
         (r". as $x | [.,1] | del(.[.[1] - 1] | $x)", "[1]"),
         (r". as $x | [.,1] | del(.[0.0] | $x)", "[1]"),
         (r". as $x | [1,.] | (.[-1.0] | $x) |= 5", "[1,5]"),
+        // A fractional key keeps its exact value: `del`'s last step names
+        // nothing for `.[-0.5]`, while a write truncates to element 0
+        // (#3302, captured live against jq 1.7.1).
+        (r". as $x | [.,1] | del(.[-0.5] | $x)", r#"[{"a":1},1]"#),
+        (r". as $x | [.,1] | del(.[0.5] | $x)", "[1]"),
+        (r". as $x | [.,1] | (.[-0.5] | $x) = 5", "[5,1]"),
+        (
+            r". as $x | [.,1] | (.[-0.5] | $x) |= empty",
+            r#"[{"a":1},1]"#,
+        ),
+        (r". as $x | [[.],1] | del(.[0.5][0] | $x)", "[[],1]"),
         // A tail after the write stage, handed on with the rewritten head.
         (r". as $x | [.] | (del(.[0] | $x) | length)", "0"),
         // The target resolves to the root itself: `[]`, spelled `.`.
@@ -65651,25 +65662,155 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
             "#3188: `{filter}`: stderr={stderr:?}"
         );
     }
-    // Components the door will not re-spell, so it declines and the bridge
+    // A component the door will not re-spell, so it declines and the bridge
     // refuses where jq answers: a slice after the embed (jq `[[2]]`; its
-    // spelling `.[{"start":0,"end":1}]` is #3300), and a fractional index,
-    // which is not the integer it truncates to for `del` (jq
-    // `[{"a":1},1]`; succinctly's own `del(.[-0.5])` deletes element 0,
-    // #3302 -- re-spelling it as `.[0]` was a wrong answer, not a refusal).
-    for (input, filter, residual) in [
-        ("[1,2]", r". as $x | [.] | del(.[0] | $x | .[0:1])", "#3300"),
+    // spelling `.[{"start":0,"end":1}]` is #3300).
+    let filter = r". as $x | [.] | del(.[0] | $x | .[0:1])";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2]"))?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("", 5),
+        "#3188 residual (#3300): `{filter}`: stderr={stderr:?}"
+    );
+    Ok(())
+}
+
+// ============================================================================
+// #3302: del()/delpaths() with a fractional index
+// ============================================================================
+
+/// jq's `jv_dels` takes a deleted path's *last* index's sign from the double
+/// and adds the length to its truncation, so `-1 < k < 0` names `len`
+/// (nothing): `del(.[-0.5])` is a no-op, while `.[-0.5]` reads element 0 and
+/// a middle `.[-0.5]` step deletes inside it. `del()`'s grouping also keys by
+/// the exact number, so `.[0.5]` and `.[0]` are two groups that each rewrite
+/// element 0, run in key order. Every row captured live against jq 1.7.1.
+#[test]
+fn test_del_fractional_index_matches_jv_dels_3302() -> Result<()> {
+    for (input, filter, expected) in [
+        // The (-1, 0) band names nothing at the last step.
+        ("[10,20,30]", "del(.[-0.5])", "[10,20,30]"),
+        ("[10,20,30]", "del(.[-0.999])", "[10,20,30]"),
+        ("[10,20,30]", "del(.[-1e-300])", "[10,20,30]"),
+        ("[10,20,30]", "del(.[-0.5]?)", "[10,20,30]"),
+        ("[10]", "del(.[-0.5])", "[10]"),
         (
-            r#"{"a":1}"#,
-            r". as $x | [.,1] | del(.[-0.5] | $x)",
-            "#3302",
+            r#"{"a":[10,20,30]}"#,
+            "del(.a[-0.5])",
+            r#"{"a":[10,20,30]}"#,
         ),
+        ("[10,20,30]", "delpaths([[-0.5]])", "[10,20,30]"),
+        ("[10,20,30]", "[-0.5] as $p | delpaths([$p])", "[10,20,30]"),
+        (
+            "[10,20,30]",
+            "to_entries | map(.key) | del(.[-0.5])",
+            "[0,1,2]",
+        ),
+        // A key read from the document keeps its literal spelling.
+        (
+            "[-0.5]",
+            ".[0] as $k | [10,20,30] | delpaths([[$k]])",
+            "[10,20,30]",
+        ),
+        (
+            "[-0.5]",
+            ".[0] as $k | [10,20,30] | del(.[$k])",
+            "[10,20,30]",
+        ),
+        // Batched with other keys, each resolves on its own.
+        ("[10,20,30]", "del(.[-0.5], .[1])", "[10,30]"),
+        ("[10,20,30]", "del(.[-0.5,1])", "[10,30]"),
+        ("[10,20,30]", "del(.[(-0.5,-1)])", "[10,20]"),
+        ("[10,20,30]", "del(.[-0.5, -2.5])", "[10,30]"),
+        ("[10,20,30]", "delpaths([[-2.5],[-0.5]])", "[10,30]"),
+        ("[10,20,30]", "del(.[-0.5], .[0])", "[20,30]"),
+        // Outside the band nothing changes: truncate toward zero, then sign.
+        ("[10,20,30]", "del(.[-1.5])", "[10,20]"),
+        ("[10,20,30]", "del(.[-2.5])", "[10,30]"),
+        ("[10,20,30]", "del(.[-3.5])", "[20,30]"),
+        ("[10,20,30]", "del(.[-4.5])", "[10,20,30]"),
+        ("[10,20,30]", "del(.[0.5])", "[20,30]"),
+        ("[10,20,30]", "del(.[2.5])", "[10,20]"),
+        // A negative zero is not negative.
+        ("[10,20,30]", "del(.[-0.0])", "[20,30]"),
+        // A middle step truncates first, as a read does.
+        ("[[1,2],20,30]", "del(.[-0.5][0])", "[[2],20,30]"),
+        ("[[1,2],20,30]", "delpaths([[-0.5,0]])", "[[2],20,30]"),
+        ("[[1,2,3],[4]]", "del(.[-0.5][-0.5])", "[[1,2,3],[4]]"),
+        ("[1,[2,3]]", "del(.[1][-0.5], .[-0.5])", "[1,[2,3]]"),
+        // `.[0.5]` and `.[0]` are separate groups, run in key order.
+        ("[[1,2,3]]", "del(.[0.5][1], .[0][0])", "[[2]]"),
+        ("[[1,2,3]]", "del(.[0][0], .[0.5][1])", "[[2]]"),
+        ("[[1,2,3]]", "del(.[-0.5][0], .[0][1])", "[[2]]"),
+        (
+            "[[1,2,3],[4]]",
+            "del(.[0][-0.5], .[-0.5][0])",
+            "[[2,3],[4]]",
+        ),
+        ("[[1,2,3]]", "del(.[0.5][1], .[0.5][0])", "[[3]]"),
+        ("[[1,2,3]]", "del(.[0.5], .[0][0])", "[]"),
+        ("[10,20,30]", "del(.[1.5], .[1])", "[10,30]"),
+        // `|= empty` removes an emptied path with `delpaths([$p])`, so the
+        // same last-step rule applies, single path or several.
+        ("[10,20,30]", ".[-0.5] |= empty", "[10,20,30]"),
+        ("[10,20,30]", ".[-0.5] |= select(false)", "[10,20,30]"),
+        (
+            r#"{"a":[10,20,30]}"#,
+            ".a[-0.5] |= empty",
+            r#"{"a":[10,20,30]}"#,
+        ),
+        ("[10,20,30]", "(.[-0.5], .[1]) |= empty", "[10,30]"),
+        ("[10,20,30]", ".[0.5] |= empty", "[20,30]"),
+        ("[10,20,30]", ".[-1.5] |= empty", "[10,20]"),
+        ("[10,20,30]", ".[-0.5] |= . + 1", "[11,20,30]"),
+        // A slice group alongside a fractional one still sorts after it.
+        ("[[1,2,3],[4]]", "del(.[0.5:1][0], .[0][0])", "[[4]]"),
+        ("[[1,2,3],[4]]", "del(.[0:1][0], .[0.5][0])", "[[4]]"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
-            (stdout.as_str(), code),
-            ("", 5),
-            "#3188 residual ({residual}): `{filter}`: stderr={stderr:?}"
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3302: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// yq mode keeps truncating: real yq rejects every fractional index (a
+/// separate gap), and #3302's fix is gated on jq semantics so `succinctly yq`
+/// answers exactly as it did before.
+#[test]
+fn test_del_fractional_index_yq_mode_unchanged_3302() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[10,20,30]", "del(.[-0.5])", "[20,30]"),
+        ("[10,20,30]", "del(.[-0.5], .[1])", "[30]"),
+        (
+            "[[1,2,3],20,30]",
+            "del(.[0.5][0], .[0][0])",
+            "[[2,3],20,30]",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.trim_end(),
+            expected,
+            "#3302 (yq): `{filter}`: stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
     Ok(())
