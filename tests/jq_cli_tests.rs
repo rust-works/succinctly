@@ -69885,6 +69885,98 @@ fn test_as_binding_and_two_arg_builtins_retry_past_a_body_error_2952() -> Result
     Ok(())
 }
 
+/// #3295: `fanout_arg_each_generic_with_origin` (the fan-out behind a plain
+/// `EXPR as $v | BODY` bind, `Expr::As`) had the same stale-`escape`-slot
+/// shape #2924 tracks for two path-resolver sinks, but in the value-mode
+/// `as`-binding fan-out instead: both its escape arms wrote
+/// `escape = Some(control); Demand::Stop` directly rather than through
+/// [`crate::jq::eval::stop_with_escape`], so `nonretryable_stop` was never
+/// set. `each_pattern_alternatives_generic`'s retry decision then treated a
+/// `Halt` escaping from the first `?//` alternative as an ordinary,
+/// retryable stop and ran the next alternative anyway -- printing (and, for
+/// `halt_error`, exiting through) the body twice for a filter jq runs once.
+/// Its sibling `fanout_arg_each_generic` one screen up already routed
+/// correctly; this pins the twin.
+#[test]
+fn test_plain_as_bind_does_not_retry_a_halt_3295() -> Result<()> {
+    // `halt_error` writes its (JSON-encoded, non-string) input to stderr,
+    // not stdout, and exits with the given code -- verified byte-for-byte
+    // against jq 1.7.1 for every row here.
+    let (out, err, code) = run_jq_full(
+        &["-c", r"(1 as $x ?// $y | 1) as $v | halt_error(3)"],
+        Some("1"),
+    )?;
+    assert_eq!((out.as_str(), code), ("", 3), "stdout: {out:?}");
+    assert_eq!(err, "1\n", "stderr: {err:?}");
+
+    // The handler's own stderr write must fire exactly once too -- a
+    // retried alternative would run the whole body, `stderr` included, a
+    // second time.
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"(1 as $x ?// $y | ("e"|stderr) | 1) as $v | halt_error(3)"#,
+        ],
+        Some("1"),
+    )?;
+    assert_eq!((out.as_str(), code), ("", 3), "stdout: {out:?}");
+    assert_eq!(err, "e1\n", "stderr: {err:?}");
+
+    let (out, err, code) = run_jq_full(
+        &["-c", r"first((1 as $x ?// $y | 1) as $v | halt_error(3))"],
+        Some("1"),
+    )?;
+    assert_eq!((out.as_str(), code), ("", 3), "stdout: {out:?}");
+    assert_eq!(err, "1\n", "stderr: {err:?}");
+
+    // A bare `halt` (no message) must stop after one alternative too --
+    // this exercises `Control::Halt(None)`, not just `halt_error`'s
+    // `Control::Halt(Some(_))`. `halt` prints nothing and exits 0.
+    let (out, err, code) = run_jq_full(&["-c", r"(1 as $x ?// $y | 1) as $v | halt"], Some("1"))?;
+    assert_eq!((out.as_str(), err.as_str(), code), ("", "", 0));
+    Ok(())
+}
+
+/// #3295: the decode-failure arm had the identical bug -- a malformed
+/// element decoded while binding `$v` must raise once, not retry into the
+/// next `?//` alternative and answer as if nothing had failed. Both the
+/// bare `$v` and pattern `[$v]` forms must agree, since `each_as_pattern_
+/// generic` already routed through `fanout_arg_each_generic` correctly and
+/// must not silently diverge from its `with_origin` twin now that this is
+/// fixed.
+#[test]
+fn test_plain_as_bind_does_not_retry_a_decode_failure_3295() -> Result<()> {
+    let input = r#"{"a": "\x", "p": 1}"#;
+    for filter in [
+        r#"([.p] as $x ?// [$x] | if ($x|type)=="array" then .a else 100 end) as $v | $v"#,
+        r#"([.p] as $x ?// [$x] | if ($x|type)=="array" then .a else 100 end) as [$v] | $v"#,
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={out:?} stderr={err:?}");
+        assert_eq!(out, "", "`{filter}`: stdout={out:?}");
+        assert!(
+            err.contains("invalid escape sequence"),
+            "`{filter}`: stderr={err:?}"
+        );
+    }
+
+    // Control: an ordinary `error(...)` (not a decode failure or `Halt`)
+    // must still retry past the first `?//` alternative -- this guards
+    // against over-correcting into refusing every stop that carries an
+    // escape.
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"(1 as $x ?// $y | ("e"|stderr) | 1) as $v | error("boom")"#,
+        ],
+        Some("1"),
+    )?;
+    assert_eq!(out, "", "stdout: {out:?}");
+    assert_eq!(err, "eejq: error (at <stdin>:0): boom\n", "stderr: {err:?}");
+    assert_eq!(code, 5);
+    Ok(())
+}
+
 /// #2874: the whole preserve-vs-reformat flag matrix, in one place.
 ///
 /// The refactor that folded `OutputConfig::jq_compat` and
