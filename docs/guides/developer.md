@@ -271,7 +271,10 @@ Use clippy with all warnings as errors. `--all-features` alone is not
 enough: it enables `scalar-yaml` and `portable-popcount`, which compile out
 the real YAML SIMD backends and the AVX-512 popcount path respectively, so
 neither is ever linted by that invocation alone (see CLAUDE.md's Feature
-Flags section for why). Run the invocation(s) matching your architecture:
+Flags section for why). Run the invocation(s) matching your architecture,
+or just run `scripts/build.sh`/`scripts/test.sh`, which already run all of
+them (the feature lists below have one source of truth,
+`scripts/lib/clippy-variants.sh` — #3354):
 
 ```bash
 # Every architecture

@@ -6,6 +6,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib/clippy-variants.sh
+source "$SCRIPT_DIR/lib/clippy-variants.sh"
+
 echo "=== Checking succinctly ==="
 cd "$ROOT_DIR"
 cargo check --all-targets --all-features
@@ -22,7 +26,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 # invocation to close (#185, #388, #3006, #3254). Matches ci.yml's `clippy` job.
 echo ""
 echo "=== Linting succinctly (clippy, YAML SIMD + AVX-512 popcount backend selected) ==="
-cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+cargo clippy --all-targets --features "$CLIPPY_CORE_FEATURES" -- -D warnings
 
 # The YAML backend selectors are cfg-exclusive to one target_arch, so the
 # invocation above never selects `neon`/`broadword` on an ARM machine either
@@ -33,7 +37,7 @@ case "$(uname -m)" in
   aarch64|arm64)
     echo ""
     echo "=== Linting succinctly (clippy, ARM broadword-yaml backend selected) ==="
-    cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+    cargo clippy --all-targets --features "$CLIPPY_ARM_BROADWORD_FEATURES" -- -D warnings
     ;;
 esac
 
