@@ -3864,14 +3864,11 @@ to `. as {(k): $v}` destructuring, and to a key read from the document (whose
 shape-only copy now keeps an object key's `start` and `end`). yq has no such key and is
 unchanged.
 
-**Narrow gap: `del()` groups two descriptors with the same bounds.** jq's `delpaths_sorted`
-groups continuations by `jv_equal` on the whole key, so two descriptors that differ only in
-an extra key are two groups, each run in `jv_sort` order (an object with more keys sorts
-later). `del()`'s comma-grouped route keys a slice step by its bounds alone, so
-`[[1,2],[3,4],[5]] | del(.[{"start":0,"end":2}][0], .[{"start":0,"end":2,"x":1}][0])` is
-`[[3,4],[5]]` where jq gives `[[5]]`, and an extra-key descriptor sorts by its bounds where
-jq sorts it after every canonical one. `delpaths` with the same paths already matches jq,
-because it compares whole components.
+`del()`'s comma-grouped route also groups slice continuations the way jq's `delpaths_sorted`
+does, by `jv_equal` on the whole component: `.[0.5:2]` and `.[0:2]`, or two descriptors that
+differ only in an extra key, are separate groups run in `jv_sort` order, even though they
+navigate identically. It used to key a slice by its bounds alone, so
+`[[1,2],[3,4],[5]] | del(.[0.5:2][0], .[0:2][0])` gave `[[3,4],[5]]` where jq gives `[[5]]`.
 
 ### A computed bound is ruled on at the slice step, after the target's kind (#2546)
 

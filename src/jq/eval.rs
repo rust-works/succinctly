@@ -2426,7 +2426,10 @@ fn scalar_fallback<'a, W: Clone + AsRef<[u64]>>(
 /// `index_one`/[`EvalError::cannot_index`] and `SliceBounds::resolved_bound`
 /// never inspect an Array/Object candidate's *contents* — only its type
 /// name, to build the `Cannot index ... with array/object`/`Array or string
-/// slice indices must be integers` message — so a full recursive [`to_owned_lossy`]
+/// slice indices must be integers` message — with one exception: in jq mode
+/// an object key is a slice descriptor (#3300), whose `start` and `end` are
+/// read, so those two members are kept, each as a number, `null` or
+/// [`bound_shape`]. Otherwise a full recursive [`to_owned_lossy`]
 /// of a large navigated container candidate is pure waste when it can only
 /// ever be rejected on type. Mirrors [`json_is_truthy`]'s existing "classify
 /// without paying for `to_owned_lossy`'s full deep copy" idiom, for the same
@@ -2445,20 +2448,41 @@ fn to_owned_key_shape<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Array(_) => Ok(OwnedValue::array()),
         // #3300: jq reads an object key's `start` and `end` as a slice
         // descriptor (`.[1][.[0]]` on `[{"start":0,"end":1},[1,2]]` is
-        // `[1]`), so jq mode keeps those two members and nothing else. Each
-        // is itself only shape-copied: a container bound can only fail
-        // classification.
+        // `[1]`), so jq mode keeps those two members and nothing else --
+        // `eval_generic`'s `descriptor_key_shape` is the same rule over a
+        // `DocumentValue`. A bound that is not a number or `null` can only
+        // fail classification, whatever it holds, so it keeps just its kind
+        // ([`bound_shape`]): the copy stays two levels deep and O(1) in the
+        // bound's size, as the old empty-object shape was.
         StandardJson::Object(fields) if S::TAG != EvalTag::Yq => {
             let mut desc = IndexMap::new();
             for name in ["start", "end"] {
                 if let Some(bound) = fields.clone().find(name)? {
-                    desc.insert(name.into(), to_owned_key_shape::<W, S>(&bound)?);
+                    let shape = match bound {
+                        StandardJson::Number(_) | StandardJson::Null => to_owned::<S, _>(&bound)?,
+                        other => bound_shape(type_name(&other)),
+                    };
+                    desc.insert(name.into(), shape);
                 }
             }
             Ok(OwnedValue::Object(desc.into()))
         }
         StandardJson::Object(_) => Ok(OwnedValue::Object(IndexMap::new().into())),
         other => to_owned::<S, _>(other),
+    }
+}
+
+/// The placeholder a slice descriptor's non-numeric, non-`null` bound is
+/// copied as (#3300): an empty value of the same kind. Such a bound only
+/// ever fails classification (`Array/string slice indices must be
+/// integers`, whatever it holds), so its content is never needed, and
+/// dropping it keeps a key's copy shallow however deep or large the bound.
+pub(crate) fn bound_shape(type_name: &str) -> OwnedValue {
+    match type_name {
+        "array" => OwnedValue::array(),
+        "object" => OwnedValue::Object(IndexMap::new().into()),
+        "boolean" => OwnedValue::Bool(false),
+        _ => OwnedValue::String(String::new()),
     }
 }
 
@@ -8851,18 +8875,27 @@ pub(crate) fn owned_write_door<S: EvalSemantics>(
     let head = unwrap_paren(head);
     let target = write_target(head)?;
     let mut marked = false;
+    // A slice descriptor key, `.[{"start":0,"end":1}]` (#3300): an object
+    // constructor is admitted only as an index key, never as a stage of the
+    // target itself, and its entries are vetted like any other node.
+    let mut descriptor_keys: Vec<*const Expr> = Vec::new();
     let effectful = any_subexpr(target, &mut |e| {
         marked |= matches!(e, Expr::TrackedVar(_));
+        if let Expr::IndexExpr { key, .. } = e {
+            if matches!(**key, Expr::Object(_)) {
+                descriptor_keys.push(&**key);
+            }
+        }
+        let descriptor_key =
+            matches!(e, Expr::Object(_)) && descriptor_keys.contains(&(e as *const Expr));
         !(is_pure_navigation_node(e)
+            || descriptor_key
             || matches!(
                 e,
                 Expr::Optional(_)
                     | Expr::IndexExpr { .. }
                     | Expr::Arithmetic { .. }
                     | Expr::Negate(_)
-                    // A slice descriptor key, `.[{"start":0,"end":1}]`
-                    // (#3300): its entries are vetted like any other node.
-                    | Expr::Object(_)
             ))
     });
     if effectful || !marked {
@@ -15187,9 +15220,11 @@ fn collect_join_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 //
                 // The empty-object special case (#1047) is checked on the
                 // live cursor *before* that collapse: `JsonFields::is_empty`
-                // is an O(1) cursor check, and `to_owned_key_shape` always
-                // produces an empty `IndexMap` for *any* object regardless
-                // of its real field count, so checking emptiness after the
+                // is an O(1) cursor check, and `to_owned_key_shape` produces
+                // an empty `IndexMap` for *any* object in yq mode (this
+                // join's only mode; jq mode keeps a descriptor's `start`/
+                // `end`, #3300) regardless of its real field count, so
+                // checking emptiness after the
                 // collapse can't distinguish "genuinely empty" from
                 // "collapsed, contents unread" (a non-empty object would
                 // wrongly render as `{}` too).
@@ -24199,8 +24234,10 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // what gives this function a demand-driven pull to stop with.
     //
     // `Item::Borrowed` goes through `to_owned_key_shape` (STYLE-0012: this
-    // normalizes an array/object key to its empty shape rather than cloning
-    // its content -- matches the pre-#2138 `One`/`Many` arms exactly, since
+    // normalizes an array/object key to its shape rather than cloning its
+    // content -- an empty array or object, except that jq mode keeps an
+    // object's scalar `start`/`end` for the slice descriptor, #3300 --
+    // matches the pre-#2138 `One`/`Many` arms exactly, since
     // a `Many` key stream is what `push_many`-style unpacking now delivers
     // as repeated `Borrowed` pushes). `Item::Owned` mirrors the pre-#2138
     // `Owned`/`ManyOwned` arms exactly (no `to_owned_key_shape`
@@ -24701,7 +24738,8 @@ fn each_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// [`each_slice_bound`]'s pull: `expr` through [`eval_each`], a borrowed
 /// item normalized to its key shape (`to_owned_key_shape`: an array/object
-/// bound only ever matters for its error, so its content is never cloned),
+/// bound only ever matters for its error, so it is copied only as a shape --
+/// at most an object's two shallow `start`/`end` members, #3300),
 /// exactly as the eager version's `One`/`Many` arms did; a decode failure
 /// doing so is the bound generator's own escape, reported as
 /// `Flow::Escaped`.
@@ -24764,11 +24802,26 @@ pub(crate) fn owned_bound_to_i64(
 pub(crate) fn descriptor_slice_bounds(
     desc: &IndexMap<String, OwnedValue>,
 ) -> (ComputedSliceBound, ComputedSliceBound) {
-    let bound = |name: &str, round: fn(f64) -> f64| match desc.get(name) {
-        Some(v) => owned_bound_to_i64(v, round),
-        None => Err(EvalError::slice_indices_not_integers()),
+    let (start, end) = descriptor_bound_sides(desc);
+    (start.bound, end.bound)
+}
+
+/// Both sides of a slice descriptor read as [`PathSliceBound`]s -- the one
+/// definition of the descriptor rule (#3300) that value mode
+/// ([`descriptor_slice_bounds`]) and path mode ([`descriptor_path_component`])
+/// both read: start floored and end ceiled as `E[S:T]`'s bounds are, and a
+/// missing side a failure like a non-number one. `slice::SliceBounds::
+/// from_descriptor` answers the same question for a runtime path component,
+/// which resolves against a length rather than carrying an `i64`.
+fn descriptor_bound_sides(desc: &IndexMap<String, OwnedValue>) -> (PathSliceBound, PathSliceBound) {
+    let side = |name: &str, round: fn(f64) -> f64| match desc.get(name) {
+        Some(v) => PathSliceBound::classify(v.clone(), round),
+        None => PathSliceBound {
+            bound: Err(EvalError::slice_indices_not_integers()),
+            key: None,
+        },
     };
-    (bound("start", f64::floor), bound("end", f64::ceil))
+    (side("start", f64::floor), side("end", f64::ceil))
 }
 
 /// One computed slice bound as `E[S:T]` carries it from the bound generator
@@ -31712,14 +31765,7 @@ fn descriptor_path_component<S: EvalSemantics>(
     desc: &IndexMap<String, OwnedValue>,
     container: &OwnedValue,
 ) -> Result<Expr, EvalError> {
-    let side = |name: &str, round: fn(f64) -> f64| match desc.get(name) {
-        Some(v) => PathSliceBound::classify(v.clone(), round),
-        None => PathSliceBound {
-            bound: Err(EvalError::slice_indices_not_integers()),
-            key: None,
-        },
-    };
-    let (s, e) = (side("start", f64::floor), side("end", f64::ceil));
+    let (s, e) = descriptor_bound_sides(desc);
     let (start, end) = match SliceTargetKind::of_type_name(owned_type_name(container)) {
         SliceTargetKind::Null => (s.navigable(), e.navigable()),
         kind => resolve_computed_slice_bounds::<S>(kind, &s.bound, &e.bound)?,
@@ -53172,12 +53218,19 @@ enum ArrayStep {
     /// `idx` is the truncated index every navigation uses. `frac` is the
     /// `f64::to_bits` of the exact key when it is non-integral and the trie
     /// was built for jq mode (#3302); see [`array_index_step`].
-    Index {
-        idx: i64,
-        frac: Option<u64>,
-    },
-    Slice(Option<i64>, Option<i64>),
+    Index { idx: i64, frac: Option<u64> },
+    /// The navigable bounds, and the id of the component's jq value in
+    /// [`DeleteTrie::slice_components`] (#3300). jq groups `delpaths`
+    /// continuations by `jv_equal` on the whole key, so `.[0.5:2]` and
+    /// `.[0:2]`, or two descriptors that differ only in an extra key, are
+    /// separate groups even though they navigate identically; the id keeps
+    /// them apart. yq mode groups by the bounds alone and leaves the id at
+    /// [`YQ_SLICE_COMPONENT`].
+    Slice(Option<i64>, Option<i64>, u32),
 }
+
+/// [`ArrayStep::Slice`]'s component id in yq mode, which never interns one.
+const YQ_SLICE_COMPONENT: u32 = u32::MAX;
 
 /// The [`ArrayStep`] a static `Expr::Index { idx, key }` component becomes.
 ///
@@ -53319,10 +53372,14 @@ impl DeleteTrieNode {
 /// ends at this node is never walked into, only deleted wholesale
 /// (`DeleteTrieNode::terminal`'s doc comment), and an array continuation
 /// alongside a slice sibling runs in jq's key order, not insertion order
-/// (`jq_delpaths_array_step_key`) — #2929. The one thing they do not mirror
+/// (`jq_delpaths_array_step_cmp`) — #2929. The one thing they do not mirror
 /// is the per-position re-grouping, which is what the trie replaces.
 struct DeleteTrie {
     nodes: Vec<DeleteTrieNode>,
+    /// Each distinct slice component's jq value, indexed by
+    /// [`ArrayStep::Slice`]'s id -- what jq groups and orders slice
+    /// continuations by (#3300).
+    slice_components: Vec<OwnedValue>,
 }
 
 impl DeleteTrie {
@@ -53374,6 +53431,10 @@ struct DeleteTrieBuilder {
     /// Reused across [`Self::push_component`] calls so flattening one chain
     /// component doesn't allocate per node.
     scratch: Vec<DeleteStep>,
+    /// The interned [`DeleteTrie::slice_components`] ids for each pair of
+    /// navigable bounds -- only components with equal bounds can be
+    /// `jv_equal`, so a lookup compares against those alone.
+    slice_ids: BTreeMap<(Option<i64>, Option<i64>), Vec<u32>>,
     /// Whether the trie is for yq mode, which keys array edges by the
     /// truncated index alone (see [`array_index_step`]).
     yq_mode: bool,
@@ -53384,9 +53445,11 @@ impl DeleteTrieBuilder {
         Self {
             trie: DeleteTrie {
                 nodes: vec![DeleteTrieNode::new(DELETE_TRIE_ROOT, 0, true, false)],
+                slice_components: Vec::new(),
             },
             memo: BTreeMap::new(),
             scratch: Vec::new(),
+            slice_ids: BTreeMap::new(),
             yq_mode,
         }
     }
@@ -53465,8 +53528,14 @@ impl DeleteTrieBuilder {
                 let step = array_index_step(*idx, key.as_ref(), self.yq_mode);
                 self.array_child(parent, step, optional)
             }
-            Expr::Slice { start, end, .. } => {
-                self.array_child(parent, ArrayStep::Slice(*start, *end), optional)
+            Expr::Slice {
+                start,
+                end,
+                start_key,
+                end_key,
+            } => {
+                let step = self.slice_step(*start, *end, start_key.as_ref(), end_key.as_ref());
+                self.array_child(parent, step, optional)
             }
             // See `needs_fanout_pass`'s doc comment for why a bare
             // `Expr::Iterate` can never reach a comma-grouped `del()` path
@@ -53502,6 +53571,38 @@ impl DeleteTrieBuilder {
             }
         }
         Ok(id)
+    }
+
+    /// The [`ArrayStep`] a static `Expr::Slice` component becomes: its
+    /// bounds, plus in jq mode the id of its rendered component, shared by
+    /// every `jv_equal` component (#3300).
+    fn slice_step(
+        &mut self,
+        start: Option<i64>,
+        end: Option<i64>,
+        start_key: Option<&SliceBoundKey>,
+        end_key: Option<&SliceBoundKey>,
+    ) -> ArrayStep {
+        if self.yq_mode {
+            return ArrayStep::Slice(start, end, YQ_SLICE_COMPONENT);
+        }
+        let component = slice_component_value(start, start_key, end, end_key);
+        let components = &mut self.trie.slice_components;
+        let ids = self.slice_ids.entry((start, end)).or_default();
+        let id = match ids.iter().find(|&&id| {
+            compare_values::<JqSemantics>(&components[id as usize], &component)
+                == core::cmp::Ordering::Equal
+        }) {
+            Some(&id) => id,
+            None => {
+                let id = u32::try_from(components.len())
+                    .expect("a del() match set cannot exceed u32::MAX distinct slices");
+                components.push(component);
+                ids.push(id);
+                id
+            }
+        };
+        ArrayStep::Slice(start, end, id)
     }
 
     fn push_node(&mut self, parent: u32, slot: usize, keyed_by_field: bool, optional: bool) -> u32 {
@@ -53843,45 +53944,33 @@ fn delete_trie_object(
     Ok(value)
 }
 
-/// jq's `jv_sort` order for an array `del()` continuation's own step, used
-/// to reorder `delete_trie_array`'s `index_groups` when a slice or
-/// fractional-index continuation is present (#2929, #3302): `Index(a)` vs
-/// `Index(b)` compares the exact keys numerically, as `(truncation,
-/// fractional part)`, which orders `-0.5 < 0 < 0.5` even though all three
-/// truncate to `0`; every `Index` sorts before every `Slice`; `Slice(s1, e1)`
-/// vs `Slice(s2, e2)` compares `e1` with `e2` first, then `s1` with `s2`,
-/// with `None` sorting before `Some(n)` — exactly `Option<i64>`'s derived
-/// `Ord`, which the `(Option<i64>, Option<i64>)` tail of the returned tuple
-/// relies on directly rather than re-implementing the `None`-first rule.
-///
-/// This is the same ordering `delete_paths_sorted` gets from
-/// `compare_values::<S>` over the `OwnedValue` form of a path component
-/// (`slice::literal_component`'s `{"start":s,"end":e}` object, whose key
-/// order gives the `end`-then-`start` rule for free) — encoded again here,
-/// rather than reused, because `ArrayStep` is a lighter-weight type than
-/// `OwnedValue` and this is a hot sort key, not a one-off comparison. If
-/// jq's own slice-descriptor ordering ever changes, both sites need the
-/// same update.
-fn jq_delpaths_array_step_key(step: &ArrayStep) -> (u8, i64, f64, Option<i64>, Option<i64>) {
-    match *step {
-        ArrayStep::Index { idx, frac } => {
-            let fraction = frac.map_or(0.0, |bits| f64::from_bits(bits).fract());
-            (0, idx, fraction, None, None)
-        }
-        ArrayStep::Slice(s, e) => (1, 0, 0.0, e, s),
-    }
-}
-
-/// [`jq_delpaths_array_step_key`]'s total order. The fraction is finite and
-/// never `-0.0` (an integral key has none), so `total_cmp` agrees with `<`.
+/// jq's `jv_sort` order for two array `del()` continuation steps, used to
+/// reorder `delete_trie_array`'s `index_groups` when a slice or
+/// fractional-index continuation is present (#2929, #3302, #3300): every
+/// number sorts before every object, so an `Index` before a `Slice`. Two
+/// indices compare their exact keys, as `(truncation, fractional part)`,
+/// which orders `-0.5 < 0 < 0.5` even though all three truncate to `0` (the
+/// fraction is finite and never `-0.0`, so `total_cmp` agrees with `<`).
+/// Two slices compare their components' jq values, as `delete_paths_sorted`
+/// compares a `delpaths` path's -- so an extra-key descriptor sorts where
+/// jq's object order puts it, not by its bounds.
 fn jq_delpaths_array_step_cmp(
-    a: &(u8, i64, f64, Option<i64>, Option<i64>),
-    b: &(u8, i64, f64, Option<i64>, Option<i64>),
+    trie: &DeleteTrie,
+    a: &ArrayStep,
+    b: &ArrayStep,
 ) -> core::cmp::Ordering {
-    (a.0, a.1)
-        .cmp(&(b.0, b.1))
-        .then(a.2.total_cmp(&b.2))
-        .then((a.3, a.4).cmp(&(b.3, b.4)))
+    let fraction = |frac: Option<u64>| frac.map_or(0.0, |bits| f64::from_bits(bits).fract());
+    match (*a, *b) {
+        (ArrayStep::Index { idx: ia, frac: fa }, ArrayStep::Index { idx: ib, frac: fb }) => {
+            ia.cmp(&ib).then(fraction(fa).total_cmp(&fraction(fb)))
+        }
+        (ArrayStep::Index { .. }, ArrayStep::Slice(..)) => core::cmp::Ordering::Less,
+        (ArrayStep::Slice(..), ArrayStep::Index { .. }) => core::cmp::Ordering::Greater,
+        (ArrayStep::Slice(_, _, ca), ArrayStep::Slice(_, _, cb)) => compare_values::<JqSemantics>(
+            &trie.slice_components[ca as usize],
+            &trie.slice_components[cb as usize],
+        ),
+    }
 }
 
 /// The pre-#1690 `delete_expr_array_paths`'s counterpart.
@@ -54026,14 +54115,12 @@ fn delete_trie_array(
                     Some(ArrayStep::Slice(..) | ArrayStep::Index { frac: Some(_), .. })
                 )
             }) {
-            // Decorate once, then a stable sort: computing the key inside
-            // the comparator -- an `IndexMap` lookup plus a match -- would
-            // run it up to O(n log n) times instead of once per element.
-            // `index_groups` can run to a few thousand entries for a
-            // filtered recursive descent (#1690); this keeps the lookup
-            // itself linear regardless. The key's fraction is an `f64`
-            // (#3302), so it sorts by `jq_delpaths_array_step_cmp` rather
-            // than a derived `Ord`.
+            // Decorate once, then a stable sort: looking the step up inside
+            // the comparator -- an `IndexMap` lookup -- would run it up to
+            // O(n log n) times instead of once per element. `index_groups`
+            // can run to a few thousand entries for a filtered recursive
+            // descent (#1690); this keeps the lookup itself linear
+            // regardless.
             let mut keyed: Vec<_> = node
                 .index_groups
                 .iter()
@@ -54042,10 +54129,10 @@ fn delete_trie_array(
                         .indices
                         .get_index(slot)
                         .expect("index_groups holds live indices indices");
-                    (jq_delpaths_array_step_key(step), slot)
+                    (*step, slot)
                 })
                 .collect();
-            keyed.sort_by(|(a, _), (b, _)| jq_delpaths_array_step_cmp(a, b));
+            keyed.sort_by(|(a, _), (b, _)| jq_delpaths_array_step_cmp(trie, a, b));
             sorted_index_groups = keyed.into_iter().map(|(_, slot)| slot).collect::<Vec<_>>();
             &sorted_index_groups
         } else {
@@ -54111,7 +54198,7 @@ fn delete_trie_array(
                 // than first-resolved order, and never under a key this
                 // node's terminal-skip above already deleted wholesale
                 // (#2929).
-                ArrayStep::Slice(s, e) => {
+                ArrayStep::Slice(s, e, _) => {
                     let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
                     let sub = OwnedValue::Array(arr[range.clone()].to_vec().into());
                     let OwnedValue::Array(items) = delete_trie_apply(sub, trie, child, yq_mode)?
@@ -54144,7 +54231,7 @@ fn delete_trie_array(
         .filter(|(_, &child)| trie.node(child).terminal)
         .map(|(step, _)| match step {
             ArrayStep::Index { idx, frac } => array_index_step_key(*idx, *frac),
-            ArrayStep::Slice(s, e) => slice::literal_component(*s, *e),
+            ArrayStep::Slice(s, e, _) => slice::literal_component(*s, *e),
         })
         .collect();
     if !doomed.is_empty() {

@@ -53,9 +53,9 @@ use super::document::{
 use super::error::EvalEscape;
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
-    boolean_fanout_bools, boolean_fanout_each, cannot_reserve_cross_product, classify_limit_n,
-    classify_nth_n, classify_parent_n, classify_skip_n, clear_nonretryable_stop, collapse_vec,
-    collect_pattern_var_names, compare_key_arrays, compare_values,
+    boolean_fanout_bools, boolean_fanout_each, bound_shape, cannot_reserve_cross_product,
+    classify_limit_n, classify_nth_n, classify_parent_n, classify_skip_n, clear_nonretryable_stop,
+    collapse_vec, collect_pattern_var_names, compare_key_arrays, compare_values,
     debug_assert_materialization_error, demote_for_reentry, descriptor_slice_bounds,
     each_path_on_owned, each_pattern_binding_set, each_recurse_walk, enter_def_call,
     entries_to_object, eval_each_owned, eval_full as full_eval, finish_fork_flow,
@@ -1925,9 +1925,10 @@ fn to_owned_key_shape<V: DocumentValue, S: EvalSemantics>(
 }
 
 /// An object key's shape: empty, except that jq mode keeps its `start` and
-/// `end` members, which jq reads as a slice descriptor (#3300; `eval.rs`'s
-/// `to_owned_key_shape` has the same rule). Each member is itself only
-/// shape-copied: a container bound can only fail classification.
+/// `end` members, which jq reads as a slice descriptor (#3300). The same
+/// rule as `eval.rs`'s `to_owned_key_shape` object arm, over a
+/// `DocumentValue`: a number or `null` bound is copied, anything else only
+/// by kind (`eval::bound_shape`), so the copy stays shallow.
 fn descriptor_key_shape<V: DocumentValue, S: EvalSemantics>(
     fields: &V::Fields,
 ) -> Result<OwnedValue, EvalError> {
@@ -1935,7 +1936,11 @@ fn descriptor_key_shape<V: DocumentValue, S: EvalSemantics>(
     if S::TAG != EvalTag::Yq {
         for name in ["start", "end"] {
             if let Some(bound) = fields.find(name)? {
-                desc.insert(name.into(), to_owned_key_shape::<V, S>(&bound)?);
+                let shape = match bound.type_name() {
+                    "number" | "null" => to_owned::<S, _>(&bound)?,
+                    other => bound_shape(other),
+                };
+                desc.insert(name.into(), shape);
             }
         }
     }
@@ -16278,7 +16283,8 @@ fn each_slice_bound_generic<S: EvalSemantics, V: DocumentValue>(
 /// normalized to its key shape the way the eager version did:
 /// `One`/`OneCursor` through `to_owned_key_shape`/
 /// `to_owned_key_shape_cursor` (STYLE-0012: an array/object bound only ever
-/// matters for its error, so its content is never cloned; `OneCursorValue`
+/// matters for its error, so it is copied only as a shape -- at most an
+/// object's two shallow `start`/`end` members, #3300; `OneCursorValue`
 /// is folded in like `OneCursor` for the reason `eval_index_expr`'s own
 /// sink gives), the lazy variants through `generic_item_to_result(..)
 /// .collect_owned::<S>()` exactly as the old `other => other.collect_owned::<S>()`

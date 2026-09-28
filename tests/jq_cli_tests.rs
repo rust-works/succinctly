@@ -66194,6 +66194,24 @@ fn test_object_index_key_is_a_slice_descriptor_3300() -> Result<()> {
             ". as $x | [.] | (.[0] | $x | .[1:]) |= map(.*10)",
             "[[1,20]]",
         ),
+        // `del()` groups slice continuations by the whole component, as jq's
+        // `delpaths_sorted` does: equal bounds are not one group.
+        ("[[1,2],[3,4],[5]]", "del(.[0.5:2][0], .[0:2][0])", "[[5]]"),
+        (
+            "[[1,2],[3,4],[5]]",
+            r#"del(.[{"start":0,"end":2}][0], .[{"start":0,"end":2,"x":1}][0])"#,
+            "[[5]]",
+        ),
+        (
+            "[[1,2],[3,4],[5]]",
+            r#"del(.[{"start":1,"end":2}][0], .[{"start":0,"end":1,"x":0}][0])"#,
+            "[[5]]",
+        ),
+        (
+            "[[1,2],[3,4],[5]]",
+            r#"del(.[{"end":2,"start":0}][0], .[0:2][0])"#,
+            "[[3,4],[5]]",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
@@ -66282,6 +66300,33 @@ fn test_object_index_key_is_a_slice_descriptor_3300() -> Result<()> {
         ("[1]", 0),
         "#3300 (input bridge): stderr={stderr:?}"
     );
+    Ok(())
+}
+
+/// A document-read descriptor key keeps only a *shape* of each bound
+/// (#3300 review): a deeply nested `start` used to be copied whole, which
+/// overflowed the stack or tripped the literal splice's depth panic. A
+/// container bound only ever fails classification, so the key stays two
+/// levels deep and the error stays catchable.
+#[test]
+fn test_deep_document_descriptor_key_is_a_catchable_error_3300() -> Result<()> {
+    let depth = 2000;
+    let input = format!(
+        "[{}1{},[1,2,3]]",
+        r#"{"start":"#.repeat(depth),
+        "}".repeat(depth)
+    );
+    for filter in ["try .[1][.[0]] catch .", "[.[1][.[0]]?]"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&input))?;
+        assert_eq!(
+            code, 0,
+            "#3300: `{filter}` must not crash: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout == "\"Array/string slice indices must be integers\"\n" || stdout == "[]\n",
+            "#3300: `{filter}`: stdout={stdout:?}"
+        );
+    }
     Ok(())
 }
 
