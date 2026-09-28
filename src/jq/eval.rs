@@ -98801,7 +98801,7 @@ mod tests {
             )
             .expect_err("depth guard should refuse at the limit");
             let EvalEscape::Error(e) = err else {
-                panic!("expected EvalEscape::Error, got {err:?}");
+                panic!("expected EvalEscape::Error, got {err:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- check_value_tree_depth's only Err variant is EvalError, and From<EvalError> for EvalEscape always produces EvalEscape::Error (#3275)"
             };
             assert!(e.is_resource_limit(), "optional={optional}: {e:?}");
             assert!(e.is_uncatchable(), "optional={optional}: {e:?}");
