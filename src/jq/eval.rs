@@ -79091,15 +79091,62 @@ mod tests {
 
     #[test]
     fn test_if_no_else() {
-        // if without else (defaults to null)
-        query!(br#"{"a": false}"#, "if .a then 1 end",
-            QueryResult::Owned(OwnedValue::Null) => {}
+        // jq 1.7 defines `if A then B end` as `if A then B else . end` — the
+        // falsy branch passes the input through unchanged, not null. It comes
+        // back as `One` (the original document, unmaterialized) rather than
+        // `Owned`, since the identity branch never constructs a new value.
+        query!(br"1", "if false then 5 end",
+            QueryResult::One(v) => {
+                assert!(matches!(
+                    to_owned_lossy::<JqSemantics, Vec<u64>>(&v),
+                    OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+                ));
+            }
         );
 
         query!(br#"{"a": true}"#, "if .a then 1 end",
             QueryResult::Owned(
                 OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
             ) => {}
+        );
+    }
+
+    #[test]
+    fn test_if_no_else_elif_chain() {
+        // Every `elif` branch falls through to the same `else .` desugaring
+        // once its own condition is falsy too, per jq 1.7.1:
+        // `1 | if false then 2 elif false then 3 end` => `1`.
+        query!(br"1", "if false then 2 elif false then 3 end",
+            QueryResult::One(v) => {
+                assert!(matches!(
+                    to_owned_lossy::<JqSemantics, Vec<u64>>(&v),
+                    OwnedValue::Int(1) | OwnedValue::NumberLiteral(NumberRepr::Int(1), _)
+                ));
+            }
+        );
+    }
+
+    #[test]
+    fn test_if_no_else_path_mode() {
+        // path(if false then .a end) is [] in jq 1.7.1: the identity
+        // else-branch contributes no path steps, matching path(.).
+        query!(br#"{"a": 1}"#, "path(if false then .a end)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
+
+        query!(br#"{"a": 1}"#, "path(if false then .a elif false then .b end)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
+
+        query!(br#"{"a": 1}"#, "path(if true then .a end)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0], OwnedValue::String("a".into()));
+            }
         );
     }
 

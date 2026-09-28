@@ -3158,9 +3158,9 @@ impl<'a> Parser<'a> {
 
             Ok(else_branch)
         } else if self.matches_keyword("end") {
-            // No else branch - default to null
+            // jq 1.7 defines `if A then B end` as `if A then B else . end`.
             self.consume_keyword("end");
-            Ok(Expr::Literal(Literal::Null))
+            Ok(Expr::Identity)
         } else {
             Err(ParseError::new(
                 "expected 'elif', 'else', or 'end'",
@@ -10150,11 +10150,11 @@ mod tests {
 
     #[test]
     fn test_if_no_else() {
-        // if without else should default to null
+        // if without else desugars to `else .`, per jq 1.7's own definition.
         let expr = parse("if .a then .b end").unwrap();
         match expr {
             Expr::If { else_branch, .. } => {
-                assert!(matches!(*else_branch, Expr::Literal(Literal::Null)));
+                assert!(matches!(*else_branch, Expr::Identity));
             }
             _ => panic!("expected If"),
         }
