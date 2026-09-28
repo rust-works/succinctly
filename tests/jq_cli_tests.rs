@@ -2522,23 +2522,17 @@ fn test_negative_filter_boundary_characters_3389() -> Result<()> {
     Ok(())
 }
 
-/// #3389 residual, tracked separately as #3397 (a pre-existing parser-
-/// precedence bug, not a CLI-parsing one): jq's unary minus binds looser
-/// than an `as`-binding's whole pipe (`-EXPR as $x | BODY` parses as
-/// `-(EXPR as $x | BODY)`, negating every output `BODY` produces), where
-/// succinctly binds it to the leading `EXPR` only. This filter was one of
-/// the boundary cases in #3389's own repro table; the CLI now accepts it
-/// (this issue's whole point), but its *result* still diverges from jq for
-/// the unrelated reason #3397 tracks. Pinned here as the current, known-
-/// divergent output rather than a jq match, so a future #3397 fix updates
-/// this test rather than silently drifting past it.
+/// #3389's boundary case, once a #3397 residual: jq's `as` binds only the
+/// Term before it and its pipe body runs to the end, so `-EXPR as $x |
+/// BODY` is `-(EXPR as $x | BODY)`, negating every output `BODY` produces
+/// (and `$x` is bound to the positive `0.5`). #3397 made succinctly's jq
+/// mode match; this filter was one of #3389's CLI-acceptance boundary rows,
+/// so it now pins jq 1.7.1's own answer end to end.
 #[test]
-fn test_negative_filter_unary_minus_as_binding_residual_3397() -> Result<()> {
+fn test_negative_filter_unary_minus_as_binding_matches_jq_3397() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "-0.5 as $i | ($i, 100)"], Some("null"))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    // jq 1.7.1 answers "-0.5\n-100" (negates the whole bind-and-pipe); this
-    // is the current, still-diverging succinctly answer (#3397).
-    assert_eq!(stdout, "-0.5\n100\n");
+    assert_eq!(stdout, "-0.5\n-100\n");
     Ok(())
 }
 
@@ -75746,5 +75740,115 @@ fn test_comma_nested_under_if_bind_source_classified_per_leaf_3334() -> Result<(
     )?;
     assert_eq!(code, 0);
     assert_eq!(out, "[[\"a\"],[\"a\"]]\n");
+    Ok(())
+}
+
+/// #3397: in jq mode an `as` binds only the Term right before it, and its
+/// pipe body runs to the end of the enclosing expression -- jq's grammar makes
+/// `Term "as" Patterns '|' Exp` an `Exp` production, so whatever operator
+/// precedes the Term (unary minus included) takes the whole binding as its
+/// right operand: `2 * 1 as $x | $x + 10` is `22`, `-1 as $i | ($i, 100)`
+/// is `-1, -100` with `$i` bound to `1`. The table covers unary minus (a
+/// literal and an expression operand, `try`/`label`/`def`/`reduce`/`if`
+/// after it), binary operators, `?//` patterns, assignment right-hand sides
+/// and `reduce`/`foreach` sources, whose own `as` must stay the fold's. Every
+/// value captured from jq 1.7.1; `(input, filter, stdout, exit)`.
+#[test]
+fn test_as_binding_binds_only_the_preceding_term_3397() -> Result<()> {
+    for (input, filter, stdout, exit) in [
+        (r"null", r"-1 as $i | ($i, 100)", "-1\n-100\n", 0),
+        (r"null", r"[-1, 2]", "[-1,2]\n", 0),
+        (r"null", r"[-1 | . + 10]", "[9]\n", 0),
+        (r"null", r"-1 + 2", "1\n", 0),
+        (r"null", r"[-(1,2)]", "[-1,-2]\n", 0),
+        (r"null", r"-2 * 3", "-6\n", 0),
+        (r"null", r"[- 1 // 2]", "[-1]\n", 0),
+        (r"null", r"-1 == -1", "true\n", 0),
+        (r"null", r"[-1 as $x | $x, 5]", "[-1,-5]\n", 0),
+        (r#"{"a":3}"#, r"[-.a | . * 2]", "[-6]\n", 0),
+        (r"null", r"[-1 | tostring]", "[\"-1\"]\n", 0),
+        (r"null", r"-1 - -1", "0\n", 0),
+        (r"null", r"[1, -2 | . * 10]", "[10,-20]\n", 0),
+        (r"null", r"[-. as $x | 1]", "[-1]\n", 0),
+        (r"3", r"-. + 1", "-2\n", 0),
+        (r"[4]", r"[-try 1 catch 2]", "[-1]\n", 0),
+        (r"[4]", r"[-label $o | 1, 2]", "[-1,-2]\n", 0),
+        (r"[4]", r"[-def f: 1; f, 2]", "[-1,-2]\n", 0),
+        (r"[4]", r"[-reduce (1,2) as $x (0; .+$x)]", "[-3]\n", 0),
+        (r"[4]", r"[-if true then 1 else 2 end, 3]", "[-1,3]\n", 0),
+        (r"[4]", r"[-[1] as [$a] ?// $b | $a, 7]", "[-1,-7]\n", 0),
+        (r"[4]", r"[-1 as $i | $i + 1, 7]", "[-2,-7]\n", 0),
+        (r"[4]", r"[-(1 as $i | $i), 7]", "[-1,7]\n", 0),
+        (r"[4]", r"[-.[0] as $i | $i, 7]", "[-4,-7]\n", 0),
+        (r"[4]", r"[- 1 as $i | 2]", "[-2]\n", 0),
+        (r"[4]", r"[-1 as $a | 5 as $b | $b]", "[-5]\n", 0),
+        (r"[4]", r"[-1 as $i | ($i, 100) | . * 2]", "[-2,-200]\n", 0),
+        (r"[4]", r"[(-1 as $i | $i), 100]", "[-1,100]\n", 0),
+        (r"[4]", r"2 * 1 as $x | $x + 10", "22\n", 0),
+        (r"[4]", r"[1, 2 as $x | $x + 10]", "[1,12]\n", 0),
+        (r"[4]", r"10 - 1 as $x | $x", "9\n", 0),
+        (r"[4]", r"[.[0] + 1 as $x | $x, 7]", "[5,11]\n", 0),
+        (r"[4]", r#""a" + "b" as $x | $x"#, "\"ab\"\n", 0),
+        (r"[4]", r"[1 // 2 as $x | $x, 9]", "[1]\n", 0),
+        (r"[4]", r"[1 and 2 as $x | $x]", "[true]\n", 0),
+        (r"[4]", r"1 == 1 as $x | $x", "true\n", 0),
+        (r"[4]", r"[2 * -1 as $x | $x, 5]", "[-2,-10]\n", 0),
+        (r"[4]", r"[-1.5 as $x | $x, 2]", "[-1.5,-2]\n", 0),
+        (r"[4]", r"[-1e2 as $x | $x]", "[-100]\n", 0),
+        (r"[4]", r"[.[-1] as $x | $x]", "[4]\n", 0),
+        (
+            r"[4]",
+            r#"{"a":1} | .a = 1 as $x | $x + 1"#,
+            "{\"a\":2}\n",
+            0,
+        ),
+        (
+            r"[4]",
+            r#"{"a":1} | .a |= 2 as $x | $x + ."#,
+            "{\"a\":3}\n",
+            0,
+        ),
+        (r"[4]", r"[.[] as $x | $x * 2]", "[8]\n", 0),
+        (r"[4]", r"[reduce .[] as $x (0; . + $x)]", "[4]\n", 0),
+        (r"[4]", r"[foreach .[] as $x (0; . + $x)]", "[4]\n", 0),
+        (r"[4]", r"[1 as $x | 2 as $y | $x + $y]", "[3]\n", 0),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "--", filter], Some(input))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (stdout, exit),
+            "`{filter}` on {input}: stderr {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3397, yq mode: real yq binds the whole left expression before `as`
+/// (`2 * 1 as $x | $x + 10` is `12` in yq v4.53.3), so `succinctly yq`
+/// keeps doing so; only jq mode moved to jq's grammar.
+#[test]
+fn test_as_binding_still_binds_whole_left_expression_in_yq_mode_3397() -> Result<()> {
+    for (filter, expected) in [
+        ("2 * 1 as $x | $x + 10", "12"),
+        ("[1 // 2 as $x | $x, 9]", "[1,9]"),
+        ("[.a + 1 as $x | $x, 7]", "[5,7]"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().expect("piped").write_all(b"a: 4\n")?;
+                child.wait_with_output()
+            })?;
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            expected,
+            "#3397 (yq): `{filter}`: stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     Ok(())
 }
