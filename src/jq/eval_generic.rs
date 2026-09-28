@@ -53,14 +53,14 @@ use super::document::{
 use super::error::EvalEscape;
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
-    boolean_fanout_bools, boolean_fanout_each, cannot_reserve_cross_product, classify_limit_n,
-    classify_nth_n, classify_parent_n, classify_skip_n, clear_nonretryable_stop, collapse_vec,
-    collect_pattern_var_names, compare_key_arrays, compare_values,
-    debug_assert_materialization_error, demote_for_reentry, each_path_on_owned,
-    each_pattern_binding_set, each_recurse_walk, enter_def_call, entries_to_object,
-    eval_each_owned, eval_full as full_eval, finish_fork_flow, finish_fork_from_flow,
-    finish_short_circuit, fold_escaped_generator_prefix, foreach_forks, format_owned,
-    has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    boolean_fanout_bools, boolean_fanout_each, bound_shape, cannot_reserve_cross_product,
+    classify_limit_n, classify_nth_n, classify_parent_n, classify_skip_n, clear_nonretryable_stop,
+    collapse_vec, collect_pattern_var_names, compare_key_arrays, compare_values,
+    debug_assert_materialization_error, demote_for_reentry, descriptor_slice_bounds,
+    each_path_on_owned, each_pattern_binding_set, each_recurse_walk, enter_def_call,
+    entries_to_object, eval_each_owned, eval_full as full_eval, finish_fork_flow,
+    finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
+    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_assignment_expr, is_eager_arg,
     is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
@@ -1917,11 +1917,34 @@ fn to_owned_key_shape<V: DocumentValue, S: EvalSemantics>(
 ) -> Result<OwnedValue, EvalError> {
     if value.is_array() {
         Ok(OwnedValue::array())
-    } else if value.is_object() {
-        Ok(OwnedValue::Object(IndexMap::new().into()))
+    } else if let Some(fields) = value.as_object() {
+        descriptor_key_shape::<V, S>(&fields)
     } else {
         to_owned::<S, _>(value)
     }
+}
+
+/// An object key's shape: empty, except that jq mode keeps its `start` and
+/// `end` members, which jq reads as a slice descriptor (#3300). The same
+/// rule as `eval.rs`'s `to_owned_key_shape` object arm, over a
+/// `DocumentValue`: a number or `null` bound is copied, anything else only
+/// by kind (`eval::bound_shape`), so the copy stays shallow.
+fn descriptor_key_shape<V: DocumentValue, S: EvalSemantics>(
+    fields: &V::Fields,
+) -> Result<OwnedValue, EvalError> {
+    let mut desc = IndexMap::new();
+    if S::TAG != EvalTag::Yq {
+        for name in ["start", "end"] {
+            if let Some(bound) = fields.find(name)? {
+                let shape = match bound.type_name() {
+                    "number" | "null" => to_owned::<S, _>(&bound)?,
+                    other => bound_shape(other),
+                };
+                desc.insert(name.into(), shape);
+            }
+        }
+    }
+    Ok(OwnedValue::Object(desc.into()))
 }
 
 /// Cursor-carrying sibling of [`to_owned_key_shape`] (#903 review): a
@@ -1935,8 +1958,8 @@ fn to_owned_key_shape_cursor<C: DocumentCursor, S: EvalSemantics>(
     let value = cursor.value();
     if value.is_array() {
         Ok(OwnedValue::array())
-    } else if value.is_object() {
-        Ok(OwnedValue::Object(IndexMap::new().into()))
+    } else if let Some(fields) = value.as_object() {
+        descriptor_key_shape::<C::Value, S>(&fields)
     } else {
         to_owned_cursor::<S, _>(cursor)
     }
@@ -15241,6 +15264,12 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Error(EvalError::cannot_index(target.type_name(), key))
             }
         }
+        // #3300: an object key is jq's slice descriptor -- see `eval.rs`'s
+        // `index_one` arm. yq has no such key and falls through below.
+        OwnedValue::Object(desc) if S::TAG != EvalTag::Yq => {
+            let (start, end) = descriptor_slice_bounds(desc);
+            slice_one_generic_computed::<S, V>(target, &start, &end, optional)
+        }
         // #2482 (yq mode): any other key kind (bool/array/object/null) on a
         // scalar target is the same empty-not-error rule -- real yq has no
         // notion of "wrong key kind" for a target that has no children at
@@ -15536,7 +15565,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                         }
                     },
                     accumulator: owned,
-                    fold: |t| index_owned_by_key(t, k, optional),
+                    fold: |t| index_owned_by_key::<S>(t, k, optional),
                 }
             }
             GenericResult::One(v) => KeyTargets::Native(vec![v]),
@@ -15689,7 +15718,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     escape_generic!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                 }
                 for t in &ts {
-                    match index_owned_by_key(t, k, optional) {
+                    match index_owned_by_key::<S>(t, k, optional) {
                         Ok(Some(v)) => owned.push(v),
                         Ok(None) => {}
                         // Same reasoning as the `Native` arm above: a later
@@ -16254,7 +16283,8 @@ fn each_slice_bound_generic<S: EvalSemantics, V: DocumentValue>(
 /// normalized to its key shape the way the eager version did:
 /// `One`/`OneCursor` through `to_owned_key_shape`/
 /// `to_owned_key_shape_cursor` (STYLE-0012: an array/object bound only ever
-/// matters for its error, so its content is never cloned; `OneCursorValue`
+/// matters for its error, so it is copied only as a shape -- at most an
+/// object's two shallow `start`/`end` members, #3300; `OneCursorValue`
 /// is folded in like `OneCursor` for the reason `eval_index_expr`'s own
 /// sink gives), the lazy variants through `generic_item_to_result(..)
 /// .collect_owned::<S>()` exactly as the old `other => other.collect_owned::<S>()`

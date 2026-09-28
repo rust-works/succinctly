@@ -65879,16 +65879,24 @@ fn test_owned_embed_write_target_3188() -> Result<()> {
             "#3188: `{filter}`: stderr={stderr:?}"
         );
     }
-    // A component the door will not re-spell, so it declines and the bridge
-    // refuses where jq answers: a slice after the embed (jq `[[2]]`; its
-    // spelling `.[{"start":0,"end":1}]` is #3300).
-    let filter = r". as $x | [.] | del(.[0] | $x | .[0:1])";
-    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2]"))?;
-    assert_eq!(
-        (stdout.as_str(), code),
-        ("", 5),
-        "#3188 residual (#3300): `{filter}`: stderr={stderr:?}"
-    );
+    // A slice after the embed is re-spelled as the descriptor index key it
+    // is (#3300), so the door answers where it used to decline and the
+    // bridge refused (captured live against jq 1.7.1).
+    for (filter, expected) in [
+        (r". as $x | [.] | del(.[0] | $x | .[0:1])", "[[2]]"),
+        (r". as $x | [.] | (.[0] | $x | .[0:1]) = [9]", "[[9,2]]"),
+        (
+            r#". as $x | [.] | del(.[0] | $x | .[{"start":0,"end":1}])"#,
+            "[[2]]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2]"))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3188 (#3300): `{filter}`: stderr={stderr:?}"
+        );
+    }
     Ok(())
 }
 
@@ -66030,6 +66038,355 @@ fn test_del_fractional_index_yq_mode_unchanged_3302() -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    Ok(())
+}
+
+// ============================================================================
+// #3300: an object index key is jq's slice descriptor
+// ============================================================================
+
+/// jq's `.[k]` is the `INDEX` opcode `.[s:e]` compiles to, so an object key
+/// is the slice descriptor in value position, path position, destructuring
+/// and every write -- with `E[S:T]`'s rules: the target's kind first, a
+/// missing or non-number bound an error only on an array or string, start
+/// floored and end ceiled, and the key appended to a path verbatim. Every
+/// row captured live against jq 1.7.1.
+#[test]
+fn test_object_index_key_is_a_slice_descriptor_3300() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[1,2,3]", ".[{\"start\":1,\"end\":2}]", "[2]"),
+        ("\"abc\"", ".[{\"start\":1,\"end\":2}]", "\"b\""),
+        ("\"aé😀b\"", ".[{\"start\":1,\"end\":3}]", "\"é😀\""),
+        ("null", ".[{\"start\":1,\"end\":2}]", "null"),
+        ("null", ".[{\"start\":1}]", "null"),
+        ("[1,2,3]", ".[{\"start\":null,\"end\":2}]", "[1,2]"),
+        ("[1,2,3]", ".[{\"start\":1.5,\"end\":2.7}]", "[2,3]"),
+        ("[1,2,3]", ".[{\"start\":-2,\"end\":null}]", "[2,3]"),
+        ("[1,2,3]", ".[{\"start\":1e300,\"end\":null}]", "[]"),
+        ("[1,2,3]", ".[{\"start\":1,\"end\":2,\"x\":3}]", "[2]"),
+        ("[1,2,3]", ".[{\"start\":1,\"end\":2}]?", "[2]"),
+        ("[1,2,3]", "[.[{\"start\":1}]?]", "[]"),
+        (
+            "[1,2,3]",
+            "try .[{\"start\":1}] catch .",
+            "\"Array/string slice indices must be integers\"",
+        ),
+        ("[1,2,3]", "{\"start\":1,\"end\":2} as $k | .[$k]", "[2]"),
+        ("[1,2,3]", "[.[{\"start\":(0,1),\"end\":2}]]", "[[1,2],[2]]"),
+        (
+            "[1,2,3]",
+            "[.[{\"start\":0,\"end\":1}, 1, {\"start\":2,\"end\":3}]]",
+            "[[1],2,[3]]",
+        ),
+        ("[1,2,3]", ".[{\"start\":0,\"end\":2}][1]", "2"),
+        (
+            "[1,2,3]",
+            "to_entries | .[{\"start\":1,\"end\":2}]",
+            "[{\"key\":1,\"value\":2}]",
+        ),
+        ("[1,2,3]", "nth({\"start\":0,\"end\":2})", "[1,2]"),
+        (
+            "[1,2,3]",
+            "def k: {\"start\":0,\"end\":1}; . as {(k):$q} | $q",
+            "[1]",
+        ),
+        (
+            "[1,2,3]",
+            "def k: {\"start\":0,\"end\":1}; [path(. as {(k):$q} | $q)]",
+            "[[{\"start\":0,\"end\":1}]]",
+        ),
+        (
+            "[{\"end\":1,\"start\":0,\"x\":[1]},[1,2],{\"start\":\"a\",\"end\":1}]",
+            ".[1][.[0]]",
+            "[1]",
+        ),
+        (
+            "[{\"end\":1,\"start\":0,\"x\":[1]},[1,2],{\"start\":\"a\",\"end\":1}]",
+            "[.[1][(.[0],.[2])]?]",
+            "[[1]]",
+        ),
+        (
+            "[{\"end\":1,\"start\":0,\"x\":[1]},[1,2],{\"start\":\"a\",\"end\":1}]",
+            "path(.[1][.[0]])",
+            "[1,{\"end\":1,\"start\":0,\"x\":[1]}]",
+        ),
+        (
+            "[1,2,3]",
+            "path(.[{\"start\":1,\"end\":2}])",
+            "[{\"start\":1,\"end\":2}]",
+        ),
+        (
+            "[1,2,3]",
+            "path(.[{\"start\":1,\"end\":2,\"x\":3}])",
+            "[{\"start\":1,\"end\":2,\"x\":3}]",
+        ),
+        (
+            "[1,2,3]",
+            "path(.[{\"end\":2,\"start\":1}])",
+            "[{\"end\":2,\"start\":1}]",
+        ),
+        (
+            "[1,2,3]",
+            "path(.[{\"start\":1.5,\"end\":2.0}])",
+            "[{\"start\":1.5,\"end\":2.0}]",
+        ),
+        ("null", "path(.[{\"start\":1}])", "[{\"start\":1}]"),
+        ("null", "path(.[{\"start\":\"x\"}])", "[{\"start\":\"x\"}]"),
+        (
+            "[1,2,3]",
+            "path(.[{\"start\":1,\"end\":2}][0])",
+            "[{\"start\":1,\"end\":2},0]",
+        ),
+        (
+            "[1,2,3]",
+            "[path(.[{\"start\":(0,1),\"end\":2}])]",
+            "[[{\"start\":0,\"end\":2}],[{\"start\":1,\"end\":2}]]",
+        ),
+        ("[1,2,3]", "path(.[{\"start\":1}]?)", ""),
+        (
+            "[1,2,3]",
+            "path(.[{\"start\":1,\"end\":2}]?)",
+            "[{\"start\":1,\"end\":2}]",
+        ),
+        (
+            "[1,2,3]",
+            ".[{\"start\":1,\"end\":2}] = [\"x\"]",
+            "[1,\"x\",3]",
+        ),
+        (
+            "[1,2,3]",
+            ".[{\"start\":1,\"end\":2}] |= map(.*10)",
+            "[1,20,3]",
+        ),
+        ("[1,2,3]", ".[{\"start\":1,\"end\":2}] |= empty", "[1,3]"),
+        (
+            "[1,2,3]",
+            ".[{\"start\":1,\"end\":2}] += [\"y\"]",
+            "[1,2,\"y\",3]",
+        ),
+        ("[1,2,3]", ".[{\"start\":1,\"end\":2}] //= 5", "[1,2,3]"),
+        (
+            "[1,2,3]",
+            ".[{\"start\":0,\"end\":2,\"x\":1}] |= reverse",
+            "[2,1,3]",
+        ),
+        ("[1,2,3]", "del(.[{\"start\":0,\"end\":1}])", "[2,3]"),
+        ("[1,2,3]", "del(.[{\"start\":0,\"end\":1}], .[2])", "[2]"),
+        ("null", ".[{\"start\":1,\"end\":2}] = [\"x\"]", "[\"x\"]"),
+        (
+            "[[1,2],[3,4],[5]]",
+            "(.[{\"start\":0,\"end\":1,\"x\":0}][0], .[{\"start\":1,\"end\":2}][0]) |= empty",
+            "[[5]]",
+        ),
+        (
+            "[[1,2],[3,4],[5]]",
+            "del(.[{\"start\":1,\"end\":2,\"x\":3}], .[{\"start\":0,\"end\":1}][0])",
+            "[[3,4]]",
+        ),
+        ("[1,2]", ". as $x | [.] | del(.[0] | $x | .[0:1])", "[[2]]"),
+        (
+            "[1,2]",
+            ". as $x | [.] | del(.[0] | $x | .[{\"start\":0,\"end\":1}])",
+            "[[2]]",
+        ),
+        (
+            "[1,2]",
+            ". as $x | [.] | (.[0] | $x | .[1:]) |= map(.*10)",
+            "[[1,20]]",
+        ),
+        // `del()` groups slice continuations by the whole component, as jq's
+        // `delpaths_sorted` does: equal bounds are not one group.
+        ("[[1,2],[3,4],[5]]", "del(.[0.5:2][0], .[0:2][0])", "[[5]]"),
+        (
+            "[[1,2],[3,4],[5]]",
+            r#"del(.[{"start":0,"end":2}][0], .[{"start":0,"end":2,"x":1}][0])"#,
+            "[[5]]",
+        ),
+        (
+            "[[1,2],[3,4],[5]]",
+            r#"del(.[{"start":1,"end":2}][0], .[{"start":0,"end":1,"x":0}][0])"#,
+            "[[5]]",
+        ),
+        (
+            "[[1,2],[3,4],[5]]",
+            r#"del(.[{"end":2,"start":0}][0], .[0:2][0])"#,
+            "[[3,4],[5]]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3300: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    for (input, filter, message) in [
+        (
+            "[1,2,3]",
+            ".[{\"start\":1}]",
+            "Array/string slice indices must be integers",
+        ),
+        (
+            "[1,2,3]",
+            ".[{}]",
+            "Array/string slice indices must be integers",
+        ),
+        (
+            "[1,2,3]",
+            ".[{\"start\":\"a\",\"end\":2}]",
+            "Array/string slice indices must be integers",
+        ),
+        (
+            "\"abcdef\"",
+            ".[{\"start\":-2}]",
+            "Array/string slice indices must be integers",
+        ),
+        (
+            "{\"a\":1}",
+            ".[{\"start\":1}]",
+            "Cannot index object with object",
+        ),
+        ("5", ".[{\"start\":1}]", "Cannot index number with object"),
+        (
+            "[1,2,3]",
+            "def k: {\"start\":0}; . as {(k):$q} | $q",
+            "Array/string slice indices must be integers",
+        ),
+        (
+            "[1,2,3]",
+            "path(.[{\"start\":1}])",
+            "Array/string slice indices must be integers",
+        ),
+        (
+            "[1,2,3]",
+            "del(.[{\"start\":1}])",
+            "Array/string slice indices must be integers",
+        ),
+        (
+            "null",
+            ".[{\"start\":\"x\"}] = [\"y\"]",
+            "Array/string slice indices must be integers",
+        ),
+        (
+            "\"abc\"",
+            ".[{\"start\":1,\"end\":2}] = \"x\"",
+            "Cannot update string slices",
+        ),
+        (
+            "[1,2,3]",
+            ".[{\"start\":1,\"end\":2}]? = 5",
+            "A slice of an array can only be assigned another array",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3300: `{filter}` on {input} must raise: stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(message),
+            "#3300: `{filter}` on {input}: expected {message:?}, stderr={stderr:?}"
+        );
+    }
+    // A document-read key through the whole-program input bridge, which
+    // runs the program in the native evaluator rather than the generic one.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "-c", "input | .[1][.[0]]"],
+        Some(r#"[{"end":1,"start":0,"x":[1]},[1,2]]"#),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        ("[1]", 0),
+        "#3300 (input bridge): stderr={stderr:?}"
+    );
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "-c", "input | try .[1][.[0]] catch ."],
+        Some(r#"[{"start":"a","end":1},[1,2]]"#),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        (r#""Array/string slice indices must be integers""#, 0),
+        "#3300 (input bridge, non-number bound): stderr={stderr:?}"
+    );
+    Ok(())
+}
+
+/// A document-read descriptor key keeps only a *shape* of each bound
+/// (#3300 review): a deeply nested `start` used to be copied whole, which
+/// overflowed the stack or tripped the literal splice's depth panic. A
+/// container bound only ever fails classification, so the key stays two
+/// levels deep and the error stays catchable.
+#[test]
+fn test_deep_document_descriptor_key_is_a_catchable_error_3300() -> Result<()> {
+    let depth = 2000;
+    let input = format!(
+        "[{}1{},[1,2,3]]",
+        r#"{"start":"#.repeat(depth),
+        "}".repeat(depth)
+    );
+    for filter in ["try .[1][.[0]] catch .", "[.[1][.[0]]?]"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&input))?;
+        assert_eq!(
+            code, 0,
+            "#3300: `{filter}` must not crash: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout == "\"Array/string slice indices must be integers\"\n" || stdout == "[]\n",
+            "#3300: `{filter}`: stdout={stdout:?}"
+        );
+    }
+    Ok(())
+}
+
+/// yq has no slice-descriptor index key: `succinctly yq` keeps raising
+/// exactly as it did before #3300 (real yq's own wording differs, a
+/// separate, pre-existing gap).
+#[test]
+fn test_object_index_key_yq_mode_unchanged_3300() -> Result<()> {
+    for filter in [
+        ".[{\"start\":1,\"end\":2}]",
+        "del(.[{\"start\":1,\"end\":2}])",
+        ".[{\"start\":1,\"end\":2}] = [\"x\"]",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().expect("piped").write_all(b"[1,2,3]")?;
+                child.wait_with_output()
+            })?;
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Cannot index array with object"),
+            "#3300 (yq): `{filter}`: {output:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "#3300 (yq): `{filter}`: {output:?}"
+        );
+    }
+    // A mapping read from the document as the key keeps yq's refusal too.
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", ".a[.k]"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .expect("piped")
+                .write_all(b"a: [1,2]\nk: {start: 0, end: 1}\n")?;
+            child.wait_with_output()
+        })?;
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Cannot index array with object"),
+        "#3300 (yq, document key): {output:?}"
+    );
     Ok(())
 }
 

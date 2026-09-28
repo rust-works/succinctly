@@ -2631,6 +2631,19 @@ pub enum SliceBoundKey {
     /// `OwnedValue` would grow this enum past `Option<NumberKey>`'s 32
     /// bytes and every parsed program pays `size_of::<Expr>()`.
     Raw(Box<OwnedValue>),
+    /// The whole slice descriptor an index key named, `.[{"start":s,..}]`
+    /// (#3300), when it is not the canonical `{"start":s,"end":e}` pair.
+    ///
+    /// jq appends an index key to the path exactly as given, so `path(.[{
+    /// "end":2,"start":1,"x":3}])` keeps the key order and the extra key, and
+    /// over `null` a descriptor with a *missing* bound resolves too
+    /// (`null | path(.[{"start":1}])` is `[{"start":1}]`) -- none of which
+    /// two per-bound keys can spell. Carried in `start_key` only, with
+    /// `end_key` `None`; the component renders as this object, and the
+    /// `i64` sides navigate as usual.
+    ///
+    /// `Box`ed for [`Self::Raw`]'s reason: [`Expr`]'s pinned size (#1401).
+    Verbatim(Box<OwnedValue>),
 }
 
 impl NumberKey {

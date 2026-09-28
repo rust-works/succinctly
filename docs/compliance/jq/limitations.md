@@ -1227,14 +1227,16 @@ is the revert that established what the other one costs.
      accumulator itself answers since [#3181](https://github.com/rust-works/succinctly/issues/3181));
    - a write reached after `.[]` peels the container (`[.] \| [.[] \| del(. \| $x)]`);
    - a target whose later path raises (`del(.[0] \| $x, .[0])` reports the bridge's refusal
-     where jq reports the second path's `Cannot index object with number`);
-   - a resolved component the door will not re-spell: a slice after the embed
-     (`[.] \| del(.[0] \| $x \| .[0:1])` on `[1,2]`, jq `[[2]]`; its spelling
-     `.[{"start":0,"end":1}]` is [#3300](https://github.com/rust-works/succinctly/issues/3300)).
-     Integral floats (`.[0.0]`, `.[-1.0]`) are re-spelled as their integer, and a fractional
-     index keeps its exact key (`[.,1] \| del(.[-0.5] \| $x)` answers jq's `[{"a":1},1]`),
-     since `del`'s last step resolves `.[-0.5]` to nothing rather than to element 0
-     ([#3302](https://github.com/rust-works/succinctly/issues/3302)).
+     where jq reports the second path's `Cannot index object with number`; likewise a
+     malformed slice descriptor after the embed, `del(.[0] \| $x \| .[{"start":0}])`, where
+     jq reports `Array/string slice indices must be integers`).
+
+   Every resolved component is re-spelled: integral floats (`.[0.0]`, `.[-1.0]`) as their
+   integer, a fractional index with its exact key (`[.,1] \| del(.[-0.5] \| $x)` answers jq's
+   `[{"a":1},1]`, since `del`'s last step resolves `.[-0.5]` to nothing rather than to element
+   0, [#3302](https://github.com/rust-works/succinctly/issues/3302)), and a slice as the
+   descriptor index key it is (`[.] \| del(.[0] \| $x \| .[0:1])` on `[1,2]` answers jq's
+   `[[2]]`, [#3300](https://github.com/rust-works/succinctly/issues/3300)).
 
    **[#3036](https://github.com/rust-works/succinctly/issues/3036), now closed: the same
    fabrication through the routes that never cross a funnel.** #2642's check ran only where
@@ -3847,6 +3849,26 @@ that in line with jq's own `setpath()` behavior, and
 [#1873](https://github.com/rust-works/succinctly/issues/1873) later fixed a gap in that
 same auto-vivification for a slice with more path *after* it (`.a[0:1][]? = 9` on a
 missing `.a` now no-ops instead of raising a write-time error, matching jq).
+
+### The descriptor is also an index key (#3300)
+
+Since jq's `.[k]` is the same `INDEX` opcode, the descriptor works as an index key too:
+`[1,2,3] | .[{"start":1,"end":2}]` is `[2]`, `"abc" | .[{"start":1,"end":2}]` is `"b"`, and
+`null | .[{"start":1}]` is `null`. The rules are `E[S:T]`'s (next section): the target's
+kind first, a missing or non-number bound only an error on an array or string
+(`Array/string slice indices must be integers`), start floored and end ceiled. In path
+position the key is appended verbatim — `path(.[{"end":2,"start":1,"x":3}])` keeps the key
+order and the extra key — and every write reaches it through the ordinary slice machinery.
+[#3300](https://github.com/rust-works/succinctly/issues/3300) added it to both evaluators,
+to `. as {(k): $v}` destructuring, and to a key read from the document (whose
+shape-only copy now keeps an object key's `start` and `end`). yq has no such key and is
+unchanged.
+
+`del()`'s comma-grouped route also groups slice continuations the way jq's `delpaths_sorted`
+does, by `jv_equal` on the whole component: `.[0.5:2]` and `.[0:2]`, or two descriptors that
+differ only in an extra key, are separate groups run in `jv_sort` order, even though they
+navigate identically. It used to key a slice by its bounds alone, so
+`[[1,2],[3,4],[5]] | del(.[0.5:2][0], .[0:2][0])` gave `[[3,4],[5]]` where jq gives `[[5]]`.
 
 ### A computed bound is ruled on at the slice step, after the target's kind (#2546)
 

@@ -2426,7 +2426,10 @@ fn scalar_fallback<'a, W: Clone + AsRef<[u64]>>(
 /// `index_one`/[`EvalError::cannot_index`] and `SliceBounds::resolved_bound`
 /// never inspect an Array/Object candidate's *contents* — only its type
 /// name, to build the `Cannot index ... with array/object`/`Array or string
-/// slice indices must be integers` message — so a full recursive [`to_owned_lossy`]
+/// slice indices must be integers` message — with one exception: in jq mode
+/// an object key is a slice descriptor (#3300), whose `start` and `end` are
+/// read, so those two members are kept, each as a number, `null` or
+/// [`bound_shape`]. Otherwise a full recursive [`to_owned_lossy`]
 /// of a large navigated container candidate is pure waste when it can only
 /// ever be rejected on type. Mirrors [`json_is_truthy`]'s existing "classify
 /// without paying for `to_owned_lossy`'s full deep copy" idiom, for the same
@@ -2443,8 +2446,43 @@ fn to_owned_key_shape<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> Result<OwnedValue, EvalError> {
     match value {
         StandardJson::Array(_) => Ok(OwnedValue::array()),
+        // #3300: jq reads an object key's `start` and `end` as a slice
+        // descriptor (`.[1][.[0]]` on `[{"start":0,"end":1},[1,2]]` is
+        // `[1]`), so jq mode keeps those two members and nothing else --
+        // `eval_generic`'s `descriptor_key_shape` is the same rule over a
+        // `DocumentValue`. A bound that is not a number or `null` can only
+        // fail classification, whatever it holds, so it keeps just its kind
+        // ([`bound_shape`]): the copy stays two levels deep and O(1) in the
+        // bound's size, as the old empty-object shape was.
+        StandardJson::Object(fields) if S::TAG != EvalTag::Yq => {
+            let mut desc = IndexMap::new();
+            for name in ["start", "end"] {
+                if let Some(bound) = fields.clone().find(name)? {
+                    let shape = match bound {
+                        StandardJson::Number(_) | StandardJson::Null => to_owned::<S, _>(&bound)?,
+                        other => bound_shape(type_name(&other)),
+                    };
+                    desc.insert(name.into(), shape);
+                }
+            }
+            Ok(OwnedValue::Object(desc.into()))
+        }
         StandardJson::Object(_) => Ok(OwnedValue::Object(IndexMap::new().into())),
         other => to_owned::<S, _>(other),
+    }
+}
+
+/// The placeholder a slice descriptor's non-numeric, non-`null` bound is
+/// copied as (#3300): an empty value of the same kind. Such a bound only
+/// ever fails classification (`Array/string slice indices must be
+/// integers`, whatever it holds), so its content is never needed, and
+/// dropping it keeps a key's copy shallow however deep or large the bound.
+pub(crate) fn bound_shape(type_name: &str) -> OwnedValue {
+    match type_name {
+        "array" => OwnedValue::array(),
+        "object" => OwnedValue::Object(IndexMap::new().into()),
+        "boolean" => OwnedValue::Bool(false),
+        _ => OwnedValue::String(String::new()),
     }
 }
 
@@ -8809,7 +8847,8 @@ pub(crate) fn owned_path_door_collect<S: EvalSemantics>(
 ///
 /// Declines (`None`, and the re-entry bridges as before) unless the target
 /// holds a marker and is built only from [`is_pure_navigation_node`]s, `?`,
-/// computed keys and arithmetic: with no marker there is no storage identity
+/// computed keys, object constructors (a slice descriptor key, #3300) and
+/// arithmetic: with no marker there is no storage identity
 /// to lose, and such a target has no side effect a declined resolution could
 /// repeat. It also declines on any escape, and on a component
 /// [`static_path_expr`] cannot spell exactly, so every refusal and error
@@ -8836,9 +8875,21 @@ pub(crate) fn owned_write_door<S: EvalSemantics>(
     let head = unwrap_paren(head);
     let target = write_target(head)?;
     let mut marked = false;
+    // A slice descriptor key, `.[{"start":0,"end":1}]` (#3300): an object
+    // constructor is admitted only as an index key, never as a stage of the
+    // target itself, and its entries are vetted like any other node.
+    let mut descriptor_keys: Vec<*const Expr> = Vec::new();
     let effectful = any_subexpr(target, &mut |e| {
         marked |= matches!(e, Expr::TrackedVar(_));
+        if let Expr::IndexExpr { key, .. } = e {
+            if matches!(**key, Expr::Object(_)) {
+                descriptor_keys.push(&**key);
+            }
+        }
+        let descriptor_key =
+            matches!(e, Expr::Object(_)) && descriptor_keys.contains(&(e as *const Expr));
         !(is_pure_navigation_node(e)
+            || descriptor_key
             || matches!(
                 e,
                 Expr::Optional(_)
@@ -8900,11 +8951,12 @@ fn write_target_mut(head: &mut Expr) -> Option<&mut Box<Expr>> {
 
 /// A path `path(f)` produced, as the static navigation that reaches it
 /// (`["a", 0]` is `.a | .[0]`, `[]` is `.`), or `None` unless every
-/// component is a string, an exactly representable integer, or a fractional
-/// number. A fractional index is not the
-/// integer it truncates to (`.[-0.5]` is not `.[0]` to jq's `del`), so it is
-/// re-spelled with its exact key (#3302). An integral float too large to be
-/// exact, and a slice (#3300), are not re-spelled.
+/// component is a string, an exactly representable integer, a fractional
+/// number or a slice descriptor. A fractional index is not the integer it
+/// truncates to (`.[-0.5]` is not `.[0]` to jq's `del`), so it is re-spelled
+/// with its exact key (#3302); a slice descriptor is re-spelled as the index
+/// key it is (#3300). An integral float too large to be exact is not
+/// re-spelled.
 fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
     let OwnedValue::Array(components) = path else {
         return None; // omni-dev: coverage tolerate-line reason="unreachable: every value path_over_owned hands back is a path() output, which is always an array (#3188)"
@@ -8939,6 +8991,13 @@ fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
                     key: Some(NumberKey::Float(*f)),
                 })
             }
+            // A slice component is jq's descriptor object, spelled as the
+            // index key it is (`.[{"start":0,"end":1}]`, #3300), which the
+            // write resolves against the real container.
+            OwnedValue::Object(_) => Some(Expr::IndexExpr {
+                target: Box::new(Expr::Identity),
+                key: Box::new(owned_to_expr(component)),
+            }),
             _ => None,
         })
         .collect::<Option<Vec<Expr>>>()?;
@@ -15161,9 +15220,11 @@ fn collect_join_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 //
                 // The empty-object special case (#1047) is checked on the
                 // live cursor *before* that collapse: `JsonFields::is_empty`
-                // is an O(1) cursor check, and `to_owned_key_shape` always
-                // produces an empty `IndexMap` for *any* object regardless
-                // of its real field count, so checking emptiness after the
+                // is an O(1) cursor check, and `to_owned_key_shape` produces
+                // an empty `IndexMap` for *any* object in yq mode (this
+                // join's only mode; jq mode keeps a descriptor's `start`/
+                // `end`, #3300) regardless of its real field count, so
+                // checking emptiness after the
                 // collapse can't distinguish "genuinely empty" from
                 // "collapsed, contents unread" (a non-empty object would
                 // wrongly render as `{}` too).
@@ -23344,6 +23405,27 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 None => QueryResult::One(StandardJson::Null),
             }
         }
+        // #3300: an object key is jq's slice descriptor, so
+        // `.[{"start":1,"end":2}]` is `.[1:2]` -- the same target-kind-first
+        // gate `E[S:T]` uses, then the literal-bounds slice. yq has no such
+        // key and keeps raising.
+        OwnedValue::Object(desc) if S::TAG != EvalTag::Yq => {
+            let (start, end) = descriptor_slice_bounds(desc);
+            let kind = SliceTargetKind::of_type_name(type_name(&target));
+            match resolve_computed_slice_bounds::<S>(kind, &start, &end) {
+                Ok((start, end)) => {
+                    let slice = Expr::Slice {
+                        start,
+                        end,
+                        start_key: None,
+                        end_key: None,
+                    };
+                    eval_single::<W, S>(&slice, target, optional)
+                }
+                Err(_) if optional => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            }
+        }
         // #2482 (yq mode): a computed key (`.s[$k]`) on a scalar target is
         // the same empty-not-error rule as the literal-field/literal-index
         // siblings above -- see `yq_field_index_on_scalar_is_empty`.
@@ -23454,11 +23536,17 @@ fn yq_negative_index_error<S: EvalSemantics>(
 /// Mirrors the borrowed path's rules exactly: missing key and out-of-bounds
 /// index both yield null, null input passes through for a valid key kind, and
 /// an invalid key kind errors even on null.
-pub(crate) fn index_one_owned(
+pub(crate) fn index_one_owned<S: EvalSemantics>(
     target: &OwnedValue,
     key: &OwnedValue,
     optional: bool,
 ) -> Result<Option<OwnedValue>, EvalError> {
+    // #3300: an object key is jq's slice descriptor on an array, string or
+    // `null` target -- see `index_one`'s own arm. yq keeps the arms below.
+    if let (OwnedValue::Object(desc), false) = (key, S::TAG == EvalTag::Yq) {
+        let (start, end) = descriptor_slice_bounds(desc);
+        return slice_owned_value_read_computed::<S>(target, &start, &end, optional);
+    }
     match (key, target) {
         (OwnedValue::String(s), OwnedValue::Object(map)) => {
             Ok(Some(map.get(s).cloned().unwrap_or(OwnedValue::Null)))
@@ -23965,7 +24053,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 }
                             },
                             accumulator: owned.as_mut().expect("promoted by the block above"),
-                            fold: |t| index_one_owned(t, k, optional),
+                            fold: |t| index_one_owned::<S>(t, k, optional),
                         }
                     }
                 };
@@ -24025,22 +24113,37 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // still survive as `Partial`, matching real jq's
                                 // output instead of vanishing.
                                 QueryResult::Error(e) => escape_with_prefix!(Control::Error(e)),
+                                // #3300: a slice-descriptor key builds a fresh
+                                // slice, promoting the accumulator the way
+                                // `eval_comma` folds an owned sibling in.
+                                QueryResult::Owned(v) => {
+                                    if let Err((prefix, e)) = promote_and_extend::<_, S>(
+                                        &mut borrowed,
+                                        &mut owned,
+                                        core::iter::once(v),
+                                    ) {
+                                        let control = Control::Error(e);
+                                        mark_nonretryable_escape(&control);
+                                        terminal = Some(partial(prefix, control));
+                                        return Demand::Stop;
+                                    }
+                                }
                                 // #2182: was a wildcard `_ =>` -- verified by tracing
-                                // both of `index_one`'s callees (`index_object_by_name`,
-                                // `index_array_by_position`) exhaustively: every arm in
-                                // both resolves to `One`/`None`/`Error`, so this is a
-                                // provably closed set today. Spelled out per-variant so
-                                // a future `QueryResult` variant this callee starts
-                                // returning is a compile error here, not a silent
-                                // absorption into a catch-all.
+                                // `index_one`'s callees (`index_object_by_name`,
+                                // `index_array_by_position`, and since #3300 the
+                                // literal-bounds `Expr::Slice`) exhaustively: every
+                                // arm resolves to `One`/`Owned`/`None`/`Error`, so
+                                // this is a provably closed set today. Spelled out
+                                // per-variant so a future `QueryResult` variant this
+                                // callee starts returning is a compile error here,
+                                // not a silent absorption into a catch-all.
                                 QueryResult::OneCursor(_)
                                 | QueryResult::Many(_)
-                                | QueryResult::Owned(_)
                                 | QueryResult::ManyOwned(_)
                                 | QueryResult::Break(_)
                                 | QueryResult::Halt(_)
                                 | QueryResult::Partial(..) => {
-                                    unreachable!("index_one yields only One/None/Error")
+                                    unreachable!("index_one yields only One/Owned/None/Error")
                                 }
                             }
                         }
@@ -24103,7 +24206,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             if let Some(e) = yq_negative_index_error::<S>(t, k) {
                                 escape_with_prefix!(Control::Error(e));
                             }
-                            match index_one_owned(t, k, optional) {
+                            match index_one_owned::<S>(t, k, optional) {
                                 Ok(Some(v)) => owned.as_mut().expect("still Some").push(v),
                                 Ok(None) => {}
                                 // Same reasoning as the `Borrowed` arm above: a
@@ -24131,8 +24234,10 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // what gives this function a demand-driven pull to stop with.
     //
     // `Item::Borrowed` goes through `to_owned_key_shape` (STYLE-0012: this
-    // normalizes an array/object key to its empty shape rather than cloning
-    // its content -- matches the pre-#2138 `One`/`Many` arms exactly, since
+    // normalizes an array/object key to its shape rather than cloning its
+    // content -- an empty array or object, except that jq mode keeps an
+    // object's scalar `start`/`end` for the slice descriptor, #3300 --
+    // matches the pre-#2138 `One`/`Many` arms exactly, since
     // a `Many` key stream is what `push_many`-style unpacking now delivers
     // as repeated `Borrowed` pushes). `Item::Owned` mirrors the pre-#2138
     // `Owned`/`ManyOwned` arms exactly (no `to_owned_key_shape`
@@ -24633,7 +24738,8 @@ fn each_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// [`each_slice_bound`]'s pull: `expr` through [`eval_each`], a borrowed
 /// item normalized to its key shape (`to_owned_key_shape`: an array/object
-/// bound only ever matters for its error, so its content is never cloned),
+/// bound only ever matters for its error, so it is copied only as a shape --
+/// at most an object's two shallow `start`/`end` members, #3300),
 /// exactly as the eager version's `One`/`Many` arms did; a decode failure
 /// doing so is the bound generator's own escape, reported as
 /// `Flow::Escaped`.
@@ -24679,6 +24785,43 @@ pub(crate) fn owned_bound_to_i64(
     round: fn(f64) -> f64,
 ) -> Result<Option<i64>, EvalError> {
     Ok(SliceBounds::resolved_bound(v)?.map(|f| round(f) as i64))
+}
+
+/// The two bounds of a slice *descriptor* used as an index key,
+/// `.[{"start":s,"end":e}]` (#3300): jq's `jv_get` hands an object key on an
+/// array or string to the same `parse_slice` `.[s:e]` reaches, so the
+/// bounds are [`ComputedSliceBound`]s exactly as `E[S:T]` pulls them --
+/// floored start, ceiled end, and a failure carried rather than raised, so
+/// [`resolve_computed_slice_bounds`] rules on it after the target's kind.
+///
+/// A *missing* `start` or `end` fails like a non-number does (jq's
+/// `jv_object_get` answers an invalid value, which `parse_slice` rejects):
+/// `[1,2,3] | .[{"start":1}]` is `Array/string slice indices must be
+/// integers`, while `null | .[{"start":1}]` is `null`. Extra keys are
+/// never looked at.
+pub(crate) fn descriptor_slice_bounds(
+    desc: &IndexMap<String, OwnedValue>,
+) -> (ComputedSliceBound, ComputedSliceBound) {
+    let (start, end) = descriptor_bound_sides(desc);
+    (start.bound, end.bound)
+}
+
+/// Both sides of a slice descriptor read as [`PathSliceBound`]s -- the one
+/// definition of the descriptor rule (#3300) that value mode
+/// ([`descriptor_slice_bounds`]) and path mode ([`descriptor_path_component`])
+/// both read: start floored and end ceiled as `E[S:T]`'s bounds are, and a
+/// missing side a failure like a non-number one. `slice::SliceBounds::
+/// from_descriptor` answers the same question for a runtime path component,
+/// which resolves against a length rather than carrying an `i64`.
+fn descriptor_bound_sides(desc: &IndexMap<String, OwnedValue>) -> (PathSliceBound, PathSliceBound) {
+    let side = |name: &str, round: fn(f64) -> f64| match desc.get(name) {
+        Some(v) => PathSliceBound::classify(v.clone(), round),
+        None => PathSliceBound {
+            bound: Err(EvalError::slice_indices_not_integers()),
+            key: None,
+        },
+    };
+    (side("start", f64::floor), side("end", f64::ceil))
 }
 
 /// One computed slice bound as `E[S:T]` carries it from the bound generator
@@ -29177,8 +29320,17 @@ fn slice_has_non_integer_bound(
     start_key: Option<&SliceBoundKey>,
     end_key: Option<&SliceBoundKey>,
 ) -> bool {
-    matches!(start_key, Some(SliceBoundKey::Raw(_)))
-        || matches!(end_key, Some(SliceBoundKey::Raw(_)))
+    let fails = |key: Option<&SliceBoundKey>| match key {
+        Some(SliceBoundKey::Raw(_)) => true,
+        // #3300: a descriptor index key whose bounds jq never parsed, which
+        // likewise only resolves over a `null` target.
+        Some(SliceBoundKey::Verbatim(desc)) => match &**desc {
+            OwnedValue::Object(desc) => SliceBounds::from_descriptor(desc).is_err(),
+            _ => false, // omni-dev: coverage tolerate-line reason="unreachable: descriptor_path_component builds a Verbatim key only from an object (#3300)"
+        },
+        Some(SliceBoundKey::Number(_)) | None => false,
+    };
+    fails(start_key) || fails(end_key)
 }
 
 struct SliceEditFlags {
@@ -31567,13 +31719,17 @@ fn eval_owned_multi_keep_partial<S: EvalSemantics>(
 /// key -- stays `5`, not an error, unlike the same key against an array
 /// target). `set_path`'s no-op check fires before this placeholder's
 /// index value is ever read back out, so its exact value doesn't matter.
-fn key_to_path_component(
+fn key_to_path_component<S: EvalSemantics>(
     key: &OwnedValue,
     container: &OwnedValue,
     scalar_noop: bool,
 ) -> Result<Expr, EvalError> {
     match key {
         OwnedValue::String(s) => Ok(Expr::Field(s.clone())),
+        // #3300: jq's slice descriptor, in path position.
+        OwnedValue::Object(desc) if S::TAG != EvalTag::Yq => {
+            descriptor_path_component::<S>(desc, container)
+        }
         // Truncation toward zero, as in the value path.
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             if scalar_noop {
@@ -31590,6 +31746,45 @@ fn key_to_path_component(
         }
         _ => Err(EvalError::cannot_index(owned_type_name(container), key)),
     }
+}
+
+/// The static component `path(.[{"start":s,"end":e}])` resolves to
+/// (#3300): an [`Expr::Slice`], ruled on against `container`'s kind in
+/// jq's `INDEX` order exactly as `E[S:T]`'s path step is
+/// (`resolve_slice_expr_sink`). A `null` container resolves without reading
+/// the bounds, so a bound jq never parsed rides into the component and the
+/// eventual write refuses it (#2853); an array or string validates them
+/// (`Array/string slice indices must be integers`); anything else is
+/// `Cannot index <kind> with object`.
+///
+/// jq appends the key verbatim, so only the canonical `{"start":s,"end":e}`
+/// pair is spelled through per-bound keys (keeping a float bound's
+/// spelling, #1326); any other shape -- reordered, extra or missing keys --
+/// is carried whole as [`SliceBoundKey::Verbatim`].
+fn descriptor_path_component<S: EvalSemantics>(
+    desc: &IndexMap<String, OwnedValue>,
+    container: &OwnedValue,
+) -> Result<Expr, EvalError> {
+    let (s, e) = descriptor_bound_sides(desc);
+    let (start, end) = match SliceTargetKind::of_type_name(owned_type_name(container)) {
+        SliceTargetKind::Null => (s.navigable(), e.navigable()),
+        kind => resolve_computed_slice_bounds::<S>(kind, &s.bound, &e.bound)?,
+    };
+    let canonical = desc.len() == 2
+        && desc.get_index(0).is_some_and(|(k, _)| k == "start")
+        && desc.get_index(1).is_some_and(|(k, _)| k == "end");
+    let (start_key, end_key) = if canonical {
+        (s.key, e.key)
+    } else {
+        let whole = OwnedValue::Object(desc.clone().into());
+        (Some(SliceBoundKey::Verbatim(Box::new(whole))), None)
+    };
+    Ok(Expr::Slice {
+        start,
+        end,
+        start_key,
+        end_key,
+    })
 }
 
 /// The static path component a numeric key already resolved to `idx` denotes.
@@ -31686,6 +31881,10 @@ pub(crate) fn slice_component_value(
     end: Option<i64>,
     end_key: Option<&SliceBoundKey>,
 ) -> OwnedValue {
+    // #3300: a non-canonical descriptor index key renders as itself.
+    if let Some(SliceBoundKey::Verbatim(desc)) = start_key {
+        return (**desc).clone();
+    }
     slice::literal_component_from_values(
         slice_bound_component_value(start, start_key),
         slice_bound_component_value(end, end_key),
@@ -31707,7 +31906,12 @@ fn slice_bound_component_value(bound: Option<i64>, key: Option<&SliceBoundKey>) 
         Some(SliceBoundKey::Number(number)) => {
             bound.map_or(OwnedValue::Null, |i| index_component_value(i, Some(number)))
         }
-        None => bound.map_or(OwnedValue::Null, |i| index_component_value(i, None)),
+        // A `Verbatim` key names the whole component, which
+        // `slice_component_value` renders before reaching here; a lone
+        // bound of one falls back to its navigable integer.
+        Some(SliceBoundKey::Verbatim(_)) | None => {
+            bound.map_or(OwnedValue::Null, |i| index_component_value(i, None))
+        }
     }
 }
 
@@ -35320,14 +35524,14 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                         // no-op behavior to match here -- unlike the `.foo`/
                         // `.[key]` shapes `resolve_index_expr` handles below,
                         // which do (#1181).
-                        let component = match key_to_path_component(key, &current, false) {
+                        let component = match key_to_path_component::<S>(key, &current, false) {
                             Ok(component) => component,
                             Err(e) => {
                                 arg_escape = Some(e.into());
                                 break 'outputs;
                             }
                         };
-                        let indexed = match index_one_owned(&current, key, false) {
+                        let indexed = match index_one_owned::<S>(&current, key, false) {
                             Ok(indexed) => indexed,
                             Err(e) => {
                                 arg_escape = Some(e.into());
@@ -38877,7 +39081,7 @@ impl PatternMode for PathPatternMode<'_> {
     type Reg = PatternRegister;
     type Binding = PatternBinding;
 
-    fn step(
+    fn step<S: EvalSemantics>(
         &self,
         key: &PatternKey<'_>,
         input: &OwnedValue,
@@ -38904,8 +39108,8 @@ impl PatternMode for PathPatternMode<'_> {
                 &element, input,
             ));
         }
-        let component = key.component(input)?;
-        let child = key.child(input)?;
+        let component = key.component::<S>(input)?;
+        let child = key.child::<S>(input)?;
         let moved = PatternRegister {
             path: PathPrefix::extend(&reg.path, component),
             value: child.clone(),
@@ -42965,7 +43169,7 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
                 escape!(EvalError::new("Cannot set array element at NaN index").into());
             }
             let scalar_noop = S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(target_value);
-            let component = match key_to_path_component(k, target_value, scalar_noop) {
+            let component = match key_to_path_component::<S>(k, target_value, scalar_noop) {
                 Ok(component) => component,
                 Err(_) if optional => continue,
                 Err(e) => escape!(e.into()),
@@ -42993,7 +43197,7 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
             let next_value: Cow<'a, OwnedValue> = if scalar_noop {
                 target_value.clone()
             } else {
-                Cow::Owned(match index_one_owned(target_value, k, false) {
+                Cow::Owned(match index_one_owned::<S>(target_value, k, false) {
                     Ok(v) => v.expect("non-optional index yields a value or errors"),
                     Err(_) if optional => continue,
                     Err(e) => escape!(e.into()),
@@ -53014,12 +53218,19 @@ enum ArrayStep {
     /// `idx` is the truncated index every navigation uses. `frac` is the
     /// `f64::to_bits` of the exact key when it is non-integral and the trie
     /// was built for jq mode (#3302); see [`array_index_step`].
-    Index {
-        idx: i64,
-        frac: Option<u64>,
-    },
-    Slice(Option<i64>, Option<i64>),
+    Index { idx: i64, frac: Option<u64> },
+    /// The navigable bounds, and the id of the component's jq value in
+    /// [`DeleteTrie::slice_components`] (#3300). jq groups `delpaths`
+    /// continuations by `jv_equal` on the whole key, so `.[0.5:2]` and
+    /// `.[0:2]`, or two descriptors that differ only in an extra key, are
+    /// separate groups even though they navigate identically; the id keeps
+    /// them apart. yq mode groups by the bounds alone and leaves the id at
+    /// [`YQ_SLICE_COMPONENT`].
+    Slice(Option<i64>, Option<i64>, u32),
 }
+
+/// [`ArrayStep::Slice`]'s component id in yq mode, which never interns one.
+const YQ_SLICE_COMPONENT: u32 = u32::MAX;
 
 /// The [`ArrayStep`] a static `Expr::Index { idx, key }` component becomes.
 ///
@@ -53161,10 +53372,14 @@ impl DeleteTrieNode {
 /// ends at this node is never walked into, only deleted wholesale
 /// (`DeleteTrieNode::terminal`'s doc comment), and an array continuation
 /// alongside a slice sibling runs in jq's key order, not insertion order
-/// (`jq_delpaths_array_step_key`) — #2929. The one thing they do not mirror
+/// (`jq_delpaths_array_step_cmp`) — #2929. The one thing they do not mirror
 /// is the per-position re-grouping, which is what the trie replaces.
 struct DeleteTrie {
     nodes: Vec<DeleteTrieNode>,
+    /// Each distinct slice component's jq value, indexed by
+    /// [`ArrayStep::Slice`]'s id -- what jq groups and orders slice
+    /// continuations by (#3300).
+    slice_components: Vec<OwnedValue>,
 }
 
 impl DeleteTrie {
@@ -53216,6 +53431,10 @@ struct DeleteTrieBuilder {
     /// Reused across [`Self::push_component`] calls so flattening one chain
     /// component doesn't allocate per node.
     scratch: Vec<DeleteStep>,
+    /// The interned [`DeleteTrie::slice_components`] ids for each pair of
+    /// navigable bounds -- only components with equal bounds can be
+    /// `jv_equal`, so a lookup compares against those alone.
+    slice_ids: BTreeMap<(Option<i64>, Option<i64>), Vec<u32>>,
     /// Whether the trie is for yq mode, which keys array edges by the
     /// truncated index alone (see [`array_index_step`]).
     yq_mode: bool,
@@ -53226,9 +53445,11 @@ impl DeleteTrieBuilder {
         Self {
             trie: DeleteTrie {
                 nodes: vec![DeleteTrieNode::new(DELETE_TRIE_ROOT, 0, true, false)],
+                slice_components: Vec::new(),
             },
             memo: BTreeMap::new(),
             scratch: Vec::new(),
+            slice_ids: BTreeMap::new(),
             yq_mode,
         }
     }
@@ -53307,8 +53528,14 @@ impl DeleteTrieBuilder {
                 let step = array_index_step(*idx, key.as_ref(), self.yq_mode);
                 self.array_child(parent, step, optional)
             }
-            Expr::Slice { start, end, .. } => {
-                self.array_child(parent, ArrayStep::Slice(*start, *end), optional)
+            Expr::Slice {
+                start,
+                end,
+                start_key,
+                end_key,
+            } => {
+                let step = self.slice_step(*start, *end, start_key.as_ref(), end_key.as_ref());
+                self.array_child(parent, step, optional)
             }
             // See `needs_fanout_pass`'s doc comment for why a bare
             // `Expr::Iterate` can never reach a comma-grouped `del()` path
@@ -53344,6 +53571,38 @@ impl DeleteTrieBuilder {
             }
         }
         Ok(id)
+    }
+
+    /// The [`ArrayStep`] a static `Expr::Slice` component becomes: its
+    /// bounds, plus in jq mode the id of its rendered component, shared by
+    /// every `jv_equal` component (#3300).
+    fn slice_step(
+        &mut self,
+        start: Option<i64>,
+        end: Option<i64>,
+        start_key: Option<&SliceBoundKey>,
+        end_key: Option<&SliceBoundKey>,
+    ) -> ArrayStep {
+        if self.yq_mode {
+            return ArrayStep::Slice(start, end, YQ_SLICE_COMPONENT);
+        }
+        let component = slice_component_value(start, start_key, end, end_key);
+        let components = &mut self.trie.slice_components;
+        let ids = self.slice_ids.entry((start, end)).or_default();
+        let id = match ids.iter().find(|&&id| {
+            compare_values::<JqSemantics>(&components[id as usize], &component)
+                == core::cmp::Ordering::Equal
+        }) {
+            Some(&id) => id,
+            None => {
+                let id = u32::try_from(components.len())
+                    .expect("a del() match set cannot exceed u32::MAX distinct slices");
+                components.push(component);
+                ids.push(id);
+                id
+            }
+        };
+        ArrayStep::Slice(start, end, id)
     }
 
     fn push_node(&mut self, parent: u32, slot: usize, keyed_by_field: bool, optional: bool) -> u32 {
@@ -53685,45 +53944,33 @@ fn delete_trie_object(
     Ok(value)
 }
 
-/// jq's `jv_sort` order for an array `del()` continuation's own step, used
-/// to reorder `delete_trie_array`'s `index_groups` when a slice or
-/// fractional-index continuation is present (#2929, #3302): `Index(a)` vs
-/// `Index(b)` compares the exact keys numerically, as `(truncation,
-/// fractional part)`, which orders `-0.5 < 0 < 0.5` even though all three
-/// truncate to `0`; every `Index` sorts before every `Slice`; `Slice(s1, e1)`
-/// vs `Slice(s2, e2)` compares `e1` with `e2` first, then `s1` with `s2`,
-/// with `None` sorting before `Some(n)` — exactly `Option<i64>`'s derived
-/// `Ord`, which the `(Option<i64>, Option<i64>)` tail of the returned tuple
-/// relies on directly rather than re-implementing the `None`-first rule.
-///
-/// This is the same ordering `delete_paths_sorted` gets from
-/// `compare_values::<S>` over the `OwnedValue` form of a path component
-/// (`slice::literal_component`'s `{"start":s,"end":e}` object, whose key
-/// order gives the `end`-then-`start` rule for free) — encoded again here,
-/// rather than reused, because `ArrayStep` is a lighter-weight type than
-/// `OwnedValue` and this is a hot sort key, not a one-off comparison. If
-/// jq's own slice-descriptor ordering ever changes, both sites need the
-/// same update.
-fn jq_delpaths_array_step_key(step: &ArrayStep) -> (u8, i64, f64, Option<i64>, Option<i64>) {
-    match *step {
-        ArrayStep::Index { idx, frac } => {
-            let fraction = frac.map_or(0.0, |bits| f64::from_bits(bits).fract());
-            (0, idx, fraction, None, None)
-        }
-        ArrayStep::Slice(s, e) => (1, 0, 0.0, e, s),
-    }
-}
-
-/// [`jq_delpaths_array_step_key`]'s total order. The fraction is finite and
-/// never `-0.0` (an integral key has none), so `total_cmp` agrees with `<`.
+/// jq's `jv_sort` order for two array `del()` continuation steps, used to
+/// reorder `delete_trie_array`'s `index_groups` when a slice or
+/// fractional-index continuation is present (#2929, #3302, #3300): every
+/// number sorts before every object, so an `Index` before a `Slice`. Two
+/// indices compare their exact keys, as `(truncation, fractional part)`,
+/// which orders `-0.5 < 0 < 0.5` even though all three truncate to `0` (the
+/// fraction is finite and never `-0.0`, so `total_cmp` agrees with `<`).
+/// Two slices compare their components' jq values, as `delete_paths_sorted`
+/// compares a `delpaths` path's -- so an extra-key descriptor sorts where
+/// jq's object order puts it, not by its bounds.
 fn jq_delpaths_array_step_cmp(
-    a: &(u8, i64, f64, Option<i64>, Option<i64>),
-    b: &(u8, i64, f64, Option<i64>, Option<i64>),
+    trie: &DeleteTrie,
+    a: &ArrayStep,
+    b: &ArrayStep,
 ) -> core::cmp::Ordering {
-    (a.0, a.1)
-        .cmp(&(b.0, b.1))
-        .then(a.2.total_cmp(&b.2))
-        .then((a.3, a.4).cmp(&(b.3, b.4)))
+    let fraction = |frac: Option<u64>| frac.map_or(0.0, |bits| f64::from_bits(bits).fract());
+    match (*a, *b) {
+        (ArrayStep::Index { idx: ia, frac: fa }, ArrayStep::Index { idx: ib, frac: fb }) => {
+            ia.cmp(&ib).then(fraction(fa).total_cmp(&fraction(fb)))
+        }
+        (ArrayStep::Index { .. }, ArrayStep::Slice(..)) => core::cmp::Ordering::Less,
+        (ArrayStep::Slice(..), ArrayStep::Index { .. }) => core::cmp::Ordering::Greater,
+        (ArrayStep::Slice(_, _, ca), ArrayStep::Slice(_, _, cb)) => compare_values::<JqSemantics>(
+            &trie.slice_components[ca as usize],
+            &trie.slice_components[cb as usize],
+        ),
+    }
 }
 
 /// The pre-#1690 `delete_expr_array_paths`'s counterpart.
@@ -53868,14 +54115,12 @@ fn delete_trie_array(
                     Some(ArrayStep::Slice(..) | ArrayStep::Index { frac: Some(_), .. })
                 )
             }) {
-            // Decorate once, then a stable sort: computing the key inside
-            // the comparator -- an `IndexMap` lookup plus a match -- would
-            // run it up to O(n log n) times instead of once per element.
-            // `index_groups` can run to a few thousand entries for a
-            // filtered recursive descent (#1690); this keeps the lookup
-            // itself linear regardless. The key's fraction is an `f64`
-            // (#3302), so it sorts by `jq_delpaths_array_step_cmp` rather
-            // than a derived `Ord`.
+            // Decorate once, then a stable sort: looking the step up inside
+            // the comparator -- an `IndexMap` lookup -- would run it up to
+            // O(n log n) times instead of once per element. `index_groups`
+            // can run to a few thousand entries for a filtered recursive
+            // descent (#1690); this keeps the lookup itself linear
+            // regardless.
             let mut keyed: Vec<_> = node
                 .index_groups
                 .iter()
@@ -53884,10 +54129,10 @@ fn delete_trie_array(
                         .indices
                         .get_index(slot)
                         .expect("index_groups holds live indices indices");
-                    (jq_delpaths_array_step_key(step), slot)
+                    (*step, slot)
                 })
                 .collect();
-            keyed.sort_by(|(a, _), (b, _)| jq_delpaths_array_step_cmp(a, b));
+            keyed.sort_by(|(a, _), (b, _)| jq_delpaths_array_step_cmp(trie, a, b));
             sorted_index_groups = keyed.into_iter().map(|(_, slot)| slot).collect::<Vec<_>>();
             &sorted_index_groups
         } else {
@@ -53953,7 +54198,7 @@ fn delete_trie_array(
                 // than first-resolved order, and never under a key this
                 // node's terminal-skip above already deleted wholesale
                 // (#2929).
-                ArrayStep::Slice(s, e) => {
+                ArrayStep::Slice(s, e, _) => {
                     let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
                     let sub = OwnedValue::Array(arr[range.clone()].to_vec().into());
                     let OwnedValue::Array(items) = delete_trie_apply(sub, trie, child, yq_mode)?
@@ -53986,7 +54231,7 @@ fn delete_trie_array(
         .filter(|(_, &child)| trie.node(child).terminal)
         .map(|(step, _)| match step {
             ArrayStep::Index { idx, frac } => array_index_step_key(*idx, *frac),
-            ArrayStep::Slice(s, e) => slice::literal_component(*s, *e),
+            ArrayStep::Slice(s, e, _) => slice::literal_component(*s, *e),
         })
         .collect();
     if !doomed.is_empty() {
@@ -61926,7 +62171,7 @@ impl PatternKey<'_> {
     /// between them -- value mode used to short-circuit a `null` target
     /// before evaluating any key (#1239), which is why `null | . as
     /// {(error("E")):$q} | $q` answered `null` where jq raises `E`.
-    fn child(&self, input: &OwnedValue) -> Result<OwnedValue, EvalError> {
+    fn child<S: EvalSemantics>(&self, input: &OwnedValue) -> Result<OwnedValue, EvalError> {
         match (self, input) {
             (Self::Field(key), OwnedValue::Object(obj)) => {
                 Ok(obj.get(*key).cloned().unwrap_or(OwnedValue::Null))
@@ -61948,7 +62193,7 @@ impl PatternKey<'_> {
                 owned_type_name(input),
                 "number",
             )),
-            (Self::Computed(key), _) => match index_one_owned(input, key, false) {
+            (Self::Computed(key), _) => match index_one_owned::<S>(input, key, false) {
                 Ok(Some(v)) => Ok(v),
                 Ok(None) => unreachable!("index_one_owned(.., optional: false) never suppresses"), // omni-dev: coverage tolerate-line reason="unreachable: `optional: false` makes index_one_owned answer Ok(Some)/Err only (#2872)"
                 Err(e) => Err(e),
@@ -61960,7 +62205,7 @@ impl PatternKey<'_> {
     /// a string key is a field, a numeric key an index that keeps its own
     /// spelling exactly as `.[EXPR]` does (`numeric_path_component`, #1088),
     /// and any other kind is [`Self::child`]'s error.
-    fn component(&self, input: &OwnedValue) -> Result<Expr, EvalError> {
+    fn component<S: EvalSemantics>(&self, input: &OwnedValue) -> Result<Expr, EvalError> {
         match self {
             Self::Field(key) => Ok(Expr::Field((*key).to_string())),
             Self::Position(i) => Ok(Expr::Index { idx: *i, key: None }),
@@ -61972,6 +62217,11 @@ impl PatternKey<'_> {
                     // position `child` resolves to `null`, not a real one.
                     let idx = numeric_key_to_index(key).unwrap_or(i64::MAX);
                     Ok(numeric_path_component(idx, key))
+                }
+                // #3300: a slice descriptor, as `.[k]`'s own path step
+                // spells it.
+                OwnedValue::Object(desc) if S::TAG != EvalTag::Yq => {
+                    descriptor_path_component::<S>(desc, input)
                 }
                 other => Err(EvalError::cannot_index_with_type(
                     owned_type_name(input),
@@ -61999,7 +62249,7 @@ trait PatternMode {
     /// is the first step its container performs (object entry 0, the last
     /// array element); every later entry steps from the container again,
     /// which path mode's identity check has to know.
-    fn step(
+    fn step<S: EvalSemantics>(
         &self,
         key: &PatternKey<'_>,
         input: &OwnedValue,
@@ -62029,14 +62279,14 @@ impl PatternMode for ValuePatternMode {
     type Reg = ();
     type Binding = (String, OwnedValue);
 
-    fn step(
+    fn step<S: EvalSemantics>(
         &self,
         key: &PatternKey<'_>,
         input: &OwnedValue,
         _reg: &(),
         _first: bool,
     ) -> Result<(OwnedValue, ()), EvalError> {
-        Ok((key.child(input)?, ()))
+        Ok((key.child::<S>(input)?, ()))
     }
 
     fn bind(&self, name: &str, value: &OwnedValue, _reg: &()) -> Self::Binding {
@@ -62088,7 +62338,7 @@ fn walk_pattern_each<M: PatternMode, S: EvalSemantics>(
 ) -> Flow {
     if !pattern_has_computed_key(pattern) {
         let mark = out.len();
-        let flow = match walk_pattern_once(mode, pattern, input, reg, out) {
+        let flow = match walk_pattern_once::<M, S>(mode, pattern, input, reg, out) {
             Ok(reg) => sink(reg, out),
             Err(e) => Flow::Escaped(Control::Error(e)),
         };
@@ -62125,7 +62375,7 @@ fn pattern_has_computed_key(pattern: &Pattern) -> bool {
 /// loop over each container's entries, recursing only into a nested
 /// sub-pattern (bounded by the parser's `MAX_PATTERN_DEPTH`). Bindings are
 /// pushed to `out` and left there for the caller to unwind.
-fn walk_pattern_once<M: PatternMode>(
+fn walk_pattern_once<M: PatternMode, S: EvalSemantics>(
     mode: &M,
     pattern: &Pattern,
     input: &OwnedValue,
@@ -62145,7 +62395,8 @@ fn walk_pattern_once<M: PatternMode>(
                 let ObjectKey::Literal(key) = &entry.key else {
                     unreachable!("the caller checked for computed keys") // omni-dev: coverage tolerate-line reason="unreachable: every caller gates on `pattern_has_computed_key` being false (#2872)"
                 };
-                let (child, moved) = mode.step(&PatternKey::Field(key), input, &reg, i == 0)?;
+                let (child, moved) =
+                    mode.step::<S>(&PatternKey::Field(key), input, &reg, i == 0)?;
                 // `{$b: P}` binds `$b` to the matched value *before* running
                 // `P` against that same value -- one `INDEX` step in jq's
                 // compilation (#2649) -- so the bind sits ahead of `P`'s own
@@ -62154,7 +62405,7 @@ fn walk_pattern_once<M: PatternMode>(
                 if let Some(bind) = &entry.bind {
                     out.push(mode.bind(bind, &child, &moved));
                 }
-                reg = walk_pattern_once(mode, &entry.pattern, &child, moved, out)?;
+                reg = walk_pattern_once::<M, S>(mode, &entry.pattern, &child, moved, out)?;
             }
             Ok(reg)
         }
@@ -62162,8 +62413,8 @@ fn walk_pattern_once<M: PatternMode>(
             let mut reg = reg;
             for (i, element) in elements.iter().enumerate().rev() {
                 let key = PatternKey::Position(i as i64);
-                let (child, moved) = mode.step(&key, input, &reg, i + 1 == elements.len())?;
-                reg = walk_pattern_once(mode, element, &child, moved, out)?;
+                let (child, moved) = mode.step::<S>(&key, input, &reg, i + 1 == elements.len())?;
+                reg = walk_pattern_once::<M, S>(mode, element, &child, moved, out)?;
             }
             Ok(reg)
         }
@@ -62195,7 +62446,7 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
         if pattern_has_computed_key(&entry.pattern) {
             break;
         }
-        let (child, moved) = match mode.step(&PatternKey::Field(key), input, &reg, first) {
+        let (child, moved) = match mode.step::<S>(&PatternKey::Field(key), input, &reg, first) {
             Ok(stepped) => stepped,
             Err(e) => {
                 out.truncate(mark);
@@ -62205,7 +62456,7 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
         if let Some(bind) = &entry.bind {
             out.push(mode.bind(bind, &child, &moved));
         }
-        reg = match walk_pattern_once(mode, &entry.pattern, &child, moved, out) {
+        reg = match walk_pattern_once::<M, S>(mode, &entry.pattern, &child, moved, out) {
             Ok(reg) => reg,
             Err(e) => {
                 out.truncate(mark);
@@ -62221,7 +62472,7 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
         return flow;
     };
     let mut per_key = |key: PatternKey<'_>, out: &mut Vec<M::Binding>| -> Flow {
-        let (child, moved) = match mode.step(&key, input, &reg, first) {
+        let (child, moved) = match mode.step::<S>(&key, input, &reg, first) {
             Ok(stepped) => stepped,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
@@ -62298,14 +62549,14 @@ fn walk_array_elements<M: PatternMode, S: EvalSemantics>(
     let mut end = elements.len();
     while end > 0 && !pattern_has_computed_key(&elements[end - 1]) {
         let key = PatternKey::Position(end as i64 - 1);
-        let (child, moved) = match mode.step(&key, input, &reg, first) {
+        let (child, moved) = match mode.step::<S>(&key, input, &reg, first) {
             Ok(stepped) => stepped,
             Err(e) => {
                 out.truncate(mark);
                 return Flow::Escaped(Control::Error(e));
             }
         };
-        reg = match walk_pattern_once(mode, &elements[end - 1], &child, moved, out) {
+        reg = match walk_pattern_once::<M, S>(mode, &elements[end - 1], &child, moved, out) {
             Ok(reg) => reg,
             Err(e) => {
                 out.truncate(mark);
@@ -62321,7 +62572,7 @@ fn walk_array_elements<M: PatternMode, S: EvalSemantics>(
         return flow;
     };
     let key = PatternKey::Position(rest.len() as i64);
-    let (child, moved) = match mode.step(&key, input, &reg, first) {
+    let (child, moved) = match mode.step::<S>(&key, input, &reg, first) {
         Ok(stepped) => stepped,
         Err(e) => {
             out.truncate(mark);
@@ -100201,7 +100452,9 @@ mod tests {
         let json_bytes: &[u8] = br"null";
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        let path_expr = parse(".[({})]").unwrap();
+        // `true`, not `{}`: an object key is a slice descriptor since #3300,
+        // and `null | del(.[{}])` is `null` in jq, not an error.
+        let path_expr = parse(".[(true)]").unwrap();
         let value_expr = Expr::Literal(Literal::Int(1));
         match eval_assign::<Vec<u64>, JqSemantics>(&path_expr, &value_expr, cursor.value(), true) {
             QueryResult::None => {}
@@ -100215,7 +100468,9 @@ mod tests {
         let json_bytes: &[u8] = br"null";
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        let path_expr = parse(".[({})]").unwrap();
+        // `true`, not `{}`: an object key is a slice descriptor since #3300,
+        // and `null | del(.[{}])` is `null` in jq, not an error.
+        let path_expr = parse(".[(true)]").unwrap();
         let filter_expr = Expr::Identity;
         match eval_update::<Vec<u64>, JqSemantics>(
             &path_expr,
@@ -100237,7 +100492,9 @@ mod tests {
         let json_bytes: &[u8] = br"null";
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        let path_expr = parse(".[({})]").unwrap();
+        // `true`, not `{}`: an object key is a slice descriptor since #3300,
+        // and `null | del(.[{}])` is `null` in jq, not an error.
+        let path_expr = parse(".[(true)]").unwrap();
         match builtin_del::<Vec<u64>, JqSemantics>(&path_expr, cursor.value(), true) {
             QueryResult::None => {}
             other => panic!("expected None, got {other:?}"),
