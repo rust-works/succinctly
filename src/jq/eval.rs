@@ -38095,6 +38095,11 @@ fn resolves_to_register<S: EvalSemantics>(
         Expr::Comma(exprs) => exprs
             .iter()
             .all(|e| resolves_to_register::<S>(e, trackable, reg, frame)),
+        // #3279: every stage is proved against the same `reg`, since each
+        // stage that resolves hands the next one `reg` again.
+        Expr::Pipe(stages) => stages
+            .iter()
+            .all(|e| resolves_to_register::<S>(e, trackable, reg, frame)),
         Expr::If {
             then_branch,
             else_branch,
@@ -45954,6 +45959,9 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
         Expr::Try { expr, .. } => is_raise_free_identity_passthrough(expr),
         // #3129: see the `A // B` bullet above.
         Expr::Alternative(left, _) => is_raise_free_identity_passthrough(left),
+        // #3279: a pipe of passthroughs of `.` is one -- each stage's input
+        // is the previous stage's output, which is `.` again.
+        Expr::Pipe(stages) => stages.iter().all(is_identity_passthrough),
         _ => false,
     }
 }
@@ -45999,7 +46007,56 @@ fn is_raise_free_identity_passthrough(expr: &Expr) -> bool {
         }
         Expr::Try { expr, .. } => is_raise_free_identity_passthrough(expr),
         Expr::Alternative(left, _) => is_raise_free_identity_passthrough(left),
-        // `Expr::If` lands here on purpose: its condition may raise.
+        // #3279: an `if` is raise-free, and yields at least one output, only
+        // when its *condition* provably is too -- `try (if true then . else
+        // . end) catch 1` binds `.`, while `try (if error("e") then . else .
+        // end) catch {"b":1}` binds the handler's value (#2978), and `(if
+        // empty then . else . end) // B` binds `B` (#3129). Any other
+        // condition still lands on `false` below.
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            cond_is_total_and_raise_free(cond)
+                && is_raise_free_identity_passthrough(then_branch)
+                && is_raise_free_identity_passthrough(else_branch)
+        }
+        // #3279: a pipe of raise-free, non-empty passthroughs is one too.
+        Expr::Pipe(stages) => stages.iter().all(is_raise_free_identity_passthrough),
+        _ => false,
+    }
+}
+
+/// Whether `cond` provably yields at least one output and never raises, on
+/// any input (#3279) -- what an `if` condition must satisfy for the `if` to
+/// count as raise-free in [`is_raise_free_identity_passthrough`]. A closed,
+/// conservative grammar: literals, `.`, variables and `$__loc__`, and `not`,
+/// comparisons (`jv_cmp` is total, so `{} < []` does not raise), `and`,
+/// `or`, `,` and `if` over them. Field and index access (`.a` raises on a
+/// number), arithmetic, negation and every call are out: any of them can
+/// raise, and a call can also yield nothing.
+fn cond_is_total_and_raise_free(cond: &Expr) -> bool {
+    match unwrap_bind_source(cond) {
+        Expr::Literal(_)
+        | Expr::Identity
+        | Expr::Var(_)
+        | Expr::TrackedVar(_)
+        | Expr::Loc { .. }
+        | Expr::Not => true,
+        Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
+            cond_is_total_and_raise_free(left) && cond_is_total_and_raise_free(right)
+        }
+        Expr::Comma(items) => !items.is_empty() && items.iter().all(cond_is_total_and_raise_free),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            cond_is_total_and_raise_free(cond)
+                && cond_is_total_and_raise_free(then_branch)
+                && cond_is_total_and_raise_free(else_branch)
+        }
         _ => false,
     }
 }
@@ -46203,6 +46260,22 @@ fn identity_bind_position<S: EvalSemantics>(
                 position(expr, trackable, frame)
             }
             Expr::Alternative(left, _) => position(left, trackable, frame),
+            // #3279: a pipe's output is its last non-`.` stage's, and that
+            // stage sees the frame's `.` only when every stage before it is
+            // `.` too. Otherwise its input is a marker's value, a node this
+            // walk has no position for: the bare value rule, or `Untracked`
+            // off the register, as for `.` itself.
+            Expr::Pipe(stages) => {
+                let mut rest = stages
+                    .iter()
+                    .filter(|stage| !matches!(unwrap_bind_source(stage), Expr::Identity));
+                match (rest.next(), rest.next()) {
+                    (None, _) => position(&Expr::Identity, trackable, frame),
+                    (Some(only), None) => position(only, trackable, frame),
+                    (Some(_), Some(_)) if trackable => None,
+                    (Some(_), Some(_)) => Some(Origin::Untracked),
+                }
+            }
             _ => None,
         }
     }
@@ -103635,9 +103708,10 @@ mod tests {
     /// `//` runs its right operand. Every row raises in jq 1.7.1 with this
     /// message.
     ///
-    /// The last row is what the gate costs: an `if` whose condition happens
-    /// not to raise, inside a `try`. jq answers `["a","k","b"]`; the static
-    /// rule cannot tell it from the raising one, so it is refuse-only.
+    /// An `if` whose condition provably cannot raise or come up empty
+    /// (`true`, #3279's condition grammar) keeps its position instead: jq
+    /// answers `["a","k","b"]`, and it used to be this gate's refuse-only
+    /// cost. The raising condition still refuses.
     ///
     /// Rows 8-11 (#3129): the same hole reached directly through `//`,
     /// with no `try` at all -- `if`'s condition can make the whole `if`
@@ -103658,7 +103732,6 @@ mod tests {
             r#"del(.a | (try (if error("e") then . else . end) catch {"b":1}) as $x | .k | $x | .b)"#,
             r#"path(.a | ((try (if error("e") then . else . end)) // {"k":{"b":1}}) as $x | .k | $x | getpath(["k"]) | .b)"#,
             r#"path(.a | ((try (if error("e") then . else . end)) // {"b":1}) as $x | .k | $x | .b)"#,
-            r#"path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)"#,
             r#"path(.a | ((if empty then . else . end) // {"b":1}) as $x | .k | $x | .b)"#,
             r#"del(.a | ((if empty then . else . end) // {"b":1}) as $x | .k | $x | .b)"#,
             r#".a | ((if empty then . else . end) // {"b":1}) as $x | .k | ($x.b) = 9"#,
@@ -103674,6 +103747,7 @@ mod tests {
         for filter in [
             r#"path(.a | (try (try . catch 1) catch 2) as $x | .k | $x | getpath(["k"]) | .b)"#,
             r#"path(.a | (try (. // 1) catch 2) as $x | .k | $x | getpath(["k"]) | .b)"#,
+            r#"path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)"#,
         ] {
             assert_eq!(outputs(doc, filter), [r#"["a","k","b"]"#], "{filter}");
         }
@@ -103686,24 +103760,32 @@ mod tests {
             [r#"["a","b"]"#]
         );
         // The predicate itself, on the shapes the rows above go through.
-        // #3129: `(if true then . else . end) // 1` flipped from `true` to
-        // `false` -- an `if` on `//`'s left is no longer admitted at all
-        // (not only inside `try`), since its condition can make the whole
-        // `if` yield nothing, and `//` runs its right side on empty just
-        // like it does on catch-less `try`.
+        // #3129 closed an `if` on `//`'s left, and #2978 one in a `try`
+        // body, because the condition can raise or make the whole `if` yield
+        // nothing. #3279 re-admits exactly the conditions that provably can
+        // do neither (`true`), so those shapes answer as jq does, while a
+        // raising, empty or navigating condition stays out.
         for (src, want) in [
             ("try . catch 1", true),
             ("try (try . catch 1) catch 2", true),
             ("try (. // 1) catch 2", true),
             ("if true then . else . end", true),
-            ("(if true then . else . end) // 1", false),
-            ("try (if true then . else . end) catch 1", false),
-            ("try ((if true then . else . end) // 1) catch 2", false),
-            ("(try (if true then . else . end)) // 1", false),
+            ("(if true then . else . end) // 1", true),
+            ("try (if true then . else . end) catch 1", true),
+            ("try ((if true then . else . end) // 1) catch 2", true),
+            ("(try (if true then . else . end)) // 1", true),
             (
                 "try (try (if true then . else . end) catch 1) catch 2",
+                true,
+            ),
+            ("(if empty then . else . end) // 1", false),
+            ("try (if error(\"e\") then . else . end) catch 1", false),
+            ("try (if .a then . else . end) catch 1", false),
+            (
+                "try (if (1, error(\"e\")) then . else . end) catch 1",
                 false,
             ),
+            ("(if error(\"e\")? then . else . end) // 1", false),
         ] {
             let parsed = parse(src).unwrap();
             assert_eq!(is_identity_passthrough(&parsed), want, "{src}");
