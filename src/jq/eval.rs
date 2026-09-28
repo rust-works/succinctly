@@ -8823,7 +8823,8 @@ pub(crate) fn owned_path_door_collect<S: EvalSemantics>(
 ///
 /// Declines (`None`, and the re-entry bridges as before) unless the target
 /// holds a marker and is built only from [`is_pure_navigation_node`]s, `?`,
-/// computed keys and arithmetic: with no marker there is no storage identity
+/// computed keys, object constructors (a slice descriptor key, #3300) and
+/// arithmetic: with no marker there is no storage identity
 /// to lose, and such a target has no side effect a declined resolution could
 /// repeat. It also declines on any escape, and on a component
 /// [`static_path_expr`] cannot spell exactly, so every refusal and error
@@ -8859,6 +8860,9 @@ pub(crate) fn owned_write_door<S: EvalSemantics>(
                     | Expr::IndexExpr { .. }
                     | Expr::Arithmetic { .. }
                     | Expr::Negate(_)
+                    // A slice descriptor key, `.[{"start":0,"end":1}]`
+                    // (#3300): its entries are vetted like any other node.
+                    | Expr::Object(_)
             ))
     });
     if effectful || !marked {
@@ -8914,11 +8918,12 @@ fn write_target_mut(head: &mut Expr) -> Option<&mut Box<Expr>> {
 
 /// A path `path(f)` produced, as the static navigation that reaches it
 /// (`["a", 0]` is `.a | .[0]`, `[]` is `.`), or `None` unless every
-/// component is a string, an exactly representable integer, or a fractional
-/// number. A fractional index is not the
-/// integer it truncates to (`.[-0.5]` is not `.[0]` to jq's `del`), so it is
-/// re-spelled with its exact key (#3302). An integral float too large to be
-/// exact, and a slice (#3300), are not re-spelled.
+/// component is a string, an exactly representable integer, a fractional
+/// number or a slice descriptor. A fractional index is not the integer it
+/// truncates to (`.[-0.5]` is not `.[0]` to jq's `del`), so it is re-spelled
+/// with its exact key (#3302); a slice descriptor is re-spelled as the index
+/// key it is (#3300). An integral float too large to be exact is not
+/// re-spelled.
 fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
     let OwnedValue::Array(components) = path else {
         return None; // omni-dev: coverage tolerate-line reason="unreachable: every value path_over_owned hands back is a path() output, which is always an array (#3188)"
@@ -8953,6 +8958,13 @@ fn static_path_expr(path: &OwnedValue) -> Option<Expr> {
                     key: Some(NumberKey::Float(*f)),
                 })
             }
+            // A slice component is jq's descriptor object, spelled as the
+            // index key it is (`.[{"start":0,"end":1}]`, #3300), which the
+            // write resolves against the real container.
+            OwnedValue::Object(_) => Some(Expr::IndexExpr {
+                target: Box::new(Expr::Identity),
+                key: Box::new(owned_to_expr(component)),
+            }),
             _ => None,
         })
         .collect::<Option<Vec<Expr>>>()?;
@@ -29255,8 +29267,17 @@ fn slice_has_non_integer_bound(
     start_key: Option<&SliceBoundKey>,
     end_key: Option<&SliceBoundKey>,
 ) -> bool {
-    matches!(start_key, Some(SliceBoundKey::Raw(_)))
-        || matches!(end_key, Some(SliceBoundKey::Raw(_)))
+    let fails = |key: Option<&SliceBoundKey>| match key {
+        Some(SliceBoundKey::Raw(_)) => true,
+        // #3300: a descriptor index key whose bounds jq never parsed, which
+        // likewise only resolves over a `null` target.
+        Some(SliceBoundKey::Verbatim(desc)) => match &**desc {
+            OwnedValue::Object(desc) => SliceBounds::from_descriptor(desc).is_err(),
+            _ => false, // omni-dev: coverage tolerate-line reason="unreachable: descriptor_path_component builds a Verbatim key only from an object (#3300)"
+        },
+        Some(SliceBoundKey::Number(_)) | None => false,
+    };
+    fails(start_key) || fails(end_key)
 }
 
 struct SliceEditFlags {
@@ -31645,13 +31666,17 @@ fn eval_owned_multi_keep_partial<S: EvalSemantics>(
 /// key -- stays `5`, not an error, unlike the same key against an array
 /// target). `set_path`'s no-op check fires before this placeholder's
 /// index value is ever read back out, so its exact value doesn't matter.
-fn key_to_path_component(
+fn key_to_path_component<S: EvalSemantics>(
     key: &OwnedValue,
     container: &OwnedValue,
     scalar_noop: bool,
 ) -> Result<Expr, EvalError> {
     match key {
         OwnedValue::String(s) => Ok(Expr::Field(s.clone())),
+        // #3300: jq's slice descriptor, in path position.
+        OwnedValue::Object(desc) if S::TAG != EvalTag::Yq => {
+            descriptor_path_component::<S>(desc, container)
+        }
         // Truncation toward zero, as in the value path.
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             if scalar_noop {
@@ -31668,6 +31693,52 @@ fn key_to_path_component(
         }
         _ => Err(EvalError::cannot_index(owned_type_name(container), key)),
     }
+}
+
+/// The static component `path(.[{"start":s,"end":e}])` resolves to
+/// (#3300): an [`Expr::Slice`], ruled on against `container`'s kind in
+/// jq's `INDEX` order exactly as `E[S:T]`'s path step is
+/// (`resolve_slice_expr_sink`). A `null` container resolves without reading
+/// the bounds, so a bound jq never parsed rides into the component and the
+/// eventual write refuses it (#2853); an array or string validates them
+/// (`Array/string slice indices must be integers`); anything else is
+/// `Cannot index <kind> with object`.
+///
+/// jq appends the key verbatim, so only the canonical `{"start":s,"end":e}`
+/// pair is spelled through per-bound keys (keeping a float bound's
+/// spelling, #1326); any other shape -- reordered, extra or missing keys --
+/// is carried whole as [`SliceBoundKey::Verbatim`].
+fn descriptor_path_component<S: EvalSemantics>(
+    desc: &IndexMap<String, OwnedValue>,
+    container: &OwnedValue,
+) -> Result<Expr, EvalError> {
+    let side = |name: &str, round: fn(f64) -> f64| match desc.get(name) {
+        Some(v) => PathSliceBound::classify(v.clone(), round),
+        None => PathSliceBound {
+            bound: Err(EvalError::slice_indices_not_integers()),
+            key: None,
+        },
+    };
+    let (s, e) = (side("start", f64::floor), side("end", f64::ceil));
+    let (start, end) = match SliceTargetKind::of_type_name(owned_type_name(container)) {
+        SliceTargetKind::Null => (s.navigable(), e.navigable()),
+        kind => resolve_computed_slice_bounds::<S>(kind, &s.bound, &e.bound)?,
+    };
+    let canonical = desc.len() == 2
+        && desc.get_index(0).is_some_and(|(k, _)| k == "start")
+        && desc.get_index(1).is_some_and(|(k, _)| k == "end");
+    let (start_key, end_key) = if canonical {
+        (s.key, e.key)
+    } else {
+        let whole = OwnedValue::Object(desc.clone().into());
+        (Some(SliceBoundKey::Verbatim(Box::new(whole))), None)
+    };
+    Ok(Expr::Slice {
+        start,
+        end,
+        start_key,
+        end_key,
+    })
 }
 
 /// The static path component a numeric key already resolved to `idx` denotes.
@@ -31764,6 +31835,10 @@ pub(crate) fn slice_component_value(
     end: Option<i64>,
     end_key: Option<&SliceBoundKey>,
 ) -> OwnedValue {
+    // #3300: a non-canonical descriptor index key renders as itself.
+    if let Some(SliceBoundKey::Verbatim(desc)) = start_key {
+        return (**desc).clone();
+    }
     slice::literal_component_from_values(
         slice_bound_component_value(start, start_key),
         slice_bound_component_value(end, end_key),
@@ -31785,7 +31860,12 @@ fn slice_bound_component_value(bound: Option<i64>, key: Option<&SliceBoundKey>) 
         Some(SliceBoundKey::Number(number)) => {
             bound.map_or(OwnedValue::Null, |i| index_component_value(i, Some(number)))
         }
-        None => bound.map_or(OwnedValue::Null, |i| index_component_value(i, None)),
+        // A `Verbatim` key names the whole component, which
+        // `slice_component_value` renders before reaching here; a lone
+        // bound of one falls back to its navigable integer.
+        Some(SliceBoundKey::Verbatim(_)) | None => {
+            bound.map_or(OwnedValue::Null, |i| index_component_value(i, None))
+        }
     }
 }
 
@@ -35398,7 +35478,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                         // no-op behavior to match here -- unlike the `.foo`/
                         // `.[key]` shapes `resolve_index_expr` handles below,
                         // which do (#1181).
-                        let component = match key_to_path_component(key, &current, false) {
+                        let component = match key_to_path_component::<S>(key, &current, false) {
                             Ok(component) => component,
                             Err(e) => {
                                 arg_escape = Some(e.into());
@@ -43043,7 +43123,7 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
                 escape!(EvalError::new("Cannot set array element at NaN index").into());
             }
             let scalar_noop = S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(target_value);
-            let component = match key_to_path_component(k, target_value, scalar_noop) {
+            let component = match key_to_path_component::<S>(k, target_value, scalar_noop) {
                 Ok(component) => component,
                 Err(_) if optional => continue,
                 Err(e) => escape!(e.into()),
