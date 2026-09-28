@@ -39,7 +39,9 @@ use super::document::{
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
 use super::expr::Literal;
-use super::value::{assert_value_tree_depth, infinite_float_preview_text, ObjectMapOf, OwnedValue};
+use super::value::{
+    assert_value_tree_depth, infinite_float_preview_text, NumberRepr, ObjectMapOf, OwnedValue,
+};
 
 /// A JSON value for jq evaluation - lazy by default, materialized when needed.
 ///
@@ -215,6 +217,12 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             // above) means the parsed value is deliberately not read until
             // needed, regardless of whether a `NumberRepr` happens to
             // already be sitting on the node.
+            // A parsed NaN (#3309) has no spelling to defer: its text is
+            // jq's printing of it, so it takes the eager conversion, which
+            // `from_owned` turns into the NaN itself.
+            Literal::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
+                JqValue::from_owned(OwnedValue::from(lit.clone()))
+            }
             Literal::NumberLiteral(_repr, text) => JqValue::NumberLiteral(text.as_str().into()),
             _ => JqValue::from_owned(OwnedValue::from(lit.clone())),
         }
@@ -237,6 +245,10 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             OwnedValue::Bool(b) => JqValue::Bool(b),
             OwnedValue::Int(n) => JqValue::Int(n),
             OwnedValue::Float(f) => JqValue::Float(f),
+            // A parsed NaN (#3309) has no number spelling to defer (its text
+            // is jq's printing, `null`): it is the NaN it holds. Its instance
+            // only matters to `==`, which never runs on a `JqValue`.
+            OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => JqValue::Float(f),
             OwnedValue::NumberLiteral(_, literal) => JqValue::NumberLiteral(literal),
             OwnedValue::String(s) => JqValue::String(s),
             OwnedValue::Array(arr) => JqValue::Array(
@@ -1450,6 +1462,25 @@ mod tests {
         let val: JqValue<'_, Vec<u64>> = JqValue::from_literal(&lit);
         assert!(matches!(val, JqValue::NumberLiteral(ref s) if s.as_ref() == "1.500"));
         assert_eq!(val.as_f64(), Some(1.5));
+    }
+
+    /// #3309: a parsed NaN's literal text is `null`, jq's printing, not a
+    /// spelling -- both constructors must hand back the NaN itself rather
+    /// than defer a parse of that text into a `null`.
+    #[test]
+    fn test_nan_instance_stays_a_nan_3309() {
+        let instance = OwnedValue::fresh_nan_instance(false);
+        let OwnedValue::NumberLiteral(repr, text) = instance.clone() else {
+            panic!("a NaN instance is a literal"); // omni-dev: coverage tolerate-line reason="failure message for the shape the test asserts"
+        };
+        let from_literal: JqValue<'_, Vec<u64>> =
+            JqValue::from_literal(&Literal::NumberLiteral(repr, text.to_string()));
+        let from_owned: JqValue<'_, Vec<u64>> = JqValue::from_owned(instance);
+        for val in [from_literal, from_owned] {
+            assert!(val.as_f64().is_some_and(f64::is_nan), "{val:?}");
+            assert_eq!(val.type_name(), "number");
+            assert!(matches!(val.materialize(), Ok(OwnedValue::Float(f)) if f.is_nan()));
+        }
     }
 
     /// #1098/#1247: sibling of `eval_generic::to_owned`'s own regression

@@ -1060,6 +1060,20 @@ pub trait DocumentValue: Sized + Clone {
         None
     }
 
+    /// The address of this number token's first byte in the document text,
+    /// `None` for anything else and for a reindex bridge token (a computed
+    /// value, not a parsed one).
+    ///
+    /// The identity jq gives a NaN it parsed (#3309): every read of one
+    /// position answers the same address and no other live token does, so a
+    /// materializer can key the NaN by it
+    /// (`OwnedValue::document_nan_instance`). Defaults to `None`, which
+    /// leaves a NaN a plain computed one; only JSON overrides it, since only
+    /// jq mode compares by instance.
+    fn number_token_address(&self) -> Option<usize> {
+        None
+    }
+
     /// Try to get as a string.
     fn as_str(&self) -> Option<Cow<'_, str>>;
 

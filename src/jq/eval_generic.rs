@@ -232,6 +232,20 @@ fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) ->
     }
 }
 
+/// [`OwnedValue::from_document_float`] for a double read from `value`, except
+/// a NaN jq parsed from the document keeps the instance identity jq's `==`
+/// compares it by (#3309), keyed by the token's address.
+fn document_float_to_owned<S: EvalSemantics, V: DocumentValue>(value: &V, f: f64) -> OwnedValue {
+    if S::DECNUMBER_LITERALS && f.is_nan() {
+        if let Some(address) = value.number_token_address() {
+            return OwnedValue::document_nan_instance(f.is_sign_negative(), address);
+        }
+        // A bridge token for a parsed NaN: the instance it was written from.
+        return OwnedValue::from_bridge_float(f);
+    }
+    OwnedValue::from_document_float(f)
+}
+
 /// Checked sibling of [`to_owned`] (#2299): identical materialization
 /// logic, `check_nesting_depth` (catchable) in place of
 /// `assert_nesting_depth` (panic).
@@ -327,7 +341,7 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
         // jq still reads that span's decimal through its 17-digit rounding
         // (#2936), which is why the double comes from the mode-aware
         // accessor rather than the plain `as_f64()`.
-        Ok(OwnedValue::from_document_float(f))
+        Ok(document_float_to_owned::<S, V>(value, f))
     } else if let Some(s) = value.as_str() {
         Ok(OwnedValue::String(s.into_owned()))
     } else if let Some(reason) = value.string_decode_error() {
@@ -579,7 +593,7 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         // jq still reads that span's decimal through its 17-digit rounding
         // (#2936), which is why the double comes from the mode-aware
         // accessor rather than the plain `as_f64()`.
-        Ok(OwnedValue::from_document_float(f))
+        Ok(document_float_to_owned::<S, V>(value, f))
     } else if let Some(s) = value.as_str() {
         Ok(OwnedValue::String(s.into_owned()))
     } else if let Some(reason) = value.string_decode_error() {
@@ -3157,7 +3171,9 @@ fn query_result_to_generic<V: DocumentValue, S: EvalSemantics>(
 /// exceptions are all numeric, because `to_json_for_reindex` is a *formatter*
 /// as much as a serializer:
 ///
-/// - A **NaN** `NumberLiteral` is replaced by `NAN_SENTINEL`.
+/// - A **NaN** `NumberLiteral` is replaced by a bridge token (`NAN_SENTINEL`
+///   plus its bits, #3309), which reads back as the same instance but not as
+///   the source spelling.
 ///
 /// A bare **`Float`** used to head this list: the formatter re-spelled a
 /// finite one by a mode-forked rule (#953) and it came back as a
@@ -24096,7 +24112,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // same provenance the `number_literal()` arm above preserves
                 // -- see `OwnedValue::from_document_float`; the double is
                 // the mode's (#2936), as in `to_owned_at_depth`.
-                GenericResult::Owned(OwnedValue::from_document_float(f))
+                GenericResult::Owned(document_float_to_owned::<S, V>(&value, f))
             } else if let Some(s) = value.as_str() {
                 match tonumber_from_str(s.as_ref(), S::TAG == EvalTag::Yq) {
                     Ok(n) => GenericResult::Owned(n),
@@ -33653,6 +33669,48 @@ mod tests {
         let expr = crate::jq::parse(".a | tonumber").unwrap();
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_error());
+    }
+
+    /// #3309: `tonumber` on a document NaN is a passthrough, so it hands
+    /// back the same parse instance `.a` reads, and `==` agrees.
+    #[test]
+    fn test_tonumber_passes_a_document_nan_instance_through_3309() {
+        let json = br#"{"a": NaN, "b": NaN}"#;
+        let index = JsonIndex::build(json);
+        for (filter, expected) in [
+            ("(.a | tonumber) == .a", true),
+            ("(.a | tonumber) == .b", false),
+        ] {
+            let expr = crate::jq::parse(filter).unwrap();
+            let result = eval_with_cursor(&expr, index.root(json));
+            assert_eq!(
+                result.into_owned::<JqSemantics>().unwrap(),
+                Some(OwnedValue::Bool(expected)),
+                "{filter}"
+            );
+        }
+    }
+
+    /// #3309: only a JSON number token has an address to key a NaN by -- any
+    /// other JSON value, and every YAML value (yq never compares by
+    /// instance), answers `None`.
+    #[test]
+    fn test_number_token_address_is_json_numbers_only_3309() {
+        let json = br#"["s", NaN]"#;
+        let index = JsonIndex::build(json);
+        let first = index.root(json).first_child().expect("an element");
+        assert_eq!(first.value().number_token_address(), None);
+        let second = first.next_sibling().expect("a second element");
+        assert!(second.value().number_token_address().is_some());
+
+        let yaml = b"a: .nan\n";
+        let index = crate::yaml::YamlIndex::build(yaml).unwrap();
+        let doc = index.root(yaml).first_child().expect("a document");
+        let nan = doc
+            .first_child()
+            .and_then(|k| k.next_sibling())
+            .expect("a value");
+        assert_eq!(nan.value().number_token_address(), None);
     }
 
     #[test]

@@ -2700,6 +2700,22 @@ impl<'a> JsonNumber<'a> {
             .or_else(|| crate::json::validate::parse_computed_float_token(bytes))
     }
 
+    /// The address of the token's first byte in the document text: the
+    /// identity jq gives a NaN it parsed (#3309), since every read of one
+    /// position answers the same address and no other live token does.
+    /// `None` for a reindex bridge token, which stands for a computed value.
+    ///
+    /// The one definition both keying routes use
+    /// (`OwnedValue::from_json_number` and `DocumentValue::number_token_address`),
+    /// so a document NaN gets the same instance whichever materializes it.
+    #[must_use]
+    pub fn token_address(&self) -> Option<usize> {
+        if self.bridge_value().is_some() {
+            return None;
+        }
+        Some(self.raw_bytes().as_ptr() as usize)
+    }
+
     /// [`bridge_value`](Self::bridge_value) restricted to the NaN/infinity
     /// tokens (#472/#1083): `None` for the computed-float token and for
     /// everything read outside the bridge. For the cursor builtins that
@@ -2830,8 +2846,8 @@ use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
 use crate::jq::{
     format_number_jq_compat, is_jq_canonical_number, jq_canonical_number_prefix,
-    nesting_depth_exceeded_message, nonfinite_display_string, EvalError, JqSemantics, OwnedValue,
-    YqSemantics, MAX_VALUE_TREE_DEPTH,
+    nesting_depth_exceeded_message, nonfinite_display_string, EvalError, JqSemantics, NumberRepr,
+    OwnedValue, YqSemantics, MAX_VALUE_TREE_DEPTH,
 };
 
 /// A [`JsonError`] as the uncatchable decode failure (#1620) every
@@ -3877,6 +3893,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         }
     }
 
+    fn number_token_address(&self) -> Option<usize> {
+        match self {
+            StandardJson::Number(n) => n.token_address(),
+            _ => None,
+        }
+    }
+
     fn number_text(&self) -> Option<Cow<'_, str>> {
         match self {
             StandardJson::Number(n) => core::str::from_utf8(n.raw_bytes()).ok().map(Cow::Borrowed),
@@ -4726,6 +4749,11 @@ fn write_json_number<Out: core::fmt::Write>(
                 // survive (`.500` -> `0.500`, not `0.5`) -- route it
                 // through the same jq-compat reformatting a strictly-valid
                 // span gets above, via the literal's own text.
+                // A NaN spelling (`NaN`, `-nan`) is a parse instance (#3309),
+                // whose literal text is not a number spelling: jq prints `null`.
+                OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
+                    out.write_str("null")
+                }
                 OwnedValue::NumberLiteral(_, literal) => {
                     out.write_str(&format_number_jq_compat(literal.as_bytes()))
                 }
