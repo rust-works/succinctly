@@ -74657,8 +74657,9 @@ fn test_skip_count_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 /// nothing, raising, or failing to destructure -- over `[10,20,30]`. The
 /// controls pin what moving the stash apart from the output prefix must
 /// keep: a prefix produced before a later bound's error, a generator in
-/// either bound, a slice error with no `?//`, and a `halt_error` that must
-/// not retry. Every value captured from jq 1.7.1.
+/// either bound, a slice error with no `?//`, a `halt_error` that must not
+/// retry, and a short-circuiting wrapper around the retrying bound. Every
+/// value captured from jq 1.7.1.
 const RETRY_ROWS_SLICE_BOUND_3293: &[RetryRow3293] = &[
     (
         r#".[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]"#,
@@ -74805,6 +74806,58 @@ const RETRY_ROWS_SLICE_BOUND_3293: &[RetryRow3293] = &[
     (
         r#".[(0, ([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)):]"#,
         "[10,20,30]\n[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // #3293 review: a `first`/`limit`/`nth` around the retrying bound
+    // reports its own count stop as `Stopped` after the retry superseded
+    // the stash -- a panic in the first version of this fix.
+    (
+        r#".[first([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[:first([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[limit(1; [[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[nth(0; [[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[.[(limit(1; [[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)):]]"#,
+        "[[10,20,30]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[limit(2; [[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a, 1):]"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[first([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]"#,
+        "",
         "AA",
         "",
         0,
