@@ -23598,6 +23598,22 @@ fn test_object_slice_computed_bounds_1102() -> Result<()> {
     Ok(())
 }
 
+/// #3404: a computed end bound in `(-1, 0)` is a *given* end that folds to
+/// the full child count `2N`, the same as `resolve_object_children` answers
+/// for any other given end past the last child -- never the entry count `N`
+/// an *omitted* end defaults to, which a "treat it as open" fix would have
+/// produced (`["a",1]`). Not a yq-parity row: real yq v4.53.3 rejects every
+/// fractional bound (`strconv.ParseInt: parsing "-0.5": invalid syntax`), a
+/// separate, pre-existing divergence. This pins internal consistency between
+/// the computed route and the given-end rule only.
+#[test]
+fn test_object_slice_fractional_negative_end_is_a_given_end_3404() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0:(-0.5)]", r#"{"a":1,"b":2}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["a",1,"b",2]"#);
+    Ok(())
+}
+
 /// Found by review: `path(.[S:E])` on an object used to succeed (the new
 /// `slice_owned_value_read` arm) while the descriptor it returned was
 /// unusable by `getpath` (whose own hand-rolled slice-descriptor dispatch

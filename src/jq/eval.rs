@@ -24681,8 +24681,9 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// bound, so a fractional dynamic bound still widens the slice the way a
 /// literal one does (`SliceBounds::resolve` re-applies the same floor/ceil
 /// to whatever `Expr::Slice` carries, so rounding here first is transparent
-/// to it -- see `slice.rs`'s doc comment). A missing bound (`None`) is a
-/// single open side (`Ok(None)`) -- not an empty stream.
+/// to it -- see `slice.rs`'s doc comment -- except for an end in `(-1, 0)`,
+/// which [`owned_bound_to_i64`] carries as past-the-end, #3404). A missing
+/// bound (`None`) is a single open side (`Ok(None)`) -- not an empty stream.
 ///
 /// The successor of the eager `eval_slice_bound` this file carried until
 /// #2546 (`eval_generic::each_slice_bound_generic` is the CLI route's
@@ -24780,11 +24781,36 @@ fn pull_slice_bound<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `drive_slice_bound` (path mode), and with `eval_generic`'s
 /// `eval_slice_bound` (#615), which needs the same OwnedValue-only classify
 /// step for its own bound resolution.
+///
+/// **A negative bound that rounds to zero is past the end, not `0`**
+/// (#3404). This rounds before any length is known, but jq folds a negative
+/// bound against the length *first* (`ceil(-0.5 + len)`, see `slice.rs`'s
+/// `clamp`, #3396). The two orders agree for every bound except a ceiled
+/// end in `(-1, 0)`: `ceil(-0.5)` is `-0.0`, which `SliceBounds::resolve`
+/// would read as a genuine `0`, while jq's `ceil(-0.5 + len)` is `len` for
+/// *every* `len >= 0`. `i64::MAX` is that answer under the one rule every
+/// consumer of this `i64` resolves it through (`SliceBounds::from_literals`,
+/// whose clamp takes it to the length), so `[1,2,3,4] | .[0:(-0.5)]` is the
+/// whole array. It stays `Some` -- a *given* end, not the *omitted* `None`
+/// -- because `resolve_object_children` defaults an omitted end to the
+/// entry count `N` but clamps a given one against the child count `2N`, so
+/// faking it as open would halve yq's object-child slice. Rendering is
+/// unaffected: a fractional bound always carries its spelling as a
+/// `NumberKey`, which `slice_bound_component_value` reads before the `i64`.
+/// A floored start never takes this arm: `floor` of a negative number is
+/// never zero.
 pub(crate) fn owned_bound_to_i64(
     v: &OwnedValue,
     round: fn(f64) -> f64,
 ) -> Result<Option<i64>, EvalError> {
-    Ok(SliceBounds::resolved_bound(v)?.map(|f| round(f) as i64))
+    Ok(SliceBounds::resolved_bound(v)?.map(|f| {
+        let rounded = round(f);
+        if f < 0.0 && rounded == 0.0 {
+            i64::MAX
+        } else {
+            rounded as i64
+        }
+    }))
 }
 
 /// The two bounds of a slice *descriptor* used as an index key,
@@ -93706,6 +93732,34 @@ mod tests {
             Some(plain.clone()),
             Some(plain),
         )));
+    }
+
+    /// #3404: a ceiled end bound in `(-1, 0)` is carried as past-the-end,
+    /// so it resolves to the length on every route -- including yq's
+    /// object-child layout, where it must stay a *given* end (`2N`), not
+    /// the omitted one (`N`). Nothing else changes: `-0.0` is not
+    /// negative, `-1.5` already rounds away from zero, and a floored start
+    /// never rounds a negative number to zero.
+    #[test]
+    fn owned_bound_to_i64_end_in_open_unit_interval_is_past_the_end_3404() {
+        let end = |f: f64| owned_bound_to_i64(&OwnedValue::Float(f), f64::ceil).unwrap();
+        let start = |f: f64| owned_bound_to_i64(&OwnedValue::Float(f), f64::floor).unwrap();
+
+        assert_eq!(end(-0.5), Some(i64::MAX));
+        assert_eq!(end(-0.999), Some(i64::MAX));
+        assert_eq!(end(-f64::MIN_POSITIVE), Some(i64::MAX));
+        assert_eq!(end(-0.0), Some(0));
+        assert_eq!(end(-1.0), Some(-1));
+        assert_eq!(end(-1.5), Some(-1));
+        assert_eq!(end(0.5), Some(1));
+        assert_eq!(start(-0.5), Some(-1));
+        assert_eq!(start(-0.0), Some(0));
+
+        let bounds = SliceBounds::from_literals(Some(0), end(-0.5));
+        assert_eq!(bounds.resolve(4), 0..4);
+        assert_eq!(bounds.resolve(0), 0..0);
+        assert!(bounds.is_full_range(4));
+        assert_eq!(bounds.resolve_object_children(2), 0..4);
     }
 
     /// #499: `eval_slice_expr` (plain reads, no `=`/`|=`/`path()`/`del()`)
