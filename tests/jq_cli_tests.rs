@@ -73767,17 +73767,36 @@ fn assert_retry_rows_3293(input: Option<&str>, rows: &[RetryRow3293]) -> Result<
 /// #3293: a `?//` retry inside unary minus supersedes the verdict the
 /// retried-past alternative left in `each_negate_generic`'s stash.
 ///
-/// The rows cover, as the sink allows: the retry answering after the first
-/// alternative's error; the retry producing nothing, so the sink is never
-/// re-invoked; the retry raising inside the generator; a consumer's stop on
-/// the first alternative that must not hide the retry's own error; and
-/// controls -- every alternative failing (the last one's error surfaces), no
-/// `?//` at all, and a `halt_error` that must not retry.
+/// Rows, as the sink allows, cover each way the retry can end: answering
+/// after the first alternative's error; producing nothing, including a
+/// pattern that yields no binding set, so the sink is never re-invoked;
+/// raising inside the generator, including a pattern that fails to
+/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
+/// the first alternative that must not hide the retry's own error. The
+/// controls are every alternative failing (the last one's error surfaces)
+/// and, in some tables, the same error with no `?//` at all.
+///
+/// The last row pins that a `halt_error` inside the generator is not
+/// retried.
 #[test]
 fn test_negate_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(
         None,
         &[
+            (
+                r#"-([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)"#,
+                "",
+                "A",
+                "Cannot index array with string \"k\"",
+                5,
+            ),
+            (
+                r#"-([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)"#,
+                "",
+                "A",
+                "",
+                0,
+            ),
             (
                 r#"-([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)"#,
                 "-1\n",
@@ -73835,17 +73854,33 @@ fn test_negate_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 /// #3293: a `?//` retry inside an `if` condition supersedes the verdict the
 /// retried-past alternative left in `each_if_generic`'s stash.
 ///
-/// The rows cover, as the sink allows: the retry answering after the first
-/// alternative's error; the retry producing nothing, so the sink is never
-/// re-invoked; the retry raising inside the generator; a consumer's stop on
-/// the first alternative that must not hide the retry's own error; and
-/// controls -- every alternative failing (the last one's error surfaces), no
-/// `?//` at all, and a `halt_error` that must not retry.
+/// Rows, as the sink allows, cover each way the retry can end: answering
+/// after the first alternative's error; producing nothing, including a
+/// pattern that yields no binding set, so the sink is never re-invoked;
+/// raising inside the generator, including a pattern that fails to
+/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
+/// the first alternative that must not hide the retry's own error. The
+/// controls are every alternative failing (the last one's error surfaces)
+/// and, in some tables, the same error with no `?//` at all.
 #[test]
 fn test_if_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(
         None,
         &[
+            (
+                r#"if (([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a) | type == "array") then error("E") else 2 end"#,
+                "",
+                "A",
+                "Cannot index array with string \"k\"",
+                5,
+            ),
+            (
+                r#"if (([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a) | type == "array") then error("E") else 2 end"#,
+                "",
+                "A",
+                "",
+                0,
+            ),
             (
                 r#"if (([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) | type == "array") then error("E") else 2 end"#,
                 "2\n",
@@ -73902,17 +73937,33 @@ fn test_if_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 /// #3293: a `?//` retry inside a computed index supersedes the verdict the
 /// retried-past alternative left in `each_index_expr_generic`'s stash.
 ///
-/// The rows cover, as the sink allows: the retry answering after the first
-/// alternative's error; the retry producing nothing, so the sink is never
-/// re-invoked; the retry raising inside the generator; a consumer's stop on
-/// the first alternative that must not hide the retry's own error; and
-/// controls -- every alternative failing (the last one's error surfaces), no
-/// `?//` at all, and a `halt_error` that must not retry.
+/// Rows, as the sink allows, cover each way the retry can end: answering
+/// after the first alternative's error; producing nothing, including a
+/// pattern that yields no binding set, so the sink is never re-invoked;
+/// raising inside the generator, including a pattern that fails to
+/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
+/// the first alternative that must not hide the retry's own error. The
+/// controls are every alternative failing (the last one's error surfaces)
+/// and, in some tables, the same error with no `?//` at all.
 #[test]
 fn test_computed_index_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(
         Some(r#"{"a":5}"#),
         &[
+            (
+                r#".[([["a"]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)]"#,
+                "",
+                "A",
+                "Cannot index array with string \"k\"",
+                5,
+            ),
+            (
+                r#".[([["a"]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)]"#,
+                "",
+                "A",
+                "",
+                0,
+            ),
             (
                 r#".[([["a"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
                 "5\n",
@@ -73955,17 +74006,26 @@ fn test_computed_index_retry_supersedes_stashed_sink_verdict_3293() -> Result<()
 /// #3293: a `?//` retry inside a computed object key or value supersedes the verdict the
 /// retried-past alternative left in `each_object_entries_generic`/`each_object_value_generic`'s stash.
 ///
-/// The rows cover, as the sink allows: the retry answering after the first
-/// alternative's error; the retry producing nothing, so the sink is never
-/// re-invoked; the retry raising inside the generator; a consumer's stop on
-/// the first alternative that must not hide the retry's own error; and
-/// controls -- every alternative failing (the last one's error surfaces), no
-/// `?//` at all, and a `halt_error` that must not retry.
+/// Rows, as the sink allows, cover each way the retry can end: answering
+/// after the first alternative's error; producing nothing, including a
+/// pattern that yields no binding set, so the sink is never re-invoked;
+/// raising inside the generator, including a pattern that fails to
+/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
+/// the first alternative that must not hide the retry's own error. The
+/// controls are every alternative failing (the last one's error surfaces)
+/// and, in some tables, the same error with no `?//` at all.
 #[test]
 fn test_object_construction_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(
         None,
         &[
+            (
+                r#"{(([["x"]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)): 1}"#,
+                "",
+                "A",
+                "Cannot index array with string \"k\"",
+                5,
+            ),
             (
                 r#"{(([["x"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)): 1}"#,
                 "{\"x\":1}\n",
@@ -74022,12 +74082,14 @@ fn test_object_construction_retry_supersedes_stashed_sink_verdict_3293() -> Resu
 /// #3293: a `?//` retry inside a `range` bound supersedes the verdict the
 /// retried-past alternative left in `each_range_generic`'s stash.
 ///
-/// The rows cover, as the sink allows: the retry answering after the first
-/// alternative's error; the retry producing nothing, so the sink is never
-/// re-invoked; the retry raising inside the generator; a consumer's stop on
-/// the first alternative that must not hide the retry's own error; and
-/// controls -- every alternative failing (the last one's error surfaces), no
-/// `?//` at all, and a `halt_error` that must not retry.
+/// Rows, as the sink allows, cover each way the retry can end: answering
+/// after the first alternative's error; producing nothing, including a
+/// pattern that yields no binding set, so the sink is never re-invoked;
+/// raising inside the generator, including a pattern that fails to
+/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
+/// the first alternative that must not hide the retry's own error. The
+/// controls are every alternative failing (the last one's error surfaces)
+/// and, in some tables, the same error with no `?//` at all.
 ///
 /// A retry inside the *step* is not pinned here: jq emits `from` before it
 /// type-checks the step (`[range(0; 3; [1])]` raises after `0`), which
@@ -74037,6 +74099,20 @@ fn test_range_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(
         None,
         &[
+            (
+                r#"range(([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a))"#,
+                "",
+                "A",
+                "Cannot index array with string \"k\"",
+                5,
+            ),
+            (
+                r#"range(([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a))"#,
+                "",
+                "A",
+                "",
+                0,
+            ),
             (
                 r#"range(([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a))"#,
                 "0\n",
@@ -74100,17 +74176,33 @@ fn test_range_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 /// #3293: a `?//` retry inside an arithmetic operand supersedes the verdict the
 /// retried-past alternative left in `binary_fanout_each_generic_with`'s stash.
 ///
-/// The rows cover, as the sink allows: the retry answering after the first
-/// alternative's error; the retry producing nothing, so the sink is never
-/// re-invoked; the retry raising inside the generator; a consumer's stop on
-/// the first alternative that must not hide the retry's own error; and
-/// controls -- every alternative failing (the last one's error surfaces), no
-/// `?//` at all, and a `halt_error` that must not retry.
+/// Rows, as the sink allows, cover each way the retry can end: answering
+/// after the first alternative's error; producing nothing, including a
+/// pattern that yields no binding set, so the sink is never re-invoked;
+/// raising inside the generator, including a pattern that fails to
+/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
+/// the first alternative that must not hide the retry's own error. The
+/// controls are every alternative failing (the last one's error surfaces)
+/// and, in some tables, the same error with no `?//` at all.
 #[test]
 fn test_arithmetic_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(
         None,
         &[
+            (
+                r#"([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a) + 1"#,
+                "",
+                "A",
+                "Cannot index array with string \"k\"",
+                5,
+            ),
+            (
+                r#"1 + ([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)"#,
+                "",
+                "A",
+                "",
+                0,
+            ),
             (
                 r#"([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) + 1"#,
                 "2\n",
@@ -74188,12 +74280,14 @@ fn test_arithmetic_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 /// #3293: a `?//` retry inside an `and`/`or` operand supersedes the verdict the
 /// retried-past alternative left in `eval::boolean_fanout_each_with`'s stash.
 ///
-/// The rows cover, as the sink allows: the retry answering after the first
-/// alternative's error; the retry producing nothing, so the sink is never
-/// re-invoked; the retry raising inside the generator; a consumer's stop on
-/// the first alternative that must not hide the retry's own error; and
-/// controls -- every alternative failing (the last one's error surfaces), no
-/// `?//` at all, and a `halt_error` that must not retry.
+/// Rows, as the sink allows, cover each way the retry can end: answering
+/// after the first alternative's error; producing nothing, including a
+/// pattern that yields no binding set, so the sink is never re-invoked;
+/// raising inside the generator, including a pattern that fails to
+/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
+/// the first alternative that must not hide the retry's own error. The
+/// controls are every alternative failing (the last one's error surfaces)
+/// and, in some tables, the same error with no `?//` at all.
 ///
 /// The `and`/`or` loop is shared with `eval.rs`, so the owned evaluator
 /// takes the same fix.
@@ -74202,6 +74296,13 @@ fn test_and_or_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(
         None,
         &[
+            (
+                r#"([1] as $a ?// {k: $b} | ("A"|stderr) | $a) and error("E")"#,
+                "",
+                "A",
+                "Cannot index array with string \"k\"",
+                5,
+            ),
             (
                 r#"([1] as $a ?// $b | ("A"|stderr) | $a) and error("E")"#,
                 "false\n",
@@ -74258,12 +74359,14 @@ fn test_and_or_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 /// #3293: a `?//` retry inside the first stage of a pipe supersedes the verdict the
 /// retried-past alternative left in the pipe driver's stash.
 ///
-/// The rows cover, as the sink allows: the retry answering after the first
-/// alternative's error; the retry producing nothing, so the sink is never
-/// re-invoked; the retry raising inside the generator; a consumer's stop on
-/// the first alternative that must not hide the retry's own error; and
-/// controls -- every alternative failing (the last one's error surfaces), no
-/// `?//` at all, and a `halt_error` that must not retry.
+/// Rows, as the sink allows, cover each way the retry can end: answering
+/// after the first alternative's error; producing nothing, including a
+/// pattern that yields no binding set, so the sink is never re-invoked;
+/// raising inside the generator, including a pattern that fails to
+/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
+/// the first alternative that must not hide the retry's own error. The
+/// controls are every alternative failing (the last one's error surfaces)
+/// and, in some tables, the same error with no `?//` at all.
 ///
 /// Both pipe drivers (`eval.rs` and `eval_generic.rs`) end through
 /// `eval::pipe_terminal_after_retry`, which now uses `retry_superseded`.
@@ -74272,6 +74375,20 @@ fn test_pipe_first_stage_retry_supersedes_stashed_sink_verdict_3293() -> Result<
     assert_retry_rows_3293(
         None,
         &[
+            (
+                r#"([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a) | error("P")"#,
+                "",
+                "A",
+                "Cannot index array with string \"k\"",
+                5,
+            ),
+            (
+                r#"[([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a) | error("P")]"#,
+                "[]\n",
+                "A",
+                "",
+                0,
+            ),
             (
                 r#"[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | . + 1]"#,
                 "",
@@ -74321,12 +74438,14 @@ fn test_pipe_first_stage_retry_supersedes_stashed_sink_verdict_3293() -> Result<
 /// #3293: a `?//` retry inside `skip`'s count argument supersedes the verdict the
 /// retried-past alternative left in `fanout_arg_each_generic`'s stash.
 ///
-/// The rows cover, as the sink allows: the retry answering after the first
-/// alternative's error; the retry producing nothing, so the sink is never
-/// re-invoked; the retry raising inside the generator; a consumer's stop on
-/// the first alternative that must not hide the retry's own error; and
-/// controls -- every alternative failing (the last one's error surfaces), no
-/// `?//` at all, and a `halt_error` that must not retry.
+/// Rows, as the sink allows, cover each way the retry can end: answering
+/// after the first alternative's error; producing nothing, including a
+/// pattern that yields no binding set, so the sink is never re-invoked;
+/// raising inside the generator, including a pattern that fails to
+/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
+/// the first alternative that must not hide the retry's own error. The
+/// controls are every alternative failing (the last one's error surfaces)
+/// and, in some tables, the same error with no `?//` at all.
 ///
 /// `skip` is jq 1.8, so these rows were captured from jq 1.7.1 with jq's own
 /// `skip` definition prepended, as #2952's tests were.
@@ -74335,6 +74454,13 @@ fn test_skip_count_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(
         None,
         &[
+            (
+                r#"[skip(([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a | length); 10, error("B"))]"#,
+                "",
+                "A",
+                "Cannot index array with string \"k\"",
+                5,
+            ),
             (
                 r#"[skip(([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty | length); 10, error("B"))]"#,
                 "[]\n",
