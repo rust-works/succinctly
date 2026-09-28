@@ -16316,9 +16316,10 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         }
         match end_flow {
             Flow::Exhausted => Demand::Continue,
-            // Only `escape!` stops the inner pull, and it has already
-            // stashed its control -- propagate the stop outward.
-            Flow::Stopped { .. } => Demand::Stop,
+            // Only `escape!` stops the inner pull, and its stash was returned
+            // just above; a stash-less stop is a stale enclosing driver's
+            // (#3293), left for the pull's own exit to judge.
+            Flow::Stopped { .. } => Demand::Stop, // omni-dev: coverage tolerate-line reason="unreachable: a real stop always comes with a stash, returned above (#3293)"
             // #2225: this `s`'s own `end` evaluation escaped after
             // producing some values -- in jq mode those are already
             // sliced into `out` (the pushes *are* the prefix, #1528); in
