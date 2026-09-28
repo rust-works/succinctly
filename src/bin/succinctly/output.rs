@@ -518,10 +518,15 @@ pub struct JsonFormatOpts<'a> {
     pub mark_nan_for_color: bool,
 }
 
-/// [`JsonFormatOpts::mark_nan_for_color`]'s placeholder: unambiguous with any
-/// real JSON token (`colorize_json`'s tokenizer only ever sees a bare
-/// identifier start with `n` for `null`), stripped and recolored before the
-/// text ever reaches a user.
+/// [`JsonFormatOpts::mark_nan_for_color`]'s placeholder: the render-time
+/// analogue of [`crate::jq::value::NAN_SENTINEL`]'s parse-time one (#3413) --
+/// same problem (smuggle "this is a NaN" through a text round-trip to a
+/// reader with no access to the original value), different pipeline. Unlike
+/// that sentinel, this one doesn't need to be digit-led: `colorize_json`
+/// only ever re-lexes text `format_json_impl` itself produced, which never
+/// emits any bare n-leading token except `null` and this marker, so the two
+/// are unambiguous by construction, not by coincidence. Stripped and
+/// recolored (as `null`) before the text ever reaches a user.
 const NAN_COLOR_MARKER: &str = "nan";
 
 /// Escape a JSON string body per the opts' control-escape style and ASCII mode.
@@ -1056,21 +1061,20 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
                 'n' => {
                     // `null`, or `NAN_COLOR_MARKER` ("nan") standing in for a
                     // NaN number that must print as "null" but color
-                    // differently (#3413) -- consumed into a buffer first so
-                    // the two can be told apart before any color is written.
-                    let mut word = String::from(c);
-                    while let Some(&next) = chars.peek() {
-                        if next.is_alphabetic() {
-                            word.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    if word == NAN_COLOR_MARKER {
-                        // jq wraps a NaN's "null" spelling in its number
-                        // color, then its null color, confirmed live against
-                        // jq 1.7.1 on both Linux and macOS: `nan` prints
-                        // `\e[0;39m\e[0;90mnull\e[0m\e[0m`.
+                    // differently (#3413; the render-time analogue of
+                    // `jq::value::NAN_SENTINEL`'s parse-time NaN marker,
+                    // same problem, different pipeline). The two share no
+                    // other letter, and `format_json_impl` never emits any
+                    // other bare n-leading token here, so one peek at the
+                    // second character is sufficient -- no need to buffer
+                    // the whole word just to compare it afterward.
+                    if chars.peek() == Some(&'a') {
+                        chars.next(); // 'a'
+                        chars.next(); // 'n'
+                                      // jq wraps a NaN's "null" spelling in its number
+                                      // color, then its null color, confirmed live against
+                                      // jq 1.7.1 on both Linux and macOS: `nan` prints
+                                      // `\e[0;39m\e[0;90mnull\e[0m\e[0m`.
                         result.push_str(&scheme.number);
                         result.push_str(&scheme.null);
                         result.push_str("null");
@@ -1078,7 +1082,14 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
                         result.push_str(&scheme.reset);
                     } else {
                         result.push_str(&scheme.null);
-                        result.push_str(&word);
+                        result.push(c);
+                        while let Some(&next) = chars.peek() {
+                            if next.is_alphabetic() {
+                                result.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        }
                         result.push_str(&scheme.reset);
                     }
                 }
