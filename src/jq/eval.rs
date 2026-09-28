@@ -33617,6 +33617,47 @@ fn unwrap_bind_source(expr: &Expr) -> &Expr {
     }
 }
 
+/// The top-level `,` leaves of a bind source, in order, or `None` when the
+/// source is not a comma (or in yq mode) (#3334).
+///
+/// In jq an `as` source is a subexp, and `FORK` runs branch A's outputs to
+/// exhaustion before starting branch B, so `(A, B) as P | body` is
+/// observationally `(A as P | body), (B as P | body)`: the same outputs in
+/// the same order, a trailing error in A stopping before B, `?//` retrying
+/// per source output. The source never moves the register, so this holds in
+/// path mode too. The resolver's source classifiers
+/// ([`identity_bind_position`], [`resolves_to_register`],
+/// [`head_may_be_frozen`]) answer once per source expression, but a comma's
+/// outputs come from different leaves: `(., 1)` has one register-identical
+/// output and one that isn't. Binding per leaf lets each one be classified
+/// by the existing single-source rules, exactly per output, with no
+/// provenance carried through the evaluated source.
+///
+/// Peels `Paren`/`Shared` ([`unwrap_bind_source`]) and flattens nested
+/// top-level commas. A comma nested under anything else (`if`, `try`, `//`)
+/// is left to the classifiers' own `Comma` arms.
+///
+/// jq mode only: yq v4.53.3 does not fan out an `as` source at all (`(.,.)
+/// as $x | $x` prints the document once), so the desugaring would be wrong
+/// there.
+fn comma_leaves<S: EvalSemantics>(expr: &Expr) -> Option<Vec<&Expr>> {
+    fn push<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match unwrap_bind_source(expr) {
+            Expr::Comma(exprs) => exprs.iter().for_each(|e| push(e, out)),
+            leaf => out.push(leaf),
+        }
+    }
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let Expr::Comma(exprs) = unwrap_bind_source(expr) else {
+        return None;
+    };
+    let mut leaves = Vec::with_capacity(exprs.len());
+    exprs.iter().for_each(|e| push(e, &mut leaves));
+    Some(leaves)
+}
+
 /// The three outcomes of one sink-driven path resolution — the same
 /// three [`Flow`] already has for value-mode evaluation ([`Demand`] is
 /// shared verbatim), minus the `pending` field: a path resolution's
@@ -34635,38 +34676,24 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // (`frame.at`, by #2042's invariant) -- computed once per `As`
         // node, not per bound value, since it depends on neither the value
         // nor the witness. See [`identity_bind_position`].
-        Expr::As { expr, var, body } => {
-            let identity_at = identity_bind_position::<S>(expr, trackable, frame);
-            resolve_bind_source_sink::<S>(
-                expr,
-                body,
-                var,
-                value,
-                trackable,
-                frame,
-                &mut |bound, origin| {
-                    let substituted = substitute_bound_var_at(
-                        expr,
-                        body,
-                        var,
-                        &bound,
-                        identity_at.clone(),
-                        origin,
-                        None,
-                        S::TAG == EvalTag::Jq,
-                    );
-                    resolve_node_sink::<S>(
-                        &substituted,
-                        value,
-                        trackable,
-                        snapshot,
-                        frame,
-                        keep,
-                        sink,
-                    )
-                },
-            )
-        }
+        //
+        // #3334: a comma source binds per leaf -- see [`comma_leaves`].
+        Expr::As { expr, var, body } => match comma_leaves::<S>(expr) {
+            Some(leaves) => {
+                for leaf in leaves {
+                    match resolve_as_source_sink::<S>(
+                        leaf, var, body, value, trackable, snapshot, frame, keep, sink,
+                    ) {
+                        ResolveFlow::Exhausted => {}
+                        other => return other,
+                    }
+                }
+                ResolveFlow::Exhausted
+            }
+            None => resolve_as_source_sink::<S>(
+                expr, var, body, value, trackable, snapshot, frame, keep, sink,
+            ),
+        },
         // #2649: `SRC as PATTERN | body`, jq's destructuring bind. Like `As`
         // above, jq evaluates SRC with tracking suspended, so the source
         // itself never moves the register -- but the *pattern* is compiled
@@ -39052,6 +39079,45 @@ fn resolve_bind_source_in<S: EvalSemantics>(
 /// demand-driven consumer (a fold source, #2235) `path(reduce
 /// ((.[]|stderr) as $x | $x) as $i (.; error("u")))` writes `1` to stderr
 /// in jq, where collecting the source first wrote `123`.
+/// `source as $var | body` in path position, for one source: the
+/// [`resolve_node_sink`] `As` arm's body, which runs it once per
+/// [`comma_leaves`] leaf when the source is a comma (#3334).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambients, as `resolve_node_sink`
+fn resolve_as_source_sink<'a, S: EvalSemantics>(
+    source: &Expr,
+    var: &str,
+    body: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let identity_at = identity_bind_position::<S>(source, trackable, frame);
+    resolve_bind_source_sink::<S>(
+        source,
+        body,
+        var,
+        value,
+        trackable,
+        frame,
+        &mut |bound, origin| {
+            let substituted = substitute_bound_var_at(
+                source,
+                body,
+                var,
+                &bound,
+                identity_at.clone(),
+                origin,
+                None,
+                S::TAG == EvalTag::Jq,
+            );
+            resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
+        },
+    )
+}
+
 fn resolve_bind_source_sink<S: EvalSemantics>(
     source: &Expr,
     body: &Expr,
