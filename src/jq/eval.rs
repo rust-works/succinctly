@@ -129,6 +129,16 @@ pub trait EvalSemantics: Copy + Default {
     /// comparison. If false (jq, which has no strict int/float distinction),
     /// `2.0 == 2` is `true`. #950.
     const STRICT_NUMERIC_EQUALITY: bool;
+    /// If true (jq, #3069), equality answers `true` for two handles on the
+    /// *same* array or object storage without comparing their contents --
+    /// jq 1.7.1's `jv_equal` checks `jv_identical` (pointer, offset, size)
+    /// first. The shortcut is unobservable except where a NaN sits inside
+    /// the container: `[nan] | . == .` is `true` in jq, although
+    /// `nan == nan` is `false`. If false (yq), equality is always
+    /// structural: yq v4.53.3 answers `false` for `.a == .a` on
+    /// `a: [.nan]`. Ordering is untouched in both modes, since jq's
+    /// `jv_cmp` has no identity check (`[nan] | . < .` is `true`).
+    const EQUALITY_SHORT_CIRCUITS_ON_IDENTITY: bool;
     /// If false (jq), a `null` *right* operand of `+` passes through
     /// unconditionally for any left-operand type (`7 + null` -> `7`,
     /// `{} + null` -> `{}`) -- jq's own null-symmetric identity for `+`
@@ -328,6 +338,7 @@ impl EvalSemantics for JqSemantics {
     const NULL_MERGES_AS_EMPTY: bool = false;
     const DEFAULT_HALT_ERROR_CODE: i32 = 5;
     const STRICT_NUMERIC_EQUALITY: bool = false;
+    const EQUALITY_SHORT_CIRCUITS_ON_IDENTITY: bool = true;
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = false;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = false;
     const COLLAPSE_DUPLICATE_KEYS: bool = true;
@@ -362,6 +373,7 @@ impl EvalSemantics for YqSemantics {
     const NULL_MERGES_AS_EMPTY: bool = true;
     const DEFAULT_HALT_ERROR_CODE: i32 = 1;
     const STRICT_NUMERIC_EQUALITY: bool = true;
+    const EQUALITY_SHORT_CIRCUITS_ON_IDENTITY: bool = false;
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = true;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = true;
     const COLLAPSE_DUPLICATE_KEYS: bool = false;
@@ -385,7 +397,7 @@ use super::expr::{
 use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
     infinite_float_preview_text, int_to_f64, jq_literal_int_to_f64, jq_numeric_cmp,
-    numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, same_nan_instance, ArrayVec,
+    numeric_repr_cmp, jq_identical, owned_value_eq, owned_value_eq_at_depth_generic, ArrayVec,
     NumberRepr, ObjectMap, OwnedValue,
 };
 
@@ -61922,7 +61934,7 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `[nan] | bsearch(nan)` is `-1` in jq (target < element) but was `-2`
     // from this loop's element-on-the-left probe.
     if elements.len() == 1 {
-        if S::DECNUMBER_LITERALS && same_nan_instance(&elements[0], &x) {
+        if jq_identical::<S>(&elements[0], &x) {
             return QueryResult::Owned(OwnedValue::Int(0));
         }
         return QueryResult::Owned(OwnedValue::Int(
@@ -61945,9 +61957,10 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // and `bsearch` reported absent values as found (#384).
         //
         // jq's probe asks `==` first (`$monkey == $target`), and `==` holds
-        // for one parsed NaN compared with itself (#3309) where the order
-        // answers `Less`.
-        if S::DECNUMBER_LITERALS && same_nan_instance(&elements[mid as usize], &x) {
+        // for one parsed NaN compared with itself (#3309), or a container
+        // holding a NaN compared with its own storage (#3069), where the
+        // order answers `Less`.
+        if jq_identical::<S>(&elements[mid as usize], &x) {
             return QueryResult::Owned(OwnedValue::Int(mid));
         }
         match compare_values::<S>(&elements[mid as usize], &x) {
@@ -88149,7 +88162,7 @@ mod tests {
             assert_eq!(idx, -2);
         });
 
-        // The `same_nan_instance` branch (#3309) this arm shares with the
+        // The `jq_identical` branch (#3309) this arm shares with the
         // general loop: `"NaN" | tonumber as $x | $x == $x` is `true` in jq
         // (a bound instance equals itself), unlike two independent `nan`s
         // above, so a one-element array probing itself is "found" at 0, not
