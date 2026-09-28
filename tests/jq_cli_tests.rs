@@ -66652,6 +66652,13 @@ fn test_try_wrapped_if_bind_source_keeps_register_3279() -> Result<()> {
         ("{\"a\":1,\"b\":2}", "path((try (if .a.q then . else . end) catch {\"b\":5}) as $v0 | $v0.b)", "Invalid path expression near attempt to access element \"b\" of {\"b\":5}"),
         ("{\"a\":{\"b\":{\"c\":1}}}", "del(.a | {b:{c:1}} | (. | if true then . else . end) as $x | $x)", "Invalid path expression with result {\"b\":{\"c\":1}}"),
         ("{\"a\":{\"b\":{\"c\":1}}}", "del(.a | {b:{c:1}} | (. | .) as $x | $x | .b)", "Invalid path expression near attempt to access element \"b\" of {\"b\":{\"c\":1}}"),
+        // A two-stage passthrough pipe off the register: a computed `.`,
+        // so the bind is `Untracked` and never certified, as jq refuses.
+        (
+            r#"{"a":1}"#,
+            "path(5 | (if true then . else . end | if 1 then . else . end) as $v | $v)",
+            "Invalid path expression with result 5",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
