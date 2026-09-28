@@ -28939,11 +28939,13 @@ fn test_loc_in_a_transitively_included_def_names_the_inner_module_2865() -> Resu
 /// Stated as a test because the "helpful" edit that adds transitive names to
 /// that set would break nothing else visibly.
 ///
-/// The first element pins the residual gap in the other direction, filed as
-/// **#2950**: the dependency's `length` *should* shadow inside the module
-/// body (jq answers `"dep-length"`), but a module's own source is parsed with
-/// no shadow-candidate seeding, so the call lowers to the builtin and answers
-/// `0` (`null | length`). Update this row when #2950 lands.
+/// The first element pins the *other* direction #2950 closed: the
+/// dependency's `length` *does* shadow inside the module body that
+/// `include`s it directly (jq answers `"dep-length"`), since `usesh`'s own
+/// source is now parsed with `shlen`'s def names seeded as shadow
+/// candidates -- but `length` at the *top level* (which only `include`s
+/// `usesh`, not `shlen`, so the transitive name never reaches its own
+/// shadow-candidate set) is still the untouched builtin, `2`.
 #[test]
 fn test_transitive_names_do_not_seed_top_level_shadow_candidates_2865() -> Result<()> {
     let (stdout, stderr, code) = run_jq_with_modules(
@@ -28954,7 +28956,7 @@ fn test_transitive_names_do_not_seed_top_level_shadow_candidates_2865() -> Resul
         &["-nc", r#"include "usesh"; [h, ([1,2]|length)]"#],
     )?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "[0,2]");
+    assert_eq!(stdout.trim_end(), r#"["dep-length",2]"#);
 
     // ...while a module's *own* def still shadows for its includer (#2395),
     // which this fix must not have disturbed.
@@ -28965,6 +28967,94 @@ fn test_transitive_names_do_not_seed_top_level_shadow_candidates_2865() -> Resul
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), r#""own-length""#);
 
+    Ok(())
+}
+
+/// #2950: `range`'s 1-arg sugar (#2395's own precedent case, mirrored one
+/// level down) still resolves by arity when a module's *own* `include`
+/// shadows the 1-arg form specifically -- the module-sourced def only
+/// covers `range/1`, so a sibling call to the ordinary 2-arg builtin
+/// `range(0;3)` inside the same module is unaffected.
+#[test]
+fn test_module_own_include_shadows_range_one_arg_sugar_by_arity_2950() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("myrange", "def range(n): \"custom-range\";\n"),
+            ("userange", "include \"myrange\";\ndef h: range(3);\n"),
+        ],
+        &["-nc", r#"include "userange"; h"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""custom-range""#);
+
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("myrange", "def range(n): \"custom-range\";\n"),
+            ("user2", "include \"myrange\";\ndef h2: [range(0;3)];\n"),
+        ],
+        &["-nc", r#"include "user2"; h2"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[0,1,2]");
+
+    Ok(())
+}
+
+/// #2950: `~/.jq`'s own defs must not seed a module's shadow-candidate set,
+/// even when that module has an unrelated `include` of its own that *does*
+/// trigger the module-level re-parse -- `~/.jq` only ever wraps the
+/// top-level filter's expr (never a module's own body), so `length` inside
+/// this module is still the builtin regardless of what `~/.jq` defines.
+#[test]
+fn test_home_jq_def_does_not_seed_a_modules_own_shadow_candidates_2950() -> Result<()> {
+    let temp_home = tempfile::tempdir()?;
+    std::fs::write(
+        temp_home.path().join(".jq"),
+        "def length: \"home-length\";\n",
+    )?;
+    let lib_dir = tempfile::tempdir()?;
+    std::fs::write(lib_dir.path().join("dummy.jq"), "def unrelated_name: 1;\n")?;
+    std::fs::write(
+        lib_dir.path().join("usesh3.jq"),
+        "include \"dummy\";\ndef h: length;\n",
+    )?;
+
+    let lib_arg = lib_dir.path().to_string_lossy().into_owned();
+    let (output, code) = spawn_jq_with_env(
+        &["-L", &lib_arg, "-nc", r#"include "usesh3"; [1,2] | h"#],
+        "HOME",
+        temp_home.path(),
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
+/// #2950: a genuine module cycle reached only through the new discovery
+/// pass (rather than the pre-existing `module_dep_defs` load) is still
+/// caught by the `loading` guard -- confirming the guard's coverage was
+/// widened to include the discovery pass, not bypassed by it. `ca`/`cb`
+/// include each other; real jq hangs on this input (confirmed live, not
+/// asserted here), so this pins succinctly's own clean-refusal behavior
+/// instead of a byte-for-byte oracle match.
+#[test]
+fn test_module_cycle_reached_through_discovery_pass_still_detected_2950() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("ca", "include \"cb\";\ndef x: 1;\n"),
+            ("cb", "include \"ca\";\ndef y: 2;\n"),
+        ],
+        &["-nc", r#"include "ca"; x"#],
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stdout.is_empty());
+    assert!(
+        stderr.contains("module cycle detected"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
