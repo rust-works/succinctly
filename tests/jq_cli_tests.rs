@@ -66271,6 +66271,17 @@ fn test_object_index_key_is_a_slice_descriptor_3300() -> Result<()> {
             "#3300: `{filter}` on {input}: expected {message:?}, stderr={stderr:?}"
         );
     }
+    // A document-read key through the whole-program input bridge, which
+    // runs the program in the native evaluator rather than the generic one.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "-c", "input | .[1][.[0]]"],
+        Some(r#"[{"end":1,"start":0,"x":[1]},[1,2]]"#),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        ("[1]", 0),
+        "#3300 (input bridge): stderr={stderr:?}"
+    );
     Ok(())
 }
 
@@ -66303,6 +66314,25 @@ fn test_object_index_key_yq_mode_unchanged_3300() -> Result<()> {
             "#3300 (yq): `{filter}`: {output:?}"
         );
     }
+    // A mapping read from the document as the key keeps yq's refusal too.
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", ".a[.k]"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .expect("piped")
+                .write_all(b"a: [1,2]\nk: {start: 0, end: 1}\n")?;
+            child.wait_with_output()
+        })?;
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Cannot index array with object"),
+        "#3300 (yq, document key): {output:?}"
+    );
     Ok(())
 }
 
