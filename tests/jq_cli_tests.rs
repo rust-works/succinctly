@@ -74678,3 +74678,147 @@ fn test_retry_sink_reset_leaves_yq_mode_unchanged_3293() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3334: a comma bind source is classified per leaf. In jq an `as` source
+/// is a subexp and `FORK` runs each branch to exhaustion in turn, so `(A, B)
+/// as P | body` behaves as `(A as P | body), (B as P | body)`. The resolver
+/// used to classify the whole comma once, so `(.,.)` refused, `(., 1)` failed
+/// on the wrong output, and `del`/`|=` through a `try` silently discarded
+/// the write at exit 0. Every `Ok` row, and each `Err` row's message, was
+/// captured from jq 1.7.1.
+#[test]
+fn test_comma_bind_source_is_classified_per_branch_3334() -> Result<()> {
+    let doc = r#"{"a":[1,2],"b":[3]}"#;
+    for (filter, want) in [
+        (r"[path((.,.) as $x | $x)]", Ok("[[],[]]")),
+        (r"[path((.,.) as $x | $x.a)]", Ok(r#"[["a"],["a"]]"#)),
+        (r"[path((., (.,.)) as $x | $x)]", Ok("[[],[],[]]")),
+        (
+            r"[path(. as $o | ($o,$o) as $x | $x.b)]",
+            Ok(r#"[["b"],["b"]]"#),
+        ),
+        (
+            r"[path((if true then (.,.) else . end) as $x | $x)]",
+            Ok("[[],[]]"),
+        ),
+        (r"[path((try (.,.) catch 1) as $x | $x)]", Ok("[[],[]]")),
+        (r"[path(((.,.) // 1) as $x | $x)]", Ok("[[],[]]")),
+        (r"[path(label $l | (., break $l) as $x | $x)]", Ok("[[]]")),
+        (
+            r"[path(. as $o | 5 | ($o,$o) as {a:$q} | $q)]",
+            Ok(r#"[["a"],["a"]]"#),
+        ),
+        (r"del((.,.) as $x | try $x.a)", Ok(r#"{"b":[3]}"#)),
+        (r"del((., 1) as $x | try $x.a)", Ok(r#"{"b":[3]}"#)),
+        (r"((.,.) as $x | $x.b) |= 9", Ok(r#"{"a":[1,2],"b":9}"#)),
+        (
+            r"(. as $o | ($o, .) as {a:$q} | $q) = 0",
+            Ok(r#"{"a":0,"b":[3]}"#),
+        ),
+        // The asymmetric source fails on its second output, as jq's does.
+        (
+            r"[path((., 1) as $x | $x)]",
+            Err("Invalid path expression with result 1"),
+        ),
+        (
+            r"[path((., 1) as [$z] ?// {a:$q} | $q)]",
+            Err(r#"Invalid path expression near attempt to access element "a" of 1"#),
+        ),
+        (
+            r"[path((1, .) as {a:$q} ?// $q | $q)]",
+            Err("Invalid path expression with result 1"),
+        ),
+        // A leaf's error stops the stream after the earlier leaf's output.
+        (
+            r#"[path((., error("e")) as $x | $x)]"#,
+            Err("error (at <stdin>:0): e"),
+        ),
+        // Must not change: leaves that are not `.` still refuse.
+        (
+            r"[path((.a, .b) as $x | $x)]",
+            Err("Invalid path expression with result [1,2]"),
+        ),
+        (
+            r"[path((., .a) as $x | $x)]",
+            Err("Invalid path expression with result [1,2]"),
+        ),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        match want {
+            Ok(want) => {
+                assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+                assert_eq!(out.trim(), want, "{filter}");
+            }
+            Err(want) => {
+                assert_eq!(code, 5, "{filter}: out: {out:?}");
+                assert!(stderr.contains(want), "{filter}: {stderr:?}");
+            }
+        }
+    }
+
+    // An asymmetric comma nested under `if` is not split, so it still
+    // refuses (on its first output, where jq names its second).
+    let (_, stderr, code) = run_jq_full(
+        &["-c", r"[path((if true then (., 1) else . end) as $x | $x)]"],
+        Some(doc),
+    )?;
+    assert_eq!(code, 5, "{stderr:?}");
+    assert!(stderr.contains("Invalid path expression"), "{stderr:?}");
+    Ok(())
+}
+
+/// #3334: a frozen `$orig` reached through a comma, `if` or `//` head pays
+/// the loud refusal the bare `$orig` head already pays (#3267), instead of
+/// a refusal `try` caught -- which silently discarded the write jq makes on
+/// `{"a":{"b":1}}` (jq 1.7.1 prints `{"a":{}}` for every row). On `{"a":5}`
+/// jq's own walk fails too, so jq answers `[]`; there the refusal is the
+/// same documented price the bare head pays, not a new one. Every row, bare
+/// head included, now answers the same way.
+#[test]
+fn test_frozen_source_through_a_composite_head_refuses_loudly_3334() -> Result<()> {
+    for (doc, filter) in [
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del(. as $orig | has("k") | try ($orig as {a:{b:$q}} | $q))"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del(. as $orig | has("k") | try (($orig,$orig) as {a:{b:$q}} | $q))"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del(. as $orig | has("k") | try (($orig,1) as {a:{b:$q}} | $q))"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del(. as $orig | has("k") | try (($orig,$orig) as $x | $x.a.b))"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del(. as $orig | has("k") | try ((if true then $orig else $orig end) as {a:{b:$q}} | $q))"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del(. as $orig | has("k") | try (($orig // 1) as {a:{b:$q}} | $q))"#,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(. as $orig | has("k") | try ($orig as {a:{b:$q}} | $q))]"#,
+        ),
+        (
+            r#"{"a":5}"#,
+            r#"[path(. as $orig | has("k") | try (($orig,$orig) as {a:{b:$q}} | $q))]"#,
+        ),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "{filter}: out: {out:?}");
+        assert_eq!(out, "", "{filter}: no write may be discarded silently");
+        assert!(
+            stderr.contains(&format!(
+                r#"Invalid path expression near attempt to access element "a" of {doc}"#
+            )),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}

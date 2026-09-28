@@ -820,6 +820,16 @@ is the revert that established what the other one costs.
    `del(. as $x \| has("a") \| (try ($x \| .a)), .k)` fails in jq on the `.k` (applied to
    `true`), and here on the guessed `$x \| .a`.
 
+   The same price now covers a frozen `$var` reached through a composite bind source
+   ([#3334](https://github.com/rust-works/succinctly/issues/3334)): `($orig, $orig)`,
+   `($orig, 1)`, `if … then $orig else $orig end` and `$orig // 1` as a destructuring
+   source. The frozen test used to recognize only a bare `$orig`/`.` head, so a refusal
+   through any of those counted as exact and `try` caught it:
+   `del(. as $orig \| has("k") \| try ((if true then $orig else $orig end) as {a:{b:$q}} \| $q))`
+   on `{"a":{"b":1}}` echoed the document where jq returns `{"a":{}}`. Each now refuses
+   loudly, exactly as the bare `$orig` head does. On `{"a":5}`, where jq's own walk fails and
+   jq answers `[]`, that is the bare head's documented price, not a new one.
+
    One residual keeps the silent drop. A *terminal* refusal (the pipe's last value is a `$var`,
    with no navigation after it) is still decided where the per-branch knowledge is gone, so a
    value-position `?` catches it: `[path(. as $x \| has("a") \| $x)?]` is `[]` here and
@@ -1715,6 +1725,20 @@ is the revert that established what the other one costs.
      it from a truly arbitrary condition without evaluating it, the same refuse-only cost
      `test_identity_bind_position_traps_keep_refusing_2978`'s row 9 already pays for
      `identity_bind_position`'s sibling mechanism.
+
+   **A comma bind source binds per leaf**
+   ([#3334](https://github.com/rust-works/succinctly/issues/3334)). In jq an `as` source is a
+   subexp and `FORK` runs each branch to exhaustion in turn, so `(A, B) as P \| body` behaves
+   as `(A as P \| body), (B as P \| body)`. The resolver's source classifiers answered once
+   for the whole comma, so `[path((.,.) as $x \| $x)]` refused where jq answers `[[],[]]`,
+   `(., 1) as [$z] ?// {a:$q} \| $q` failed on the `.` where jq fails on the `1`, and
+   `del((., 1) as $x \| try $x.a)` discarded its write at exit 0. Both `as` and destructuring
+   now split a top-level comma source per leaf (jq mode only: yq does not fan out an `as`
+   source), and a comma nested under `if`/`try`/`//` is recognized when every leaf is a
+   passthrough. One refuse-only residual: an *asymmetric* comma nested under another head,
+   `(if true then (., 1) else . end) as $x \| $x`, refuses on its first output, where jq
+   succeeds on it and refuses on the second. Pinned by
+   `test_comma_bind_source_is_classified_per_branch_3334`.
 3. **jq's pointer-identity artifacts on `*`/`+` with an empty operand** —
    `path(. as $x \| reduce (1) as $i (0; $x + {}))` on `{"a":1}` is `[]` in jq; succinctly
    refuses (likewise `$x * {}` and `$x + null`). This is not a rule jq implements but an

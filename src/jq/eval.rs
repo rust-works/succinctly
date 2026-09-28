@@ -33643,18 +33643,19 @@ fn unwrap_bind_source(expr: &Expr) -> &Expr {
 fn comma_leaves<S: EvalSemantics>(expr: &Expr) -> Option<Vec<&Expr>> {
     fn push<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
         match unwrap_bind_source(expr) {
-            Expr::Comma(exprs) => exprs.iter().for_each(|e| push(e, out)),
+            Expr::Comma(exprs) => {
+                for e in exprs {
+                    push(e, out);
+                }
+            }
             leaf => out.push(leaf),
         }
     }
-    if S::TAG != EvalTag::Jq {
+    if S::TAG != EvalTag::Jq || !matches!(unwrap_bind_source(expr), Expr::Comma(_)) {
         return None;
     }
-    let Expr::Comma(exprs) = unwrap_bind_source(expr) else {
-        return None;
-    };
-    let mut leaves = Vec::with_capacity(exprs.len());
-    exprs.iter().for_each(|e| push(e, &mut leaves));
+    let mut leaves = Vec::new();
+    push(expr, &mut leaves);
     Some(leaves)
 }
 
@@ -38186,11 +38187,11 @@ fn marker_identical<S: EvalSemantics>(
 /// produced the value) rather than on `is_raise_free_identity_passthrough
 /// (left)` alone, which says nothing about which side's value reached
 /// `bound` -- the same #3129 lesson applied to an immediate, non-deferred
-/// certification instead of a later one. Second (#3127): this function has
-/// an `Expr::Comma` arm and `is_identity_passthrough` does not -- a gap
-/// this function's own review found and fixed here, `is_identity_passthrough`'s
-/// still open as #3334, so this "mirrors ... otherwise" claim is accurate
-/// only up to that one recorded exception.
+/// certification instead of a later one. Second (#3127): this function's
+/// `Expr::Comma` arm is not gated to jq mode, where `is_identity_passthrough`'s
+/// (#3334) is. A top-level comma source never reaches either: jq mode splits
+/// it per leaf first ([`comma_leaves`]), so the arm answers a comma nested
+/// under another head.
 fn resolves_to_register<S: EvalSemantics>(
     expr: &Expr,
     trackable: bool,
@@ -38203,27 +38204,13 @@ fn resolves_to_register<S: EvalSemantics>(
         // own `TrackedVar` arm, so a future refinement of this rule can't
         // apply to one and silently miss the other.
         Expr::TrackedVar(marker) => marker_identical::<S>(marker, reg, frame),
-        // #3127: every branch of a comma-fanned source is its own separate
-        // output (`eval_owned_expr_fork`'s `sources`), so this is sound
-        // exactly when every branch is -- `(.,.)` (both `Identity`) proves
-        // every output register-identical this way; `(., 1)` does not (`1`
-        // fails its own arm), and correctly falls through to the per-bound
-        // null/bool fallback below for the branch that does resolve, same
-        // conservative "guess" this function already makes for any shape
-        // it doesn't recognize (see this function's own doc comment) --
-        // this arm only turns a previously-unrecognized shape into one that
-        // sometimes proves `true`, never the reverse. Confirmed live: jq
-        // agrees `[path((.,.) as [$z] ?// {a:$q} | $q)]` is `[["a"],["a"]]`
-        // (this arm's only caller, `resolve_as_pattern`, is reached through
-        // `?//`/destructuring, never a bare `. as $x | body` -- that
-        // simpler form's own identical gap, in the unrelated
-        // `is_identity_passthrough` mechanism, is #3334, not fixed here),
-        // and still refuses `(., 1) as [$z] ?// {a:$q} | $q` on the
-        // *second* output only (jq's own message names `1`, not the whole
-        // document) -- where this arm's own `false` for that mixed shape
-        // leaves the existing per-bound fallback to (wrongly) refuse the
-        // first, resolvable branch too, a real, tracked divergence (#3334)
-        // this fix does not reach.
+        // #3127: every output of a comma is one of its leaves', so this is
+        // sound exactly when every leaf is -- `(.,.)` proves every output
+        // register-identical; `(., 1)` does not, and falls to the per-bound
+        // null/bool fallback. Since #3334 `resolve_as_pattern` splits a
+        // top-level comma per leaf before asking ([`comma_leaves`]), so
+        // `(., 1)` is judged leaf by leaf there and this arm only answers a
+        // comma nested under another head (`if true then (.,.) else . end`).
         Expr::Comma(exprs) => exprs
             .iter()
             .all(|e| resolves_to_register::<S>(e, trackable, reg, frame)),
@@ -109248,13 +109235,9 @@ mod tests {
     /// answered `[]` at exit 0 in the write-adjacent `?`-wrapped shape the
     /// issue's own repro uses.
     ///
-    /// `(., 1)` (row 3) is the asymmetric control this fix deliberately
-    /// leaves unrecognized: `1` doesn't resolve on its own, so the `&&`
-    /// answers `false` for the whole comma and the existing per-bound
-    /// fallback is what's left to judge each branch -- same as before this
-    /// fix, and still a real, separately-tracked gap (#3334; a per-branch,
-    /// not per-head, provenance question) that this issue's own narrow fix
-    /// does not attempt.
+    /// `(., 1)`, the asymmetric source, is pinned by #3334's own tests: that
+    /// fix splits a comma source per leaf, so each output is judged by the
+    /// leaf that produced it.
     #[test]
     fn test_comma_fanned_source_recognizes_every_identity_branch_3127() {
         for (doc, filter, want) in [
@@ -109268,14 +109251,8 @@ mod tests {
                 r"[path(((.,.) as [$z] ?// {a:$q} | ($q, 0))?)]",
                 Err(r"Invalid path expression with result 0"),
             ),
-            // The asymmetric source (`.` resolves, `1` does not) is
-            // deliberately *not* pinned here: `resolves_to_register`'s own
-            // `&&` still answers `false` for the whole comma in that case,
-            // and the pre-existing per-bound fallback then refuses the
-            // resolvable branch too -- a real, separately-tracked
-            // divergence from jq (#3334), not something this fix reaches.
-            // Pinning succinctly's own current (wrong) answer as "expected"
-            // here would misrepresent it as verified-correct.
+            // The asymmetric source (`.` resolves, `1` does not) is pinned
+            // by `test_comma_bind_source_is_classified_per_branch_3334`.
         ] {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
@@ -109309,6 +109286,59 @@ mod tests {
             .map(OwnedValue::to_json)
             .collect();
         assert_eq!(got, vec![r#"{"b":[3]}"#.to_string()]);
+    }
+
+    /// #3334: `comma_leaves` flattens a top-level comma through parens and
+    /// nested commas, in order, leaves a comma nested under another head
+    /// alone, and answers `None` for a non-comma source or in yq mode.
+    #[test]
+    fn test_comma_leaves_flattens_top_level_commas_3334() {
+        let leaves = |filter: &str| {
+            let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            comma_leaves::<JqSemantics>(&expr).map(|ls| ls.into_iter().cloned().collect::<Vec<_>>())
+        };
+        assert_eq!(
+            leaves("(., (1, (.a, .b)))"),
+            Some(vec![
+                parse(".").unwrap(),
+                parse("1").unwrap(),
+                parse(".a").unwrap(),
+                parse(".b").unwrap(),
+            ])
+        );
+        assert_eq!(leaves("."), None);
+        assert_eq!(leaves("if true then (.,.) else . end"), None);
+        assert_eq!(comma_leaves::<YqSemantics>(&parse("(.,.)").unwrap()), None);
+    }
+
+    /// #3334: `head_may_be_frozen` answers true when any branch of an `if`,
+    /// `try`, `//` or comma head can yield a frozen value -- `.` over a
+    /// marked snapshot here -- and false when none can.
+    #[test]
+    fn test_head_may_be_frozen_looks_through_composite_heads_3334() {
+        let marked = Snapshot::Marked(Origin::Snapshot);
+        for (filter, when_marked) in [
+            (".", true),
+            ("(.)", true),
+            ("if true then . else 1 end", true),
+            ("if true then 1 else . end", true),
+            ("try . catch 1", true),
+            ("try 1 catch .", true),
+            (". // 1", true),
+            ("1 // .", true),
+            ("(1, .)", true),
+            ("1", false),
+            ("(1, 2)", false),
+            ("if . then 1 else 2 end", false),
+            (".a", false),
+        ] {
+            let expr = parse(filter).unwrap();
+            assert_eq!(head_may_be_frozen(&expr, &marked), when_marked, "{filter}");
+            assert!(
+                !head_may_be_frozen(&expr, &Snapshot::No),
+                "{filter} unmarked"
+            );
+        }
     }
 
     /// #3133: a pipe nested under `try`/`?` in a pattern body used to carry
