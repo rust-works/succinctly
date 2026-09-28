@@ -5687,10 +5687,10 @@ pub enum YamlString<'a> {
     DoubleQuoted {
         text: &'a [u8],
         start: usize,
-        /// Set from [`YamlIndex::canonicalize_numbers`](super::index::YamlIndex::canonicalize_numbers)
-        /// at construction (#996: JSON is a syntactic subset of YAML's flow
-        /// grammar, so `-p=json` input still parses as a double-quoted
-        /// scalar here). A raw, unescaped `\r`/`\n` byte inside a genuine
+        /// Set from `YamlIndex::canonicalize_numbers` (`pub(crate)`, so not
+        /// linked here) at construction (#996: JSON is a syntactic subset
+        /// of YAML's flow grammar, so `-p=json` input still parses as a
+        /// double-quoted scalar here). A raw, unescaped `\r`/`\n` byte inside a genuine
         /// YAML double-quoted scalar is a real multi-line-source line
         /// break that YAML 7.3's folding rule must collapse to a space --
         /// but the same byte inside a *JSON* string value is just literal
