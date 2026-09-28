@@ -73759,11 +73759,13 @@ fn test_parsed_nan_instances_across_inputs_and_args_3309() -> Result<()> {
 /// follow it.
 type RetryRow3293 = (&'static str, &'static str, &'static str, &'static str, i32);
 
-/// Runs every row with `-nc`, or with `-c` over `input` when one is given
-/// (a document input keeps the operand on the cursor route; a value built
-/// under `-n` is owned and takes `eval.rs`'s evaluator instead).
-fn assert_retry_rows_3293(input: Option<&str>, rows: &[RetryRow3293]) -> Result<()> {
+/// Runs every row with `-nc`, or with `-c` over `input` when one is given,
+/// each filter behind `prefix`. A document input keeps the operand on the
+/// cursor route (`eval_generic.rs`); a `prefix` that builds the input under
+/// `-n` makes it an owned value, which takes `eval.rs`'s evaluator instead.
+fn assert_retry_rows_3293(input: Option<&str>, prefix: &str, rows: &[RetryRow3293]) -> Result<()> {
     for &(filter, stdout, trace, message, exit) in rows {
+        let filter = &format!("{prefix}{filter}");
         let args = if input.is_some() {
             ["-c", filter]
         } else {
@@ -73808,77 +73810,76 @@ fn assert_retry_rows_3293(input: Option<&str>, rows: &[RetryRow3293]) -> Result<
 ///
 /// The last row pins that a `halt_error` inside the generator is not
 /// retried.
+const RETRY_ROWS_NEGATE_3293: &[RetryRow3293] = &[
+    (
+        r#"-([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"-([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)"#,
+        "",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"-([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)"#,
+        "-1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"-([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"-([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(-(([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else 1 end))]"#,
+        "",
+        "AA",
+        "array ([]) cannot be negated",
+        5,
+    ),
+    (
+        r#"[first(-([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end))]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"-([1] as $x ?// $y | ("A"|stderr) | [1])"#,
+        "",
+        "AA",
+        "array ([1]) cannot be negated",
+        5,
+    ),
+    (r"-(1, [1])", "-1\n", "", "array ([1]) cannot be negated", 5),
+    (
+        r#"-(1 as $x ?// $y | ("A"|stderr) | ("h"|halt_error(3)))"#,
+        "",
+        "A",
+        "h",
+        3,
+    ),
+];
+
 #[test]
 fn test_negate_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
-    assert_retry_rows_3293(
-        None,
-        &[
-            (
-                r#"-([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)"#,
-                "",
-                "A",
-                "Cannot index array with string \"k\"",
-                5,
-            ),
-            (
-                r#"-([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)"#,
-                "",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"-([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)"#,
-                "-1\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"-([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)"#,
-                "",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"-([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"[first(-(([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else 1 end))]"#,
-                "",
-                "AA",
-                "array ([]) cannot be negated",
-                5,
-            ),
-            (
-                r#"[first(-([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end))]"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"-([1] as $x ?// $y | ("A"|stderr) | [1])"#,
-                "",
-                "AA",
-                "array ([1]) cannot be negated",
-                5,
-            ),
-            (r"-(1, [1])", "-1\n", "", "array ([1]) cannot be negated", 5),
-            (
-                r#"-(1 as $x ?// $y | ("A"|stderr) | ("h"|halt_error(3)))"#,
-                "",
-                "A",
-                "h",
-                3,
-            ),
-        ],
-    )
+    assert_retry_rows_3293(None, "", RETRY_ROWS_NEGATE_3293)
 }
 
 /// #3293: a `?//` retry inside an `if` condition supersedes the verdict the
@@ -73892,76 +73893,75 @@ fn test_negate_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 /// the first alternative that must not hide the retry's own error. The
 /// controls are every alternative failing (the last one's error surfaces)
 /// and, in some tables, the same error with no `?//` at all.
+const RETRY_ROWS_IF_3293: &[RetryRow3293] = &[
+    (
+        r#"if (([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a) | type == "array") then error("E") else 2 end"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"if (([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a) | type == "array") then error("E") else 2 end"#,
+        "",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"if (([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) | type == "array") then error("E") else 2 end"#,
+        "2\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"if (([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) | type == "array") then error("E") else 2 end"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"if (([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | type == "array") then error("E") else 2 end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(if ([1] as $a ?// $b | ("A"|stderr) | $a) then 1 else error("E") end)]"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
+        r#"[limit(1; if ([1] as $a ?// $b | ("A"|stderr) | $a) then 1 else error("E") end)]"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
+        r#"[first(if ([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) then 1 else 2 end)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"if ([1] as $x ?// $y | ("A"|stderr) | true) then error("E") else 2 end"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+];
+
 #[test]
 fn test_if_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
-    assert_retry_rows_3293(
-        None,
-        &[
-            (
-                r#"if (([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a) | type == "array") then error("E") else 2 end"#,
-                "",
-                "A",
-                "Cannot index array with string \"k\"",
-                5,
-            ),
-            (
-                r#"if (([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a) | type == "array") then error("E") else 2 end"#,
-                "",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"if (([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) | type == "array") then error("E") else 2 end"#,
-                "2\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"if (([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) | type == "array") then error("E") else 2 end"#,
-                "",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"if (([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | type == "array") then error("E") else 2 end"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"[first(if ([1] as $a ?// $b | ("A"|stderr) | $a) then 1 else error("E") end)]"#,
-                "",
-                "AA",
-                "E",
-                5,
-            ),
-            (
-                r#"[limit(1; if ([1] as $a ?// $b | ("A"|stderr) | $a) then 1 else error("E") end)]"#,
-                "",
-                "AA",
-                "E",
-                5,
-            ),
-            (
-                r#"[first(if ([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) then 1 else 2 end)]"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"if ([1] as $x ?// $y | ("A"|stderr) | true) then error("E") else 2 end"#,
-                "",
-                "AA",
-                "E",
-                5,
-            ),
-        ],
-    )
+    assert_retry_rows_3293(None, "", RETRY_ROWS_IF_3293)
 }
 
 /// #3293: a `?//` retry inside a computed index supersedes the verdict the
@@ -73975,62 +73975,61 @@ fn test_if_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 /// the first alternative that must not hide the retry's own error. The
 /// controls are every alternative failing (the last one's error surfaces)
 /// and, in some tables, the same error with no `?//` at all.
+const RETRY_ROWS_COMPUTED_INDEX_3293: &[RetryRow3293] = &[
+    (
+        r#".[([["a"]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#".[([["a"]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)]"#,
+        "",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#".[([["a"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
+        "5\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([["a"]] as [$a] ?// $b | ("A"|stderr) | $a // empty)]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([["a"]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(.[(([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else "a" end)])]"#,
+        "",
+        "AA",
+        "Cannot index object with array",
+        5,
+    ),
+    (
+        r#".[(["a"] as $x ?// $y | ("A"|stderr) | ["a"])]"#,
+        "",
+        "AA",
+        "Cannot index object with array",
+        5,
+    ),
+];
+
 #[test]
 fn test_computed_index_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
-    assert_retry_rows_3293(
-        Some(r#"{"a":5}"#),
-        &[
-            (
-                r#".[([["a"]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)]"#,
-                "",
-                "A",
-                "Cannot index array with string \"k\"",
-                5,
-            ),
-            (
-                r#".[([["a"]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)]"#,
-                "",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#".[([["a"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]"#,
-                "5\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#".[([["a"]] as [$a] ?// $b | ("A"|stderr) | $a // empty)]"#,
-                "",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#".[([["a"]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"[first(.[(([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else "a" end)])]"#,
-                "",
-                "AA",
-                "Cannot index object with array",
-                5,
-            ),
-            (
-                r#".[(["a"] as $x ?// $y | ("A"|stderr) | ["a"])]"#,
-                "",
-                "AA",
-                "Cannot index object with array",
-                5,
-            ),
-        ],
-    )
+    assert_retry_rows_3293(Some(r#"{"a":5}"#), "", RETRY_ROWS_COMPUTED_INDEX_3293)
 }
 
 /// #3293: a `?//` retry inside a computed object key or value supersedes the verdict the
@@ -74044,76 +74043,75 @@ fn test_computed_index_retry_supersedes_stashed_sink_verdict_3293() -> Result<()
 /// the first alternative that must not hide the retry's own error. The
 /// controls are every alternative failing (the last one's error surfaces)
 /// and, in some tables, the same error with no `?//` at all.
+const RETRY_ROWS_OBJECT_CONSTRUCTION_3293: &[RetryRow3293] = &[
+    (
+        r#"{(([["x"]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)): 1}"#,
+        "",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"{(([["x"]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)): 1}"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"{(([["x"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)): 1}"#,
+        "{\"x\":1}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"{(([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)): 1}"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"{(([["x"]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)): 1}"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"{a: 1} | {a: ([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("V") else . end), b: 2}"#,
+        "{\"a\":[1],\"b\":2}\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"{k: ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)}"#,
+        "{\"k\":[1]}\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first({(((([1] as $a ?// $b | ("A"|stderr) | $a)) | if . == null then 1 else "k" end)): 1})]"#,
+        "",
+        "AA",
+        "Cannot use number (1) as object key",
+        5,
+    ),
+    (
+        r#"{(["x"] as $x ?// $y | ("A"|stderr) | ["x"]): 1}"#,
+        "",
+        "AA",
+        "Cannot use array ([\"x\"]) as object key",
+        5,
+    ),
+];
+
 #[test]
 fn test_object_construction_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
-    assert_retry_rows_3293(
-        None,
-        &[
-            (
-                r#"{(([["x"]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)): 1}"#,
-                "",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"{(([["x"]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)): 1}"#,
-                "",
-                "A",
-                "Cannot index array with string \"k\"",
-                5,
-            ),
-            (
-                r#"{(([["x"]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)): 1}"#,
-                "{\"x\":1}\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"{(([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)): 1}"#,
-                "",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"{(([["x"]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)): 1}"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"{a: 1} | {a: ([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("V") else . end), b: 2}"#,
-                "{\"a\":[1],\"b\":2}\n",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"{k: ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)}"#,
-                "{\"k\":[1]}\n",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"[first({(((([1] as $a ?// $b | ("A"|stderr) | $a)) | if . == null then 1 else "k" end)): 1})]"#,
-                "",
-                "AA",
-                "Cannot use number (1) as object key",
-                5,
-            ),
-            (
-                r#"{(["x"] as $x ?// $y | ("A"|stderr) | ["x"]): 1}"#,
-                "",
-                "AA",
-                "Cannot use array ([\"x\"]) as object key",
-                5,
-            ),
-        ],
-    )
+    assert_retry_rows_3293(None, "", RETRY_ROWS_OBJECT_CONSTRUCTION_3293)
 }
 
 /// #3293: a `?//` retry inside a `range` bound supersedes the verdict the
@@ -74131,83 +74129,82 @@ fn test_object_construction_retry_supersedes_stashed_sink_verdict_3293() -> Resu
 /// A retry inside the *step* is not pinned here: jq emits `from` before it
 /// type-checks the step (`[range(0; 3; [1])]` raises after `0`), which
 /// succinctly does not, independently of #3293.
+const RETRY_ROWS_RANGE_3293: &[RetryRow3293] = &[
+    (
+        r#"range(([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a))"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"range(([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a))"#,
+        "",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"range(([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a))"#,
+        "0\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"range(([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"range(([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(range(([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then "x" else 1 end))]"#,
+        "",
+        "AA",
+        "Range bounds must be numeric",
+        5,
+    ),
+    (
+        r#"[first(range(1 as $a ?// $b | $a // "x"))]"#,
+        "",
+        "",
+        "Range bounds must be numeric",
+        5,
+    ),
+    (
+        r#"[first(range(([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)))]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[range(0; ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a))]"#,
+        "[0]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"range(1 as $x ?// $y | ("A"|stderr) | [1])"#,
+        "",
+        "AA",
+        "Range bounds must be numeric",
+        5,
+    ),
+];
+
 #[test]
 fn test_range_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
-    assert_retry_rows_3293(
-        None,
-        &[
-            (
-                r#"range(([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a))"#,
-                "",
-                "A",
-                "Cannot index array with string \"k\"",
-                5,
-            ),
-            (
-                r#"range(([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a))"#,
-                "",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"range(([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a))"#,
-                "0\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"range(([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty))"#,
-                "",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"range(([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end))"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"[first(range(([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then "x" else 1 end))]"#,
-                "",
-                "AA",
-                "Range bounds must be numeric",
-                5,
-            ),
-            (
-                r#"[first(range(1 as $a ?// $b | $a // "x"))]"#,
-                "",
-                "",
-                "Range bounds must be numeric",
-                5,
-            ),
-            (
-                r#"[first(range(([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)))]"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"[range(0; ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a))]"#,
-                "[0]\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"range(1 as $x ?// $y | ("A"|stderr) | [1])"#,
-                "",
-                "AA",
-                "Range bounds must be numeric",
-                5,
-            ),
-        ],
-    )
+    assert_retry_rows_3293(None, "", RETRY_ROWS_RANGE_3293)
 }
 
 /// #3293: a `?//` retry inside an arithmetic operand supersedes the verdict the
@@ -74221,97 +74218,96 @@ fn test_range_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 /// the first alternative that must not hide the retry's own error. The
 /// controls are every alternative failing (the last one's error surfaces)
 /// and, in some tables, the same error with no `?//` at all.
+const RETRY_ROWS_ARITHMETIC_3293: &[RetryRow3293] = &[
+    (
+        r#"([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a) + 1"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"1 + ([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)"#,
+        "",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) + 1"#,
+        "2\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"1 + ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)"#,
+        "2\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) + 1"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"1 + ([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) + 1"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"1 + ([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(1 + (([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else 1 end))]"#,
+        "",
+        "AA",
+        "number (1) and array ([]) cannot be added",
+        5,
+    ),
+    (
+        r#"[first((([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else 1 end) - 1)]"#,
+        "",
+        "AA",
+        "array ([]) and number (1) cannot be subtracted",
+        5,
+    ),
+    (
+        r#"(1 as $x ?// $y | ("A"|stderr) | [1]) + 1"#,
+        "",
+        "AA",
+        "array ([1]) and number (1) cannot be added",
+        5,
+    ),
+    (
+        r"[1] - (1, 2)",
+        "",
+        "",
+        "array ([1]) and number (1) cannot be subtracted",
+        5,
+    ),
+];
+
 #[test]
 fn test_arithmetic_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
-    assert_retry_rows_3293(
-        None,
-        &[
-            (
-                r#"([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a) + 1"#,
-                "",
-                "A",
-                "Cannot index array with string \"k\"",
-                5,
-            ),
-            (
-                r#"1 + ([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a)"#,
-                "",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) + 1"#,
-                "2\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"1 + ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)"#,
-                "2\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) + 1"#,
-                "",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"1 + ([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)"#,
-                "",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) + 1"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"1 + ([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"[first(1 + (([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else 1 end))]"#,
-                "",
-                "AA",
-                "number (1) and array ([]) cannot be added",
-                5,
-            ),
-            (
-                r#"[first((([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then [] else 1 end) - 1)]"#,
-                "",
-                "AA",
-                "array ([]) and number (1) cannot be subtracted",
-                5,
-            ),
-            (
-                r#"(1 as $x ?// $y | ("A"|stderr) | [1]) + 1"#,
-                "",
-                "AA",
-                "array ([1]) and number (1) cannot be added",
-                5,
-            ),
-            (
-                r"[1] - (1, 2)",
-                "",
-                "",
-                "array ([1]) and number (1) cannot be subtracted",
-                5,
-            ),
-        ],
-    )
+    assert_retry_rows_3293(None, "", RETRY_ROWS_ARITHMETIC_3293)
 }
 
 /// #3293: a `?//` retry inside an `and`/`or` operand supersedes the verdict the
@@ -74328,76 +74324,75 @@ fn test_arithmetic_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 ///
 /// The `and`/`or` loop is shared with `eval.rs`, so the owned evaluator
 /// takes the same fix.
+const RETRY_ROWS_AND_OR_3293: &[RetryRow3293] = &[
+    (
+        r#"([1] as $a ?// {(empty): $b} | ("A"|stderr) | $a) and error("E")"#,
+        "",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"([1] as $a ?// {k: $b} | ("A"|stderr) | $a) and error("E")"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"([1] as $a ?// $b | ("A"|stderr) | $a) and error("E")"#,
+        "false\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([1] as $a ?// $b | ("A"|stderr) | $a // empty) and error("E")"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(false, ([1] as $a ?// $b | ("A"|stderr) | $a)) and error("E")"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([1] as $a ?// $b | ("A"|stderr) | $a) or error("E")"#,
+        "true\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([1] as $a ?// $b | ("A"|stderr) | $a) and 1)]"#,
+        "[true,false]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) and true)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"(1 as $x ?// $y | ("A"|stderr) | true) and error("E")"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+];
+
 #[test]
 fn test_and_or_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
-    assert_retry_rows_3293(
-        None,
-        &[
-            (
-                r#"([1] as $a ?// {(empty): $b} | ("A"|stderr) | $a) and error("E")"#,
-                "",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"([1] as $a ?// {k: $b} | ("A"|stderr) | $a) and error("E")"#,
-                "",
-                "A",
-                "Cannot index array with string \"k\"",
-                5,
-            ),
-            (
-                r#"([1] as $a ?// $b | ("A"|stderr) | $a) and error("E")"#,
-                "false\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"([1] as $a ?// $b | ("A"|stderr) | $a // empty) and error("E")"#,
-                "",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"(false, ([1] as $a ?// $b | ("A"|stderr) | $a)) and error("E")"#,
-                "false\nfalse\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"([1] as $a ?// $b | ("A"|stderr) | $a) or error("E")"#,
-                "true\n",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"[first(([1] as $a ?// $b | ("A"|stderr) | $a) and 1)]"#,
-                "[true,false]\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"[first(([1] as $a ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) and true)]"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"(1 as $x ?// $y | ("A"|stderr) | true) and error("E")"#,
-                "",
-                "AA",
-                "E",
-                5,
-            ),
-        ],
-    )
+    assert_retry_rows_3293(None, "", RETRY_ROWS_AND_OR_3293)
 }
 
 /// #3293: a `?//` retry inside the first stage of a pipe supersedes the verdict the
@@ -74414,69 +74409,119 @@ fn test_and_or_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 ///
 /// Both pipe drivers (`eval.rs` and `eval_generic.rs`) end through
 /// `eval::pipe_terminal_after_retry`, which now uses `retry_superseded`.
+const RETRY_ROWS_PIPE_FIRST_STAGE_3293: &[RetryRow3293] = &[
+    (
+        r#"([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a) | error("P")"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a) | error("P")]"#,
+        "[]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | . + 1]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"(([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | -.)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first((([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | .), 3)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) | . + 1]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) | -.]"#,
+        "[-1]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first((([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then error("P") else . end) | ., 9)]"#,
+        "",
+        "AA",
+        "P",
+        5,
+    ),
+];
+
 #[test]
 fn test_pipe_first_stage_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
-    assert_retry_rows_3293(
-        None,
-        &[
-            (
-                r#"([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a) | error("P")"#,
-                "",
-                "A",
-                "Cannot index array with string \"k\"",
-                5,
-            ),
-            (
-                r#"[([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a) | error("P")]"#,
-                "[]\n",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | . + 1]"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"(([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | -.)"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"[first((([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end) | .), 3)]"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-            (
-                r#"[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) | . + 1]"#,
-                "[]\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) | -.]"#,
-                "[-1]\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"[first((([1] as $a ?// $b | ("A"|stderr) | $a) | if . == null then error("P") else . end) | ., 9)]"#,
-                "",
-                "AA",
-                "P",
-                5,
-            ),
-        ],
-    )
+    assert_retry_rows_3293(None, "", RETRY_ROWS_PIPE_FIRST_STAGE_3293)
+}
+
+/// #3293: a `?//` retry inside `limit`'s generator, after its count stopped it supersedes the verdict the
+/// retried-past alternative left in `limit`'s eager route (`each_take_n`)'s stash.
+///
+/// Rows, as the sink allows, cover each way the retry can end: answering
+/// after the first alternative's error; producing nothing, including a
+/// pattern that yields no binding set, so the sink is never re-invoked;
+/// raising inside the generator, including a pattern that fails to
+/// destructure; and, where the sink keeps a stop flag, a consumer's stop on
+/// the first alternative that must not hide the retry's own error. The
+/// controls are every alternative failing (the last one's error surfaces)
+/// and, in some tables, the same error with no `?//` at all.
+///
+/// The last two rows are controls: an eager trailing control after the count
+/// is still dropped, and a clean retry still answers twice (#1519).
+const RETRY_ROWS_LIMIT_COUNT_STOP_3293: &[RetryRow3293] = &[
+    (
+        r#"[limit(1; if ([1] as $a ?// $b | ("A"|stderr) | $a) then 1 else error("E") end)]"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
+        r#"[limit(1; ([1] as $a ?// $b | ("A"|stderr) | $a) | if . then 1 else error("E") end)]"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
+        r#"[limit(1; (1, 2) | if ([1] as $a ?// $b | ("A"|stderr) | $a) then . else error("E") end)]"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (r#"[limit(2; 1, 2, error("x"))]"#, "[1,2]\n", "", "", 0),
+    (
+        r#"[limit(1; 1 as $x ?// $y | ("A"|stderr) | 5)]"#,
+        "[5,5]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+#[test]
+fn test_limit_count_stop_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(None, "", RETRY_ROWS_LIMIT_COUNT_STOP_3293)
 }
 
 /// #3293: a `?//` retry inside `skip`'s count argument supersedes the verdict the
@@ -74493,48 +74538,71 @@ fn test_pipe_first_stage_retry_supersedes_stashed_sink_verdict_3293() -> Result<
 ///
 /// `skip` is jq 1.8, so these rows were captured from jq 1.7.1 with jq's own
 /// `skip` definition prepended, as #2952's tests were.
+const RETRY_ROWS_SKIP_COUNT_3293: &[RetryRow3293] = &[
+    (
+        r#"[skip(([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a | length); 10, error("B"))]"#,
+        "[]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[skip(([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a | length); 10, error("B"))]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[skip(([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty | length); 10, error("B"))]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(skip(([1] as $a ?// $b | ("A"|stderr) | if $a then 0 else -1 end); 10))]"#,
+        "",
+        "AA",
+        "skip doesn't support negative count",
+        5,
+    ),
+    (
+        r#"[first(skip(([1] as $a ?// $b | ("A"|stderr) | if $a then 0 else error("E2") end); 10))]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+];
+
 #[test]
 fn test_skip_count_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
-    assert_retry_rows_3293(
-        None,
-        &[
-            (
-                r#"[skip(([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a | length); 10, error("B"))]"#,
-                "[]\n",
-                "A",
-                "",
-                0,
-            ),
-            (
-                r#"[skip(([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a | length); 10, error("B"))]"#,
-                "",
-                "A",
-                "Cannot index array with string \"k\"",
-                5,
-            ),
-            (
-                r#"[skip(([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty | length); 10, error("B"))]"#,
-                "[]\n",
-                "AA",
-                "",
-                0,
-            ),
-            (
-                r#"[first(skip(([1] as $a ?// $b | ("A"|stderr) | if $a then 0 else -1 end); 10))]"#,
-                "",
-                "AA",
-                "skip doesn't support negative count",
-                5,
-            ),
-            (
-                r#"[first(skip(([1] as $a ?// $b | ("A"|stderr) | if $a then 0 else error("E2") end); 10))]"#,
-                "",
-                "AA",
-                "E2",
-                5,
-            ),
-        ],
-    )
+    assert_retry_rows_3293(None, "", RETRY_ROWS_SKIP_COUNT_3293)
+}
+
+/// #3293 slice 2: every table above again, with the operand's input built
+/// under `-n` so it is an owned value and the query runs on `eval.rs`'s
+/// evaluator -- the twins of the cursor-route sinks those tables pin. A
+/// `{} | ` prefix changes no row's jq 1.7.1 answer (checked row by row;
+/// the index table's `{"a":5}` becomes the prefix instead of the input).
+#[test]
+fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()> {
+    for (prefix, rows) in [
+        ("{} | ", RETRY_ROWS_NEGATE_3293),
+        ("{} | ", RETRY_ROWS_IF_3293),
+        (r#"{"a":5} | "#, RETRY_ROWS_COMPUTED_INDEX_3293),
+        ("{} | ", RETRY_ROWS_OBJECT_CONSTRUCTION_3293),
+        ("{} | ", RETRY_ROWS_RANGE_3293),
+        ("{} | ", RETRY_ROWS_ARITHMETIC_3293),
+        ("{} | ", RETRY_ROWS_AND_OR_3293),
+        ("{} | ", RETRY_ROWS_PIPE_FIRST_STAGE_3293),
+        ("{} | ", RETRY_ROWS_LIMIT_COUNT_STOP_3293),
+        ("{} | ", RETRY_ROWS_SKIP_COUNT_3293),
+    ] {
+        assert_retry_rows_3293(None, prefix, rows)?;
+    }
+    Ok(())
 }
 
 /// #3293, yq mode: the sinks #3293 changed are shared with `succinctly yq`,
