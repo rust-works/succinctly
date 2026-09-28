@@ -8267,7 +8267,9 @@ fn json_bytes_to_owned_value_checked(bytes: &[u8]) -> core::result::Result<Owned
     let index = JsonIndex::build(bytes);
     let cursor = index.root(bytes);
     validate_json_delimiters(&cursor, 0)?;
-    generic_to_owned::<JqSemantics, _>(&cursor.value())
+    // `bytes` is often a temporary (an `--argjson` string, a `--seq` record),
+    // so each NaN gets an identity of its own rather than its address (#3309).
+    generic_to_owned::<JqSemantics, _>(&cursor.value()).map(OwnedValue::with_fresh_nan_instances)
 }
 
 /// The bracket/brace-delimited, comma-and-indent-joined skeleton shared by

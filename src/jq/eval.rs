@@ -18439,8 +18439,14 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // (a real NaN, printed) in jq 1.7.1, and Rust's `parse::<f64>()` below
     // rejects both. jq mode only by construction -- yq mode has already
     // returned above with its own grammar (#2960).
+    // A NaN is a new parse instance (#3309): `"NaN" | tonumber as $x |
+    // $x == $x` is `true` in jq, while two `tonumber` runs never agree.
     if let Some(f) = crate::json::validate::jq_special_number(trimmed.as_bytes()) {
-        return Ok(OwnedValue::Float(f));
+        return Ok(if f.is_nan() {
+            OwnedValue::fresh_nan_instance(f.is_sign_negative())
+        } else {
+            OwnedValue::Float(f)
+        });
     }
     // The remaining lenient spellings jq's decNumber reader accepts but
     // does not preserve the spelling of even on the document path -- a
@@ -18947,7 +18953,10 @@ fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
         // STYLE-0012: this parser has no `optional` flag; its caller handles
         // suppression, and the validator already bounds nesting below the
         // materializer's own limit.
+        // Each parse makes new NaN instances (#3309), whatever address the
+        // text it indexed happens to have.
         return super::eval_generic::to_owned::<JqSemantics, _>(&index.root(bytes).value())
+            .map(OwnedValue::with_fresh_nan_instances)
             .map_err(|e| e.to_string());
     }
 

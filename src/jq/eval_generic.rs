@@ -232,6 +232,20 @@ fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) ->
     }
 }
 
+/// [`OwnedValue::from_document_float`] for a double read from `value`, except
+/// a NaN jq parsed from the document keeps the instance identity jq's `==`
+/// compares it by (#3309), keyed by the token's address.
+fn document_float_to_owned<S: EvalSemantics, V: DocumentValue>(value: &V, f: f64) -> OwnedValue {
+    if S::DECNUMBER_LITERALS && f.is_nan() {
+        if let Some(address) = value.number_token_address() {
+            return OwnedValue::document_nan_instance(f.is_sign_negative(), address);
+        }
+        // A bridge token for a parsed NaN: the instance it was written from.
+        return OwnedValue::from_bridge_float(f);
+    }
+    OwnedValue::from_document_float(f)
+}
+
 /// Checked sibling of [`to_owned`] (#2299): identical materialization
 /// logic, `check_nesting_depth` (catchable) in place of
 /// `assert_nesting_depth` (panic).
@@ -327,7 +341,7 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
         // jq still reads that span's decimal through its 17-digit rounding
         // (#2936), which is why the double comes from the mode-aware
         // accessor rather than the plain `as_f64()`.
-        Ok(OwnedValue::from_document_float(f))
+        Ok(document_float_to_owned::<S, V>(value, f))
     } else if let Some(s) = value.as_str() {
         Ok(OwnedValue::String(s.into_owned()))
     } else if let Some(reason) = value.string_decode_error() {
@@ -579,7 +593,7 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         // jq still reads that span's decimal through its 17-digit rounding
         // (#2936), which is why the double comes from the mode-aware
         // accessor rather than the plain `as_f64()`.
-        Ok(OwnedValue::from_document_float(f))
+        Ok(document_float_to_owned::<S, V>(value, f))
     } else if let Some(s) = value.as_str() {
         Ok(OwnedValue::String(s.into_owned()))
     } else if let Some(reason) = value.string_decode_error() {
@@ -24096,7 +24110,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // same provenance the `number_literal()` arm above preserves
                 // -- see `OwnedValue::from_document_float`; the double is
                 // the mode's (#2936), as in `to_owned_at_depth`.
-                GenericResult::Owned(OwnedValue::from_document_float(f))
+                GenericResult::Owned(document_float_to_owned::<S, V>(&value, f))
             } else if let Some(s) = value.as_str() {
                 match tonumber_from_str(s.as_ref(), S::TAG == EvalTag::Yq) {
                     Ok(n) => GenericResult::Owned(n),

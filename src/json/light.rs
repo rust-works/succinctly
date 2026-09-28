@@ -2830,8 +2830,8 @@ use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
 use crate::jq::{
     format_number_jq_compat, is_jq_canonical_number, jq_canonical_number_prefix,
-    nesting_depth_exceeded_message, nonfinite_display_string, EvalError, JqSemantics, OwnedValue,
-    YqSemantics, MAX_VALUE_TREE_DEPTH,
+    nesting_depth_exceeded_message, nonfinite_display_string, EvalError, JqSemantics, NumberRepr,
+    OwnedValue, YqSemantics, MAX_VALUE_TREE_DEPTH,
 };
 
 /// A [`JsonError`] as the uncatchable decode failure (#1620) every
@@ -3877,6 +3877,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         }
     }
 
+    fn number_token_address(&self) -> Option<usize> {
+        match self {
+            StandardJson::Number(n) if n.bridge_value().is_none() => {
+                Some(n.raw_bytes().as_ptr() as usize)
+            }
+            _ => None,
+        }
+    }
+
     fn number_text(&self) -> Option<Cow<'_, str>> {
         match self {
             StandardJson::Number(n) => core::str::from_utf8(n.raw_bytes()).ok().map(Cow::Borrowed),
@@ -4726,6 +4735,11 @@ fn write_json_number<Out: core::fmt::Write>(
                 // survive (`.500` -> `0.500`, not `0.5`) -- route it
                 // through the same jq-compat reformatting a strictly-valid
                 // span gets above, via the literal's own text.
+                // A NaN spelling (`NaN`, `-nan`) is a parse instance (#3309),
+                // whose literal text is not a number spelling: jq prints `null`.
+                OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
+                    out.write_str("null")
+                }
                 OwnedValue::NumberLiteral(_, literal) => {
                     out.write_str(&format_number_jq_compat(literal.as_bytes()))
                 }
