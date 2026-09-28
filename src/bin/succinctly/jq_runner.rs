@@ -7691,19 +7691,22 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     // `write_terminator` stays on `out`, so `--unbuffered` still flushes
     // once per record.
     scratch.clear();
-    if !is_raw_record(&as_str, config) {
-        render_json_body(scratch, value, config)?;
-    }
-    if write_output_raw_prologue(out, as_str, config)? {
-        return Ok(());
-    }
-    out.write_all(scratch)?;
-    // Don't pin one huge record's buffer for the rest of a long stream.
+    let written = (|| {
+        if !is_raw_record(&as_str, config) {
+            render_json_body(scratch, value, config)?;
+        }
+        if write_output_raw_prologue(out, as_str, config)? {
+            return Ok(());
+        }
+        out.write_all(scratch)?;
+        write_terminator(out, config)
+    })();
+    // Don't pin one huge record's buffer for the rest of a long stream,
+    // including one that rendered most of a large record and then failed.
     if scratch.capacity() > MAX_RETAINED_RECORD_SCRATCH {
         *scratch = Vec::new();
     }
-    write_terminator(out, config)?;
-    Ok(())
+    written
 }
 
 /// The largest record buffer [`write_output_jq_value`] keeps between
@@ -7712,11 +7715,11 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
 /// its largest record.
 const MAX_RETAINED_RECORD_SCRATCH: usize = 8 << 20;
 
-/// [`write_output_jq_value`]'s JSON body, written to `out` with no prologue
-/// or terminator. It can fail after writing part of the body, which is why
-/// its caller hands it a buffer rather than stdout (#3265).
-fn render_json_body<Out: Write, Wrd: Clone + AsRef<[u64]>>(
-    out: &mut Out,
+/// [`write_output_jq_value`]'s JSON body, rendered into the empty `out`
+/// with no prologue or terminator. It can fail after rendering part of the
+/// body, which is why it renders into a buffer rather than stdout (#3265).
+fn render_json_body<Wrd: Clone + AsRef<[u64]>>(
+    out: &mut Vec<u8>,
     value: &JqValue<'_, Wrd>,
     config: &OutputConfig,
 ) -> Result<()> {
@@ -7794,7 +7797,9 @@ fn render_json_body<Out: Write, Wrd: Clone + AsRef<[u64]>>(
         let owned = value
             .try_materialize()
             .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?;
-        out.write_all(format_json(&owned, config).as_bytes())?;
+        // Nothing can fail past `try_materialize`, so take the formatted
+        // `String`'s allocation as the buffer rather than copying into it.
+        *out = format_json(&owned, config).into_bytes();
     }
     Ok(())
 }
@@ -8941,11 +8946,10 @@ where
                 // it, bailing produced a truncated document at a *generic*
                 // exit 1 -- worse on every axis than the silent `null` it
                 // replaced, so it was reverted back to `null` (#1194). That
-                // convention exists now, so reuse it: same truncated-prefix
-                // trade the object arm above and the `keys_unsorted` writer
-                // already make (`docs/compliance/jq/limitations.md`), but a
-                // clean diagnostic and jq's own exit 5 instead of a silent
-                // wrong answer (#1641).
+                // convention exists now, so reuse it: a clean diagnostic and
+                // jq's own exit 5 instead of a silent wrong answer (#1641).
+                // Since #3265 `out` is the record buffer, so the siblings
+                // already rendered here never reach stdout.
                 StandardJson::Error(_) => {
                     return Err(
                         MalformedJsonError::new(EvalError::malformed_json_text(c.text())).into(),

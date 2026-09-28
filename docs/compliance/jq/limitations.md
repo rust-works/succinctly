@@ -2466,7 +2466,8 @@ $ echo '[1,zzz,3]' | sjq -c .   # (nothing), exit 5 (was: [1,null,3], exit 0)
 This exact fix was tried once before and reverted: the earlier attempt predated
 `MalformedJsonError`, so bailing surfaced as a generic exit 1 instead of jq's own exit 5 — worse
 than the silent `null` it replaced. Reusing the now-established convention keeps the exit code and
-diagnostic clean; the truncation itself was already the accepted trade, not a new one.
+diagnostic clean. The truncation it left on stdout was the accepted trade until #3265 buffered
+the record.
 
 **Not fixed: `obj | map(f)` has the identical latent gap.** `{invalid: 1} | map(.)` goes through
 `LazySource::Values` in `eval_generic.rs`, whose `uncons` still cannot tell "no more fields" from
@@ -3128,7 +3129,7 @@ object `length` too. `{"a":{"x":1},} | length` still answers `1` instead
 of raising. Pinned as still open by
 `test_jq_length_object_trailing_comma_container_last_value_still_a_known_gap_2307`.
 
-### Partial output before the error, on the two genuinely streaming writers
+### Partial output before the error, on the one genuinely streaming writer
 
 One of the newly-checked paths can write real, already-confirmed-good
 output to stdout before the trailing-comma fault surfaces -- not a new
@@ -3725,8 +3726,9 @@ over-deep input, now via a different, more direct mechanism than the one #2662 s
 
 `succinctly yq` still has no equivalent guard on either its default or materializing path at
 all (#1817) — untouched by #2850, which is jq-mode only. Confirmed live, also pre-existing and
-unrelated to any of #1793/#1818/#2850: `print_json`'s own guard can flush corrupted/truncated
-JSON to stdout before it fires (#1819).
+unrelated to any of #1793/#1818/#2850: `print_json`'s own guard used to flush corrupted/truncated
+JSON to stdout before it fired (#1819). #1819 aligned its ceiling with the construction guards,
+and since #3265 the render it interrupts is buffered, so a 500-deep `.` prints nothing.
 
 [#2692](https://github.com/rust-works/succinctly/issues/2692) widens the "accepts at
 parse/index time" story above to more filters, by the same mechanism as `.[1]`/`length`:

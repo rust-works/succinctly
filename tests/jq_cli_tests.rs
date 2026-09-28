@@ -31899,12 +31899,15 @@ fn test_func_def_arity_overload_through_path_context_evaluator_1376() -> Result<
 /// #1819 moved that guard's own ceiling from `MAX_NESTING_DEPTH` (256) to
 /// `MAX_VALUE_TREE_DEPTH` (384) -- this test's 500-deep input still clears
 /// either ceiling, so it keeps demonstrating the same rejection, just with
-/// the new number.
+/// the new number. The guard fires 384 levels into the render; since #3265
+/// that render is buffered, so none of those `[` reach stdout (jq 1.7.1,
+/// whose parser refuses past 256 levels, prints nothing either).
 #[test]
 fn test_identity_query_rejects_adversarial_nesting_998() -> Result<()> {
     let input = nested_arrays(500);
-    let (_stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
     assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert_eq!(stdout, "", "no partial record (#3265)");
     assert!(
         stderr.contains("nesting depth exceeds limit of 384"),
         "stderr: {stderr:?}"
