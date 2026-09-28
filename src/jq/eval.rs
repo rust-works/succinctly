@@ -383,9 +383,10 @@ use super::expr::{
     SliceBoundKey, StringPart, Tracked,
 };
 use super::value::{
-    assert_value_tree_depth, cmp_f64, document_number_f64, infinite_float_preview_text, int_to_f64,
-    jq_literal_int_to_f64, jq_numeric_cmp, numeric_repr_cmp, owned_value_eq,
-    owned_value_eq_at_depth_generic, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
+    assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
+    infinite_float_preview_text, int_to_f64, jq_literal_int_to_f64, jq_numeric_cmp,
+    numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, ArrayVec, NumberRepr,
+    ObjectMap, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -51324,21 +51325,20 @@ fn walk_path<'v, S: EvalSemantics>(
     out: &mut Vec<(Rc<PathTrail>, WalkNode<'v>)>,
     optional: bool,
 ) -> Result<(), EvalEscape> {
-    // Panics past `MAX_VALUE_TREE_DEPTH` levels (code review on #2058): a
-    // static chain (`path(.a.a.a...)`) reaches this function once per
-    // component via `walk_pipe`'s own per-stage recursion, which -- unlike
-    // `value_after_components`'s plain iterative `for` loop over `=`/`del()`'s
-    // resolved components -- grows the native call stack by one frame per
-    // step with no cap of its own. A million-component chain overflowed the
-    // stack and aborted the process outright (confirmed live) once this fix
-    // made `path()` fast enough to reach that depth in practice; before,
-    // the pre-fix O(d^2) cost made the same input time out long before ever
-    // getting there. `walk_pipe` always calls this function once per stage
-    // before recursing any deeper, so checking here bounds it too -- the
-    // same "check at the one function that recurses once per node" shape
-    // `collect_paths`/`collect_tostream_events`/`collect_leaf_paths` already
-    // use for value-tree recursion elsewhere in this file.
-    assert_value_tree_depth(current_path.depth());
+    // Reports the uncatchable `resource_limit` past `MAX_VALUE_TREE_DEPTH`
+    // levels (#3275; code review on #2058 first added the guard here as a
+    // panic): a static chain (`path(.a.a.a...)`) reaches this function once
+    // per component via `walk_pipe`'s own per-stage recursion, which --
+    // unlike `value_after_components`'s plain iterative `for` loop over
+    // `=`/`del()`'s resolved components -- grows the native call stack by one
+    // frame per step with no cap of its own. A million-component chain
+    // overflowed the stack and aborted the process outright (confirmed live)
+    // once the #2058 fix made `path()` fast enough to reach that depth in
+    // practice; before, the pre-fix O(d^2) cost made the same input time out
+    // long before ever getting there. `walk_pipe` always calls this function
+    // once per stage before recursing any deeper, so checking here bounds it
+    // too.
+    check_value_tree_depth(current_path.depth())?;
     match expr {
         // The path already reaching here, named as it stands. `value` moves
         // straight into `out`, and `current_path` is a cheap `Rc::clone`
@@ -51503,7 +51503,7 @@ fn walk_pipe<'v, S: EvalSemantics>(
     // appears (`path((.a[] | .b) | .c[0:1])` on `{"a":[{"b":5},7]}` reports
     // the `.c` failure, where propagating `stepped` first reported the `.b`
     // one). And this function has no depth guard of its own: it relies on
-    // the `assert_value_tree_depth` at the top of `walk_path`, which it
+    // the `check_value_tree_depth` at the top of `walk_path`, which it
     // calls once per stage before recursing. The twin carries its own at
     // entry -- an early return added *above* the `walk_path` call here would
     // bypass the guard entirely.
@@ -98770,6 +98770,44 @@ mod tests {
                 &PathTrail::root(),
                 &mut reached,
                 false,
+            );
+        }
+    }
+
+    /// #3275: `walk_path`'s depth guard (`check_value_tree_depth`, converted
+    /// from a panic by this issue) reports an uncatchable `resource_limit`
+    /// once `current_path` is already at [`crate::jq::value::MAX_VALUE_TREE_DEPTH`]
+    /// -- regardless of `optional`, since a succinctly-only ceiling is not
+    /// something a jq-written `try`/`?` can have meant to catch (#2132). This
+    /// calls `walk_path` directly with a pre-built, already-at-the-limit
+    /// `PathTrail` rather than constructing a long `Expr::Pipe` chain to grow
+    /// one: the guard reads only `current_path.depth()`, so seeding it
+    /// directly exercises the exact boundary without depending on how many
+    /// pipe stages `walk_pipe`'s own per-stage recursion takes to get there.
+    #[test]
+    fn test_walk_path_reports_uncatchable_resource_limit_at_max_depth_3275() {
+        let mut path = PathTrail::root();
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            path = PathTrail::extend(&path, OwnedValue::String("a".to_string()));
+        }
+        for optional in [false, true] {
+            let mut reached = Vec::new();
+            let err = walk_path::<JqSemantics>(
+                &Expr::Identity,
+                WalkNode::Null,
+                &path,
+                &mut reached,
+                optional,
+            )
+            .expect_err("depth guard should refuse at the limit");
+            let EvalEscape::Error(e) = err else {
+                panic!("expected EvalEscape::Error, got {err:?}");
+            };
+            assert!(e.is_resource_limit(), "optional={optional}: {e:?}");
+            assert!(e.is_uncatchable(), "optional={optional}: {e:?}");
+            assert_eq!(
+                e.message, "nesting depth exceeds limit of 384",
+                "optional={optional}"
             );
         }
     }
