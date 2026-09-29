@@ -263,10 +263,14 @@ Three findings, in order of what they cost:
   run in the accepting direction, jq mode only). The same change rebased the one funnel
   that never demoted — the assignment family's fallback into `eval_full` — which wrote
   through a root `Snapshot` re-navigated onto an equal-valued sibling. The **positional**
-  rows (`.a as $y | path(.a | $y)` — jq `["a"]`) stay refuse-only: the marker must certify at
-  a non-root register position, which needs a document-absolute bind path reachable from a
-  value-mode cursor (the `Origin::At` machinery) plus `needs_path_context` routing to decide
-  when to pay for it — scoped separately.
+  rows (the marker certified at a non-root register position) are closed too: containers by
+  #3177/#3069's storage clause, which needs no bind path, and scalars and nodes below a
+  bound ancestor by [#3134](https://github.com/rust-works/succinctly/issues/3134)'s anchor —
+  the bind registers the container it sits in with the embed table, and `marker_identical`
+  accepts a register whose container shares that storage and which sits the recorded steps
+  below it. No document-absolute bind path was needed: the anchor rides the parent's `Rc`,
+  so it reaches every route container identity does. A scalar jq keeps through a rebuilt or
+  new parent (`[.a.b]`, `to_entries`, a sibling write) stays refuse-only.
 - **Closed by [#3122](https://github.com/rust-works/succinctly/issues/3122).** The
   re-entry contract is one type. Every owned re-entry in `eval.rs` (`eval_each_owned`,
   `eval_owned_input`, `eval_owned_expr_fork`, `eval_owned_multi_first`,
