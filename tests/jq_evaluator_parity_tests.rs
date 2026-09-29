@@ -3023,3 +3023,43 @@ fn test_eager_isvalid_uncatchable_and_empty_generator_2658() {
         assert_eq!(full, generic, "evaluators disagree on `{filter}`");
     }
 }
+
+/// #3307: both evaluators install a def spine the same way -- the full
+/// evaluator (`eval.rs`) and the generic one (`eval_generic.rs`) each reach
+/// `bind_def`, and every spine shape must answer identically through both.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_parity_def_spines_3307() {
+    for program in [
+        "def a: 1; def b: 2; def c: a + b; c",
+        "def f(n): if n < 1 then 0 else f(n - 1) + 1 end; def g: f(3); g",
+        "def a: 1; def b: a; def a: 2; def c: a + b; c",
+        "def f(x): x + 1; def f(x; y): f(x) + y; f(2; 3)",
+        "def f(x): x; def f(x; y): x + y; def g: f(1) + f(1; 2); g",
+        "def b: 8; def h(b): b + 1; def i: b; h(6) + i",
+        "def a: 1; def b: (def a: 2; a); def c: b + a; c",
+        "def a: 1; def b: 2; (def a: 3; a + b) + a",
+        "def a: 1; def b: def a: 5; a; b + a",
+        "def a: 1; def b: 2; def h(a): a + b; h(5) + a",
+        "def a: 1; def b: 2; def h(a; b): a + b; h(a; b)",
+        "def f(x): x; def g(x): x * 2; g(f(3))",
+        "def f($x): $x; def g: f(1); g",
+        "def a: 1; def b: 2; [range(3)] | map(. + a) | select(. > b)",
+        "def a: 1; def b: 2; {x: a, y: (b | a)} | \"\\(a)-\\(b)\"",
+        "def a: 1; reduce range(3) as $i (0; . + a)",
+        "def a: 1; def b: 2; foreach range(3) as $i (a; . + b; . * a)",
+        "def a: 1; def b: 2; [1,2] | . as [$p, $q] | a + b + $p + $q",
+        "def a: 1; def b: 2; try error(\"x\") catch (a + b)",
+        "def a: 1; def b: 2; if a then b else a end",
+        "def a: 1; def b: def c: a; c; def d: b + a; d",
+        "def a: 1; def b: 2; def c: (def d: a; def e: b; d + e); c",
+        "def a(f): f; def b: a(1); def c(g): a(g) + b; c(2)",
+        "def rec(n): if n == 0 then 0 else rec(n - 1) + 1 end; def a: rec(4); def b: a; b",
+        "def a: 1; def b: 2; def c: 3; def d: 4; def e: 5; def f: 6; def g: 7; def h: 8; def i: 9; def j: 10; a+b+c+d+e+f+g+h+i+j",
+        "def a: 1; def b: a; def c: b; def d: c; def e: d; def f: e; def g: f; def h: g; def i: h; def j: i; j",
+        "def a: .a; def b: .b; def c: a + b; {a: 1, b: 2} | c",
+        "def a: .a; def b: .b; def c: a; def d: b; def e: c; def f: d; def g: e; def h: f; def i: g; def j: h; {a: 1, b: 2} | [j, i]",
+    ] {
+        assert_parity(b"null", program);
+    }
+}

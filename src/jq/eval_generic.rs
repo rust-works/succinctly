@@ -41194,4 +41194,49 @@ mod tests {
         assert!(embed_shared_for::<YqSemantics, _>(&empty).is_none());
         assert!(embed_at_or_within::<YqSemantics, _>(&empty).0.is_none());
     }
+
+    /// `def d0: .; def d1: .; ...` (`defs` of them) over `main`.
+    fn trivial_def_spine(defs: usize, main: &str) -> Expr {
+        let mut program = String::new();
+        for i in 0..defs {
+            program.push_str(&format!("def d{i}: .; "));
+        }
+        program.push_str(main);
+        parse(&program).unwrap()
+    }
+
+    /// #3307: `bind_def` installs a whole spine of defs in one step, so the
+    /// two gates that bound how many levels of `def` they unfold
+    /// (`OWNED_IDENTITY_DEF_UNFOLD_LIMIT`) charge one per spine def up front.
+    /// Without that a spine of nine defs, which both gates refuse, would be
+    /// admitted as one bind. Every verdict below is what `main` before #3307
+    /// answered, captured by running the gates on it -- not derived.
+    #[test]
+    fn route_gates_count_each_spine_def_3307() {
+        // (defs in the spine, main filter, admitted by both gates)
+        for (defs, main, admitted) in [
+            (1, ".a", true),
+            (2, ".a", true),
+            (7, ".a", true),
+            (7, ".a | d0", true),
+            (7, ".a | d0 | .b", true),
+            (8, ".a", true),
+            (8, ".a | d0", false),
+            (8, ".a | d0 | .b", false),
+            (9, ".a", false),
+            (10, ".a", false),
+        ] {
+            let expr = trivial_def_spine(defs, main);
+            assert_eq!(
+                path_context_is_navigational(&expr),
+                admitted,
+                "path-context gate, {defs} defs over `{main}`"
+            );
+            assert_eq!(
+                owned_identity_pipe_supported(std::slice::from_ref(&expr)),
+                admitted,
+                "owned-identity gate, {defs} defs over `{main}`"
+            );
+        }
+    }
 }

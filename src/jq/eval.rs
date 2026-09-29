@@ -113773,6 +113773,8 @@ mod touched_edge_cases_2999 {
         "def f(x): x; def f(x; y): x + y; def g: f(1) + f(1; 2); g",
         "def b: 8; def h(b): b; h(6)",
         "def b: 8; def h(b): b + 1; def i: b; h(6) + i",
+        "def a: 1; def b: (def h(a): a + 1; h(5)) + a; b",
+        "def a: 1; def b: 2; (def h(a; b): a + b; h(3; 4)) + a + b",
         "def a: 1; def b: (def a: 2; a); def c: b + a; c",
         "def a: 1; def b: 2; (def a: 3; a + b) + a",
         "def a: 1; def b: def a: 5; a; b + a",
@@ -113969,5 +113971,86 @@ mod touched_edge_cases_2999 {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    proptest::proptest! {
+        /// #3307: the one-pass install is the nested per-def binding over
+        /// *generated* spines: 2-8 defs over a three-name, three-arity
+        /// alphabet (so same-key redefinitions, arity overloads and parameters
+        /// named like defs are common), with bodies and a main filter built
+        /// from calls, parameter references, pipes, arithmetic, constructors,
+        /// builtins with arguments, `as` bindings and nested defs.
+        #[test]
+        fn def_spine_install_matches_the_nested_walk_generated_3307(
+            defs in proptest::collection::vec(
+                (
+                    proptest::sample::select(vec!["a", "b", "c"]),
+                    proptest::sample::select(vec!["", "(p)", "($p)", "(p; q)", "(a)"]),
+                    spine_expr(),
+                ),
+                2..8,
+            ),
+            main in spine_expr(),
+            depth in 0u32..6,
+        ) {
+            let mut program = String::new();
+            for (name, params, body) in &defs {
+                program.push_str(&format!("def {name}{params}: {body}; "));
+            }
+            program.push_str(&main);
+            let (first, then) = spine_head(&program);
+            proptest::prop_assert_eq!(
+                install_def_spine(&first, &then, depth),
+                nested_spine_reference(&first, &then, depth),
+                "{} at ambient depth {}", program, depth
+            );
+        }
+    }
+
+    /// Expressions for the generated spine test: leaves that name defs and
+    /// parameters, and the structural shapes the install walk has arms for.
+    fn spine_expr() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let leaf = prop_oneof![
+            Just("1"),
+            Just("."),
+            Just("a"),
+            Just("b"),
+            Just("c"),
+            Just("p"),
+            Just("$p"),
+            Just("a(1)"),
+            Just("b(.)"),
+            Just("c(a)"),
+            Just("a(1; 2)"),
+            Just("b(p; $p)"),
+        ]
+        .prop_map(String::from);
+        leaf.prop_recursive(3, 24, 3, |inner| {
+            prop_oneof![
+                (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("({x} | {y})")),
+                (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("({x} + {y})")),
+                inner.clone().prop_map(|x| format!("[{x}]")),
+                inner.clone().prop_map(|x| format!("map({x})")),
+                (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("{{k: {x}, j: {y}}}")),
+                (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("\"\\({x})-\\({y})\"")),
+                (
+                    proptest::sample::select(vec!["a", "b", "c"]),
+                    inner.clone(),
+                    inner.clone()
+                )
+                    .prop_map(|(n, x, y)| format!("(def {n}: {x}; {y})")),
+                // A nested def whose parameter is named like a spine def
+                // (#2738): the body sees the parameter, not the def.
+                (
+                    proptest::sample::select(vec!["a", "b", "p"]),
+                    proptest::sample::select(vec!["p", "a", "b", "c"]),
+                    inner.clone(),
+                    inner.clone()
+                )
+                    .prop_map(|(n, param, x, y)| format!("(def {n}({param}): {x}; {y})")),
+                (inner.clone(), inner).prop_map(|(x, y)| format!("({x} as $v | {y})")),
+            ]
+        })
     }
 }
