@@ -3541,133 +3541,116 @@ fn fold_generic_owned_values<V: DocumentValue, S: EvalSemantics>(
     None
 }
 
-/// One item of a jq-mode `[a, b, ...]` body on its way to
-/// [`comma_array_generic`]'s answer (#3317).
-enum CommaItem<C> {
-    /// A container node that passed [`validate_cursor`]: nothing built yet.
-    Container(C),
-    /// A scalar node, decoded once. The cursor is kept too, since the array
-    /// may still end up a cursor sequence; the decoded value costs nothing
-    /// worth avoiding.
-    Scalar(C, OwnedValue),
-    /// A computed value, or a node built because the array is already known
-    /// to end up owned.
-    Owned(OwnedValue),
-}
-
-/// A jq-mode array constructor over a `,` body, `[a, b, ...]` (#3317).
+/// A jq-mode array constructor over a `,` body of pure navigation,
+/// `[a, b, ...]` (#3317).
 ///
 /// The `Expr::Comma` arm hands its caller one `OwnedValue` per item, built
 /// with `to_owned_cursor` from the node each branch yields, so `[., .]` held
-/// two whole copies of the document. This collects the same branches, in the
-/// same order, with the same `optional`, but keeps a node as its cursor:
+/// two whole copies of the document. This evaluates the same branches, in the
+/// same order, with the same `optional`, and keeps each node as its cursor.
 ///
-/// - A container node is walked with [`validate_cursor`] instead of built.
-///   That is `to_owned_cursor`'s own walk with nothing kept, so it answers
-///   the same `Ok`/`Err` at the same point in branch order, and the array
-///   still fails whole before anything downstream (or any branch after it)
-///   runs -- `try [., error("x")] catch .` on a malformed document still
-///   raises the decode failure, not `"x"`. Deferring the walk to the consumer
-///   the way `[.]` does would change that, and `[., .] | length` would
-///   answer `2` on a malformed document.
-/// - A scalar node is decoded at once, as before.
-/// - Every other result converts exactly as the `Expr::Comma` arm's
-///   [`fold_generic_owned_values`] does, which is the one rule set for it.
+/// **One walk per node, and the same first error.** On the `Comma` route a
+/// node was built as soon as its branch yielded it, so its decode failure
+/// came ahead of anything a later branch did. Only a body whose every branch
+/// is pure navigation (`path_expr_is_cursor_navigable`) comes here, and
+/// navigation has no side effects -- no `input`, `debug` or `error` -- so a
+/// later branch running first is unobservable except through the one thing
+/// it can do, raise. Each node is therefore walked once, when the answer's
+/// shape is known, and every exit walks the pending nodes in branch order
+/// before anything that came after them:
 ///
-/// The answer is a cursor sequence only when every item is a node and at
-/// least one is a container: [`LazySeq::from_validated_cursors`], which the
-/// jq printer renders without walking a second time. Anything else is the
-/// owned array the `Comma` arm's route built. An all-scalar body
-/// (`[.name, .age]`, the per-record `@csv` shape) has nothing large to save,
-/// and a boxed `LazySeq` per record costs more than its small array.
+/// - Every item a node, one a container: [`validate_cursor`] each (building
+///   nothing) and answer [`LazySeq::from_validated_cursors`], which the jq
+///   printer renders without walking a second time. The array still fails
+///   whole on a malformed document, and `[., .] | length` still raises there
+///   rather than counting what it never read.
+/// - Every item a scalar node (`[.name, .age]`, the per-record `@csv`
+///   shape): build them. A small array costs less than a boxed sequence.
+/// - An item that is not a node -- the `null` a missing key reads as
+///   (`[.a, .missing]`): build the pending nodes then, and every later node as
+///   it arrives, so the array is owned exactly as the `Comma` route built it.
+/// - A branch escapes: validate the pending nodes first, so their decode
+///   failure still wins over the later branch's error.
 ///
-/// Only a body whose every branch is pure navigation
-/// (`path_expr_is_cursor_navigable`) comes here, so a computed branch such
-/// as `[., 1]` keeps the owned route whole instead of validating `.` and
-/// then building it anyway. Navigation can still produce a value that is not
-/// a node -- the `null` of a missing key, `[.a, .missing]` -- so the owned
-/// fallback stays: once such an item arrives, every later node is built
-/// directly, and a container validated before it is built at the end.
+/// A computed branch (`[., 1]`) never comes here: its array ends up owned
+/// whatever the others are, so `Expr::Array` keeps it on the `Comma` route.
 fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    let mut items: Vec<CommaItem<V::Cursor>> = Vec::new();
-    // Set by the first computed item: from then on the answer is owned, so
-    // a node is built as it arrives rather than walked now and built later.
-    let mut owned = false;
+    // Nodes not walked yet, all of them document nodes.
+    let mut nodes: Vec<V::Cursor> = Vec::new();
+    // `Some` once an item that is not a node arrived: `nodes` was built into
+    // it then, and the answer is this owned array.
+    let mut owned: Option<Vec<OwnedValue>> = None;
     for expr in exprs {
         let result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
-        let control = match result {
-            GenericResult::OneCursor(c) => push_comma_cursor::<S, V>(&mut items, c, owned),
-            GenericResult::ManyCursor(cs) => cs
-                .into_iter()
-                .find_map(|c| push_comma_cursor::<S, V>(&mut items, c, owned)),
-            other => fold_generic_owned_values::<_, S>(other, &mut |v, _| {
-                owned = true;
-                items.push(CommaItem::Owned(v));
-            }),
+        let escape = match (owned.as_mut(), result) {
+            (None, GenericResult::OneCursor(c)) => {
+                nodes.push(c);
+                None
+            }
+            // The branch's own `Vec` when it is the first, rather than a copy.
+            (None, GenericResult::ManyCursor(cs)) if nodes.is_empty() => {
+                nodes = cs;
+                None
+            }
+            (None, GenericResult::ManyCursor(cs)) => {
+                nodes.extend(cs);
+                None
+            }
+            (Some(out), result) => push_generic_owned_values::<_, S>(result, out),
+            (None, result) => {
+                let mut values = Vec::new();
+                let escape = push_generic_owned_values::<_, S>(result, &mut values);
+                if !values.is_empty() {
+                    // STYLE-0012: atomic array construction raises
+                    // regardless of `optional`, as `Expr::Array`'s own arms
+                    // do -- `optional` was forwarded into each branch instead.
+                    let mut out = owned_or_err!(to_owned_all_cursors::<S, _>(&nodes));
+                    out.append(&mut values);
+                    nodes = Vec::new();
+                    owned = Some(out);
+                }
+                escape
+            }
         };
-        // Atomic, like the rest of `Expr::Array`: whatever was collected is
-        // discarded and the escape is the whole answer.
-        match control {
-            Some(Control::Error(e)) => return GenericResult::Error(e),
-            Some(Control::Break(label)) => return GenericResult::Break(label),
-            Some(Control::Halt(code)) => return GenericResult::Halt(code),
-            None => {}
+        if let Some(control) = escape {
+            // Atomic, like the rest of `Expr::Array`: whatever was collected
+            // is discarded, and the first failure in branch order is the
+            // whole answer.
+            if let Err(e) = validate_cursors::<S, V>(&nodes) {
+                return GenericResult::Error(e);
+            }
+            return partial_generic(Vec::new(), control);
         }
     }
-    let all_nodes = items
-        .iter()
-        .all(|item| !matches!(item, CommaItem::Owned(_)));
-    let any_container = items
-        .iter()
-        .any(|item| matches!(item, CommaItem::Container(_)));
-    if all_nodes && any_container {
-        let cursors = items
-            .into_iter()
-            .map(|item| match item {
-                CommaItem::Container(c) | CommaItem::Scalar(c, _) => c,
-                CommaItem::Owned(_) => unreachable!("checked by `all_nodes` above"),
-            })
-            .collect();
-        return GenericResult::LazySeq(Box::new(LazySeq::from_validated_cursors(cursors)));
+    if let Some(out) = owned {
+        return GenericResult::Owned(OwnedValue::array_from(out));
     }
-    let mut out = vec_with_capacity(items.len());
-    for item in items {
-        out.push(match item {
-            // Validated above, so this cannot fail; the arm stays honest
-            // rather than unwrapping. STYLE-0012: atomic array construction
-            // raises regardless of `optional`, as `Expr::Array`'s own arms
-            // do -- `optional` was forwarded into each branch instead.
-            CommaItem::Container(c) => owned_or_err!(to_owned_cursor::<S, _>(&c)),
-            CommaItem::Scalar(_, v) | CommaItem::Owned(v) => v,
-        });
+    // `push`/`extend` may have doubled the buffer: `[.[], .[0]]` over 300k
+    // strings otherwise holds 600k slots while its values are built, or for
+    // as long as the sequence lives.
+    nodes.shrink_to_fit();
+    if nodes.iter().any(DocumentCursor::is_container) {
+        if let Err(e) = validate_cursors::<S, V>(&nodes) {
+            return GenericResult::Error(e);
+        }
+        return GenericResult::LazySeq(Box::new(LazySeq::from_validated_cursors(nodes)));
     }
-    GenericResult::Owned(OwnedValue::array_from(out))
+    // STYLE-0012: atomic array construction -- see the arm above.
+    GenericResult::Owned(OwnedValue::array_from(owned_or_err!(
+        to_owned_all_cursors::<S, _>(&nodes)
+    )))
 }
 
-/// [`comma_array_generic`]'s handling of one node: validate a container,
-/// decode a scalar, or build either outright once the array is `owned`.
-fn push_comma_cursor<S: EvalSemantics, V: DocumentValue>(
-    items: &mut Vec<CommaItem<V::Cursor>>,
-    c: V::Cursor,
-    owned: bool,
-) -> Option<Control> {
-    if owned {
-        items.push(CommaItem::Owned(push_or_control!(to_owned_cursor::<S, _>(
-            &c
-        ))));
-    } else if c.is_container() {
-        push_or_control!(validate_cursor::<S, _>(&c));
-        items.push(CommaItem::Container(c));
-    } else {
-        let v = push_or_control!(to_owned_cursor::<S, _>(&c));
-        items.push(CommaItem::Scalar(c, v));
-    }
-    None
+/// [`validate_cursor`] over `nodes` in order, stopping at the first failure.
+fn validate_cursors<S: EvalSemantics, V: DocumentValue>(
+    nodes: &[V::Cursor],
+) -> Result<(), EvalError> {
+    nodes.iter().try_for_each(validate_cursor::<S, _>)
 }
 
 /// Whether `c`'s subtree, at any depth, contains a value that cannot be

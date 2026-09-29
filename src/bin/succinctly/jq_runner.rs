@@ -7417,10 +7417,10 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         //
         // Skipped when `is_prevalidated()` (#3317): a jq-mode `[a, b, ...]`
         // over document nodes already ran this exact walk, under these same
-        // `JqSemantics`, on every cursor as it collected them -- which is
-        // what keeps `try [., error("x")] catch .` raising the decode
-        // failure in branch order -- so a second walk here would only
-        // repeat it (+50% time on `[., .]`).
+        // `JqSemantics`, on every cursor before answering -- which is what
+        // keeps a malformed node failing the construction itself, ahead of
+        // any consumer -- so a second walk here would only repeat it (+50%
+        // time on `[., .]`).
         GenericResult::LazySeq(seq) => {
             let prevalidated = seq.is_prevalidated();
             match seq.drain_atomic() {
