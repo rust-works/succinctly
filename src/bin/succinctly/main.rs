@@ -977,6 +977,18 @@ struct JqCommand {
     #[arg(long, num_args = 0.., value_name = "JSON_VALUES", allow_hyphen_values = true)]
     jsonargs: Vec<String>,
 
+    /// `--args`/`--jsonargs`' words in argv order, filled by `run_jq`
+    /// (#3412). clap's greedy flags above capture every word after them,
+    /// the filter and any later `--args`/`--jsonargs` included;
+    /// `JqCommand::resolve_positional_args` sorts them back out.
+    #[arg(skip)]
+    positional_words: Vec<jq_runner::PositionalWord>,
+
+    /// Whether `--args`/`--jsonargs` captured anything, so a later input
+    /// file is a positional word rather than a file (#3412).
+    #[arg(skip)]
+    positional_mode: bool,
+
     // === Modules ===
     /// Prepend directory to module search path
     #[arg(short = 'L', value_name = "DIR", action = clap::ArgAction::Append, allow_hyphen_values = true)]
