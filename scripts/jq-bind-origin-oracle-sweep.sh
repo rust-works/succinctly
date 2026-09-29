@@ -448,6 +448,49 @@ navigated-bind-reduce-update	{"a":{"b":1}}	reduce (1) as $i (.; .a as $y | .a | 
 navigated-bind-catch-handler	{"a":{"b":1}}	try error(.) catch (.a as $y | .a | path($y))
 navigated-bind-bool-sibling	{"a":true,"c":true}	.a as $y | .c | $y |= 5
 navigated-bind-owned-root	{"a":{"b":1}}	(tojson|fromjson) | .a as $y | .a | path($y)
+navigated-bind-anchor-scalar-path	{"a":{"b":1}}	.a.b as $z | path(.a.b | $z)
+navigated-bind-anchor-string-path	{"a":{"b":"s"}}	.a.b as $z | path(.a | .b | $z)
+navigated-bind-anchor-float-path	{"a":{"b":1.5}}	.a.b as $z | path(.a.b | $z)
+navigated-bind-anchor-sub-root	{"a":{"b":1}}	.a.b as $z | .a | path(.b | $z)
+navigated-bind-anchor-optional	{"a":{"b":1}}	.a.b as $z | .a | path(.b? | $z)
+navigated-bind-anchor-getpath	{"a":{"b":1}}	.a.b as $z | path(getpath(["a","b"]) | $z)
+navigated-bind-anchor-recurse	{"a":{"b":1}}	.a.b as $z | .a | path(.. | select(type=="number") | $z)
+navigated-bind-anchor-index	{"a":[1,1]}	.a[0] as $z | path(.a[0] | $z)
+navigated-bind-anchor-negative-index	{"a":[1,1]}	.a[0] as $z | .a | path(.[-2] | $z)
+navigated-bind-anchor-dup-key	{"a":1,"a":2}	.a as $z | path(.a | $z)
+navigated-bind-anchor-assign	{"a":{"b":1}}	.a.b as $z | (.a.b | $z) = 9
+navigated-bind-anchor-update	{"a":{"b":1}}	.a.b as $z | (.a | .b | $z) |= 9
+navigated-bind-anchor-compound	{"a":{"b":1}}	.a.b as $z | (.a.b | $z) += 5
+navigated-bind-anchor-del	{"a":{"b":1}}	.a.b as $z | del(.a.b | $z)
+navigated-bind-anchor-array-assign	{"a":[1,1]}	.a[1] as $z | (.a[1] | $z) = 5
+navigated-bind-anchor-try	{"a":{"b":1}}	.a.b as $z | try path(.a.b | $z) catch "c"
+navigated-bind-anchor-collect	{"a":{"b":1}}	.a.b as $z | [path(.a.b | $z)]
+navigated-bind-anchor-limit	{"a":{"b":1}}	.a.b as $z | limit(1; path(.a.b | $z))
+navigated-bind-anchor-def	{"a":{"b":1}}	.a.b as $z | def f: path(.a.b | $z); f
+navigated-bind-anchor-reduce	{"a":{"b":1}}	.a.b as $z | reduce (1) as $i (.; (.a.b | $z) = 9)
+navigated-bind-anchor-embed-object	{"a":{"b":1}}	.a.b as $z | {k: .a} | path(.k.b | $z)
+navigated-bind-anchor-embed-array	{"a":{"b":1}}	.a.b as $z | [.a] | path(.[0].b | $z)
+navigated-bind-anchor-nested-ancestor-path	{"a":{"b":{"c":1}}}	.a as $y | .a.b as $z | .a | path(.b | $z)
+navigated-bind-anchor-nested-ancestor-assign	{"a":{"b":{"c":1}}}	.a as $y | .a.b as $z | (.a | .b | $z) = 9
+navigated-bind-anchor-nested-ancestor-deep	{"a":{"b":{"c":1}}}	.a as $y | .a.b.c as $z | path(.a.b.c | $z)
+navigated-bind-anchor-nested-ancestor-array	{"a":[[1],[1]]}	.a[1] as $y | .a[1][0] as $z | path(.a[1][0] | $z)
+navigated-bind-anchor-sibling	{"a":{"b":1},"c":1}	.a.b as $z | path(.c | $z)
+navigated-bind-anchor-sibling-sub-root	{"a":{"b":1,"c":1}}	.a.b as $z | .a | path(.c | $z)
+navigated-bind-anchor-same-step-other-parent	{"a":{"b":1},"x":{"b":1}}	.a.b as $z | .x | (.b | $z) = 5
+navigated-bind-anchor-same-step-other-parent-del	{"a":{"b":1},"x":{"b":1}}	.a.b as $z | del(.x.b | $z)
+navigated-bind-anchor-other-index	{"a":[1,1]}	.a[1] as $z | path(.a[0] | $z)
+navigated-bind-anchor-other-negative-index	{"a":[1,1]}	.a[1] as $z | .a | path(.[-2] | $z)
+navigated-bind-anchor-iterate-equal	{"a":[1,1]}	.a[1] as $z | [path(.a[] | $z)]
+navigated-bind-anchor-moved-root	{"a":{"b":1},"x":{"a":{"b":1}}}	.a.b as $z | .x | path(.a.b | $z)
+navigated-bind-anchor-def-moved-root	{"a":{"b":1},"x":{"a":{"b":1}}}	.a.b as $z | def f: path(.a.b | $z); .x | f
+navigated-bind-anchor-shifted-parent	{"a":{"a":{"b":1},"b":1}}	.a.a.b as $z | path(.a.b | $z)
+navigated-bind-anchor-nested-ancestor-other-index	{"a":[[1],[1]]}	.a[1] as $y | .a[1][0] as $z | path(.a[0][0] | $z)
+navigated-bind-anchor-written-node	{"a":{"b":1}}	.a.b as $z | .a.b = 1 | path(.a.b | $z)
+navigated-bind-anchor-rewritten-node	{"a":{"b":1}}	.a.b as $z | .a.b |= (. as $w | 1) | path(.a.b | $z)
+navigated-bind-anchor-rebuilt-parent	{"a":{"b":1,"c":0}}	.a.b as $z | .a.c = 1 | path(.a.b | $z)
+navigated-bind-anchor-new-parent	{"a":{"b":1}}	.a.b as $z | [.a.b] | path(.[0] | $z)
+navigated-bind-anchor-relocated	{"a":{"b":1}}	.a.b as $z | .a | to_entries | path(.[0].value | $z)
+navigated-bind-anchor-owned-root	{"a":{"b":1}}	tojson | fromjson | .a.b as $z | path(.a.b | $z)
 navigated-bind-input-root	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | path($y)
 owned-root-input-assign	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | ($y.b) = 9
 owned-root-input-del	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | del($y.b)
@@ -872,7 +915,10 @@ destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nest
 carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
 in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
-owned-embed-refuse-path-nested-ancestor-bind:#3177 -- $x is bound first, so [.] reuses $x's own value, whose .a is $x's materialization, not $y's: sharing here needs an *ancestor* lookup when $y is bound, the mirror of #3179's nested reuse; jq answers [0,"a"]
+navigated-bind-anchor-rebuilt-parent:#3134 -- jq keeps the scalar jv through a copy-on-write of its parent; the anchor proves identity only while the parent is the document's own unmodified container
+navigated-bind-anchor-new-parent:#3134 -- jq places the same scalar jv in a new array; a scalar has no storage for a new container to share, and its anchor is the old parent
+navigated-bind-anchor-relocated:#3134 -- to_entries moves the same scalar jv into a new object; the scalar twin of #3178's relocation, which only real scalar identity could follow
+navigated-bind-anchor-owned-root:#3134 -- eval.rs's own bind sites mint no node for a scalar (a scalar StandardJson keeps no cursor), so no anchor is pushed on an owned-rooted document
 owned-embed-refuse-path-nested-del-fractional:#3188 -- the write door will not re-spell a fractional index: del(.[-0.5]) deletes element 0 here and nothing in jq (#3302), so the static spelling would be a wrong answer
 owned-embed-refuse-path-nested-del-slice:#3188 -- a slice component has no static spelling the evaluator indexes by (.[{"start":0,"end":1}], #3300), so the write door declines
 owned-embed-fold-update-rebuilt-by-nonwrite:#3181 review -- a witnessed step runs its UPDATE through the owned re-index bridge, so even an UPDATE returning `.` hands the next step a rebuilt copy (the owned-embed-fold-if-identity mechanism)
