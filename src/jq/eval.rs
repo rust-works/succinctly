@@ -11559,6 +11559,10 @@ fn arith_sub<S: EvalSemantics>(
 /// it naturally yields `-0.0`; this promotion is the one place `Int`
 /// deliberately gives up exact-integer fidelity to match that.
 ///
+/// A `-0` *literal* operand is a second, separate mechanism: `signed_plain_number`
+/// promotes it to `Float(-0.0)` before the match, so `-(-0)` negates through
+/// the `Float` arm to `0` and never reaches the `Int(0)` arm above (#3442).
+///
 /// **The past-`2^53` rounding is jq-mode only**: real yq has no unary-minus
 /// operator at all (confirmed live against yq v4.53.3: `-.a` is a hard
 /// parse error, `'-' expects 2 args but there is 1`) -- succinctly's own
@@ -11604,8 +11608,18 @@ fn is_negative_zero_int_literal(value: &OwnedValue) -> bool {
 /// [`OwnedValue::number_repr`], except that in jq mode a `-0` integer literal
 /// reads as `Float(-0.0)` rather than `Int(0)` (#3442). jq has no integer
 /// type, so `-0` stays negative zero through `+`, `-`, `*`, `/` and negation
-/// (`(-0) - 0` is `-0`, `(-0) / -1` is `0`). yq keeps `Int(0)`: Go's `int64`
-/// has no negative zero.
+/// (`(-0) - 0` is `-0`, `(-0) / -1` is `0`).
+///
+/// yq mode is left alone: real yq v4.53.3 reads a `-0` *expression literal*
+/// as integer zero for `+`, `-` and `*` (`(-0) - 0` is `0`), which
+/// `Int(0)` reproduces. Its `/` on that literal, and any `-0` read from a
+/// YAML *document*, stay float there and keep the sign; that is a separate,
+/// pre-existing divergence (#3445), not something this reader decides.
+///
+/// This is a per-call-site reader rather than a change to `number_repr()`
+/// itself because that also feeds ordering (`arith_compare`), `%` and
+/// `range`, which are correct as they stand and read the literal as `Int(0)`
+/// on purpose: jq's `%` casts to `intmax_t`, so `-0` must not reach it.
 fn signed_number_repr<S: EvalSemantics>(value: &OwnedValue) -> Option<NumberRepr> {
     if S::TAG != EvalTag::Yq && is_negative_zero_int_literal(value) {
         Some(NumberRepr::Float(-0.0))
@@ -76111,12 +76125,48 @@ mod tests {
         assert_eq!(outputs(b"-0", ". / 5"), ["-0"]);
         assert_eq!(outputs(b"-0", ". / -1"), ["0"]);
         assert_eq!(outputs(b"-0", "-."), ["0"]);
+        // Spellings other than `-0`, and operands past 2^53 (which now go
+        // through the float path instead of `jq_checked_int_arith`).
+        assert_eq!(outputs(b"null", "(-0e0) + (-0.0)"), ["-0"]);
+        assert_eq!(outputs(b"null", "(-0e0) - 0"), ["-0"]);
+        assert_eq!(
+            outputs(b"null", "(-0) + 9007199254740993"),
+            ["9007199254740992"]
+        );
+        assert_eq!(
+            outputs(b"null", "9007199254740993 + (-0)"),
+            ["9007199254740992"]
+        );
+        assert_eq!(
+            outputs(b"null", "(-0) - 9007199254740993"),
+            ["-9007199254740992"]
+        );
+        assert_eq!(
+            outputs(b"null", "(-0) + 869389897822472004"),
+            ["869389897822472000"]
+        );
+        // Accumulator and assignment paths reach the same arithmetic.
+        assert_eq!(
+            outputs(b"null", "reduce range(2) as $x (-0; . - 0)"),
+            ["-0"]
+        );
+        assert_eq!(outputs(b"null", "reduce range(2) as $x (-0; . + 0)"), ["0"]);
+        assert_eq!(outputs(br#"{"a":-0}"#, ".a -= 0"), [r#"{"a":-0}"#]);
+        assert_eq!(outputs(br#"{"a":-0}"#, ".a += -0"), [r#"{"a":-0}"#]);
+        assert_eq!(outputs(br#"{"a":-0}"#, ".a /= 1"), [r#"{"a":-0}"#]);
+        assert_eq!(outputs(br#"{"a":-0,"b":0}"#, ".a - .b"), ["-0"]);
+        assert_eq!(outputs(br#"{"a":-0,"b":-0}"#, ".a + .b"), ["-0"]);
+        assert_eq!(outputs(br#"{"a":-0,"b":-1}"#, ".a / .b"), ["0"]);
+        assert_eq!(outputs(b"[-0,0]", "map(. - 0)"), ["[-0,0]"]);
         // A zero divisor is still an error, however it is signed.
         assert!(outputs(b"null", "try (1 / (-0)) catch .")[0].contains("divisor is zero"));
     }
 
-    /// #3442: yq keeps a `-0` literal as `Int(0)` (Go's `int64` has no
-    /// negative zero), so the jq-mode reader must not reach `YqSemantics`.
+    /// #3442: real yq v4.53.3 reads a `-0` expression literal as integer
+    /// zero for `+`, `-` and `*` (all three rows below captured live), so the
+    /// jq-mode reader must not reach `YqSemantics`. yq's `/` on that literal
+    /// and a `-0` YAML document number keep the sign there; succinctly does
+    /// not match that yet (#3445), so neither is pinned here.
     #[test]
     fn test_arithmetic_negative_zero_operand_yq_stays_zero_3442() {
         assert_eq!(outputs_yq(b"null", "(-0) - 0"), ["0"]);
