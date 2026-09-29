@@ -9155,17 +9155,18 @@ pub(crate) fn owned_write_door<S: EvalSemantics>(
 /// [`owned_write_door`] for a cursor-side funnel (#3134): the assignment
 /// family's and `del`'s bridges into this evaluator, whose root is the live
 /// cursor `root` names and whose navigated binds `positions` places below
-/// it. Runs only when there is a position to mint -- a container the
-/// storage clause certifies already answers on the bridge, and this leaves
-/// it there -- and then exactly as the owned door does, so every decline
-/// hands the write back to the bridge's own resolver, refusal text and all.
+/// it. Runs only when some marker in the target has a position to mint --
+/// one the storage clause already certifies answers on the bridge, which
+/// resolves the target once where this door would resolve it twice -- and
+/// then exactly as the owned door does, so every decline hands the write
+/// back to the bridge's own resolver, refusal text and all.
 pub(crate) fn positioned_write_door<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     root: &RootWitness,
     positions: &MarkerPositions,
 ) -> Option<Expr> {
-    if S::TAG != EvalTag::Jq || positions.is_empty() {
+    if S::TAG != EvalTag::Jq || !positions.mints_any(write_door_target(expr)?, input) {
         return None;
     }
     write_door_with::<S>(expr, input, Some(root), positions)
@@ -33093,8 +33094,9 @@ pub(crate) struct MarkerPositions {
     /// The `document_token` every recorded node belongs to.
     document: usize,
     /// A handful at most (one per distinct bound node in the argument), so
-    /// a scan beats a map.
-    positions: Vec<(usize, Rc<PathPrefix>)>,
+    /// a scan beats a map. Each node's position as the resolver spells it,
+    /// and as the components that reach it in an owned tree.
+    positions: Vec<(usize, Rc<PathPrefix>, Vec<OwnedValue>)>,
 }
 
 impl MarkerPositions {
@@ -33118,15 +33120,15 @@ impl MarkerPositions {
 
     /// Whether `node` already has a position.
     pub(crate) fn contains(&self, node: usize) -> bool {
-        self.positions.iter().any(|(n, _)| *n == node)
+        self.positions.iter().any(|(n, _, _)| *n == node)
     }
 
     /// Record `node` at `components` below the root: each a member key
     /// (`OwnedValue::String`) or an element index (`OwnedValue::Int`).
     /// Anything else leaves `node` without a position.
-    pub(crate) fn insert(&mut self, node: usize, components: &[OwnedValue]) {
+    pub(crate) fn insert(&mut self, node: usize, components: Vec<OwnedValue>) {
         let mut path = PathPrefix::root();
-        for component in components {
+        for component in &components {
             let component = match component {
                 OwnedValue::String(key) => Expr::Field(key.clone()),
                 OwnedValue::Int(idx) => Expr::Index {
@@ -33137,7 +33139,7 @@ impl MarkerPositions {
             };
             path = PathPrefix::extend(&path, component);
         }
-        self.positions.push((node, path));
+        self.positions.push((node, path, components));
     }
 
     /// The components recorded for `node`, for the tests.
@@ -33145,13 +33147,34 @@ impl MarkerPositions {
     pub(crate) fn components_of(&self, node: usize) -> Option<Vec<Expr>> {
         self.positions
             .iter()
-            .find(|(n, _)| *n == node)
-            .map(|(_, path)| path.to_vec())
+            .find(|(n, _, _)| *n == node)
+            .map(|(_, path, _)| path.to_vec())
+    }
+
+    /// The position [`mint_positioned_markers`] stamps on `marker` for a
+    /// resolver over `owned`: `marker`'s recorded position, unless `owned`
+    /// already holds `marker`'s own storage there, where storage certifies
+    /// it and a stamp would add nothing.
+    fn position_to_mint(&self, marker: &Tracked, owned: &OwnedValue) -> Option<&Rc<PathPrefix>> {
+        let (path, components) = self.position_of(marker)?;
+        let certified_by_storage = owned_at(owned, components)
+            .is_some_and(|there| marker.value.shares_storage_with(there));
+        (!certified_by_storage).then_some(path)
+    }
+
+    /// Whether any marker in `expr` has a position to mint over `owned`.
+    fn mints_any(&self, expr: &Expr, owned: &OwnedValue) -> bool {
+        !self.is_empty()
+            && any_subexpr(expr, &mut |e| {
+                matches!(e, Expr::TrackedVar(marker)
+                    if self.position_to_mint(marker, owned).is_some())
+            })
     }
 
     /// The position recorded for `marker`'s node, if it is an
-    /// [`Origin::Untracked`] document-node marker of this document.
-    fn position_of(&self, marker: &Tracked) -> Option<&Rc<PathPrefix>> {
+    /// [`Origin::Untracked`] document-node marker of this document: as the
+    /// resolver spells it, and as components into an owned tree.
+    fn position_of(&self, marker: &Tracked) -> Option<(&Rc<PathPrefix>, &[OwnedValue])> {
         if marker.origin != Origin::Untracked {
             return None;
         }
@@ -33163,28 +33186,51 @@ impl MarkerPositions {
         }
         self.positions
             .iter()
-            .find(|(n, _)| n == node)
-            .map(|(_, path)| path)
+            .find(|(n, _, _)| n == node)
+            .map(|(_, path, components)| (path, components.as_slice()))
     }
 }
 
 /// `expr` with every marker `positions` places stamped [`Origin::At`] its
 /// position in `invocation` (#3134) -- see
 /// [`each_path_on_owned_positioned`], the one caller, for why this is only
-/// sound immediately before `invocation` is entered on the root those
-/// positions are relative to. `Tracked::node` is kept, as every rewrite
-/// keeps it.
+/// sound immediately before `invocation` is entered on `owned`, the root
+/// those positions are relative to. `Tracked::node` is kept, as every
+/// rewrite keeps it.
+///
+/// A marker whose own storage `owned` already holds at that position is
+/// left alone: [`marker_identical`]'s storage clause certifies it there
+/// already, and a stamp certifies nowhere else, so it would add nothing but
+/// the rebuild. That is the common container case (`.[] | .x as $v |
+/// path(.x | $v)`), which then costs what it did before #3134.
 fn mint_positioned_markers<'e>(
     expr: &'e Expr,
+    owned: &OwnedValue,
     positions: &MarkerPositions,
     invocation: u64,
 ) -> Cow<'e, Expr> {
     rewrite_markers(expr, &|marker| {
-        positions.position_of(marker).map(|path| Origin::At {
-            invocation,
-            path: BindPath(Rc::clone(path)),
-        })
+        positions
+            .position_to_mint(marker, owned)
+            .map(|path| Origin::At {
+                invocation,
+                path: BindPath(Rc::clone(path)),
+            })
     })
+}
+
+/// The value `components` (member keys and element indices) reach in
+/// `owned`, if they all exist.
+fn owned_at<'v>(owned: &'v OwnedValue, components: &[OwnedValue]) -> Option<&'v OwnedValue> {
+    components
+        .iter()
+        .try_fold(owned, |value, component| match (value, component) {
+            (OwnedValue::Object(map), OwnedValue::String(key)) => map.get(key),
+            (OwnedValue::Array(items), OwnedValue::Int(idx)) => {
+                items.get(usize::try_from(*idx).ok()?)
+            }
+            _ => None,
+        })
 }
 
 /// [`demote_rebuilt_markers`] plus the one *promotion* this evaluator makes
@@ -53060,8 +53106,13 @@ pub(crate) fn each_path_on_owned_positioned<S: EvalSemantics>(
         return each_path_on_owned::<S>(expr, owned, optional, sink);
     }
     let invocation = Frame::reserve_invocation();
-    let minted = mint_positioned_markers(expr, positions, invocation);
-    each_path_on_owned_in::<S>(&minted, owned, optional, Some(invocation), sink)
+    match mint_positioned_markers(expr, owned, positions, invocation) {
+        // Every placed marker is certified by storage already.
+        Cow::Borrowed(expr) => each_path_on_owned::<S>(expr, owned, optional, sink),
+        Cow::Owned(minted) => {
+            each_path_on_owned_in::<S>(&minted, owned, optional, Some(invocation), sink)
+        }
+    }
 }
 
 fn each_path_on_owned_in<S: EvalSemantics>(
@@ -109106,7 +109157,7 @@ mod tests {
     #[test]
     fn mint_positioned_markers_certifies_only_in_its_own_invocation_3134() {
         let mut positions = MarkerPositions::new(7);
-        positions.insert(3, &[OwnedValue::string("a"), OwnedValue::Int(0)]);
+        positions.insert(3, vec![OwnedValue::string("a"), OwnedValue::Int(0)]);
         let marker = |origin: Origin, node: Option<BindOrigin>| {
             Expr::TrackedVar(Rc::new(Tracked {
                 value: OwnedValue::Int(1),
@@ -109123,7 +109174,7 @@ mod tests {
             marker(Origin::Untracked, None),
         ]);
         let invocation = Frame::reserve_invocation();
-        let minted = mint_positioned_markers(&expr, &positions, invocation);
+        let minted = mint_positioned_markers(&expr, &OwnedValue::Null, &positions, invocation);
         let Expr::Comma(items) = minted.as_ref() else {
             panic!("expected the comma back, got {minted:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `rewrite_markers` rebuilds the same node kind it was given (#3134)"
         };
@@ -109163,8 +109214,40 @@ mod tests {
         assert!(!other.extend(&path).certifies(&stamped));
 
         assert!(matches!(
-            mint_positioned_markers(&expr, &MarkerPositions::NONE, invocation),
+            mint_positioned_markers(&expr, &OwnedValue::Null, &MarkerPositions::NONE, invocation),
             Cow::Borrowed(_)
+        ));
+
+        // A marker whose own storage the tree already holds at its position
+        // is certified there by storage; the stamp would add nothing.
+        let shared = OwnedValue::object_from([("b".to_string(), OwnedValue::Int(1))]);
+        let tree = OwnedValue::object_from([(
+            "a".to_string(),
+            OwnedValue::Array(vec![shared.clone()].into()),
+        )]);
+        let stored = Expr::TrackedVar(Rc::new(Tracked {
+            value: shared.clone(),
+            origin: Origin::Untracked,
+            node: node(3, 7),
+        }));
+        assert!(matches!(
+            mint_positioned_markers(&stored, &tree, &positions, invocation),
+            Cow::Borrowed(_)
+        ));
+        // An equal value in other storage is not that node: it is stamped.
+        let copy = OwnedValue::object_from([(
+            "a".to_string(),
+            OwnedValue::Array(
+                vec![OwnedValue::object_from([(
+                    "b".to_string(),
+                    OwnedValue::Int(1),
+                )])]
+                .into(),
+            ),
+        )]);
+        assert!(matches!(
+            mint_positioned_markers(&stored, &copy, &positions, invocation),
+            Cow::Owned(_)
         ));
         assert_eq!(
             positions.components_of(3),
