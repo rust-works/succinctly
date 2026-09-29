@@ -9403,6 +9403,53 @@ register, which is out of scope here — tracked as a follow-up alongside #3048 
 opened as its own issue, since no design for surfacing fold-register state to a
 `resolve_node_sink` arm exists yet.
 
+## `and`/`or`/unary minus in path position on a trackable input (#3289, open)
+
+#2760 resolves `and`/`or`/unary minus live under `path`/`del`/`|=`/`=` only when the input
+is **untracked**. A trackable input, the common case with no `as` binding at all, still
+reaches `resolve_node_sink`'s eager catch-all. That catch-all evaluates both operands by
+value and emits the boolean at the register the stage *entered* with.
+
+jq compiles `L and R` as `DUP; L; JUMP_F; POP; R; …; LOADK true|false`, not as a subexp.
+`L` moves the path register, and `R` then runs on the `DUP`ed original input while the
+register stays wherever `L` left it. So any navigation in `R` refuses unless the input is
+still the value at the register. The boolean result stays at `L`'s (or `R`'s) register,
+and `PATH_END` accepts it only when that register holds an identical `null`/`true`/`false`.
+`or` is the mirror image. A negation stays at its operand's register the same way.
+Captured against jq 1.7.1 and `main` `452940f6e`:
+
+| Input               | Filter                                  | jq 1.7.1                            | succinctly                         |
+|---------------------|-----------------------------------------|-------------------------------------|------------------------------------|
+| `{"a":1}`           | `path((.a and .b) \| empty)`            | exit 5, `near … element "b"`        | exit 0, no output                  |
+| `{"a":1}`           | `del((.a and .b) \| empty)`             | exit 5, `near … element "b"`        | exit 0, `{"a":1}` (write dropped)  |
+| `{"a":1}`           | `path((.a and first(.b)) \| empty)`     | exit 5, `near … element "b"`        | exit 0, no output (#3428)          |
+| `{"a":1}`           | `del(-(.a \| {b:2} \| .b) \| empty)`    | exit 5, `near … element "b"`        | exit 0, `{"a":1}` (write dropped)  |
+| `{"a":1}`           | `del(.a and .b)`, `(.a and .b) \|= 3`   | exit 5, `near … element "b"`        | exit 5, `with result false`        |
+| `{"a":1}`           | `path((.a and .b)?)`                    | exit 0, no output (`?` catches it)  | exit 5, `with result false`        |
+| `{"a":false}`       | `path(.a and .b)`                       | `["a"]`                             | exit 5, `with result false`        |
+| `{"a":false}`       | `del(.a and .b)` / `(.a and .b) \|= 3`  | `{}` / `{"a":3}`                    | exit 5, `with result false`        |
+| `{"a":1}`           | `path(.a as $y \| -.a \| $y)`           | `["a"]`                             | exit 5, `with result 1`            |
+| `{"a":0}`           | `path(.a and 5)`                        | exit 5, `with result true`          | exit 5, `with result true` (match) |
+
+In the dangerous direction (accepting where jq refuses), no row probed here makes `main`
+write a wrong value. Each one either emits no path at all, so a `del`/`|=` is a silent
+no-op where jq exits 5, or refuses with a different message. The opposite direction, refusing a write
+jq performs (the `{"a":false}` rows), only affects a boolean or `null` register, where jq's
+own `jv_identical` check passes by kind.
+
+**Why this is still open.** PR #3425 attempted the whole family by composing registers per
+operand branch. Two review rounds found shapes where that composition *wrote* where both jq
+and `main` refuse: through by-value operands (`first`, `any`), `try … catch $x`, a `?//`
+retry, structurally-equal copies taken as identical, wrapper routes, and the fold register.
+Every case had the same cause. A by-value leaf (`untracked_at_register`,
+`forward_drained_result`) reports the register it entered with, and nothing says whether
+evaluating it moved that register, so every consumer that composes registers has to guess.
+[#3456](https://github.com/rust-works/succinctly/issues/3456) makes `PathBranch::register`
+truthful at the producer, with a distinct lost state alongside #3267's `RegisterLoss`.
+#3289 is blocked on it and resumes on top of it. Until then, the rows above stand as
+recorded, and so does the by-value-operand subset in
+[#3428](https://github.com/rust-works/succinctly/issues/3428).
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |
