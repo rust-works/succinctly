@@ -8967,18 +8967,25 @@ fn skip_identity_stages(stages: &[Expr]) -> &[Expr] {
 /// through. The demoted marker still certifies where it should, by
 /// [`marker_identical`]'s storage clause, which reads the pointer rather
 /// than the origin.
+///
+/// `positions` places the navigated binds a cursor-holding caller could
+/// locate below `root` (#3134, [`each_path_on_owned_positioned`]);
+/// [`MarkerPositions::NONE`] from every other caller.
 pub(crate) fn path_over_owned<S: EvalSemantics>(
     path_expr: &Expr,
     owned: &OwnedValue,
     root: &RootWitness,
     optional: bool,
+    positions: &MarkerPositions,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Option<Flow> {
     if !super::eval_generic::reindex_bridge_is_identity(owned) {
         return None;
     }
     let path_expr = reroot_markers::<S>(path_expr, root);
-    Some(each_path_on_owned::<S>(&path_expr, owned, optional, sink))
+    Some(each_path_on_owned_positioned::<S>(
+        &path_expr, owned, optional, positions, sink,
+    ))
 }
 
 /// [`path_over_owned`] for the eager callers: every path collected, with
@@ -8988,9 +8995,10 @@ pub(crate) fn path_over_owned_collect<S: EvalSemantics>(
     owned: &OwnedValue,
     root: &RootWitness,
     optional: bool,
+    positions: &MarkerPositions,
 ) -> Option<(Vec<OwnedValue>, Option<Control>)> {
     let mut collected: Vec<OwnedValue> = Vec::new();
-    let flow = path_over_owned::<S>(path_expr, owned, root, optional, &mut |v| {
+    let flow = path_over_owned::<S>(path_expr, owned, root, optional, positions, &mut |v| {
         collected.push(v);
         Demand::Continue
     })?;
@@ -9065,21 +9073,28 @@ pub(crate) fn owned_path_door<S: EvalSemantics>(
     };
     let root = RootWitness::of_owned::<S>(input);
     if rest.is_empty() {
-        return path_over_owned::<S>(path_expr, input, &root, optional, sink);
-    }
-    let rest = Expr::Pipe(rest.to_vec());
-    let mut downstream: Option<Flow> = None;
-    let upstream =
-        path_over_owned::<S>(
+        return path_over_owned::<S>(
             path_expr,
             input,
             &root,
             optional,
-            &mut |path| match eval_each_owned::<S>(&rest, &path, optional, Reentry::REBUILT, sink) {
-                Flow::Exhausted => Demand::Continue,
-                other => stop_with_downstream(&mut downstream, other),
-            },
-        )?;
+            &MarkerPositions::NONE,
+            sink,
+        );
+    }
+    let rest = Expr::Pipe(rest.to_vec());
+    let mut downstream: Option<Flow> = None;
+    let upstream = path_over_owned::<S>(
+        path_expr,
+        input,
+        &root,
+        optional,
+        &MarkerPositions::NONE,
+        &mut |path| match eval_each_owned::<S>(&rest, &path, optional, Reentry::REBUILT, sink) {
+            Flow::Exhausted => Demand::Continue,
+            other => stop_with_downstream(&mut downstream, other),
+        },
+    )?;
     // Downstream decided: its verdict wins over the resolver's `Stopped`,
     // which is only the echo of our own driver answering `Stop`.
     Some(downstream.unwrap_or(upstream))
@@ -9134,6 +9149,51 @@ pub(crate) fn owned_write_door<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq || reentry != Reentry::REBUILT {
         return None;
     }
+    write_door_with::<S>(expr, input, None, &MarkerPositions::NONE)
+}
+
+/// [`owned_write_door`] for a cursor-side funnel (#3134): the assignment
+/// family's and `del`'s bridges into this evaluator, whose root is the live
+/// cursor `root` names and whose navigated binds `positions` places below
+/// it. Runs only when there is a position to mint -- a container the
+/// storage clause certifies already answers on the bridge, and this leaves
+/// it there -- and then exactly as the owned door does, so every decline
+/// hands the write back to the bridge's own resolver, refusal text and all.
+pub(crate) fn positioned_write_door<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    root: &RootWitness,
+    positions: &MarkerPositions,
+) -> Option<Expr> {
+    if S::TAG != EvalTag::Jq || positions.is_empty() {
+        return None;
+    }
+    write_door_with::<S>(expr, input, Some(root), positions)
+}
+
+/// The target of the write heading `expr`, after its leading `.` stages --
+/// what [`owned_write_door`] and [`positioned_write_door`] resolve, and what
+/// a cursor-side caller locates markers in before it bridges (#3134).
+pub(crate) fn write_door_target(expr: &Expr) -> Option<&Expr> {
+    let stages = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => stages.as_slice(),
+        other => core::slice::from_ref(other),
+    };
+    let [head, ..] = skip_identity_stages(stages) else {
+        return None;
+    };
+    write_target(unwrap_paren(head))
+}
+
+/// The shared body of [`owned_write_door`] and [`positioned_write_door`].
+/// `root` is `None` for the owned door, which derives it from `input` only
+/// once the cheap gates have passed.
+fn write_door_with<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    root: Option<&RootWitness>,
+    positions: &MarkerPositions,
+) -> Option<Expr> {
     let stages = match unwrap_paren(expr) {
         Expr::Pipe(stages) => stages.as_slice(),
         other => core::slice::from_ref(other),
@@ -9170,8 +9230,12 @@ pub(crate) fn owned_write_door<S: EvalSemantics>(
     if effectful || !marked {
         return None;
     }
-    let root = RootWitness::of_owned::<S>(input);
-    let (paths, None) = path_over_owned_collect::<S>(target, input, &root, false)? else {
+    let root = match root {
+        Some(root) => *root,
+        None => RootWitness::of_owned::<S>(input),
+    };
+    let (paths, None) = path_over_owned_collect::<S>(target, input, &root, false, positions)?
+    else {
         return None;
     };
     let mut resolved = paths
@@ -28326,17 +28390,18 @@ fn stream_path_writes<S: EvalSemantics>(
         "alias identity is yq-only (#1351); jq mode must not reach the streaming write"
     );
     let mut parked: Option<Control> = None;
-    let resolved = resolve_dynamic_indexes_sink::<S>(path_expr, pristine, false, &mut |path| {
-        // A path arriving after a stop means a `?//` in `path_expr` retried
-        // the next alternative (#2974 review): see [`RetryResumes`].
-        if retry_resumes == RetryResumes::Yes {
-            parked = None;
-        }
-        match write(result, &path) {
-            Ok(()) => Demand::Continue,
-            Err(escape) => stop_with_escape(&mut parked, escape.into()),
-        }
-    });
+    let resolved =
+        resolve_dynamic_indexes_sink::<S>(path_expr, pristine, false, None, &mut |path| {
+            // A path arriving after a stop means a `?//` in `path_expr` retried
+            // the next alternative (#2974 review): see [`RetryResumes`].
+            if retry_resumes == RetryResumes::Yes {
+                parked = None;
+            }
+            match write(result, &path) {
+                Ok(()) => Demand::Continue,
+                Err(escape) => stop_with_escape(&mut parked, escape.into()),
+            }
+        });
     // Reclaim the parked escape, clearing the side channel it set.
     let parked = match resume_from_escape(parked, Flow::Exhausted) {
         Flow::Escaped(control) => Some(EvalEscape::from(control)),
@@ -32497,11 +32562,32 @@ static NEXT_INVOCATION: core::sync::atomic::AtomicUsize = core::sync::atomic::At
 impl Frame {
     /// A fresh invocation, rooted at `expr`'s input.
     fn enter(expr: &Expr) -> Self {
-        let invocation = NEXT_INVOCATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u64;
+        let invocation = Self::reserve_invocation();
         let at = may_bind_navigated(expr).then(PathPrefix::root);
         Self {
             invocation,
             at,
+            register: None,
+            register_loss: RegisterLoss::Kept,
+        }
+    }
+
+    /// A fresh invocation id, taken before the frame that will use it is
+    /// entered (#3134): [`mint_positioned_markers`] needs the id to stamp
+    /// a marker's [`Origin::At`] before the resolver starts, and
+    /// [`Frame::enter_reserved`] then enters exactly that invocation.
+    fn reserve_invocation() -> u64 {
+        NEXT_INVOCATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u64
+    }
+
+    /// The invocation `invocation` (from [`Frame::reserve_invocation`]),
+    /// rooted at the resolver's input. `at` is always tracked: the caller
+    /// minted a marker positioned in this invocation, and a position can
+    /// only be certified by a frame that knows its own.
+    fn enter_reserved(invocation: u64) -> Self {
+        Self {
+            invocation,
+            at: Some(PathPrefix::root()),
             register: None,
             register_loss: RegisterLoss::Kept,
         }
@@ -32993,6 +33079,112 @@ fn marker_is_root(marker: &Tracked, root: &RootWitness) -> bool {
         (Some(BindOrigin::Owned { root, .. }), RootWitness::OwnedRoot(witness)) => root == witness,
         _ => false,
     }
+}
+
+/// Where each navigated bind in a resolver's argument sits below that
+/// resolver's root (#3134), for [`mint_positioned_markers`]: a document
+/// node id, from a marker's [`BindOrigin::Node`], mapped to the node's path
+/// relative to the root, spelled as the resolver spells its own frame
+/// positions (`Expr::Field` for a member, `Expr::Index` for an element).
+/// Built by `eval_generic::marker_positions` from a live cursor; empty
+/// everywhere else, which leaves every marker exactly as it was.
+#[derive(Debug, Default)]
+pub(crate) struct MarkerPositions {
+    /// The `document_token` every recorded node belongs to.
+    document: usize,
+    /// A handful at most (one per distinct bound node in the argument), so
+    /// a scan beats a map.
+    positions: Vec<(usize, Rc<PathPrefix>)>,
+}
+
+impl MarkerPositions {
+    /// No positions, for the funnels with no cursor to derive one from.
+    pub(crate) const NONE: Self = Self {
+        document: 0,
+        positions: Vec::new(),
+    };
+
+    /// An empty set for nodes of `document`.
+    pub(crate) fn new(document: usize) -> Self {
+        Self {
+            document,
+            positions: Vec::new(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    /// Whether `node` already has a position.
+    pub(crate) fn contains(&self, node: usize) -> bool {
+        self.positions.iter().any(|(n, _)| *n == node)
+    }
+
+    /// Record `node` at `components` below the root: each a member key
+    /// (`OwnedValue::String`) or an element index (`OwnedValue::Int`).
+    /// Anything else leaves `node` without a position.
+    pub(crate) fn insert(&mut self, node: usize, components: &[OwnedValue]) {
+        let mut path = PathPrefix::root();
+        for component in components {
+            let component = match component {
+                OwnedValue::String(key) => Expr::Field(key.clone()),
+                OwnedValue::Int(idx) => Expr::Index {
+                    idx: *idx,
+                    key: None,
+                },
+                _ => return, // omni-dev: coverage tolerate-line reason="unreachable: marker_positions only ever records member keys and element indices (#3134)"
+            };
+            path = PathPrefix::extend(&path, component);
+        }
+        self.positions.push((node, path));
+    }
+
+    /// The components recorded for `node`, for the tests.
+    #[cfg(test)]
+    pub(crate) fn components_of(&self, node: usize) -> Option<Vec<Expr>> {
+        self.positions
+            .iter()
+            .find(|(n, _)| *n == node)
+            .map(|(_, path)| path.to_vec())
+    }
+
+    /// The position recorded for `marker`'s node, if it is an
+    /// [`Origin::Untracked`] document-node marker of this document.
+    fn position_of(&self, marker: &Tracked) -> Option<&Rc<PathPrefix>> {
+        if marker.origin != Origin::Untracked {
+            return None;
+        }
+        let Some(BindOrigin::Node { node, document }) = &marker.node else {
+            return None;
+        };
+        if *document != self.document {
+            return None;
+        }
+        self.positions
+            .iter()
+            .find(|(n, _)| n == node)
+            .map(|(_, path)| path)
+    }
+}
+
+/// `expr` with every marker `positions` places stamped [`Origin::At`] its
+/// position in `invocation` (#3134) -- see
+/// [`each_path_on_owned_positioned`], the one caller, for why this is only
+/// sound immediately before `invocation` is entered on the root those
+/// positions are relative to. `Tracked::node` is kept, as every rewrite
+/// keeps it.
+fn mint_positioned_markers<'e>(
+    expr: &'e Expr,
+    positions: &MarkerPositions,
+    invocation: u64,
+) -> Cow<'e, Expr> {
+    rewrite_markers(expr, &|marker| {
+        positions.position_of(marker).map(|path| Origin::At {
+            invocation,
+            path: BindPath(Rc::clone(path)),
+        })
+    })
 }
 
 /// [`demote_rebuilt_markers`] plus the one *promotion* this evaluator makes
@@ -38681,8 +38873,10 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
 /// crosses `eval_on_owned`'s round trip), every node is a fresh copy and
 /// the clause is false where jq's pointer equality answers `[0]`; recorded
 /// in `docs/compliance/jq/limitations.md`. Scalars are not `Rc`-backed and
-/// never match, which costs the refusal jq's by-value number identity would
-/// not give -- a documented residual, never a wrong acceptance.
+/// never match here; a scalar bound from a document node is certified by
+/// position instead, where a cursor-side funnel can place it (#3134,
+/// `eval_generic::marker_positions`), and refuses elsewhere -- a
+/// documented residual, never a wrong acceptance.
 ///
 /// The resolver only ever holds the pointer on the routes that hand it the
 /// caller's own tree ([`path_over_owned`], [`owned_path_door`]); after a
@@ -46137,7 +46331,7 @@ fn resolve_terminal<'a, S: EvalSemantics>(
     // rule -- the write-side callers (`=`, `|=`, `del()`) want every branch
     // and have nothing to stop for.
     let mut kept: Vec<PathBranch<'a>> = Vec::new();
-    let flow = resolve_terminal_sink::<S>(expr, input, near_iterate, untracked, &mut |b| {
+    let flow = resolve_terminal_sink::<S>(expr, input, near_iterate, untracked, None, &mut |b| {
         kept.push(b);
         Demand::Continue
     });
@@ -46167,6 +46361,7 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
     input: &'a OwnedValue,
     near_iterate: bool,
     mut untracked: Untracked<'_>,
+    invocation: Option<u64>,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> Result<(), EvalEscape> {
     let mut violation: Option<EvalEscape> = None;
@@ -46184,7 +46379,12 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
         input,
         true,
         &Snapshot::No,
-        &Frame::enter(expr),
+        // #3134: a caller that minted positioned markers for this call
+        // reserved the invocation they name; everything else starts fresh.
+        &match invocation {
+            Some(invocation) => Frame::enter_reserved(invocation),
+            None => Frame::enter(expr),
+        },
         Keep::First,
         &mut |branch| {
             // #2691: the reset just below discards a violation this sink
@@ -46488,7 +46688,7 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     // An always-`Continue` sink over the streaming form below; the
     // write-side callers want every resolved expression.
     let mut out = Vec::new();
-    match resolve_dynamic_indexes_sink::<S>(expr, input, defer_trailing_iterate, &mut |e| {
+    match resolve_dynamic_indexes_sink::<S>(expr, input, defer_trailing_iterate, None, &mut |e| {
         out.push(e);
         Demand::Continue
     }) {
@@ -46500,10 +46700,15 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
 /// [`resolve_dynamic_indexes`], delivering each resolved path expression to
 /// `sink` as it is produced (#2908) -- what lets `path()` stop a generator
 /// its own consumer is already done with.
+///
+/// `invocation` is the resolver invocation to enter, when the caller
+/// reserved one for markers it positioned in `expr` (#3134,
+/// [`each_path_on_owned_positioned`]); `None` enters a fresh one.
 fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     defer_trailing_iterate: bool,
+    invocation: Option<u64>,
     sink: &mut dyn FnMut(Expr) -> Demand,
 ) -> Result<(), EvalEscape> {
     if !needs_path_prepass(expr) {
@@ -46583,7 +46788,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
     };
 
     if trailing.is_empty() {
-        return resolve_terminal_sink::<S>(expr, input, false, untracked, &mut |b| {
+        return resolve_terminal_sink::<S>(expr, input, false, untracked, invocation, &mut |b| {
             sink(assemble_one_branch(&b))
         });
     }
@@ -46593,9 +46798,14 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
         1 => flat.into_iter().next().expect("len checked"),
         _ => Expr::Pipe(flat),
     };
-    resolve_terminal_sink::<S>(&reduced_expr, input, true, untracked, &mut |b| {
-        sink(append_trailing(assemble_one_branch(&b), &trailing))
-    })
+    resolve_terminal_sink::<S>(
+        &reduced_expr,
+        input,
+        true,
+        untracked,
+        invocation,
+        &mut |b| sink(append_trailing(assemble_one_branch(&b), &trailing)),
+    )
 }
 
 /// Drop any `Expr::Optional` wrapper a resolved path component still
@@ -52818,48 +53028,92 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
+    each_path_on_owned_in::<S>(expr, owned, optional, None, sink)
+}
+
+/// [`each_path_on_owned`], with `path_expr`'s navigated binds certified at
+/// the positions `positions` gives them (#3134).
+///
+/// A bind made outside any resolver (`.a.b as $z`, #2072) is an
+/// [`Origin::Untracked`] marker: there was no invocation to record a
+/// position in, so it never certifies by node identity, and storage
+/// identity (#3177) cannot help a scalar or a node another bind's `Rc`
+/// already stands for. The caller -- a funnel holding a live cursor for
+/// `owned`'s root -- knows where each such marker's node sits below that
+/// root; this stamps each one [`Origin::At`] that position in an
+/// invocation reserved here, and resolves `expr` in exactly that
+/// invocation. Minting at the resolver's own entry, for the resolver's own
+/// argument, is what keeps it sound: every comparison inside the
+/// invocation is between absolute frame positions, which track any
+/// navigation `expr` makes (`path(.x | .a | $y)` stands at `["x","a"]`, not
+/// `["a"]`), and a nested invocation (a `select` condition, an inner
+/// `path()`) enters a fresh id, where the marker never certifies. See
+/// `eval_generic::marker_positions` for why the position is jq's rule.
+pub(crate) fn each_path_on_owned_positioned<S: EvalSemantics>(
+    expr: &Expr,
+    owned: &OwnedValue,
+    optional: bool,
+    positions: &MarkerPositions,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    if positions.is_empty() {
+        return each_path_on_owned::<S>(expr, owned, optional, sink);
+    }
+    let invocation = Frame::reserve_invocation();
+    let minted = mint_positioned_markers(expr, positions, invocation);
+    each_path_on_owned_in::<S>(&minted, owned, optional, Some(invocation), sink)
+}
+
+fn each_path_on_owned_in<S: EvalSemantics>(
+    expr: &Expr,
+    owned: &OwnedValue,
+    optional: bool,
+    invocation: Option<u64>,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
     let root = PathTrail::root();
     let mut walk_error: Option<EvalEscape> = None;
     let mut stopped = false;
     // Reused across branches so a wide fan-out does not allocate per branch.
     let mut reached: Vec<(Rc<PathTrail>, WalkNode<'_>)> = Vec::new();
 
-    let resolve_error = resolve_dynamic_indexes_sink::<S>(expr, owned, true, &mut |resolved| {
-        reached.clear();
-        // A failing walk still emits whatever it reached first (#2680): jq's
-        // generator never un-emits an output it already produced, so
-        // `path((.a[] | .b) | .c[0:1])` on `{"a":[{"b":{}},5]}` prints
-        // `["a",0,"b","c",{"start":0,"end":1}]` and *then* raises on the
-        // second element. `walk_path` fills `reached` as it goes, so the
-        // prefix is whatever is in it when the error comes back -- draining
-        // it before returning is what keeps that contract, and dropping it
-        // is what `builtin_path_on_owned`'s own `partial(paths, e)` warns
-        // against.
-        let outcome = walk_path::<S>(
-            &resolved,
-            WalkNode::Doc(owned),
-            &root,
-            &mut reached,
-            optional,
-        );
-        // Borrowed, not drained: `reached` is cleared at the top of the next
-        // branch and reused, so a wide fan-out allocates once rather than
-        // once per branch.
-        for (path, _) in &reached {
-            // `PathTrail::to_vec` is the one O(depth) flatten, paid exactly
-            // once per reached branch (#2058).
-            if sink(OwnedValue::Array(path.to_vec().into())) == Demand::Stop {
-                stopped = true;
+    let resolve_error =
+        resolve_dynamic_indexes_sink::<S>(expr, owned, true, invocation, &mut |resolved| {
+            reached.clear();
+            // A failing walk still emits whatever it reached first (#2680): jq's
+            // generator never un-emits an output it already produced, so
+            // `path((.a[] | .b) | .c[0:1])` on `{"a":[{"b":{}},5]}` prints
+            // `["a",0,"b","c",{"start":0,"end":1}]` and *then* raises on the
+            // second element. `walk_path` fills `reached` as it goes, so the
+            // prefix is whatever is in it when the error comes back -- draining
+            // it before returning is what keeps that contract, and dropping it
+            // is what `builtin_path_on_owned`'s own `partial(paths, e)` warns
+            // against.
+            let outcome = walk_path::<S>(
+                &resolved,
+                WalkNode::Doc(owned),
+                &root,
+                &mut reached,
+                optional,
+            );
+            // Borrowed, not drained: `reached` is cleared at the top of the next
+            // branch and reused, so a wide fan-out allocates once rather than
+            // once per branch.
+            for (path, _) in &reached {
+                // `PathTrail::to_vec` is the one O(depth) flatten, paid exactly
+                // once per reached branch (#2058).
+                if sink(OwnedValue::Array(path.to_vec().into())) == Demand::Stop {
+                    stopped = true;
+                    return Demand::Stop;
+                }
+            }
+            if let Err(e) = outcome {
+                walk_error = Some(e);
                 return Demand::Stop;
             }
-        }
-        if let Err(e) = outcome {
-            walk_error = Some(e);
-            return Demand::Stop;
-        }
-        Demand::Continue
-    })
-    .err();
+            Demand::Continue
+        })
+        .err();
 
     // A walk error is this call's own, raised while the prepass was still
     // running, so it outranks whatever the prepass reported on the way out --
@@ -108840,6 +109094,86 @@ mod tests {
             ..bare.clone()
         };
         assert!(!marker_needs_demotion(&untracked, &RootWitness::Owned));
+    }
+
+    /// #3134: `mint_positioned_markers` stamps exactly the `Untracked`
+    /// document-node markers of the positions' own document that have a
+    /// position, keeping `node`, and the stamp certifies at that position in
+    /// that invocation and nowhere else -- not at the invocation's root, not
+    /// at a prefix of the position, and not at the same position in any
+    /// other invocation (a nested `path()`/`select` condition enters its
+    /// own). No positions borrows the expression back untouched.
+    #[test]
+    fn mint_positioned_markers_certifies_only_in_its_own_invocation_3134() {
+        let mut positions = MarkerPositions::new(7);
+        positions.insert(3, &[OwnedValue::string("a"), OwnedValue::Int(0)]);
+        let marker = |origin: Origin, node: Option<BindOrigin>| {
+            Expr::TrackedVar(Rc::new(Tracked {
+                value: OwnedValue::Int(1),
+                origin,
+                node,
+            }))
+        };
+        let node = |node: usize, document: usize| Some(BindOrigin::Node { node, document });
+        let expr = Expr::Comma(vec![
+            marker(Origin::Untracked, node(3, 7)),
+            marker(Origin::Untracked, node(3, 8)),
+            marker(Origin::Untracked, node(4, 7)),
+            marker(Origin::Snapshot, node(3, 7)),
+            marker(Origin::Untracked, None),
+        ]);
+        let invocation = Frame::reserve_invocation();
+        let minted = mint_positioned_markers(&expr, &positions, invocation);
+        let Expr::Comma(items) = minted.as_ref() else {
+            panic!("expected the comma back, got {minted:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `rewrite_markers` rebuilds the same node kind it was given (#3134)"
+        };
+        let marks: Vec<(Origin, Option<BindOrigin>)> = items
+            .iter()
+            .map(|e| match e {
+                Expr::TrackedVar(m) => (m.origin.clone(), m.node.clone()),
+                other => panic!("expected a marker, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every item is built by `marker` above (#3134)"
+            })
+            .collect();
+        let path = PathPrefix::from_components([
+            Expr::Field("a".into()),
+            Expr::Index { idx: 0, key: None },
+        ]);
+        let stamped = Origin::At {
+            invocation,
+            path: BindPath(Rc::clone(&path)),
+        };
+        assert_eq!(
+            marks,
+            vec![
+                (stamped.clone(), node(3, 7)),
+                (Origin::Untracked, node(3, 8)),
+                (Origin::Untracked, node(4, 7)),
+                (Origin::Snapshot, node(3, 7)),
+                (Origin::Untracked, None),
+            ]
+        );
+
+        let frame = Frame::enter_reserved(invocation);
+        assert!(frame.at.is_some(), "a reserved frame always tracks `at`");
+        assert!(frame.extend(&path).certifies(&stamped));
+        assert!(!frame.certifies(&stamped));
+        let prefix = PathPrefix::from_components([Expr::Field("a".into())]);
+        assert!(!frame.extend(&prefix).certifies(&stamped));
+        let other = Frame::enter_reserved(Frame::reserve_invocation());
+        assert!(!other.extend(&path).certifies(&stamped));
+
+        assert!(matches!(
+            mint_positioned_markers(&expr, &MarkerPositions::NONE, invocation),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            positions.components_of(3),
+            Some(vec![
+                Expr::Field("a".into()),
+                Expr::Index { idx: 0, key: None }
+            ])
+        );
+        assert_eq!(positions.components_of(4), None);
     }
 
     /// #3037: `reroot_markers`' promotion is the accepting-direction twin of

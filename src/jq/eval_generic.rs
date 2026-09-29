@@ -57,10 +57,10 @@ use super::eval::{
     classify_limit_n, classify_nth_n, classify_parent_n, classify_skip_n, clear_nonretryable_stop,
     collapse_vec, collect_pattern_var_names, compare_key_arrays, compare_values,
     debug_assert_materialization_error, def_spine_len, demote_for_reentry, descriptor_slice_bounds,
-    each_path_on_owned, each_pattern_binding_set, each_recurse_walk, enter_def_call,
-    entries_to_object, eval_each_owned, eval_full as full_eval, finish_fork_flow,
-    finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
-    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    each_pattern_binding_set, each_recurse_walk, enter_def_call, entries_to_object,
+    eval_each_owned, eval_full as full_eval, finish_fork_flow, finish_fork_from_flow,
+    finish_short_circuit, fold_escaped_generator_prefix, foreach_forks, format_owned,
+    has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_assignment_expr, is_eager_arg,
     is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
@@ -9136,9 +9136,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // does not name it and, in jq mode, promoting an `Untracked`
             // one that *is* it (`.a as $y | .a | ($y.b) = 9`, #3037).
             let root = RootWitness::of(cursor.as_ref());
+            let positions = write_target_positions::<S, V>(expr, cursor.as_ref());
             let expr = reroot_for_reentry::<S>(expr, &root);
             let expr = expr.as_ref();
             let owned = owned_or_err!(bridge_ambient_input::<_, S>(expr, &value, cursor));
+            // #3134: a write whose target reads a navigated bind below this
+            // root resolves that target here, where the bind's position is
+            // still known, and the write goes on with it resolved. See
+            // `eval::positioned_write_door`.
+            let written =
+                crate::jq::eval::positioned_write_door::<S>(expr, &owned, &root, &positions);
+            let expr = written.as_ref().unwrap_or(expr);
             let doc = owned_or_err!(owned.reindexed::<S>());
             let cursor = doc.root();
 
@@ -10103,6 +10111,12 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             // #2642: demote any marker not proven to be `cursor`'s own node
             // before resolving, exactly as the eager arm does.
             let root = RootWitness::of(cursor.as_ref());
+            // #3134: where `path_expr`'s navigated binds sit below `cursor`,
+            // read before the materialization below consumes it.
+            let positions = match cursor.as_ref() {
+                Some(c) => marker_positions::<S, _>(path_expr, c),
+                None => crate::jq::eval::MarkerPositions::NONE,
+            };
             // `reroot_markers`, not `reroot_for_reentry`: `path_expr` is the
             // resolver's own argument, so the resolver-reaching node the
             // precheck looks for is the `path` builtin *around* it (#3122).
@@ -10141,9 +10155,13 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
                     &mut |v| sink.push(GenericItem::Owned(v)),
                 );
             }
-            each_path_on_owned::<S>(&demoted, &owned, false, &mut |v| {
-                sink.push(GenericItem::Owned(v))
-            })
+            crate::jq::eval::each_path_on_owned_positioned::<S>(
+                &demoted,
+                &owned,
+                false,
+                &positions,
+                &mut |v| sink.push(GenericItem::Owned(v)),
+            )
         }
         // #2693: the parameterised `recurse` spellings, and the bare one
         // with no live cursor to walk, stream their visited nodes through
@@ -20672,6 +20690,103 @@ fn cursor_key<C: DocumentCursor>(c: &C) -> Result<Option<OwnedValue>, EvalError>
     })
 }
 
+/// Where each navigated bind in `expr` sits below `root` (#3134): for every
+/// `Origin::Untracked` marker bound from a node of `root`'s document that
+/// is a proper descendant of `root`, the path from `root` down to it. What
+/// `eval::each_path_on_owned_positioned` stamps on those markers for the
+/// one resolver invocation it enters on `root`'s own value.
+///
+/// **Why a position is jq's rule, exactly.** jq certifies `path(f | $v)`
+/// by `jv_identical(value, $v)`. Every value jq's parser makes -- a number
+/// literal and a string as much as an array or object -- is its own
+/// allocation, compared by pointer (`null`/`true`/`false` are compared by
+/// value, and already handled, #3136). So on unmodified parsed input, the
+/// `jv` at a position is identical to a bound one exactly when the bind
+/// came from that same position: an equal-valued sibling, an iterated
+/// element or a value written back is a different `jv`. Here the resolver
+/// runs on `to_owned_with_cursor(root)` -- a copy of `root`'s subtree that
+/// it never writes -- so its frame position `P` holds document node
+/// `root/P`'s content, and a live cursor into the document means nothing
+/// has written to it (a write leaves the cursor domain). The marker names
+/// its node by id and document token, so "the resolver stands at this
+/// marker's position" is "the value there is the node the variable was
+/// bound from" -- `jv_identical`, no wider. Storage identity (#3177) cannot
+/// say this for a scalar, which has no `Rc`, or for a node another bind's
+/// `Rc` already stands for (`.a as $y | .a.b as $z | .a | path(.b | $z)`).
+///
+/// A marker at `root` itself gets no entry (`reroot_markers` already
+/// promotes it, #3037); nor does one whose node is not below `root`, is a
+/// member's *key* node, or is not a node of this document at all. Those
+/// keep refusing, as before. jq mode only (ADR-0018): real yq's writes
+/// through a variable are refuse-only in succinctly, and a position here
+/// would turn that refusal into a write yq does not perform.
+///
+/// Costs one `walk::any_subexpr` walk of `expr` when it holds no such marker;
+/// otherwise a climb from each marker's node to `root`, scanning each
+/// parent for the child's slot -- paid once per resolver call, beside a
+/// materialization of the whole subtree.
+fn marker_positions<S: EvalSemantics, C: DocumentCursor>(
+    expr: &Expr,
+    root: &C,
+) -> crate::jq::eval::MarkerPositions {
+    use crate::jq::eval::MarkerPositions;
+    if S::TAG != EvalTag::Jq {
+        return MarkerPositions::NONE;
+    }
+    let document = root.document_token();
+    let root_node = root.node_id();
+    let mut positions = MarkerPositions::new(document);
+    crate::jq::walk::any_subexpr(expr, &mut |e| {
+        if let Expr::TrackedVar(marker) = e {
+            if let (super::expr::Origin::Untracked, Some(BindOrigin::Node { node, document: d })) =
+                (&marker.origin, &marker.node)
+            {
+                if *d == document && *node != root_node && !positions.contains(*node) {
+                    if let Some(components) = root
+                        .at_node_id(*node)
+                        .and_then(|c| path_below(c, root_node))
+                    {
+                        positions.insert(*node, &components);
+                    }
+                }
+            }
+        }
+        false
+    });
+    positions
+}
+
+/// [`marker_positions`] for the target of the write heading `expr`
+/// (`eval::write_door_target`), or none when `expr` is not headed by a
+/// write or there is no cursor to locate its binds from (#3134).
+fn write_target_positions<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    cursor: Option<&V::Cursor>,
+) -> crate::jq::eval::MarkerPositions {
+    match (crate::jq::eval::write_door_target(expr), cursor) {
+        (Some(target), Some(cursor)) => marker_positions::<S, _>(target, cursor),
+        _ => crate::jq::eval::MarkerPositions::NONE,
+    }
+}
+
+/// The components from the node `root_node` down to `c`, or `None` when `c`
+/// is not below it (the climb reaches the document root first), or the
+/// climb passes through a key node or a slot it cannot spell.
+fn path_below<C: DocumentCursor>(c: C, root_node: usize) -> Option<Vec<OwnedValue>> {
+    let mut components = Vec::new();
+    let mut current = c;
+    while current.node_id() != root_node {
+        match cursor_slot(&current).ok()?? {
+            CursorSlot::Value { key, .. } => components.push(key),
+            CursorSlot::Element(index) => components.push(OwnedValue::Int(index)),
+            CursorSlot::Key(_) => return None,
+        }
+        current = current.document_parent()?;
+    }
+    components.reverse();
+    Some(components)
+}
+
 /// Where `c` sits in its parent (#2763): the value of an object member, the
 /// **key** of one, or an element of an array. `None` at the document root.
 ///
@@ -24230,15 +24345,20 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // is a different node). Demote any marker not proven to be
             // `cursor`'s own node before either resolution route below.
             let root = RootWitness::of(cursor.as_ref());
+            // #3134: see the streaming arm's own `marker_positions` call.
+            let positions = match cursor.as_ref() {
+                Some(c) => marker_positions::<S, _>(path_expr, c),
+                None => crate::jq::eval::MarkerPositions::NONE,
+            };
             let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
             // The reroot (`reroot_markers`, not `reroot_for_reentry` --
             // `path_expr` is the resolver's own argument, #3122) and the
             // `reindex_bridge_is_identity` gate both live in
             // `path_over_owned`, shared with the owned re-entries' door
             // (#3177) so the two routes cannot drift.
-            if let Some((values, control)) =
-                crate::jq::eval::path_over_owned_collect::<S>(path_expr, &owned, &root, false)
-            {
+            if let Some((values, control)) = crate::jq::eval::path_over_owned_collect::<S>(
+                path_expr, &owned, &root, false, &positions,
+            ) {
                 return match control {
                     Some(control) => partial_generic(values, control),
                     None => owned_vec_to_generic_result(values),
@@ -24634,10 +24754,16 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // argument), so it must be checked against this call's own root.
             let root = RootWitness::of(cursor.as_ref());
             let expr = Expr::Builtin(builtin.clone());
+            let positions = write_target_positions::<S, V>(&expr, cursor.as_ref());
             let owned = owned_or_suppress!(
                 bridge_ambient_input::<_, S>(&expr, &value, cursor),
                 optional
             );
+            // #3134: `del(f)`'s twin of the assignment family's door in
+            // `eval_single`'s fallback.
+            let written =
+                crate::jq::eval::positioned_write_door::<S>(&expr, &owned, &root, &positions);
+            let expr = written.unwrap_or(expr);
             eval_on_owned::<S, _>(&expr, owned, optional, Reentry::Against(root))
         }
     }
@@ -28662,6 +28788,79 @@ mod tests {
             GenericResult::Owned(v) => assert_eq!(v, frozen),
             other => panic!("expected the frozen value, got {other:?}"),
         }
+    }
+
+    /// #3134: `marker_positions` places an `Untracked` document-node marker
+    /// at its path below the root it is asked about -- a member by key, an
+    /// element by index -- and places nothing for the root's own node (the
+    /// #3037 promotion's), a node outside the root's subtree, a member's key
+    /// node, a node of another document, or a marker of another origin.
+    /// yq mode places nothing at all.
+    #[test]
+    fn marker_positions_places_only_the_roots_descendants_3134() {
+        fn marker<C: DocumentCursor>(c: &C, origin: super::super::expr::Origin) -> Expr {
+            Expr::TrackedVar(Rc::new(super::super::expr::Tracked {
+                value: OwnedValue::Int(1),
+                origin,
+                node: Some(BindOrigin::Node {
+                    node: c.node_id(),
+                    document: c.document_token(),
+                }),
+            }))
+        }
+        use super::super::expr::Origin::{Snapshot, Untracked};
+        let json = br#"{"a":{"b":1},"x":[1,1]}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let a = root.first_child().unwrap().next_sibling().unwrap();
+        let key_b = a.first_child().unwrap();
+        let b = key_b.next_sibling().unwrap();
+        let x = a.next_sibling().unwrap().next_sibling().unwrap();
+        let x1 = x.first_child().unwrap().next_sibling().unwrap();
+
+        let other_json = br#"{"a":{"b":1}}"#;
+        let other_index = JsonIndex::build(other_json);
+        let other_a = other_index
+            .root(other_json)
+            .first_child()
+            .unwrap()
+            .next_sibling()
+            .unwrap();
+
+        let expr = Expr::Comma(vec![
+            marker(&b, Untracked),
+            marker(&x1, Untracked),
+            marker(&key_b, Untracked),
+            marker(&a, Snapshot),
+            marker(&other_a, Untracked),
+        ]);
+        let field = |k: &str| Expr::Field(k.into());
+        let index_at = |idx: i64| Expr::Index { idx, key: None };
+
+        let from_root = marker_positions::<JqSemantics, _>(&expr, &root);
+        assert_eq!(
+            from_root.components_of(b.node_id()),
+            Some(vec![field("a"), field("b")])
+        );
+        assert_eq!(
+            from_root.components_of(x1.node_id()),
+            Some(vec![field("x"), index_at(1)])
+        );
+        assert_eq!(from_root.components_of(key_b.node_id()), None);
+        assert_eq!(from_root.components_of(a.node_id()), None);
+
+        let from_a = marker_positions::<JqSemantics, _>(&expr, &a);
+        assert_eq!(from_a.components_of(b.node_id()), Some(vec![field("b")]));
+        assert_eq!(from_a.components_of(x1.node_id()), None);
+
+        let at_b = marker_positions::<JqSemantics, _>(&expr, &b);
+        assert!(
+            at_b.is_empty(),
+            "the root's own node is #3037's, not a position"
+        );
+
+        assert!(marker_positions::<YqSemantics, _>(&expr, &root).is_empty());
+        assert!(marker_positions::<JqSemantics, _>(&Expr::Identity, &root).is_empty());
     }
 
     /// temporary JSON index is dropped, preserving the complete preorder.
