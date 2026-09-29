@@ -36443,6 +36443,20 @@ fn test_negative_index_out_of_range_survives_owned_target_computed_index_2254() 
         "Error: index [-5] out of range, array size is 2"
     );
 
+    // #3457: the same query without `--slurp` runs on the cursor route, whose
+    // owned-target computed index skipped the rule and answered `null` (real
+    // yq raises, `?` or not). `--slurp` only reached the rule because it used
+    // to be evaluated by the other evaluator.
+    for filter in ["([1,2]+[])[(1*-5)]?", "([1,2]+[])[(1*-5)]"] {
+        let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: [1, 2]\n", &["-o", "json"])?;
+        assert_eq!(code, 1, "{filter}: out: {out:?}");
+        assert_eq!(
+            stderr.trim(),
+            "Error: index [-5] out of range, array size is 2",
+            "{filter}"
+        );
+    }
+
     Ok(())
 }
 

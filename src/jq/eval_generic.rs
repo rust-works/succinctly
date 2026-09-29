@@ -217,12 +217,13 @@ pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
     }
 }
 
-/// If `payload` (a caught panic's payload) is exactly
-/// [`assert_nesting_depth`]'s [`MAX_NESTING_DEPTH`] message, returns it;
-/// `None` for any other panic, so a caller can `resume_unwind` anything
-/// unrelated rather than treating an unexpected panic as this known one
-/// (#1793, moved here from the CLI by #3457 so the library entry and the
-/// binary share one definition).
+/// The message of a caught nesting-depth panic, or `None` for any other.
+///
+/// `Some` iff `payload` (a caught panic's payload) is exactly
+/// [`assert_nesting_depth`]'s [`MAX_NESTING_DEPTH`] message, so a caller can
+/// `resume_unwind` anything unrelated rather than treating an unexpected
+/// panic as this known one (#1793, moved here from the CLI by #3457 so the
+/// library entry and the binary share one definition).
 ///
 /// An *exact* match against `assert_depth`'s message template
 /// (`src/jq/value.rs`), not a substring check:
@@ -5278,8 +5279,8 @@ pub fn eval<V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
 /// read (a malformed number such as `1.2.3`, or a keyword such as `tru`) it
 /// answers some filters that never read the value (`1`, `[paths]`) and
 /// raises on others (`not`, `[.] | length`), where
-/// [`eval_with_cursor_using`], the entry the CLI uses, answers all of them
-/// (#3266).
+/// [`eval_with_cursor_using`], the entry the CLI uses (and, since #3457,
+/// [`crate::jq::eval`](fn@crate::jq::eval)), answers all of them (#3266).
 ///
 /// Arithmetic that falls back to the full evaluator (division, modulo, overflow)
 /// follows `S`, so yq keeps yq numeric behavior instead of jq's.
@@ -6571,15 +6572,16 @@ pub fn eval_with_cursor<C: DocumentCursor>(expr: &Expr, cursor: C) -> GenericRes
 /// modulo/division/overflow behavior is preserved on the cursor path.
 ///
 /// `succinctly jq` evaluates through this entry and its streaming twin,
-/// [`eval_each_with_cursor_using`]. It holds the input as a cursor, so a
-/// value the index cannot read (a malformed number such as `1.2.3`, or a
-/// keyword such as `tru`) does not raise under a filter that navigates past
-/// it (`path(.a)`) or wraps it in `[.]`, where [`eval_using`] and
-/// [`crate::jq::eval`](fn@crate::jq::eval) can (#3266). Other collections
-/// (`[., 1]`, `{a: .}`, `. as $x | [$x]`) materialize the value here too, and
-/// raise (#3427). Unlike `crate::jq::eval`, its `path`/`paths`/`leaf_paths`/
-/// `getpath` walkers panic on a document nested deeper than 256 levels
-/// (#3429); the CLI catches that panic.
+/// [`eval_each_with_cursor_using`], and so does the library entry
+/// [`crate::jq::eval`](fn@crate::jq::eval) since #3457 (it reshapes the answer
+/// into a `QueryResult`). The input is held as a cursor, so a value the index
+/// cannot read (a malformed number such as `1.2.3`, or a keyword such as
+/// `tru`) does not raise under a filter that navigates past it (`path(.a)`) or
+/// wraps it in `[.]`, where [`eval_using`], which is handed a decoded value,
+/// can (#3266). Other collections (`[., 1]`, `{a: .}`, `. as $x | [$x]`)
+/// materialize the value here too, and raise (#3427). A document nested deeper
+/// than 256 levels makes the `path`/`paths`/`leaf_paths`/`getpath` walkers
+/// return a decode-failure-tagged error (#3429 tracks the ceiling).
 ///
 /// Same `takes_input_queue_bridge` condition as [`eval_using`] (#1504),
 /// cursor-metadata carve-out included; see its doc comment for why the
@@ -16285,8 +16287,8 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
 /// caller indexing an *owned* target checks it ahead. `eval.rs`'s own
 /// `KeyTargets::Owned` loop did; this evaluator's two did not, so
 /// `([1,2]+[])[(1*-5)]` answered `null` here where yq and `eval.rs` raise. It
-/// surfaced when the library entry moved onto this evaluator; the CLI's
-/// cursor route had the same answer all along.
+/// surfaced when the library entry moved onto this evaluator (#3457), and the
+/// CLI's cursor route, which had the same gap, is fixed with it.
 fn index_owned_checked<S: EvalSemantics>(
     target: &OwnedValue,
     key: &OwnedValue,

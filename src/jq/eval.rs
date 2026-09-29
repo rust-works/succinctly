@@ -115471,7 +115471,7 @@ mod touched_edge_cases_2999 {
     /// the same thread answers the next query as a fresh one would.
     #[test]
     fn eval_depth_panic_leaves_no_scope_behind_3457() {
-        let json = br#"[1]"#;
+        let json = br"[1]";
         let index = JsonIndex::build(json);
         let expr = parse("file_index").expect("parse");
         let probe = || {
@@ -115488,5 +115488,309 @@ mod touched_edge_cases_2999 {
         });
         assert!(caught.is_error());
         assert_eq!(probe(), fresh, "the unwound scope must have been restored");
+    }
+
+    /// #3457: the must-not-change sweep for moving `eval()` onto the cursor
+    /// evaluator. Every row is a well-formed document and a filter, run through
+    /// the entry it used to reach (`eval_full`) and through the new `eval`, in
+    /// jq and yq mode; the two must give the same outputs (or the same error).
+    /// Where they do not, that is a bug in one evaluator or a documented
+    /// improvement -- [`MOVED`] pins those, each with its reason, so a row
+    /// moving is a decision rather than drift.
+    #[test]
+    fn eval_matches_the_previous_entry_on_well_formed_input_3457() {
+        /// (control kind, outputs, error message): everything a caller can see
+        /// of a result, with a decode failure kept distinct from a value.
+        fn observe<S: EvalSemantics>(
+            r: QueryResult<'_, Vec<u64>>,
+        ) -> (&'static str, String, String) {
+            let kind = match &r {
+                QueryResult::Error(_) => "error",
+                QueryResult::Break(_) => "break",
+                QueryResult::Halt(_) => "halt",
+                QueryResult::Partial(..) => "partial",
+                _ => "values",
+            };
+            let message = match &r {
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    e.message.clone()
+                }
+                _ => String::new(),
+            };
+            let values = match r.try_collect_owned::<S>() {
+                Ok(vs) => vs
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                Err(e) => format!("decode failure: {}", e.message),
+            };
+            (kind, values, message)
+        }
+        fn both<S: EvalSemantics>(
+            json: &str,
+            filter: &str,
+        ) -> (
+            (&'static str, String, String),
+            (&'static str, String, String),
+        ) {
+            let index = JsonIndex::build(json.as_bytes());
+            let expr = parse(filter).unwrap_or_else(|e| panic!("`{filter}` must parse: {e:?}"));
+            (
+                observe::<S>(eval_full::<Vec<u64>, S>(&expr, index.root(json.as_bytes()))),
+                observe::<S>(eval::<Vec<u64>, S>(&expr, index.root(json.as_bytes()))),
+            )
+        }
+
+        const DOC: &str = r#"{"a":[1,2,{"b":null}],"c":"x","d":{"e":[3,4]},"f":true,"g":1.5}"#;
+        const ARR: &str = "[3,1,2]";
+        const STR: &str = r#""héllo wörld""#;
+        const FILTERS: &[(&str, &[&str])] = &[
+            (
+                DOC,
+                &[
+                    ".a",
+                    ".a[]",
+                    ".a[2].b",
+                    ".d.e | add",
+                    "[.a[] | numbers]",
+                    "keys",
+                    "to_entries | map(.key)",
+                    "path(..)",
+                    "[paths]",
+                    "[leaf_paths]",
+                    "[paths(type == \"number\")]",
+                    r#"getpath(["d","e",1])"#,
+                    r#"getpath(["z"])"#,
+                    "[.. | numbers]",
+                    "map_values(type)",
+                    "with_entries(.value |= type)",
+                    "del(.a)",
+                    ".d.e[1] = 9",
+                    ".g += 1",
+                    "reduce .d.e[] as $x (0; . + $x)",
+                    "[foreach .d.e[] as $x (0; . + $x)]",
+                    "[limit(2; .a[])]",
+                    "first(.a[])",
+                    "[.a[] | select(. != null)]",
+                    ".c | ascii_upcase",
+                    ".c * 3",
+                    "tojson",
+                    "{(.c): .f}",
+                    "[.a[] | type]",
+                    "def f: .d.e[]; [f]",
+                    ". as {a: [$x]} | $x",
+                    ".a | length",
+                    "[.[] | type]",
+                    "[(.a, .d) | length]",
+                    r#"try error("x") catch ."#,
+                    "label $out | .a[] | if . == 2 then ., break $out else . end",
+                    "[limit(3; repeat(1))]",
+                    "[tostream] | length",
+                    "path(.a[1:])",
+                    ".a[-1]",
+                    ".a[1:] | length",
+                    "$__loc__",
+                    "path(.a[2].b)",
+                    "path(first(.a[]))",
+                    "[path(.a[] | select(. == 2))]",
+                    ".a | to_entries | length",
+                    "[.d.e[] | . * 2] | @csv",
+                    "walk(if type == \"number\" then . + 1 else . end)",
+                    "[splits(\"x\")]?",
+                    "to_entries[0]",
+                    "with_entries(select(.key == \"c\"))",
+                    ".a as [$p, $q] | [$p, $q]",
+                    "any(.a[]; . == 2)",
+                    "isvalid(.a[9])",
+                    "input_line_number",
+                    "getpath([\"a\",2,\"b\"])",
+                    "[.. | scalars]",
+                    "del(.a[0], .d)",
+                    "delpaths([[\"a\",0],[\"c\"]])",
+                    "setpath([\"c\"]; 1)",
+                    "to_entries | from_entries",
+                    "[range(3)] | map(. * 2)",
+                    "ltrimstr(\"x\")",
+                    "tostring",
+                    "@json",
+                    "@text",
+                    "[.a[]?]",
+                    ".a[]?",
+                    ".c[]?",
+                    ".c.d?",
+                    "(.a | first), (.a | last)",
+                    "[.a[] | tojson]",
+                    "map(.)?",
+                    "env | type",
+                ],
+            ),
+            (
+                ARR,
+                &[
+                    "sort",
+                    "min",
+                    "add",
+                    ".[1:]",
+                    "map(. * 2)",
+                    "to_entries",
+                    "reverse",
+                    "index(1)",
+                    "any",
+                    "all",
+                    "flatten",
+                    "[.[] | tostring] | join(\",\")",
+                    "@csv",
+                    "@sh",
+                    "sort_by(-.)",
+                    "group_by(. > 1)",
+                    "unique",
+                    "[.[] | . as $x | $x]",
+                    "path(.[1])",
+                    "[paths]",
+                    "getpath([1])",
+                    "del(.[0])",
+                    ".[1] = 9",
+                    "first",
+                    "last",
+                    "nth(1)",
+                    "length",
+                    "bsearch(2)",
+                    "combinations?",
+                    "tojson | fromjson",
+                    "limit(2; .[])",
+                    "[.[:2], .[2:]]",
+                    "min_by(-.)",
+                    "transpose?",
+                    "@json",
+                ],
+            ),
+            (
+                STR,
+                &[
+                    "length",
+                    "utf8bytelength",
+                    "explode | implode",
+                    "test(\"w\")",
+                    "ascii_downcase",
+                    "split(\" \")",
+                    "@uri",
+                    "@base64",
+                    "@base64 | @base64d",
+                    "ltrimstr(\"h\")",
+                    "[match(\"l+\"; \"g\") | .offset]",
+                    "sub(\"l\"; \"L\")",
+                    "gsub(\"l\"; \"L\")",
+                    "capture(\"(?<w>w\\\\S+)\")",
+                    "@html",
+                    "tojson",
+                    "ascii",
+                    ".[1:3]",
+                    "path(.)",
+                    "[paths]",
+                    "getpath([])",
+                    "try tonumber catch \"nan\"",
+                ],
+            ),
+        ];
+        // Duplicate keys: jq keeps the last, and so does the cursor evaluator.
+        const DUP: &str = r#"{"a":1,"a":2,"b":3}"#;
+        const DUP_FILTERS: &[&str] = &[
+            "to_entries | length",
+            "pick(.a)",
+            "keys",
+            "length",
+            ".a",
+            "[paths]",
+            "with_entries(.)",
+            "map_values(. + 1)",
+            "[.[]]",
+            "tojson",
+            "del(.a)",
+        ];
+        const YQ_FILTERS: &[(&str, &[&str])] = &[(
+            DOC,
+            &[
+                ".a[]",
+                ".a[-1]",
+                "del(.a)",
+                ".a[0] = 5",
+                "path(.d.e[0])",
+                "keys",
+                ".d | to_entries",
+                "[..] | length",
+                "[paths] | length",
+                ".a[(1*-5)]?",
+                ".a[(1*-5)]",
+                "([1,2]+[])[(1*-5)]",
+                "(.a, .d) | key",
+                ".a[] | key",
+                ".d.e | parent",
+                ".c | line",
+                ".. | select(tag == \"!!int\")",
+                ".a | length",
+                "with_entries(.value |= tag)",
+                "pick([\"c\"])",
+                "[.a[] | select(. == 2)]",
+            ],
+        )];
+
+        // Rows whose answer moved on purpose: (mode, doc, filter). Each is
+        // the cursor evaluator answering where eval.rs's own answer was the
+        // outlier, with the reason beside it.
+        const MOVED: &[(&str, &str, &str)] = &[
+            // `line` answered a fixed default here; the cursor evaluator reads
+            // the real position (the two evaluators' cursor-metadata stubs).
+            ("yq", DOC, ".c | line"),
+            // jq collapses a duplicate key (last wins), so `to_entries` has two
+            // entries (captured from jq 1.7.1); eval.rs's owned walk kept all
+            // three. The cursor evaluator, and so the CLI, always answered 2.
+            ("jq", DUP, "to_entries | length"),
+        ];
+
+        let mut differ = Vec::new();
+        let is_moved = |mode: &str, doc: &str, filter: &str| {
+            MOVED
+                .iter()
+                .any(|(m, d, f)| *m == mode && *d == doc && *f == filter)
+        };
+        let mut checked = 0;
+        for (doc, filters) in FILTERS {
+            for filter in *filters {
+                let (old, new) = both::<JqSemantics>(doc, filter);
+                checked += 1;
+                if old != new && !is_moved("jq", doc, filter) {
+                    differ.push(format!(
+                        "jq `{filter}` on {doc}:\n    eval_full {old:?}\n    eval      {new:?}"
+                    ));
+                }
+            }
+        }
+        for filter in DUP_FILTERS {
+            let (old, new) = both::<JqSemantics>(DUP, filter);
+            checked += 1;
+            if old != new && !is_moved("jq", DUP, filter) {
+                differ.push(format!(
+                    "jq `{filter}` on {DUP}:\n    eval_full {old:?}\n    eval      {new:?}"
+                ));
+            }
+        }
+        for (doc, filters) in YQ_FILTERS {
+            for filter in *filters {
+                let (old, new) = both::<YqSemantics>(doc, filter);
+                checked += 1;
+                if old != new && !is_moved("yq", doc, filter) {
+                    differ.push(format!(
+                        "yq `{filter}` on {doc}:\n    eval_full {old:?}\n    eval      {new:?}"
+                    ));
+                }
+            }
+        }
+        assert!(checked >= 150, "the sweep shrank: {checked} rows");
+        assert!(
+            differ.is_empty(),
+            "eval moved from eval_full:\n{}",
+            differ.join("\n")
+        );
     }
 }

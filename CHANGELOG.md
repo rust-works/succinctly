@@ -29,6 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `eval_with_cursor`/`eval_with_cursor_using` return `GenericResult::LazySeq`
   for these shapes, as they already did for `[.]`.
 
+- **jq: the library `succinctly::jq::eval` is the CLI's evaluator** (#3457, #3266).
+  It used to be a second evaluator that decoded the whole value it walked, so on
+  a value the index cannot read (`1.2.3`, `tru`) `path(.a)` on
+  `{"a":1,"b":tru}` and `[.] | length` raised through the library and answered
+  in the CLI. `eval` now hands every query to the generic evaluator's cursor
+  entry and reshapes the answer into a `QueryResult`; there is no per-query
+  routing decision. Path builtins on a document nested 256 levels or deeper
+  return a `QueryResult::Error` (decode-failure-tagged, never a panic; they used
+  to answer up to 384 levels, raising it is #3429). New
+  `QueryResult::try_collect_owned` reports an undecodable cursor as an error
+  where `collect_owned` (documented lossy) returns `null`; `eval_lenient`
+  follows `eval` and keeps an owned `null`/boolean. Cursor-metadata builtins
+  answer from the real document, duplicate keys collapse as in jq, and a yq
+  owned-target computed index now raises on a negative out-of-range index as yq
+  does (`([1,2]+[])[(1*-5)]`, also in the CLI). The list of what changed for
+  library callers is in `docs/compliance/jq/limitations.md`.
+
 - **jq: installing a program or module of many top-level `def`s is linear,
   not `O(defs x program)`** (#3307). Each `def` was installed over everything
   below it and every copy was kept, so 3000 one-literal defs peaked at 1 GB
