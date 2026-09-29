@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: `[., .]` and other array constructors over a `,` of document nodes
+  no longer copy each node** (#3317). Each item of `[a, b, ...]` was built as
+  a whole owned tree, so `[., .]` held the document twice and a later stage
+  (`| length`, `[]`) reindexed the array on top of that: on an 8.4 MB
+  document `[., .]` peaked at 215 MB, `[., .] | length` at 312 MB and
+  `[., .][]` at 396 MB, where jq 1.7.1 needs about 140 MB. In jq mode a body
+  whose every branch is navigation (`.`, `.a`, `.[0]`, `.[]`, ...) with a
+  container among the nodes now keeps them as cursors, as `[.]` already did:
+  46, 24 and 37 MB, with `| length` and `[]` about 2x faster (Apple M5 Max;
+  30 MB input: 618 → 166 MB and 888 → 60 MB). Every node is still checked
+  when the array is collected, so a malformed document fails the whole
+  construction in branch order with nothing printed, as before. Consumers
+  that build the array anyway pay that check on top of the build: `[., .] |
+  tojson` +26%, `[., .] as $a | ...` +33% and `.data | map([., .])` over
+  small records +60% in time, with memory unchanged. Under `--preserve-input`
+  the elements now echo duplicate object keys like `.` and `[.]` do. yq mode,
+  and any body with a computed branch (`[., 1]`), keep the owned route.
+  `eval_with_cursor`/`eval_with_cursor_using` return `GenericResult::LazySeq`
+  for these shapes, as they already did for `[.]`.
+
 - **jq: installing a program or module of many top-level `def`s is linear,
   not `O(defs x program)`** (#3307). Each `def` was installed over everything
   below it and every copy was kept, so 3000 one-literal defs peaked at 1 GB

@@ -2473,14 +2473,21 @@ extension whose purpose is echoing the input's original spelling, and ADR-0018 r
 exempts it because it perturbs no reference-defined filter. That exemption reaches the
 printer, not the evaluator:
 
-| filter          | `sjq`           | `sjq --preserve-input` |
-|-----------------|-----------------|------------------------|
-| `.`             | `{"b":3,"a":2}` | `{"b":1,"a":2,"b":3}`  |
-| `.x` (nested)   | `{"b":3,"a":2}` | `{"b":1,"a":2,"b":3}`  |
-| `length`        | `2`             | `2`                    |
-| `keys`          | `["a","b"]`     | `["a","b"]`            |
-| `[.[]]`         | `[3,2]`         | `[3,2]`                |
-| `to_entries`    | 2 entries       | 2 entries              |
+| filter          | `sjq`                           | `sjq --preserve-input`                      |
+|-----------------|---------------------------------|---------------------------------------------|
+| `.`             | `{"b":3,"a":2}`                 | `{"b":1,"a":2,"b":3}`                       |
+| `.x` (nested)   | `{"b":3,"a":2}`                 | `{"b":1,"a":2,"b":3}`                       |
+| `[., .]`        | `[{"b":3,"a":2},{"b":3,"a":2}]` | `[{"b":1,"a":2,"b":3},{"b":1,"a":2,"b":3}]` |
+| `length`        | `2`                             | `2`                                         |
+| `keys`          | `["a","b"]`                     | `["a","b"]`                                 |
+| `[.[]]`         | `[3,2]`                         | `[3,2]`                                     |
+| `to_entries`    | 2 entries                       | 2 entries                                   |
+
+An array constructor over document nodes renders each node from the document, so `[.]`,
+`[., .]` and `[.a, .b]` echo like `.` does. `[., .]` did so only after
+[#3317](https://github.com/rust-works/succinctly/issues/3317), which stopped building each
+comma item as an owned object first; any item computed rather than read (`[., 1]`) still
+makes the whole array owned, and collapsed.
 
 This is the split the flag already has for numbers, not a new one: `--preserve-input`
 echoes `4e4` as written while `.n + 0` still evaluates to `40000`. The flag chooses how a
