@@ -604,6 +604,23 @@ regressed. What it leaves:
 - **Path-mode folds** (`resolve_reduce`/`resolve_foreach`, under `path`/`del`/`|=`) keep their
   own bare escape slots and were not touched.
 
+## Path-mode slice bounds and a `?//` retry (#3293)
+
+A `?//` in a computed slice bound under `path`/`del`/`=`/`|=`/`+=`/`//=`/`pick` retries past
+the slice error its first alternative hit, as jq's does (`del(.[([[1]] as [$a] ?// [[$a]] |
+$a):])` on `[10,20,30]` is `[10]`, was "Array/string slice indices must be integers"). A
+consumer that stopped `path(f)` on the first alternative no longer hides the retry's own error
+either (`[first(path(.[([0] as [$a] ?// $b | if $a == null then "x" else $a end):])), 9]`
+raises in jq and now here). What it leaves:
+
+- **`no_std` recognises only a direct bind**, for the reason the fold section above gives: a
+  bound that *is* a `?//` bind is covered, and one behind a comma (`.[(0, ([[1]] as [$a] ?//
+  $b | $a // empty)):]`) keeps the previous error when its retry produces nothing or raises.
+  The same holds for `path(f)`'s consumer stop, whose operand is the whole path expression.
+- **A computed index** (`path(.[K])`, `del(.[K])`) keeps its own bare slots in
+  `resolve_index_expr_sink`: `[first(path(.[([0] as [$a] ?// $b | if $a == null then "x"
+  else $a end)])), 9]` is `[[0],9]` here where jq raises. Unchanged by this slice.
+
 ## Where succinctly errors and jq does not
 
 A probe is only admitted to the corpus if jq errors on it, so the corpus is blind to the

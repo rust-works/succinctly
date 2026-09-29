@@ -211,22 +211,71 @@ W_ENTRIES=(
   'identity::::__G__'
 )
 
+# #3293 ("sink-side failure, then clean retry"): a second family, over its
+# own input. Each bound variant's first `?//` alternative makes the slice (or
+# index) *around* it fail, so only a retry past that failure matches jq; the
+# retry then answers, produces nothing, raises, fails to destructure (the
+# last alternative's error must surface), or -- the last variant -- answers
+# first and fails on the retry a consumer's stop causes. `("A"|stderr)`
+# counts the attempts, and stderr is compared exactly. Constructs are
+# `LABEL::TAG::TEMPLATE` like W_ENTRIES, `__B__` standing for the bound; TAG
+# names the #3293 slice expected to close a construct, blank once it has.
+RETRY_INPUT='[10,20,30]'
+B_VARIANTS=(
+  '([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)'
+  '([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)'
+  '([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)'
+  '([[1]] as [$a] ?// {$z} | ("A"|stderr) | $a)'
+  '([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)'
+)
+R_CONSUMERS=(
+  '__W__'
+  '[first(__W__), 9]'
+  '[limit(1; __W__), 9]'
+  '[__W__, 9]'
+)
+R_ENTRIES=(
+  # -- slice 6: CLOSED. resolve_slice_expr_sink/drive_slice_bound (eval.rs),
+  #    path_context_step_computed_slice (eval_generic.rs), and the consumer
+  #    stop each_path_on_owned records for `path(f)`. --
+  'path-slice-start::::path(.[__B__:])'
+  'path-slice-end::::path(.[:__B__])'
+  'path-slice-both::::path(.[__B__:__B__])'
+  'del-slice::::del(.[__B__:])'
+  'update-slice::::.[__B__:] |= ["x"]'
+  'assign-slice::::.[__B__:] = ["x"]'
+  'add-assign-slice::::.[__B__:] += ["x"]'
+  'alt-assign-slice::::.[__B__:] //= 1'
+  'pick-slice::::pick(.[__B__:])'
+  'path-slice-optional::::path(.[__B__:]?)'
+  'path-slice-then-index::::path(.[__B__:] | .[0])'
+  # -- open: the path-mode computed index (resolve_index_expr_sink). --
+  'path-index::#3293 slice 5::path(.[__B__])'
+  'del-index::#3293 slice 5::del(.[__B__])'
+)
+
 # Fed from a file, never a pipe — see jq-fanout-oracle-sweep.sh's own
 # documented SIGPIPE lesson (a filter that never reads `input` leaves the
 # writer holding data, killing a `printf | jq` pipeline with SIGPIPE under
 # load and recording a phantom exit-code divergence).
 STDIN_FILE="$(mktemp -t jq-alt-retry-sweep-stdin)"
-trap 'rm -f "$STDIN_FILE" /tmp/jq-alt-retry-sweep.err /tmp/succ-alt-retry-sweep.err' EXIT
+RETRY_STDIN_FILE="$(mktemp -t jq-alt-retry-sweep-retry-stdin)"
+trap 'rm -f "$STDIN_FILE" "$RETRY_STDIN_FILE" /tmp/jq-alt-retry-sweep.err /tmp/succ-alt-retry-sweep.err' EXIT
 printf '1' > "$STDIN_FILE"
+printf '%s' "$RETRY_INPUT" > "$RETRY_STDIN_FILE"
 
-# Attribute a divergence to an already-known, currently-open #2180 work
-# package, or return 1 for "this is new, look at it". `wp_tag` comes
-# straight from the W_ENTRIES table above (see the design note in the
-# header) rather than being re-derived from filter text.
+# Attribute a divergence to an already-known, currently-open work package,
+# or return 1 for "this is new, look at it". `wp_tag` comes straight from the
+# W_ENTRIES/R_ENTRIES tables above (see the design note in the header) rather
+# than being re-derived from filter text; a W_ENTRIES tag is #2180's, and an
+# R_ENTRIES tag names its own issue.
 classify_divergence() {
   local wp_tag="$1"
   if [[ -n "$wp_tag" ]]; then
-    echo "#2180 $wp_tag"
+    case "$wp_tag" in
+      '#'*) echo "$wp_tag" ;;
+      *) echo "#2180 $wp_tag" ;;
+    esac
     return 0
   fi
   return 1
@@ -239,13 +288,13 @@ divergence_log=""
 declare -a known_labels=()
 
 run_case() {
-  local label="$1" filter="$2" wp_tag="$3"
+  local label="$1" filter="$2" wp_tag="$3" stdin_file="${4:-$STDIN_FILE}"
   total=$((total + 1))
 
   local jq_out jq_err jq_code succ_out succ_err succ_code
-  jq_out="$("$JQ" -c "$filter" <"$STDIN_FILE" 2>/tmp/jq-alt-retry-sweep.err)" && jq_code=0 || jq_code=$?
+  jq_out="$("$JQ" -c "$filter" <"$stdin_file" 2>/tmp/jq-alt-retry-sweep.err)" && jq_code=0 || jq_code=$?
   jq_err="$(cat /tmp/jq-alt-retry-sweep.err)"
-  succ_out="$("$SUCC" jq -c "$filter" <"$STDIN_FILE" 2>/tmp/succ-alt-retry-sweep.err)" && succ_code=0 || succ_code=$?
+  succ_out="$("$SUCC" jq -c "$filter" <"$stdin_file" 2>/tmp/succ-alt-retry-sweep.err)" && succ_code=0 || succ_code=$?
   succ_err="$(cat /tmp/succ-alt-retry-sweep.err)"
 
   if [[ "$jq_out" != "$succ_out" || "$jq_err" != "$succ_err" || "$jq_code" != "$succ_code" ]]; then
@@ -276,6 +325,20 @@ for w_entry in "${W_ENTRIES[@]}"; do
     for c in "${C_SHAPES[@]}"; do
       filter="[${c//__W__/$w_filled}]"
       run_case "$w_label" "$filter" "$wp_tag"
+    done
+  done
+done
+
+for r_entry in "${R_ENTRIES[@]}"; do
+  r_rest="$r_entry"
+  r_label="${r_rest%%::*}"
+  r_rest="${r_rest#*::}"
+  r_tag="${r_rest%%::*}"
+  r_template="${r_rest#*::}"
+  for b in "${B_VARIANTS[@]}"; do
+    r_filled="${r_template//__B__/$b}"
+    for c in "${R_CONSUMERS[@]}"; do
+      run_case "$r_label" "${c//__W__/$r_filled}" "$r_tag" "$RETRY_STDIN_FILE"
     done
   done
 done
