@@ -847,6 +847,14 @@ trait CursorWalkOutput {
     /// A bound node's own value, standing in for a subtree the walk would
     /// otherwise build (#3179), or `None` to walk it anyway.
     fn reuse(value: OwnedValue) -> Option<Self::Out>;
+    /// Hand `out`, just built for `parent`'s node, to the anchors waiting on
+    /// the children `watched` names, each with its step (#3134).
+    fn fill_anchors<C: DocumentCursor>(
+        _parent: &C,
+        _out: &Self::Out,
+        _watched: &[(usize, OwnedValue)],
+    ) {
+    }
 }
 
 /// [`to_owned_cursor`]'s output: the `OwnedValue`.
@@ -865,6 +873,13 @@ impl CursorWalkOutput for BuildOwned {
     }
     fn reuse(value: OwnedValue) -> Option<OwnedValue> {
         Some(value)
+    }
+    fn fill_anchors<C: DocumentCursor>(
+        parent: &C,
+        out: &OwnedValue,
+        watched: &[(usize, OwnedValue)],
+    ) {
+        embed_anchor_fill(parent, out, watched);
     }
 }
 
@@ -910,6 +925,9 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
         // `trailing_element_gap_ok` resolves a value from it (if it even
         // needs to) once, after the loop, not per field.
         let mut last_field: Option<C> = None;
+        // #3134: the members whose node an anchor is waiting on, with their
+        // keys -- empty unless `nested` names one.
+        let mut watched: Vec<(usize, OwnedValue)> = Vec::new();
         while let Some((field, rest)) = f.uncons() {
             // Same key and delimiter handling as `to_owned_at_depth` above,
             // and since #1803 literally the same call -- these two
@@ -927,6 +945,17 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                     nested,
                 )?,
             };
+            if !nested.is_empty() {
+                // A later member with the same key replaces the value, so an
+                // earlier watched member is in no value this walk returns.
+                if map.contains_key(&key) {
+                    watched.retain(|(_, k)| !matches!(k, OwnedValue::String(k) if *k == key));
+                }
+                let node = field.value_cursor.node_id();
+                if nested.contains(&node) {
+                    watched.push((node, OwnedValue::String(key.clone())));
+                }
+            }
             map.insert(key, child);
             last_field = Some(field.value_cursor);
             f = rest;
@@ -941,18 +970,29 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
         // that left `map` empty -- every iteration sets both -- so the split
         // that decision used to make on `map.is_empty()` is unchanged.
         container_tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
-        Ok(B::object(map))
+        let out = B::object(map);
+        if !watched.is_empty() {
+            B::fill_anchors(cursor, &out, &watched);
+        }
+        Ok(out)
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
         let mut is_first = true;
         // #2243: same reasoning as the object arm's own `last_field` above.
         let mut last_elem: Option<C> = None;
+        // #3134: as the object arm's own `watched`, keyed by index.
+        let mut watched: Vec<(usize, OwnedValue)> = Vec::new();
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             // #1677: same gap check as `to_owned_at_depth`'s array loop --
             // #1803 made "same" literal, via the shared `element_gap_ok`.
             if !elem_cursor.element_gap_ok(is_first) {
                 return Err(elem_cursor.malformed_delimiter_error());
+            }
+            if !nested.is_empty() && nested.contains(&elem_cursor.node_id()) {
+                // `items.len()` is this element's index: it is pushed next.
+                let index = i64::try_from(items.len()).unwrap_or(i64::MAX);
+                watched.push((elem_cursor.node_id(), OwnedValue::Int(index)));
             }
             items.push(
                 match embed_shared_nested::<_, B>(&elem_cursor, depth + 1, nested) {
@@ -973,7 +1013,11 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
         // #2211/#2243: same reasoning as the object arm's own check just
         // above, and now literally the same call (#1803).
         container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
-        Ok(B::array(items))
+        let out = B::array(items);
+        if !watched.is_empty() {
+            B::fill_anchors(cursor, &out, &watched);
+        }
+        Ok(out)
     } else {
         if let Some(owned) = scalar_override(&value) {
             return Ok(B::scalar(owned));
@@ -5047,6 +5091,14 @@ pub fn eval<V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
 /// instead give a wrong answer or an error. See
 /// [`crate::jq::walk::uses_cursor_metadata_builtins`].
 pub fn eval_using<S: EvalSemantics, V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
+    with_anchor_scope::<S, _>(expr, || eval_using_unscoped::<S, V>(expr, value))
+}
+
+/// [`eval_using`] inside the anchor scope it opens (#3134).
+fn eval_using_unscoped<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+) -> GenericResult<V> {
     if takes_input_queue_bridge(expr) {
         let owned = owned_or_err!(to_owned_with_cursor::<_, S>(&value, None));
         // #2642: the cursor is `None` here -- `Owned` demotes any `Snapshot`
@@ -5443,9 +5495,14 @@ pub(crate) fn ambient_document_index() -> Option<i64> {
 ///   value -- exactly the condition under which jq's `jv_identical($x, .)`
 ///   holds. This mirrors jq itself, where the binding's own reference is
 ///   what makes the refcount exceed one and forces the copy.
-/// - Scalars are not `Rc`-backed and never enter the table, so a scalar
-///   root (`"s" | . as $x | {k:.} | .k | path($x)`, `[]` in jq) stays a
-///   documented refuse-only residual.
+/// - Scalars are not `Rc`-backed and never enter the table as a binding's
+///   own entry, so a scalar root (`"s" | . as $x | {k:.} | .k | path($x)`,
+///   `[]` in jq) stays a documented refuse-only residual. A navigated scalar
+///   bind enters it as an *anchor* instead (#3134, [`embed_anchor_push`]):
+///   the container it sits in, whose storage `eval::marker_identical` reads
+///   one or more steps above the register. An anchor is reused like an entry
+///   once a materialization has filled it, but `witness_of` never reads it,
+///   so no reader that predates it widens.
 ///
 /// **jq mode only.** Both reads are gated on `S::TAG == EvalTag::Jq`, the
 /// same gate [`eval::reroot_markers`]' promotion uses: yq's node model is
@@ -5478,17 +5535,33 @@ mod embed_table {
     use alloc::vec::Vec;
     use std::cell::{Cell, RefCell};
 
-    /// One in-scope binding: the node it was frozen from, and the value.
+    /// One in-scope binding: the node it was frozen from, and the value --
+    /// or, for an anchor (#3134), the container a binding sits in.
     struct Entry {
+        /// The node `value` materializes. For an anchor still waiting on its
+        /// container ([`fill`]), the bound node itself: that is the node a
+        /// walk meets, and the walk knows its container when it does.
         node: usize,
         document: usize,
         /// Always an `OwnedValue::Array`/`Object` -- [`push`]'s caller
-        /// filters, since only those two are `Rc`-backed.
-        value: OwnedValue,
+        /// filters, since only those two are `Rc`-backed. `None` only for an
+        /// anchor no materialization of its container has filled yet.
+        value: Option<OwnedValue>,
         /// The node's subtree height ([`super::cursor_height`]), computed the
         /// first time a nested reuse asks for it (#3179) and kept, so a bind
         /// never pays for it and a reuse pays once.
         height: Cell<Option<usize>>,
+        /// `Some` for an anchor entry (#3134), `None` for a binding's own.
+        anchor: Option<Anchor>,
+    }
+
+    /// What an anchor entry adds (#3134): the bound node `child` inside
+    /// `node`'s subtree, and the steps from `node` down to it -- `None`
+    /// until known, and for good where `node`'s value does not keep `child`
+    /// (a duplicate key a later member shadows).
+    struct Anchor {
+        child: usize,
+        steps: Option<Vec<OwnedValue>>,
     }
 
     thread_local! {
@@ -5497,12 +5570,20 @@ mod embed_table {
         /// materializer's gate is a plain load rather than a `RefCell`
         /// borrow.
         static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        /// Whether any entry is an anchor -- the resolver's gate for
+        /// tracking positions on a marker it could certify by one (#3134).
+        static ANCHORED: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Whether any binding is in scope at all -- the cheap gate every read
     /// takes first.
     pub(crate) fn active() -> bool {
         ACTIVE.with(Cell::get)
+    }
+
+    /// Whether any anchor entry is in scope (#3134).
+    pub(crate) fn anchored() -> bool {
+        ANCHORED.with(Cell::get)
     }
 
     /// Pops the entry (and any pushed under it) when dropped, including
@@ -5524,26 +5605,70 @@ mod embed_table {
                 let mut t = t.borrow_mut();
                 t.truncate(self.0);
                 ACTIVE.with(|a| a.set(!t.is_empty()));
+                ANCHORED.with(|a| a.set(t.iter().any(|e| e.anchor.is_some())));
             });
         }
+    }
+
+    fn push_entry(entry: Entry) -> Guard {
+        let anchor = entry.anchor.is_some();
+        let previous = TABLE.with(|t| {
+            let mut t = t.borrow_mut();
+            let previous = t.len();
+            t.push(entry);
+            previous
+        });
+        ACTIVE.with(|a| a.set(true));
+        if anchor {
+            ANCHORED.with(|a| a.set(true));
+        }
+        Guard(previous)
     }
 
     /// Register `value` as the materialization of `(node, document)` for as
     /// long as the returned guard lives.
     pub(crate) fn push(node: usize, document: usize, value: OwnedValue) -> Guard {
-        let previous = TABLE.with(|t| {
-            let mut t = t.borrow_mut();
-            let previous = t.len();
-            t.push(Entry {
-                node,
-                document,
-                value,
-                height: Cell::new(None),
-            });
-            previous
-        });
-        ACTIVE.with(|a| a.set(true));
-        Guard(previous)
+        push_entry(Entry {
+            node,
+            document,
+            value: Some(value),
+            height: Cell::new(None),
+            anchor: None,
+        })
+    }
+
+    /// Register `(node, document)`, holding `value`, as the anchor of the
+    /// bound node `child`, `steps` above it (#3134).
+    pub(crate) fn push_anchor(
+        node: usize,
+        document: usize,
+        child: usize,
+        value: OwnedValue,
+        steps: Vec<OwnedValue>,
+    ) -> Guard {
+        push_entry(Entry {
+            node,
+            document,
+            value: Some(value),
+            height: Cell::new(None),
+            anchor: Some(Anchor {
+                child,
+                steps: Some(steps),
+            }),
+        })
+    }
+
+    /// Register an anchor for the bound node `(child, document)` whose
+    /// container is not known yet (#3134): the first walk to build that
+    /// container meets `child` inside it and [`fill`]s it.
+    pub(crate) fn push_pending(child: usize, document: usize) -> Guard {
+        push_entry(Entry {
+            node: child,
+            document,
+            value: None,
+            height: Cell::new(None),
+            anchor: Some(Anchor { child, steps: None }),
+        })
     }
 
     /// The `Rc` an in-scope binding already holds for `(node, document)`,
@@ -5551,24 +5676,35 @@ mod embed_table {
     ///
     /// Innermost first: a re-entered bind of the same node (`. as $x | . as
     /// $y | ...`) shadows the outer one, and the two hold equal values
-    /// anyway.
+    /// anyway. A pending anchor holds no value and is skipped.
     pub(crate) fn shared_for(node: usize, document: usize) -> Option<OwnedValue> {
         TABLE.with(|t| {
             t.borrow()
                 .iter()
                 .rev()
-                .find(|e| e.node == node && e.document == document)
-                .map(|e| e.value.clone())
+                .find(|e| e.node == node && e.document == document && e.value.is_some())
+                .and_then(|e| e.value.clone())
+        })
+    }
+
+    /// Whether some entry of `document` opens before `node` -- the only
+    /// entries that can be one of its ancestors (#3134).
+    pub(crate) fn any_before(node: usize, document: usize) -> bool {
+        TABLE.with(|t| {
+            t.borrow()
+                .iter()
+                .any(|e| e.document == document && e.node < node && e.value.is_some())
         })
     }
 
     /// One pass over the table for a walk about to start at `node` (#3179):
     /// the entry for `node` itself if there is one ([`shared_for`]'s answer),
     /// else every entry's node lying strictly inside the subtree `node`
-    /// opens -- usually none. `hi`, the subtree's closing position (a BP
-    /// `find_close`), is asked for only when some entry of `document` opens
-    /// after `node` at all, which a per-item bind's own later
-    /// materializations never do.
+    /// opens -- usually none. That includes the bound node of an anchor still
+    /// waiting on its container (#3134), which the walk then [`fill`]s.
+    /// `hi`, the subtree's closing position (a BP `find_close`), is asked for
+    /// only when some entry of `document` opens after `node` at all, which a
+    /// per-item bind's own later materializations never do.
     pub(crate) fn at_or_within(
         node: usize,
         document: usize,
@@ -5579,9 +5715,9 @@ mod embed_table {
             if let Some(e) = t
                 .iter()
                 .rev()
-                .find(|e| e.node == node && e.document == document)
+                .find(|e| e.node == node && e.document == document && e.value.is_some())
             {
-                return (Some(e.value.clone()), Vec::new());
+                return (e.value.clone(), Vec::new());
             }
             if !t.iter().any(|e| e.document == document && e.node > node) {
                 return (None, Vec::new());
@@ -5612,7 +5748,7 @@ mod embed_table {
             let e = t
                 .iter()
                 .rev()
-                .find(|e| e.node == node && e.document == document)?;
+                .find(|e| e.node == node && e.document == document && e.value.is_some())?;
             let height = match e.height.get() {
                 Some(h) => h,
                 None => {
@@ -5621,19 +5757,68 @@ mod embed_table {
                     h
                 }
             };
-            Some((e.value.clone(), height))
+            Some((e.value.clone()?, height))
+        })
+    }
+
+    /// Hand every anchor still waiting on the bound node `(child,
+    /// document)` its container: `parent`, whose value a walk just built as
+    /// `value`, with `child` one `step` below it (#3134). The entry becomes
+    /// `parent`'s, so every later materialization of it reuses `value`. A
+    /// no-op when nothing waits.
+    pub(crate) fn fill(
+        child: usize,
+        document: usize,
+        parent: usize,
+        value: &OwnedValue,
+        step: &OwnedValue,
+    ) {
+        TABLE.with(|t| {
+            for e in t.borrow_mut().iter_mut() {
+                if e.node == child && e.document == document && e.value.is_none() {
+                    e.node = parent;
+                    e.value = Some(value.clone());
+                    if let Some(anchor) = e.anchor.as_mut() {
+                        anchor.steps = Some(alloc::vec![step.clone()]);
+                    }
+                }
+            }
+        });
+    }
+
+    /// The value and steps of the innermost filled anchor of the bound node
+    /// `(child, document)` (#3134).
+    pub(crate) fn anchor_for(
+        child: usize,
+        document: usize,
+    ) -> Option<(OwnedValue, Vec<OwnedValue>)> {
+        TABLE.with(|t| {
+            t.borrow().iter().rev().find_map(|e| {
+                let anchor = e.anchor.as_ref()?;
+                if anchor.child != child || e.document != document {
+                    return None;
+                }
+                Some((e.value.clone()?, anchor.steps.clone()?))
+            })
         })
     }
 
     /// The node an in-scope binding was frozen from, if `value` still
     /// shares that binding's container storage -- i.e. if `value` *is* that
-    /// node's own unmodified value.
+    /// node's own unmodified value. A binding's own entries only: an anchor
+    /// proves the same, but is read by `anchor_for` alone, so no reader
+    /// that predates #3134 widens.
     pub(crate) fn witness_of(value: &OwnedValue) -> Option<(usize, usize)> {
         TABLE.with(|t| {
             t.borrow()
                 .iter()
                 .rev()
-                .find(|e| e.value.shares_storage_with(value))
+                .filter(|e| e.anchor.is_none())
+                .find(|e| {
+                    e.value
+                        .as_ref()
+                        .is_some_and(|v| v.shares_storage_with(value))
+                })
                 .map(|e| (e.node, e.document))
         })
     }
@@ -5642,8 +5827,13 @@ mod embed_table {
 #[cfg(not(feature = "std"))]
 mod embed_table {
     use super::OwnedValue;
+    use alloc::vec::Vec;
 
     pub(crate) fn active() -> bool {
+        false
+    }
+
+    pub(crate) fn anchored() -> bool {
         false
     }
 
@@ -5655,8 +5845,26 @@ mod embed_table {
         Guard
     }
 
+    pub(crate) fn push_anchor(
+        _node: usize,
+        _document: usize,
+        _child: usize,
+        _value: OwnedValue,
+        _steps: Vec<OwnedValue>,
+    ) -> Guard {
+        Guard
+    }
+
+    pub(crate) fn push_pending(_child: usize, _document: usize) -> Guard {
+        Guard
+    }
+
     pub(crate) fn shared_for(_node: usize, _document: usize) -> Option<OwnedValue> {
         None
+    }
+
+    pub(crate) fn any_before(_node: usize, _document: usize) -> bool {
+        false
     }
 
     pub(crate) fn witness_of(_value: &OwnedValue) -> Option<(usize, usize)> {
@@ -5667,8 +5875,8 @@ mod embed_table {
         _node: usize,
         _document: usize,
         _hi: impl FnOnce() -> Option<usize>,
-    ) -> (Option<OwnedValue>, alloc::vec::Vec<usize>) {
-        (None, alloc::vec::Vec::new())
+    ) -> (Option<OwnedValue>, Vec<usize>) {
+        (None, Vec::new())
     }
 
     pub(crate) fn shared_with_height(
@@ -5676,6 +5884,22 @@ mod embed_table {
         _document: usize,
         _height_of: impl FnOnce() -> usize,
     ) -> Option<(OwnedValue, usize)> {
+        None
+    }
+
+    pub(crate) fn fill(
+        _child: usize,
+        _document: usize,
+        _parent: usize,
+        _value: &OwnedValue,
+        _step: &OwnedValue,
+    ) {
+    }
+
+    pub(crate) fn anchor_for(
+        _child: usize,
+        _document: usize,
+    ) -> Option<(OwnedValue, Vec<OwnedValue>)> {
         None
     }
 }
@@ -5702,6 +5926,266 @@ pub(crate) fn embed_table_push<S: EvalSemantics>(
         }
         _ => None,
     }
+}
+
+/// Whether the program being evaluated can certify a navigated bind by its
+/// anchor at all (#3134) -- decided once per program by [`with_anchor_scope`]
+/// at the public entry points, so a bind in a program that never reads a
+/// variable in path position pays one thread-local load rather than a walk
+/// of its body per bound value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AnchorScope {
+    /// No entry point decided: every bind asks of its own body
+    /// ([`embed_anchor_push`]'s per-bind gate). A library caller that reaches
+    /// a bind by a route no entry point wraps gets exactly the behaviour a
+    /// wrapped one does, only paying for the walk.
+    Unknown,
+    /// The program reads no variable where a resolver can see it.
+    Off,
+    /// It may: every navigated scalar bind registers its anchor.
+    On,
+}
+
+#[cfg(feature = "std")]
+mod anchor_scope {
+    use super::AnchorScope;
+    use std::cell::Cell;
+
+    thread_local! {
+        static SCOPE: Cell<AnchorScope> = const { Cell::new(AnchorScope::Unknown) };
+    }
+
+    pub(crate) fn get() -> AnchorScope {
+        SCOPE.with(Cell::get)
+    }
+
+    /// Restores the scope that was current when it was made.
+    pub(crate) struct Guard(AnchorScope);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SCOPE.with(|s| s.set(self.0));
+        }
+    }
+
+    pub(crate) fn enter(scope: AnchorScope) -> Guard {
+        Guard(SCOPE.with(|s| s.replace(scope)))
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod anchor_scope {
+    use super::AnchorScope;
+
+    pub(crate) fn get() -> AnchorScope {
+        AnchorScope::Unknown
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter(_scope: AnchorScope) -> Guard {
+        Guard
+    }
+}
+
+/// Run `f` with the [`AnchorScope`] of `expr`, unless an enclosing entry
+/// point already decided one -- a nested evaluation (a re-entry, a bridge)
+/// runs part of the same program, whose answer is already known.
+fn with_anchor_scope<S: EvalSemantics, R>(expr: &Expr, f: impl FnOnce() -> R) -> R {
+    if anchor_scope::get() != AnchorScope::Unknown {
+        return f();
+    }
+    let scope = if S::TAG == EvalTag::Jq && reads_variable_in_path_position(expr) {
+        AnchorScope::On
+    } else {
+        AnchorScope::Off
+    };
+    let _scope = anchor_scope::enter(scope);
+    f()
+}
+
+/// Whether `expr` holds a variable, or a call (whose definition may read
+/// one), inside the argument a resolver runs in path mode: `path(f)`,
+/// `del(f)`, `pick(f)` and every assignment's target (#3134). A marker is
+/// only ever certified there, so a program with none can never read an
+/// anchor. Missing a spelling here can only cost an answer -- a bind in such
+/// a program registers no anchor and refuses as it did before #3134 -- never
+/// a wrong one.
+fn reads_variable_in_path_position(expr: &Expr) -> bool {
+    crate::jq::walk::any_subexpr(expr, &mut |e| {
+        let argument = match e {
+            Expr::Assign { path, .. }
+            | Expr::Update { path, .. }
+            | Expr::CompoundAssign { path, .. }
+            | Expr::AlternativeAssign { path, .. } => path,
+            Expr::Builtin(Builtin::Path(f) | Builtin::Del(f) | Builtin::Pick(f)) => f,
+            _ => return false,
+        };
+        crate::jq::walk::any_subexpr(argument, &mut |v| {
+            matches!(
+                v,
+                Expr::Var(_)
+                    | Expr::TrackedVar(_)
+                    | Expr::FuncCall { .. }
+                    | Expr::NamespacedCall { .. }
+                    | Expr::DefCall { .. }
+                    | Expr::Shared(_)
+            )
+        })
+    })
+}
+
+/// Register the **anchor** of a navigated binding the storage clause cannot
+/// certify (#3134): the container its node sits in, and the steps from
+/// there down to it, for as long as the returned guard lives.
+///
+/// jq's `jv_identical` is pointer equality, and on unmodified parsed input
+/// the `jv` at one step of a container is fixed per node. So a binding from
+/// node `N` is identical to the register exactly when the register's
+/// container at the anchor *shares storage* with a materialization of the
+/// anchor node the table holds, and the register sits the recorded steps
+/// below it -- the same soundness argument the table rests on (a container
+/// sharing the entry's `Rc` is that node's own, unmodified value), applied
+/// one or more steps up. `eval::marker_identical` reads it back through
+/// [`embed_anchor_for`].
+///
+/// Two shapes need it, and nothing else pushes one:
+/// - a **scalar**, which is not `Rc`-backed: `.a.b as $z | path(.a.b |
+///   $z)` is `["a","b"]` in jq 1.7.1. The anchor is `N`'s parent, pushed
+///   *pending* under `N` itself: the first walk to build the parent meets
+///   `N` among its children, knowing the key or index it sits at, and fills
+///   the anchor with the value it built ([`embed_anchor_fill`]). The bind
+///   reads nothing from the document, and a body that never materializes
+///   the parent never pays for it.
+/// - a node below an **already-bound ancestor**, scalar or container:
+///   `.a as $y | .a.b as $z | .a | path(.b | $z)` is `["b"]`, but `.a` is
+///   `$y`'s `Rc`, so its `.b` is `$y`'s materialization, never `$z`'s. The
+///   anchor is that ancestor, with its value and steps known now.
+///
+/// jq mode only, like every read of the table, and only for a body that
+/// can start a resolver invocation at all (`eval::may_enter_resolver`): a
+/// per-record `. as $x | {s: .score}` body never reads an anchor.
+pub(crate) fn embed_anchor_push<S: EvalSemantics, C: DocumentCursor>(
+    origin: Option<&BindOrigin>,
+    value: &OwnedValue,
+    anchor: Option<&C>,
+    body: &Expr,
+) -> Option<EmbedGuard> {
+    // #3134: the program-wide answer first -- one thread-local load, and
+    // every bind of a program that reads no variable in path position stops
+    // here.
+    let scope = anchor_scope::get();
+    if S::TAG != EvalTag::Jq || scope == AnchorScope::Off {
+        return None;
+    }
+    let Some(BindOrigin::Node { node, document }) = origin else {
+        return None;
+    };
+    let (node, document) = (*node, *document);
+    let below_bound = embed_table::active() && embed_table::any_before(node, document);
+    let container = matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
+    if container && !below_bound {
+        return None;
+    }
+    // No entry point decided for this program: ask of the body instead.
+    if scope == AnchorScope::Unknown && !super::eval::may_enter_resolver(body) {
+        return None;
+    }
+    if below_bound {
+        // The one case that reads the document at bind time: an ancestor's
+        // walk reuses the binding's `Rc` rather than descending, so no walk
+        // would ever meet this node to fill a pending anchor.
+        let anchor = anchor.filter(|c| c.document_token() == document)?;
+        let mut steps = Vec::new();
+        let mut cur = anchor.at_node_id(node)?;
+        while let Some(parent) = cur.document_parent() {
+            steps.push(anchor_step(&parent, cur.node_id())?);
+            if let Some(held) = embed_table::shared_for(parent.node_id(), document) {
+                steps.reverse();
+                return Some(embed_table::push_anchor(
+                    parent.node_id(),
+                    document,
+                    node,
+                    held,
+                    steps,
+                ));
+            }
+            cur = parent;
+        }
+    }
+    if container {
+        return None;
+    }
+    Some(embed_table::push_pending(node, document))
+}
+
+/// The step from `parent` to its child node `child` (#3134): the member's
+/// key, or the element's index. `None` for a key node, for a node that is
+/// not a child of `parent`, and for a member a later one with the same key
+/// shadows -- the owned value keeps only the last (jq's own parse does the
+/// same), so the shadowed node is in no value the resolver can stand on.
+fn anchor_step<C: DocumentCursor>(parent: &C, child: usize) -> Option<OwnedValue> {
+    let value = parent.value();
+    if let Some(fields) = value.as_object() {
+        let mut f = fields;
+        let mut found: Option<String> = None;
+        while let Some((field, rest)) = f.uncons() {
+            let key = key_display_string(&field.key)?;
+            match &found {
+                None if field.value_cursor.node_id() == child => found = Some(key.into_owned()),
+                Some(k) if *k == key => return None,
+                _ => {}
+            }
+            f = rest;
+        }
+        found.map(OwnedValue::String)
+    } else if let Some(elements) = value.as_array() {
+        let mut index = 0i64;
+        let mut e = elements;
+        while let Some((elem, rest)) = e.uncons_cursor() {
+            if elem.node_id() == child {
+                return Some(OwnedValue::Int(index));
+            }
+            index += 1;
+            e = rest;
+        }
+        None
+    } else {
+        None
+    }
+}
+
+/// Hand `value`, just materialized for `parent`'s node, to the anchors
+/// waiting on the children `watched` names, each with its step down from
+/// `parent` (#3134; see [`embed_anchor_push`]).
+fn embed_anchor_fill<C: DocumentCursor>(
+    parent: &C,
+    value: &OwnedValue,
+    watched: &[(usize, OwnedValue)],
+) {
+    let (node, document) = (parent.node_id(), parent.document_token());
+    for (child, step) in watched {
+        embed_table::fill(*child, document, node, value, step);
+    }
+}
+
+/// The anchor of the bound node `(child, document)`, if an in-scope binding
+/// registered one and a materialization has filled it (#3134): the anchor
+/// node's value, and the steps from it down to `child`.
+pub(crate) fn embed_anchor_for(
+    child: usize,
+    document: usize,
+) -> Option<(OwnedValue, Vec<OwnedValue>)> {
+    if !embed_table::anchored() {
+        return None;
+    }
+    embed_table::anchor_for(child, document)
+}
+
+/// Whether any anchor is in scope (#3134) -- the resolver's gate for
+/// tracking the positions an anchor is read against.
+pub(crate) fn embed_anchors_active() -> bool {
+    embed_table::anchored()
 }
 
 /// Whether any `as` binding's value is currently registered in the embed
@@ -5874,6 +6358,14 @@ pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
     expr: &Expr,
     cursor: C,
 ) -> GenericResult<C::Value> {
+    with_anchor_scope::<S, _>(expr, || eval_with_cursor_unscoped::<S, C>(expr, cursor))
+}
+
+/// [`eval_with_cursor_using`] inside the anchor scope it opens (#3134).
+fn eval_with_cursor_unscoped<S: EvalSemantics, C: DocumentCursor>(
+    expr: &Expr,
+    cursor: C,
+) -> GenericResult<C::Value> {
     if takes_input_queue_bridge(expr) {
         // `to_owned_cursor` directly rather than `to_owned_with_cursor`: the
         // latter ignores its value argument whenever the cursor is `Some`, so
@@ -5968,6 +6460,17 @@ pub fn eval_each_with_cursor<C: DocumentCursor>(
 /// `eval_each_owned_collect`'s accumulating one. `jq -n 'inputs, debug'`
 /// interleaves like jq because of this branch, not despite it.
 pub fn eval_each_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
+    expr: &Expr,
+    cursor: C,
+    on_value: &mut dyn FnMut(GenericResult<C::Value>) -> bool,
+) -> Option<Control> {
+    with_anchor_scope::<S, _>(expr, || {
+        eval_each_with_cursor_unscoped::<S, C>(expr, cursor, on_value)
+    })
+}
+
+/// [`eval_each_with_cursor_using`] inside the anchor scope it opens (#3134).
+fn eval_each_with_cursor_unscoped<S: EvalSemantics, C: DocumentCursor>(
     expr: &Expr,
     cursor: C,
     on_value: &mut dyn FnMut(GenericResult<C::Value>) -> bool,
@@ -10963,6 +11466,10 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
             // see `embed_table`. The guard pops the entry however the body
             // leaves, error and `break` included.
             let _embed = embed_table_push::<S>(origin.as_ref(), &bound_val);
+            // #3134: and, where the storage clause cannot certify it (a
+            // scalar, or a node below a bound ancestor), its anchor.
+            let _anchor =
+                embed_anchor_push::<S, _>(origin.as_ref(), &bound_val, cursor.as_ref(), body);
             let substituted_body =
                 substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
             eval_each_generic::<S, V>(&substituted_body, value.clone(), optional, cursor, sink)
@@ -41254,6 +41761,156 @@ mod tests {
         // yq mode never shares.
         assert!(embed_shared_for::<YqSemantics, _>(&empty).is_none());
         assert!(embed_at_or_within::<YqSemantics, _>(&empty).0.is_none());
+    }
+
+    /// #3134: a scalar binding's anchor is pushed *pending* on its parent,
+    /// filled by the first materialization of that parent with the value it
+    /// built and the one step down to the bound node, and reused from then
+    /// on; the embed witness (`RootWitness::of_owned`'s source) never reads
+    /// it. A node below an already-bound ancestor anchors on that ancestor at
+    /// once, with every step. A member a later duplicate key shadows gets no
+    /// step, and so can never certify.
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[test]
+    fn embed_anchor_pending_fill_and_steps_3134() {
+        let doc = br#"{"a":{"b":1,"c":2},"x":[5,6],"d":1,"d":2}"#;
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+        let a = root.first_child().unwrap().next_sibling().unwrap();
+        let b = a.first_child().unwrap().next_sibling().unwrap();
+        let x = a.next_sibling().unwrap().next_sibling().unwrap();
+        let x1 = x.first_child().unwrap().next_sibling().unwrap();
+        let d_first = x.next_sibling().unwrap().next_sibling().unwrap();
+        let d_last = d_first.next_sibling().unwrap().next_sibling().unwrap();
+        let document = root.document_token();
+        let node = |c: &crate::json::light::JsonCursor<'_, Vec<u64>>| BindOrigin::Node {
+            node: c.node_id(),
+            document,
+        };
+        let resolver = Expr::Builtin(Builtin::Path(Box::new(Expr::Identity)));
+        let scalar = OwnedValue::Int(1);
+
+        // Gated off: yq mode, and a body that cannot reach a resolver.
+        assert!(embed_anchor_push::<YqSemantics, _>(
+            Some(&node(&b)),
+            &scalar,
+            Some(&root),
+            &resolver
+        )
+        .is_none());
+        assert!(embed_anchor_push::<JqSemantics, _>(
+            Some(&node(&b)),
+            &scalar,
+            Some(&root),
+            &Expr::Identity
+        )
+        .is_none());
+        // A container with no bound ancestor needs none: storage decides.
+        let a_value = to_owned_cursor::<JqSemantics, _>(&a).unwrap();
+        assert!(embed_anchor_push::<JqSemantics, _>(
+            Some(&node(&a)),
+            &a_value,
+            Some(&root),
+            &resolver
+        )
+        .is_none());
+
+        {
+            let _anchor = embed_anchor_push::<JqSemantics, _>(
+                Some(&node(&b)),
+                &scalar,
+                Some(&root),
+                &resolver,
+            )
+            .unwrap();
+            assert!(embed_anchors_active());
+            assert!(
+                embed_anchor_for(b.node_id(), document).is_none(),
+                "pending until a materialization of `.a` fills it"
+            );
+            let first = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+            let OwnedValue::Object(map) = &first else {
+                panic!("an object root")
+            };
+            let (held, steps) = embed_anchor_for(b.node_id(), document).unwrap();
+            assert!(
+                held.shares_storage_with(&map["a"]),
+                "the value the walk built"
+            );
+            assert_eq!(steps, vec![OwnedValue::String("b".into())]);
+            let again = to_owned_cursor::<JqSemantics, _>(&a).unwrap();
+            assert!(again.shares_storage_with(&held), "reused from then on");
+            assert!(
+                embed_witness_of(&held).is_none(),
+                "an anchor is not a binding's own entry"
+            );
+        }
+        assert!(!embed_anchors_active(), "popped with its guard");
+
+        {
+            let _anchor = embed_anchor_push::<JqSemantics, _>(
+                Some(&node(&x1)),
+                &scalar,
+                Some(&root),
+                &resolver,
+            )
+            .unwrap();
+            to_owned_cursor::<JqSemantics, _>(&x).unwrap();
+            let (_, steps) = embed_anchor_for(x1.node_id(), document).unwrap();
+            assert_eq!(steps, vec![OwnedValue::Int(1)], "an element's index");
+        }
+
+        {
+            let _first = embed_anchor_push::<JqSemantics, _>(
+                Some(&node(&d_first)),
+                &scalar,
+                Some(&root),
+                &resolver,
+            )
+            .unwrap();
+            let _last = embed_anchor_push::<JqSemantics, _>(
+                Some(&node(&d_last)),
+                &scalar,
+                Some(&root),
+                &resolver,
+            )
+            .unwrap();
+            to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+            assert!(
+                embed_anchor_for(d_first.node_id(), document).is_none(),
+                "shadowed by the later `d`"
+            );
+            let (_, steps) = embed_anchor_for(d_last.node_id(), document).unwrap();
+            assert_eq!(steps, vec![OwnedValue::String("d".into())]);
+        }
+
+        {
+            let _bound = embed_table_push::<JqSemantics>(Some(&node(&a)), &a_value).unwrap();
+            let _anchor = embed_anchor_push::<JqSemantics, _>(
+                Some(&node(&b)),
+                &scalar,
+                Some(&root),
+                &resolver,
+            )
+            .unwrap();
+            let (held, steps) = embed_anchor_for(b.node_id(), document).unwrap();
+            assert!(
+                held.shares_storage_with(&a_value),
+                "the bound ancestor's own Rc"
+            );
+            assert_eq!(steps, vec![OwnedValue::String("b".into())]);
+            // A container below it anchors too: `.a`'s materialization is
+            // the ancestor's, never its own.
+            let root_value = to_owned_cursor::<JqSemantics, _>(&root).unwrap();
+            let _outer = embed_table_push::<JqSemantics>(Some(&node(&root)), &root_value).unwrap();
+            let _inner = embed_anchor_push::<JqSemantics, _>(
+                Some(&node(&a)),
+                &a_value,
+                Some(&root),
+                &resolver,
+            )
+            .unwrap();
+        }
     }
 
     /// `def d0: .; def d1: .; ...` (`defs` of them) over `main`.

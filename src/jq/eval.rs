@@ -32498,7 +32498,10 @@ impl Frame {
     /// A fresh invocation, rooted at `expr`'s input.
     fn enter(expr: &Expr) -> Self {
         let invocation = NEXT_INVOCATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u64;
-        let at = may_bind_navigated(expr).then(PathPrefix::root);
+        // #3134: a navigated binding's marker certified by its anchor is read
+        // against the frame's position, so an anchored marker switches `at`
+        // on exactly as a binding inside `expr` does.
+        let at = (may_bind_navigated(expr) || may_certify_by_anchor(expr)).then(PathPrefix::root);
         Self {
             invocation,
             at,
@@ -33202,6 +33205,14 @@ fn reentry_can_observe(expr: &Expr, rewrite: &dyn Fn(&Tracked) -> Option<Origin>
     rewritable && resolver
 }
 
+/// Whether evaluating `expr` can start a resolver invocation anywhere in it
+/// -- [`may_enter_resolver_node`] over every node. `eval_generic`'s anchor
+/// push (#3134) gates on it: a body that cannot reach a resolver never reads
+/// an anchor.
+pub(crate) fn may_enter_resolver(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut may_enter_resolver_node)
+}
+
 /// Whether evaluating `node` itself can start a resolver invocation -- see
 /// [`reentry_can_observe`], which asks this of every node in the
 /// expression. Conservative: every builtin and every call counts (a `def`
@@ -33265,6 +33276,167 @@ fn may_bind_navigated(expr: &Expr) -> bool {
                 if patterns.iter().any(|p| !matches!(p, Pattern::Var(_)))
         )
     })
+}
+
+/// Whether `expr` holds a marker an anchor could certify (#3134): one bound
+/// from a document node, while some anchor is in scope at all. The second
+/// half of [`Frame::enter`]'s gate on `at` -- the anchor clause of
+/// [`marker_identical`] reads the frame's position, so it needs one.
+fn may_certify_by_anchor(expr: &Expr) -> bool {
+    super::eval_generic::embed_anchors_active()
+        && any_subexpr(
+            expr,
+            &mut |e| matches!(e, Expr::TrackedVar(marker) if matches!(marker.node, Some(BindOrigin::Node { .. }))),
+        )
+}
+
+/// The root each live resolver invocation started from, by
+/// [`Frame::invocation`] (#3134) -- what [`anchored_identical`] navigates
+/// from to reach the register's container. Pushed by
+/// `resolve_terminal_sink` only while an anchor is in scope, and popped when
+/// that invocation ends, however it ends.
+///
+/// `std` only, the same `thread_local!`-with-RAII-guard shape and the same
+/// degradation as `eval_generic`'s `embed_table`, which is the only source of
+/// anchors: without `std` there are none, so nothing is ever looked up.
+#[cfg(feature = "std")]
+mod invocation_roots {
+    use super::OwnedValue;
+    use alloc::vec::Vec;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ROOTS: RefCell<Vec<(u64, OwnedValue)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Pops the root (and any pushed under it) when dropped.
+    pub(crate) struct Guard(usize);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ROOTS.with(|r| r.borrow_mut().truncate(self.0));
+        }
+    }
+
+    pub(crate) fn push(invocation: u64, root: OwnedValue) -> Guard {
+        ROOTS.with(|r| {
+            let mut r = r.borrow_mut();
+            let previous = r.len();
+            r.push((invocation, root));
+            Guard(previous)
+        })
+    }
+
+    /// The root `invocation` started from, if it is live.
+    pub(crate) fn get(invocation: u64) -> Option<OwnedValue> {
+        ROOTS.with(|r| {
+            r.borrow()
+                .iter()
+                .rev()
+                .find(|(i, _)| *i == invocation)
+                .map(|(_, root)| root.clone())
+        })
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod invocation_roots {
+    use super::OwnedValue;
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn push(_invocation: u64, _root: OwnedValue) -> Guard {
+        Guard
+    }
+
+    pub(crate) fn get(_invocation: u64) -> Option<OwnedValue> {
+        None
+    }
+}
+
+/// The anchor clause of [`marker_identical`] (#3134): whether the register
+/// at `frame`'s position is the very node `marker` was bound from, proven by
+/// the container its binding anchored (`eval_generic::embed_anchor_push`).
+///
+/// The register sits at `P` in its invocation, and the anchor names a node
+/// `A`, held by the embed table, and the steps from `A` down to the bound
+/// node. The clause navigates the invocation's root along `P` minus that
+/// many trailing steps and requires the container it reaches to *share
+/// storage* with `A`'s held value, then requires `P`'s trailing components
+/// to be exactly those steps. Sharing storage makes that container `A`'s own
+/// unmodified value (the embed table's argument: its strong reference forces
+/// every write to copy first), an unmodified container's child at a step is
+/// the one node the document has there, and a resolver never writes -- so
+/// the register is the bound node, which is jq's `jv_identical` on parsed
+/// input, where every number and string is its own allocated `jv`. An
+/// equal-valued sibling, another element, or anything past a write or a
+/// rebuild fails one of the two checks and refuses, as it does in jq.
+///
+/// A component other than a plain field or index, or a position the frame
+/// could not prove (`at` is `None`), refuses: the clause can only ever
+/// under-accept.
+fn anchored_identical(marker: &Tracked, frame: &Frame) -> bool {
+    let Some(BindOrigin::Node { node, document }) = &marker.node else {
+        return false;
+    };
+    let Some(at) = frame.at.as_ref() else {
+        return false;
+    };
+    let Some((held, steps)) = super::eval_generic::embed_anchor_for(*node, *document) else {
+        return false;
+    };
+    let path = at.to_vec();
+    let Some(split) = path.len().checked_sub(steps.len()) else {
+        return false;
+    };
+    if steps.is_empty() {
+        return false; // omni-dev: coverage tolerate-line reason="unreachable: an anchor is always a proper ancestor, so it records at least one step (#3134)"
+    }
+    let Some(root) = invocation_roots::get(frame.invocation) else {
+        return false;
+    };
+    let mut current = &root;
+    for component in &path[..split] {
+        match anchor_component_step(current, component) {
+            Some((next, _)) => current = next,
+            None => return false,
+        }
+    }
+    if !current.shares_storage_with(&held) {
+        return false;
+    }
+    for (component, step) in path[split..].iter().zip(&steps) {
+        match anchor_component_step(current, component) {
+            Some((next, key)) if key == *step => current = next,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// One resolver path component applied to `value`, with the step it takes
+/// spelled the way `eval_generic::anchor_step` records one (#3134): a field
+/// of an object, or an in-range element of an array, a negative index
+/// counted from the end. A `?` component (`.b?`) took its inner step: the
+/// frame only moves on its success. `None` for every other component or
+/// mismatch.
+fn anchor_component_step<'v>(
+    value: &'v OwnedValue,
+    component: &Expr,
+) -> Option<(&'v OwnedValue, OwnedValue)> {
+    match (value, component) {
+        (_, Expr::Optional(inner)) => anchor_component_step(value, inner),
+        (OwnedValue::Object(map), Expr::Field(name)) => {
+            Some((map.get(name.as_str())?, OwnedValue::String(name.clone())))
+        }
+        (OwnedValue::Array(items), Expr::Index { idx, .. }) => {
+            let len = i64::try_from(items.len()).ok()?;
+            let slot = if *idx < 0 { len + *idx } else { *idx };
+            let item = items.get(usize::try_from(slot).ok()?)?;
+            Some((item, OwnedValue::Int(slot)))
+        }
+        _ => None,
+    }
 }
 
 /// A branch's provenance mark (#1466, generalised by #2042): whether its
@@ -38649,8 +38821,9 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
 }
 
 /// Whether `marker` certifies against `target` -- storage identity (jq
-/// mode, #3177), node identity (`Frame::certifies`) or, failing both, jq's
-/// `jv_identical` null/bool value-identity carve-out (#3136). Shared by
+/// mode, #3177), node identity (`Frame::certifies`), jq's `jv_identical`
+/// null/bool value-identity carve-out (#3136) or, jq mode, the storage of
+/// the container the bind is anchored in (#3134, [`anchored_identical`]). Shared by
 /// `resolve_node_eager`'s and `resolves_to_register`'s otherwise-identical
 /// `Expr::TrackedVar` arms so a future refinement of this rule can't apply
 /// to one and silently miss the other, the same duplication risk
@@ -38681,8 +38854,10 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
 /// crosses `eval_on_owned`'s round trip), every node is a fresh copy and
 /// the clause is false where jq's pointer equality answers `[0]`; recorded
 /// in `docs/compliance/jq/limitations.md`. Scalars are not `Rc`-backed and
-/// never match, which costs the refusal jq's by-value number identity would
-/// not give -- a documented residual, never a wrong acceptance.
+/// never match here; a navigated scalar bind is certified instead by its
+/// anchor ([`anchored_identical`], #3134), the storage of the container it
+/// sits in, which is also what certifies a node below an already-bound
+/// ancestor, whose materialization is the ancestor's and never its own.
 ///
 /// The resolver only ever holds the pointer on the routes that hand it the
 /// caller's own tree ([`path_over_owned`], [`owned_path_door`]); after a
@@ -38698,7 +38873,9 @@ fn marker_identical<S: EvalSemantics>(
 ) -> bool {
     (S::TAG == EvalTag::Jq && marker.value.shares_storage_with(target))
         || (marker.value == *target
-            && (frame.certifies(&marker.origin) || null_bool_identical(&marker.value, target)))
+            && (frame.certifies(&marker.origin)
+                || null_bool_identical(&marker.value, target)
+                || (S::TAG == EvalTag::Jq && anchored_identical(marker, frame))))
 }
 
 /// Whether `expr`, given it runs to completion without raising or
@@ -46239,12 +46416,17 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
     // and the document `path()`/`=`/`|=`/`del()` were actually called on is
     // always fully trackable (the untracked marker, #843, exists only for
     // the value `resolve_catch` synthesizes for a `catch` handler).
+    let frame = Frame::enter(expr);
+    // #3134: an anchored marker is certified by navigating from this
+    // invocation's own root, so record it for as long as the invocation runs.
+    let _root = (frame.at.is_some() && super::eval_generic::embed_anchors_active())
+        .then(|| invocation_roots::push(frame.invocation, input.clone()));
     let flow = resolve_node_sink::<S>(
         expr,
         input,
         true,
         &Snapshot::No,
-        &Frame::enter(expr),
+        &frame,
         Keep::First,
         &mut |branch| {
             // #2691: the reset just below discards a violation this sink
