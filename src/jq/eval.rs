@@ -75982,9 +75982,9 @@ mod tests {
 
     /// #3440: jq multiplies in doubles, so a zero product carries the XOR of
     /// its operands' signs and a negative one prints `-0`. The all-integer
-    /// path used to return `Int(0)` whenever the zero was on the left
-    /// (`0 * -1`) while `-1 * 0` already printed `-0`. Rows captured live
-    /// against jq 1.7.1.
+    /// path used to return `Int(0)` for every such product (`0 * -1` and
+    /// `-1 * 0` alike), while an operand past 2^53 took the float fallback
+    /// and already printed `-0`. Rows captured live against jq 1.7.1.
     #[test]
     fn test_arithmetic_mul_zero_product_sign_3440() {
         // The issue's own table.
@@ -76021,6 +76021,11 @@ mod tests {
         ] {
             assert_eq!(outputs(b"0", filter), [want], "{filter}");
         }
+        // An operand past 2^53 takes `jq_checked_int_arith`'s float
+        // fallback; the zero guard sits ahead of it, and both agree.
+        assert_eq!(outputs(b"0", "-9007199254740993 * 0"), ["-0"]);
+        assert_eq!(outputs(b"0", "0 * -9007199254740993"), ["-0"]);
+
         // The same literal arriving as a document number.
         assert_eq!(outputs(b"-0", ". * 1"), ["-0"]);
         assert_eq!(outputs(b"-0", ". * -1"), ["0"]);
