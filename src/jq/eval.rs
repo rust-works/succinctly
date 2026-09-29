@@ -41360,13 +41360,39 @@ fn drive_fold_source<S: EvalSemantics>(
             // ambient shape whose paths come back relative to it
             // (`FoldSourceAmbient::relocate`, #2388), mirroring
             // `FoldRegister::relocate`'s own trackable arm.
-            let register_path = branch.trackable.then(|| match relocate_base {
-                Some(base) => PathPrefix::extend_many(base, branch.path.to_vec()),
-                None => Rc::clone(&branch.path),
-            });
+            let rebase = |path: &Rc<PathPrefix>| match relocate_base {
+                Some(base) => PathPrefix::extend_many(base, path.to_vec()),
+                None => Rc::clone(path),
+            };
+            let register_path = branch.trackable.then(|| rebase(&branch.path));
+            // #2159: an *untracked* element can still have moved the
+            // register -- `.a | tostring` navigates, then computes -- and
+            // the branch says where: an untracked branch that navigated
+            // keeps the register's own path, and `resolve_seq` carries the
+            // register's value alongside it (`carry_register`, #1573). A
+            // branch still at the root never navigated (a literal, an `as`
+            // source, a conditional whose taken arm computes), so the
+            // register stayed put.
+            let moved = if branch.trackable || branch.path.depth() == 0 {
+                MovedRegister::Unmoved
+            } else {
+                match branch.register.into_unmoved() {
+                    // Moved out, not cloned: `into_owned_value` already made
+                    // it an owned `Cow`, so this is free unless it borrows.
+                    Some(register) => MovedRegister::At {
+                        path: rebase(&branch.path),
+                        value: register.into_owned(),
+                    },
+                    // Navigated, then a stage the resolver cannot see
+                    // inside (`first`, `add`, a `def`): jq indexed within
+                    // it, so the register's position is unknowable here.
+                    None => MovedRegister::Lost,
+                }
+            };
             step(FoldSourceValue {
                 value: branch.value.into_owned(),
                 register_path,
+                moved,
             })
         },
     );
@@ -41395,6 +41421,7 @@ fn drive_fold_source_by_value<S: EvalSemantics>(
             step(FoldSourceValue {
                 value,
                 register_path: None,
+                moved: MovedRegister::Unmoved,
             })
         },
     )
@@ -41438,13 +41465,47 @@ fn reclaim_fold_escape(
 /// call -- mirroring real jq's single shared path register, which SOURCE's
 /// own navigation moves just as INIT's does (confirmed live against jq
 /// 1.7.1; see [`resolve_reduce`]'s own doc comment for the derivation).
-/// `None` means this element was merely computed (a literal, `keys[]`'s
-/// own untracked output, ...), in which case UPDATE is checked against the
-/// fold's usual persistent register exactly as it always has been --
-/// [`drive_fold_source`]'s pre-#2031 behaviour, unchanged for this case.
+/// `None` means this element's *final* stage computed its value (a literal,
+/// `keys[]`'s own untracked output, `.a | tostring`, ...). That says nothing
+/// about whether the source *navigated* on the way there (#2159): a literal
+/// never touched jq's register, so UPDATE is checked against the fold's usual
+/// persistent one, but `.a | tostring` ran a real `INDEX` first and moved it
+/// -- which is what [`FoldSourceValue::moved`] records.
 struct FoldSourceValue {
     value: OwnedValue,
     register_path: Option<Rc<PathPrefix>>,
+    /// Where jq's register sits once this element is emitted, when the
+    /// element is *not* itself register-derived (#2159). Always
+    /// [`MovedRegister::Unmoved`] when `register_path` is `Some`.
+    moved: MovedRegister,
+}
+
+/// Where a source element left jq's path register, for an element that was
+/// not itself reached by navigation (#2159).
+///
+/// `register_path.is_none()` says the element's *final* stage computed its
+/// value. It does not say the register never moved: `.a | tostring` runs a
+/// real `INDEX` first, which moves jq's shared register onto `.a`, and the
+/// `tostring` after it only declines to move it further. UPDATE and EXTRACT
+/// then navigate against *that* register, not the fold's INIT-seeded one --
+/// `path(foreach (.a|tostring) as $k (.; .a))` raises in jq, and on a `null`
+/// document `path(foreach (.a|tostring) as $k (.; .))` is `["a"]`.
+#[derive(Clone)]
+enum MovedRegister {
+    /// The source never navigated to this element (a literal, an `as`
+    /// source, an untaken navigating branch): the fold's persistent
+    /// register is where jq's register is.
+    Unmoved,
+    /// The source navigated and then computed: the register is at `path`
+    /// (absolute, already rebased) holding `value`.
+    At {
+        path: Rc<PathPrefix>,
+        value: OwnedValue,
+    },
+    /// The source navigated and then ran a stage the resolver cannot see
+    /// inside, so the register's position is unknown. Refusing costs an
+    /// answer; keeping the stale register would fabricate a path.
+    Lost,
 }
 
 /// What a witness route resolved an `as` source to: the bound values, each
@@ -41714,9 +41775,11 @@ struct PatternRegister {
 /// - `elem.register_path.is_some()`: the source element's own position *is*
 ///   the register (confirmed live: `path(foreach .b as {c:$x} (.; .; $x))`
 ///   is `["b","c"]`).
-/// - `None` (a computed element): jq's register is untouched by this
-///   element, so `path_intact` is checked against wherever it already was —
-///   the fold's own persistent `reg` — which only ever admits the walk
+/// - `None` (a computed element the source never navigated to --
+///   [`MovedRegister::Unmoved`]; one it navigated to and then computed
+///   seeds from where it left the register instead, #2159): jq's register
+///   is untouched by this element, so `path_intact` is checked against
+///   wherever it already was — the fold's own persistent `reg` — which only ever admits the walk
 ///   through `PathPatternMode::step`'s `null`/`bool` identity exception, never
 ///   through `reg.value == elem.value` (a structural coincidence, not a real
 ///   `jv_identical`). Confirmed live: `path(foreach (null) as {a:$x} (.; .;
@@ -41725,14 +41788,28 @@ struct PatternRegister {
 ///   document ("near attempt to access element \"a\" of 5") even though `$x`
 ///   goes unused.
 fn fold_pattern_seed(elem: &FoldSourceValue, reg: &FoldRegister) -> PatternRegister {
-    match &elem.register_path {
-        Some(path) => PatternRegister {
+    match (&elem.register_path, &elem.moved) {
+        (Some(path), _) => PatternRegister {
             path: Rc::clone(path),
             value: elem.value.clone(),
             is_input: true,
             known: true,
         },
-        None => PatternRegister {
+        // #2159: the element was computed after the source navigated, so
+        // the register is where that navigation left it -- not the element.
+        (None, MovedRegister::At { path, value }) => PatternRegister {
+            path: Rc::clone(path),
+            value: value.clone(),
+            is_input: false,
+            known: true,
+        },
+        (None, MovedRegister::Lost) => PatternRegister {
+            path: Rc::clone(&reg.path),
+            value: reg.value.clone(),
+            is_input: false,
+            known: false,
+        },
+        (None, MovedRegister::Unmoved) => PatternRegister {
             path: Rc::clone(&reg.path),
             value: reg.value.clone(),
             is_input: false,
@@ -42856,10 +42933,19 @@ fn each_fold_bind<S: EvalSemantics>(
 /// instead: a refusal where jq might answer, never an answer jq would not
 /// give.
 fn fold_walk_refusal_is_guess(elem: &FoldSourceValue, reg: &FoldRegister) -> bool {
-    elem.register_path.is_none()
-        && (!reg.trackable
-            || (!matches!(elem.value, OwnedValue::Null | OwnedValue::Bool(_))
-                && elem.value == reg.value))
+    if elem.register_path.is_some() {
+        return false;
+    }
+    // #2159: the register the walk compared against is the moved one when
+    // the source navigated before computing this element.
+    let (trackable, register) = match &elem.moved {
+        MovedRegister::Unmoved => (reg.trackable, &reg.value),
+        MovedRegister::At { value, .. } => (true, value),
+        MovedRegister::Lost => (false, &reg.value),
+    };
+    !trackable
+        || (!matches!(elem.value, OwnedValue::Null | OwnedValue::Bool(_))
+            && elem.value == *register)
 }
 
 /// The resolver's own two refusal kinds (#2979): a pattern step or a
@@ -43816,9 +43902,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             // - `elem.register_path.is_some()`: the element's own position
             //   is the register (confirmed live: `path(foreach .b as
             //   {c:$x} (.; .; $x))` is `["b","c"]`, not a refusal).
-            // - `None` (a computed element -- a literal source, or one whose
-            //   own navigation was untracked): jq's register is untouched by
-            //   this element, so path_intact is checked against wherever it
+            // - `None` (a computed element -- a literal source; one whose own
+            //   navigation was untracked and *moved* the register is the
+            //   [`MovedRegister::At`] arm instead, #2159): jq's register is
+            //   untouched by this element, so path_intact is checked against wherever it
             //   already was — the fold's own persistent `reg` (mirroring the
             //   bare-`$var` `None` arm below) — which only ever admits the
             //   walk through `PathPatternMode::step`'s `null`/`bool` identity
@@ -43884,8 +43971,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             );
                             (step_reg, at_register)
                         } else {
-                            match &elem.register_path {
-                                Some(path) => {
+                            match (&elem.register_path, &elem.moved) {
+                                (Some(path), _) => {
                                     let step_reg = FoldRegister {
                                         path: Rc::clone(path),
                                         value: elem.value.clone(),
@@ -43962,7 +44049,46 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 // being the register's value, so step 2 is genuinely
                                 // untracked. Both fall out of the identity check; neither
                                 // falls out of the path comparison.
-                                None => (
+                                // #2159: the element was computed *after* the source
+                                // navigated (`.a | tostring`), which moved jq's register
+                                // onto where it navigated to -- so UPDATE/EXTRACT are
+                                // checked against that register, seeded exactly as the
+                                // register-derived arm above seeds its own, rather than
+                                // against the INIT-seeded persistent one. `state` (the
+                                // accumulator) is not the register's node here, which is
+                                // what `register_identical` is asked: a `null`/`bool`
+                                // accumulator still re-establishes against a `null`/`bool`
+                                // register, anything else is refused, as in jq.
+                                (None, MovedRegister::At { path, value }) => {
+                                    let step_reg = FoldRegister {
+                                        path: Rc::clone(path),
+                                        value: value.clone(),
+                                        trackable: true,
+                                        frame: frame.extend(path),
+                                    };
+                                    let at_register = register_identical::<S>(
+                                        &step_reg.value,
+                                        &step_reg.frame,
+                                        &state,
+                                        &state_snapshot,
+                                    );
+                                    (step_reg, at_register)
+                                }
+                                // #2159: the source navigated and then ran a stage the
+                                // resolver cannot see inside, so the register is
+                                // somewhere unknown. An untracked register admits
+                                // nothing (`FoldRegister::identical` needs `trackable`),
+                                // so every navigation UPDATE/EXTRACT attempts refuses.
+                                (None, MovedRegister::Lost) => (
+                                    FoldRegister {
+                                        path: Rc::clone(&reg.path),
+                                        value: reg.value.clone(),
+                                        trackable: false,
+                                        frame: reg.frame.unknown(),
+                                    },
+                                    false,
+                                ),
+                                (None, MovedRegister::Unmoved) => (
                                     FoldRegister {
                                         path: Rc::clone(&reg.path),
                                         value: reg.value.clone(),

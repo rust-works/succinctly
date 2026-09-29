@@ -57547,6 +57547,163 @@ fn test_foreach_source_navigation_clobber_blocks_a_write_2031() -> Result<()> {
     Ok(())
 }
 
+/// #2159: a fold source whose *final* stage computes (`tostring`, `length`,
+/// `type`, `tonumber`, ...) has still run a real `INDEX` before it, and that
+/// moves jq's shared path register onto the navigated position. UPDATE and
+/// EXTRACT then navigate against *that* register, not the INIT-seeded one.
+/// Before the fix the element looked like an ordinary computed value
+/// (`register_path == None`), so `path(foreach (.a|tostring) as $k (.; .a))`
+/// answered `["a"]` where jq raises -- and the write twin
+/// (`(foreach ... ) = 9`) mutated a document jq leaves untouched.
+///
+/// Every row is a live jq 1.7.1 capture: exit 5, nothing on stdout, and the
+/// message below on stderr.
+#[test]
+fn test_foreach_source_navigation_then_computation_still_clobbers_register_2159() -> Result<()> {
+    const DOC: &str = r#"{"a":1,"b":{"c":2}}"#;
+    let near_a =
+        r#"Invalid path expression near attempt to access element "a" of {"a":1,"b":{"c":2}}"#;
+    let near_b =
+        r#"Invalid path expression near attempt to access element "b" of {"a":1,"b":{"c":2}}"#;
+    let result_doc = r#"Invalid path expression with result {"a":1,"b":{"c":2}}"#;
+    for (filter, needle) in [
+        // The issue's own repro and its write twin, plus `|=` and `del`.
+        ("path(foreach (.a|tostring) as $k (.; .a))", near_a),
+        ("(foreach (.a|tostring) as $k (.; .a)) = 9", near_a),
+        ("(foreach (.a|tostring) as $k (.; .a)) |= 9", near_a),
+        ("del(foreach (.a|tostring) as $k (.; .a))", near_a),
+        // Any non-navigating tail, not just `tostring`.
+        ("path(foreach (.b|length) as $k (.; .a))", near_a),
+        ("path(foreach (.a|tostring|tonumber) as $k (.; .b))", near_b),
+        // The register moved, so even a bare `.` no longer names it.
+        ("path(foreach (.a|tostring) as $k (.; .))", result_doc),
+        // EXTRACT is checked against the moved register too.
+        ("path(foreach (.a|tostring) as $k (.; .; .a))", near_a),
+        ("path(foreach (.a|tostring) as $k (.; .a; .))", near_a),
+        // A fan-out source: the first element already moves it.
+        ("[path(foreach ((.a,.b)|tostring) as $k (.; .a))]", near_a),
+        // The register moves *between* elements: the unmoved `1` streams
+        // its path, the moved one raises (and the other order raises first).
+        ("path(foreach ((.a|tostring), 1) as $k (.; .))", result_doc),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(DOC))?;
+        assert_eq!(stdout, "", "`{filter}` must not emit: stderr: {stderr:?}");
+        assert!(stderr.contains(needle), "`{filter}`: stderr: {stderr:?}");
+        assert_eq!(code, 5, "`{filter}`: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (.a|first) as $k (.; .a))"],
+        Some(r#"{"a":[1]}"#),
+    )?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr
+            .contains(r#"Invalid path expression near attempt to access element "a" of {"a":[1]}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5);
+
+    // The `1` before it is unmoved and streams `[]` first, exactly as jq
+    // does, before the moved element raises.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (1, (.a|tostring)) as $k (.; .))"],
+        Some(DOC),
+    )?;
+    assert_eq!(stdout, "[]\n", "stderr: {stderr:?}");
+    assert!(stderr.contains(result_doc), "stderr: {stderr:?}");
+    assert_eq!(code, 5);
+
+    // A destructuring pattern walks against the moved register as well.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (.b|[.]) as [$x] (.; .; $x))"],
+        Some(DOC),
+    )?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"near attempt to access element 0 of [{"c":2}]"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5);
+    Ok(())
+}
+
+/// #2159's other face: the register the source left behind is not only a
+/// reason to refuse, it is where UPDATE *resumes* when the accumulator is
+/// identical to it. `null`/`true`/`false` are identical to a same-kind
+/// register wherever it sits, so a `null` document (or `null` accumulator)
+/// re-establishes against the moved register and the answer is rooted at
+/// the source's navigated path -- `["a"]`, not the `[]` this used to print.
+/// Every row is a live jq 1.7.1 capture.
+#[test]
+fn test_foreach_source_navigation_then_computation_relocates_register_2159() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            "null",
+            "path(foreach (.a|tostring) as $k (.; .))",
+            r#"["a"]"#,
+        ),
+        // INIT moved the register to `.b` first; the source's `.a` then
+        // extends *that* position.
+        (
+            "null",
+            "path(foreach (.a|tostring) as $k (.b; .))",
+            r#"["b","a"]"#,
+        ),
+        (
+            r#"{"a":null,"b":null}"#,
+            "path(foreach (.a|tostring) as $k (null; .a))",
+            r#"["a","a"]"#,
+        ),
+        // The write side: jq writes here where it used to be refused.
+        (
+            r#"{"a":null,"b":null}"#,
+            "(foreach (.a|tostring) as $k (null; .)) = 9",
+            r#"{"a":9,"b":null}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}` on {input}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "`{filter}` on {input}");
+    }
+    Ok(())
+}
+
+/// #2159 must-not-change guards. A source that only *looks* like it could
+/// navigate -- a literal, an untaken navigating branch, an `as` source (a
+/// subexp in jq, so it never moves the register) -- leaves jq's register
+/// exactly where INIT put it, so UPDATE's `.a` still resolves. A fix that
+/// keyed on "the source contains navigation" instead of "the source
+/// navigated" would refuse all three. `reduce` restores the register when it
+/// backtracks its source, so it is untouched by any of this. Live jq 1.7.1.
+#[test]
+fn test_fold_source_that_never_navigates_leaves_register_alone_2159() -> Result<()> {
+    const DOC: &str = r#"{"a":1,"b":{"c":2}}"#;
+    for (filter, expected) in [
+        ("path(foreach (1) as $k (.; .a))", r#"["a"]"#),
+        (
+            "path(foreach (if true then 1 else .a end) as $k (.; .a))",
+            r#"["a"]"#,
+        ),
+        ("path(foreach (.a as $x | 1) as $k (.; .a))", r#"["a"]"#),
+        ("path(reduce (.a|tostring) as $k (.; .))", "[]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(DOC))?;
+        assert_eq!(code, 0, "`{filter}`: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "`{filter}`");
+    }
+    // `reduce`'s UPDATE still navigates against the moved register, so this
+    // raises in both -- pinned so a future per-step `reduce` register does
+    // not silently change which error it is.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(reduce (.a|tostring) as $k (.; .a))"],
+        Some(DOC),
+    )?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert_eq!(code, 5);
+    Ok(())
+}
+
 /// #2031 positive companion to the primary repro: a trackable source
 /// element's own per-element binding (`$k`, bound from `.a`'s own navigated
 /// value) *does* carry the register through when UPDATE references it

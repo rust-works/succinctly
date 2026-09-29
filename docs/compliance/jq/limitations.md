@@ -2513,16 +2513,41 @@ separate, sixth bug in `fold_source_ambient`'s fork-0 arm — a `null`/`bool` do
 against an equal-valued register, `path(reduce .a as $k (.b; .))` on `null` raised where jq
 answers `["b"]` — and classified the two residuals appended below):
 
-- **A fold source whose navigation is discarded by a later non-navigating stage still
-  clobbers jq's real path register, undetected.** `path(foreach (.a|tostring) as $k (.; .a))`
-  on `{"a":1,"b":{"c":2}}` raises `Invalid path expression near attempt to access element "a"
-  of {"a":1,"b":{"c":2}}` in jq; succinctly prints `["a"]`. `.a` genuinely navigates (moving
-  jq's real register) before `tostring` — not itself a path primitive — discards that
-  provenance from the *source element's own* final value; `drive_fold_source` only inspects
-  each element's final `PathBranch.trackable`, so a source like this looks exactly like an
-  ordinary computed value to it. Distinct from — and not closed by — #2031's fix, confirmed via
-  `git stash` A/B against the pre-#2031 build on `main` too. Tracked as
-  [#2159](https://github.com/rust-works/succinctly/issues/2159).
+- ~~**A fold source whose navigation is discarded by a later non-navigating stage still
+  clobbers jq's real path register, undetected.**~~ **Closed by
+  [#2159](https://github.com/rust-works/succinctly/issues/2159).** `path(foreach (.a|tostring)
+  as $k (.; .a))` on `{"a":1,"b":{"c":2}}` raises `Invalid path expression near attempt to
+  access element "a" of {"a":1,"b":{"c":2}}` in jq, and succinctly printed `["a"]`. `.a`
+  genuinely navigates -- moving jq's real register -- and the `tostring` after it only stops
+  the register moving further; but `drive_fold_source` inspected only each element's *final*
+  `PathBranch.trackable`, so the element looked like a literal that never touched the register.
+  The divergence was wider than that one row and had a positive face: on a `null` document
+  `path(foreach (.a|tostring) as $k (.; .))` is `["a"]` in jq (the `null` accumulator is
+  `jv_identical` to the moved `null` register) and was `[]` here. Over the 61,824-case
+  `path(...)`/`(...) = 9` sweep (`scripts/jq-fold-source-register-sweep.py`) the divergences fell from 2,788 to 351 with no row that matched
+  before diverging now: "jq errors, succinctly succeeds" 972 to 0, "jq succeeds, succinctly
+  errors" 492 to 245, "both succeed, differ" 1,150 to 100, "both error, differ" 174 to 6.
+  `foreach` only -- `reduce` restores the register when it backtracks its source, so a moved
+  register never reaches its final-emission check. An untracked branch that navigated keeps the
+  register's own path and value (`carry_register`, #1573), and `drive_fold_source` now hands both
+  to the fold as `MovedRegister::At`, seeding the per-step register exactly as #2031 does for a
+  register-derived element; `MovedRegister::Lost` (below) covers a navigation followed by a stage
+  the resolver cannot see inside. jq mode only: yq's lexer rejects `foreach`, so its arm still
+  discards the branches (#1467's shape) and stays refuse-only. Everything left is a *refusal*
+  or the `null`-document case below, tracked separately:
+
+  - **A navigation followed by an opaque builtin** (`first`, `add`, a `def`): jq indexes inside
+    it, so the register's position is unknown and the element is modelled as `Lost`. This
+    refuses where jq answers (`path(foreach (.a|first) as $k (null; .))` on `{"a":null,"b":null}`
+    is `["a",0]` in jq), and on a `null` document a `null` accumulator is kind-identical to the
+    lost register, so `(foreach (.a|first) as $k (.; .)) = 9` writes `9` where jq writes
+    `{"a":[9]}`. Predates #2159. Tracked as
+    [#3459](https://github.com/rust-works/succinctly/issues/3459).
+  - **Two pointer-identity refusals**: the accumulator's identity is not carried from one source
+    element to the next (`path(foreach (1, .a) as $k (.; .a))`), and `tostring` of a string is
+    the same `jv` in jq (`path(foreach (.b|tostring) as $k (.; $k))` on `{"b":"s"}` is `["b"]`).
+    Predate #2159. Tracked as
+    [#3460](https://github.com/rust-works/succinctly/issues/3460).
 
 - ~~**A generator the resolver reaches only through an eager arm is still collected before
   its first element is folded.**~~ **Closed by
