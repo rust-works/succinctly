@@ -6895,7 +6895,7 @@ mod tests {
             (seed >> 33) % n
         };
         fn tree(depth: usize, next: &mut dyn FnMut(u64) -> u64) -> OwnedValue {
-            let pick = if depth >= 4 { next(9) } else { next(12) };
+            let pick = if depth >= 4 { next(10) } else { next(13) };
             match pick {
                 0 => OwnedValue::Null,
                 1 => OwnedValue::Bool(next(2) == 0),
@@ -6912,7 +6912,10 @@ mod tests {
                 8 => OwnedValue::String(
                     ["", "a", "q\"u", "\\", "\u{1}", "é"][next(6) as usize].into(),
                 ),
-                9 | 10 => {
+                // A parsed NaN: the one scalar the bridge does not round-trip, so
+                // the table records `None` for it and every container around it.
+                9 => OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into()),
+                10 | 11 => {
                     OwnedValue::array_from((0..next(4)).map(|_| tree(depth + 1, next)).collect())
                 }
                 _ => OwnedValue::object_from(
@@ -6933,7 +6936,7 @@ mod tests {
                 table.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
                 actual.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
                 "positions for {}",
-                doc.text()
+                doc.text() // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3069 test exists to make"
             );
             for (position, recorded) in &table {
                 let descended =
@@ -6942,7 +6945,7 @@ mod tests {
                     alloc::format!("{descended:?}"),
                     alloc::format!("{recorded:?}"),
                     "descent to {position} of {}",
-                    doc.text()
+                    doc.text() // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3069 test exists to make"
                 );
             }
             for ((position, recorded), (_, fresh)) in table.iter().zip(&actual) {
@@ -6950,7 +6953,7 @@ mod tests {
                     assert!(
                         bridge_round_trip_eq(recorded, fresh),
                         "container at {position} of {}: {recorded:?} vs {fresh:?}",
-                        doc.text()
+                        doc.text() // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3069 test exists to make"
                     );
                 }
             }
@@ -6967,6 +6970,46 @@ mod tests {
             .map(|(_, v)| v.is_some())
             .collect();
         assert_eq!(recorded, [false, false, true]);
+    }
+
+    /// #3069: with a bridge document live, a container read from any *other*
+    /// document -- one that keeps no provenance, like the input document or a
+    /// sibling's -- is read fresh, and a descent aimed at an object key's own
+    /// node (never a container's) finds nothing to share.
+    #[cfg(feature = "std")]
+    #[test]
+    fn bridge_provenance_ignores_other_documents_and_key_nodes_3069() {
+        use crate::json::StandardJson;
+        let source = OwnedValue::array_from(vec![OwnedValue::object_from([(
+            "a".to_string(),
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+        )])]);
+        let bridge = source
+            .reindexed::<crate::jq::JqSemantics>()
+            .expect("shallow");
+        let other = source
+            .reindexed_without_provenance::<crate::jq::JqSemantics>()
+            .expect("shallow");
+        assert!(bridge_provenance::active());
+
+        let read = |doc: &ReindexedDoc| {
+            crate::jq::eval::bridge_shared_for_value::<crate::jq::JqSemantics, _>(
+                &doc.root().value(),
+            )
+        };
+        assert!(matches!(bridge.root().value(), StandardJson::Array(_)));
+        assert!(read(&bridge).is_some(), "the registered document shares");
+        assert!(read(&other).is_none(), "an unregistered document does not");
+
+        // The object's first child is its key `"a"`, ahead of the array.
+        let table = bridge_provenance::table_of(&source);
+        let (object, array) = (table[1].0, table[2].0);
+        let key = object + 1;
+        assert!(key < array);
+        assert!(crate::jq::eval::bridge_provenance_descend(&source, bridge.root(), key).is_none());
+        assert!(
+            crate::jq::eval::bridge_provenance_descend(&source, bridge.root(), array).is_some()
+        );
     }
 
     /// [`OwnedValue::input_bridge_doc`] is the exact `to_json_input_bridge` +

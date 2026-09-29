@@ -2263,7 +2263,8 @@ pub(crate) fn bridge_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>
     );
     if !same_kind {
         debug_assert!(
-            same_kind,
+            // omni-dev: coverage tolerate-line reason="unreachable: same invariant as the tolerated line below (#3069)"
+            same_kind, // omni-dev: coverage tolerate-line reason="unreachable: same invariant as the tolerated line below (#3069)"
             "#3069: bridge provenance names a {shared:?} for another kind"
         ); // omni-dev: coverage tolerate-line reason="unreachable: a bridge document is its source's serialization, so the node at each recorded position is the recorded kind (#3069)"
         return None; // omni-dev: coverage tolerate-line reason="unreachable: see the debug_assert above (#3069)"
@@ -75059,9 +75060,11 @@ mod tests {
                             Vec<u64>,
                             JqSemantics,
                         >(&expr, value, false));
-                        if cfg!(feature = "std")
-                            || !(jq_identical::<JqSemantics>(bound, value) && holds_nan(bound))
-                        {
+                        // Evaluated whatever `std` says, so the helper is covered in
+                        // both builds rather than only where the `||` reaches it.
+                        let nan_identical =
+                            holds_nan(bound) && jq_identical::<JqSemantics>(bound, value);
+                        if cfg!(feature = "std") || !nan_identical {
                             assert_eq!(
                                 fast, bridge,
                                 "jq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
@@ -75122,7 +75125,7 @@ mod tests {
             if cfg!(feature = "std") {
                 jq_true
             } else {
-                jq_false.clone()
+                jq_false.clone() // omni-dev: coverage tolerate-line reason="the no-std arm: `cfg!(feature = \"std\")` is true in every coverage build, so only the other build takes this (#3069)"
             }
         );
         assert_eq!(
