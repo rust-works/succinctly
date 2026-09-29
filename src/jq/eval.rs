@@ -44662,9 +44662,14 @@ fn drive_slice_bound<S: EvalSemantics>(
     round: fn(f64) -> f64,
     sink: &mut dyn FnMut(PathSliceBound) -> Demand,
 ) -> Result<Flow, EvalEscape> {
+    // A missing bound, and yq mode's drain below, have no `?//` to retry,
+    // so the sink's stop is reported as one: `Exhausted` after a stash
+    // would read as a retry that consumed it (#3293).
     let Some(expr) = bound else {
-        sink(PathSliceBound::open());
-        return Ok(Flow::Exhausted);
+        return Ok(match sink(PathSliceBound::open()) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
     };
 
     // yq mode cannot stream, and that is a property of its own rule rather
@@ -44697,7 +44702,7 @@ fn drive_slice_bound<S: EvalSemantics>(
             // this bound's trailing one -- the pre-#2267 `target_escape`
             // before `ends_escape` ordering (#1517), unchanged.
             if sink(bound) == Demand::Stop {
-                return Ok(Flow::Exhausted);
+                return Ok(Flow::Stopped { pending: None });
             }
         }
         return Ok(escape.map_or(Flow::Exhausted, |e| Flow::Escaped(Control::from(e))));
@@ -45780,15 +45785,15 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             carried_register.as_deref(),
             &stage_frame,
         );
-    let mut downstream: Option<ResolveFlow> = None;
-    // #3293: the retry generation `downstream` was recorded at. A `?//`
-    // inside this stage's element retries past the stop it answered
-    // (#1519); a retry that re-invokes `place_step` drops the verdict at
-    // its top, and one that raises or produces nothing supersedes it at the
-    // exit below -- `[first(path(.[([1] as [$a] ?// $b | if $a == null then
-    // "x" else $a end):] | .[0])), 9]` on `[10,20,30]` raises the retry's
-    // slice error in jq 1.7.1, not the first alternative's satisfied stop.
-    let mut downstream_at: u64 = 0;
+    //
+    // #3293: a [`StashedVerdict`]. A `?//` inside this stage's element
+    // retries past the stop it answered (#1519); a retry that re-invokes
+    // `place_step` drops the verdict at its top, and one that raises or
+    // produces nothing supersedes it at the exit below -- `[first(path(.[([1]
+    // as [$a] ?// $b | if $a == null then "x" else $a end):] | .[0])), 9]` on
+    // `[10,20,30]` raises the retry's slice error in jq 1.7.1, not the first
+    // alternative's satisfied stop. A halt or a decode failure is kept.
+    let downstream: StashedVerdict<ResolveFlow> = StashedVerdict::new();
     // Whether a *trackable* step out of an untracked stage is a proven
     // re-establishment rather than something "untracked is absorbing" must
     // demote (#3120, generalised by #3133). From an untracked input, no route
@@ -45803,7 +45808,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     let step_may_reestablish = stage_frame.register().is_some();
     let mut place_step = |step: PathBranch<'a>| -> Demand {
         // #3293: only a `?//` retry re-invokes this after a stop.
-        downstream = None;
+        downstream.begin();
         let PathBranch {
             path: components,
             value: resulting,
@@ -45952,8 +45957,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
                 if let ResolveFlow::Escaped(escape) = &other {
                     mark_nonretryable_escape(&Control::from(escape.clone()));
                 }
-                downstream = Some(other);
-                downstream_at = pipe_retry_generation();
+                downstream.stash(other);
                 Demand::Stop
             }
         }
@@ -45991,19 +45995,10 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             &mut place_step,
         ),
     };
-    match downstream {
-        Some(f)
-            if f.is_nonretryable()
-                || !resolve_retry_superseded(
-                    &flow,
-                    downstream_at,
-                    direct_pattern_retry(element),
-                ) =>
-        {
-            f
-        }
-        _ => flow,
-    }
+    let direct_retry = direct_pattern_retry(element);
+    downstream
+        .take_unless(|at| resolve_retry_superseded(&flow, at, direct_retry))
+        .unwrap_or(flow)
 }
 
 /// [`resolve_as_pattern`] on an untracked stage, matched over the branch's
@@ -49415,9 +49410,7 @@ pub(crate) fn stop_with_escape(slot: &mut Option<Control>, control: Control) -> 
 }
 
 /// [`stop_with_escape`] for `resolve_index_expr_sink` (#2924) and the live
-/// negation arm of [`resolve_node_sink`] (#3299) -- `resolve_slice_expr_sink`
-/// stashes into a [`StashedEscape`] since #3293, which a `?//` retry inside
-/// a bound can supersede -- whose
+/// negation arm of [`resolve_node_sink`] (#3299), whose
 /// out-of-band slot holds an [`EvalEscape`] rather than a bare [`Control`] --
 /// their return type ([`ResolveFlow`]) has a dedicated `Escaped` variant, so
 /// the escape each stashes is never lost at its own boundary the way it would
@@ -49632,9 +49625,16 @@ impl<T: Nonretryable> StashedVerdict<T> {
     /// The verdict the drive still owes, or `None` when a retry inside the
     /// driven generator consumed it -- [`Self::settle`], then take.
     pub(crate) fn take(self, flow: &Flow, direct_retry: bool) -> Option<T> {
+        self.take_unless(|at| retry_superseded(flow, at, direct_retry))
+    }
+
+    /// [`Self::take`] for a drive whose verdict is not a [`Flow`] (a
+    /// resolver's [`ResolveFlow`]): `superseded` answers, from the
+    /// generation the verdict was stashed at, whether a retry since then
+    /// consumed it. A nonretryable verdict is never dropped.
+    pub(crate) fn take_unless(self, superseded: impl FnOnce(u64) -> bool) -> Option<T> {
         let verdict = self.slot.into_inner()?;
-        let superseded =
-            !verdict.is_nonretryable() && retry_superseded(flow, self.at.get(), direct_retry);
+        let superseded = !verdict.is_nonretryable() && superseded(self.at.get());
         (!superseded).then_some(verdict)
     }
 }
@@ -52947,7 +52947,12 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
         Ok(()) => Flow::Exhausted,
         Err(e) => Flow::Escaped(Control::from(e)),
     };
-    let direct_retry = direct_pattern_retry(expr);
+    // `false`, not `direct_pattern_retry(expr)`: the resolver's `Ok` is both
+    // "exhausted" and "stopped by this sink", which only the `std` build's
+    // retry generation tells apart. `no_std` keeps the verdict (the
+    // limitation `docs/compliance/jq/limitations.md` records) rather than
+    // reading a stop as a retry and dropping a real error.
+    let direct_retry = false;
 
     // A walk error is this call's own, raised while the prepass was still
     // running, so it outranks whatever the prepass reported on the way out --

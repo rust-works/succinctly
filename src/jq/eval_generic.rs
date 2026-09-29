@@ -19159,10 +19159,11 @@ fn path_context_component_each_bound<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     match expr {
         Some(e) => path_context_component_flow::<S, V>(e, pos, sink),
-        None => {
-            sink(OwnedValue::Null);
-            Flow::Exhausted
-        }
+        // No `?//` to retry, so the sink's stop is reported as one.
+        None => match sink(OwnedValue::Null) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        },
     }
 }
 

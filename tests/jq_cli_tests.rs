@@ -77048,7 +77048,11 @@ fn test_path_slice_retry_stash_leaves_yq_mode_unchanged_3293() -> Result<()> {
             "#3293 (yq): `{filter}`: stderr={stderr:?}"
         );
         if expected.is_empty() {
+            assert!(!output.status.success(), "`{filter}`: exited 0");
             assert!(stderr.contains("Error: x"), "`{filter}`: stderr={stderr:?}");
+        } else {
+            assert!(output.status.success(), "`{filter}`: stderr={stderr:?}");
+            assert!(stderr.is_empty(), "`{filter}`: stderr={stderr:?}");
         }
     }
     Ok(())
