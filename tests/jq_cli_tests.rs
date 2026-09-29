@@ -75344,6 +75344,158 @@ fn test_wrapper_stop_resets_across_retry_3293() -> Result<()> {
     assert_retry_rows_3293(None, "", RETRY_ROWS_WRAPPER_STOP_3293)
 }
 
+/// #3293 slice 4: `reduce`/`foreach` stash the step's (or fork's) escape in
+/// an out-of-band slot and answer `Stop`. A `?//` in the fold's *source* or
+/// INIT that retries past that stop and then produces nothing, or raises,
+/// never re-enters the fold's callback, so the stale stash outranked what the
+/// retry went on to do: the abandoned alternative's error was raised where
+/// jq answers `null` (`reduce`) or nothing (`foreach`). Both slots are now
+/// generation-stamped like every other driver's. The controls are a fold with
+/// no `?//` (its error surfaces), a retry that raises (its own error wins),
+/// every alternative failing, and a consumer's stop reaching INIT's `?//`.
+/// Every value captured from jq 1.7.1 with `-nc`.
+const RETRY_ROWS_FOLD_3293: &[RetryRow3293] = &[
+    (
+        r#"reduce ([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) as $x (0; .+$x)"#,
+        "null\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[foreach ([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) as $x (0; .+$x)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[foreach ([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) as $x (0; .+$x; .)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"reduce ([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) as $x (0; error("E"))"#,
+        "null\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"reduce (([[1]] as [$a] ?// $b | ("A"|stderr) | $a) // empty) as $x (0; .+$x)"#,
+        "null\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[foreach (([[1]] as [$a] ?// $b | ("A"|stderr) | $a) // empty) as $x (0; .+$x)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"reduce ([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) as $x (0; .+1)"#,
+        "1\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"reduce ([[1]] as [$a] ?// $b | $a | if . == null then error("E2") end) as $x (0; error("E1"))"#,
+        "",
+        "",
+        "E2",
+        5,
+    ),
+    (
+        r#"[foreach ([[1]] as [$a] ?// $b | $a | if . == null then error("E2") end) as $x (0; error("E1"))]"#,
+        "",
+        "",
+        "E2",
+        5,
+    ),
+    (
+        r#"reduce ([[1]] as [$a] ?// [[$b]] | ("A"|stderr) | $a) as $x (0; error("E1"))"#,
+        "",
+        "AA",
+        "E1",
+        5,
+    ),
+    (
+        r#"reduce 1 as $x (([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty); error("E"))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[foreach 1 as $x (([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty); error("E"))]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"reduce 1 as $x (([[1]] as [$a] ?// $b | $a | if . == null then error("E2") end); error("E1"))"#,
+        "",
+        "",
+        "E2",
+        5,
+    ),
+    (
+        r#"[foreach 1 as $x (([[1]] as [$a] ?// $b | $a | if . == null then error("E2") end); error("E1"))]"#,
+        "",
+        "",
+        "E2",
+        5,
+    ),
+    (
+        r#"reduce 1 as $x (([[1]] as [$a] ?// [[$b]] | ("A"|stderr) | $a); error("E1"))"#,
+        "",
+        "AA",
+        "E1",
+        5,
+    ),
+    (r#"reduce (1,2) as $x (0; error("E"))"#, "", "", "E", 5),
+    (
+        r"[first(foreach ([[1]] as [$a] ?// $b | $a // empty) as $x (0; .+$x))]",
+        "[]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r"[limit(1; reduce 1 as $x (([[1]] as [$a] ?// [[$a]] | $a); .+1))]",
+        "[2]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#"[first(reduce 1 as $x ((1 as $x ?// $y | ("A"|stderr) | 1); .+1))]"#,
+        "[2,2]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(reduce ([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty) as $x (0; .+$x))]"#,
+        "[null]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+#[test]
+fn test_fold_source_and_init_retry_supersedes_stash_3293() -> Result<()> {
+    assert_retry_rows_3293(None, "", RETRY_ROWS_FOLD_3293)
+}
+
 /// #3293 review: `isempty`/`any`/`all` record the wrapping sink's stop and
 /// reset it per invocation, like `first`/`limit`/`nth`. The stop-then-
 /// continue shape reaches them through `input`: the consumer stops on the
@@ -75437,6 +75589,7 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("{} | ", RETRY_ROWS_SKIP_COUNT_3293),
         ("[10,20,30] | ", RETRY_ROWS_SLICE_BOUND_3293),
         ("{} | ", RETRY_ROWS_WRAPPER_STOP_3293),
+        ("{} | ", RETRY_ROWS_FOLD_3293),
     ] {
         assert_retry_rows_3293(None, prefix, rows)?;
     }
