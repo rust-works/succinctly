@@ -2165,9 +2165,11 @@ fn to_owned_lossy_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
 /// element list is a *suffix* of the container, not the container, and must
 /// not be given its node.
 ///
-/// Scalars, empty containers and advanced lists answer `None`. All three
-/// are under-reports that cost an acceptance and never a wrong answer: the
-/// caller falls back to exactly the behaviour it had before #2889.
+/// An empty container, which has no child to hop from, answers through the
+/// container cursor its list keeps for exactly that case (#3180). Scalars
+/// and advanced lists answer `None`. Both are under-reports that cost an
+/// acceptance and never a wrong answer: the caller falls back to exactly
+/// the behaviour it had before #2889.
 fn standard_json_node_cursor<'a, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'a, W>,
 ) -> Option<JsonCursor<'a, W>> {
