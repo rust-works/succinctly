@@ -404,9 +404,9 @@ Loosest first, matching jq's `parser.y`:
 |-------|---------------------------------------|----------------------------------------------------|
 | 1     | `\|`                                  | Loosest. Each stage is a comma list.               |
 | 2     | `,`                                   | Binds tighter than `\|`: `a,b \| f` is `(a,b) \| f`. |
-| 3     | `as`                                  | Sits inside a comma operand; its body runs to the end. |
-| 4     | `=` `\|=` `+=` `-=` `*=` `/=` `%=` `//=` | See divergence 2 below.                         |
-| 5     | `//`                                  | See divergence 2 below.                            |
+| 3     | `as`                                  | Binds the `Term` before it; body runs to the end.  |
+| 4     | `=` `\|=` `+=` `-=` `*=` `/=` `%=` `//=` | See divergence 1 below.                         |
+| 5     | `//`                                  | See divergence 1 below.                            |
 | 6     | `or`, `and`                           |                                                    |
 | 7     | `==` `!=` `<` `<=` `>` `>=`           |                                                    |
 | 8     | `+` `-`, then `*` `/` `%`             | Tightest.                                          |
@@ -428,14 +428,22 @@ as in real jq — parenthesize into a `Term` where a full expression is
 wanted (`{a: (if true then 1 else 2 end)}`). The `reduce`/`foreach` and
 `until`/`while` slots accept full expressions too.
 
-Two precedence divergences from jq remain:
+In jq mode `as` binds only the `Term` before it, and whatever operator precedes
+that `Term` takes the whole binding as its right operand (#3397): `1 + 2 as $x | [$x]`
+is `1 + (2 as $x | [$x])`, which is an error, and `2 * 1 as $x | $x + 10` is `22`.
+Unary minus covers the multiplicative chain after its operand, as jq's `'-' Exp`
+does: `-1 as $i | ($i, 100)` is `-1, -100`. A second comparison or assignment
+operator after a binding's body is a syntax error (`1 as $x | $x == 1 == 1`), as in
+jq. **yq mode binds the whole left expression**, as real yq does: `1 + 2 as $x | [$x]` is
+`(1 + 2) as $x | [$x]` and `2 * 1 as $x | $x + 10` is `12`.
 
-1. **`as` binds an assignment-level expression, where jq binds a `Term`.** jq
-   reads `1 + 2 as $x | [$x]` as `1 + (2 as $x | [$x])`; here it is
-   `(1 + 2) as $x | [$x]`.
-2. **`//` binds tighter than assignment, where jq has it looser.** jq declares
+One precedence divergence from jq remains:
+
+1. **`//` binds tighter than assignment, where jq has it looser.** jq declares
    `%right "//"` before the assignment operators, so `.a = 1 // 2` is
-   `(.a = 1) // 2`; here it is `.a = (1 // 2)`.
+   `(.a = 1) // 2`; here it is `.a = (1 // 2)`. Since #3397 puts a binding's body on
+   the right of an assignment, this also shows inside that body:
+   `.a = 1 as $x | .a // 1 %= 2`.
 
 ## Known Limitations
 
