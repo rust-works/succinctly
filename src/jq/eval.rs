@@ -63885,6 +63885,15 @@ mod ambient_frame_depth {
 /// recomputes whenever the depth this call observes doesn't match what
 /// produced the cached answer, rather than trusting any cached answer at
 /// all like [`BoundBody`] does.
+///
+/// **A def whose `then` is itself a def binds the whole spine at once**
+/// (#3307): it returns the filter below the last def of the direct run, with
+/// every spine def's calls installed, rather than the next `FuncDef` for the
+/// caller to bind in turn. Every caller continues into the result with the
+/// same input either way, so nothing distinguishes the two, but the
+/// one-at-a-time form rebuilt and kept everything below each def -- `M` defs
+/// over `N` nodes cost `O(M x N)` in time and memory. See
+/// [`install_def_spine`].
 pub(crate) fn bind_def(
     name: &str,
     params: &[Param],

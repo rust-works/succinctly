@@ -25474,6 +25474,10 @@ fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
 /// up on a call: a self-recursive definition (`def f: f; f`) would otherwise
 /// keep it unfolding forever, and a body that deep is the eager evaluator's
 /// exactly as it was before this gate existed.
+///
+/// One unfold per `def`, however they are bound: `bind_def` installs a whole
+/// direct spine of defs in one step (#3307), and the two gates that count
+/// unfolds charge the spine's length up front rather than one per level.
 const OWNED_IDENTITY_DEF_UNFOLD_LIMIT: u8 = 8;
 
 /// [`owned_identity_pipe_supported`], `unfolded` levels of `def` binding in.
