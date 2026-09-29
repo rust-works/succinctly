@@ -1185,12 +1185,12 @@ pub trait DocumentValue: Sized + Clone {
     ///
     /// Consulted only by [`resolve_display_key`], i.e. by a caller about to
     /// insert into an `IndexMap<String, _>`. It is deliberately *not* what
-    /// [`key_display_string_kind`] answers: that one also feeds read-only
+    /// `key_display_string_kind` answers: that one also feeds read-only
     /// walks (`push_generic_document_validation_error` behind `select`/`if`)
     /// that keep both entries on a stream, where refusing a complex-key
     /// collision would diverge from the reference for no data-loss reason.
     ///
-    /// The default is [`key_display_string_kind`] -- a fallback is exactly a
+    /// The default is `key_display_string_kind` -- a fallback is exactly a
     /// decode failure, which is JSON's whole story. `YamlValue` overrides it
     /// with `YamlValue::key_string_kind`, which also flags a *complex* key
     /// (mapping, sequence, `null`, a non-string or unresolved alias): it

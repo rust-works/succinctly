@@ -41701,6 +41701,11 @@ mod issue_1349_inplace_presentation {
             let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
                 .args(["yq", "-i", filter])
                 .arg(file.path())
+                // CI exports RUST_BACKTRACE=1, and only the `-i` route
+                // returns the error out of `main`, where anyhow's Debug
+                // form appends a backtrace the stdout route never prints.
+                .env_remove("RUST_BACKTRACE")
+                .env_remove("RUST_LIB_BACKTRACE")
                 .stdin(Stdio::null())
                 .output()?;
             let inplace_stderr = String::from_utf8(output.stderr)?;
