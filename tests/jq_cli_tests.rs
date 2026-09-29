@@ -68267,6 +68267,7 @@ fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
 /// each container back out as the storage that went in
 /// (`bridge_provenance`), so the resolver stands on `$y`'s own `Rc` at
 /// `.a`, and #3177's storage clause is jq's `jv_identical`.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 // jq filter literals like `{b:1}`/`{k:.a}` are not formatting strings;
 // clippy cannot tell the two apart from the brace shape alone (as `*_2642`).
@@ -68558,8 +68559,7 @@ fn test_navigated_bind_on_owned_root_traps_refuse_3135() -> Result<()> {
 /// consulted node identity first, so a `null`/`bool` marker bound from a
 /// navigated position refused at an equal-valued *sibling* where jq
 /// answers. All three values, and both write forms (`|=`, `del`), not just
-/// the `path()` read `test_navigated_bind_residuals_refuse_cleanly_3037`
-/// used to pin as refuse-only. The last two rows are
+/// the `path()` read #3037's residual test used to pin as refuse-only. The last two rows are
 /// `resolve_as_pattern`'s own sibling gap (review): a bare-var pattern
 /// source (`$y as $z | ...`) reaches `resolves_to_register`'s identical
 /// `TrackedVar` arm, which had the same gap independently.
@@ -74582,7 +74582,10 @@ fn test_bridge_provenance_never_certifies_a_rebuilt_copy_3069() -> Result<()> {
 /// and a write through it refuse exactly as before -- and certify only where
 /// jq's own identity does, the resolver standing on the bound storage itself
 /// (`$a | path($a)`). Captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
+// jq filter literals like `{a:1}` are not formatting strings.
+#[allow(clippy::literal_string_with_formatting_args)]
 fn test_literal_bind_keeps_path_answers_3069() -> Result<()> {
     for (filter, stdout_expected, stderr_expected, code_expected) in [
         (

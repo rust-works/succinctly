@@ -2266,7 +2266,7 @@ fn bridge_provenance_walk<W: Clone + AsRef<[u64]>>(
             table.push((cursor.bp_position(), None));
             let mut rest = elements;
             let mut all = true;
-            for item in items.iter() {
+            for item in items {
                 let Some((element, tail)) = rest.uncons_cursor() else {
                     return false; // omni-dev: coverage tolerate-line reason="unreachable: a bridge document is its source's serialization, so it has one element per source element (#3069)"
                 };
@@ -74965,7 +74965,9 @@ mod tests {
     /// case, sharing storage with `.`) and a separately built copy of each,
     /// so jq's instance rule is diffed too: with `$y` holding the input's
     /// very storage and a NaN inside, both routes answer identity, the
-    /// bridge because it hands its input's storage back out (#3069).
+    /// bridge because it hands its input's storage back out (#3069). Without
+    /// `std` the bridge has no thread-local to register its input in and
+    /// rebuilds, as before #3069, so that one pairing is exempt there.
     #[test]
     fn eval_owned_pure_agrees_with_the_reindex_bridge_on_tracked_vars_2042() {
         let shapes = [
@@ -74999,6 +75001,13 @@ mod tests {
         let values = pure_value_matrix();
         let copies = pure_value_matrix();
         let bounds: Vec<&OwnedValue> = values.iter().chain(copies.iter()).collect();
+        fn holds_nan(value: &OwnedValue) -> bool {
+            match value {
+                OwnedValue::Array(items) => items.iter().any(holds_nan),
+                OwnedValue::Object(map) => map.values().any(holds_nan),
+                other => other.as_f64().is_some_and(f64::is_nan),
+            }
+        }
         for src in shapes {
             let parsed = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             for origin in &origins {
@@ -75024,10 +75033,14 @@ mod tests {
                             Vec<u64>,
                             JqSemantics,
                         >(&expr, value, false));
-                        assert_eq!(
-                            fast, bridge,
-                            "jq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
-                        );
+                        if cfg!(feature = "std")
+                            || !(jq_identical::<JqSemantics>(bound, value) && holds_nan(bound))
+                        {
+                            assert_eq!(
+                                fast, bridge,
+                                "jq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
+                            );
+                        }
                         let fast = debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
                             &expr,
                             value,
@@ -75053,7 +75066,8 @@ mod tests {
     /// both the owned route and the reindex bridge answer that `true` -- the
     /// bridge because a container read back out of it is the storage that
     /// went in (`bridge_provenance`). yq compares structurally, and its
-    /// bridge rebuilds.
+    /// bridge rebuilds; so does jq's without `std`, which has no thread-local
+    /// to register the bridge's input in.
     #[cfg(not(feature = "unshared-containers"))]
     #[test]
     fn eval_owned_pure_and_the_bridge_keep_container_identity_3069() {
@@ -75073,13 +75087,17 @@ mod tests {
                 false,
                 Reentry::REBUILT,
             )),
-            jq_true
+            jq_true.clone()
         );
         assert_eq!(
             debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
                 &expr, &value, false
             )),
-            jq_true
+            if cfg!(feature = "std") {
+                jq_true
+            } else {
+                jq_false.clone()
+            }
         );
         assert_eq!(
             debug_normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(

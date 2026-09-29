@@ -3851,8 +3851,8 @@ impl OwnedValue {
     ///
     /// In jq mode ([`EvalSemantics::REINDEX_BRIDGE_KEEPS_IDENTITY`], #3069)
     /// the document also remembers `self`, so a container read back out of
-    /// it is `self`'s own storage rather than a rebuild -- see
-    /// [`bridge_provenance`].
+    /// it is `self`'s own storage rather than a rebuild -- see the
+    /// crate-private `bridge_provenance` module.
     pub fn reindexed<S: EvalSemantics>(&self) -> Result<ReindexedDoc, EvalError> {
         Ok(ReindexedDoc::new(
             self.to_json_for_reindex::<S>()?,

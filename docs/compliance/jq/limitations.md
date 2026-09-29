@@ -1185,18 +1185,40 @@ is the revert that established what the other one costs.
    `scripts/jq-bind-origin-oracle-sweep.sh`'s `owned-embed-refuse-*` rows and exercised
    by `scripts/jq-bind-origin-fuzz.py`'s `EMBEDS`/`REBUILDS` pools):
 
-   | Filter                                                                                                                                                                                                                            | Why still refused                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-   | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-   | `{k:.} \| scalars (`OwnedValue::String`, numbers) are not `Rc`-backed, so they never enter the embed table and have no storage for #3177's clause to share; giving them one (ADR-0024's option D) was built, measured in #3182 and rejected (+8% to +50% peak RSS on scalar-heavy rows). The sweep's `scalar-*` family is the full matrix                                                                                                                           |
-   | `[.] \| (path(.[0] \| $x), path(.[0] \| $x \| .a))`, `[.] \| [limit(1; path(.[] \| $x))]`, `[.] \| path(.[0] \| $x)?` (the last swallows the refusal into no output)                                                              | a `path()` reached only through a wrapper (a comma, an array constructor, `limit`, `?`/`try`) is not at the head of the owned re-entry's pipe, so #3177's door does not open and the value still crosses the bridge; taking it natively would mean re-implementing the wrapper's own driver over an owned value — [#3189](https://github.com/rust-works/succinctly/issues/3189)                                                                           |
-   | `[.] \| path(.[0] \| $x) as $p \| $p`, `[.] \| reduce path(.[0] \| $x) as $p (0; 1)`, `[.] \| select(path(.[0] \| $x) == [0])`, `[.] \| first(path(.[] \| $x) \| .[0])`, `[.] \| label $out \| path(.[0] \| $x) \| ., break $out` | the same rule from the other side: a `path()` that is a bind's *source*, a binary operand, or the body of `first`/`label` is in no position the door looks at either — the door opens only for the head of the pipe the owned re-entry is handed, and `as`/`reduce`/`==`/`first`/`label` each own the driver that runs their inner pipe (#3189)                                                                                                           |
-   | `{k:.} \| with_entries(.) \| path(.k \| $x)`, `[[.]] \| add \| path(.[0] \| $x)`, `[.] \| .[0] \|= . \| path(.[0] \| $x)`                                                                                                         | jq answers all of these (`["k"]`, `[0]`): its `with_entries`/`add`/`setpath` move the element's own `jv` into the new container. succinctly refuses because the stage *ahead* of `path()` folds through `eval_on_owned`'s JSON round trip first, so the array the resolver is then handed holds fresh copies and the storage clause has nothing to match — the same bridge that keeps `[.] \| sort \| .[0] \| path($x)` refused below                     |
-   | `. as $x \| .a as $y \| [.] \| path(.[0].a \| $y)`                                                                                                                                                                                | `$x` is bound first, so `[.]` reuses `$x`'s own value, whose `.a` is `$x`'s materialization, not `$y`'s: sharing it needs an *ancestor* lookup when `$y` is bound, the mirror of #3179's nested reuse (jq `[0,"a"]`; the other bind order answers since #3179)                                                                                                                                                                                            |
-   | `[.] \| .[0] \|= . \| .[0]`, `[1,2] \| .[0:2]` (all `\| path($x)`)                                                                                                                                                                | none is one of `embed_peel_step`'s recognized head stages (`.foo`/`.[n]`/`.[]`/`add`/`min`/`max`, and since #3178 `sort`/`unique`/`reverse`/`to_entries`/a literal `getpath`, after leading `.` stages are skipped), and a write (`\|=`) always runs through the assignment resolver first — so each re-indexes on the owned route before the read reaches the shared value                                                                               |
-   | `reduce (1) as $i (.; if true then . else 1 end) \| path($x)`                                                                                                                                                                     | the UPDATE is not one of the owned fast paths (`eval_owned_navigation`/`eval_owned_relocating_fold`), so the fold's own hoisted per-step reroot rebuilds the accumulator before `path($x)` reads it                                                                                                                                                                                                                                                       |
-   | `[.] \| reduce (1) as $i (.[0]; ($x.a) = 9)`, `reduce (.) as $x (.; path($x))`, `-n 'input \| .a as $y \| .a \| reduce (1) as $i (.; ($y.b) = 9)'`                                                                                | #3181 witnesses each fold step's accumulator; an owned fold input is bridged first, so INIT is a copy ([#3328](https://github.com/rust-works/succinctly/issues/3328)); a loop variable is a literal, never a marker ([#3329](https://github.com/rust-works/succinctly/issues/3329)); `-n`'s owned-identity tokens are not asked ([#3331](https://github.com/rust-works/succinctly/issues/3331))                                                           |
-   | `no_std` builds                                                                                                                                                                                                                   | `embed_table` is thread-local; without `std` it is a no-op, refuse-only like `file_index`                                                                                                                                                                                                                                                                                                                                                                 |
-   | `succinctly yq`                                                                                                                                                                                                                   | unchanged by design — `RootWitness::of_owned` is gated on `S::TAG == EvalTag::Jq`; yq's node model is #2643's business (ADR-0018)                                                                                                                                                                                                                                                                                                                         |
+   | Filter                                                                                            | Why still refused                                                                                                                                                                                                                                                                                                                                   |
+   | ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `. as $x \| [.] \| path(.[0] \| $x)` on `1`, `input \| . as $x \| [.] \| .[0] \| path($x)` on `1` | scalars (`OwnedValue::String`, numbers) are not `Rc`-backed, so they never enter the embed table and have no storage for #3177's clause to share; giving them one (ADR-0024's option D) was built, measured in #3182 and rejected (+8% to +50% peak RSS on scalar-heavy rows). The sweep's `scalar-*` family is the full matrix                     |
+   | `. as $x \| .a as $y \| [.] \| path(.[0].a \| $y)`                                                | `$x` is bound first, so `[.]` reuses `$x`'s own value, whose `.a` is `$x`'s materialization, not `$y`'s: sharing it needs an *ancestor* lookup when `$y` is bound, the mirror of #3179's nested reuse (jq `[0,"a"]`; the other bind order answers since #3179)                                                                                      |
+   | `reduce (1) as $i (.; if true then . else 1 end) \| path($x)`                                     | the UPDATE is not one of the owned fast paths (`eval_owned_navigation`/`eval_owned_relocating_fold`), so the fold's own hoisted per-step reroot rebuilds the accumulator before `path($x)` reads it                                                                                                                                                 |
+   | `reduce (.) as $x (.; path($x))`                                                                  | a fold's own loop variable is a literal, never a marker ([#3329](https://github.com/rust-works/succinctly/issues/3329)); the owned fold input ([#3328](https://github.com/rust-works/succinctly/issues/3328)) and `-n` owned-identity ([#3331](https://github.com/rust-works/succinctly/issues/3331)) rows that shared this cell answer since #3069 |
+   | `no_std` builds                                                                                   | `embed_table` is thread-local; without `std` it is a no-op, refuse-only like `file_index`                                                                                                                                                                                                                                                           |
+   | `succinctly yq`                                                                                   | unchanged by design — `RootWitness::of_owned` is gated on `S::TAG == EvalTag::Jq`; yq's node model is #2643's business (ADR-0018)                                                                                                                                                                                                                   |
+
+   **[#3069](https://github.com/rust-works/succinctly/issues/3069): the reindex bridge keeps
+   container identity.** Most of what this section used to list as refused had one cause: a
+   stage the owned route cannot answer natively re-indexes its input as a new document, and
+   every container read back out of that document was a fresh copy, so the resolver met a
+   value-equal twin of `$x` and #3177's storage clause had nothing to match. A bridge document
+   now remembers the value it was serialized from (`ReindexedDoc` registers it in
+   `bridge_provenance`, jq mode only), and `eval::to_owned` and
+   `eval_generic::owned_from_standard_json` hand back the source subtree's own `Rc` for any
+   container the bridge round-trips unchanged. That is jq's model: reading a `jv` never copies
+   it. It closed [#3189](https://github.com/rust-works/succinctly/issues/3189) (`path()` under
+   `?`, `try`, a comma, `limit`, `first`, `label`, as a bind or `reduce` source, as a binary
+   operand), [#3305](https://github.com/rust-works/succinctly/issues/3305) (the `_by` forms,
+   `with_entries`, `map_values`, `flatten`, `[.[]]`, `limit`, `first`, `add`),
+   [#3383](https://github.com/rust-works/succinctly/issues/3383) (a no-op `|=`),
+   [#3328](https://github.com/rust-works/succinctly/issues/3328) (a fold over an owned input)
+   and [#3331](https://github.com/rust-works/succinctly/issues/3331) (`until` and `-n`'s
+   owned-identity binds), each checked row by row against jq 1.7.1 (the must-refuse controls
+   still refuse). A rebuilt copy is a new allocation in jq too and still refuses here
+   (`map(.a |= .)`, `{} + .`, `tojson | fromjson`, a sibling); the bridge only returns storage
+   for the node that went in. On a 2124-row stage-by-tail sweep (`. as $x | STAGE | TAIL` over
+   60 stages and 12 `path()`/write tails), rows refused where jq answers went from 434 to 44,
+   and no row answers where jq refuses. The 44 are the fold loop variable (#3329) and
+   destructuring binds (`as {a:$v}`, `?//`). Pinned in
+   `test_bridge_provenance_keeps_path_identity_3069` and
+   `test_bridge_provenance_never_certifies_a_rebuilt_copy_3069`.
 
    **[#3181](https://github.com/rust-works/succinctly/issues/3181), now closed: a marker
    inside a fold's UPDATE or EXTRACT naming the accumulator.** `. as $x \| reduce (1) as $i
@@ -1212,12 +1234,12 @@ is the revert that established what the other one costs.
    - a step after one whose UPDATE rebuilt the accumulator, which a witnessed step always does
      (its UPDATE crosses the re-index bridge, as in the `if true then . else 1 end` row above):
      `reduce (1,2) as $i (.; if $i == 2 then ($x.a) = 9 else . end)`;
-   - a fold over an owned input, including one with a `repeat` source
-     ([#3328](https://github.com/rust-works/succinctly/issues/3328)), and the fold's own loop
-     variable ([#3329](https://github.com/rust-works/succinctly/issues/3329));
-   - a navigated bind on the `-n 'input | ...'` route, whose witness is an owned-identity token,
-     and the same pattern in `while`/`until`
-     ([#3331](https://github.com/rust-works/succinctly/issues/3331)).
+   - the fold's own loop variable ([#3329](https://github.com/rust-works/succinctly/issues/3329)).
+
+   A fold over an owned input ([#3328](https://github.com/rust-works/succinctly/issues/3328)) and
+   a navigated bind on the `-n 'input | ...'` route or in `while`/`until`
+   ([#3331](https://github.com/rust-works/succinctly/issues/3331)) answer since #3069: the
+   accumulator the bridge hands back is the bound storage itself.
 
    **[#2575](https://github.com/rust-works/succinctly/issues/2575)
    closed one row of this residual as a side effect, not a targeted fix**: `[.] \| .[0] \|
@@ -1260,10 +1282,9 @@ is the revert that established what the other one costs.
    max) \| path($x)`, `{k:.} \| (. \| .k) \| path($x)`) bridged and refused where jq answers
    `[]`. It now unwraps the parentheses and peels a stage that is the whole pipe (an
    `Expr::Identity` tail), under the same payoff gates. What stays refused is in the table
-   above: scalars, a `path()` in any
-   position but the head of the owned re-entry's pipe (#3189), a stage ahead of `path()`
-   that bridges first (`with_entries`, `\|=`, ...; `sort`, `to_entries` and their kin
-   since #3178), and an embed reached through an ancestor's bind. The same clause closed #2042's
+   above: scalars and an embed reached through an ancestor's bind. A `path()` in any position
+   but the head of the owned re-entry's pipe (#3189) and a stage ahead of `path()` that bridges
+   first (`with_entries`, `\|=`) answer since #3069. The same clause closed #2042's
    `path(.[0] as $y \| .[-2] \| $y)` residual (jq `[-2]`): the negative spelling never matched
    the bind path, but `.[-2]` stands on the very storage `$y` was bound from.
    **[#3178](https://github.com/rust-works/succinctly/issues/3178), now closed: element identity
@@ -1277,21 +1298,16 @@ is the revert that established what the other one costs.
    the bridge's and only the children's storage differs; which of two equal elements is the
    node matches jq both ways (`[., {"a":1}] \| sort \| .[0]` answers, `[{"a":1}, .] \| sort \|
    .[0]` refuses). It fires only while a bind's embed table is active and some child is already
-   witnessed (a `getpath` only when its answer is), so no other program's route changes. Still
-   refused where jq answers: the `_by` forms (`sort_by`, `unique_by`, `group_by`, `min_by`),
-   `with_entries`, `map_values`, `flatten`, `[.[]]` over an object and `limit`, which need their
-   filter or driver run over owned children
-   ([#3305](https://github.com/rust-works/succinctly/issues/3305)); a no-op `\|=` (#3306's
-   remaining half, tracked as
-   [#3383](https://github.com/rust-works/succinctly/issues/3383) -- the full-range slice half
-   of [#3306](https://github.com/rust-works/succinctly/issues/3306) is fixed, see
-   [`SliceBounds::is_full_range`](../../../src/jq/slice.rs)); and a `getpath` whose
-   path the owned route cannot read as a literal (`getpath([-0.5])`: `-0.5` is a negation). A
-   builtin reached through a `.[]` whose children are not themselves witnessed
-   (`[[.]] \| .[] \| sort \| .[0] \| path($x)`) still bridges: peeling that iterate per child
-   is the shape #2889 measured at +20%. So does a container that also holds a NaN read from the
-   input (`[.a, 1, $x] \| sort \| .[2] \| path($x)` with `.a` = `NaN`), which is not an identity
-   of the bridge. `unique` compares such a NaN by instance on both routes, as jq does
+   witnessed (a `getpath` only when its answer is), so no other program's route changes. The
+   builtins these arms do not cover still bridge, and since #3069 the bridge hands the children
+   back as their own storage, so the `_by` forms, `with_entries`, `map_values`, `flatten`,
+   `[.[]]` over an object, `limit`
+   ([#3305](https://github.com/rust-works/succinctly/issues/3305)), a no-op `\|=`
+   ([#3383](https://github.com/rust-works/succinctly/issues/3383)), `getpath([-0.5])` and a
+   builtin reached through an unwitnessed `.[]` (`[[.]] \| .[] \| sort \| .[0] \| path($x)`)
+   all answer as jq does. Still refused where jq answers: a container that also holds a NaN
+   read from the input (`[.a, 1, $x] \| sort \| .[2] \| path($x)` with `.a` = `NaN`), which
+   the bridge does not round-trip unchanged (`reindex_bridge_is_identity`), so it is rebuilt. `unique` compares such a NaN by instance on both routes, as jq does
    ([#3309](https://github.com/rust-works/succinctly/issues/3309)).
    **[#3179](https://github.com/rust-works/succinctly/issues/3179), now closed: an embed reached
    through a container built from an *ancestor* of the bound node.** `.a as $y | {k:.} | .k.a |
@@ -1303,12 +1319,10 @@ is the revert that established what the other one costs.
    plus the entry's height stays under `MAX_NESTING_DEPTH`, exactly when the skipped walk would
    have passed. `.a as $y | path(.a | $y)` answers `["a"]` for the same reason, since the resolver
    materializes the root. Still refused: the other bind order (`. as $x | .a as $y | [.] |
-   path(.[0].a | $y)`, which needs an ancestor lookup when `$y` is bound), a navigation that lands
-   on a container *holding* the embed before a resolver (`.a as $y | {k:.} | .k | path(.a | $y)`:
-   the peel's payoff gate reads only the landing value), and the assignment twin `(.a | ($y.b)) =
-   9`, whose resolver does not materialize through `to_owned_cursor`; and every one of these
-   shapes on the input-queue route (`input | .a as $y | {k:.} | .k.a | path($y)`), whose
-   `eval.rs` converter still reuses at depth 0 only. The depth rule measures the *document's*
+   path(.[0].a | $y)`, which needs an ancestor lookup when `$y` is bound). A navigation that lands
+   on a container *holding* the embed before a resolver (`.a as $y | {k:.} | .k | path(.a | $y)`),
+   the assignment twin `(.a | ($y.b)) = 9`, and these shapes on the input-queue route
+   (`input | .a as $y | {k:.} | .k.a | path($y)`) answer since #3069's bridge provenance. The depth rule measures the *document's*
    subtree height, not the bound value's: a duplicate key the walk descends into but the value
    drops still fails the fresh walk, so binding it never hides a nesting-depth error.
    **[#3188](https://github.com/rust-works/succinctly/issues/3188), now closed: the same embed
@@ -1323,22 +1337,12 @@ is the revert that established what the other one costs.
    is built from navigation, `?`, computed keys, arithmetic, literals and `error` -- nothing a
    declined resolution could repeat -- and declines on any escape, so every refusal still
    comes from the bridge's own resolver. A rebuilt equal value still refuses as jq does
-   (`[{"a":1}] \| del(.[0] \| $x)`). Still refused where jq answers -- every shape where
-   `path()`'s own door still refuses refuses here too, since the write resolves through it:
-
-   - a write under a wrapper (`(del(.[0] \| $x))?` prints nothing, jq `[]`; under `try ...
-     catch "c"` the refusal is *caught* and the handler's `"c"` is printed -- the same
-     wrapper class as `path()`'s, [#3189](https://github.com/rust-works/succinctly/issues/3189));
-   - a navigated bind (`.a as $y \| [.] \| (.[0].a \| $y).b = 9`,
-     [#3179](https://github.com/rust-works/succinctly/issues/3179)) and a write inside a fold
-     over the owned input (`[.] \| reduce range(1) as $i (.; del(.[0] \| $x))`,
-     [#3328](https://github.com/rust-works/succinctly/issues/3328); a marker naming the
-     accumulator itself answers since [#3181](https://github.com/rust-works/succinctly/issues/3181));
-   - a write reached after `.[]` peels the container (`[.] \| [.[] \| del(. \| $x)]`);
-   - a target whose later path raises (`del(.[0] \| $x, .[0])` reports the bridge's refusal
-     where jq reports the second path's `Cannot index object with number`; likewise a
-     malformed slice descriptor after the embed, `del(.[0] \| $x \| .[{"start":0}])`, where
-     jq reports `Array/string slice indices must be integers`).
+   (`[{"a":1}] \| del(.[0] \| $x)`). The shapes this used to leave refused all answer since
+   #3069, because each refused only where the write's target crossed the bridge first: a write
+   under a wrapper (`(del(.[0] \| $x))?`, `try ... catch "c"`), a write inside a fold over the
+   owned input (`[.] \| reduce range(1) as $i (.; del(.[0] \| $x))`), a write after `.[]` peels
+   the container (`[.] \| [.[] \| del(. \| $x)]`), and a target whose later path raises
+   (`del(.[0] \| $x, .[0])` now reports jq's own `Cannot index object with number`).
 
    Every resolved component is re-spelled: integral floats (`.[0.0]`, `.[-1.0]`) as their
    integer, a fractional index with its exact key (`[.,1] \| del(.[-0.5] \| $x)` answers jq's
@@ -1426,11 +1430,12 @@ is the revert that established what the other one costs.
    `test_owned_embed_keeps_node_identity_on_the_input_bridge_2889`. Three residuals were
    left, all specific to this route; two are closed since. What still refuses on it, bare
    or collected into an array, where jq and the generic route answer, is pinned in
-   `test_input_bridge_embed_residuals_refuse_cleanly_2889`: the empty container below, a
-   *second* construct-and-navigate hop after the embed (`input | . as $x | {k:.} | .k |
-   {j:.} | .j | path($x)` -- the first hop's re-entry bridges `{j:.}`, and the throwaway
-   document it builds holds no node the table knows), and a scalar root (`input | . as $x |
-   [.] | .[0] | path($x)` on `1`, which never enters the embed table on this route).
+   `test_input_bridge_embed_residuals_refuse_cleanly_2889`: the empty container below and a
+   scalar root (`input | . as $x | [.] | .[0] | path($x)` on `1`, which never enters the
+   embed table on this route). A *second* construct-and-navigate hop after the embed
+   (`input | . as $x | {k:.} | .k | {j:.} | .j | path($x)`), whose first hop's re-entry
+   bridged `{j:.}` into a document the table knew nothing of, answers since #3069: the
+   bridge hands `$x`'s storage back out.
    - An **empty container** (`input | . as $x | {k:.} | .k | path($x)` on `{}` or `[]`)
      binds no node at all: `whole_container_cursor` has no retained child cursor to hop
      `parent()` from, so the table never gets an entry. jq answers `[]`; the generic
@@ -1518,12 +1523,12 @@ is the revert that established what the other one costs.
    declines it, and that arm never demoted — so `. as $r | .a | . as $x | $r | .c | ($x.b) = 9`
    on `{"a":{"b":1},"c":{"b":1}}` wrote `{"b":9}` (and `$x |= 5` wrote `5`; also through
    `limit(1; …)` and a `def`) where jq refuses, while `del`/`path` of the same shape refused
-   through the demoting funnels. Rebased like every other funnel now. **Still refusing**, each
-   pinned in `test_navigated_bind_residuals_refuse_cleanly_3037` and the sweep's
-   `navigated-bind-*` refuse-only rows: the positional rows (`.a as $y | path(.a | $y)`,
-   `(.a | ($y.b)) = 9` — the marker must certify at a non-root register position, which needs
-   a document-absolute bind path, the #2042 `Origin::At` machinery reached from a value-mode
-   bind; scoped separately). The routes that re-enter the eager evaluator with an *owned*
+   through the demoting funnels. Rebased like every other funnel now. The positional rows it
+   left refusing (`.a as $y | path(.a | $y)`, `(.a | ($y.b)) = 9`, and the same on an
+   owned-rooted document: `-n 'input | ...'`, a `tojson | fromjson` root) answer since #3179
+   and #3069: the resolver stands on `$y`'s own storage at `.a`, so #3177's storage clause
+   certifies it without a document-absolute bind path. Pinned in
+   `test_navigated_bind_positional_and_owned_root_rows_answer_3069`. The routes that re-enter the eager evaluator with an *owned*
    accumulator (`reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)`, a `catch` handler) were
    listed here too — `eval.rs`'s own `eval_as` carries no node for a navigated bind, so no
    witness could promote it — until #3177's storage clause certified the marker by the `Rc`
@@ -7760,7 +7765,8 @@ leading `+` with the spelling dropped, like the `007`/`.5` they already take.
 
 **A parsed NaN compared with itself — closed by
 [#3309](https://github.com/rust-works/succinctly/issues/3309); a container compared with
-itself — narrowed by [#3069](https://github.com/rust-works/succinctly/issues/3069).**
+itself — closed by [#3069](https://github.com/rust-works/succinctly/issues/3069), except a
+partial slice (recorded below).**
 jq's `jv_equal` short-circuits on pointer identity before comparing values, and a parsed
 number literal is an allocated `jv`, so the *same* parsed NaN is equal to itself there while a
 computed NaN is not. succinctly now keeps that identity: a NaN jq mode parses (from a document,
@@ -7793,36 +7799,49 @@ is rebuilt (`map(.)`, `sort`, `[] + .`, `[.[]]`) is a new allocation in jq too a
 | `[nan] \| . == .`, `{a:nan} \| . == .`                  | `true` | `true`     |
 | `[nan] \| . as $a \| {x:$a,y:$a} \| .x == .y`           | `true` | `true`     |
 | `[nan] \| . as $a \| [$a,1,$a] \| unique \| length`     | `2`    | `2`        |
-| `[nan] as $a \| $a == $a`                               | `true` | `false`    |
-| `[nan] \| [.] == [.]`, `[.,.] \| .[0] == .[1]`          | `true` | `false`    |
-| `[nan] \| . + [] == .`, `first(.) == .`                 | `true` | `false`    |
-| `[nan] \| . as $a \| [$a] \| .[] == $a`, `any(. == $a)` | `true` | `false`    |
-| `[nan] \| . as $a \| [$a,$a] \| group_by(.) \| length`  | `1`    | `2`        |
+| `[nan] as $a \| $a == $a`                               | `true` | `true`     |
+| `[nan] \| [.] == [.]`, `[.,.] \| .[0] == .[1]`          | `true` | `true`     |
+| `[nan] \| . + [] == .`, `first(.) == .`                 | `true` | `true`     |
+| `[nan] \| . as $a \| [$a] \| .[] == $a`, `any(. == $a)` | `true` | `true`     |
+| `[nan] \| . as $a \| [$a,$a] \| group_by(.) \| length`  | `1`    | `1`        |
+| `[nan] \| . as $a \| [$a,$a] \| bsearch($a)`            | `0`    | `0`        |
+| `[nan] \| .[0:] == .`                                   | `true` | `true`     |
+| `map(nan) \| . == .` on stdin `[1]`                     | `true` | `true`     |
+| `{a:[nan]} \| .a as $x \| .a \| path($x)`               | `[]`   | `[]`       |
+| `[nan,1] \| .[0:1] == .[0:1]`                           | `true` | `false`    |
 | `[nan] \| . as $a \| [$a] \| indices([$a])`             | `[0]`  | `[]`       |
-| `[nan] \| . as $a \| [$a,$a] \| bsearch($a)`            | `0`    | `-3`       |
-| `[nan] \| .[0:] == .`                                   | `true` | `false`    |
-| `map(nan) \| . == .` on stdin `[1]`                     | `true` | `false`    |
-| `{a:[nan]} \| .a as $x \| .a \| path($x)`               | `[]`   | error      |
 
-The shortcut only fires where `==` is handed two handles on one storage. Everywhere
-succinctly has already split the value into two containers first, jq's `true` is still
-`false` here, so the rows above are examples of a rule, not a closed list. The splits:
+The shortcut fires only where `==` is handed two handles on one storage, so the other half of
+#3069 is not splitting a value into two containers before `==` sees it:
 
-- **The reindex bridge**, the main one. It serializes a value and re-materializes every node
-  as a fresh container. That covers an operand evaluated as `.` inside `+`, `[..]` or
-  `first`, and every builtin that walks a constructed array's elements as a document
-  (`.[]`, `any`, `IN`, `index`/`indices`, `group_by`/`unique_by`, `bsearch`'s element list).
-  Carrying identity across it is the mechanism
-  [#3189](https://github.com/rust-works/succinctly/issues/3189) and
-  [#3305](https://github.com/rust-works/succinctly/issues/3305) need for `path()`, and #3069
-  stays open for it.
-- **Document input.** The generic evaluator reads stdin as a cursor and materializes each
-  read separately, so `map(nan) | . == .` over a document is `false` although the same
-  filter under `-n` is `true`.
-- **Slices.** `.[0:]` is a view onto the same array in jq, and a copy here.
-- **Path tracking.** jq accepts `path($x)` where `$x` is `jv_identical` to the value at the
-  current path. succinctly certifies a bound variable by value or by its bind origin, so a
-  NaN-bearing `$x` bound from a navigated read refuses.
+- **The reindex bridge.** A stage the owned route cannot answer natively serializes its input
+  and re-indexes it as a new document. Every container read back out of that document used to
+  be a fresh copy, which covered an operand evaluated as `.` inside `+`, `[..]` or `first`, and
+  every builtin that walks a constructed array's elements (`.[]`, `any`, `IN`, `group_by`,
+  `unique_by`, `bsearch`), on `-n` and on stdin alike. A bridge document now remembers the
+  value it was serialized from (`bridge_provenance`, `src/jq/value.rs`, jq mode only), and the
+  two converters its nodes leave through (`eval::to_owned`,
+  `eval_generic::owned_from_standard_json`) hand back that value's own storage for any
+  container the bridge round-trips unchanged. It is jq's model, where reading a `jv` never
+  copies it, and it is sound for the same reason the embed table is: the document is the
+  source's serialization, so the handle is the value a fresh walk would build. `path()` sees
+  the same identity: see the #2889 section's #3069 paragraph for the path rows it closed.
+- **A constructed `as` source.** `[nan] as $a` bound the array by splicing it back into the
+  body as literal syntax, so each `$a` *rebuilt* it. A container is now spliced as an
+  untracked marker holding the bound value, so every `$a` reads one allocation; `path($a)`
+  refuses exactly as before, because a constructed value is no node of `.`.
+
+Still different:
+
+- **Slices.** `.[0:]` and any other full-range slice hand back the array itself, as jq's view
+  does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
+  and size all equal), so `.[0:1] == .[0:1]` is identical there; here each slice is a new
+  array. Matching it would need a slice representation, which a NaN is the only way to observe.
+- **`indices`/`index`/`rindex` with an array argument** differ for a reason unrelated to
+  identity: an array pattern is a subsequence search in jq and a whole-element comparison here
+  ([#3453](https://github.com/rust-works/succinctly/issues/3453)).
+- **`no_std` builds.** The bridge registry is a thread-local, so without `std` every bridge
+  read rebuilds, as before, and the bridged rows above answer `false` there.
 
 Ordering is unchanged in both: NaN sorts below NaN, itself included. A mixed-instance
 `sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's

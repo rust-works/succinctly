@@ -121,11 +121,13 @@
 # `to_entries`/literal `getpath`). The residual `owned-embed-refuse-*` ids, and
 # `owned-embed-fold-if-identity`, are pinned in REFUSE_ONLY below with the
 # mechanism each is missing: a scalar root (never `Rc`-backed, so it can't
-# enter the embed table), or a shape `eval::embed_peel_step` does not
-# recognize (a slice, a no-op `|=`, `with_entries`) and so runs through the
-# owned-value re-index bridge before the read reaches it, same as a fold's
-# UPDATE that is not one of the owned fast paths -- see
-# docs/compliance/jq/limitations.md's #2889 section.
+# enter the embed table), or a fold's UPDATE that is not one of the owned
+# fast paths and rebuilds the accumulator before the read reaches it -- see
+# docs/compliance/jq/limitations.md's #2889 section. The rows that refused
+# only because a stage (a wrapper around `path()`, `with_entries`, `add`, a
+# no-op `|=`, a fold over an owned input) crossed the owned-value re-index
+# bridge first agree since #3069: the bridge hands each container back out
+# as the storage that went in.
 #
 # The `owned-embed-array-multi-*`, `owned-embed-object-add` and
 # `owned-embed-array-tie-*` rows are the #2889 review: the relocating fold
@@ -870,26 +872,11 @@ destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nest
 carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
 in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
-navigated-bind-positional-assign:#3037 residual -- the marker certified at a non-root register position inside an assignment's own resolver; the path() twin answers since #3179 (the resolver's materialized root now holds $y's own value), the assignment resolver does not materialize through to_owned_cursor
 owned-embed-refuse-path-nested-ancestor-bind:#3177 -- $x is bound first, so [.] reuses $x's own value, whose .a is $x's materialization, not $y's: sharing here needs an *ancestor* lookup when $y is bound, the mirror of #3179's nested reuse; jq answers [0,"a"]
-owned-embed-refuse-path-nested-comma:#3177 -- path() reached through a comma wrapper is not at the head of the owned re-entry's pipe, so it still crosses the bridge; taking it natively would mean re-implementing the wrapper's driver over an owned value (#3189)
-owned-embed-refuse-path-nested-wrapper:#3177 -- same as owned-embed-refuse-path-nested-comma, through an array constructor and limit
 owned-embed-refuse-path-nested-del-fractional:#3188 -- the write door will not re-spell a fractional index: del(.[-0.5]) deletes element 0 here and nothing in jq (#3302), so the static spelling would be a wrong answer
 owned-embed-refuse-path-nested-del-slice:#3188 -- a slice component has no static spelling the evaluator indexes by (.[{"start":0,"end":1}], #3300), so the write door declines
-owned-embed-refuse-path-nested-as-source:#3177 review -- path() as a bind's source is not the head of the owned re-entry's pipe; the as driver owns the inner pipe, so it still bridges (#3189)
-owned-embed-refuse-path-nested-reduce-source:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as a reduce source
-owned-embed-refuse-path-nested-binary-operand:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as a binary operand inside select
-owned-embed-refuse-path-nested-first-body:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as the body of first
-owned-embed-refuse-path-nested-label-body:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as the body of label
-owned-embed-refuse-path-nested-after-with-entries:#3177 review -- a stage ahead of path() still bridges first, for with_entries (jq ["k"])
-owned-embed-refuse-path-nested-after-add:#3177 review -- a stage ahead of path() still bridges first, for a one-element add
-owned-embed-refuse-path-nested-after-update:#3177 review -- a stage ahead of path() still bridges first, for a no-op |= (jq's setpath places the same jv)
 owned-embed-fold-update-rebuilt-by-nonwrite:#3181 review -- a witnessed step runs its UPDATE through the owned re-index bridge, so even an UPDATE returning `.` hands the next step a rebuilt copy (the owned-embed-fold-if-identity mechanism)
-owned-embed-fold-repeat-source:#3328 -- a `repeat` source fails streams_unbounded, so the whole fold takes the wildcard re-index bridge and INIT is a copy
-owned-embed-fold-owned-input-init:#3328 -- a fold at the head of an owned re-entry is not one of embed_peel_step's shapes, so the whole fold crosses the re-index bridge and INIT navigates a fresh copy
-owned-embed-fold-owned-input-contains:#3328 -- same bridge: the accumulator built from the owned input `[.]` is a re-indexed copy, so its element no longer shares $x's storage
 owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
-owned-embed-refuse-update-noop-element:#2889 -- a `|=` writes through the assignment resolver first, which re-indexes before the trailing read reaches embed_peel_step
 owned-embed-refuse-array-slice:#2889 -- a slice is not one of embed_peel_step's Field/Index/Iterate shapes, so it re-indexes before the read
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
 identity-try-if-nonraising:#2978 review -- a try body holding an if is not a passthrough (its condition may raise and bind the value of the handler); the gate is static, so an if whose condition happens not to raise pays a refusal. The raising twin (identity-trap-raising-try-*) is the write-side fabrication this prevents
