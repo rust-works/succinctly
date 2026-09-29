@@ -3861,13 +3861,13 @@ impl OwnedValue {
     }
 
     /// [`to_json_input_bridge`](Self::to_json_input_bridge)'s text, indexed
-    /// as bridge text -- see [`reindexed`](Self::reindexed), including its
-    /// provenance rule.
-    pub fn input_bridge_doc<S: EvalSemantics>(&self) -> ReindexedDoc {
-        ReindexedDoc::new(
-            self.to_json_input_bridge(),
-            S::REINDEX_BRIDGE_KEEPS_IDENTITY.then_some(self),
-        )
+    /// as bridge text -- see [`reindexed`](Self::reindexed). Unlike that
+    /// one, it keeps no provenance: its serializer spells some scalars for
+    /// the input queue rather than for a round trip, so the rule that makes
+    /// handing back the source sound (`reindex_bridge_is_identity`) was
+    /// never shown to hold for it.
+    pub fn input_bridge_doc(&self) -> ReindexedDoc {
+        ReindexedDoc::new(self.to_json_input_bridge(), None)
     }
 }
 
@@ -3951,11 +3951,23 @@ impl Drop for ReindexedDoc {
 /// limit `eval::to_owned` walks under, and a subtree is never deeper than
 /// the tree it sits in.
 ///
+/// **Where each container is.** A JSON index gives every value *and every
+/// object key* one BP node, in document order, so the node the `k`th of them
+/// (counting from 0) opens sits at BP position `2k - depth`: `k` opens and
+/// `k - depth` closes precede it. The table is therefore computed from
+/// `source` alone, by the walk the serializer made (elements in order, each
+/// field's key then its value), with no cursor navigation -- a cursor walk
+/// over the document measured +15% on a query that reads one element of a
+/// 10 MB bridged array. A read still checks the recorded value is the kind
+/// of container it stands on before using it, and a debug build checks it
+/// against a fresh walk on every hit
+/// (`bridge_provenance_positions_match_the_index_3069` pins the arithmetic
+/// against the index itself).
+///
 /// **Cost.** Registering is one `Rc` clone and a push, per bridge crossing
 /// of a container, and only in jq mode. The node table itself is built on
-/// the first container read out of the document -- one walk over its
-/// containers, no more than the single fresh materialization it replaces --
-/// so a bridged evaluation that only reads scalars never pays for it.
+/// the first container read out of the document, so a bridged evaluation
+/// that only reads scalars never pays for it.
 ///
 /// `#[cfg(feature = "std")]` only, the same `thread_local!` shape and
 /// degradation as `eval_generic`'s `embed_table`: without `std` nothing is
@@ -4014,23 +4026,103 @@ pub(crate) mod bridge_provenance {
         });
     }
 
+    /// Whether a registered bridge document's text starts at `text` -- the
+    /// check a read makes before paying for anything else.
+    pub(crate) fn registered(text: usize) -> bool {
+        DOCS.with(|d| d.borrow().iter().any(|r| r.text == text))
+    }
+
     /// The source storage for the container at BP position `node` of the
     /// bridge document whose text starts at `text`, or `None` when no
     /// registered document has that text or the container is not one the
-    /// bridge round-trips unchanged. `build` walks the document against its
-    /// source the first time any read of that document asks.
-    pub(crate) fn shared_for(
-        text: usize,
-        node: usize,
-        build: impl FnOnce(&OwnedValue) -> Vec<(usize, Option<OwnedValue>)>,
-    ) -> Option<OwnedValue> {
+    /// bridge round-trips unchanged. The table is built the first time any
+    /// read of that document asks.
+    pub(crate) fn shared_for(text: usize, node: usize) -> Option<OwnedValue> {
         DOCS.with(|d| {
             let d = d.borrow();
             let reg = d.iter().rev().find(|r| r.text == text)?;
-            let table = reg.table.get_or_init(|| build(&reg.source));
+            let table = reg.table.get_or_init(|| table_of(&reg.source));
             let i = table.binary_search_by_key(&node, |(n, _)| *n).ok()?;
             table[i].1.clone()
         })
+    }
+
+    /// Every container in `source`'s serialization, in document order, at
+    /// the BP position its node opens at (see the module doc), with its
+    /// storage -- or `None` where the bridge does not round-trip it
+    /// unchanged, which is where some value inside it does not.
+    pub(super) fn table_of(source: &OwnedValue) -> Vec<(usize, Option<OwnedValue>)> {
+        /// Records `value` and its subtree; `k` counts the nodes before it.
+        /// Returns whether the subtree round-trips unchanged.
+        fn walk(
+            value: &OwnedValue,
+            depth: usize,
+            k: &mut usize,
+            table: &mut Vec<(usize, Option<OwnedValue>)>,
+        ) -> bool {
+            let position = 2 * *k - depth;
+            *k += 1;
+            let round_trips = match value {
+                OwnedValue::Array(items) => {
+                    let slot = table.len();
+                    table.push((position, None));
+                    let mut all = true;
+                    for item in items {
+                        all &= walk(item, depth + 1, k, table);
+                    }
+                    if all {
+                        table[slot].1 = Some(value.clone());
+                    }
+                    all
+                }
+                OwnedValue::Object(fields) => {
+                    let slot = table.len();
+                    table.push((position, None));
+                    let mut all = true;
+                    for field in fields.values() {
+                        *k += 1; // the key's own node
+                        all &= walk(field, depth + 1, k, table);
+                    }
+                    if all {
+                        table[slot].1 = Some(value.clone());
+                    }
+                    all
+                }
+                scalar => super::super::eval_generic::reindex_bridge_is_identity(scalar),
+            };
+            round_trips
+        }
+        let mut table = Vec::new();
+        walk(source, 0, &mut 0, &mut table);
+        table
+    }
+}
+
+/// Whether `shared`, handed back for a node, is the value a fresh walk
+/// of that node built (`fresh`) up to the one difference the bridge's
+/// round trip is allowed (`reindex_bridge_is_identity`): a bare `Int(n)`
+/// reads back as the literal `n`, its only spelling, which renders
+/// identically. Everything else must match exactly, NaN payloads and
+/// literal spellings included. Debug builds and tests only.
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn bridge_round_trip_eq(shared: &OwnedValue, fresh: &OwnedValue) -> bool {
+    match (shared, fresh) {
+        (OwnedValue::Int(n), OwnedValue::NumberLiteral(NumberRepr::Int(m), text)) => {
+            n == m && **text == *alloc::format!("{n}")
+        }
+        (OwnedValue::Array(a), OwnedValue::Array(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| bridge_round_trip_eq(x, y))
+        }
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|((ka, va), (kb, vb))| ka == kb && bridge_round_trip_eq(va, vb))
+        }
+        _ => alloc::format!("{shared:?}") == alloc::format!("{fresh:?}"),
     }
 }
 
@@ -4051,11 +4143,11 @@ pub(crate) mod bridge_provenance {
 
     pub(super) fn unregister(_text: usize) {}
 
-    pub(crate) fn shared_for(
-        _text: usize,
-        _node: usize,
-        _build: impl FnOnce(&OwnedValue) -> alloc::vec::Vec<(usize, Option<OwnedValue>)>,
-    ) -> Option<OwnedValue> {
+    pub(crate) fn registered(_text: usize) -> bool {
+        false
+    }
+
+    pub(crate) fn shared_for(_text: usize, _node: usize) -> Option<OwnedValue> {
         None
     }
 }
@@ -6731,6 +6823,108 @@ mod tests {
         }
     }
 
+    /// #3069: `bridge_provenance` places each container of a bridge document
+    /// by arithmetic over the source value (a node per value and per object
+    /// key, the `k`th opening at BP position `2k - depth`), never by reading
+    /// the document. This is the oracle for that arithmetic: over random
+    /// trees holding every scalar spelling the bridge writes (a computed and
+    /// a parsed NaN, both infinities, a computed float, literals, escaped
+    /// strings and keys, empty containers), the positions it computes are
+    /// exactly the index's own container positions in document order, and
+    /// every container it records as round-tripping is what a fresh walk of
+    /// that node builds.
+    #[cfg(feature = "std")]
+    #[test]
+    fn bridge_provenance_positions_match_the_index_3069() {
+        use crate::json::light::JsonCursor;
+        fn containers(c: JsonCursor<'_>, out: &mut Vec<(usize, OwnedValue)>) {
+            if matches!(
+                c.value(),
+                crate::json::StandardJson::Array(_) | crate::json::StandardJson::Object(_)
+            ) {
+                let fresh =
+                    crate::jq::eval_generic::to_owned_cursor::<crate::jq::JqSemantics, _>(&c)
+                        .expect("bridge text decodes");
+                out.push((c.bp_position(), fresh));
+            }
+            let mut child = c.first_child();
+            while let Some(x) = child {
+                containers(x, out);
+                child = x.next_sibling();
+            }
+        }
+        let mut seed: u64 = 0x3069;
+        let mut next = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        fn tree(depth: usize, next: &mut dyn FnMut(u64) -> u64) -> OwnedValue {
+            let pick = if depth >= 4 { next(9) } else { next(12) };
+            match pick {
+                0 => OwnedValue::Null,
+                1 => OwnedValue::Bool(next(2) == 0),
+                2 => OwnedValue::Int(next(1000) as i64 - 500),
+                3 => OwnedValue::Float(f64::NAN),
+                4 => OwnedValue::Float(if next(2) == 0 {
+                    f64::INFINITY
+                } else {
+                    f64::NEG_INFINITY
+                }),
+                5 => OwnedValue::Float(0.25 * next(9) as f64 + 0.1),
+                6 => OwnedValue::NumberLiteral(NumberRepr::Int(7), "7".into()),
+                7 => OwnedValue::NumberLiteral(NumberRepr::Float(1.5), "1.50".into()),
+                8 => OwnedValue::String(
+                    ["", "a", "q\"u", "\\", "\u{1}", "é"][next(6) as usize].into(),
+                ),
+                9 | 10 => {
+                    OwnedValue::array_from((0..next(4)).map(|_| tree(depth + 1, next)).collect())
+                }
+                _ => OwnedValue::object_from(
+                    (0..next(4))
+                        .map(|i| (alloc::format!("k{i}\"{}", next(3)), tree(depth + 1, next))),
+                ),
+            }
+        }
+        for _ in 0..400 {
+            let source = OwnedValue::array_from(vec![tree(0, &mut next), tree(1, &mut next)]);
+            let doc = source
+                .reindexed::<crate::jq::JqSemantics>()
+                .expect("shallow");
+            let mut actual = Vec::new();
+            containers(doc.root(), &mut actual);
+            let table = bridge_provenance::table_of(&source);
+            assert_eq!(
+                table.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                actual.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                "positions for {}",
+                doc.text()
+            );
+            for ((position, recorded), (_, fresh)) in table.iter().zip(&actual) {
+                if let Some(recorded) = recorded {
+                    assert!(
+                        bridge_round_trip_eq(recorded, fresh),
+                        "container at {position} of {}: {recorded:?} vs {fresh:?}",
+                        doc.text()
+                    );
+                }
+            }
+        }
+        // A parsed NaN is the one scalar the bridge does not round-trip
+        // unchanged, so neither it nor any container around it is recorded.
+        let parsed_nan = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into());
+        let source = OwnedValue::array_from(vec![
+            OwnedValue::array_from(vec![parsed_nan]),
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+        ]);
+        let recorded: Vec<bool> = bridge_provenance::table_of(&source)
+            .iter()
+            .map(|(_, v)| v.is_some())
+            .collect();
+        assert_eq!(recorded, [false, false, true]);
+    }
+
     /// [`OwnedValue::input_bridge_doc`] is the exact `to_json_input_bridge` +
     /// `JsonIndex::build_reindex` pair `evaluate_input_streaming`
     /// (`src/bin/succinctly/jq_runner.rs`) used to spell out by hand, bundled
@@ -6741,7 +6935,7 @@ mod tests {
     #[test]
     fn test_input_bridge_doc_pairs_bridge_text_with_its_flagged_index_3034() {
         let input = OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN), OwnedValue::Int(1)]);
-        let doc = input.input_bridge_doc::<crate::jq::JqSemantics>();
+        let doc = input.input_bridge_doc();
         assert_eq!(doc.text(), input.to_json_input_bridge());
 
         let mut children = doc.root().children();

@@ -2231,70 +2231,51 @@ fn embed_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
 pub(crate) fn bridge_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
 ) -> Option<OwnedValue> {
-    if !S::REINDEX_BRIDGE_KEEPS_IDENTITY || !super::value::bridge_provenance::active() {
+    use super::value::bridge_provenance;
+    if !S::REINDEX_BRIDGE_KEEPS_IDENTITY || !bridge_provenance::active() {
+        return None;
+    }
+    // Which document first, from the retained child cursor: a read from any
+    // other document (the input, a sibling bridge) stops here, before the
+    // BP `parent()` hop that naming the container's own node costs.
+    let text = match value {
+        StandardJson::Array(elements) => elements.document_text()?,
+        StandardJson::Object(fields) => fields.document_text()?,
+        _ => return None,
+    };
+    let text = text.as_ptr() as usize;
+    if !bridge_provenance::registered(text) {
         return None;
     }
     let cursor = standard_json_node_cursor(value)?;
-    super::value::bridge_provenance::shared_for(
-        cursor.text().as_ptr() as usize,
-        cursor.bp_position(),
-        |source| {
-            let mut table = Vec::new();
-            bridge_provenance_walk(source, cursor.index().root(cursor.text()), &mut table);
-            table
-        },
-    )
-}
-
-/// Walk a bridge document and the value it was serialized from in lockstep,
-/// recording every container's BP position in document order with the
-/// source storage it stands for, or `None` where the bridge does not
-/// round-trip that subtree unchanged. Returns whether `source` round-trips.
-///
-/// The two trees have the same shape by construction (the document *is*
-/// `source`'s serialization: array elements in order, object fields in the
-/// map's own order). A mismatch would mean that stopped being true; it is
-/// recorded as not round-tripping, so a read falls back to a fresh walk.
-fn bridge_provenance_walk<W: Clone + AsRef<[u64]>>(
-    source: &OwnedValue,
-    cursor: JsonCursor<'_, W>,
-    table: &mut Vec<(usize, Option<OwnedValue>)>,
-) -> bool {
-    let slot = table.len();
-    let round_trips = match (source, cursor.value()) {
-        (OwnedValue::Array(items), StandardJson::Array(elements)) => {
-            table.push((cursor.bp_position(), None));
-            let mut rest = elements;
-            let mut all = true;
-            for item in items {
-                let Some((element, tail)) = rest.uncons_cursor() else {
-                    return false; // omni-dev: coverage tolerate-line reason="unreachable: a bridge document is its source's serialization, so it has one element per source element (#3069)"
-                };
-                all &= bridge_provenance_walk(item, element, table);
-                rest = tail;
-            }
-            all && rest.uncons_cursor().is_none()
-        }
-        (OwnedValue::Object(map), StandardJson::Object(fields)) => {
-            table.push((cursor.bp_position(), None));
-            let mut rest = fields;
-            let mut all = true;
-            for value in map.values() {
-                let Some((field, tail)) = rest.uncons() else {
-                    return false; // omni-dev: coverage tolerate-line reason="unreachable: a bridge document is its source's serialization, so it has one field per source field (#3069)"
-                };
-                all &= bridge_provenance_walk(value, field.value_cursor(), table);
-                rest = tail;
-            }
-            all && rest.uncons().is_none()
-        }
-        (OwnedValue::Array(_) | OwnedValue::Object(_), _) => false, // omni-dev: coverage tolerate-line reason="unreachable: a serialized container re-indexes as the same kind of container (#3069)"
-        (scalar, _) => return super::eval_generic::reindex_bridge_is_identity(scalar),
-    };
-    if round_trips {
-        table[slot].1 = Some(source.clone());
+    let shared = bridge_provenance::shared_for(text, cursor.bp_position())?;
+    // The table places each container by arithmetic over the source rather
+    // than by walking the document (see `bridge_provenance`); a node whose
+    // kind disagrees would mean the two stopped corresponding, and is read
+    // fresh instead.
+    let same_kind = matches!(
+        (&shared, value),
+        (OwnedValue::Array(_), StandardJson::Array(_))
+            | (OwnedValue::Object(_), StandardJson::Object(_))
+    );
+    if !same_kind {
+        debug_assert!(
+            same_kind,
+            "#3069: bridge provenance names a {shared:?} for another kind"
+        ); // omni-dev: coverage tolerate-line reason="unreachable: a bridge document is its source's serialization, so the node at each recorded position is the recorded kind (#3069)"
+        return None; // omni-dev: coverage tolerate-line reason="unreachable: see the debug_assert above (#3069)"
     }
-    round_trips
+    #[cfg(debug_assertions)]
+    {
+        let fresh = to_owned_at_depth::<S, W>(value, None, 0);
+        debug_assert!(
+            fresh
+                .as_ref()
+                .is_ok_and(|fresh| super::value::bridge_round_trip_eq(&shared, fresh)),
+            "#3069: bridge provenance handed back {shared:?} where a fresh walk builds {fresh:?}"
+        );
+    }
+    Some(shared)
 }
 
 /// The [`BindOrigin`] an `as` binding over `value` should carry (#2889
