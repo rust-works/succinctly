@@ -11584,6 +11584,18 @@ pub(crate) fn arith_negate<S: EvalSemantics>(operand: OwnedValue) -> Result<Owne
     }
 }
 
+/// Whether an integer-valued numeric operand is negative in jq's double
+/// model, where zero has a sign too. `n` is `operand`'s already-read integer
+/// value; only a `-0` literal (`NumberLiteral(Int(0), "-0")`, which
+/// `number_repr` collapses to `Int(0)`) needs the spelling to say so.
+fn int_operand_is_negative(operand: &OwnedValue, n: i64) -> bool {
+    n < 0
+        || matches!(
+            operand,
+            OwnedValue::NumberLiteral(NumberRepr::Int(0), text) if text.starts_with('-')
+        )
+}
+
 /// Multiply two values.
 fn arith_mul<S: EvalSemantics>(
     left: OwnedValue,
@@ -11665,10 +11677,19 @@ fn arith_mul<S: EvalSemantics>(
             let (l_num, r_num) = (left.number_repr(), right.number_repr());
             match (left, right, l_num, r_num) {
                 // jq converts to float on overflow, yq wraps
-                (_, _, Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
+                (l, r, Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
                     if S::OVERFLOW_WRAPS {
                         // yq behavior: wrapping mul
                         Ok(OwnedValue::Int(a.wrapping_mul(b)))
+                    } else if (a == 0 || b == 0)
+                        && int_operand_is_negative(&l, a) != int_operand_is_negative(&r, b)
+                    {
+                        // jq multiplies in doubles, so a zero product takes
+                        // the XOR of its operands' signs, and a negative one
+                        // prints `-0` (#3440). `i64` has no negative zero,
+                        // so this is the one product the exact fast path
+                        // below cannot represent.
+                        Ok(OwnedValue::Float(-0.0))
                     } else {
                         // jq behavior: convert to float on overflow -- or
                         // whenever the exact i64 result doesn't match
@@ -75957,6 +75978,65 @@ mod tests {
         query!(br#"{"a": [1, 2], "b": [3, 4]}"#, ".a * .b",
             QueryResult::Error(_) => {}
         );
+    }
+
+    /// #3440: jq multiplies in doubles, so a zero product carries the XOR of
+    /// its operands' signs and a negative one prints `-0`. The all-integer
+    /// path used to return `Int(0)` whenever the zero was on the left
+    /// (`0 * -1`) while `-1 * 0` already printed `-0`. Rows captured live
+    /// against jq 1.7.1.
+    #[test]
+    fn test_arithmetic_mul_zero_product_sign_3440() {
+        // The issue's own table.
+        for (filter, want) in [
+            ("0 * -1", "-0"),
+            ("0 * -5", "-0"),
+            ("-1 * 0", "-0"),
+            ("-3 * 0", "-0"),
+            ("0.0 * -1", "-0"),
+            ("-(0 * -1)", "0"),
+        ] {
+            assert_eq!(outputs(b"0", filter), [want], "{filter}");
+        }
+        assert_eq!(outputs(b"0", ". * -1"), ["-0"]);
+        assert_eq!(
+            outputs(b"0", "[0 * -1, -1 * 0] | map(tostring)"),
+            [r#"["-0","-0"]"#]
+        );
+
+        // Same-sign and positive zero products stay a plain `0`.
+        for filter in ["0 * 1", "0 * 0", "1 * 0"] {
+            assert_eq!(outputs(b"0", filter), ["0"], "{filter}");
+        }
+
+        // A `-0` literal is negative even though `number_repr` reads it as
+        // `Int(0)`: `(-0) * -1` is `+0`, and `0 * -0` / `(-0) * 1` are `-0`.
+        // Without the sign check the `-0` rows regress `(-0) * -1`.
+        for (filter, want) in [
+            ("(-0) * -1", "0"),
+            ("(-0) * 1", "-0"),
+            ("0 * (-0)", "-0"),
+            ("(-0) * (-0)", "0"),
+            ("(-0) * 0", "-0"),
+        ] {
+            assert_eq!(outputs(b"0", filter), [want], "{filter}");
+        }
+        // The same literal arriving as a document number.
+        assert_eq!(outputs(b"-0", ". * 1"), ["-0"]);
+        assert_eq!(outputs(b"-0", ". * -1"), ["0"]);
+        assert_eq!(outputs(b"-5", ". * 0"), ["-0"]);
+
+        // A nonzero product and the compound-assign form are unaffected.
+        assert_eq!(outputs(b"-5", ". * -1"), ["5"]);
+        assert_eq!(outputs(b"0", ". *= -1"), ["-0"]);
+    }
+
+    /// #3440: yq has no negative zero (Go's `int64` product is plain `0`),
+    /// so the jq-mode fix must not reach `YqSemantics`.
+    #[test]
+    fn test_arithmetic_mul_zero_product_sign_yq_stays_zero_3440() {
+        assert_eq!(outputs_yq(b"0", "0 * -1"), ["0"]);
+        assert_eq!(outputs_yq(b"0", ". * -1"), ["0"]);
     }
 
     /// #1230: a `Float`-repr repeat count truncates toward zero, matching
