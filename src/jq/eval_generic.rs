@@ -3654,9 +3654,6 @@ fn push_generic_document_validation_error<C: DocumentCursor>(
                 // `display_key_kind`: a YAML complex-key collision is a
                 // map-build problem, and `select(.)`/`if` stream the
                 // container with both entries intact, as yq does (#2519).
-                // Once a decode-failure key flips `seen_fallback`,
-                // `resolve_display_key` below does flag complex keys too --
-                // accepted, since yq rejects such a document at parse time.
                 match key_display_string_kind(&field.key) {
                     None => return Some(Control::Error(f.malformed_member_error())),
                     // Clean key, no fallback seen yet: no collision is

@@ -1837,12 +1837,16 @@ produces a different *value* depending on whether it edited the file or printed 
 fast path already shared `stream_cursor!` with stdout, so this only ever concerned the
 fallback a non-M2-eligible filter reaches.
 
-**The one fork #1349 left between `-i` and stdout is closed**
-([#2519](https://github.com/rust-works/succinctly/issues/2519)). A document with two *complex*
-mapping keys whose display spellings collide (`? [1]\n: v1\n? [2]\n: v2`, both `""` per
-[#222](https://github.com/rust-works/succinctly/issues/222)) used to make `-i` raise while
-stdout printed `'': v2` and dropped the first entry silently; both routes now raise the same
-`object key "" is ambiguous` error, and `-i` leaves the file untouched. See the display-key
+**The fork #1349 left between `-i` and stdout is closed for every filter that materializes
+the mapping** ([#2519](https://github.com/rust-works/succinctly/issues/2519)). A document with
+two *complex* mapping keys whose display spellings collide (`? [1]\n: v1\n? [2]\n: v2`, both
+`""` per [#222](https://github.com/rust-works/succinctly/issues/222)) used to make `-i '.x = 1'`
+raise while stdout printed `'': v2` and dropped the first entry silently; both routes now
+raise the same `object key "" is ambiguous` error, and `-i` leaves the file untouched. `-i`'s
+non-M2 branch still refuses such a file *outright*, before evaluating anything
+(`validate_yaml_display_keys`), so a filter that stdout streams with both entries intact
+(`to_entries`) is refused under `-i` -- the safe direction, since that pre-walk is also what
+stops `-i 'to_entries | from_entries'` from writing a merged document. See the display-key
 collision section below for which routes raise and which keep both entries.
 
 A JSON-sourced `-i` file stays on the materializing route deliberately: a `YamlIndex` accepts
@@ -2360,12 +2364,15 @@ streams. This is an [ADR-0018](../../adrs/adr-0018.md) rule-4(b) divergence on t
 materializing routes only: yq keeps both keys there too, and `OwnedValue::Object` cannot until
 a duplicate-capable object exists ([#1344](https://github.com/rust-works/succinctly/issues/1344)).
 
-**Two residuals.** `with_entries(.)` and `to_entries | from_entries` still merge on stdout
+**Residuals.** `with_entries(.)` and `to_entries | from_entries` still merge on stdout
 (`'': v2`, exit 0): `to_entries` has already turned both keys into the plain string `""`, so
 `from_entries` sees an ordinary repeated key and no fallback flag survives to catch it. `-i`
 refuses these (its `validate_yaml_display_keys` pre-walk stays for exactly this case). And the
 `load()` builtin's own YAML-mapping conversion is tracked separately in
-[#1753](https://github.com/rust-works/succinctly/issues/1753). The `-i` fast path writing a
+[#1753](https://github.com/rust-works/succinctly/issues/1753). Merge keys (`<<`) collapse a
+merged-in complex key with a local one by their shared `""` spelling inside merge resolution
+itself, before any map is built, so even `.b.z = 1` drops an entry
+([#3467](https://github.com/rust-works/succinctly/issues/3467)). The `-i` fast path writing a
 complex key's `""` spelling into the file is
 [#3463](https://github.com/rust-works/succinctly/issues/3463).
 

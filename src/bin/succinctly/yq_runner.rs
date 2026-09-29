@@ -741,6 +741,11 @@ fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
             YamlValue::Mapping(fields) => {
                 let mut seen: IndexMap<String, ()> = IndexMap::new();
                 let mut guard = DisplayKeyGuard::default();
+                // STYLE-0013: `resolve_display_key` directly, not
+                // `DocumentField::checked_key` -- this walks `YamlFields`
+                // from a `YamlCursor` (no `DocumentField` to call it on),
+                // and YAML has no `,`/`:` member delimiters for the
+                // delimiter half to check; only the shared key rule applies.
                 for field in fields {
                     let key = resolve_display_key(&field.key(), &seen, &mut guard)
                         .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -827,6 +832,8 @@ fn yaml_to_owned_value<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> Re
             // classification on `DocumentValue::display_key_kind`, so this
             // route and every generic materializer answer from one rule.
             let mut guard = DisplayKeyGuard::default();
+            // STYLE-0013: same reason as `validate_yaml_display_keys`'s own
+            // exemption -- a `YamlCursor`-native walk with no delimiters.
             for field in fields {
                 let key = resolve_display_key(&field.key(), &map, &mut guard)
                     .map_err(|e| anyhow::anyhow!("{e}"))?

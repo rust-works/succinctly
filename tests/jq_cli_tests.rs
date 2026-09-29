@@ -6591,12 +6591,12 @@ fn test_colliding_display_key_error_is_uncatchable_1813() -> Result<()> {
 /// text it carries.
 #[test]
 fn test_user_error_matching_colliding_key_suffix_stays_catchable_1813() -> Result<()> {
-    let filter = r#"try error("object key \"x\" is ambiguous: an undecodable key's display form collides with another key of the same name and cannot be represented") catch ("caught: " + .)"#;
+    let filter = r#"try error("object key \"x\" is ambiguous: a complex or undecodable key's display form collides with another key of the same name and cannot be represented") catch ("caught: " + .)"#;
     let (out, err, code) = run_jq_full(&[filter], Some("null"))?;
     assert_eq!(code, 0, "stderr: {err}");
     assert_eq!(
         out.trim(),
-        "\"caught: object key \\\"x\\\" is ambiguous: an undecodable key's display form collides with another key of the same name and cannot be represented\""
+        "\"caught: object key \\\"x\\\" is ambiguous: a complex or undecodable key's display form collides with another key of the same name and cannot be represented\""
     );
     Ok(())
 }
