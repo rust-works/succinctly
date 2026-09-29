@@ -43,8 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follows `eval` and keeps an owned `null`/boolean. Cursor-metadata builtins
   answer from the real document, duplicate keys collapse as in jq, and a yq
   owned-target computed index now raises on a negative out-of-range index as yq
-  does (`([1,2]+[])[(1*-5)]`, also in the CLI). The list of what changed for
-  library callers is in `docs/compliance/jq/limitations.md`.
+  does (`([1,2]+[])[(1*-5)]`, also in the CLI). `succinctly yq`'s own DOM route
+  keeps the previous evaluator (it evaluates an already-decoded value, and the
+  generic evaluator measured +21% to +37% on `-R` regex queries). The list of
+  what changed for library callers is in `docs/compliance/jq/limitations.md`.
 
 - **jq: installing a program or module of many top-level `def`s is linear,
   not `O(defs x program)`** (#3307). Each `def` was installed over everything

@@ -4757,7 +4757,11 @@ stack the CLI reserves for evaluation (`EVAL_STACK_SIZE`, `src/bin/succinctly/ma
 and the CLI registers that stack for ADR-0025's floor. A library caller invoking
 `succinctly::jq::eval` directly gets neither guarantee on its own: the same recursion that
 errors cleanly under the CLI can abort the process with a native stack overflow on an
-ordinary (e.g. default 8 MB) thread. Wrapping the evaluation in
+ordinary (e.g. default 8 MB) thread. Since #3457 `succinctly::jq::eval` is the generic
+evaluator, whose recursion uses a little more native stack per level: on an 8 MB thread in a
+release build `def f(n): if n == 0 then 0 else f(n-1) + 1 end` answers up to about 450 levels
+through `eval` and about 550 through the evaluator it replaced (both abort past that).
+Wrapping the evaluation in
 `succinctly::jq::with_stack_budget(bytes_available, || ...)` arms the floor for that thread,
 so a recursion too deep for it refuses instead; running recursive `def`s at any real depth
 still needs a thread reserved at a comparable size.
@@ -8109,6 +8113,18 @@ narrowing:
   without the `1` it produced first, which `succinctly yq` already discarded (#2392).
 - **Wording.** A decode failure reads as the cursor evaluator words it (`Invalid JSON text: ...`,
   `malformed value in document`) rather than the previous evaluator's (`invalid numeric literal`).
+
+`succinctly yq`'s DOM route (`-R` lines, `--inplace`, `--slurp`, writes, `--arg`) does **not**
+use the converged entry: it evaluates a value it has already decoded and re-indexed, so the
+split above cannot arise there, and it calls the hidden `jq::eval_reindexed`, which is the
+hybrid `eval` was before #3457. That keeps its output and its speed as they were. Through the
+converged `eval` the same route measured slower (M4 Pro, interleaved, 9 reps, the `users`
+document as 1 MB and 10 MB of `-R` lines: `select(test("age"))` +21% and +37% wall, `. + "x"`
++4% to +9%, the rest within the harness's +-1% noise floor), because the generic evaluator
+answers a builtin it has no native arm for by serializing and re-indexing the value on every
+call, and `-R` makes one call per line. It would also read cursor metadata from the synthetic
+re-indexed document (`.c | line`: `1` through `eval`, the fixed default `0` through
+`eval_reindexed`). Moving that route is a separate decision, gated on that bridge cost.
 
 `jq::eval_owned_with_file_index` evaluates an already-decoded value, which has no unreadable
 value to split on, and keeps its own route. `eval.rs`'s owned evaluator (`eval_full`) is still

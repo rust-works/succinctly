@@ -26386,7 +26386,9 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 ///
 /// [`eval_lenient`] follows this entry. [`eval_owned_with_file_index`]
 /// evaluates an already-decoded [`OwnedValue`], which has no unreadable value
-/// to split on, and keeps its own route.
+/// to split on, and keeps its own route; so does `succinctly yq`'s DOM route,
+/// through the hidden `eval_reindexed`, for the same reason and because the
+/// generic evaluator costs it measurably more per `-R` line.
 ///
 /// # Examples
 ///
@@ -26434,6 +26436,44 @@ pub fn eval<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::OneCursor(c) => QueryResult::One(c.value()),
             other => other,
         }
+    })
+}
+
+/// [`eval`] for a document that was decoded first and then re-indexed: the
+/// hybrid `eval` was before #3457 (a query that reads path context goes to
+/// the generic evaluator, everything else to [`eval_full`]).
+///
+/// `succinctly yq`'s DOM route -- `-R` lines, `--inplace`, `--slurp`, writes,
+/// `--arg` -- evaluates an [`OwnedValue`] it has already decoded, re-indexed
+/// into a throwaway document (`OwnedValue::reindexed_without_provenance`).
+/// Two things make [`eval`] the wrong entry for it:
+///
+/// - The split #3457 closes (a value the index cannot read is validated where
+///   it is wrapped rather than where it is read) cannot arise: nothing in a
+///   re-indexed decoded value is unreadable. Cursor-metadata builtins would
+///   answer from the *synthetic* document's positions, which are not the
+///   user's file's (`.c | line` is `0` here, and `1` through [`eval`]).
+/// - The generic evaluator answers a builtin it has no native arm for
+///   (`test`, `+`, ...) by serializing the value and indexing it again per
+///   call. On the tiny documents `-R` produces one call per line, and
+///   measured on an M4 Pro (interleaved, 9 reps, `users` 1 MB and 10 MB as
+///   lines) that cost `select(test("age"))` +21% and +37% wall, `. + "x"` +4%
+///   to +9%, against this route, which reaches `eval_full` with no bridge.
+///
+/// Not a supported entry point; a library caller wants [`eval`].
+#[doc(hidden)]
+pub fn eval_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    cursor: JsonCursor<'a, W>,
+) -> QueryResult<'a, W> {
+    contain_depth_panic(move || {
+        if needs_path_context(expr) {
+            return generic_to_query_result::<_, S>(super::eval_generic::eval_with_cursor_using::<
+                S,
+                _,
+            >(expr, cursor));
+        }
+        eval_full::<W, S>(expr, cursor)
     })
 }
 
@@ -115792,5 +115832,50 @@ mod touched_edge_cases_2999 {
             "eval moved from eval_full:\n{}",
             differ.join("\n")
         );
+    }
+
+    /// #3457: `eval_reindexed` is the hybrid `eval` was, for `succinctly yq`'s
+    /// DOM route. It reaches `eval_full` for a query with no path context (so
+    /// eval.rs's own answer, unreadable-value raise included, is unchanged) and
+    /// the generic evaluator for one that reads it, exactly as before.
+    #[test]
+    fn eval_reindexed_keeps_the_previous_hybrid_3457() {
+        let outcome = |json: &str, filter: &str| {
+            let index = JsonIndex::build(json.as_bytes());
+            let expr = parse(filter).expect("filter parses");
+            let element = index.root(json.as_bytes()).first_child().expect("element");
+            let run = |r: QueryResult<'_, Vec<u64>>| match r {
+                QueryResult::Error(e) => format!("error: {}", e.is_decode_failure()),
+                other => other
+                    .collect_owned::<JqSemantics>()
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            (
+                run(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, element)),
+                run(eval_full::<Vec<u64>, JqSemantics>(&expr, element)),
+                run(eval::<Vec<u64>, JqSemantics>(&expr, element)),
+            )
+        };
+        // No path context: `eval_reindexed` is `eval_full`, not `eval`.
+        let (reindexed, full, entry) = outcome("[1.2.3]", "[.] | length");
+        assert_eq!(
+            (reindexed.as_str(), full.as_str()),
+            ("error: true", "error: true")
+        );
+        assert_eq!(entry, "1");
+        let (reindexed, full, entry) = outcome(r#"[{"c":"x"}]"#, ".c | line");
+        // Cursor metadata: `eval_full`'s fixed default for the DOM route, whose
+        // document is a synthetic re-index, against the real position `eval` reads.
+        assert_eq!(
+            (reindexed.as_str(), full.as_str(), entry.as_str()),
+            ("0", "0", "1")
+        );
+        // Path context: the generic evaluator, as `eval` was routed before.
+        let (reindexed, _, entry) = outcome(r#"[{"a":1}]"#, "select(key == 0) | path(.a)");
+        assert_eq!(reindexed, r#"["a"]"#);
+        assert_eq!(reindexed, entry);
     }
 }
