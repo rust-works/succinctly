@@ -47477,10 +47477,18 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         &mut lazy_drive
     };
 
-    let flow = reduce_forks::<S>(patterns, update, drive_init, optional, drive, &mut |v| {
-        outputs.push(v);
-        Demand::Continue
-    });
+    let flow = reduce_forks::<S>(
+        patterns,
+        update,
+        drive_init,
+        optional,
+        drive,
+        FoldDirectRetry::of(init, input),
+        &mut |v| {
+            outputs.push(v);
+            Demand::Continue
+        },
+    );
     finish_fork_from_flow(outputs, flow, optional)
 }
 
@@ -49740,6 +49748,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         drive_init,
         optional,
         drive,
+        FoldDirectRetry::of(init, input),
         &mut |v| {
             outputs.push(v);
             Demand::Continue
@@ -49812,6 +49821,25 @@ pub(crate) type ForeachSourceDrive<'a> = &'a mut dyn FnMut(ForeachElementSink<'_
 pub(crate) type ForeachInitDrive<'a> =
     &'a mut dyn FnMut(&mut dyn FnMut(OwnedValue) -> Demand) -> Flow;
 
+/// Whether a fold's INIT and source generators are each a direct `?//` bind
+/// ([`direct_pattern_retry`]) -- the `no_std` stand-in for the retry
+/// generation that [`StashedVerdict::take`] reads, one flag per drive
+/// because the fold stashes one verdict per drive (#3293).
+#[derive(Clone, Copy)]
+pub(crate) struct FoldDirectRetry {
+    init: bool,
+    source: bool,
+}
+
+impl FoldDirectRetry {
+    pub(crate) fn of(init: &Expr, source: &Expr) -> Self {
+        Self {
+            init: direct_pattern_retry(init),
+            source: direct_pattern_retry(source),
+        }
+    }
+}
+
 /// **The** `foreach` fold, shared by every entry point (#2180 WP3, reshaped
 /// by its review; INIT reshaped again by #2668): INIT's fan-out outermost
 /// (#534), one step per source element, every EXTRACT (or bare UPDATE)
@@ -49871,6 +49899,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     drive_init: ForeachInitDrive<'_>,
     optional: bool,
     drive_source: ForeachSourceDrive<'_>,
+    retry: FoldDirectRetry,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     // #3036/#3122: UPDATE/EXTRACT rerun against the fold's own accumulator,
@@ -49899,9 +49928,12 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     // `Escaped` with a specific `Control`) actually ended the whole
     // construct -- recorded out-of-band, the same pattern the per-element
     // callback just below uses for `ended`, one level further out.
-    let mut terminal: Option<Flow> = None;
+    // A `?//` INIT that retries past a fork's abort leaves this stale, so it
+    // is a [`StashedVerdict`] like `ended` below (#3293).
+    let terminal = StashedVerdict::<Flow>::new();
 
     let init_flow = drive_init(&mut |init_val| {
+        terminal.begin();
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
         let mut state = init_val;
@@ -49911,11 +49943,14 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // because a `?//` in the source generator re-enters this callback
         // after a stop has already been reported once (#1519's retry, seen
         // from the consuming side) and it is the later step's verdict that
-        // counts.
-        let mut ended: Option<Flow> = None;
+        // counts. A retry that supersedes the stash without re-entering
+        // this callback (the next alternative produces nothing, or raises)
+        // is recognised by `take` below, from the drive's own verdict and
+        // the retry generation (#3293).
+        let ended = StashedVerdict::<Flow>::new();
 
         let flow = drive_source(&mut |input_val| {
-            ended = None;
+            ended.begin();
             // Substituted per element as it arrives: the demand-driven path
             // sees one element at a time and can never hoist a whole matrix
             // the way the pre-review eager path did (#695), and with the
@@ -49945,17 +49980,17 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
                 // place that rule lives, so `ended` and `terminal` (below)
                 // both go through it rather than each hand-copying
                 // [`mark_nonretryable_escape`].
-                end => stop_with_downstream(&mut ended, end),
+                end => ended.stop_with_downstream(end),
             }
         });
 
-        match ended.unwrap_or(flow) {
+        match ended.take(&flow, retry.source).unwrap_or(flow) {
             Flow::Exhausted => Demand::Continue,
-            other => stop_with_downstream(&mut terminal, other),
+            other => terminal.stop_with_downstream(other),
         }
     });
 
-    match terminal {
+    match terminal.take(&init_flow, retry.init) {
         // A fork's own stop ends everything, `pending` dropped the same
         // reason every other lazy consumer drops it.
         Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
@@ -50019,6 +50054,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     drive_init: ForeachInitDrive<'_>,
     optional: bool,
     drive_source: ForeachSourceDrive<'_>,
+    retry: FoldDirectRetry,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     // #3036/#3122: UPDATE reruns against the fold's own accumulator, which
@@ -50038,20 +50074,22 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     // Shared across every INIT fork (#695), the same "whole tree, not
     // per-fork" accounting the collecting version used.
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
-    let mut terminal: Option<Flow> = None;
+    let terminal = StashedVerdict::<Flow>::new();
 
     let init_flow = drive_init(&mut |init_val| {
+        terminal.begin();
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
         let mut acc = init_val;
         // Cleared on entry to every step, not just the first: a `?//` in the
         // source re-enters this callback after a stop was already reported
         // (#1519's retry seen from the consuming side), and the later step's
-        // verdict is the one that counts.
-        let mut ended: Option<Flow> = None;
+        // verdict is the one that counts; a retry that never re-enters is
+        // recognised by `take` below (#3293).
+        let ended = StashedVerdict::<Flow>::new();
 
         let flow = drive_source(&mut |input_val| {
-            ended = None;
+            ended.begin();
             let step_acc = core::mem::replace(&mut acc, OwnedValue::Null);
             let (new_acc, step_control) = try_reduce_step_alternatives::<S>(
                 patterns,
@@ -50070,11 +50108,11 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
                 // classification a source-side `?//` must not retry past --
                 // the rule #2180 WP3's own review established for the
                 // identical slot in `foreach_forks`.
-                Some(control) => stop_with_downstream(&mut ended, Flow::Escaped(control)),
+                Some(control) => ended.stop_with_downstream(Flow::Escaped(control)),
             }
         });
 
-        match ended.unwrap_or(flow) {
+        match ended.take(&flow, retry.source).unwrap_or(flow) {
             // The source ran out: this fork's answer is its accumulator, and
             // it is the fork's *only* output -- `reduce` emits no
             // intermediate, which is why a step escape above discards it.
@@ -50082,16 +50120,14 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
                 let final_acc = core::mem::replace(&mut acc, OwnedValue::Null);
                 match sink(final_acc) {
                     Demand::Continue => Demand::Continue,
-                    Demand::Stop => {
-                        stop_with_downstream(&mut terminal, Flow::Stopped { pending: None })
-                    }
+                    Demand::Stop => terminal.stop_with_downstream(Flow::Stopped { pending: None }),
                 }
             }
-            other => stop_with_downstream(&mut terminal, other),
+            other => terminal.stop_with_downstream(other),
         }
     });
 
-    match terminal {
+    match terminal.take(&init_flow, retry.init) {
         Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
         Some(Flow::Escaped(control)) => finish_fork_flow(Some(control), optional),
         Some(Flow::Exhausted) => {
@@ -50205,6 +50241,7 @@ fn each_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         &mut drive_init,
         optional,
         &mut drive,
+        FoldDirectRetry::of(init, input),
         &mut |v| sink(Item::Owned(v)),
     )
 }
@@ -50289,6 +50326,7 @@ fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         &mut drive_init,
         optional,
         &mut drive,
+        FoldDirectRetry::of(init, input),
         &mut |v| sink(Item::Owned(v)),
     )
 }
