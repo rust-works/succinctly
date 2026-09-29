@@ -3860,6 +3860,18 @@ impl OwnedValue {
         ))
     }
 
+    /// [`reindexed`](Self::reindexed)'s document, spelled as `S` spells it but
+    /// keeping no provenance -- for a caller that serializes with one mode's
+    /// spelling and evaluates under another (`succinctly yq` re-indexes its
+    /// input with jq's spelling and runs yq semantics over it), so that
+    /// choosing a spelling does not also register the document with a
+    /// provenance table the evaluating mode never reads.
+    pub fn reindexed_without_provenance<S: EvalSemantics>(
+        &self,
+    ) -> Result<ReindexedDoc, EvalError> {
+        Ok(ReindexedDoc::new(self.to_json_for_reindex::<S>()?, None))
+    }
+
     /// [`to_json_input_bridge`](Self::to_json_input_bridge)'s text, indexed
     /// as bridge text -- see [`reindexed`](Self::reindexed). Unlike that
     /// one, it keeps no provenance: its serializer spells some scalars for

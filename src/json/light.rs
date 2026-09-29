@@ -1276,6 +1276,14 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         self.key_cursor.is_none()
     }
 
+    /// The document text the retained child cursor reads, or `None` for an
+    /// empty list -- no BP work, unlike [`whole_container_cursor`](Self::whole_container_cursor),
+    /// so a caller that only needs to know *which* document a list belongs
+    /// to can ask before paying for the hop (#3069).
+    pub(crate) fn document_text(&self) -> Option<&'a [u8]> {
+        self.key_cursor.map(|c| c.text)
+    }
+
     /// The cursor of the object this field list belongs to, but **only**
     /// while the list still stands at that object's first child -- i.e.
     /// while `StandardJson::Object(self)` really is the whole object and not
@@ -1299,14 +1307,6 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// cursor of their own to consult, and is not a shape for this type's
     /// public iteration API to grow.
     #[inline]
-    /// The document text the retained child cursor reads, or `None` for an
-    /// empty list -- no BP work, unlike [`whole_container_cursor`](Self::whole_container_cursor),
-    /// so a caller that only needs to know *which* document a list belongs
-    /// to can ask before paying for the hop (#3069).
-    pub(crate) fn document_text(&self) -> Option<&'a [u8]> {
-        self.key_cursor.map(|c| c.text)
-    }
-
     pub(crate) fn whole_container_cursor(&self) -> Option<JsonCursor<'a, W>> {
         let child = self.key_cursor?;
         let container = child.parent()?;
@@ -1702,16 +1702,16 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
         self.element_cursor.is_none()
     }
 
-    /// The cursor of the array this element list belongs to, but **only**
-    /// while the list still stands at that array's first element (#2889) --
-    /// [`JsonFields::whole_container_cursor`]'s twin, with the same
-    /// first-child rule, the same reasons for it, and the same `pub(crate)`.
-    #[inline]
     /// See [`JsonFields::document_text`].
     pub(crate) fn document_text(&self) -> Option<&'a [u8]> {
         self.element_cursor.map(|c| c.text)
     }
 
+    /// The cursor of the array this element list belongs to, but **only**
+    /// while the list still stands at that array's first element (#2889) --
+    /// [`JsonFields::whole_container_cursor`]'s twin, with the same
+    /// first-child rule, the same reasons for it, and the same `pub(crate)`.
+    #[inline]
     pub(crate) fn whole_container_cursor(&self) -> Option<JsonCursor<'a, W>> {
         let child = self.element_cursor?;
         let container = child.parent()?;
