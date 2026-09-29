@@ -579,6 +579,31 @@ Costs and gaps this change leaves:
 - **`try` bodies and `catch` handlers** take a binding as jq does (`try 1 as $x | $x == 1
   == 1` is a syntax error in both).
 
+## `reduce`/`foreach` and a `?//` in their source or INIT (#3293)
+
+A step error, or a consumer's stop, reaches a `?//` in a fold's SOURCE or INIT as a stop,
+which retries (#1519); the fold's stashed verdict for the abandoned alternative is now
+superseded when that retry produces nothing or raises, as jq's is (`reduce ([[1]] as [$a]
+?// $b | $a // empty) as $x (0; .+$x)` is `null`, was an error). A differential fuzz of fold
+programs against jq 1.7.1 and the previous build found 2,437 of 36,000 fixed and none
+regressed. What it leaves:
+
+- **`no_std` recognises only a direct bind.** The build has no retry generation, so a fold
+  compares its operand with `direct_pattern_retry` (the operand *is* a `?//` bind). A bind
+  wrapped in `first`, `limit`, `//`, a pipe or a `def` keeps the previous answer there
+  (`reduce (([[1]] as [$a] ?// $b | $a) // empty) as $x (0; .+$x)` errors); the `std` build
+  fixes every shape.
+- **`repeat` in SOURCE or INIT drives the fold eagerly** (`streams_unbounded`, even for a
+  bounded or dead `repeat`): the operand, `?//` included, runs to completion before the
+  first step, so the retry cannot happen. `reduce ([[1]] as [$a] ?// $b | limit(1; repeat($a))
+  // empty) as $x (0; .+$x)` is `null` in jq and an error here, before and after #3293.
+- **A `halt` inside a `try` in SOURCE runs twice.** `reduce ((try (...)), 5) as $x (0;
+  "H"|halt_error(3))` writes `H` twice where jq writes it once (exit code 3 both); the
+  `try` driver's own unstamped slot lets the source continue past a stashed halt. Unchanged
+  by #3293.
+- **Path-mode folds** (`resolve_reduce`/`resolve_foreach`, under `path`/`del`/`|=`) keep their
+  own bare escape slots and were not touched.
+
 ## Where succinctly errors and jq does not
 
 A probe is only admitted to the corpus if jq errors on it, so the corpus is blind to the
@@ -7916,6 +7941,22 @@ runs, so jq writes once; succinctly's second fork iterates the real `{"a":1}` an
 again. Stdout and exit codes are unaffected in every such shape. This is the divergence this
 entry already records, reached by more spellings — not a new one, and not something `reduce`
 had ever deliberately matched.
+
+**#3293's fold slice widened it again, and here stdout and exit codes can differ.** A fold's
+step error (or a consumer's stop) used to end the whole fold at the first INIT fork, even
+when a `?//` in SOURCE retried past it and produced nothing. jq's retry consumes that verdict
+and lets the next fork run; succinctly now does too, and that second fork reads the real
+input where jq reads its synthetic `null`. Shapes where the old early exit happened to match
+jq change:
+
+```console
+$ echo '[[1]]' | jq -c '[first(foreach (. as [$a] ?// [[$b]] | $a // empty) as $x ((0,100); $x; .))]'
+[[1]]        # succinctly: [[1],[1]]  (`[[1]] | ...` with a literal source gives jq [[1],[1]] too)
+$ echo '[[1]]' | jq -c '[reduce (. as [$a] ?// [[$b]] | $a | if . == null then error("E2") end) as $x (([1] as $a ?// $b | $a); .+1)]'
+jq: error: E2   # succinctly: [1]  (fork 2's source sees `[[1]]`, where jq's sees `null` and raises)
+```
+
+Pinned by `test_fold_second_fork_source_reads_real_input_after_retry_2163_3293`.
 
 That front-end-level agreement (not independent
 double-implementation of the fold itself, since both front ends call the same shared
