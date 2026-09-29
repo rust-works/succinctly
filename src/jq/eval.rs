@@ -107572,24 +107572,26 @@ mod tests {
         assert_eq!(sets, vec![vec![("x".to_string(), OwnedValue::Int(3))]]);
     }
 
+    /// value-mode-binding-same-node, refuse-only on `eval()` until #3266:
+    /// its dedicated path resolver's bind-origin tracking never covers a
+    /// value-mode `as` binding (`.a as $y` binds by value, not by path).
+    /// #3266 routes `path(f)` onto the generic evaluator, which answers
+    /// like jq (`[["a"]]`) through #3179's embed table. That table is a
+    /// `thread_local!`, so a `no_std` build still refuses -- the `no_std`
+    /// row of limitations.md's embed-table section.
+    #[test]
+    fn test_path_bind_origin_value_mode_same_node_3266() {
+        let got = bind_origin_outputs(br#"{"a":{"b":1}}"#, ".a as $y | path(.a | $y)");
+        #[cfg(feature = "std")]
+        assert_eq!(got.map_err(|e| e.message), Ok(r#"[["a"]]"#.to_string()));
+        #[cfg(not(feature = "std"))]
+        assert!(got.is_err(), "no_std has no embed table to certify `$y`");
+    }
+
     #[test]
     fn test_path_bind_origin_matrix_accepts_2042() {
         // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
         let rows: &[(&[u8], &str, &str)] = &[
-            // value-mode-binding-same-node, refuse-only until #3266: `eval()`
-            // used to answer this through its own dedicated path resolver,
-            // whose bind-origin tracking never covers a value-mode `as`
-            // binding (`.a as $y` binds by value, not by path). #3266 routes
-            // `path(f)` onto the generic evaluator's cursor-native walker
-            // instead, which resolves `$y` back to the node it was bound
-            // from directly -- no bind-origin tracking involved -- so this
-            // row now answers like jq without needing the resolver to change
-            // at all.
-            (
-                br#"{"a":{"b":1}}"#,
-                ".a as $y | path(.a | $y)",
-                r#"[["a"]]"#,
-            ),
             // #3049: `fromjson` does not move the register. The marker can
             // restore it after the reconstructed value, as jq does.
             (
