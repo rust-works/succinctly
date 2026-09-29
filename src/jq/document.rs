@@ -4692,12 +4692,13 @@ mod decoded_key_str_tests {
         );
     }
 
+    /// An owned `(spelling, is_fallback)` classification, as the helpers
+    /// above return it.
+    type OwnedKeyKind = Option<(String, bool)>;
+
     /// [`yaml_nth_key`] and [`DocumentValue::display_key_kind`] for the same
     /// key: `(key_display_string_kind, display_key_kind)`.
-    fn yaml_nth_key_both(
-        yaml: &[u8],
-        nth: usize,
-    ) -> (Option<(String, bool)>, Option<(String, bool)>) {
+    fn yaml_nth_key_both(yaml: &[u8], nth: usize) -> (OwnedKeyKind, OwnedKeyKind) {
         let index = YamlIndex::build(yaml).expect("valid YAML");
         let cursor = index.root(yaml);
         let mapping = cursor.first_child().expect("document content");
