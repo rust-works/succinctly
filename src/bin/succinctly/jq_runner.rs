@@ -36,7 +36,6 @@ use crate::output::{
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, Terminator,
 };
 
-/// Evaluation context for passing variables to the jq evaluator.
 /// One word taken by `--args` (a string) or `--jsonargs` (JSON text), kept
 /// in the order the command line gave it (#3412).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,34 +56,29 @@ impl JqCommand {
     /// of the most recent `--args`/`--jsonargs`. This walks each captured list
     /// in order applying exactly that, and a `--` ends the mode switches.
     ///
-    /// Only words clap already captured are resequenced: an option-shaped
-    /// word inside a captured list (`--args '$ARGS.positional' -c a`) stays
-    /// a positional word here, as it did before, rather than being parsed as
-    /// the flag jq would take it for.
+    /// Only words clap already captured are resequenced. An option-shaped
+    /// word among them (`--args '$ARGS.positional' -c a`) is never taken as
+    /// the program, as in jq, but is not applied as the flag either: it stays
+    /// a positional word, as it did before this change (#3447).
     fn resolve_positional_args(&mut self) {
+        // (starts in `--jsonargs` mode, the words clap captured under it)
         let captured = [
-            (
-                PositionalWord::Str as fn(String) -> PositionalWord,
-                std::mem::take(&mut self.args),
-            ),
-            (
-                PositionalWord::Json as fn(String) -> PositionalWord,
-                std::mem::take(&mut self.jsonargs),
-            ),
+            (false, std::mem::take(&mut self.args)),
+            (true, std::mem::take(&mut self.jsonargs)),
         ];
         self.positional_mode = captured.iter().any(|(_, words)| !words.is_empty());
-        for (start, words) in captured {
-            let mut mode = start;
+        for (starts_json, words) in captured {
+            let mut json = starts_json;
             let mut options_ended = false;
             for word in words {
                 if !options_ended {
                     match word.as_str() {
                         "--args" => {
-                            mode = PositionalWord::Str;
+                            json = false;
                             continue;
                         }
                         "--jsonargs" => {
-                            mode = PositionalWord::Json;
+                            json = true;
                             continue;
                         }
                         "--" => {
@@ -94,16 +88,21 @@ impl JqCommand {
                         _ => {}
                     }
                 }
-                if self.filter.is_none() && self.from_file.is_none() {
+                let option_shaped =
+                    word.starts_with('-') && !super::looks_like_negative_filter(&word);
+                if self.filter.is_none() && self.from_file.is_none() && !option_shaped {
                     self.filter = Some(word);
+                } else if json {
+                    self.positional_words.push(PositionalWord::Json(word));
                 } else {
-                    self.positional_words.push(mode(word));
+                    self.positional_words.push(PositionalWord::Str(word));
                 }
             }
         }
     }
 }
 
+/// Evaluation context for passing variables to the jq evaluator.
 #[derive(Debug, Default)]
 pub struct EvalContext {
     /// Named arguments from --arg, --argjson, --slurpfile, --rawfile
@@ -9426,6 +9425,94 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3412: `resolve_positional_args` on clap's own captures, without the
+    /// CLI. `argv` is parsed exactly as `succinctly jq` parses it, so each
+    /// row starts from what the greedy `--args`/`--jsonargs` flags really
+    /// capture.
+    mod resolve_positional_args_3412 {
+        use super::*;
+        use clap::Parser;
+
+        fn resolved(argv: &[&str]) -> (Option<String>, Vec<PositionalWord>) {
+            let mut cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            cmd.resolve_positional_args();
+            (cmd.filter, cmd.positional_words)
+        }
+
+        fn s(text: &str) -> PositionalWord {
+            PositionalWord::Str(text.to_string())
+        }
+
+        fn j(text: &str) -> PositionalWord {
+            PositionalWord::Json(text.to_string())
+        }
+
+        #[test]
+        fn first_word_after_the_flag_is_the_filter() {
+            assert_eq!(
+                resolved(&["jq", "--args", ".x", "a", "b"]),
+                (Some(".x".into()), vec![s("a"), s("b")])
+            );
+            assert_eq!(
+                resolved(&["jq", "--jsonargs", ".x", "1"]),
+                (Some(".x".into()), vec![j("1")])
+            );
+        }
+
+        #[test]
+        fn a_filter_given_first_is_kept_and_every_word_is_positional() {
+            assert_eq!(
+                resolved(&["jq", ".x", "--args", "a", "--jsonargs", "1"]),
+                (Some(".x".into()), vec![s("a"), j("1")])
+            );
+        }
+
+        #[test]
+        fn later_flags_switch_mode_and_double_dash_ends_the_switches() {
+            assert_eq!(
+                resolved(&[
+                    "jq",
+                    "--jsonargs",
+                    ".x",
+                    "1",
+                    "--args",
+                    "a",
+                    "--",
+                    "--jsonargs"
+                ]),
+                (Some(".x".into()), vec![j("1"), s("a"), s("--jsonargs")])
+            );
+        }
+
+        #[test]
+        fn from_file_supplies_the_program_so_no_word_becomes_the_filter() {
+            let (filter, words) = resolved(&["jq", "-f", "prog.jq", "--args", "a", "b"]);
+            assert_eq!(filter, None);
+            assert_eq!(words, vec![s("a"), s("b")]);
+        }
+
+        /// jq's program is the first *non-option* word. An option-shaped
+        /// word is not applied as a flag here (#3447) but must not become the
+        /// program either; a `-7`-style word is not option-shaped.
+        #[test]
+        fn an_option_shaped_word_is_never_taken_as_the_filter() {
+            let (filter, _) = resolved(&["jq", "--args", "-c", ".x", "a"]);
+            assert_eq!(filter, Some(".x".into()));
+            let (filter, words) = resolved(&["jq", "--jsonargs", "-7", "-8"]);
+            assert_eq!(filter, Some("-7".into()));
+            assert_eq!(words, vec![j("-8")]);
+        }
+
+        #[test]
+        fn nothing_captured_leaves_the_command_alone() {
+            let mut cmd = JqCommand::try_parse_from(["jq", ".x", "in.json"]).unwrap();
+            cmd.resolve_positional_args();
+            assert_eq!(cmd.filter, Some(".x".into()));
+            assert!(cmd.positional_words.is_empty());
+            assert!(!cmd.positional_mode);
+        }
+    }
 
     /// #3313: `error_report_rank`'s walk, pinned on a hand-built module graph
     /// independently of the CLI.
