@@ -11399,7 +11399,10 @@ fn arith_add<S: EvalSemantics>(
         // operand unchanged and must not collapse its literal spelling
         // (#1143).
         (left, right) if left.is_number() && right.is_number() => {
-            match (left.into_plain_number(), right.into_plain_number()) {
+            match (
+                signed_plain_number::<S>(left),
+                signed_plain_number::<S>(right),
+            ) {
                 // Number addition - jq converts to float on overflow, yq wraps
                 (OwnedValue::Int(a), OwnedValue::Int(b)) => {
                     if S::OVERFLOW_WRAPS {
@@ -11495,7 +11498,10 @@ fn arith_sub<S: EvalSemantics>(
         // numeric (via the non-consuming `is_number()` peek) does this arm
         // actually move them into `into_plain_number()`.
         (left, right) if left.is_number() && right.is_number() => {
-            match (left.into_plain_number(), right.into_plain_number()) {
+            match (
+                signed_plain_number::<S>(left),
+                signed_plain_number::<S>(right),
+            ) {
                 // jq converts to float on overflow, yq wraps
                 (OwnedValue::Int(a), OwnedValue::Int(b)) => {
                     if S::OVERFLOW_WRAPS {
@@ -11553,6 +11559,10 @@ fn arith_sub<S: EvalSemantics>(
 /// it naturally yields `-0.0`; this promotion is the one place `Int`
 /// deliberately gives up exact-integer fidelity to match that.
 ///
+/// A `-0` *literal* operand is a second, separate mechanism: `signed_plain_number`
+/// promotes it to `Float(-0.0)` before the match, so `-(-0)` negates through
+/// the `Float` arm to `0` and never reaches the `Int(0)` arm above (#3442).
+///
 /// **The past-`2^53` rounding is jq-mode only**: real yq has no unary-minus
 /// operator at all (confirmed live against yq v4.53.3: `-.a` is a hard
 /// parse error, `'-' expects 2 args but there is 1`) -- succinctly's own
@@ -11570,7 +11580,7 @@ fn arith_sub<S: EvalSemantics>(
 /// leaving unary minus as the one holdout still keeping exact fidelity
 /// here. See `docs/compliance/jq/limitations.md`'s removed "#2357" entry.
 pub(crate) fn arith_negate<S: EvalSemantics>(operand: OwnedValue) -> Result<OwnedValue, EvalError> {
-    match operand.into_plain_number() {
+    match signed_plain_number::<S>(operand) {
         OwnedValue::Int(0) if S::TAG != EvalTag::Yq => Ok(OwnedValue::Float(-0.0)),
         OwnedValue::Int(n) => Ok(if S::OVERFLOW_WRAPS {
             OwnedValue::Int(n.wrapping_neg())
@@ -11584,16 +11594,47 @@ pub(crate) fn arith_negate<S: EvalSemantics>(operand: OwnedValue) -> Result<Owne
     }
 }
 
-/// Whether an integer-valued numeric operand is negative in jq's double
-/// model, where zero has a sign too. `n` is `operand`'s already-read integer
-/// value; only a `-0` literal (`NumberLiteral(Int(0), "-0")`, which
-/// `number_repr` collapses to `Int(0)`) needs the spelling to say so.
-fn int_operand_is_negative(operand: &OwnedValue, n: i64) -> bool {
-    n < 0
-        || matches!(
-            operand,
-            OwnedValue::NumberLiteral(NumberRepr::Int(0), text) if text.starts_with('-')
-        )
+/// Whether `value` is a `-0` integer literal, the one number whose sign lives
+/// only in its spelling: `NumberLiteral(Int(0), "-0")`, which
+/// `number_repr()` and `into_plain_number()` both collapse to `Int(0)`. The
+/// zero test comes first so only a zero literal pays for the text check.
+fn is_negative_zero_int_literal(value: &OwnedValue) -> bool {
+    matches!(
+        value,
+        OwnedValue::NumberLiteral(NumberRepr::Int(0), text) if text.starts_with('-')
+    )
+}
+
+/// [`OwnedValue::number_repr`], except that in jq mode a `-0` integer literal
+/// reads as `Float(-0.0)` rather than `Int(0)` (#3442). jq has no integer
+/// type, so `-0` stays negative zero through `+`, `-`, `*`, `/` and negation
+/// (`(-0) - 0` is `-0`, `(-0) / -1` is `0`).
+///
+/// yq mode is left alone: real yq v4.53.3 reads a `-0` *expression literal*
+/// as integer zero for `+`, `-` and `*` (`(-0) - 0` is `0`), which
+/// `Int(0)` reproduces. Its `/` on that literal, and any `-0` read from a
+/// YAML *document*, stay float there and keep the sign; that is a separate,
+/// pre-existing divergence (#3445), not something this reader decides.
+///
+/// This is a per-call-site reader rather than a change to `number_repr()`
+/// itself because that also feeds ordering (`arith_compare`), `%` and
+/// `range`, which are correct as they stand and read the literal as `Int(0)`
+/// on purpose: jq's `%` casts to `intmax_t`, so `-0` must not reach it.
+fn signed_number_repr<S: EvalSemantics>(value: &OwnedValue) -> Option<NumberRepr> {
+    if S::TAG != EvalTag::Yq && is_negative_zero_int_literal(value) {
+        Some(NumberRepr::Float(-0.0))
+    } else {
+        value.number_repr()
+    }
+}
+
+/// [`OwnedValue::into_plain_number`] with [`signed_number_repr`]'s `-0` rule.
+fn signed_plain_number<S: EvalSemantics>(value: OwnedValue) -> OwnedValue {
+    if S::TAG != EvalTag::Yq && is_negative_zero_int_literal(&value) {
+        OwnedValue::Float(-0.0)
+    } else {
+        value.into_plain_number()
+    }
 }
 
 /// Multiply two values.
@@ -11674,21 +11715,23 @@ fn arith_mul<S: EvalSemantics>(
         // production instead of erroring (caught by code review before
         // merge).
         (left, right) => {
-            let (l_num, r_num) = (left.number_repr(), right.number_repr());
+            let (l_num, r_num) = (
+                signed_number_repr::<S>(&left),
+                signed_number_repr::<S>(&right),
+            );
             match (left, right, l_num, r_num) {
                 // jq converts to float on overflow, yq wraps
-                (l, r, Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
+                (_, _, Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
                     if S::OVERFLOW_WRAPS {
                         // yq behavior: wrapping mul
                         Ok(OwnedValue::Int(a.wrapping_mul(b)))
-                    } else if (a == 0 || b == 0)
-                        && int_operand_is_negative(&l, a) != int_operand_is_negative(&r, b)
-                    {
+                    } else if (a == 0 || b == 0) && (a < 0) != (b < 0) {
                         // jq multiplies in doubles, so a zero product takes
                         // the XOR of its operands' signs, and a negative one
                         // prints `-0` (#3440). `i64` has no negative zero,
                         // so this is the one product the exact fast path
-                        // below cannot represent.
+                        // below cannot represent. A `-0` operand never gets
+                        // here: `signed_number_repr` reads it as a float.
                         Ok(OwnedValue::Float(-0.0))
                     } else {
                         // jq behavior: convert to float on overflow -- or
@@ -12007,7 +12050,10 @@ fn arith_div<S: EvalSemantics>(
     // still cite a `NumberLiteral` operand's own source spelling, not the
     // canonically-reformatted value `into_plain_number()` would have left
     // behind.
-    match (left.number_repr(), right.number_repr()) {
+    match (
+        signed_number_repr::<S>(&left),
+        signed_number_repr::<S>(&right),
+    ) {
         (Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
             if b == 0 {
                 if S::DIV_BY_ZERO_IS_INFINITY {
@@ -76034,6 +76080,98 @@ mod tests {
         // A nonzero product and the compound-assign form are unaffected.
         assert_eq!(outputs(b"-5", ". * -1"), ["5"]);
         assert_eq!(outputs(b"0", ". *= -1"), ["-0"]);
+    }
+
+    /// #3442: a `-0` literal keeps its sign through `+`, `-`, `/` and unary
+    /// minus, as it does through `*` (#3440). `NumberLiteral(Int(0), "-0")`
+    /// reads as `Int(0)` everywhere else, so each of these used to treat it
+    /// as a positive zero. `%` is deliberately absent: jq casts both operands
+    /// to `intmax_t` there, so a `-0` operand never reaches its result
+    /// (`(-0) % 5` is `0`). Rows captured live against jq 1.7.1.
+    #[test]
+    fn test_arithmetic_negative_zero_operand_sign_3442() {
+        for (filter, want) in [
+            // `+`: negative only when both operands are.
+            ("(-0) + (-0)", "-0"),
+            ("(-0) + (-0.0)", "-0"),
+            ("(-0.0) + (-0)", "-0"),
+            ("(-0) + 0", "0"),
+            ("0 + (-0)", "0"),
+            // `-`: `-0 - 0` stays negative, `-0.0 - -0` cancels to positive.
+            ("(-0) - 0", "-0"),
+            ("(-0) - 0.0", "-0"),
+            ("(-0.0) - (-0)", "0"),
+            ("0 - (-0)", "0"),
+            ("(-0) - (-0)", "0"),
+            // `/`: the quotient's sign is the XOR of the operands'.
+            ("(-0) / 1", "-0"),
+            ("(-0) / 2", "-0"),
+            ("(-0) / -1", "0"),
+            ("(-0) / -5", "0"),
+            ("0 / -1", "-0"),
+            // Unary minus flips a `-0` literal back to `0`.
+            ("-(-0)", "0"),
+            ("-(-0.0)", "0"),
+            ("-(0)", "-0"),
+            // `%` never sees the sign.
+            ("(-0) % 5", "0"),
+        ] {
+            assert_eq!(outputs(b"null", filter), [want], "{filter}");
+        }
+        // The same literal arriving as a document number.
+        assert_eq!(outputs(b"-0", ". - 0"), ["-0"]);
+        assert_eq!(outputs(b"-0", ". + (-0)"), ["-0"]);
+        assert_eq!(outputs(b"-0", ". + 0"), ["0"]);
+        assert_eq!(outputs(b"-0", ". / 5"), ["-0"]);
+        assert_eq!(outputs(b"-0", ". / -1"), ["0"]);
+        assert_eq!(outputs(b"-0", "-."), ["0"]);
+        // Spellings other than `-0`, and operands past 2^53 (which now go
+        // through the float path instead of `jq_checked_int_arith`).
+        assert_eq!(outputs(b"null", "(-0e0) + (-0.0)"), ["-0"]);
+        assert_eq!(outputs(b"null", "(-0e0) - 0"), ["-0"]);
+        assert_eq!(
+            outputs(b"null", "(-0) + 9007199254740993"),
+            ["9007199254740992"]
+        );
+        assert_eq!(
+            outputs(b"null", "9007199254740993 + (-0)"),
+            ["9007199254740992"]
+        );
+        assert_eq!(
+            outputs(b"null", "(-0) - 9007199254740993"),
+            ["-9007199254740992"]
+        );
+        assert_eq!(
+            outputs(b"null", "(-0) + 869389897822472004"),
+            ["869389897822472000"]
+        );
+        // Accumulator and assignment paths reach the same arithmetic.
+        assert_eq!(
+            outputs(b"null", "reduce range(2) as $x (-0; . - 0)"),
+            ["-0"]
+        );
+        assert_eq!(outputs(b"null", "reduce range(2) as $x (-0; . + 0)"), ["0"]);
+        assert_eq!(outputs(br#"{"a":-0}"#, ".a -= 0"), [r#"{"a":-0}"#]);
+        assert_eq!(outputs(br#"{"a":-0}"#, ".a += -0"), [r#"{"a":-0}"#]);
+        assert_eq!(outputs(br#"{"a":-0}"#, ".a /= 1"), [r#"{"a":-0}"#]);
+        assert_eq!(outputs(br#"{"a":-0,"b":0}"#, ".a - .b"), ["-0"]);
+        assert_eq!(outputs(br#"{"a":-0,"b":-0}"#, ".a + .b"), ["-0"]);
+        assert_eq!(outputs(br#"{"a":-0,"b":-1}"#, ".a / .b"), ["0"]);
+        assert_eq!(outputs(b"[-0,0]", "map(. - 0)"), ["[-0,0]"]);
+        // A zero divisor is still an error, however it is signed.
+        assert!(outputs(b"null", "try (1 / (-0)) catch .")[0].contains("divisor is zero"));
+    }
+
+    /// #3442: real yq v4.53.3 reads a `-0` expression literal as integer
+    /// zero for `+`, `-` and `*` (all three rows below captured live), so the
+    /// jq-mode reader must not reach `YqSemantics`. yq's `/` on that literal
+    /// and a `-0` YAML document number keep the sign there; succinctly does
+    /// not match that yet (#3445), so neither is pinned here.
+    #[test]
+    fn test_arithmetic_negative_zero_operand_yq_stays_zero_3442() {
+        assert_eq!(outputs_yq(b"null", "(-0) - 0"), ["0"]);
+        assert_eq!(outputs_yq(b"null", "(-0) + (-0)"), ["0"]);
+        assert_eq!(outputs_yq(b"null", "(-0) * 1"), ["0"]);
     }
 
     /// #3440: yq has no negative zero (Go's `int64` product is plain `0`),
