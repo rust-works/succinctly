@@ -1013,10 +1013,6 @@ scalar-root-nested-embed-string:same as owned-embed-refuse-scalar-string-root
 scalar-root-embed-write-string:same as owned-embed-refuse-scalar-string-root
 scalar-root-float-literal:same as owned-embed-refuse-scalar-string-root
 scalar-nested-embed-yq-untouched-number:same as owned-embed-refuse-scalar-string-root
-navigated-bind-positional-reduce-path:#3465 -- an owned re-entry (a fold body) has no cursor to place a scalar bind from; containers answer by storage
-navigated-bind-positional-reduce-assign:#3465 -- same as navigated-bind-positional-reduce-path
-navigated-bind-positional-negative-index:#3464 -- a frame position keeps the -2 spelling, so it never equals the bind's canonical index
-navigated-bind-positional-optional-step:#3464 -- a frame position keeps the ? wrapper, so it never equals the bind's canonical key
 navigated-bind-positional-relocated-scalar:#3466 -- to_entries moves the scalar jv into a new container; a scalar has no identity to follow it
 REFUSE_EOF
 

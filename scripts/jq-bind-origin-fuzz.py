@@ -72,8 +72,8 @@ accepts and the still-deferred optional-navigation cases from #2764.
 #3134 adds the POSITIONAL family: a navigated bind made outside any
 resolver (`.a.b as $y`, an `Untracked` marker) and then used *below* the
 resolver's root, `path(NAV | $y)`/`(NAV | $y) = v`, possibly after moving
-the root first. The cursor-side funnels stamp such a marker with its
-position below the root; the trap is an equal-valued scalar at a sibling,
+the root first. Such a marker certifies by its anchor, the storage of the
+container it sits in; the trap is an equal-valued scalar at a sibling,
 under a moved root, or reached by iteration, which must keep refusing.
 Off by default (`--positional-bind-p`) so existing seeds keep their stream.
 
