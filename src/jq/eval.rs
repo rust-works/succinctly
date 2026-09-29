@@ -2248,7 +2248,10 @@ pub(crate) fn bridge_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>
         return None;
     }
     let cursor = standard_json_node_cursor(value)?;
-    let shared = bridge_provenance::shared_for(text, cursor.bp_position())?;
+    let node = cursor.bp_position();
+    let shared = bridge_provenance::shared_for(text, node, |source| {
+        bridge_provenance_descend(source, cursor.index().root(cursor.text()), node)
+    })?;
     // The table places each container by arithmetic over the source rather
     // than by walking the document (see `bridge_provenance`); a node whose
     // kind disagrees would mean the two stopped corresponding, and is read
@@ -2276,6 +2279,48 @@ pub(crate) fn bridge_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>
         );
     }
     Some(shared)
+}
+
+/// The source storage for the container at BP position `node` of a bridge
+/// document, found by walking down from `cursor` (the document's root, over
+/// `source`, the value it was serialized from) through only the subtrees
+/// that hold `node`: each sibling ahead of it is skipped by its BP close
+/// ([`DocumentCursor::subtree_end`]), and its source counterpart by index,
+/// so nothing else in the value is read. `None` where the node is not a
+/// container, or its subtree does not round-trip unchanged
+/// ([`reindex_bridge_is_identity`](super::eval_generic::reindex_bridge_is_identity),
+/// which depends on that subtree alone). The first read of each bridge
+/// document takes this route (`bridge_provenance::shared_for`).
+pub(crate) fn bridge_provenance_descend<W: Clone + AsRef<[u64]>>(
+    source: &OwnedValue,
+    cursor: JsonCursor<'_, W>,
+    node: usize,
+) -> Option<OwnedValue> {
+    let (mut source, mut cursor) = (source, cursor);
+    while cursor.bp_position() != node {
+        // Children lie in document order, so the first whose subtree closes
+        // at or after `node` is the one holding it.
+        let mut child = cursor.first_child();
+        (source, cursor) = match source {
+            OwnedValue::Array(items) => items.iter().find_map(|item| {
+                let element = child?;
+                child = element.next_sibling();
+                (node <= element.subtree_end()?).then_some((item, element))
+            })?,
+            OwnedValue::Object(fields) => fields.values().find_map(|field| {
+                let value = child?.next_sibling()?; // past the key's own node
+                child = value.next_sibling();
+                (node <= value.subtree_end()?).then_some((field, value))
+            })?,
+            _ => return None, // omni-dev: coverage tolerate-line reason="unreachable: a scalar has no children, and `node` lies inside the subtree the walk is in (#3069)"
+        };
+        if node < cursor.bp_position() {
+            return None; // an object key's own node, never a container
+        }
+    }
+    (matches!(source, OwnedValue::Array(_) | OwnedValue::Object(_))
+        && super::eval_generic::reindex_bridge_is_identity(source))
+    .then(|| source.clone())
 }
 
 /// The [`BindOrigin`] an `as` binding over `value` should carry (#2889

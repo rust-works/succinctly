@@ -3986,6 +3986,8 @@ pub(crate) mod bridge_provenance {
     struct Registration {
         text: usize,
         source: OwnedValue,
+        /// Reads served so far without the table.
+        descents: Cell<u32>,
         table: OnceCell<Vec<(usize, Option<OwnedValue>)>>,
     }
 
@@ -4006,6 +4008,7 @@ pub(crate) mod bridge_provenance {
             d.borrow_mut().push(Registration {
                 text,
                 source,
+                descents: Cell::new(0),
                 table: OnceCell::new(),
             });
         });
@@ -4035,12 +4038,27 @@ pub(crate) mod bridge_provenance {
     /// The source storage for the container at BP position `node` of the
     /// bridge document whose text starts at `text`, or `None` when no
     /// registered document has that text or the container is not one the
-    /// bridge round-trips unchanged. The table is built the first time any
-    /// read of that document asks.
-    pub(crate) fn shared_for(text: usize, node: usize) -> Option<OwnedValue> {
+    /// bridge round-trips unchanged.
+    ///
+    /// The first read of a document is served by `descend` (a walk from the
+    /// root to `node` alone, skipping every other subtree, which the caller
+    /// can do with the document's BP), and the table is built at the second:
+    /// a single read out of a large bridged value (`min_by`, `first(.[] |
+    /// select(..))`) otherwise pays for every container in it, measured at
+    /// +10% on a 7950X for one element of a 10 MB array, while a builtin that
+    /// reads every element amortizes the table over all of them.
+    pub(crate) fn shared_for(
+        text: usize,
+        node: usize,
+        descend: impl FnOnce(&OwnedValue) -> Option<OwnedValue>,
+    ) -> Option<OwnedValue> {
         DOCS.with(|d| {
             let d = d.borrow();
             let reg = d.iter().rev().find(|r| r.text == text)?;
+            if reg.table.get().is_none() && reg.descents.get() == 0 {
+                reg.descents.set(1);
+                return descend(&reg.source);
+            }
             let table = reg.table.get_or_init(|| table_of(&reg.source));
             let i = table.binary_search_by_key(&node, |(n, _)| *n).ok()?;
             table[i].1.clone()
@@ -4147,7 +4165,11 @@ pub(crate) mod bridge_provenance {
         false
     }
 
-    pub(crate) fn shared_for(_text: usize, _node: usize) -> Option<OwnedValue> {
+    pub(crate) fn shared_for(
+        _text: usize,
+        _node: usize,
+        _descend: impl FnOnce(&OwnedValue) -> Option<OwnedValue>,
+    ) -> Option<OwnedValue> {
         None
     }
 }
@@ -6901,6 +6923,16 @@ mod tests {
                 "positions for {}",
                 doc.text()
             );
+            for (position, recorded) in &table {
+                let descended =
+                    crate::jq::eval::bridge_provenance_descend(&source, doc.root(), *position);
+                assert_eq!(
+                    alloc::format!("{descended:?}"),
+                    alloc::format!("{recorded:?}"),
+                    "descent to {position} of {}",
+                    doc.text()
+                );
+            }
             for ((position, recorded), (_, fresh)) in table.iter().zip(&actual) {
                 if let Some(recorded) = recorded {
                     assert!(
