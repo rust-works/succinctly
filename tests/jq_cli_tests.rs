@@ -75747,72 +75747,195 @@ fn test_comma_nested_under_if_bind_source_classified_per_leaf_3334() -> Result<(
 /// pipe body runs to the end of the enclosing expression -- jq's grammar makes
 /// `Term "as" Patterns '|' Exp` an `Exp` production, so whatever operator
 /// precedes the Term (unary minus included) takes the whole binding as its
-/// right operand: `2 * 1 as $x | $x + 10` is `22`, `-1 as $i | ($i, 100)`
-/// is `-1, -100` with `$i` bound to `1`. The table covers unary minus (a
-/// literal and an expression operand, `try`/`label`/`def`/`reduce`/`if`
-/// after it), binary operators, `?//` patterns, assignment right-hand sides
-/// and `reduce`/`foreach` sources, whose own `as` must stay the fold's. Every
-/// value captured from jq 1.7.1; `(input, filter, stdout, exit)`.
-#[test]
-fn test_as_binding_binds_only_the_preceding_term_3397() -> Result<()> {
-    for (input, filter, stdout, exit) in [
-        (r"null", r"-1 as $i | ($i, 100)", "-1\n-100\n", 0),
-        (r"null", r"[-1, 2]", "[-1,2]\n", 0),
-        (r"null", r"[-1 | . + 10]", "[9]\n", 0),
-        (r"null", r"-1 + 2", "1\n", 0),
-        (r"null", r"[-(1,2)]", "[-1,-2]\n", 0),
-        (r"null", r"-2 * 3", "-6\n", 0),
-        (r"null", r"[- 1 // 2]", "[-1]\n", 0),
-        (r"null", r"-1 == -1", "true\n", 0),
-        (r"null", r"[-1 as $x | $x, 5]", "[-1,-5]\n", 0),
-        (r#"{"a":3}"#, r"[-.a | . * 2]", "[-6]\n", 0),
-        (r"null", r"[-1 | tostring]", "[\"-1\"]\n", 0),
-        (r"null", r"-1 - -1", "0\n", 0),
-        (r"null", r"[1, -2 | . * 10]", "[10,-20]\n", 0),
-        (r"null", r"[-. as $x | 1]", "[-1]\n", 0),
-        (r"3", r"-. + 1", "-2\n", 0),
-        (r"[4]", r"[-try 1 catch 2]", "[-1]\n", 0),
-        (r"[4]", r"[-label $o | 1, 2]", "[-1,-2]\n", 0),
-        (r"[4]", r"[-def f: 1; f, 2]", "[-1,-2]\n", 0),
-        (r"[4]", r"[-reduce (1,2) as $x (0; .+$x)]", "[-3]\n", 0),
-        (r"[4]", r"[-if true then 1 else 2 end, 3]", "[-1,3]\n", 0),
-        (r"[4]", r"[-[1] as [$a] ?// $b | $a, 7]", "[-1,-7]\n", 0),
-        (r"[4]", r"[-1 as $i | $i + 1, 7]", "[-2,-7]\n", 0),
-        (r"[4]", r"[-(1 as $i | $i), 7]", "[-1,7]\n", 0),
-        (r"[4]", r"[-.[0] as $i | $i, 7]", "[-4,-7]\n", 0),
-        (r"[4]", r"[- 1 as $i | 2]", "[-2]\n", 0),
-        (r"[4]", r"[-1 as $a | 5 as $b | $b]", "[-5]\n", 0),
-        (r"[4]", r"[-1 as $i | ($i, 100) | . * 2]", "[-2,-200]\n", 0),
-        (r"[4]", r"[(-1 as $i | $i), 100]", "[-1,100]\n", 0),
-        (r"[4]", r"2 * 1 as $x | $x + 10", "22\n", 0),
-        (r"[4]", r"[1, 2 as $x | $x + 10]", "[1,12]\n", 0),
-        (r"[4]", r"10 - 1 as $x | $x", "9\n", 0),
-        (r"[4]", r"[.[0] + 1 as $x | $x, 7]", "[5,11]\n", 0),
-        (r"[4]", r#""a" + "b" as $x | $x"#, "\"ab\"\n", 0),
-        (r"[4]", r"[1 // 2 as $x | $x, 9]", "[1]\n", 0),
-        (r"[4]", r"[1 and 2 as $x | $x]", "[true]\n", 0),
-        (r"[4]", r"1 == 1 as $x | $x", "true\n", 0),
-        (r"[4]", r"[2 * -1 as $x | $x, 5]", "[-2,-10]\n", 0),
-        (r"[4]", r"[-1.5 as $x | $x, 2]", "[-1.5,-2]\n", 0),
-        (r"[4]", r"[-1e2 as $x | $x]", "[-100]\n", 0),
-        (r"[4]", r"[.[-1] as $x | $x]", "[4]\n", 0),
-        (
-            r"[4]",
-            r#"{"a":1} | .a = 1 as $x | $x + 1"#,
-            "{\"a\":2}\n",
-            0,
-        ),
-        (
-            r"[4]",
-            r#"{"a":1} | .a |= 2 as $x | $x + ."#,
-            "{\"a\":3}\n",
-            0,
-        ),
-        (r"[4]", r"[.[] as $x | $x * 2]", "[8]\n", 0),
-        (r"[4]", r"[reduce .[] as $x (0; . + $x)]", "[4]\n", 0),
-        (r"[4]", r"[foreach .[] as $x (0; . + $x)]", "[4]\n", 0),
-        (r"[4]", r"[1 as $x | 2 as $y | $x + $y]", "[3]\n", 0),
-    ] {
+/// right operand: `2 * 1 as $x | $x + 10` is `22`, `-1 as $i | ($i, 100)` is
+/// `-1, -100` with `$i` bound to `1`. jq's `'-' Exp` likewise covers the
+/// multiplicative chain after its operand, so `-2 * "ab"` is `-(2 * "ab")`,
+/// an error. These rows all differ between the parse before #3397 and jq's
+/// own; every value is captured from jq 1.7.1 -- `(input, filter, stdout,
+/// exit)`.
+const AS_BINDING_FIXED_ROWS_3397: &[(&str, &str, &str, i32)] = &[
+    (r"null", r"-1 as $i | ($i, 100)", "-1\n-100\n", 0),
+    (r"null", r"[-1 as $x | $x, 5]", "[-1,-5]\n", 0),
+    (r"null", r"[-. as $x | 1]", "[-1]\n", 0),
+    (r"[4]", r"[-[1] as [$a] ?// $b | $a, 7]", "[-1,-7]\n", 0),
+    (r"[4]", r"[-1 as $i | $i + 1, 7]", "[-2,-7]\n", 0),
+    (r"[4]", r"[-.[0] as $i | $i, 7]", "[-4,-7]\n", 0),
+    (r"[4]", r"[- 1 as $i | 2]", "[-2]\n", 0),
+    (r"[4]", r"[-1 as $a | 5 as $b | $b]", "[-5]\n", 0),
+    (r"[4]", r"[-1 as $i | ($i, 100) | . * 2]", "[-2,-200]\n", 0),
+    (r"[4]", r"2 * 1 as $x | $x + 10", "22\n", 0),
+    (r"[4]", r"[.[0] + 1 as $x | $x, 7]", "[5,11]\n", 0),
+    (r"[4]", r"[1 // 2 as $x | $x, 9]", "[1]\n", 0),
+    (r"[4]", r"[2 * -1 as $x | $x, 5]", "[-2,-10]\n", 0),
+    (r"[4]", r"[-1.5 as $x | $x, 2]", "[-1.5,-2]\n", 0),
+    (
+        r"[4]",
+        r#"{"a":1} | .a = 1 as $x | $x + 1"#,
+        "{\"a\":2}\n",
+        0,
+    ),
+    (
+        r"[4]",
+        r#"{"a":1} | .a |= 2 as $x | $x + ."#,
+        "{\"a\":3}\n",
+        0,
+    ),
+    (r"[4]", r"[10 - 1 as $x | $x, 7]", "[9,3]\n", 0),
+    (r"[4]", r"[false or 2 as $x | $x, 9]", "[true,true]\n", 0),
+    (r"[4]", r"[8 / 2 as $x | $x, 4]", "[4,2]\n", 0),
+    (r"[4]", r"[9 % 4 as $x | $x, 5]", "[1,4]\n", 0),
+    (r"null", r"[try 1 catch 2 as $y | $y + 10]", "[1]\n", 0),
+    (r"null", r#"[-2 * "ab"]"#, "", 5),
+    (r"null", r"[-2 * 3 as $x | $x, 5]", "[-6,-10]\n", 0),
+    (r"null", r"-9223372036854775807 % 10", "-7\n", 0),
+    (r"[4]", r"[-.[0] * 2 as $x | $x, 7]", "[-8,-28]\n", 0),
+    (r"null", r"[-1 / 2 as $x | $x, 4]", "[-0.5,-0.25]\n", 0),
+    (r"null", r"[-7 % 4 as $x | $x, 5]", "[-3,-2]\n", 0),
+    (
+        r"[1,2]",
+        r"reduce (2 * 1 as $z | $z + 1) as $x (0; . + $x)",
+        "4\n",
+        0,
+    ),
+    (
+        r"[1,3]",
+        r"[reduce .[] as $y (0; . + $y), 2 * 1 as $z | $z + 10]",
+        "[4,22]\n",
+        0,
+    ),
+    (
+        r"[1,3]",
+        r"[foreach .[] as $y (0; . + $y), 2 * 1 as $z | $z + 10]",
+        "[1,4,22]\n",
+        0,
+    ),
+    (r"null", r"[2 * 1 as $x | $x + 10]", "[22]\n", 0),
+    (r"null", r#""v=\(2 * 1 as $x | $x + 10)""#, "\"v=22\"\n", 0),
+    (r#"{"b":3}"#, r"[-.b * 2 as $x | $x, 1]", "[-6,-3]\n", 0),
+];
+
+/// #3397: the shapes around the change that must keep matching jq -- the ones
+/// an over-eager version of the fix broke. A second non-associative operator
+/// after a binding's body is a *syntax error* (exit 3), a `catch` handler
+/// scopes the binding inside it, a `reduce`/`foreach` source keeps its own
+/// `as`, a negative literal keeps folding (`.[-1]`), a body that takes a
+/// comma or pipe takes all of it, and an object value is jq's restricted
+/// `ExpD`: `{a: -1 * 2}` is a syntax error even though `-1 * 2` is not.
+/// Every value captured from jq 1.7.1.
+const AS_BINDING_GUARD_ROWS_3397: &[(&str, &str, &str, i32)] = &[
+    (r"null", r"[-1, 2]", "[-1,2]\n", 0),
+    (r"null", r"[-1 | . + 10]", "[9]\n", 0),
+    (r"null", r"-1 + 2", "1\n", 0),
+    (r"null", r"[-(1,2)]", "[-1,-2]\n", 0),
+    (r"null", r"-2 * 3", "-6\n", 0),
+    (r"null", r"[- 1 // 2]", "[-1]\n", 0),
+    (r"null", r"-1 == -1", "true\n", 0),
+    (r#"{"a":3}"#, r"[-.a | . * 2]", "[-6]\n", 0),
+    (r"null", r"[-1 | tostring]", "[\"-1\"]\n", 0),
+    (r"null", r"-1 - -1", "0\n", 0),
+    (r"null", r"[1, -2 | . * 10]", "[10,-20]\n", 0),
+    (r"3", r"-. + 1", "-2\n", 0),
+    (r"[4]", r"[-try 1 catch 2]", "[-1]\n", 0),
+    (r"[4]", r"[-label $o | 1, 2]", "[-1,-2]\n", 0),
+    (r"[4]", r"[-def f: 1; f, 2]", "[-1,-2]\n", 0),
+    (r"[4]", r"[-reduce (1,2) as $x (0; .+$x)]", "[-3]\n", 0),
+    (r"[4]", r"[-if true then 1 else 2 end, 3]", "[-1,3]\n", 0),
+    (r"[4]", r"[-(1 as $i | $i), 7]", "[-1,7]\n", 0),
+    (r"[4]", r"[(-1 as $i | $i), 100]", "[-1,100]\n", 0),
+    (r"[4]", r"[1, 2 as $x | $x + 10]", "[1,12]\n", 0),
+    (r"[4]", r"10 - 1 as $x | $x", "9\n", 0),
+    (r"[4]", r#""a" + "b" as $x | $x"#, "\"ab\"\n", 0),
+    (r"[4]", r"[1 and 2 as $x | $x]", "[true]\n", 0),
+    (r"[4]", r"1 == 1 as $x | $x", "true\n", 0),
+    (r"[4]", r"-reduce (1,2) as $i (0; .+$i) as $z | $z", "", 3),
+    (r"[4]", r"[-1e2 as $x | $x]", "[-100]\n", 0),
+    (r"[4]", r"[.[-1] as $x | $x]", "[4]\n", 0),
+    (r"[4]", r"[.[] as $x | $x * 2]", "[8]\n", 0),
+    (r"[4]", r"[reduce .[] as $x (0; . + $x)]", "[4]\n", 0),
+    (r"[4]", r"[foreach .[] as $x (0; . + $x)]", "[4]\n", 0),
+    (r"[4]", r"{a: 1 as $x | $x}", "", 3),
+    (r"[4]", r"[1 as $x | 2 as $y | $x + $y]", "[3]\n", 0),
+    (r"null", r"1 as $x | $x == 1 == 1", "", 3),
+    (r"[0,3,10]", r"[.[] | select(. as $v | 1 < $v < 5)]", "", 3),
+    (r#"{"a":1}"#, r"1 as $x | .a = 1 = 2", "", 3),
+    (r"null", r"-1 as $x | $x == 1 == 1", "", 3),
+    (r"null", r"1 as $x | $x < 2 > 1", "", 3),
+    (r#"{"a":1}"#, r"1 as $x | .a += 1 |= 2", "", 3),
+    (r"null", r"1 as $x | .a //= 1 //= 2", "", 3),
+    (r"null", r"[1 as $x | $x == 1] == [true]", "true\n", 0),
+    (r"null", r"1 as $x | ($x == 1) == true", "true\n", 0),
+    (r"null", r"{a: -1 as $x | $x}", "", 3),
+    (r"null", r"{a: 1 as $x | $x}", "", 3),
+    (
+        r"null",
+        r"[1 + try 2 catch 0 as $v | $v | select(. > 2)]",
+        "[3]\n",
+        0,
+    ),
+    (
+        r#"{"a":1}"#,
+        r".a |= try 1 catch 0 as $v | $v | select(. > 1)",
+        "{\"a\":1}\n",
+        0,
+    ),
+    (r"null", r#"[-try "s" catch 1 as $v | 5]"#, "", 5),
+    (r"null", r"try 1 catch 0 as $x | 2 * 3 as $y | $x", "1\n", 0),
+    (
+        r"null",
+        r#"[reduce (1,2) as $x (0; . + try error("e") catch . as $v | .)]"#,
+        "",
+        5,
+    ),
+    (r"null", r"-try null catch first as [$x] | length", "", 5),
+    (r#"{"a":1}"#, r"[-2 * . as $x | $x | tostring]", "", 5),
+    (r#"{"a":3}"#, r"[-.a * . as $x | $x | tostring]", "", 5),
+    (r"null", r"[-2 * 3]", "[-6]\n", 0),
+    (r"[4]", r"[-.[0] * -2 as $x | $x]", "[8]\n", 0),
+    (r"null", r"[-1 * 2 * 3]", "[-6]\n", 0),
+    (r"null", r"[-1 + 2 * 3]", "[5]\n", 0),
+    (r"null", r"-1 - -2 * 3", "5\n", 0),
+    (r"null", r"[.[-1]?]", "[null]\n", 0),
+    (r"[1,2,3]", r".[-1]", "3\n", 0),
+    (r"[1,2,3]", r".[-2:]", "[2,3]\n", 0),
+    (r"[1,2,3]", r"[.[-1 * 1]]", "[3]\n", 0),
+    (
+        r"[1,2]",
+        r"[reduce (1 as $a | $a, 5) as $x (0; . + $x)]",
+        "[6]\n",
+        0,
+    ),
+    (r"null", r"[1 as $a | 2 as $b | $a + $b, 9]", "[3,9]\n", 0),
+    (r"null", r"[(1 as $a | $a), 9]", "[1,9]\n", 0),
+    (r"null", r"[[1 as $a | $a] , 9]", "[[1],9]\n", 0),
+    (r"null", r"[1, 2 as $x | $x * 10]", "[1,20]\n", 0),
+    (
+        r"[4]",
+        r#"{"x": 5} | .x as $v | [$v, . ]"#,
+        "[5,{\"x\":5}]\n",
+        0,
+    ),
+    (r"null", r"def f: 1 as $x | $x + 1; [f, 5]", "[2,5]\n", 0),
+    (r#"{"b":3}"#, r"{a: -1 * 2}", "", 3),
+    (r#"{"b":3}"#, r"{a: -.b * 2}", "", 3),
+    (r#"{"b":3}"#, r"{a: 1, b: -2 * 3}", "", 3),
+    (r#"{"b":3}"#, r"{a: -1 % 3}", "", 3),
+    (r#"{"b":3}"#, r"{a: -1 / 2}", "", 3),
+    (r#"{"b":3}"#, r"{a: -1}", "{\"a\":-1}\n", 0),
+    (r#"{"b":3}"#, r"{a: -(-1 * 2)}", "{\"a\":2}\n", 0),
+    (
+        r#"{"b":3}"#,
+        r"{a: (-1 * 2), b: -.b}",
+        "{\"a\":-2,\"b\":-3}\n",
+        0,
+    ),
+    (r#"{"b":3}"#, r"[{a: [-1 * 2]}]", "[{\"a\":[-2]}]\n", 0),
+    (r#"{"b":3}"#, r"try -1 * 2", "-2\n", 0),
+    (r#"{"b":3}"#, r"try -.b * 2", "-6\n", 0),
+    (r#"{"b":3}"#, r#"try error("x") catch -1 * 2"#, "-2\n", 0),
+];
+
+fn assert_as_binding_rows_3397(rows: &[(&str, &str, &str, i32)]) -> Result<()> {
+    for &(input, filter, stdout, exit) in rows {
         let (out, err, code) = run_jq_full(&["-c", "--", filter], Some(input))?;
         assert_eq!(
             (out.as_str(), code),
@@ -75821,6 +75944,16 @@ fn test_as_binding_binds_only_the_preceding_term_3397() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn test_as_binding_binds_only_the_preceding_term_3397() -> Result<()> {
+    assert_as_binding_rows_3397(AS_BINDING_FIXED_ROWS_3397)
+}
+
+#[test]
+fn test_as_binding_neighbouring_shapes_still_match_jq_3397() -> Result<()> {
+    assert_as_binding_rows_3397(AS_BINDING_GUARD_ROWS_3397)
 }
 
 /// #3397, yq mode: real yq binds the whole left expression before `as`
@@ -75833,16 +75966,14 @@ fn test_as_binding_still_binds_whole_left_expression_in_yq_mode_3397() -> Result
         ("[1 // 2 as $x | $x, 9]", "[1,9]"),
         ("[.a + 1 as $x | $x, 7]", "[5,7]"),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .args(["yq", "-o", "json", "-I", "0", filter])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                child.stdin.take().expect("piped").write_all(b"a: 4\n")?;
-                child.wait_with_output()
-            })?;
+        let (output, _) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command.args(["yq", "-o", "json", "-I", "0", filter]);
+                command
+            },
+            Some(b"a: 4\n"),
+        )?;
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim_end(),
             expected,
