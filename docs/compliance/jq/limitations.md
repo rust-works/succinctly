@@ -1600,7 +1600,13 @@ is the revert that established what the other one costs.
      ([#3465](https://github.com/rust-works/succinctly/issues/3465));
    - a scalar relocated into a new container (`.a.b as $z | .a | to_entries | path(.[0].value
      | $z)`, jq `[0,"value"]`). jq moves the same `jv`, and a scalar has no identity to follow
-     it ([#3466](https://github.com/rust-works/succinctly/issues/3466)).
+     it ([#3466](https://github.com/rust-works/succinctly/issues/3466));
+   - a write whose target wraps the variable in anything other than navigation, `?`,
+     computed keys and arithmetic (`.a as $x | del(.a | $x | first(.))`,
+     `del(limit(1; .a | $x))`, `(.a | $x | if . then . else error end) = 7`), where
+     `path()` of the same target answers. The write door resolves only targets it can
+     prove effect-free (`owned_write_door`'s gate, shared with #3188); anything else keeps
+     the bridge's resolver, which has no position for `$x`.
 
    Two shapes refuse where jq raises a *different* error:
    - `(.a.b | $z, .a.b) = 9` (jq: `Cannot index number with string "a"`). The write door

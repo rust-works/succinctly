@@ -486,6 +486,9 @@ navigated-bind-positional-reduce-assign	{"a":{"b":1}}	.a.b as $z | reduce (1) as
 navigated-bind-positional-negative-index	{"a":[1,1]}	.a[0] as $z | .a | path(.[-2] | $z)
 navigated-bind-positional-optional-step	{"a":{"b":1}}	.a.b as $z | .a | path(.b? | $z)
 navigated-bind-positional-relocated-scalar	{"a":{"b":1}}	.a.b as $z | .a | to_entries | path(.[0].value | $z)
+navigated-bind-positional-write-first	{"a":5,"b":1}	.a as $x | del(.a | $x | first(.))
+navigated-bind-positional-write-limit	{"a":5,"b":1}	.a as $x | del(limit(1; .a | $x))
+navigated-bind-positional-path-first	{"a":5,"b":1}	.a as $x | path(.a | $x | first(.))
 navigated-bind-embed	{"a":{"b":1}}	.a as $y | {k:.a} | .k | path($y)
 navigated-bind-reduce-update	{"a":{"b":1}}	reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)
 navigated-bind-catch-handler	{"a":{"b":1}}	try error(.) catch (.a as $y | .a | path($y))
@@ -972,6 +975,8 @@ navigated-bind-positional-reduce-assign:#3465 -- same as navigated-bind-position
 navigated-bind-positional-negative-index:#3464 -- a frame position keeps the -2 spelling, so it never equals the bind's canonical index
 navigated-bind-positional-optional-step:#3464 -- a frame position keeps the ? wrapper, so it never equals the bind's canonical key
 navigated-bind-positional-relocated-scalar:#3466 -- to_entries moves the scalar jv into a new container; a scalar has no identity to follow it
+navigated-bind-positional-write-first:the write door resolves only effect-free navigation targets (owned_write_door's gate, #3188); first(.) keeps the bridge's resolver, which has no position; path() of the same target answers
+navigated-bind-positional-write-limit:same as navigated-bind-positional-write-first
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then

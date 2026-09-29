@@ -69318,6 +69318,41 @@ fn test_navigated_bind_positional_controls_refuse_3134() -> Result<()> {
     Ok(())
 }
 
+/// #3134 review: `at_offset` (a succinctly extension) can bind the *first*
+/// of two duplicate keys, a member jq's parser discards and that `.a` never
+/// reaches -- `.a` is the last member, in jq and in the owned tree the
+/// resolver walks. A position for the shadowed member would certify `.a`
+/// by value on `{"a":1,"a":1}` and let `del` delete through it, so it gets
+/// none and refuses; the last member, which `.a` is, answers.
+#[test]
+fn test_navigated_bind_positional_shadowed_duplicate_key_refuses_3134() -> Result<()> {
+    let input = r#"{"a":1,"a":1}"#;
+    for filter in [
+        r"at_offset(5) as $x | path(.a | $x)",
+        r"at_offset(5) as $x | del(.a | $x)",
+        r"at_offset(5) as $x | (.a | $x) = 9",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with result"),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    for (filter, expected) in [
+        (r"at_offset(11) as $x | path(.a | $x)", r#"["a"]"#),
+        (r"at_offset(11) as $x | del(.a | $x)", "{}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// yq mode is untouched by #3037: real yq v4.53.3 treats `($y.b) = 9`
 /// through a variable as a no-op and prints the document unchanged
 /// (`b: 1`), at the marker's own node and at a sibling alike, where
