@@ -1605,7 +1605,9 @@ is the revert that established what the other one costs.
    its parent (`.a.c = 1 | path(.a.b | $z)`, `.a.b |= .`), into a new container (`[.a.b] |
    path(.[0] | $z)`, `to_entries`), or on an owned-rooted document (`tojson | fromjson`, `-n
    'input | …'`), whose `eval.rs` bind sites mint no node for a scalar at all. Only a real scalar
-   identity could close them. The routes that re-enter the eager evaluator with an *owned*
+   identity could close them. A member a later duplicate key shadows (`at_offset(5) as $x |
+   del(.a | $x)` on `{"a":1,"a":1}`, a succinctly extension binding the member jq's parser
+   discards) gets no anchor step and refuses; `.a` is the last member. The routes that re-enter the eager evaluator with an *owned*
    accumulator (`reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)`, a `catch` handler) were
    listed here too — `eval.rs`'s own `eval_as` carries no node for a navigated bind, so no
    witness could promote it — until #3177's storage clause certified the marker by the `Rc`
