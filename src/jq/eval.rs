@@ -26315,6 +26315,20 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 
 /// Evaluate a jq expression against a JSON cursor.
 ///
+/// # Which entry point
+///
+/// The CLI does not use this entry; it evaluates through
+/// [`eval_with_cursor_using`](super::eval_generic::eval_with_cursor_using).
+/// On well-formed input the two agree. They differ on a value the index
+/// cannot read (a malformed number such as `1.2.3`, or a keyword such as
+/// `tru`), which jq rejects at parse time (#3266): this entry collects its
+/// results into owned values, and its `path`/`paths`/`leaf_paths`/`getpath`
+/// walk an owned copy of their input. Building that copy decodes the value,
+/// so `[.] | length` on it, or `path(.a)` on `{"a":1,"b":tru}`, raises
+/// here but answers in the CLI. Call `eval_with_cursor_using` for answers
+/// identical to the CLI's. The split is recorded in
+/// `docs/compliance/jq/limitations.md`; converging the two is #3457.
+///
 /// # Examples
 ///
 /// ```ignore
@@ -114090,20 +114104,11 @@ mod tests {
             "isvalid(.)",
             "empty",
             "1",
-            // `eval` collects these into owned values -- it materializes,
-            // and materializing validates, as `-s` and `-S` do -- so only
-            // the generic evaluator, the one the CLI routes them to, is held
-            // to answering here.
-            "[limit(1; .)] | length",
-            "[.] | length",
-            "path(.)",
-            "[paths]",
-        ];
-        const MATERIALIZED_BY_EVAL: &[&str] = &[
-            "[limit(1; .)] | length",
-            "[.] | length",
-            "path(.)",
-            "[paths]",
+            // Filters that wrap or navigate the value without reading it
+            // (`[.] | length`, `path(.)`, ...) answer here in the generic
+            // evaluator but raise in `eval`, which materializes them; that
+            // split is pinned per evaluator by
+            // `eval_entry_validates_what_the_cursor_entry_navigates_3266`.
         ];
         let good = b"[1]";
         let good_index = JsonIndex::build(good);
@@ -114117,14 +114122,12 @@ mod tests {
                 .expect("one element");
             for filter in NON_READERS {
                 let expr = parse(filter).expect("filter parses");
-                if !MATERIALIZED_BY_EVAL.contains(filter) {
-                    let concrete = normalize(eval::<Vec<u64>, JqSemantics>(&expr, element));
-                    let expected = normalize(eval::<Vec<u64>, JqSemantics>(&expr, good_element));
-                    if concrete != expected {
-                        // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a NON_READERS filter disagrees between the malformed and well-formed document (#3222)"
-                        disagreed.push(format!("eval `{filter}` on {json}: {concrete:?}"));
-                        // omni-dev: coverage end
-                    }
+                let concrete = normalize(eval::<Vec<u64>, JqSemantics>(&expr, element));
+                let expected = normalize(eval::<Vec<u64>, JqSemantics>(&expr, good_element));
+                if concrete != expected {
+                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a NON_READERS filter disagrees between the malformed and well-formed document (#3222)"
+                    disagreed.push(format!("eval `{filter}` on {json}: {concrete:?}"));
+                    // omni-dev: coverage end
                 }
                 let run_generic = |cursor| match crate::jq::eval_generic::eval_with_cursor_using::<
                     JqSemantics,
@@ -114147,6 +114150,111 @@ mod tests {
             disagreed.is_empty(),
             "a non-reader read the value: {disagreed:#?}"
         );
+    }
+
+    /// #3266: the library entry `eval` validates a value that the CLI's
+    /// entry, `eval_with_cursor_using`, only wraps or navigates past. `eval`
+    /// collects its results into owned values, and its `path`/`paths`/
+    /// `leaf_paths`/`getpath` walk an owned copy of their input, so building
+    /// that copy decodes every value in it -- including a sibling the
+    /// navigation never visits (`path(.a)` with a malformed `"b"`). The
+    /// generic evaluator keeps a single-source collection as cursors and
+    /// walks paths on the cursor, so it answers. jq rejects every document
+    /// here at parse time, so neither answer has a reference.
+    ///
+    /// Recorded as out of policy in `docs/compliance/jq/limitations.md`
+    /// ("The library `eval()` entry validates what the CLI's entry only
+    /// navigates"): the path-family rows break ADR-0018's #2168 instance
+    /// for the library entry. Converging `eval` onto the cursor entry is
+    /// #3457; the collection rows (the last two raise in both evaluators,
+    /// where `[.] | length` answers in one) are #3427. Each row pins both
+    /// evaluators' current answer, so a convergence has to flip a row on
+    /// purpose rather than pass silently.
+    #[test]
+    fn eval_entry_validates_what_the_cursor_entry_navigates_3266() {
+        /// `None` = raises a decode failure; `Some(json)` = answers exactly
+        /// that one value.
+        type Outcome = Option<&'static str>;
+        const ROWS: &[(&str, &str, Outcome, Outcome)] = &[
+            // (document -- the filter runs on its first element, filter,
+            //  `eval`, `eval_with_cursor_using`)
+            ("[1.2.3]", "[.] | length", None, Some("1")),
+            ("[tru]", "[.] | length", None, Some("1")),
+            ("[1.2.3]", "[limit(1; .)] | length", None, Some("1")),
+            ("[1.2.3]", "path(.)", None, Some("[]")),
+            ("[tru]", "path(.)", None, Some("[]")),
+            ("[1.2.3]", "[paths]", None, Some("[]")),
+            ("[tru]", "[paths]", None, Some("[]")),
+            ("[1.2.3]", "getpath([]) | not", None, Some("false")),
+            (r#"[{"a":1,"b":tru}]"#, "path(.a)", None, Some(r#"["a"]"#)),
+            (r#"[{"a":1,"b":tru}]"#, "[paths] | length", None, Some("2")),
+            (
+                r#"[{"a":1,"b":tru}]"#,
+                "[leaf_paths]",
+                None,
+                Some(r#"[["a"],["b"]]"#),
+            ),
+            (r#"[{"a":1,"b":tru}]"#, r#"getpath(["a"])"#, None, Some("1")),
+            (r#"[{"a":1,"b":tru}]"#, "[.[]] | length", None, Some("2")),
+            // #3427: a multi-source collection materializes its elements in
+            // the generic evaluator too.
+            ("[1.2.3]", "[., 1] | length", None, None),
+            ("[1.2.3]", "{a: .} | length", None, None),
+        ];
+        let mut moved = Vec::new();
+        for &(json, filter, want_eval, want_generic) in ROWS {
+            let index = JsonIndex::build(json.as_bytes());
+            let element = index
+                .root(json.as_bytes())
+                .first_child()
+                .expect("one element");
+            let expr = parse(filter).expect("filter parses");
+            let concrete: Outcome = match eval::<Vec<u64>, JqSemantics>(&expr, element) {
+                QueryResult::Error(e) if e.is_decode_failure() => None,
+                other => match normalize(other) {
+                    (values, tag) if values.len() == 1 && tag == "ok" => {
+                        Some(values[0].to_json().leak())
+                    }
+                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- every ROWS filter either raises a decode failure or answers one value through eval, so this fallback only reports a row that moved (#3266)"
+                    other => Some(format!("{other:?}").leak()),
+                    // omni-dev: coverage end
+                },
+            };
+            let generic: Outcome = match crate::jq::eval_generic::eval_with_cursor_using::<
+                JqSemantics,
+                _,
+            >(&expr, element)
+            {
+                crate::jq::eval_generic::GenericResult::Error(e) if e.is_decode_failure() => None,
+                other => match other.into_owned::<JqSemantics>() {
+                    Ok(Some(value)) => Some(value.to_json().leak()),
+                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- every ROWS filter either raises a decode failure or answers one value through the generic evaluator, so this fallback only reports a row that moved (#3266)"
+                    other => Some(format!("{other:?}").leak()),
+                    // omni-dev: coverage end
+                },
+            };
+            if (concrete, generic) != (want_eval, want_generic) {
+                // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a ROWS answer moves (#3266)"
+                moved.push(format!(
+                    "`{filter}` on {json}: eval {concrete:?} (pinned {want_eval:?}), \
+                     eval_with_cursor_using {generic:?} (pinned {want_generic:?})"
+                ));
+                // omni-dev: coverage end
+            }
+        }
+        assert!(moved.is_empty(), "a pinned answer moved: {moved:#?}");
+
+        // The value entry `eval_using` is handed an already-decoded value, so
+        // the malformed number raises before evaluation starts, even under
+        // `not`, which reads nothing (the cursor entry answers `false`).
+        let json = b"[1.2.3]";
+        let index = JsonIndex::build(json);
+        let element = index.root(json).first_child().expect("one element");
+        let expr = parse("not").expect("filter parses");
+        assert!(matches!(
+            crate::jq::eval_generic::eval_using::<JqSemantics, _>(&expr, element.value()),
+            crate::jq::eval_generic::GenericResult::Error(e) if e.is_decode_failure()
+        ));
     }
 }
 

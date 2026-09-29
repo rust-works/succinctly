@@ -7986,6 +7986,60 @@ Pinned by `test_bridge_token_spellings_read_like_their_siblings_3034` and
 `test_bridge_token_spelling_in_a_real_document_is_not_a_token_3034` (`src/jq/eval.rs`), and
 `bridge_tokens_decode_only_under_the_bridge_index_3034` (`src/json/light.rs`).
 
+A library caller of `succinctly::jq::eval` sees more filters raise on such a value than the CLI
+does. See the next entry.
+
+### The library `eval()` entry validates what the CLI's entry only navigates (#3266, #3427) — out of policy
+
+The CLI evaluates through `eval_generic::eval_with_cursor_using`, which holds its input as a
+cursor. The library entry `succinctly::jq::eval` (`src/jq/eval.rs`) collects its results into
+owned values, and its `path`/`paths`/`leaf_paths`/`getpath` walk an owned copy of their input.
+Building an owned copy decodes every value in it. So on a value the index cannot read (the
+malformed number above, or a keyword such as `tru`), filters that only navigate past it or
+wrap it answer in the CLI and raise through `jq::eval`. A third entry, `eval_using`, takes an
+already-decoded value, so there the value raises before any filter runs (even `not`). jq 1.7.1
+rejects every document below at parse time (exit 5), so no row has a reference answer.
+
+| filter, on the first element of                     | CLI / `eval_with_cursor_using` | `jq::eval` |
+|-----------------------------------------------------|--------------------------------|------------|
+| `[.] \| length` on `[1.2.3]`, `[tru]`               | `1`                            | raises     |
+| `[limit(1; .)] \| length` on `[1.2.3]`              | `1`                            | raises     |
+| `path(.)`, `[paths]` on `[1.2.3]`, `[tru]`          | `[]`, `[]`                     | raises     |
+| `getpath([]) \| not` on `[1.2.3]`                   | `false`                        | raises     |
+| `path(.a)` on `[{"a":1,"b":tru}]`                   | `["a"]`                        | raises     |
+| `[paths] \| length`, `[leaf_paths]` (same)          | `2`, `[["a"],["b"]]`           | raises     |
+| `getpath(["a"])`, `[.[]] \| length` (same)          | `1`, `2`                       | raises     |
+| `[., 1] \| length`, `{a: .} \| length` on `[1.2.3]` | raises                         | raises     |
+
+Two splits are recorded here, and both are **out of policy** against ADR-0018's #2103
+amendment, whose point is that the answer must not depend on how the filter is spelled:
+
+- **Between entries.** The path-family rows break the amendment's #2168 instance ("`path`/
+  `getpath` validate only the nodes they navigate") for the library entry: `path(.a)` raises
+  because of the sibling `"b"`, which it never visits. The rule holds for the CLI and
+  `eval_with_cursor_using` only. Converging `jq::eval` onto the cursor entry is
+  [#3457](https://github.com/rust-works/succinctly/issues/3457).
+  [#3432](https://github.com/rust-works/succinctly/pull/3432) tried routing only
+  path-family queries across and was not merged: the generic path walkers panic past nesting
+  depth 256, which `jq::eval` does not catch (#3429); a syntactic scan rerouted whole queries,
+  including from a `def` that is never called, and changed unrelated answers; and a cursor
+  result turned a decode failure into `null`. Those costs are larger than this Severity: Low
+  split, so the fix is a complete, deliberate move with those problems designed out, not a
+  per-query one.
+- **Within the cursor entry.** A single-source collection (`[.]`, `[limit(1; .)]`, `[.[]]`)
+  keeps its elements as cursors, but a multi-source one (`[., 1]`, `{a: .}`) materializes
+  them, so `[.] | length` answers where `[., 1] | length` raises in the CLI itself.
+  [#3427](https://github.com/rust-works/succinctly/issues/3427) tracks it. Neither direction
+  is a quick fix: materializing every collection would decode every element of `[.[]]` over
+  a large document and break `LazySeq` streaming, and keeping cursors in every collection
+  needs a mixed lazy/owned array in both evaluators.
+
+A library caller who wants the CLI's answers should call `eval_with_cursor_using`; the three
+entry points' rustdoc says which one the CLI uses and what each one decodes. Pinned per
+evaluator by `eval_entry_validates_what_the_cursor_entry_navigates_3266` (`src/jq/eval.rs`),
+so a convergence has to change a row on purpose, and in the CLI by
+`test_unreadable_value_collection_split_3266` (`tests/jq_cli_tests.rs`).
+
 ### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads real jq's synthetic `null`, not the ambient input — no carve-out; recorded as a still-open policy question (#534, #2163)
 
 `foreach`/`reduce`'s parser accepted a top-level comma in the INIT slot from #534 onward

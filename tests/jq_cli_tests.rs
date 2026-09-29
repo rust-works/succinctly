@@ -74182,6 +74182,34 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
     Ok(())
 }
 
+/// #3266/#3427: on a value the index cannot read, the CLI answers a filter
+/// that navigates past it or wraps it in a single-source collection, but a
+/// multi-source collection materializes its elements and raises. The split is
+/// recorded as out of policy in `docs/compliance/jq/limitations.md` ("The
+/// library `eval()` entry validates what the CLI's entry only navigates"),
+/// where `succinctly::jq::eval` raises on every row here; #3427 tracks the
+/// collection half. jq 1.7.1 rejects every document at parse time (exit 5).
+#[test]
+fn test_unreadable_value_collection_split_3266() -> Result<()> {
+    let rows: &[(&str, &str, &str, i32)] = &[
+        ("[1.2.3]", ".[0] | [.] | length", "1\n", 0),
+        ("[1.2.3]", ".[0] | [limit(1; .)] | length", "1\n", 0),
+        ("[1.2.3]", ".[0] | [., 1] | length", "", 5),
+        ("[1.2.3]", ".[0] | {a: .} | length", "", 5),
+        (r#"[{"a":1,"b":tru}]"#, ".[0] | path(.a)", "[\"a\"]\n", 0),
+        (r#"[{"a":1,"b":tru}]"#, ".[0] | [paths] | length", "2\n", 0),
+    ];
+    for &(doc, filter, stdout, code) in rows {
+        let (out, err, got) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (out.as_str(), got),
+            (stdout, code),
+            "{filter} on {doc}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
 // ---- #2764: untracked-input `path()` arms refuse only where jq does ----
 
 /// The document every #2764 row below runs against. `.a.b.b` is `null`, so
