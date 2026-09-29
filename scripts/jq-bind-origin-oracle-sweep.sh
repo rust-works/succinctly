@@ -443,6 +443,49 @@ root-snapshot-renavigated-sibling-def	{"a":{"b":1},"c":{"b":1}}	def f: . as $r |
 root-snapshot-renavigated-own-node	{"a":{"b":1},"c":{"b":1}}	. as $r | .a | . as $x | $r | .a | ($x.b) = 9
 navigated-bind-positional-path	{"a":{"b":1}}	.a as $y | path(.a | $y)
 navigated-bind-positional-assign	{"a":{"b":1}}	.a as $y | (.a | ($y.b)) = 9
+navigated-bind-positional-scalar-path	{"a":{"b":1}}	.a.b as $z | path(.a.b | $z)
+navigated-bind-positional-scalar-path-steps	{"a":{"b":1}}	.a.b as $z | path(.a | .b | $z)
+navigated-bind-positional-string-path	{"a":{"b":"s"}}	.a.b as $z | path(.a | .b | $z)
+navigated-bind-positional-float-path	{"a":{"b":1.5}}	.a.b as $z | path(.a | .b | $z)
+navigated-bind-positional-bracket-key	{"a":{"b":1}}	.a.b as $z | path(.a | .["b"] | $z)
+navigated-bind-positional-sub-root	{"a":{"b":1}}	.a.b as $z | .a | path(.b | $z)
+navigated-bind-positional-getpath	{"a":{"b":1}}	.a.b as $z | .a | path(getpath(["b"]) | $z)
+navigated-bind-positional-recurse	{"a":{"b":1}}	.a.b as $z | .a | path(.. | select(type=="number") | $z)
+navigated-bind-positional-index	{"a":[1,1]}	.a[0] as $z | .a | path(.[0] | $z)
+navigated-bind-positional-bind-after-nav	{"a":{"b":1}}	.a | .b as $z | path(.b | $z)
+navigated-bind-positional-intervening-bind	{"a":{"b":1}}	.a.b as $z | .a | .b as $w | path(.b | $z)
+navigated-bind-positional-comma-source	{"a":{"b":1}}	(.a.b, .a.b) as $z | path(.a.b | $z)
+navigated-bind-positional-dup-key	{"a":1,"a":2}	.a as $z | path(.a | $z)
+navigated-bind-positional-try	{"a":{"b":1}}	.a.b as $z | try path(.a.b | $z) catch "c"
+navigated-bind-positional-collect	{"a":{"b":1}}	.a.b as $z | [path(.a.b | $z)]
+navigated-bind-positional-limit	{"a":{"b":1}}	.a.b as $z | limit(1; path(.a.b | $z))
+navigated-bind-positional-def	{"a":{"b":1}}	.a.b as $z | def f: path(.a.b | $z); f
+navigated-bind-positional-assign-scalar	{"a":{"b":1}}	.a.b as $z | (.a.b | $z) = 9
+navigated-bind-positional-update-scalar	{"a":{"b":1}}	.a.b as $z | (.a | .b | $z) |= 9
+navigated-bind-positional-compound-scalar	{"a":{"b":1}}	.a.b as $z | (.a.b | $z) += 5
+navigated-bind-positional-del-scalar	{"a":{"b":1}}	.a.b as $z | del(.a | .b | $z)
+navigated-bind-positional-sub-root-assign-scalar	{"a":{"b":1}}	.a.b as $z | .a | (.b | $z) = 9
+navigated-bind-positional-array-assign-scalar	{"a":[1,1]}	.a[1] as $z | (.a[1] | $z) = 5
+navigated-bind-positional-array-compound-scalar	{"a":[1,1]}	.a[1] as $z | (.a[1] | $z) += 5
+navigated-bind-positional-nested-ancestor-path	{"a":{"b":{"c":1}}}	.a as $y | .a.b as $z | .a | path(.b | $z)
+navigated-bind-positional-nested-ancestor-root-path	{"a":{"b":{"c":1}}}	.a as $y | .a.b as $z | path(.a | .b | $z)
+navigated-bind-positional-nested-ancestor-assign	{"a":{"b":{"c":1}}}	.a as $y | .a.b as $z | (.a | .b | $z) = 9
+navigated-bind-positional-sibling-scalar	{"a":{"b":1},"c":1}	.a.b as $z | path(.c | $z)
+navigated-bind-positional-sibling-sub-root	{"a":{"b":1,"c":1}}	.a.b as $z | .a | path(.c | $z)
+navigated-bind-positional-sibling-assign	{"a":{"b":1},"c":1}	.a.b as $z | (.c | $z) = 9
+navigated-bind-positional-other-root	{"a":{"b":1},"x":{"b":1}}	.a.b as $z | .x | path(.b | $z)
+navigated-bind-positional-other-root-assign	{"a":{"b":1},"x":{"b":1}}	.a.b as $z | .x | (.b | $z) = 9
+navigated-bind-positional-iterate-equal	{"a":[1,1]}	.a[1] as $z | [path(.a[] | $z)]
+navigated-bind-positional-iterate-equal-assign	{"a":[1,1]}	.a[1] as $z | (.a[] | $z) = 5
+navigated-bind-positional-moved-root	{"a":{"b":1},"x":{"a":{"b":1}}}	.a as $y | .x | path(.a | $y)
+navigated-bind-positional-def-moved-root	{"a":{"b":1},"x":{"a":{"b":1}}}	.a as $y | def f: path(.a | $y); .x | f
+navigated-bind-positional-written-node	{"a":{"b":1}}	.a.b as $z | .a.b = 1 | path(.a.b | $z)
+navigated-bind-positional-rewritten-node	{"a":{"b":1}}	.a.b as $z | .a.b |= (. as $w | 1) | path(.a.b | $z)
+navigated-bind-positional-reduce-path	{"a":{"b":1}}	.a.b as $z | reduce (1) as $i (.; path(.a.b | $z))
+navigated-bind-positional-reduce-assign	{"a":{"b":1}}	.a.b as $z | reduce (1) as $i (.; (.a | .b | $z) = 9)
+navigated-bind-positional-negative-index	{"a":[1,1]}	.a[0] as $z | .a | path(.[-2] | $z)
+navigated-bind-positional-optional-step	{"a":{"b":1}}	.a.b as $z | .a | path(.b? | $z)
+navigated-bind-positional-relocated-scalar	{"a":{"b":1}}	.a.b as $z | .a | to_entries | path(.[0].value | $z)
 navigated-bind-embed	{"a":{"b":1}}	.a as $y | {k:.a} | .k | path($y)
 navigated-bind-reduce-update	{"a":{"b":1}}	reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)
 navigated-bind-catch-handler	{"a":{"b":1}}	try error(.) catch (.a as $y | .a | path($y))
@@ -970,6 +1013,11 @@ scalar-root-nested-embed-string:same as owned-embed-refuse-scalar-string-root
 scalar-root-embed-write-string:same as owned-embed-refuse-scalar-string-root
 scalar-root-float-literal:same as owned-embed-refuse-scalar-string-root
 scalar-nested-embed-yq-untouched-number:same as owned-embed-refuse-scalar-string-root
+navigated-bind-positional-reduce-path:#3465 -- an owned re-entry (a fold body) has no cursor to place a scalar bind from; containers answer by storage
+navigated-bind-positional-reduce-assign:#3465 -- same as navigated-bind-positional-reduce-path
+navigated-bind-positional-negative-index:#3464 -- a frame position keeps the -2 spelling, so it never equals the bind's canonical index
+navigated-bind-positional-optional-step:#3464 -- a frame position keeps the ? wrapper, so it never equals the bind's canonical key
+navigated-bind-positional-relocated-scalar:#3466 -- to_entries moves the scalar jv into a new container; a scalar has no identity to follow it
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then

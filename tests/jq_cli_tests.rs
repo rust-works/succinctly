@@ -69323,6 +69323,211 @@ fn test_navigated_bind_on_owned_root_yq_mode_unchanged_3135() -> Result<()> {
     Ok(())
 }
 
+/// What #3069 left refusing, answered since #3134: a navigated bind whose
+/// node is *below* the resolver's root and which storage identity cannot
+/// certify -- a scalar (no `Rc`), or a node another bind's `Rc` already
+/// stands for (`.a as $y | .a.b as $z | .a | ...`). The cursor-side
+/// `path()` arms and write funnels now stamp such a marker with its
+/// position below the root for the one resolver invocation they enter.
+/// Every row captured live from `/usr/bin/jq` 1.7.1; every one exited 5
+/// on `main` before.
+#[test]
+fn test_navigated_bind_positional_scalar_and_nested_rows_answer_3134() -> Result<()> {
+    for (input, filter, expected) in [
+        // `path()`: scalars of every allocated kind, at every depth.
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | path(.a | .b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":"s"}}"#,
+            r".a.b as $z | path(.a | .b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1.5}}"#,
+            r".a.b as $z | path(.a | .b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#".a.b as $z | path(.a | .["b"] | $z)"#,
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#".a.b as $z | .a | path(getpath(["b"]) | $z)"#,
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#".a.b as $z | .a | path(.. | select(type=="number") | $z)"#,
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            r".a[0] as $z | .a | path(.[0] | $z)",
+            "[0]",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a | .b as $z | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a | .b as $w | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"(.a.b, .a.b) as $z | path(.a.b | $z)",
+            "[\"a\",\"b\"]\n[\"a\",\"b\"]",
+        ),
+        (r#"{"a":1,"a":2}"#, r".a as $z | path(.a | $z)", r#"["a"]"#),
+        // Under the wrappers the generic evaluator drives with a cursor.
+        (
+            r#"{"a":{"b":1}}"#,
+            r#".a.b as $z | try path(.a.b | $z) catch "c""#,
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | [path(.a.b | $z)]",
+            r#"[["a","b"]]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | limit(1; path(.a.b | $z))",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | def f: path(.a.b | $z); f",
+            r#"["a","b"]"#,
+        ),
+        // Writes.
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | (.a.b | $z) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | (.a | .b | $z) |= 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | (.a.b | $z) += 5",
+            r#"{"a":{"b":6}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | del(.a | .b | $z)",
+            r#"{"a":{}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a | (.b | $z) = 9",
+            r#"{"b":9}"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            r".a[1] as $z | (.a[1] | $z) = 5",
+            r#"{"a":[1,5]}"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            r".a[1] as $z | (.a[1] | $z) += 5",
+            r#"{"a":[1,6]}"#,
+        ),
+        // A node an ancestor bind's `Rc` stands for.
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a as $y | .a.b as $z | .a | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a as $y | .a.b as $z | path(.a | .b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a as $y | .a.b as $z | (.a | .b | $z) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3134's controls: jq 1.7.1 refuses every row (captured live), because
+/// the value the resolver stands on is equal to the bound one but is a
+/// different `jv` -- an equal-valued sibling, an iterated element, the
+/// same path under a moved root, or a node written since the bind. A
+/// position minted for the bind's own node must never certify any of them.
+#[test]
+fn test_navigated_bind_positional_controls_refuse_3134() -> Result<()> {
+    for (input, filter) in [
+        (r#"{"a":{"b":1},"c":1}"#, r".a.b as $z | path(.c | $z)"),
+        (r#"{"a":{"b":1,"c":1}}"#, r".a.b as $z | .a | path(.c | $z)"),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r".a.b as $z | .x | path(.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r".a.b as $z | .x | (.b | $z) = 9",
+        ),
+        (r#"{"a":{"b":1},"c":1}"#, r".a.b as $z | (.c | $z) = 9"),
+        (r#"{"a":[1,1]}"#, r".a[1] as $z | [path(.a[] | $z)]"),
+        (r#"{"a":[1,1]}"#, r".a[1] as $z | (.a[] | $z) = 5"),
+        (
+            r#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+            r".a as $y | .x | path(.a | $y)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+            r".a as $y | def f: path(.a | $y); .x | f",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a.b = 1 | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a.b |= (. as $w | 1) | path(.a.b | $z)",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}` on {input}: stdout={stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with result"),
+            "`{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// yq mode is untouched by #3037: real yq v4.53.3 treats `($y.b) = 9`
 /// through a variable as a no-op and prints the document unchanged
 /// (`b: 1`), at the marker's own node and at a sibling alike, where
