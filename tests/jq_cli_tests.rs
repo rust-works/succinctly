@@ -76446,3 +76446,147 @@ fn test_as_binding_still_binds_whole_left_expression_in_yq_mode_3397() -> Result
     }
     Ok(())
 }
+
+// ============================================================================
+// #3307: a spine of top-level defs is installed in one walk
+// ============================================================================
+
+/// Every scoping rule the one-pass install of a def spine has an arm for,
+/// end to end: redefinition, arity overloading, a parameter named like an
+/// earlier zero-arity def, defs nested in a body or in the main filter, calls
+/// in arguments and in builtin arguments, `reduce`/`foreach`/`try`/`as`
+/// patterns, self-recursion, and two 10-def spines. Expected outputs captured
+/// live from `/usr/bin/jq` 1.7.1 (`-nc`), never derived. None of these reads a
+/// node's position, so none reaches the route gates that count `def` levels:
+/// `test_def_spine_route_gate_boundary_unchanged_3307` does.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_def_spine_programs_match_jq_3307() -> Result<()> {
+    for (program, want) in [
+        ("def a: 1; def b: 2; def c: a + b; c", "3"),
+        ("def f(n): if n < 1 then 0 else f(n - 1) + 1 end; def g: f(3); g", "3"),
+        ("def a: 1; def b: a; def a: 2; def c: a + b; c", "3"),
+        ("def f(x): x + 1; def f(x; y): f(x) + y; f(2; 3)", "6"),
+        ("def f(x): x; def f(x; y): x + y; def g: f(1) + f(1; 2); g", "4"),
+        ("def b: 8; def h(b): b + 1; def i: b; h(6) + i", "15"),
+        ("def a: 1; def b: (def a: 2; a); def c: b + a; c", "3"),
+        ("def a: 1; def b: 2; (def a: 3; a + b) + a", "6"),
+        ("def a: 1; def b: def a: 5; a; b + a", "6"),
+        ("def a: 1; def b: 2; def h(a): a + b; h(5) + a", "8"),
+        ("def a: 1; def b: 2; def h(a; b): a + b; h(a; b)", "3"),
+        ("def f(x): x; def g(x): x * 2; g(f(3))", "6"),
+        ("def f($x): $x; def g: f(1); g", "1"),
+        ("def a: 1; def b: 2; [range(3)] | map(. + a) | select(. > b)", "[1,2,3]"),
+        ("def a: 1; def b: 2; {x: a, y: (b | a)} | \"\\(a)-\\(b)\"", "\"1-2\""),
+        ("def a: 1; reduce range(3) as $i (0; . + a)", "3"),
+        ("def a: 1; def b: 2; foreach range(3) as $i (a; . + b; . * a)", "3\n5\n7"),
+        ("def a: 1; def b: 2; [1,2] | . as [$p, $q] | a + b + $p + $q", "6"),
+        ("def a: 1; def b: 2; try error(\"x\") catch (a + b)", "3"),
+        ("def a: 1; def b: 2; if a then b else a end", "2"),
+        ("def a: 1; def b: def c: a; c; def d: b + a; d", "2"),
+        ("def a: 1; def b: 2; def c: (def d: a; def e: b; d + e); c", "3"),
+        ("def a(f): f; def b: a(1); def c(g): a(g) + b; c(2)", "3"),
+        ("def rec(n): if n == 0 then 0 else rec(n - 1) + 1 end; def a: rec(4); def b: a; b", "4"),
+        ("def a: 1; def b: 2; def c: 3; def d: 4; def e: 5; def f: 6; def g: 7; def h: 8; def i: 9; def j: 10; a+b+c+d+e+f+g+h+i+j", "55"),
+        ("def a: 1; def b: a; def c: b; def d: c; def e: d; def f: e; def g: f; def h: g; def i: h; def j: i; j", "1"),
+        ("def a: .a; def b: .b; def c: a + b; {a: 1, b: 2} | c", "3"),
+        ("def a: .a; def b: .b; def c: a; def d: b; def e: c; def f: d; def g: e; def h: f; def i: g; def j: h; {a: 1, b: 2} | [j, i]", "[2,1]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", program], None)?;
+        assert_eq!(code, 0, "#3307: `{program}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3307: `{program}`");
+    }
+    Ok(())
+}
+
+/// Thousands of top-level defs evaluate, inline and through `include`. Before
+/// the one-pass install each def rebuilt and kept everything below it, so
+/// this took seconds and gigabytes (3000 defs: 1 GB); the assertion is on the
+/// answer, not the cost, which is platform-specific (the deterministic guard
+/// is the `binding_a_def_spine_is_linear_and_cached_3307` unit test, which
+/// counts nodes). `/usr/bin/jq` 1.7.1 prints `2999` for the inline chain and
+/// `3000` for the included `[g1, g2999] | add`.
+#[test]
+fn test_large_def_spine_evaluates_3307() -> Result<()> {
+    let m = 3000;
+    let mut chain = String::from("def f0: 0;");
+    let mut flat = String::new();
+    for i in 1..m {
+        chain.push_str(&format!(" def f{i}: f{} + 1;", i - 1));
+        flat.push_str(&format!("def g{i}: {i};\n"));
+    }
+    let (stdout, stderr, code) = run_jq_full(&["-nc", &format!("{chain} f{}", m - 1)], None)?;
+    assert_eq!(code, 0, "#3307: dependent chain: stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "2999");
+
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("lib.jq"), &flat)?;
+    let dir_arg = dir.path().to_str().unwrap();
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", "-L", dir_arg, "include \"lib\"; [g1, g2999] | add"],
+        None,
+    )?;
+    assert_eq!(code, 0, "#3307: included module: stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "3000");
+    Ok(())
+}
+
+/// Module chains: an included module that itself includes another and
+/// redefines one of its names (`z` sees jq's own resolution, which is not the
+/// textual one), and an `import ... as` alias next to a local redefinition.
+/// Expected outputs from `/usr/bin/jq` 1.7.1 with the same `-L`.
+#[test]
+fn test_def_spine_module_chain_matches_jq_3307() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("a.jq"), "def x: 1; def y: x + 1;\n")?;
+    std::fs::write(
+        dir.path().join("b.jq"),
+        "include \"a\"; def x: 10; def z: x + y;\n",
+    )?;
+    std::fs::write(
+        dir.path().join("c.jq"),
+        "import \"a\" as A; def x: 5; def w: A::x + A::y + x;\n",
+    )?;
+    let dir_arg = dir.path().to_str().unwrap();
+    for (program, want) in [
+        (r#"include "b"; z"#, "3"),
+        (r#"include "c"; w"#, "8"),
+        (r#"include "a"; include "b"; [x, y, z]"#, "[10,2,3]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", "-L", dir_arg, program], None)?;
+        assert_eq!(code, 0, "#3307: `{program}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3307: `{program}`");
+    }
+    Ok(())
+}
+
+/// #3307: the route gates that count levels of `def` binding
+/// (`OWNED_IDENTITY_DEF_UNFOLD_LIMIT`, 8) refuse a spine of nine defs, and the
+/// stage then takes the eager route, which answers differently for a read of
+/// the node's position: with 7 and 8 defs `path` is `["a","b"]` and `key` is
+/// `"b"`, with 9 and 10 they are `[]` and `null`. `path/0` and `key/0` are
+/// succinctly's own here (`/usr/bin/jq` 1.7.1 does not define them), so every
+/// row is pinned from the binary before #3307 and is a claim about *this*
+/// route boundary staying where it was, not about jq. One bind of a whole spine
+/// must be charged one level per def, or the 9-def rows would flip to the
+/// 7-def answers.
+#[test]
+fn test_def_spine_route_gate_boundary_unchanged_3307() -> Result<()> {
+    for (defs, path_want, key_want) in [
+        (7, r#"["a","b"]"#, r#""b""#),
+        (8, r#"["a","b"]"#, r#""b""#),
+        (9, "[]", "null"),
+        (10, "[]", "null"),
+    ] {
+        let prefix: String = (0..defs).map(|i| format!("def d{i}: .; ")).collect();
+        for (filter, want) in [
+            (format!(".a | ({prefix} .b) as $x | $x | path"), path_want),
+            (format!(".a.b | ({prefix} . + 0) | key"), key_want),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":{"b":1}}"#))?;
+            assert_eq!(code, 0, "#3307: {defs} defs, `{filter}`: stderr={stderr:?}");
+            assert_eq!(stdout.trim_end(), want, "#3307: {defs} defs, `{filter}`");
+        }
+    }
+    Ok(())
+}

@@ -49134,3 +49134,36 @@ fn test_yq_container_nan_equality_stays_structural_3069() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3307: a spine of top-level defs is installed in one walk, in yq mode too
+/// (`succinctly yq` accepts `def`, which real yq's lexer rejects, and reaches
+/// the same `bind_def`). Every output below is what `succinctly yq` answered
+/// before the one-pass install -- pinned from the base binary, not a claim
+/// about real yq. `path` is a jq builtin, so it needs `--jq-extensions`.
+#[test]
+fn test_def_spine_in_yq_mode_unchanged_3307() -> Result<()> {
+    let input = "a:\n  b: 5\nb: 2\n";
+    for (filter, extra, want) in [
+        ("def a: .a; def b: .b; def c: a | b; c", &[][..], "5\n"),
+        ("def a: .a; def b: .b; a | b | key", &[][..], "\"b\"\n"),
+        (
+            "def a: .a; def b: .b; def c: a; def d: b; def e: c; def f: d; def g: e; def h: f; def i: g; def j: h; [j, i]",
+            &[][..],
+            "[2,{\"b\":5}]\n",
+        ),
+        ("def f(x): x + 1; def f(x; y): f(x) + y; f(2; 3)", &[][..], "6\n"),
+        ("def a: .a; def a: .b; a", &[][..], "2\n"),
+        (
+            "def a: .a; def b: .b; path(a | b)",
+            &["--jq-extensions"][..],
+            "[\"a\",\"b\"]\n",
+        ),
+    ] {
+        let mut args = vec!["-p=yaml", "-o=json", "-I=0"];
+        args.extend_from_slice(extra);
+        let (stdout, code) = run_yq_stdin(filter, input, &args)?;
+        assert_eq!(code, 0, "#3307: `{filter}`");
+        assert_eq!(stdout, want, "#3307: `{filter}`");
+    }
+    Ok(())
+}

@@ -8446,12 +8446,26 @@ the top-level chain and starts in 136 ms (32 ms before; Apple M4 Pro, idle, inte
 medians of 25 reps). A module-heavy loop, `[range(1e5) | f]` with `f` calling one
 dependency through a stub, is neutral within noise (+1.6%, against +3.3% drift on the same
 defs written inline).
-Each chain def is installed over the whole program below it when bound, so the chain's
-length is quadratic at startup -- the same pre-existing evaluator cost a single 3000-def
-`include` pays today (1 GB, 0.5 s; [#3307](https://github.com/rust-works/succinctly/issues/3307),
-split from #3148) -- where the copying loader had kept those
-bodies nested inside the defs that used them. Only the defs the filter reaches are linked, which is what
-keeps the common shapes at or below their old cost.
+Each chain def used to be installed over the whole program below it when bound, so the
+chain's length was quadratic at startup -- the same evaluator cost a single 3000-def
+`include` paid (1 GB, 0.5 s) -- where the copying loader had kept those bodies nested inside
+the defs that used them. That is closed by
+[#3307](https://github.com/rust-works/succinctly/issues/3307) (split from #3148): a direct
+spine of defs is now installed in one walk, so 3000 defs peak at 16 MB and 10000 at 34 MB
+(11.3 GB before, as the issue measured it). Only the defs the filter reaches are linked,
+which is what keeps the common shapes at or below their old cost.
+
+What #3307 does *not* make linear, so a program of many top-level defs is bounded by these
+and not by the install: the resolver resolves each call by a linear scan of the defs in
+scope (a filter naming every one of `M` defs is `O(M x calls)` before evaluation starts;
+`resolve.rs`); a chain written through a pipe (`def f_i: f_{i-1} | . + 1;`) re-runs
+`needs_path_context` down the whole chain per evaluation, quadratic in time (12000 defs:
+about 2 s) where `f_{i-1} + 1` is linear; and the native stack still holds one frame per def
+through the resolver's recursion and the drop of the parsed chain (the CLI aborts near
+500000 defs; jq itself refuses to compile about 10000). The recursion-depth *charge* is
+unchanged on purpose, so a spine of 40000 or more defs refuses a call to a def with that
+many after it (`MAX_EVAL_FRAMES`) even though the collapsed spine holds no native frame per
+def: a size jq cannot compile.
 
 ### A call tree retained one bound body per call — closed (#3148)
 
@@ -8585,9 +8599,13 @@ The cost it removes scales with the size of the reached bodies (Apple M-series, 
 `/usr/bin/time -l`, output identical to base and to jq). The fat module has 300 defs, each
 body about 30 nodes, reached both from the filter and through a consumer (`include "fat";
 include "fatc"; use + ([s_0, …] | add)`). It went from 900 MB / 0.46 s to 340 MB / 0.19 s,
-the same as a control with no second copy. With 2000 one-literal defs the RSS drops only
-from 5.9 GB to 5.86 GB: a stub is as large as such a body, and the chain's def count, which
-[#3307](https://github.com/rust-works/succinctly/issues/3307) prices, does not change.
+the same as a control with no second copy. With 2000 one-literal defs the RSS dropped only
+from 5.9 GB to 5.86 GB: a stub is as large as such a body, and the chain's def count did not
+change. That count was the cost, and
+[#3307](https://github.com/rust-works/succinctly/issues/3307) removed it: the def chain is
+now installed in one pass, so the same shape no longer multiplies by its length (500
+fat-body defs of 50 terms, every one used and included: 585 ms to 28 ms on an Apple M4 Pro,
+1.9 s to 57 ms on an AMD 7950X, output identical; 2000 of them run in 112 ms and 245 ms).
 Programs whose modules are only top-level, or only dependencies, are unchanged.
 
 ### Module-scope gaps that are genuinely open

@@ -63885,6 +63885,17 @@ mod ambient_frame_depth {
 /// recomputes whenever the depth this call observes doesn't match what
 /// produced the cached answer, rather than trusting any cached answer at
 /// all like [`BoundBody`] does.
+///
+/// **A def whose `then` is itself a def binds the whole spine at once**
+/// (#3307): it returns the filter below the last def of the direct run, with
+/// every spine def's calls installed, rather than the next `FuncDef` for the
+/// caller to bind in turn. Every caller continues into the result with the
+/// same input either way, so evaluation cannot tell the two apart -- only the
+/// two route gates that *count* levels of `def` binding can, and they charge
+/// the spine's length up front to match (`eval_generic::charge_def_spine`). The
+/// one-at-a-time form rebuilt and kept everything below each def: `M` defs
+/// over `N` nodes cost `O(M x N)` in time and memory. See
+/// [`install_def_spine`].
 pub(crate) fn bind_def(
     name: &str,
     params: &[Param],
@@ -63904,8 +63915,360 @@ pub(crate) fn bind_def(
         // visits exactly once for this `def`, never a self-recursive
         // substitution `bind_def_call` re-enters. See `sibling_frame_charge`'s
         // own doc comment (#2135 code review, Finding 1).
+        //
+        // #3307: a `then` that is itself a `def` is the head of a *spine*
+        // (`def f_1: ..; def f_2: ..; ...; main`, which is what every program
+        // and every module run parses to). Binding it one def at a time
+        // rebuilds everything below each def and keeps every copy, `O(M x N)`
+        // in time and memory for `M` defs over `N` nodes; the whole spine is
+        // installed in one walk instead ([`install_def_spine`]).
+        if matches!(then, Expr::FuncDef { .. }) {
+            return Rc::new(install_def_spine(&def, then, depth));
+        }
         Rc::new(install_def_calls(then, &def, depth, false))
     })
+}
+
+/// How many `def`s the direct spine starting at `then` holds (#3307): the
+/// run of `Expr::FuncDef` nodes reached through `then` alone. Capped at `cap`,
+/// past which the count is not needed.
+pub(crate) fn def_spine_len(then: &Expr, cap: usize) -> usize {
+    let mut n = 0;
+    let mut cur = then;
+    while let Expr::FuncDef { then: next, .. } = cur {
+        n += 1;
+        if n >= cap {
+            break;
+        }
+        cur = next;
+    }
+    n
+}
+
+// Nodes the two def installers have visited on this thread -- test-only, so a
+// test can count work instead of timing it (#3307).
+#[cfg(test)]
+thread_local! {
+    static INSTALL_VISITS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// One in-scope spine `def` and where its `then` starts (#3307): `start` is
+/// the structural depth of the first node after the def, counted from zero at
+/// the first spine node -- where the nested per-def walk this replaces began
+/// counting its own `frames` (the ambient depth is added back by
+/// [`SpineInstaller::call_frames`]).
+struct SpineEntry {
+    def: Rc<FuncDefData>,
+    start: u32,
+}
+
+/// The innermost spine def of one `(name, arity)` key, and how many enclosing
+/// constructs currently hide the key (#3307).
+///
+/// A later def of the same key *replaces* the earlier one: the nested walk
+/// cloned a redefinition wholesale (`install_def_calls`' `FuncDef` arm), so the
+/// earlier def was unreachable from there on and is never needed again. A mask
+/// is per *key*, not per def, because the nested walk's two shadowing rules (a
+/// nested def of the same key; a nested def's own parameter named like a
+/// zero-arity def) also hid every def of that key at once.
+struct SpineSlot {
+    arity: usize,
+    current: SpineEntry,
+    masked: u32,
+}
+
+/// The one-pass installer for a def spine (#3307). See [`install_def_spine`].
+///
+/// This is deliberately *not* [`install_def_calls`] made generic: that
+/// function is the per-call hot path (`bind_def_call` re-runs it for every
+/// call of a recursive def), and its arms carry `in_recursive_body` charging
+/// that a spine never uses (it is always `false` here, which makes
+/// `Pipe`/`Object`/`StringInterpolation` charge the same flat `frames + 1` as
+/// any other node). Two copies of one policy can drift, so the two are held in
+/// lockstep by `def_spine_install_matches_the_nested_walk_3307` and its
+/// siblings, which compare this walk against the per-def nested binding it
+/// replaces, `frames` included, over hand-written, pre-existing-`DefCall` and
+/// generated corpora. A change to one walk's rules has to change both.
+struct SpineInstaller {
+    slots: BTreeMap<String, Vec<SpineSlot>>,
+    /// How many slots are currently visible, so "does any def still apply
+    /// here" (the wholesale-clone short circuits) is a compare.
+    visible: usize,
+    /// The ambient depth `bind_def` was reached at.
+    ambient: u32,
+    /// Smallest `start` over the visible slots, computed when a pre-existing
+    /// `DefCall` asks and dropped (`min_start_valid` cleared) on any change to
+    /// what is visible.
+    min_start: Option<u32>,
+    min_start_valid: bool,
+}
+
+impl SpineInstaller {
+    fn new(ambient: u32) -> Self {
+        Self {
+            slots: BTreeMap::new(),
+            visible: 0,
+            ambient,
+            min_start: None,
+            min_start_valid: false,
+        }
+    }
+
+    fn slot_mut(&mut self, name: &str, arity: usize) -> Option<&mut SpineSlot> {
+        self.slots
+            .get_mut(name)?
+            .iter_mut()
+            .find(|slot| slot.arity == arity)
+    }
+
+    fn push(&mut self, def: Rc<FuncDefData>, start: u32) {
+        self.min_start_valid = false;
+        let arity = def.params.len();
+        let entry = SpineEntry { def, start };
+        if let Some(slot) = self.slot_mut(&entry.def.name, arity) {
+            // Replaces the earlier def of this key; whether the key is
+            // visible does not change.
+            slot.current = entry;
+            return;
+        }
+        self.visible += 1;
+        self.slots
+            .entry(entry.def.name.clone())
+            .or_default()
+            .push(SpineSlot {
+                arity,
+                current: entry,
+                masked: 0,
+            });
+    }
+
+    /// Hide `(name, arity)` until the matching [`unmask`](Self::unmask). A key
+    /// no spine def has (yet) has no slot, and nothing to hide.
+    fn mask(&mut self, name: &str, arity: usize) {
+        self.min_start_valid = false;
+        let Some(slot) = self.slot_mut(name, arity) else {
+            return;
+        };
+        let hid = slot.masked == 0;
+        slot.masked += 1;
+        if hid {
+            self.visible -= 1;
+        }
+    }
+
+    fn unmask(&mut self, name: &str, arity: usize) {
+        self.min_start_valid = false;
+        let Some(slot) = self.slot_mut(name, arity) else {
+            return;
+        };
+        slot.masked -= 1;
+        if slot.masked == 0 {
+            self.visible += 1;
+        }
+    }
+
+    /// The spine def a call to `(name, arity)` resolves to here, with where its
+    /// `then` starts.
+    fn lookup(&self, name: &str, arity: usize) -> Option<(Rc<FuncDefData>, u32)> {
+        let slot = self
+            .slots
+            .get(name)?
+            .iter()
+            .find(|slot| slot.arity == arity)?;
+        (slot.masked == 0).then(|| (Rc::clone(&slot.current.def), slot.current.start))
+    }
+
+    /// The `frames` a call to a def whose `then` starts at `start` gets at
+    /// structural depth `frames`: the ambient depth plus the distance from
+    /// that start -- what the nested walk, counting from zero at the def's own
+    /// `then` and seeded with the ambient depth, produced.
+    fn call_frames(&self, frames: u32, start: u32) -> u32 {
+        self.ambient.saturating_add(frames.saturating_sub(start))
+    }
+
+    /// The smallest `start` among the defs a walk at the current point still
+    /// applies (#3307): the nested walk refreshed a *pre-existing* `DefCall`'s
+    /// `frames` once per def that reached it, with that def's own relative
+    /// depth, so the outermost reaching def -- the smallest `start` -- wins.
+    fn outermost_start(&mut self) -> Option<u32> {
+        if !self.min_start_valid {
+            self.min_start = self
+                .slots
+                .values()
+                .flatten()
+                .filter(|slot| slot.masked == 0)
+                .map(|slot| slot.current.start)
+                .min();
+            self.min_start_valid = true;
+        }
+        self.min_start
+    }
+
+    /// Walk `expr` at structural depth `frames`, resolving every call to a def
+    /// still in scope. Arm for arm the same policy as [`install_def_calls`]
+    /// with `in_recursive_body == false`; see its comments for each rule's
+    /// history.
+    fn walk(&mut self, expr: &Expr, frames: u32) -> Expr {
+        #[cfg(test)]
+        INSTALL_VISITS.with(|n| n.set(n.get() + 1));
+        match expr {
+            Expr::FuncCall { name, args, .. } => {
+                let Some((def, start)) = self.lookup(name, args.len()) else {
+                    // Not a spine def's call (a different name, or #1376's
+                    // different arity): expand in the arguments only.
+                    return map_subexprs(expr, &mut |sub| self.walk(sub, frames + 1));
+                };
+                Expr::DefCall {
+                    def,
+                    args: args.iter().map(|a| self.walk(a, frames + 1)).collect(),
+                    frames: self.call_frames(frames, start),
+                    bound: BoundBody::default(),
+                }
+            }
+            // `install_def_calls`' `Builtin` arm charges 1, and
+            // `install_def_calls_in_builtin` one more per argument.
+            Expr::Builtin(b) => {
+                Expr::Builtin(map_builtin_subexprs(b, &mut |e| self.walk(e, frames + 2)))
+            }
+            Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } => {
+                // A nested def (not the spine's own, which `install_def_spine`
+                // consumes): it hides its own key from its body and `then`
+                // (#1376), and a zero-arity def named like one of its
+                // parameters from its body only (#2738).
+                self.mask(name, params.len());
+                if self.visible == 0 {
+                    // Every def that applied here is redefined: the node is
+                    // cloned wholesale, its own cache included.
+                    self.unmask(name, params.len());
+                    return expr.clone();
+                }
+                let new_body = Box::new(self.walk_def_body(params, body, frames + 1));
+                let new_then = Box::new(self.walk(then, frames + 1));
+                self.unmask(name, params.len());
+                Expr::FuncDef {
+                    name: name.clone(),
+                    params: params.clone(),
+                    body: new_body,
+                    then: new_then,
+                    bound: FuncDefBound::default(),
+                }
+            }
+            // Opaque, as in `install_def_calls`: an argument captured at call
+            // time, already installed. Descending would re-walk the whole
+            // chain of arguments from every level below.
+            Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
+            Expr::DefCall {
+                def,
+                args,
+                frames: n,
+                ..
+            } => {
+                let refreshed = self
+                    .outermost_start()
+                    .map_or(*n, |start| (*n).max(self.call_frames(frames, start)));
+                Expr::DefCall {
+                    def: Rc::clone(def),
+                    args: args.iter().map(|a| self.walk(a, frames + 1)).collect(),
+                    frames: refreshed,
+                    bound: BoundBody::default(),
+                }
+            }
+            _ => map_subexprs(expr, &mut |sub| self.walk(sub, frames + 1)),
+        }
+    }
+
+    /// A def's body, installed with the defs in scope except a zero-arity def
+    /// named like one of `params` (#2738), which the parameter shadows. The
+    /// caller has already hidden the def's own key. When nothing is left in
+    /// scope the body is cloned, as `install_def_calls` clones a fully
+    /// shadowed one.
+    fn walk_def_body(&mut self, params: &[Param], body: &Expr, frames: u32) -> Expr {
+        for p in params {
+            self.mask(p.name(), 0);
+        }
+        let installed = if self.visible == 0 {
+            body.clone()
+        } else {
+            self.walk(body, frames)
+        };
+        for p in params {
+            self.unmask(p.name(), 0);
+        }
+        installed
+    }
+}
+
+/// Install a whole direct def spine over the filter below it, in one walk
+/// (#3307): `first` is the head def (already frozen, as `bind_def` freezes
+/// it), `then` everything after it, `depth` the ambient frame depth.
+///
+/// Returns what the per-def nested binding produced for the *last* def --
+/// the main filter with every spine def's calls resolved -- without building
+/// or keeping the `M - 1` intermediate trees. It is equivalent because
+/// nothing can happen between two spine levels: every evaluator's `FuncDef`
+/// arm is "`bind_def`, then continue into the result with the same input", so
+/// no input changes, no binder is crossed and no call is entered, and the
+/// ambient depth is the same at every level.
+///
+/// What each def contributes, in order (the nested walk's rules, applied per
+/// key):
+/// - its body is installed with the defs *before* it, its own key and any
+///   zero-arity def named like one of its parameters hidden, so a
+///   self-recursive call stays a `FuncCall` for `bind_def_call` to install
+///   per call, exactly as before;
+/// - it is then made current for its key, with `start` at its own `then`, and
+///   the body it is kept with is the installed one, as the nested binding
+///   froze it;
+/// - a later def of the same key replaces it.
+///
+/// Only the spine is collapsed. A `def` inside a body or the main filter is
+/// still bound lazily at evaluation, after its enclosing parameters are
+/// substituted, and is only rebuilt here.
+///
+/// The `frames` charge keeps counting one per spine def, as the nested
+/// binding's native recursion did, so every `MAX_EVAL_FRAMES` threshold is
+/// where it was. A collapsed spine holds no native frame per def any more, so
+/// that charge is conservative for a very long spine: a call to a def with
+/// `MAX_EVAL_FRAMES` (40,000) or more defs after it is refused. Relaxing it
+/// is a separate change.
+fn install_def_spine(first: &Rc<FuncDefData>, then: &Expr, depth: u32) -> Expr {
+    let mut installer = SpineInstaller::new(depth);
+    // Depth is counted from zero at the first spine node and the ambient depth
+    // added back per call: the first def's `then` is one node in, and each
+    // further spine node is one structural step deeper, as `install_def_calls`'
+    // `FuncDef` arm charges its `then`.
+    let mut frames = 0;
+    installer.push(Rc::clone(first), frames);
+    let mut cur = then;
+    while let Expr::FuncDef {
+        name,
+        params,
+        body,
+        then: next,
+        ..
+    } = cur
+    {
+        installer.mask(name, params.len());
+        let new_body = installer.walk_def_body(params, body, frames + 1);
+        installer.unmask(name, params.len());
+        frames += 1;
+        installer.push(
+            Rc::new(FuncDefData {
+                name: name.clone(),
+                params: params.clone(),
+                body: new_body,
+            }),
+            frames,
+        );
+        cur = next;
+    }
+    installer.walk(cur, frames)
 }
 
 /// Widens the ambient frame-depth floor (see [`ambient_frame_depth`]) to
@@ -64788,6 +65151,8 @@ pub(crate) fn install_def_calls(
     frames: u32,
     in_recursive_body: bool,
 ) -> Expr {
+    #[cfg(test)]
+    INSTALL_VISITS.with(|n| n.set(n.get() + 1));
     match expr {
         // #1376: the arity check used to live *inside* this arm, matching
         // on name alone and erroring on any arity mismatch -- which broke
@@ -113366,5 +113731,610 @@ mod touched_edge_cases_2999 {
         assert!(matches!(slot, Some(EvalEscape::Break(ref label)) if label == "out"));
         assert!(!nonretryable_stop::is_set());
         clear_nonretryable_stop();
+    }
+
+    /// What the per-def nested binding this replaces produced for a def spine
+    /// (#3307): install the head over everything after it, then keep binding
+    /// the `FuncDef` that leaves at the front, each over its own `then`, at the
+    /// same ambient depth -- exactly `bind_def` reached level by level.
+    fn nested_spine_reference(first: &Rc<FuncDefData>, then: &Expr, depth: u32) -> Expr {
+        let mut cur = install_def_calls(then, first, depth, false);
+        loop {
+            match cur {
+                Expr::FuncDef {
+                    name,
+                    params,
+                    body,
+                    then,
+                    ..
+                } => {
+                    let def = Rc::new(FuncDefData {
+                        name,
+                        params,
+                        body: *body,
+                    });
+                    cur = install_def_calls(&then, &def, depth, false);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// The head of the spine `program` parses to, and the rest of it.
+    fn spine_head(program: &str) -> (Rc<FuncDefData>, Expr) {
+        let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            ..
+        } = parse(program).unwrap()
+        else {
+            panic!("{program}: expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every corpus program starts with a def (#3307)"
+        };
+        (
+            Rc::new(FuncDefData {
+                name,
+                params,
+                body: *body,
+            }),
+            *then,
+        )
+    }
+
+    /// The corpus the two installs are compared over: every rule the walk has
+    /// an arm for (#1371 binding, #1376 arity, #2738 parameter masking, #2135
+    /// sibling charging, shadowing, opaque `Shared`, nested defs, builtin
+    /// arguments), each as a spine.
+    const SPINE_CORPUS: &[&str] = &[
+        "def a: 1; def b: 2; def c: a + b; c",
+        "def a: 1; def b: 2; 3",
+        "def f(n): if n < 1 then 0 else f(n - 1) end; def g: f(3); g",
+        "def a: 1; def b: a; def a: 2; def c: a + b; c",
+        "def a: 1; def a: a + 1; def a: a + 1; a",
+        "def f(x): x + 1; def f(x; y): f(x) + y; f(2; 3)",
+        "def f(x): x; def f(x; y): x + y; def g: f(1) + f(1; 2); g",
+        "def b: 8; def h(b): b; h(6)",
+        "def b: 8; def h(b): b + 1; def i: b; h(6) + i",
+        "def a: 1; def b: (def h(a): a + 1; h(5)) + a; b",
+        "def a: 1; def b: 2; (def h(a; b): a + b; h(3; 4)) + a + b",
+        "def a: 1; def b: (def a: 2; a); def c: b + a; c",
+        "def a: 1; def b: 2; (def a: 3; a + b) + a",
+        "def a: 1; def b: def a: 5; a; b + a",
+        "def a: 1; def b: 2; def h(a): a + b; h(5) + a",
+        "def a: 1; def b: 2; def h(a; b): a + b; h(a; b)",
+        "def f(x): x; def g(x): x * 2; g(f(3))",
+        "def f($x): $x; def g: f(1); g",
+        "def a: 1; def b: 2; [range(3)] | map(. + a) | select(. > b)",
+        "def a: 1; def b: 2; map(a) | first(b) | limit(a; b)",
+        "def a: 1; def b: 2; {x: a, y: (b | a)} | \"\\(a)-\\(b)\"",
+        "def a: 1; def b: 2; (a, b) | [a, b] | {k: a} | .k",
+        "def a: 1; reduce range(3) as $i (0; . + a)",
+        "def a: 1; def b: 2; foreach range(3) as $i (a; . + b; . * a)",
+        "def a: 1; def b: 2; . as [$p, $q] | a + b",
+        "def a: 1; def b: 2; label $out | (a, b | if . > 1 then ., break $out else . end)",
+        "def a: 1; def b: 2; try error(\"x\") catch (a + b)",
+        "def a: 1; def b: 2; if a then b else a end",
+        "def a: 1; def b: 2; .[a:b] | .[a] | .x",
+        "def a: 1; def b: 2; a as $v | b + $v",
+        "def a: 1; def b: def c: a; c; def d: b + a; d",
+        "def a: 1; def b: 2; def c: (def d: a; def e: b; d + e); c",
+        "def a(f): f; def b: a(1); def c(g): a(g) + b; c(2)",
+        "def rec(n): if n == 0 then 0 else rec(n - 1) + 1 end; def a: rec(4); def b: a; b",
+        "def a: 1; def b: 2; def c: 3; def d: 4; def e: 5; def f: 6; def g: 7; def h: 8; def i: 9; a+b+c+d+e+f+g+h+i",
+        "def a: 1; def b: a; def c: b; def d: c; def e: d; def f: e; def g: f; def h: g; def i: h; i",
+    ];
+
+    /// #3307: the one-pass spine install is the nested per-def binding it
+    /// replaces, `frames` included (`Expr`'s derived `PartialEq` compares
+    /// it), at several ambient depths.
+    #[test]
+    fn def_spine_install_matches_the_nested_walk_3307() {
+        for program in SPINE_CORPUS {
+            let (first, then) = spine_head(program);
+            for depth in [0, 3, 50] {
+                assert_eq!(
+                    install_def_spine(&first, &then, depth),
+                    nested_spine_reference(&first, &then, depth),
+                    "{program} at ambient depth {depth}"
+                );
+            }
+        }
+    }
+
+    /// Spines that call an *outer* def (`o`), as `(outer def, program)`: what
+    /// `bind_def_call`/an enclosing `bind_def` leaves in the tree, so the spine
+    /// install meets `DefCall`s that already exist -- in a body, an argument,
+    /// a builtin's argument, a nested def, under a shadowing redefinition, and
+    /// inside a parameter-masked body.
+    const SPINE_OVER_CALLS_CORPUS: &[(&str, &str)] = &[
+        (
+            "def o(x): x;",
+            "def a: o(1); def b: o(a); def c: o(b) + a; c",
+        ),
+        (
+            "def o(x): x;",
+            "def a: 1; def b: o(2); (def a: o(3); a + b) + o(a)",
+        ),
+        (
+            "def o(x): x;",
+            "def a(f): f; def b: a(o(1)); [range(3)] | map(o(.)) | a(b)",
+        ),
+        (
+            "def o(x): x;",
+            "def a: 1; def b: 2; {x: o(a), y: (b | o(.))} | \"\\(o(a))\"",
+        ),
+        ("def o(x): x;", "def a: 1; def a: o(a); def b: o(a); b"),
+        (
+            "def o(x): x;",
+            "def a: 1; def b: 2; def h(a): o(a) + b; h(o(5)) + a",
+        ),
+        (
+            "def o(x): x;",
+            "def a: o(1); def o(x): x + 1; def b: o(a); b",
+        ),
+        ("def o: 1;", "def h(o): o; def a: h(1); a + o"),
+        (
+            "def o: 1;",
+            "def a: o; def b: a + o; def c: (def o: 2; o + a); c",
+        ),
+        (
+            "def o(x): x;",
+            "def f(n): if n < 1 then o(0) else f(n - 1) + o(1) end; def g: f(3); g",
+        ),
+    ];
+
+    /// #3307: the same comparison over a spine that already holds `DefCall`s
+    /// -- what `bind_def_call` hands `bind_def` when a spine sits inside a
+    /// recursive body, or under an outer def. Their `frames` is refreshed to
+    /// the larger of the stale count and the outermost reaching def's
+    /// relative depth, which the one-pass walk has to reproduce.
+    #[test]
+    fn def_spine_install_matches_the_nested_walk_over_existing_defcalls_3307() {
+        for (prefix, program) in SPINE_OVER_CALLS_CORPUS {
+            let (outer, then) = spine_head(&format!("{prefix} {program}"));
+            for (base, in_recursive_body) in [(0, false), (7, false), (7, true), (40, true)] {
+                let Expr::FuncDef {
+                    name,
+                    params,
+                    body,
+                    then: inner_then,
+                    ..
+                } = install_def_calls(&then, &outer, base, in_recursive_body)
+                else {
+                    panic!("{program}: expected the spine to stay a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every corpus program's first node is a def (#3307)"
+                };
+                let first = Rc::new(FuncDefData {
+                    name,
+                    params,
+                    body: *body,
+                });
+                // The calls to `o` are real `DefCall`s already, so the walk
+                // below meets pre-existing ones.
+                assert!(
+                    format!("{first:?} {inner_then:?}").contains("DefCall"),
+                    "{program}: no pre-existing call to refresh"
+                );
+                for depth in [0, 5, 60] {
+                    assert_eq!(
+                        install_def_spine(&first, &inner_then, depth),
+                        nested_spine_reference(&first, &inner_then, depth),
+                        "{program} over an existing call chain (base {base}, recursive \
+                         {in_recursive_body}) at ambient depth {depth}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The `DefCall`s the corpus above installs really are present (a
+    /// comparison of two trees with no calls in them proves nothing), and a
+    /// program with a call installs one whose `frames` counts from its def.
+    #[test]
+    fn def_spine_install_binds_calls_and_charges_frames_3307() {
+        let (first, then) = spine_head("def a: 1; def b: 2; def c: a + b; c");
+        let installed = install_def_spine(&first, &then, 4);
+        assert!(
+            format!("{installed:?}").matches("DefCall").count() >= 1,
+            "{installed:?}"
+        );
+        // `c` is called at the main filter, two spine steps (b, c) plus its
+        // own `then` past `a`'s start: the nested walk counted `frames` from
+        // the ambient depth at the def's own `then`.
+        match &installed {
+            Expr::DefCall { frames, .. } => assert_eq!(*frames, 4, "`c`'s own then starts here"),
+            other => panic!("expected the call to `c` to be bound: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: the last def's call is bound (#3307)"
+        }
+    }
+
+    /// The spine is walked iteratively: a spine far deeper than the native
+    /// stack could recurse through installs, and matches the nested reference
+    /// on a size the quadratic reference can afford. Run on a big stack: the
+    /// parse and the drop of a 20,000-deep `then` chain recurse, and that is
+    /// the parser's and `Expr`'s own depth, not this install's.
+    #[test]
+    fn def_spine_install_is_iterative_and_matches_a_long_chain_3307() {
+        std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(|| {
+                // Built node by node: `parse` refuses this nesting (its own
+                // `MAX_EXPR_DEPTH`), and the runner builds long spines the
+                // same way, one def at a time.
+                let chain = |m: usize| {
+                    let mut then = parse(&format!("f{}", m - 1)).unwrap();
+                    for i in (1..m).rev() {
+                        then = Expr::FuncDef {
+                            name: format!("f{i}"),
+                            params: Vec::new(),
+                            body: Box::new(parse(&format!("f{} + 1", i - 1)).unwrap()),
+                            then: Box::new(then),
+                            bound: FuncDefBound::default(),
+                        };
+                    }
+                    let first = Rc::new(FuncDefData {
+                        name: "f0".to_string(),
+                        params: Vec::new(),
+                        body: parse("0").unwrap(),
+                    });
+                    (first, then)
+                };
+                let (first, then) = chain(150);
+                assert_eq!(
+                    install_def_spine(&first, &then, 0),
+                    nested_spine_reference(&first, &then, 0)
+                );
+                // No reference here (it is `O(M^2)`): only that a deep spine
+                // installs, to the call of the last def.
+                let (first, then) = chain(20_000);
+                let installed = install_def_spine(&first, &then, 0);
+                assert!(matches!(installed, Expr::DefCall { .. }));
+                assert_eq!(def_spine_len(&then, usize::MAX), 19_999);
+                assert_eq!(def_spine_len(&then, 8), 8);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    proptest::proptest! {
+        /// #3307: the one-pass install is the nested per-def binding over
+        /// *generated* spines: 2-8 defs over a three-name, three-arity
+        /// alphabet (so same-key redefinitions, arity overloads and parameters
+        /// named like defs are common), with bodies and a main filter built
+        /// from calls, parameter references, pipes, arithmetic, constructors,
+        /// builtins with arguments, `as` bindings and nested defs.
+        #[test]
+        fn def_spine_install_matches_the_nested_walk_generated_3307(
+            defs in proptest::collection::vec(
+                (
+                    proptest::sample::select(vec!["a", "b", "c"]),
+                    proptest::sample::select(vec!["", "(p)", "($p)", "(p; q)", "(a)"]),
+                    spine_expr(),
+                ),
+                2..8,
+            ),
+            main in spine_expr(),
+            depth in 0u32..6,
+        ) {
+            let mut program = String::new();
+            for (name, params, body) in &defs {
+                program.push_str(&format!("def {name}{params}: {body}; "));
+            }
+            program.push_str(&main);
+            let (first, then) = spine_head(&program);
+            proptest::prop_assert_eq!(
+                install_def_spine(&first, &then, depth),
+                nested_spine_reference(&first, &then, depth),
+                "{} at ambient depth {}", program, depth
+            );
+        }
+    }
+
+    /// Expressions for the generated spine test: leaves that name defs and
+    /// parameters, and the structural shapes the install walk has arms for.
+    fn spine_expr() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let leaf = prop_oneof![
+            Just("1"),
+            Just("."),
+            Just("a"),
+            Just("b"),
+            Just("c"),
+            Just("p"),
+            Just("$p"),
+            Just("a(1)"),
+            Just("b(.)"),
+            Just("c(a)"),
+            Just("a(1; 2)"),
+            Just("b(p; $p)"),
+        ]
+        .prop_map(String::from);
+        leaf.prop_recursive(3, 24, 3, |inner| {
+            prop_oneof![
+                (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("({x} | {y})")),
+                (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("({x} + {y})")),
+                inner.clone().prop_map(|x| format!("[{x}]")),
+                inner.clone().prop_map(|x| format!("map({x})")),
+                (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("{{k: {x}, j: {y}}}")),
+                (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("\"\\({x})-\\({y})\"")),
+                (
+                    proptest::sample::select(vec!["a", "b", "c"]),
+                    inner.clone(),
+                    inner.clone()
+                )
+                    .prop_map(|(n, x, y)| format!("(def {n}: {x}; {y})")),
+                // A nested def whose parameter is named like a spine def
+                // (#2738): the body sees the parameter, not the def.
+                (
+                    proptest::sample::select(vec!["a", "b", "p"]),
+                    proptest::sample::select(vec!["p", "a", "b", "c"]),
+                    inner.clone(),
+                    inner.clone()
+                )
+                    .prop_map(|(n, param, x, y)| format!("(def {n}({param}): {x}; {y})")),
+                (inner.clone(), inner).prop_map(|(x, y)| format!("({x} as $v | {y})")),
+            ]
+        })
+    }
+
+    /// A spine `def n_0: b_0; def n_1: b_1; ...` over `main`, with the whole
+    /// head node returned (so its `bound` cache is the one evaluation uses).
+    fn spine_node(defs: &[(&str, &str)], main: Expr) -> Expr {
+        let mut then = main;
+        for (name, body) in defs.iter().rev() {
+            then = Expr::FuncDef {
+                name: (*name).to_string(),
+                params: Vec::new(),
+                body: Box::new(parse(body).unwrap()),
+                then: Box::new(then),
+                bound: FuncDefBound::default(),
+            };
+        }
+        then
+    }
+
+    /// Bind a spine head the way every evaluator does -- `bind_def`, then keep
+    /// binding while the result is still a `FuncDef` -- and return what it
+    /// ends on.
+    fn bind_through_spine(head: &Expr) -> Rc<Expr> {
+        let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } = head
+        else {
+            panic!("expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every caller passes a def head (#3307)"
+        };
+        let mut cur = bind_def(name, params, body, then, bound);
+        loop {
+            let node = Rc::clone(&cur);
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                bound,
+            } = &*node
+            else {
+                return cur;
+            };
+            cur = bind_def(name, params, body, then, bound);
+        }
+    }
+
+    /// The nodes the two installers visited while `f` ran on this thread.
+    fn install_visits(f: impl FnOnce()) -> usize {
+        let before = INSTALL_VISITS.with(core::cell::Cell::get);
+        f();
+        INSTALL_VISITS.with(core::cell::Cell::get) - before
+    }
+
+    /// #3307: binding a spine costs work linear in its length, counted in
+    /// nodes visited rather than timed. `def f_i: f_{i-1} + 1` grows the
+    /// program by a constant per def, so the visits must grow by a constant
+    /// too; the per-def nested binding it replaced re-walked everything below
+    /// each def and grew quadratically. A second reach of the head at the same
+    /// ambient depth installs nothing, and the parsed tree's inner spine nodes
+    /// are never bound.
+    #[test]
+    fn binding_a_def_spine_is_linear_and_cached_3307() {
+        let chain = |m: usize| {
+            let names: Vec<String> = (0..m).map(|i| format!("f{i}")).collect();
+            let bodies: Vec<String> = (0..m)
+                .map(|i| {
+                    if i == 0 {
+                        "0".to_string()
+                    } else {
+                        format!("f{} + 1", i - 1)
+                    }
+                })
+                .collect();
+            let defs: Vec<(&str, &str)> = names
+                .iter()
+                .zip(&bodies)
+                .map(|(n, b)| (n.as_str(), b.as_str()))
+                .collect();
+            spine_node(&defs, parse(&format!("f{}", m - 1)).unwrap())
+        };
+        let visits = |m: usize| {
+            let head = chain(m);
+            install_visits(|| {
+                bind_through_spine(&head);
+            })
+        };
+        let (v100, v200, v300) = (visits(100), visits(200), visits(300));
+        assert_eq!(
+            v200 - v100,
+            v300 - v200,
+            "visits per def must be constant: {v100} / {v200} / {v300}"
+        );
+
+        let head = chain(50);
+        let first = bind_through_spine(&head);
+        let again = install_visits(|| {
+            let second = bind_through_spine(&head);
+            assert!(Rc::ptr_eq(&first, &second), "same depth is a cache hit");
+        });
+        assert_eq!(again, 0, "a second reach installs nothing");
+        // Only the head caches the collapsed result; the parsed tree's inner
+        // spine nodes were never reached.
+        let Expr::FuncDef { bound, then, .. } = &head else {
+            panic!("expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: `chain` builds a def head (#3307)"
+        };
+        assert!(bound.is_cached());
+        let Expr::FuncDef { bound: inner, .. } = &**then else {
+            panic!("expected a second def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: a 50-def chain has a second def (#3307)"
+        };
+        assert!(!inner.is_cached(), "inner spine nodes stay unbound");
+    }
+
+    /// #3307: `bind_def`'s own spine branch takes the ambient depth from
+    /// [`ambient_frame_depth`] (`test_bind_def_seeds_defcall_frames_from_
+    /// ambient_depth_1371`'s contract, for a spine): the result at each depth
+    /// is the nested binding's at that depth, the head's cache hits at the same
+    /// depth and recomputes at another.
+    #[test]
+    #[cfg(feature = "std")] // the ambient depth is a thread-local; `no_std` has none
+    fn bind_def_spine_seeds_frames_from_the_ambient_depth_3307() {
+        let head = spine_node(
+            &[("a", "1"), ("b", "a + 1"), ("c", "b + a")],
+            parse("c + b").unwrap(),
+        );
+        let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } = &head
+        else {
+            panic!("expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: `spine_node` builds a def head (#3307)"
+        };
+        let first = Rc::new(FuncDefData {
+            name: name.clone(),
+            params: params.clone(),
+            body: (**body).clone(),
+        });
+        let mut at_zero = None;
+        for depth in [0, 5, 60] {
+            let _guard = enter_def_call_frame(depth);
+            let bound_then = bind_def(name, params, body, then, bound);
+            assert_eq!(
+                *bound_then,
+                nested_spine_reference(&first, then, depth),
+                "ambient depth {depth}"
+            );
+            if depth == 0 {
+                at_zero = Some(Rc::clone(&bound_then));
+                let again = bind_def(name, params, body, then, bound);
+                assert!(Rc::ptr_eq(&bound_then, &again), "same depth hits the cache");
+            } else {
+                assert!(
+                    !Rc::ptr_eq(at_zero.as_ref().unwrap(), &bound_then),
+                    "a different depth recomputes"
+                );
+            }
+        }
+    }
+
+    /// #3307: `Expr::Shared` stays opaque to the spine walk -- an argument
+    /// captured at call time is already installed, and descending into it would
+    /// re-walk the whole chain of arguments from every level below. Only
+    /// evaluation builds a `Shared`, so the parsed corpora never hold one;
+    /// this splices one in, in a body and in the main filter.
+    #[test]
+    fn def_spine_install_leaves_shared_opaque_3307() {
+        let defs = [("a", "1"), ("b", "2")];
+        let shared_a = || Expr::shared(parse("a").unwrap());
+        let mut then = Expr::Pipe(vec![shared_a(), parse("b").unwrap(), shared_a()]);
+        for (name, body) in defs.iter().rev() {
+            let body = if *name == "b" {
+                Expr::Pipe(vec![shared_a(), parse("a").unwrap()])
+            } else {
+                parse(body).unwrap()
+            };
+            then = Expr::FuncDef {
+                name: (*name).to_string(),
+                params: Vec::new(),
+                body: Box::new(body),
+                then: Box::new(then),
+                bound: FuncDefBound::default(),
+            };
+        }
+        let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            ..
+        } = then
+        else {
+            panic!("expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: the loop above builds a def (#3307)"
+        };
+        let first = Rc::new(FuncDefData {
+            name,
+            params,
+            body: *body,
+        });
+        let installed = install_def_spine(&first, &then, 0);
+        assert_eq!(installed, nested_spine_reference(&first, &then, 0));
+        // The reference leaves the captured `a` alone, and so must this: the
+        // two `Shared` nodes still hold a bare call, not a bound one.
+        let Expr::Pipe(stages) = &installed else {
+            panic!("expected a pipe: {installed:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: the main filter is a pipe (#3307)"
+        };
+        for stage in [&stages[0], &stages[2]] {
+            let Expr::Shared(inner) = stage else {
+                panic!("expected a shared arg: {stage:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: stages 0 and 2 are the spliced arguments (#3307)"
+            };
+            assert!(
+                !format!("{inner:?}").contains("DefCall"),
+                "a captured argument must stay unresolved: {inner:?}"
+            );
+        }
+    }
+
+    /// #3307: a nested def the spine's defs still apply to is rebuilt, so any
+    /// cached binding on it is stale and is reset; one every spine def is
+    /// redefined under is cloned wholesale, cache included, exactly as the
+    /// per-def install treats it. `Expr`'s `PartialEq` cannot see either
+    /// (`FuncDefBound` compares equal always), so this reads `is_cached`.
+    #[test]
+    fn def_spine_install_resets_or_keeps_nested_def_caches_3307() {
+        let warm = |expr: &Expr| {
+            any_subexpr(expr, &mut |e| {
+                if let Expr::FuncDef { bound, .. } = e {
+                    bound.get_or_init_at(0, || Rc::new(Expr::Identity));
+                }
+                false
+            });
+        };
+        let nested_defs_cached = |expr: &Expr| {
+            let mut cached = Vec::new();
+            any_subexpr(expr, &mut |e| {
+                if let Expr::FuncDef { bound, .. } = e {
+                    cached.push(bound.is_cached());
+                }
+                false
+            });
+            cached
+        };
+        // `a` applies below the nested `def g`: rebuilt, cache reset.
+        let (first, then) = spine_head("def a: 1; def b: 2; (def g: a; g)");
+        warm(&then);
+        assert!(nested_defs_cached(&then).iter().all(|c| *c), "premise");
+        let installed = install_def_spine(&first, &then, 0);
+        assert_eq!(nested_defs_cached(&installed), vec![false]);
+        // Every spine def that applied is redefined by the nested `def a`
+        // and `def b` (one visible key each is not enough: both are hidden):
+        // the node is cloned wholesale and keeps its cache.
+        let (first, then) = spine_head("def a: 1; def b: 2; (def a: 3; def b: 4; a + b)");
+        warm(&then);
+        let installed = install_def_spine(&first, &then, 0);
+        // The outer nested def hides `a` only, so `b` is still visible: it is
+        // rebuilt. Its inner `def b` hides the last visible key: cloned.
+        assert_eq!(nested_defs_cached(&installed), vec![false, true]);
     }
 }

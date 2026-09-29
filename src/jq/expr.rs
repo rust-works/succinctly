@@ -686,7 +686,11 @@ pub enum Expr {
         /// Expression where this function is in scope
         then: Box<Self>,
         /// `then`, with this def's own calls installed -- computed on first
-        /// evaluation of this node and reused afterwards (#2094). See
+        /// evaluation of this node and reused afterwards (#2094). For the
+        /// head of a spine of defs (`then` is itself a def) this is the
+        /// filter *below the whole spine*, with every spine def's calls
+        /// installed (#3307): the inner spine nodes of the parsed tree are
+        /// never reached by evaluation and keep an empty cache. See
         /// [`FuncDefBound`]'s own doc comment for why this needs a different
         /// cache shape than `DefCall`'s own `bound` field. Every
         /// substitution pass that rebuilds this node's `body`/`then`/`params`
@@ -1508,6 +1512,10 @@ impl core::fmt::Debug for SharedArg {
 /// silently reuse it for the deep reach too, undercounting how close that
 /// deep call actually is to `MAX_EVAL_FRAMES` -- exactly the unbounded
 /// native-recursion gap #1098/#1016 exist to close.
+///
+/// A spine of defs (`def f_1: ..; def f_2: ..; main`) is bound as one unit
+/// (#3307), so it is the *head's* cache that holds the result, keyed on the
+/// depth the head is reached at; the inner spine nodes' caches stay empty.
 ///
 /// Falling back to recomputing whenever the depth moves keeps the *common*
 /// case (a `def` inline in a loop body, reached repeatedly at one constant

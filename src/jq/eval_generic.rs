@@ -56,7 +56,7 @@ use super::eval::{
     boolean_fanout_bools, boolean_fanout_each, bound_shape, cannot_reserve_cross_product,
     classify_limit_n, classify_nth_n, classify_parent_n, classify_skip_n, clear_nonretryable_stop,
     collapse_vec, collect_pattern_var_names, compare_key_arrays, compare_values,
-    debug_assert_materialization_error, demote_for_reentry, descriptor_slice_bounds,
+    debug_assert_materialization_error, def_spine_len, demote_for_reentry, descriptor_slice_bounds,
     each_path_on_owned, each_pattern_binding_set, each_recurse_walk, enter_def_call,
     entries_to_object, eval_each_owned, eval_full as full_eval, finish_fork_flow,
     finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
@@ -18406,11 +18406,14 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
             then,
             bound,
         } => {
-            unfolded < OWNED_IDENTITY_DEF_UNFOLD_LIMIT
-                && path_context_is_navigational_at(
+            // #3307: `bind_def` binds the whole direct spine of defs at once, so
+            // the unfold count is charged up front (see `charge_def_spine`).
+            charge_def_spine(unfolded, then).is_some_and(|unfolded| {
+                path_context_is_navigational_at(
                     &bind_def(name, params, body, then, bound),
-                    unfolded + 1,
+                    unfolded,
                 )
+            })
         }
         Expr::DefCall {
             def,
@@ -25468,7 +25471,32 @@ fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
 /// up on a call: a self-recursive definition (`def f: f; f`) would otherwise
 /// keep it unfolding forever, and a body that deep is the eager evaluator's
 /// exactly as it was before this gate existed.
+///
+/// One unfold per `def`, however they are bound: `bind_def` installs a whole
+/// direct spine of defs in one step (#3307), and the two gates that count
+/// unfolds charge the spine's length up front rather than one per level.
 const OWNED_IDENTITY_DEF_UNFOLD_LIMIT: u8 = 8;
+
+/// The unfold count after binding the `FuncDef` whose `then` is `then`, or
+/// `None` when that would pass [`OWNED_IDENTITY_DEF_UNFOLD_LIMIT`] (#3307).
+///
+/// `bind_def` installs a whole direct spine of defs in one step and returns
+/// the filter below it, so the gates charge one unfold per spine def *up
+/// front*, where binding one def at a time charged one per level as it went.
+/// The verdicts are the same (a spine of nine defs is refused either way);
+/// what changes is that an over-long spine is refused before anything is
+/// bound, where the per-level form bound its first levels and refused at the
+/// limit. The other `bind_def` callers carry no counter.
+fn charge_def_spine(unfolded: u8, then: &Expr) -> Option<u8> {
+    let limit = usize::from(OWNED_IDENTITY_DEF_UNFOLD_LIMIT);
+    // `then` past the limit cannot fit, so the walk stops there.
+    let total = usize::from(unfolded) + 1 + def_spine_len(then, limit);
+    if total <= limit {
+        u8::try_from(total).ok()
+    } else {
+        None
+    }
+}
 
 /// [`owned_identity_pipe_supported`], `unfolded` levels of `def` binding in.
 fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
@@ -25641,13 +25669,16 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
                 then,
                 bound,
             } => {
-                if unfolded >= OWNED_IDENTITY_DEF_UNFOLD_LIMIT {
+                // #3307: `bind_def` binds the whole direct spine of defs at once,
+                // so the unfold count is charged up front (see
+                // `charge_def_spine`).
+                let Some(unfolded) = charge_def_spine(unfolded, then) else {
                     return false;
-                }
+                };
                 let installed = bind_def(name, params, def_body, then, bound);
                 if !owned_identity_pipe_supported_at(
                     owned_identity_body_stages(&installed),
-                    unfolded + 1,
+                    unfolded,
                 ) {
                     return false;
                 }
@@ -41183,5 +41214,50 @@ mod tests {
         // yq mode never shares.
         assert!(embed_shared_for::<YqSemantics, _>(&empty).is_none());
         assert!(embed_at_or_within::<YqSemantics, _>(&empty).0.is_none());
+    }
+
+    /// `def d0: .; def d1: .; ...` (`defs` of them) over `main`.
+    fn trivial_def_spine(defs: usize, main: &str) -> Expr {
+        let mut program = String::new();
+        for i in 0..defs {
+            program.push_str(&format!("def d{i}: .; "));
+        }
+        program.push_str(main);
+        parse(&program).unwrap()
+    }
+
+    /// #3307: `bind_def` installs a whole spine of defs in one step, so the
+    /// two gates that bound how many levels of `def` they unfold
+    /// (`OWNED_IDENTITY_DEF_UNFOLD_LIMIT`) charge one per spine def up front.
+    /// Without that a spine of nine defs, which both gates refuse, would be
+    /// admitted as one bind. Every verdict below is what `main` before #3307
+    /// answered, captured by running the gates on it -- not derived.
+    #[test]
+    fn route_gates_count_each_spine_def_3307() {
+        // (defs in the spine, main filter, admitted by both gates)
+        for (defs, main, admitted) in [
+            (1, ".a", true),
+            (2, ".a", true),
+            (7, ".a", true),
+            (7, ".a | d0", true),
+            (7, ".a | d0 | .b", true),
+            (8, ".a", true),
+            (8, ".a | d0", false),
+            (8, ".a | d0 | .b", false),
+            (9, ".a", false),
+            (10, ".a", false),
+        ] {
+            let expr = trivial_def_spine(defs, main);
+            assert_eq!(
+                path_context_is_navigational(&expr),
+                admitted,
+                "path-context gate, {defs} defs over `{main}`"
+            );
+            assert_eq!(
+                owned_identity_pipe_supported(std::slice::from_ref(&expr)),
+                admitted,
+                "owned-identity gate, {defs} defs over `{main}`"
+            );
+        }
     }
 }
