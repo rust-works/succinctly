@@ -528,15 +528,12 @@ also covers the multiplicative chain after its operand, so `-2 * "ab"` is `-(2 *
 
 A generated grammar sweep (160,000 random programs over bindings, every binary operator,
 unary minus, `try`/`catch`, `reduce`/`foreach`, `if`, assignment, `?//`, object values and
-`def` bodies, against jq 1.7.1 and the previous build) fixes 6.3% of the programs it draws,
-accepts no program jq rejects, and regresses 16 that matched jq before: 13 are the sign of
-a zero result and 3 are `?//` in an assignment's right-hand side, both below. What it turns
-up is the parse now being *right* in front of gaps that were already there behind a
-parenthesis:
+`def` bodies, against jq 1.7.1 and the previous build) fixes 6.9% of the programs it draws
+(11,081 of 160,000), makes none of them accepted-invalid (a program jq refuses that the
+previous build refused too), and regresses 3 that matched jq before, all `?//` in an
+assignment's right-hand side (below). What it turns up is the parse now being *right* in
+front of gaps that were already there behind a parenthesis:
 
-- **Zero's sign in integer arithmetic.** `0 * -1` prints `0` where jq prints `-0`
-  ([#3440](https://github.com/rust-works/succinctly/issues/3440)); programs like
-  `-0 * -1` used to match jq only because the old parse cancelled that bug.
 - **`?//` in an assignment's right-hand side never retries.** jq retries the next
   alternative when the update's own write step fails; succinctly retries neither there
   nor in `map`/`map_values` ([#3417](https://github.com/rust-works/succinctly/issues/3417)).
@@ -548,23 +545,39 @@ parenthesis:
   write is dropped; `and`/`or`/unary minus in front of a destructuring `as` reach
   [#3289](https://github.com/rust-works/succinctly/issues/3289). Both spellings behaved
   the same way behind parentheses on `main`.
-- **Eager bodies.** `-T as $x | B` is `Negate(As)` and an assignment right-hand side is
-  collected before it is consumed, so *later* outputs of `B` (`input`, `debug`, `stderr`)
-  run before the first is used, where jq is lazy. Distinct from #2267's open note (an
-  assignment's *target* path), and not covered by an earlier entry.
+- **An assignment's right-hand side is collected eagerly**
+  ([#3448](https://github.com/rust-works/succinctly/issues/3448)), so under an early-exit
+  consumer (`first`, `limit`, `nth`, `any`, `isempty`) the *later* outputs of the right-hand
+  side (`input`, `debug`, `stderr`) run where jq is lazy. `[first(.a = (1, input)), input]`
+  already did on `main`; `.a = 1 as $x | ($x, input)` used to mis-parse as `(.a = 1) as $x |
+  ...` and now reaches it too. Under full consumption that spelling is a fix. Distinct from
+  #2267's open note (an assignment's *target* path). `-T as $x | B` itself is lazy in every
+  demand-driven consumer.
 - **`//` against assignment** (the remaining divergence in
   [the language reference](../../reference/jq-language.md#operator-precedence)) now also
   shows inside a binding body on the right of an assignment: `.a = 1 as $x | .a // 1 %= 2`.
 
-Two grammar gaps this change leaves:
+Costs and gaps this change leaves:
 
-- **A `reduce`/`foreach` source is a `Term` in jq** (`reduce 1 + 2 as $x (0; $x)` is a
-  syntax error there) and an alternative-level expression here, unchanged.
 - **Stack per binding.** A binding's body re-enters the operator ladder from
   `parse_operand`, about 13 native frames per level where `parse_binding` used about 5.
-  `MAX_EXPR_DEPTH` does not count it (a chain of bindings is not paren nesting), so a
-  caller driving the parser from a small stack reaches its overflow point sooner; the CLI
-  parses on a 256 MiB (release) / 2 GiB (debug) thread and is not affected.
+  `MAX_EXPR_DEPTH` does not count it (a chain of bindings is not paren nesting, and jq and
+  the previous build accept a thousand), so a caller driving the parser from a small stack
+  reaches its overflow point sooner; the CLI parses on a 256 MiB (release) / 2 GiB (debug)
+  thread and is not affected.
+- **Stack per negated factor.** jq's `'-' Exp` puts the rest of a multiplicative chain
+  under the negation, so `-1 * -1 * -1 ...` nests one negation per negated factor and the
+  parser recurses once per factor (about 19 KiB of debug stack each, where the old parse was
+  iterative). The depth limit still bounds it with a clean error (257 factors); a 2 MiB
+  debug thread overflows first, from about 106.
+- **One evaluator frame more for `-N * X`.** It is `-(N * X)`, as in jq, one node deeper than
+  the old `(-N) * X`, so a recursion through such an operand reaches `MAX_EVAL_FRAMES` sooner
+  (`def g: ... -1 * (. - 1 | g) ...` from `n` = 5715 rather than 6667); parenthesised
+  `(-1) * ...` is unchanged.
+- **`label $o | 1 < 2 > 3`** is accepted (jq: syntax error), as before this change: the
+  non-associative check covers bindings, not the other greedy-body prefixes.
+- **`try` bodies and `catch` handlers** take a binding as jq does (`try 1 as $x | $x == 1
+  == 1` is a syntax error in both).
 
 ## Where succinctly errors and jq does not
 

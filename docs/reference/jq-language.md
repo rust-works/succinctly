@@ -404,9 +404,9 @@ Loosest first, matching jq's `parser.y`:
 |-------|---------------------------------------|----------------------------------------------------|
 | 1     | `\|`                                  | Loosest. Each stage is a comma list.               |
 | 2     | `,`                                   | Binds tighter than `\|`: `a,b \| f` is `(a,b) \| f`. |
-| 3     | `as`                                  | Binds only the `Term` before it (jq mode); its body runs to the end. |
-| 4     | `=` `\|=` `+=` `-=` `*=` `/=` `%=` `//=` | See divergence 2 below.                         |
-| 5     | `//`                                  | See divergence 2 below.                            |
+| 3     | `as`                                  | Binds the `Term` before it; body runs to the end.  |
+| 4     | `=` `\|=` `+=` `-=` `*=` `/=` `%=` `//=` | See divergence 1 below.                         |
+| 5     | `//`                                  | See divergence 1 below.                            |
 | 6     | `or`, `and`                           |                                                    |
 | 7     | `==` `!=` `<` `<=` `>` `>=`           |                                                    |
 | 8     | `+` `-`, then `*` `/` `%`             | Tightest.                                          |
