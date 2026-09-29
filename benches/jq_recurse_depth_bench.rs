@@ -42,7 +42,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
-use succinctly::jq::{eval, parse, JqSemantics, QueryResult};
+use succinctly::jq::{eval_full, parse, JqSemantics, QueryResult};
 use succinctly::json::JsonIndex;
 
 /// `{"k": {"k": ... "pad": {"a":{},"b":{},"c":{}}}}`, `depth` levels of `"k"`
@@ -64,7 +64,7 @@ fn bench_recurse_depth(c: &mut Criterion) {
         // Guard the premise: a fixture that errored or produced output would
         // no longer be isolating the clone cost this benchmark targets.
         let cursor = index.root(&json);
-        let probe: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+        let probe: QueryResult<Vec<u64>> = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
         assert!(!probe.is_error(), "depth {depth} fixture must not error");
         assert!(
             probe.collect_owned::<JqSemantics>().is_empty(),
@@ -75,7 +75,8 @@ fn bench_recurse_depth(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(depth), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+                let result: QueryResult<Vec<u64>> =
+                    eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
                 black_box(result.collect_owned::<JqSemantics>().len())
             });
         });

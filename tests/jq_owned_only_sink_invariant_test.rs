@@ -25,14 +25,14 @@
 
 #![cfg(feature = "std")]
 
-use succinctly::jq::{eval, parse, seed_remaining_inputs, JqSemantics, OwnedValue};
+use succinctly::jq::{eval_full, parse, seed_remaining_inputs, JqSemantics, OwnedValue};
 use succinctly::json::JsonIndex;
 
 fn eval_to_json(json: &[u8], filter: &str) -> Vec<String> {
     let index = JsonIndex::build(json);
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
-    eval::<_, JqSemantics>(&expr, cursor)
+    eval_full::<_, JqSemantics>(&expr, cursor)
         .collect_owned::<JqSemantics>()
         .iter()
         .map(OwnedValue::to_json)

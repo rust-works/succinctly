@@ -90,3 +90,54 @@ fn test_public_eval_accepts_depth_under_limit_2627() {
     let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
     assert!(!result.is_error(), "unexpected error: {result:?}");
 }
+
+/// #3457: the path family reports a document nested past the generic
+/// walkers' 256 ceiling as an ordinary `QueryResult::Error`, through the
+/// public entry with no `catch_unwind` net and not as a panic. The error is
+/// decode-failure-tagged, so a `try` in the running filter cannot swallow it
+/// (a plain error would let `try ... catch` turn a stack-safety guard into an
+/// ordinary answer).
+#[test]
+fn test_public_eval_path_family_over_depth_is_a_clean_error_3457() {
+    for depth in [256, 300, 384, 1000] {
+        let json = nested_arrays(depth);
+        let bytes = json.as_bytes();
+        let index = JsonIndex::build(bytes);
+        for filter in [
+            "[paths] | length",
+            "[leaf_paths] | length",
+            "[path(..)] | length",
+            r#"try ([paths] | length) catch "swallowed""#,
+        ] {
+            let expr = parse(filter).expect("parse failed");
+            let result: QueryResult<Vec<u64>> =
+                eval::<Vec<u64>, JqSemantics>(&expr, index.root(bytes));
+            match result {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "{filter} @ {depth}: {e:?}");
+                    assert_eq!(
+                        e.to_string(),
+                        "nesting depth exceeds limit of 256",
+                        "{filter} @ {depth}"
+                    );
+                }
+                other => panic!("{filter} @ {depth}: expected an error, got {other:?}"),
+            }
+        }
+    }
+}
+
+/// Companion to the test above: just under the ceiling the same queries
+/// answer.
+#[test]
+fn test_public_eval_path_family_under_depth_answers_3457() {
+    let json = nested_arrays(200);
+    let bytes = json.as_bytes();
+    let index = JsonIndex::build(bytes);
+    let expr = parse("[paths] | length").expect("parse failed");
+    let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, index.root(bytes));
+    match result {
+        QueryResult::Owned(OwnedValue::Int(n)) => assert_eq!(n, 200),
+        other => panic!("expected Owned(200), got: {other:?}"),
+    }
+}

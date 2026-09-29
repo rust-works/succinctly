@@ -118,7 +118,7 @@ fn test_field_nested_object() {
 fn test_field_missing_returns_null() {
     // jq returns null for missing fields on objects (not an error)
     query!(br#"{"a": 1}"#, ".missing",
-        QueryResult::One(StandardJson::Null) => {}
+        QueryResult::Owned(OwnedValue::Null) => {}
     );
 }
 
@@ -188,7 +188,7 @@ fn test_index_negative() {
 fn test_index_out_of_bounds_returns_null() {
     // jq returns null for out-of-bounds array access (not an error)
     query!(br"[1, 2, 3]", ".[10]",
-        QueryResult::One(StandardJson::Null) => {}
+        QueryResult::Owned(OwnedValue::Null) => {}
     );
 }
 
@@ -196,7 +196,7 @@ fn test_index_out_of_bounds_returns_null() {
 fn test_index_negative_out_of_bounds_returns_null() {
     // jq returns null for negative out-of-bounds array access (not an error)
     query!(br"[1, 2, 3]", ".[-10]",
-        QueryResult::One(StandardJson::Null) => {}
+        QueryResult::Owned(OwnedValue::Null) => {}
     );
 }
 
@@ -204,7 +204,7 @@ fn test_index_negative_out_of_bounds_returns_null() {
 fn test_index_on_null_returns_null() {
     // jq returns null when indexing null
     query!(b"null", ".[0]",
-        QueryResult::One(StandardJson::Null) => {}
+        QueryResult::Owned(OwnedValue::Null) => {}
     );
 }
 
@@ -212,7 +212,7 @@ fn test_index_on_null_returns_null() {
 fn test_index_on_null_negative_returns_null() {
     // jq returns null when indexing null with negative index
     query!(b"null", ".[-1]",
-        QueryResult::One(StandardJson::Null) => {}
+        QueryResult::Owned(OwnedValue::Null) => {}
     );
 }
 
@@ -257,18 +257,14 @@ fn test_iterate_object_values() {
 #[test]
 fn test_iterate_empty_array() {
     query!(br"[]", ".[]",
-        QueryResult::Many(values) => {
-            assert!(values.is_empty());
-        }
+        QueryResult::None => {}
     );
 }
 
 #[test]
 fn test_iterate_empty_object() {
     query!(br"{}", ".[]",
-        QueryResult::Many(values) => {
-            assert!(values.is_empty());
-        }
+        QueryResult::None => {}
     );
 }
 
@@ -339,7 +335,7 @@ fn test_slice_empty_result() {
 fn test_slice_on_null_returns_null() {
     // jq returns null when slicing null
     query!(b"null", ".[0:2]",
-        QueryResult::One(StandardJson::Null) => {}
+        QueryResult::Owned(OwnedValue::Null) => {}
     );
 }
 
@@ -434,7 +430,7 @@ fn test_full_slice_returns_whole_array() {
 fn test_optional_field_missing() {
     // jq returns null for missing fields on objects (even with optional syntax)
     query!(br#"{"a": 1}"#, ".missing?",
-        QueryResult::One(StandardJson::Null) => {}
+        QueryResult::Owned(OwnedValue::Null) => {}
     );
 }
 
@@ -451,7 +447,7 @@ fn test_optional_field_present() {
 fn test_optional_index_out_of_bounds_returns_null() {
     // jq returns null for optional out-of-bounds (not empty)
     query!(br"[1, 2, 3]", ".[10]?",
-        QueryResult::One(StandardJson::Null) => {}
+        QueryResult::Owned(OwnedValue::Null) => {}
     );
 }
 
@@ -459,7 +455,7 @@ fn test_optional_index_out_of_bounds_returns_null() {
 fn test_optional_index_on_null_returns_null() {
     // jq returns null for optional index on null
     query!(b"null", ".[0]?",
-        QueryResult::One(StandardJson::Null) => {}
+        QueryResult::Owned(OwnedValue::Null) => {}
     );
 }
 
@@ -942,7 +938,7 @@ fn test_nth_on_null_returns_null() {
     // rather than an eagerly-materialized `Owned(Null)` -- same value,
     // different QueryResult variant.
     query!(b"null", "nth(0)",
-        QueryResult::One(StandardJson::Null) => {}
+        QueryResult::Owned(OwnedValue::Null) => {}
     );
 }
 

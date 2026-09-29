@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use succinctly::jq::eval_generic;
-use succinctly::jq::{eval, parse, JqSemantics, QueryResult};
+use succinctly::jq::{eval_full, parse, JqSemantics, QueryResult};
 use succinctly::json::JsonIndex;
 
 const TABLE: &str = include_str!("data/jq-error-messages.tsv");
@@ -137,7 +137,7 @@ fn outcome(evaluator: Evaluator, probe: &Probe) -> Result<String, String> {
 
     let (error, outputs) = match evaluator {
         Evaluator::Full => {
-            let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+            let result: QueryResult<Vec<u64>> = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
             match result {
                 QueryResult::Error(e) => (Some(e.message), Vec::new()),
                 other => (None, render(other.collect_owned::<JqSemantics>())),

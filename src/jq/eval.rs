@@ -1856,6 +1856,34 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
         )
     }
 
+    /// [`Self::collect_owned`] without the loss: a value that cannot be
+    /// decoded is an `Err`, not a `null` (#3457).
+    ///
+    /// A cursor result is undecoded by design (that is what keeps `.`
+    /// cheap), and [`eval`] hands the generic evaluator's cursors through as
+    /// they are, so `getpath(["b"])` on `{"a":1,"b":tru}` is a
+    /// [`QueryResult::OneCursor`] naming a value nothing can read. Mirrors
+    /// [`crate::jq::eval_generic::GenericResult::collect_owned`], which
+    /// already reports it (#1247); `None`/`Error`/`Break`/`Halt` collect to
+    /// an empty `Vec` and a `Partial` to its prefix, as there.
+    pub fn try_collect_owned<S: EvalSemantics>(self) -> Result<Vec<OwnedValue>, EvalError> {
+        Ok(match self {
+            QueryResult::One(v) => vec![super::eval_generic::to_owned::<S, _>(&v)?],
+            QueryResult::OneCursor(c) => vec![super::eval_generic::to_owned::<S, _>(&c.value())?],
+            QueryResult::Many(vs) => vs
+                .iter()
+                .map(super::eval_generic::to_owned::<S, _>)
+                .collect::<Result<_, _>>()?,
+            QueryResult::None
+            | QueryResult::Error(_)
+            | QueryResult::Break(_)
+            | QueryResult::Halt(_) => Vec::new(),
+            QueryResult::Owned(o) => vec![o],
+            QueryResult::ManyOwned(os) => os,
+            QueryResult::Partial(vs, _control) => vs,
+        })
+    }
+
     /// Collect all output values into a `Vec<OwnedValue>`.
     ///
     /// Mirrors [`crate::jq::eval_generic::GenericResult::collect_owned`]:
@@ -1864,6 +1892,10 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
     /// outputs are no longer discarded. This gives the full evaluator the
     /// same materialization surface as the generic (CLI) path, which is what
     /// evaluator-parity tests rely on.
+    ///
+    /// **Lossy:** a cursor whose value cannot be decoded (a malformed number,
+    /// an unquoted keyword) becomes `null` rather than an error. Use
+    /// [`Self::try_collect_owned`] when that distinction matters (#3457).
     pub fn collect_owned<S: EvalSemantics>(self) -> Vec<OwnedValue> {
         match self {
             QueryResult::One(v) => vec![to_owned_lossy::<S, _>(&v)],
@@ -23911,7 +23943,7 @@ fn yq_negative_index_error_for_len(
 /// this read-only helper's contract. `del()`/`delpaths()`'s own gap #2268
 /// also found is fixed via [`yq_negative_index_error_for_len`] above, not
 /// this function -- see that one's own doc comment for why.
-fn yq_negative_index_error<S: EvalSemantics>(
+pub(crate) fn yq_negative_index_error<S: EvalSemantics>(
     target: &OwnedValue,
     key: &OwnedValue,
 ) -> Option<EvalError> {
@@ -26319,26 +26351,42 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 ///
 /// # Relation to the CLI
 ///
-/// `succinctly jq` does not evaluate through this function; it uses the
-/// generic evaluator's cursor entries
-/// ([`eval_with_cursor_using`](super::eval_generic::eval_with_cursor_using)
-/// and its streaming twin). `succinctly yq`'s DOM route does call it. This
-/// function hands a query that needs path context (`key`, `parent`, ...) to
-/// that cursor entry and evaluates everything else itself, so the two can
-/// answer differently, on well-formed input too: cursor-metadata builtins
-/// such as `line` answer from fixed defaults here.
+/// This is the same evaluator `succinctly jq`/`succinctly yq` use: it hands
+/// every query to the generic evaluator's cursor entry
+/// ([`eval_with_cursor_using`](super::eval_generic::eval_with_cursor_using))
+/// and reshapes the answer into a [`QueryResult`] (#3457). So a value the
+/// index cannot read (a malformed number such as `1.2.3`, or a keyword such
+/// as `tru`), which jq rejects at parse time, is only validated where
+/// something reads it: `[.] | length` on it answers `1`, and `path(.a)` on
+/// `{"a":1,"b":tru}` answers `["a"]`, as they do in the CLI (#3266).
+/// Cursor-metadata builtins such as `line` answer from the real document.
 ///
-/// On a value the index cannot read (a malformed number such as `1.2.3`, or
-/// a keyword such as `tru`), which jq rejects at parse time, this entry
-/// raises where the cursor entry answers (#3266). It collects its results
-/// into owned values, and its `path`/`paths`/`leaf_paths`/`getpath` walk an
-/// owned copy of their input, and building that copy decodes the value:
-/// `[.] | length` on it, or `path(.a)` on `{"a":1,"b":tru}`, raises here
-/// and answers in the CLI. `eval_with_cursor_using` gives the CLI's
-/// answers, but its path walkers panic on a document nested deeper than 256
-/// levels, where this entry answers (#3429); the CLI catches that panic. The
-/// split is recorded in `docs/compliance/jq/limitations.md`; converging the
-/// two is #3457.
+/// # Results and decode failures
+///
+/// A cursor result ([`QueryResult::OneCursor`], and the values inside
+/// [`QueryResult::One`]/[`QueryResult::Many`]) is *not* decoded here, so the
+/// value it names may still be unreadable. [`QueryResult::try_collect_owned`]
+/// reports that as an `Err`; [`QueryResult::collect_owned`] is the lossy form
+/// and turns it into `null`. Use the former wherever a wrong answer is worse
+/// than an error.
+///
+/// # Nesting depth
+///
+/// A document nested 256 levels or deeper makes the queries that walk it
+/// (`paths`, `path(..)`, ...) return `nesting depth exceeds limit of 256` as
+/// a [`QueryResult::Error`]. The error is tagged as a decode failure, so a
+/// `try` in the filter does not swallow it, and it is a return value, not an
+/// unwinding panic. The evaluator this entry used before #3457 answered these
+/// up to 384 levels; raising the ceiling is #3429. With the `std` feature
+/// the few guards that still panic (comment-preserving YAML materialization)
+/// are contained the same way; without it there is no unwinding to catch and
+/// they propagate.
+///
+/// # Other entry points
+///
+/// [`eval_lenient`] follows this entry. [`eval_owned_with_file_index`]
+/// evaluates an already-decoded [`OwnedValue`], which has no unreadable value
+/// to split on, and keeps its own route.
 ///
 /// # Examples
 ///
@@ -26357,26 +26405,35 @@ pub fn eval<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
 ) -> QueryResult<'a, W> {
-    // Spine 2416, phase 3: a query that reads path context anywhere is
-    // evaluated by the generic evaluator, where `key`/`parent`/`path` are
-    // cursor properties and object construction, `select`, `if` and the
-    // bounded consumers thread the cursor natively. This evaluator's own
-    // `eval_pipe` would divert such a pipe to the deleted eager path-context evaluator
-    // -- the eager, materializing path-context evaluator that spine is
-    // retiring -- so the library entry point no longer enters it at all
-    // for these shapes. The generic evaluator still bridges back into this
-    // file for the shapes only the eager evaluator can answer (owned-domain
+    // #3457: one evaluator for the library and the CLI, with no per-query
+    // routing decision. The generic evaluator still bridges back into this
+    // file for the shapes only this evaluator can answer (owned-domain
     // navigation, absent nodes, constructs it has no native arm for), and
     // does so through [`eval_full`], never through here, so the two cannot
-    // recurse into each other.
+    // recurse into each other. #3432 tried routing only the path builtins
+    // and, by scanning the whole `Expr` (dead `def`s included), changed
+    // unrelated queries' answers, native stack use and cost; an
+    // unconditional route has no scan to get wrong.
+    //
+    // `.` needs no evaluation at all: it is the unchanged input as a cursor,
+    // which is also what the generic evaluator answers, so it skips the
+    // dispatch and the unwind guard.
+    if matches!(expr, Expr::Identity) {
+        return QueryResult::OneCursor(cursor);
+    }
+    //
+    // One shape adaptation keeps the documented result contract (README, the
+    // `jq` module docs): a single navigated value is the borrowed `One` view
+    // (`.age` is `One(Number)`), and only `.` is a `OneCursor`. The generic
+    // evaluator hands back a cursor for both. The value is the same either
+    // way; which variant carries it is what callers match on.
     contain_depth_panic(move || {
-        if needs_path_context(expr) {
-            return generic_to_query_result::<_, S>(super::eval_generic::eval_with_cursor_using::<
-                S,
-                _,
-            >(expr, cursor));
+        match generic_to_query_result::<_, S>(super::eval_generic::eval_with_cursor_using::<S, _>(
+            expr, cursor,
+        )) {
+            QueryResult::OneCursor(c) => QueryResult::One(c.value()),
+            other => other,
         }
-        eval_full::<W, S>(expr, cursor)
     })
 }
 
@@ -26421,8 +26478,7 @@ fn contain_depth_panic<'a, W>(f: impl FnOnce() -> QueryResult<'a, W>) -> QueryRe
 
 /// This evaluator alone, with no generic-evaluator routing: the entry the
 /// generic evaluator's bridges use (`eval_generic::eval_on_owned`,
-/// `bridge_to_full_evaluator`), and what [`eval`] itself falls through to
-/// for a query with no path context.
+/// `bridge_to_full_evaluator`).
 ///
 /// `#[doc(hidden)] pub` (#3457) only so `tests/jq_evaluator_parity_tests.rs`
 /// can keep comparing *this* evaluator against the generic one: [`eval`] is
@@ -26473,18 +26529,33 @@ fn generic_to_query_result<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate a jq expression, returning only successfully matched values.
 /// Errors and None results are filtered out.
+///
+/// Follows [`eval`] (#3457), whose generic evaluator answers a computed value
+/// (a missing field's `null`, `1 == 1`, `.a + 1`) as an owned value rather
+/// than a borrowed one. A `Vec<StandardJson>` can only carry the two of those
+/// with no text to borrow, `null` and booleans, so those are returned and any
+/// other owned value (a number, string, array or object built by the filter)
+/// is still dropped, as it always was. Use [`eval`] and match on
+/// [`QueryResult`] to see every result.
 pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
 ) -> Vec<StandardJson<'a, W>> {
+    fn borrowed<'v, V: Clone + AsRef<[u64]>>(v: &OwnedValue) -> Option<StandardJson<'v, V>> {
+        match v {
+            OwnedValue::Null => Some(StandardJson::Null),
+            OwnedValue::Bool(b) => Some(StandardJson::Bool(*b)),
+            _ => None,
+        }
+    }
     match eval::<W, S>(expr, cursor) {
         QueryResult::One(v) => vec![v],
         QueryResult::OneCursor(c) => vec![c.value()],
         QueryResult::Many(vs) => vs,
         QueryResult::None => Vec::new(),
         QueryResult::Error(_) => Vec::new(),
-        QueryResult::Owned(_) => Vec::new(), // Owned values not returned as StandardJson
-        QueryResult::ManyOwned(_) => Vec::new(),
+        QueryResult::Owned(v) => borrowed(&v).into_iter().collect(),
+        QueryResult::ManyOwned(vs) => vs.iter().filter_map(borrowed).collect(),
         QueryResult::Break(_) => Vec::new(), // Break without matching label
         QueryResult::Halt(_) => Vec::new(),  // Halt: not representable as borrowed StandardJson
         QueryResult::Partial(..) => Vec::new(), // Same: not representable as borrowed StandardJson
@@ -98420,12 +98491,13 @@ mod tests {
 
     #[test]
     fn test_key_nested() {
-        // Test key on nested access. `OneCursor`, not `Owned`: see
-        // `test_key_object` above (#2763).
+        // Test key on nested access. A node the document holds (`One`), not
+        // `Owned`: see `test_key_object` above (#2763). `eval` presents the
+        // cursor the generic evaluator produced as its borrowed view.
         query_entry!(br#"{"outer": {"inner": 42}}"#, ".outer | .[] | key",
-            QueryResult::OneCursor(c) => {
+            QueryResult::One(v) => {
                 assert_eq!(
-                    crate::jq::eval_generic::to_owned_cursor::<JqSemantics, _>(&c).expect("decodes"),
+                    crate::jq::eval_generic::to_owned::<JqSemantics, _>(&v).expect("decodes"),
                     OwnedValue::String("inner".to_string())
                 );
             }
@@ -114201,10 +114273,11 @@ mod tests {
     /// #3222: a value the index could not read -- a malformed nested number
     /// (`1.2.3`) or keyword (`tru`, #3035) -- raises an uncatchable decode
     /// failure on every route that reads it or asks its type, in *both*
-    /// evaluators: this one (`eval`, cursor-based) and the generic one
-    /// (`eval_using`). The CLI's routing picks one evaluator or the other
-    /// by query shape, so a CLI sweep alone cannot prove both are covered.
-    /// The generic one is entered through a cursor, as the CLI enters it.
+    /// evaluators: this one (`eval_full`, cursor-based) and the generic one
+    /// (`eval_with_cursor_using`, which `eval` has been since #3457). The
+    /// generic evaluator bridges into this one for some shapes, so a CLI
+    /// sweep alone cannot prove both are covered. The generic one is entered
+    /// through a cursor, as the CLI enters it.
     /// Before #3222 the type filters here dropped the value (`numbers`,
     /// `iterables`), the type tests answered `false`, and indexing it was a
     /// catchable `Cannot index error with ...`.
@@ -114278,7 +114351,7 @@ mod tests {
                 .expect("one element");
             for filter in READERS {
                 let expr = parse(filter).expect("filter parses");
-                let concrete = match eval::<Vec<u64>, JqSemantics>(&expr, element) {
+                let concrete = match eval_full::<Vec<u64>, JqSemantics>(&expr, element) {
                     QueryResult::Error(e) => e.is_decode_failure(),
                     _ => false, // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every READERS filter raises a decode failure on every malformed json in this sweep, so this fallback never fires (#3222)"
                 };
@@ -114288,7 +114361,8 @@ mod tests {
                     crate::jq::eval_generic::GenericResult::Error(e) => e.is_decode_failure(),
                     _ => false, // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- see the `concrete` match above, same sweep (#3222)"
                 };
-                for (evaluator, raised) in [("eval", concrete), ("eval_with_cursor_using", generic)]
+                for (evaluator, raised) in
+                    [("eval_full", concrete), ("eval_with_cursor_using", generic)]
                 {
                     if !raised {
                         // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a READERS filter fails to raise (#3222)"
@@ -114319,10 +114393,11 @@ mod tests {
             "empty",
             "1",
             // Filters that wrap or navigate the value without reading it
-            // (`[.] | length`, `path(.)`, ...) answer here in the generic
-            // evaluator but raise in `eval`, which materializes them; that
-            // split is pinned per evaluator by
-            // `eval_entry_validates_what_the_cursor_entry_navigates_3266`.
+            // (`[.] | length`, `path(.)`, ...) answer in the generic
+            // evaluator (and so in `eval`, which is that evaluator since
+            // #3457) but raise in `eval_full`, which materializes them; that
+            // split is pinned by
+            // `eval_entry_agrees_with_the_cursor_entry_on_unreadable_values_3266`.
         ];
         let good = b"[1]";
         let good_index = JsonIndex::build(good);
@@ -114336,8 +114411,8 @@ mod tests {
                 .expect("one element");
             for filter in NON_READERS {
                 let expr = parse(filter).expect("filter parses");
-                let concrete = normalize(eval::<Vec<u64>, JqSemantics>(&expr, element));
-                let expected = normalize(eval::<Vec<u64>, JqSemantics>(&expr, good_element));
+                let concrete = normalize(eval_full::<Vec<u64>, JqSemantics>(&expr, element));
+                let expected = normalize(eval_full::<Vec<u64>, JqSemantics>(&expr, good_element));
                 if concrete != expected {
                     // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a NON_READERS filter disagrees between the malformed and well-formed document (#3222)"
                     disagreed.push(format!("eval `{filter}` on {json}: {concrete:?}"));
@@ -114368,30 +114443,24 @@ mod tests {
         );
     }
 
-    /// #3266: the three library entries give different answers on a value
-    /// the index cannot read (a malformed number `1.2.3`, a keyword `tru`)
-    /// under filters that never read it. `eval_with_cursor_using`, the
-    /// generic evaluator's cursor entry that `succinctly jq` evaluates
-    /// through, holds the input as a cursor and answers where a filter only
-    /// navigates past the value or wraps it in `[.]`. `eval` collects its
-    /// results into owned values, and its `path`/`paths`/`leaf_paths`/
-    /// `getpath` walk an owned copy of their input, so it decodes the value
-    /// -- even a sibling the navigation never visits (`path(.a)` with a
-    /// malformed `"b"`) -- unless the query needs path context (`key`), which
-    /// it hands to the cursor entry. `eval_using` is given a decoded value,
-    /// so it answers some of these and raises on others (even `not`). jq
-    /// rejects every document here at parse time, so no answer has a
+    /// #3266, converged by #3457: `eval` and `eval_with_cursor_using` give the
+    /// same answer on a value the index cannot read (a malformed number
+    /// `1.2.3`, a keyword `tru`), because `eval` *is* the cursor entry
+    /// reshaped into a `QueryResult`. Neither reads the value unless the
+    /// filter does: `[.] | length` and `path(.a)` on `{"a":1,"b":tru}` answer,
+    /// where `eval` used to raise (it collected into owned values and its
+    /// `path` builtins walked an owned copy). `eval_using` is given a decoded
+    /// value, so it answers some of these and raises on others (even `not`).
+    /// jq rejects every document here at parse time, so no answer has a
     /// reference.
     ///
-    /// Recorded as out of policy in `docs/compliance/jq/limitations.md`
-    /// ("The library `eval()` entry validates what the CLI's entry only
-    /// navigates"). Converging `eval` onto the cursor entry is #3457; the
-    /// collections that materialize in the cursor entry too (`[., 1]`,
-    /// `{a: .}`, `. as $x | [$x]`) are #3427. Each row pins every entry's
-    /// current answer, so a convergence has to flip a row on purpose rather
-    /// than pass silently.
+    /// Each row pins `eval_using`'s and the cursor entry's answer, and the
+    /// `eval` half is asserted equal to the cursor entry's for every row --
+    /// including the collections that materialize in the cursor entry too
+    /// (`[., 1]`, `{a: .}`, `. as $x | [$x]`, #3427), which raise in both, so
+    /// fixing #3427 has to flip a row on purpose.
     #[test]
-    fn eval_entry_validates_what_the_cursor_entry_navigates_3266() {
+    fn eval_entry_agrees_with_the_cursor_entry_on_unreadable_values_3266() {
         use crate::jq::eval_generic::{eval_using, eval_with_cursor_using, GenericResult};
 
         /// `None` = raises a decode failure; `Some(json)` = answers exactly
@@ -114399,50 +114468,40 @@ mod tests {
         type Outcome = Option<&'static str>;
         const OBJ: &str = r#"[{"a":1,"b":tru}]"#;
         // (document -- the filter runs on its first element, filter,
-        //  `eval`, `eval_using`, `eval_with_cursor_using`)
-        const ROWS: &[(&str, &str, Outcome, Outcome, Outcome)] = &[
-            ("[1.2.3]", "1", Some("1"), Some("1"), Some("1")),
-            ("[1.2.3]", "not", Some("false"), None, Some("false")),
-            ("[1.2.3]", "[.] | length", None, None, Some("1")),
-            ("[tru]", "[.] | length", None, None, Some("1")),
-            ("[1.2.3]", "[limit(1; .)] | length", None, None, Some("1")),
-            ("[tru]", "[limit(1; .)] | length", None, None, Some("1")),
-            ("[1.2.3]", "path(.)", None, None, Some("[]")),
-            ("[tru]", "path(.)", None, None, Some("[]")),
-            ("[1.2.3]", "[paths]", None, Some("[]"), Some("[]")),
-            ("[tru]", "[paths]", None, Some("[]"), Some("[]")),
-            ("[1.2.3]", "getpath([]) | not", None, None, Some("false")),
-            (OBJ, "path(.a)", None, None, Some(r#"["a"]"#)),
-            (OBJ, "[paths] | length", None, Some("2"), Some("2")),
+        //  `eval_using`, `eval_with_cursor_using` and therefore `eval`)
+        const ROWS: &[(&str, &str, Outcome, Outcome)] = &[
+            ("[1.2.3]", "1", Some("1"), Some("1")),
+            ("[1.2.3]", "not", None, Some("false")),
+            ("[1.2.3]", "[.] | length", None, Some("1")),
+            ("[tru]", "[.] | length", None, Some("1")),
+            ("[1.2.3]", "[limit(1; .)] | length", None, Some("1")),
+            ("[tru]", "[limit(1; .)] | length", None, Some("1")),
+            ("[1.2.3]", "path(.)", None, Some("[]")),
+            ("[tru]", "path(.)", None, Some("[]")),
+            ("[1.2.3]", "[paths]", Some("[]"), Some("[]")),
+            ("[tru]", "[paths]", Some("[]"), Some("[]")),
+            ("[1.2.3]", "getpath([]) | not", None, Some("false")),
+            (OBJ, "path(.a)", None, Some(r#"["a"]"#)),
+            (OBJ, "[paths] | length", Some("2"), Some("2")),
             (
                 OBJ,
                 "[leaf_paths]",
-                None,
                 Some(r#"[["a"],["b"]]"#),
                 Some(r#"[["a"],["b"]]"#),
             ),
-            (OBJ, r#"getpath(["a"])"#, None, None, Some("1")),
-            (OBJ, "[.[]] | length", None, Some("2"), Some("2")),
-            // `key` needs path context, so `eval` hands the whole query to
-            // the cursor entry and answers like it.
+            (OBJ, r#"getpath(["a"])"#, None, Some("1")),
+            (OBJ, "[.[]] | length", Some("2"), Some("2")),
             (
                 "[1.2.3]",
                 "select(key == 0) | [.] | length",
-                Some("1"),
                 None,
                 Some("1"),
             ),
-            (
-                OBJ,
-                "select(key == 0) | path(.a)",
-                Some(r#"["a"]"#),
-                None,
-                Some(r#"["a"]"#),
-            ),
+            (OBJ, "select(key == 0) | path(.a)", None, Some(r#"["a"]"#)),
             // #3427: these collections materialize in the cursor entry too.
-            ("[1.2.3]", "[., 1] | length", None, None, None),
-            ("[1.2.3]", "{a: .} | length", None, None, None),
-            ("[1.2.3]", ". as $x | [$x] | length", None, None, None),
+            ("[1.2.3]", "[., 1] | length", None, None),
+            ("[1.2.3]", "{a: .} | length", None, None),
+            ("[1.2.3]", ". as $x | [$x] | length", None, None),
         ];
         fn generic<V: crate::jq::document::DocumentValue>(r: GenericResult<V>) -> Outcome {
             match r {
@@ -114456,7 +114515,7 @@ mod tests {
             }
         }
         let mut moved = Vec::new();
-        for &(json, filter, want_eval, want_using, want_cursor) in ROWS {
+        for &(json, filter, want_using, want_cursor) in ROWS {
             let index = JsonIndex::build(json.as_bytes());
             let element = index
                 .root(json.as_bytes())
@@ -114477,7 +114536,7 @@ mod tests {
             let using = generic(eval_using::<JqSemantics, _>(&expr, element.value()));
             let cursor = generic(eval_with_cursor_using::<JqSemantics, _>(&expr, element));
             let got = (concrete, using, cursor);
-            let want = (want_eval, want_using, want_cursor);
+            let want = (want_cursor, want_using, want_cursor);
             if got != want {
                 // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a ROWS answer moves (#3266)"
                 moved.push(format!(

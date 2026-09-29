@@ -29,7 +29,7 @@
 //! Every expectation below is pinned against jq-1.7.1 (the version in
 //! `tests/data/jq-golden/JQ_VERSION`).
 
-use succinctly::jq::{eval, parse, JqSemantics, QueryResult};
+use succinctly::jq::{eval_full, parse, JqSemantics, QueryResult};
 use succinctly::json::JsonIndex;
 
 /// Render every output of the full evaluator as a compact JSON string.
@@ -37,7 +37,7 @@ fn full_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let index = JsonIndex::build(json);
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
-    let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+    let result: QueryResult<Vec<u64>> = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
     result
         .collect_owned::<JqSemantics>()
         .iter()

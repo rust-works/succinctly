@@ -104,7 +104,9 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
-use succinctly::jq::{eval, parse, JqSemantics, OwnedValue, QueryResult, MAX_VALUE_TREE_DEPTH};
+use succinctly::jq::{
+    eval_full, parse, JqSemantics, OwnedValue, QueryResult, MAX_VALUE_TREE_DEPTH,
+};
 use succinctly::json::JsonIndex;
 
 /// `{"k": {"k": ... {} ... }}`, `depth` levels of `"k"` nesting, no other
@@ -133,7 +135,7 @@ fn bench_recurse_clone_depth(c: &mut Criterion) {
         // would mean this fixture stopped exercising the full `d + 1`-node
         // fan-out `resolve_recursive_descent_sink` walks.
         let cursor = index.root(&json);
-        let probe: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+        let probe: QueryResult<Vec<u64>> = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
         assert!(
             matches!(probe, QueryResult::Owned(OwnedValue::Null)),
             "depth {depth} fixture must delete down to null"
@@ -143,7 +145,8 @@ fn bench_recurse_clone_depth(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(depth), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+                let result: QueryResult<Vec<u64>> =
+                    eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
                 black_box(result.collect_owned::<JqSemantics>().len())
             });
         });

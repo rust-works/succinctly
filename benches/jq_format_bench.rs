@@ -11,7 +11,8 @@
 //!
 //! * `jq_format/e2e/*` -- the **gating** measurement. Drives whole queries
 //!   through both evaluators. The `generic` arm is the CLI path; the `full`
-//!   arm is the library's `jq::eval` entry point. Any remaining gap between
+//!   arm is eval.rs's own evaluator (`eval_full`; the library's `jq::eval` is
+//!   the generic one since #3457). Any remaining gap between
 //!   them is the two evaluators' general dispatch overhead, not a format
 //!   round-trip: `eval_generic` now formats values directly (this issue's
 //!   round-trip-elimination half), the same as `full`.
@@ -30,7 +31,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
-use succinctly::jq::{eval, eval_generic, parse, Expr, JqSemantics, QueryResult};
+use succinctly::jq::{eval_full, eval_generic, parse, Expr, JqSemantics, QueryResult};
 use succinctly::json::JsonIndex;
 
 // ---------------------------------------------------------------------------
@@ -41,7 +42,7 @@ use succinctly::json::JsonIndex;
 fn run_full(json: &[u8], expr: &Expr) -> usize {
     let index = JsonIndex::build(json);
     let cursor = index.root(json);
-    let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(expr, cursor);
+    let result: QueryResult<Vec<u64>> = eval_full::<Vec<u64>, JqSemantics>(expr, cursor);
     result.collect_owned::<JqSemantics>().len()
 }
 

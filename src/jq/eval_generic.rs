@@ -75,11 +75,11 @@ use super::eval::{
     streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
     try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
-    Reentry, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
-    WHILE_UNTIL_MAX_STEPS,
+    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, RangeNum, Reentry, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict,
+    YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -16276,6 +16276,28 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// [`index_owned_by_key`] with yq's negative-index rule applied first (#3457):
+/// a negative index still negative once resolved against the array's length
+/// raises in real yq, unconditionally -- `?` does not suppress it (#2254).
+///
+/// `index_one_owned` has no notion of that rule (see
+/// `eval::yq_negative_index_error` for why it is not threaded into it), so a
+/// caller indexing an *owned* target checks it ahead. `eval.rs`'s own
+/// `KeyTargets::Owned` loop did; this evaluator's two did not, so
+/// `([1,2]+[])[(1*-5)]` answered `null` here where yq and `eval.rs` raise. It
+/// surfaced when the library entry moved onto this evaluator; the CLI's
+/// cursor route had the same answer all along.
+fn index_owned_checked<S: EvalSemantics>(
+    target: &OwnedValue,
+    key: &OwnedValue,
+    optional: bool,
+) -> Result<Option<OwnedValue>, EvalError> {
+    if let Some(e) = yq_negative_index_error::<S>(target, key) {
+        return Err(e);
+    }
+    index_owned_by_key::<S>(target, key, optional)
+}
+
 /// Evaluate `E[K]` — indexing by a computed key.
 ///
 /// The counterpart of `eval::eval_index_expr`; see that function for why the
@@ -16554,7 +16576,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                         }
                     },
                     accumulator: owned,
-                    fold: |t| index_owned_by_key::<S>(t, k, optional),
+                    fold: |t| index_owned_checked::<S>(t, k, optional),
                 }
             }
             GenericResult::One(v) => KeyTargets::Native(vec![v]),
@@ -16707,7 +16729,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     escape_generic!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                 }
                 for t in &ts {
-                    match index_owned_by_key::<S>(t, k, optional) {
+                    match index_owned_checked::<S>(t, k, optional) {
                         Ok(Some(v)) => owned.push(v),
                         Ok(None) => {}
                         // Same reasoning as the `Native` arm above: a later
