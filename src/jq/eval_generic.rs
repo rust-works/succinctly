@@ -56,7 +56,7 @@ use super::eval::{
     boolean_fanout_bools, boolean_fanout_each, bound_shape, cannot_reserve_cross_product,
     classify_limit_n, classify_nth_n, classify_parent_n, classify_skip_n, clear_nonretryable_stop,
     collapse_vec, collect_pattern_var_names, compare_key_arrays, compare_values,
-    debug_assert_materialization_error, demote_for_reentry, descriptor_slice_bounds,
+    debug_assert_materialization_error, def_spine_len, demote_for_reentry, descriptor_slice_bounds,
     each_path_on_owned, each_pattern_binding_set, each_recurse_walk, enter_def_call,
     entries_to_object, eval_each_owned, eval_full as full_eval, finish_fork_flow,
     finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
@@ -18406,10 +18406,16 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
             then,
             bound,
         } => {
-            unfolded < OWNED_IDENTITY_DEF_UNFOLD_LIMIT
+            // #3307: `bind_def` installs a whole direct spine of defs in one
+            // step and returns the filter below it, so the unfold count is
+            // charged up front, one per def, as the per-def binding it
+            // replaces charged it -- a spine of nine defs is refused here
+            // without being bound, as it always was.
+            let spine = 1 + def_spine_len(then, usize::from(OWNED_IDENTITY_DEF_UNFOLD_LIMIT) + 1);
+            usize::from(unfolded) + spine <= usize::from(OWNED_IDENTITY_DEF_UNFOLD_LIMIT)
                 && path_context_is_navigational_at(
                     &bind_def(name, params, body, then, bound),
-                    unfolded + 1,
+                    unfolded + spine as u8,
                 )
         }
         Expr::DefCall {
@@ -25641,13 +25647,17 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
                 then,
                 bound,
             } => {
-                if unfolded >= OWNED_IDENTITY_DEF_UNFOLD_LIMIT {
+                // #3307: one unfold per spine def, charged up front -- see
+                // `path_context_is_navigational_at`'s `FuncDef` arm.
+                let spine =
+                    1 + def_spine_len(then, usize::from(OWNED_IDENTITY_DEF_UNFOLD_LIMIT) + 1);
+                if usize::from(unfolded) + spine > usize::from(OWNED_IDENTITY_DEF_UNFOLD_LIMIT) {
                     return false;
                 }
                 let installed = bind_def(name, params, def_body, then, bound);
                 if !owned_identity_pipe_supported_at(
                     owned_identity_body_stages(&installed),
-                    unfolded + 1,
+                    unfolded + spine as u8,
                 ) {
                     return false;
                 }
