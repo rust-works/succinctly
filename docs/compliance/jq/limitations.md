@@ -8460,7 +8460,7 @@ and not by the install: the resolver resolves each call by a linear scan of the 
 scope (a filter naming every one of `M` defs is `O(M x calls)` before evaluation starts;
 `resolve.rs`); a chain written through a pipe (`def f_i: f_{i-1} | . + 1;`) re-runs
 `needs_path_context` down the whole chain per evaluation, quadratic in time (12000 defs:
-3 s) where `f_{i-1} + 1` is linear; and the native stack still holds one frame per def
+about 2 s) where `f_{i-1} + 1` is linear; and the native stack still holds one frame per def
 through the resolver's recursion and the drop of the parsed chain (the CLI aborts near
 500000 defs; jq itself refuses to compile about 10000). The recursion-depth *charge* is
 unchanged on purpose, so a spine of 40000 or more defs refuses a call to a def with that
