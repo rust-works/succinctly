@@ -658,9 +658,14 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
     // false on every path outside a jq-mode `as` body, so it goes first, so
     // that every per-item bind (`.[] | .score as $y`, a fold's own `$u`)
     // pays nothing when no table is active -- the other order cost 3-6% on
-    // an M4 Pro. #3180: with a binding in scope, a childless node (a scalar,
-    // or an empty `{}`/`[]` that a binding may name) gets the exact
-    // `(node, document)` lookup, a compare against a handful of entries.
+    // an M4 Pro. #3180: with a binding in scope, a childless node gets the
+    // exact `(node, document)` lookup too, because an empty `{}`/`[]` is one
+    // and is what a binding may name. A scalar is childless as well and can
+    // never hit (scalars never enter the table), so it pays a thread-local
+    // read, a `RefCell` borrow and a scan of the handful of entries for
+    // nothing. Measured on `to_entries`/`[.[]]`/`with_entries` over a wide
+    // object and `. as $y | .score` over users, 2 and 10 MB, on an M4 Pro
+    // and a 7950X: neutral within the same-binary control's band (#3180).
     //
     // #3179: the same table pass also names any bound node *below* depth 0
     // -- `.a as $y | {k:.} | .k.a`, where `{k:.}` materializes the root and
@@ -5724,7 +5729,8 @@ pub(crate) fn embed_shared_for<S: EvalSemantics, C: DocumentCursor>(
     // "has BP children", so it is `false` for an empty `{}`/`[]`, which is
     // still an `Rc`-backed value a binding registers and whose identity jq
     // keeps. The exact `(node, document)` lookup is the whole test -- a
-    // scalar never enters the table, so it can only hit a bound node.
+    // scalar never enters the table, so it can only hit a bound node (and
+    // pays the lookup for nothing; see `to_owned_cursor` for the cost).
     if S::TAG != EvalTag::Jq || !embed_table::active() {
         return None;
     }

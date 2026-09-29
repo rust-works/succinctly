@@ -69160,6 +69160,39 @@ fn test_default_route_empty_container_embed_keeps_identity_3180() -> Result<()> 
             "[]",
         ),
         (r#"{"a":{}}"#, r". as $x | {k:.} | .k | path($x)", "[]"),
+        // The bound empty container sits *inside* the materialized root
+        // (#3179's nested reuse): the root has children, so `is_container`
+        // was never the obstacle, and these already answered. Pinned so a
+        // change to the nested precheck cannot lose them silently.
+        (r#"{"a":{}}"#, r".a as $y | {k:.} | .k.a | path($y)", "[]"),
+        (r#"{"a":{}}"#, r".a as $y | [.] | .[0].a | path($y)", "[]"),
+        (
+            r#"{"a":{}}"#,
+            r".a as $y | {k:{j:.}} | .k.j.a | path($y)",
+            "[]",
+        ),
+        (r#"{"a":[]}"#, r".a as $y | {k:.} | .k.a | path($y)", "[]"),
+        (r#"{"a":[]}"#, r".a as $y | [.] | .[0].a | path($y)", "[]"),
+        (
+            r#"{"a":[]}"#,
+            r".a as $y | {k:{j:.}} | .k.j.a | path($y)",
+            "[]",
+        ),
+        (
+            r#"{"a":{},"b":{}}"#,
+            r".a as $y | {k:.} | .k.a | path($y)",
+            "[]",
+        ),
+        (
+            r#"{"a":{},"b":{}}"#,
+            r".a as $y | [.] | .[0].a | path($y)",
+            "[]",
+        ),
+        (
+            r#"{"a":{},"b":{}}"#,
+            r".a as $y | {k:{j:.}} | .k.j.a | path($y)",
+            "[]",
+        ),
         // The write half, where a wrong answer costs data.
         ("{}", r". as $x | {k:.} | .k | ($x.a) = 9", r#"{"a":9}"#),
         ("{}", r". as $x | {k:.} | .k | ($x.a) |= 9", r#"{"a":9}"#),
@@ -69189,6 +69222,9 @@ fn test_default_route_empty_container_embed_keeps_identity_3180() -> Result<()> 
         (r#"{"a":[],"b":[]}"#, r".a as $x | {k:.b} | .k | path($x)"),
         (r#"{"a":{},"b":{}}"#, r".a as $x | [.b] | .[0] | path($x)"),
         (r#"{"a":[],"b":[]}"#, r".a as $x | [.b] | .[0] | path($x)"),
+        // Nested: a *sibling's* empty container is not the bound node.
+        (r#"{"a":{}}"#, r".a as $y | {k:.} | .k.b | path($y)"),
+        (r#"{"a":[]}"#, r".a as $y | {k:.} | .k.b | path($y)"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
