@@ -337,8 +337,20 @@ DEFAULT_THRESHOLD = 5.0
 # to its own permanent 10.0 above and `users_identity` to none (see that
 # entry's own removal, also #3345) once every row read ~0% again against a
 # merge-base that already included it.
+#
+# `users_del_select` / `users_del_bound_select` / `users_update_select` /
+# `users_assign_scores` (#3069) carry overrides of the same one-off kind:
+# the reindex bridge now hands a container back out as the storage that
+# went in (`bridge_provenance`), so these write shapes stop rebuilding the
+# bridged document they resolve over (-25.9% / -25.2% / -25.2% / -17.9% on
+# x86_64 against the PR's own merge-base, outputs byte-identical). Remove
+# all four once `main` carries #3069 and the rows read ~0% again.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
+    "users_del_select": 30.0,
+    "users_del_bound_select": 30.0,
+    "users_update_select": 30.0,
+    "users_assign_scores": 30.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant

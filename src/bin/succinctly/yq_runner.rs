@@ -1727,7 +1727,7 @@ fn evaluate_input(
     sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
-    let doc = match input.reindexed::<jq::JqSemantics>() {
+    let doc = match input.reindexed_without_provenance::<jq::JqSemantics>() {
         Ok(doc) => doc,
         // #3261: report and yield nothing, exactly as `query_result_to_owned_values`'s
         // own `QueryResult::Error` arm does for a failure surfacing further downstream.
@@ -3382,7 +3382,9 @@ fn owned_value_at_mut<'v>(
 /// stages the real evaluation is about to run anyway -- whatever fails
 /// there is reported *there*, once, not a second time here.
 fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<OwnedValue>> {
-    let doc = input.reindexed::<jq::JqSemantics>().ok()?;
+    let doc = input
+        .reindexed_without_provenance::<jq::JqSemantics>()
+        .ok()?;
     let cursor = doc.root();
     match jq::eval::<Vec<u64>, YqSemantics>(expr, cursor) {
         QueryResult::One(v) => generic_to_owned::<YqSemantics, _>(&v).ok().map(|v| vec![v]),

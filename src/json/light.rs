@@ -1276,6 +1276,14 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         self.key_cursor.is_none()
     }
 
+    /// The document text the retained child cursor reads, or `None` for an
+    /// empty list -- no BP work, unlike [`whole_container_cursor`](Self::whole_container_cursor),
+    /// so a caller that only needs to know *which* document a list belongs
+    /// to can ask before paying for the hop (#3069).
+    pub(crate) fn document_text(&self) -> Option<&'a [u8]> {
+        self.key_cursor.map(|c| c.text)
+    }
+
     /// The cursor of the object this field list belongs to, but **only**
     /// while the list still stands at that object's first child -- i.e.
     /// while `StandardJson::Object(self)` really is the whole object and not
@@ -1692,6 +1700,11 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.element_cursor.is_none()
+    }
+
+    /// See [`JsonFields::document_text`].
+    pub(crate) fn document_text(&self) -> Option<&'a [u8]> {
+        self.element_cursor.map(|c| c.text)
     }
 
     /// The cursor of the array this element list belongs to, but **only**

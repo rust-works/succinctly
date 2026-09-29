@@ -66064,6 +66064,10 @@ fn test_owned_embed_navigated_inside_path_argument_3177() -> Result<()> {
 /// What #3177 leaves refused, each a mechanism of its own (see
 /// `docs/compliance/jq/limitations.md`'s #2889 residual table). Every jq
 /// 1.7.1 answer captured live; refusing is the safe direction (ADR-0018).
+/// The wrapper rows this used to pin (`path()` under a comma, `limit`,
+/// `first`, `label`, `?`, as an `as`/`reduce` source or a binary operand,
+/// and behind `with_entries`/`add`/a no-op `|=`) answer since #3069's
+/// bridge provenance: see `test_bridge_provenance_keeps_path_identity_3069`.
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
@@ -66079,66 +66083,6 @@ fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
             r". as $x | [.] | path(.[0] | $x)",
             "a scalar is not Rc-backed, so there is no storage to share (jq `[0]`)",
         ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | (path(.[0] | $x), path(.[0] | $x | .a))",
-            "`path()` under a comma wrapper is not at the head of the owned \
-             re-entry, so it still bridges (jq `[0]` then `[0,\"a\"]`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | [limit(1; path(.[] | $x))]",
-            "`path()` under an array constructor and `limit` still bridges (jq `[[0]]`)",
-        ),
-        // The door opens only for the head of the pipe the owned re-entry
-        // is handed: a `path()` that is a bind's source, a binary operand,
-        // or the body of `first`/`label` is in no such position (#3189).
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | path(.[0] | $x) as $p | $p",
-            "`path()` as an `as` source still bridges (jq `[0]`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | reduce path(.[0] | $x) as $p (0; 1)",
-            "`path()` as a `reduce` source still bridges (jq `1`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | select(path(.[0] | $x) == [0])",
-            "`path()` as a binary operand still bridges (jq `[{\"a\":1}]`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | first(path(.[] | $x) | .[0])",
-            "`path()` as the body of `first` still bridges (jq `0`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | label $out | path(.[0] | $x) | ., break $out",
-            "`path()` as the body of `label` still bridges (jq `[0]`)",
-        ),
-        // A stage ahead of `path()` that folds through `eval_on_owned`'s
-        // round trip hands the resolver fresh copies. jq answers every one:
-        // its `with_entries`/`add`/`setpath` move the element's own `jv`
-        // into the new container. (`sort`/`reverse`/`unique`/`to_entries`
-        // relocate natively since #3178 -- see
-        // `test_owned_embed_identity_through_relocating_builtins_3178`.)
-        (
-            r#"{"a":1}"#,
-            r". as $x | {k:.} | with_entries(.) | path(.k | $x)",
-            "`with_entries` ahead of `path()` bridges first (jq `[\"k\"]`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [[.]] | add | path(.[0] | $x)",
-            "a one-element `add` ahead of `path()` bridges first (jq `[0]`)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r". as $x | [.] | .[0] |= . | path(.[0] | $x)",
-            "a no-op `|=` ahead of `path()` bridges first (jq `[0]`)",
-        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
@@ -66146,17 +66090,6 @@ fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
             "#3177 residual: `{filter}` ({why}): stdout={stdout:?} stderr={stderr:?}"
         );
     }
-    // `path(f)?` is a `try` wrapper and swallows the refusal above into no
-    // output at all, where jq prints `[0]`.
-    let (stdout, stderr, code) = run_jq_full(
-        &["-c", r". as $x | [.] | path(.[0] | $x)?"],
-        Some(r#"{"a":1}"#),
-    )?;
-    assert_eq!(
-        (stdout.trim_end(), code),
-        ("", 0),
-        "#3177 residual: stderr={stderr:?}"
-    );
     Ok(())
 }
 
@@ -67445,11 +67378,11 @@ fn test_tracked_var_rebuilt_root_in_evaluator_routes_refuse_3036() -> Result<()>
             r#"{"a":1}"#,
             ". as $x | any({a:1}; ($x.a = 9))",
         ),
-        (
-            &["-c"][..],
-            r#"{"a":1}"#,
-            ". as $x | try (if .a then error($x) else error({a:1}) end) catch path($x)",
-        ),
+        // (`try (if .a then error($x) else error({a:1}) end) catch path($x)`
+        // is not one of these: `.a` is truthy, so the handler's `.` is `$x`'s
+        // own allocation, and jq answers `[]` -- as succinctly does since
+        // #3069's bridge provenance. See
+        // `test_bridge_provenance_keeps_path_identity_3069`.)
         (
             &["-c"][..],
             r#"{"foo":[2,1]}"#,
@@ -68319,41 +68252,69 @@ fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
     Ok(())
 }
 
-/// What #3037 leaves refusing, pinned so a later widening is deliberate.
-/// jq 1.7.1 answers every row; each is the safe direction.
+/// What #3037 left refusing, answered since #3069. jq 1.7.1 answers every
+/// row (captured live).
 ///
 /// - The positional assignment row: the marker certified at a non-root
 ///   register position inside an assignment's resolver (`(.a | ($y.b)) =
-///   9`). Its `path(.a | $y)` twin answers since #3179: the resolver's
-///   materialized root now holds `$y`'s own value at `.a`, where the
-///   assignment resolver does not materialize through `to_owned_cursor`.
-/// - A navigated bind on an *owned-rooted* document (`input | …`, `-n`, a
-///   `tojson|fromjson`-rebuilt root): the marker's node is an
-///   `OwnedIdentity` position, and `marker_is_root` reads only a document
-///   node against a live cursor -- no `OwnedRoot` twin (review finding).
+///   9`), where the assignment resolver's root was a bridged rebuild.
+/// - A navigated bind on an *owned-rooted* document (`input | …` under
+///   `-n`, a `tojson|fromjson`-rebuilt root, a constructed root): the
+///   marker's node is an `OwnedIdentity` position, which `marker_is_root`
+///   cannot read against a live cursor.
 ///
-/// The routes that re-enter the eager evaluator with an *owned*
-/// accumulator (`reduce`'s UPDATE, a `catch` handler) used to be listed
-/// here too: their `eval_as` carries no node for a navigated bind, so no
-/// witness could promote it. #3177's storage clause needs no witness --
-/// the bind's value and the register are the same `Rc` -- so those rows
-/// moved to [`test_navigated_bind_at_its_own_node_3037`].
+/// Both now certify by storage instead of by node: the reindex bridge hands
+/// each container back out as the storage that went in
+/// (`bridge_provenance`), so the resolver stands on `$y`'s own `Rc` at
+/// `.a`, and #3177's storage clause is jq's `jv_identical`.
+#[cfg(not(feature = "unshared-containers"))]
 #[test]
 // jq filter literals like `{b:1}`/`{k:.a}` are not formatting strings;
 // clippy cannot tell the two apart from the brace shape alone (as `*_2642`).
 #[allow(clippy::literal_string_with_formatting_args)]
-fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
-    let filter = r".a as $y | (.a | ($y.b)) = 9";
-    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1}}"#))?;
-    assert_eq!(
-        code, 5,
-        "#3037 residual: `{filter}` (jq answers; recorded refuse-only), got \
-         stdout={stdout:?} stderr={stderr:?}"
-    );
-    assert!(
-        stderr.contains("Invalid path expression"),
-        "#3037 residual: `{filter}` -- stderr: {stderr:?}"
-    );
+fn test_navigated_bind_positional_and_owned_root_rows_answer_3069() -> Result<()> {
+    let input = r#"{"a":{"b":1}}"#;
+    for (args, filter, expected) in [
+        (
+            &["-c"][..],
+            r".a as $y | (.a | ($y.b)) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            &["-n", "-c"][..],
+            r"input | .a as $y | (.a | ($y.b)) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            &["-n", "-c"][..],
+            r"input | .a as $y | path(.a | $y)",
+            r#"["a"]"#,
+        ),
+        (
+            &["-c"][..],
+            r"tojson | fromjson | .a as $y | path(.a | $y)",
+            r#"["a"]"#,
+        ),
+        (
+            &["-c"][..],
+            r"tojson | fromjson | .a as $y | (.a | ($y.b)) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            &["-n", "-c"][..],
+            r"{a:{b:1}} | .a as $y | path(.a | $y)",
+            r#"["a"]"#,
+        ),
+    ] {
+        let mut argv: Vec<&str> = args.to_vec();
+        argv.push(filter);
+        let (stdout, stderr, code) = run_jq_full(&argv, Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
     Ok(())
 }
 
@@ -68598,8 +68559,7 @@ fn test_navigated_bind_on_owned_root_traps_refuse_3135() -> Result<()> {
 /// consulted node identity first, so a `null`/`bool` marker bound from a
 /// navigated position refused at an equal-valued *sibling* where jq
 /// answers. All three values, and both write forms (`|=`, `del`), not just
-/// the `path()` read `test_navigated_bind_residuals_refuse_cleanly_3037`
-/// used to pin as refuse-only. The last two rows are
+/// the `path()` read #3037's residual test used to pin as refuse-only. The last two rows are
 /// `resolve_as_pattern`'s own sibling gap (review): a bare-var pattern
 /// source (`$y as $z | ...`) reaches `resolves_to_register`'s identical
 /// `TrackedVar` arm, which had the same gap independently.
@@ -69080,25 +69040,11 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         (r"{}", r"input | . as $x | {k:.} | .k | path($x)"),
         (r"[]", r"input | . as $x | {k:.} | .k | path($x)"),
         // (Collecting the pipe into an array answers since #3180 -- see
-        // `test_input_route_array_collect_keeps_embed_identity_3180`.)
-        // A second construct-and-navigate hop: the first hop's re-entry
-        // bridges `{j:.}`, and the throwaway document it builds holds no
-        // node the table knows. jq answers `[]`/`[[]]`.
-        (
-            r#"{"a":1}"#,
-            r"input | . as $x | {k:.} | .k | {j:.} | .j | path($x)",
-        ),
-        (
-            r#"{"a":1}"#,
-            r"[input | . as $x | {k:.} | .k | {j:.} | .j | path($x)]",
-        ),
-        // #3179's nested reuse is the generic evaluator's: `eval.rs`'s own
-        // converter still reuses at depth 0 only. jq answers `[]`/`["a"]`.
-        (
-            r#"{"a":{"b":1}}"#,
-            r"input | .a as $y | {k:.} | .k.a | path($y)",
-        ),
-        (r#"{"a":{"b":1}}"#, r"input | .a as $y | path(.a | $y)"),
+        // `test_input_route_array_collect_keeps_embed_identity_3180`. A
+        // second construct-and-navigate hop, `{k:.} | .k | {j:.} | .j`, and
+        // `eval.rs`'s nested reuse, `input | .a as $y | {k:.} | .k.a`,
+        // answer since #3069's bridge provenance -- see
+        // `test_bridge_provenance_keeps_path_identity_3069`.)
         // A scalar root never enters the table on this route. jq answers.
         ("1", r"input | . as $x | [.] | .[0] | path($x)"),
         ("1", r"[input | . as $x | [.] | .[0] | path($x)]"),
@@ -74197,6 +74143,484 @@ fn test_container_identity_through_document_input_3069() -> Result<()> {
             (stdout.trim_end(), code),
             (expected, 0),
             "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3069 Phase 2: the same identity where the value crossed the reindex
+/// bridge or was bound from a constructed source. Under `-n` every stage
+/// after `[nan]` runs over a bridged copy of its input, and each read of a
+/// container used to materialize a fresh twin (`[.] == [.]` compared two);
+/// a read now hands back the storage that went in (`bridge_provenance`), and
+/// a constructed `as` source is spliced as its own storage rather than
+/// rebuilt at each `$a`. Every value captured from `/usr/bin/jq` 1.7.1 with
+/// `-nc`.
+#[cfg(not(feature = "unshared-containers"))]
+const CONTAINER_IDENTITY_ACROSS_THE_BRIDGE_3069: &[(&str, &str)] = &[
+    ("[nan] as $a | $a == $a", "true"),
+    ("([nan]|.) as $a | $a == $a", "true"),
+    ("{a:nan} as $a | $a == $a", "true"),
+    ("[nan] | [.] == [.]", "true"),
+    ("[nan] | [.,.] | .[0] == .[1]", "true"),
+    ("[nan] | [.,.] | unique | length", "1"),
+    ("[nan] | . + [] == .", "true"),
+    ("{a:nan} | . + {} == .", "true"),
+    ("[nan] | first(.) == .", "true"),
+    ("[nan] | getpath([]) == .", "true"),
+    ("[nan] | def f: .; f == .", "true"),
+    ("[nan] | tojson as $t | . == .", "true"),
+    ("[nan] | [limit(1; .)] == [.]", "true"),
+    ("[nan] | [range(2) as $i | .] | .[0] == .[1]", "true"),
+    ("[nan] | [.] - [.]", "[]"),
+    ("[nan] | . as $a | [$a] | .[] == $a", "true"),
+    ("[nan] | . as $a | [$a] | any(. == $a)", "true"),
+    ("[nan] | . as $a | [$a,$a] | group_by(.) | length", "1"),
+    ("[nan] | . as $a | [$a,$a] | unique_by(.) | length", "1"),
+    ("[nan] | . as $a | [$a] | bsearch($a)", "0"),
+    ("[nan] | . as $a | [$a,$a] | bsearch($a)", "0"),
+    ("[nan] | . as $a | [$a] | .[1] = 2 | .[0] == $a", "true"),
+    ("[nan] | . as $a | [$a] | del(.[1]) | .[0] == $a", "true"),
+    ("[nan] | . as $a | [$a] | . + [1] | .[0] == $a", "true"),
+    ("[nan] | . as $a | [$a] | map(.) | .[0] == $a", "true"),
+    (
+        "[nan] | . as $a | {a:$a} | with_entries(.) | .a == $a",
+        "true",
+    ),
+    (
+        "[nan] | . as $a | reduce range(2) as $i ([]; . + [$a]) | .[0] == .[1]",
+        "true",
+    ),
+    ("[1] | .[0] = nan | [.,.] | unique | length", "1"),
+    ("[nan] | .[0:] == .", "true"),
+    ("[nan,1] | .[0:2] == .", "true"),
+    ("{a:[nan]} | .a as $x | .a | path($x)", "[]"),
+];
+
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_container_identity_survives_the_bridge_and_literal_binds_3069() -> Result<()> {
+    for (filter, expected) in CONTAINER_IDENTITY_ACROSS_THE_BRIDGE_3069 {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "", &["-nc"])?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (*expected, 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    // Document input: the stage after `map(nan)` is bridged too.
+    let (stdout, stderr, code) = run_jq_stdin_streams("map(nan) | . == .", "[1]", &["-c"])?;
+    assert_eq!((stdout.trim_end(), code), ("true", 0), "stderr={stderr:?}");
+    Ok(())
+}
+
+/// #3069's bridge provenance, seen by `path()`: a container read back out of
+/// the reindex bridge is the storage that went in, so a bound `$x` embedded
+/// in something the bridge rebuilt is still `$x`'s own `Rc` where the
+/// resolver meets it, and #3177's storage clause certifies it as jq's
+/// `jv_identical` does. That closes the wrapper rows #3189 lists (`path()`
+/// under `?`, `try`, a comma, `limit`, `first`, `label`, as a bind or
+/// `reduce` source, as a binary operand), #3305's relocating builtins
+/// (`sort_by`/`unique_by`/`group_by`/`min_by`/`max_by`, `with_entries`,
+/// `map_values`, `flatten`, `[.[]]`, `limit`, `first`, `add`), #3383,
+/// #3328 and #3331, plus the #2889/#3036/#3188 residuals that bridged for
+/// the same reason. Every expected output captured live against jq 1.7.1.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_bridge_provenance_keeps_path_identity_3069() -> Result<()> {
+    for (args, input, filter, expected) in [
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | try (if .a then error($x) else error({a:1}) end) catch path($x)",
+            "[]",
+        ),
+        (
+            &["-n", "-c"][..],
+            "{\"a\":1}",
+            "input | . as $x | {k:.} | .k | {j:.} | .j | path($x)",
+            "[]",
+        ),
+        (
+            &["-n", "-c"][..],
+            "{\"a\":1}",
+            "[input | . as $x | {k:.} | .k | {j:.} | .j | path($x)]",
+            "[[]]",
+        ),
+        (
+            &["-n", "-c"][..],
+            "{\"a\":{\"b\":1}}",
+            "input | .a as $y | {k:.} | .k.a | path($y)",
+            "[]",
+        ),
+        (
+            &["-n", "-c"][..],
+            "{\"a\":{\"b\":1}}",
+            "input | .a as $y | path(.a | $y)",
+            "[\"a\"]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | path(.[0] | $x)?",
+            "[0]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | try path(.[0] | $x) catch \"caught\"",
+            "[0]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | (path(.[0] | $x), path(.[0] | $x | .a))",
+            "[0]\n[0,\"a\"]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | [limit(1; path(.[] | $x))]",
+            "[[0]]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | path(.[0] | $x) as $p | $p",
+            "[0]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | reduce path(.[0] | $x) as $p (0; 1)",
+            "1",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | select(path(.[0] | $x) == [0])",
+            "[{\"a\":1}]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | first(path(.[] | $x) | .[0])",
+            "0",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | label $out | path(.[0] | $x) | ., break $out",
+            "[0]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | sort_by(.a) | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | unique_by(.a) | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | group_by(.a) | .[0][0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | min_by(.a) | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | max_by(.a) | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | {k:.} | with_entries(.) | .k | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | {k:.} | map_values(.) | .k | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [[.]] | flatten | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | {k:.} | [.[]] | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | limit(1; .[]) | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | first(.[]) | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [[.]] | add | path(.[0] | $x)",
+            "[0]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | sort_by(.a) | .[0] | ($x.a) = 9",
+            "{\"a\":9}",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.,.] | sort_by(.a) | .[1] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | [.[] | select(true)] | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | {k:.} | with_entries(.value |= .) | .k | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | {k:.} | with_entries(.) | path(.k | $x)",
+            "[\"k\"]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | .[0] |= . | path(.[0] | $x)",
+            "[0]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | limit(1; .[]) | ($x.a) = 9",
+            "{\"a\":9}",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | [.[0] + {}] | path(.[0] | $x)",
+            "[0]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | [.[0] * {}] | path(.[0] | $x)",
+            "[0]",
+        ),
+        // #3383 (a no-op `|=`), #3328 (a fold over an owned input), #3331
+        // (`until`, `-n`'s owned-identity binds), #3188's wrapper and `.[]`
+        // rows, and an ancestor's container or a full-range slice ahead of
+        // the read: each bridged a copy before the resolver met it.
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | .[0] |= . | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | reduce (1) as $i (.[0]; ($x.a) = 9)",
+            "{\"a\":9}",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | reduce range(1) as $i (.; .) | del(.[0] | $x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | reduce range(1) as $i (.; del(.[0] | $x))",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | {b:.} | reduce (1) as $i (.b; path($x))",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | reduce limit(1; repeat(1)) as $i (.; ($x.a) = 9)",
+            "{\"a\":9}",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | until(try (path($x) == []) catch false; .[0])",
+            "{\"a\":1}",
+        ),
+        (
+            &["-n", "-c"][..],
+            "{\"a\":{\"b\":1}}",
+            "input | .a as $y | .a | reduce (1) as $i (.; ($y.b) = 9)",
+            "{\"b\":9}",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | (del(.[0] | $x))?",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | try del(.[0] | $x) catch \"c\"",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.] | [.[] | del(. | $x)]",
+            "[null]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [[.]] | .[] | sort | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":{\"b\":1}}",
+            ".a as $y | {k:.} | .k | path(.a | $y)",
+            "[\"a\"]",
+        ),
+        (
+            &["-c"][..],
+            "{\"a\":1}",
+            ". as $x | [.,1] | .[0:2] | .[0] | path($x)",
+            "[]",
+        ),
+    ] {
+        let mut argv: Vec<&str> = args.to_vec();
+        argv.push(filter);
+        let (stdout, stderr, code) = run_jq_full(&argv, Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The other side of `test_bridge_provenance_keeps_path_identity_3069`: a
+/// rebuilt container is a new allocation in jq, so a value-equal copy of
+/// `$x` never certifies -- a written copy (`.a |= .`, `map(.a |= .)`), a
+/// merge into a *new* left operand (`{} + .`, `. + {a:1}`), a re-parse, a
+/// sibling, a raised copy. Any of these answering would be the provenance
+/// table handing out storage for a node that is not the one that went in.
+/// Each captured live as refused by jq 1.7.1 on `{"a":1}`.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_bridge_provenance_never_certifies_a_rebuilt_copy_3069() -> Result<()> {
+    for filter in [
+        ". as $x | .a |= . | path($x)",
+        ". as $x | with_entries(.) | path($x)",
+        ". as $x | [.[]] | path($x)",
+        ". as $x | . + {a:1} | path($x)",
+        ". as $x | [.] | map({} + .) | path(.[0] | $x)",
+        ". as $x | [.] | [{} + .[0]] | path(.[0] | $x)",
+        ". as $x | [.] | map(.a |= .) | path(.[0] | $x)",
+        ". as $x | [.] | map(with_entries(.)) | path(.[0] | $x)",
+        ". as $x | [.] | tojson | fromjson | path(.[0] | $x)",
+        ". as $x | [.,{a:1}] | path(.[1] | $x)",
+        ". as $x | try error({a:1}) catch path($x)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(
+            code, 5,
+            "`{filter}` must refuse as jq does: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A constructed `as` source is spliced as an untracked marker now (#3069),
+/// not as literal syntax. It is a value, never a node of `.`, so `path()`
+/// and a write through it refuse exactly as before -- and certify only where
+/// jq's own identity does, the resolver standing on the bound storage itself
+/// (`$a | path($a)`). Captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+// jq filter literals like `{a:1}` are not formatting strings.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_literal_bind_keeps_path_answers_3069() -> Result<()> {
+    for (filter, stdout_expected, stderr_expected, code_expected) in [
+        (
+            "[1] as $a | path($a)",
+            "",
+            "jq: error (at <unknown>): Invalid path expression with result [1]",
+            5,
+        ),
+        (
+            "{a:1} as $a | path($a)",
+            "",
+            "jq: error (at <unknown>): Invalid path expression with result {\"a\":1}",
+            5,
+        ),
+        (
+            "[1] as $a | $a[0] = 2",
+            "",
+            "jq: error (at <unknown>): Invalid path expression near attempt to access element 0 of [1]",
+            5,
+        ),
+        (
+            "[1] as $a | del($a[0])",
+            "",
+            "jq: error (at <unknown>): Invalid path expression near attempt to access element 0 of [1]",
+            5,
+        ),
+        ("[1] as $a | $a | path($a)", "[]", "", 0),
+        ("[1] as $a | [$a] | path(.[0] | $a)", "[0]", "", 0),
+        ("[1] as $a | $a | . as $b | path($b)", "[]", "", 0),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "", &["-nc"])?;
+        assert_eq!(
+            (stdout.trim_end(), stderr.trim_end(), code),
+            (stdout_expected, stderr_expected, code_expected),
+            "`{filter}`"
         );
     }
     Ok(())

@@ -49128,6 +49128,12 @@ fn test_yq_container_nan_equality_stays_structural_3069() -> Result<()> {
         (".a != .a", "true"),
         (".b == .b", "false"),
         (".a | . == .", "false"),
+        // Past the reindex bridge and through binds too: yq mode's bridge
+        // rebuilds (`REINDEX_BRIDGE_KEEPS_IDENTITY` is jq-only).
+        ("[.a] == [.a]", "false"),
+        (".a as $x | $x == $x", "false"),
+        ("[.a, .a] | .[0] == .[1]", "false"),
+        (".a | [.] == [.]", "false"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, "a: [.nan]\nb: {x: .nan}\n", &[])?;
         assert_eq!((stdout.trim_end(), code), (expected, 0), "`{filter}`");

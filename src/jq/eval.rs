@@ -139,6 +139,16 @@ pub trait EvalSemantics: Copy + Default {
     /// `a: [.nan]`. Ordering is untouched in both modes, since jq's
     /// `jv_cmp` has no identity check (`[nan] | . < .` is `true`).
     const EQUALITY_SHORT_CIRCUITS_ON_IDENTITY: bool;
+    /// If true (jq, #3069), a container the reindex bridge serialized comes
+    /// back out of the bridged document as the *same* storage it went in as
+    /// ([`OwnedValue::reindexed`](super::value::OwnedValue::reindexed)'s
+    /// provenance table), rather than as a value-equal rebuild -- in jq a
+    /// value is never copied by being read, so `[nan] | [.] == [.]` is
+    /// `true` there, and only identity keeps it so here. If false (yq), every
+    /// read out of the bridge rebuilds, as before #3069: nothing yq-side
+    /// compares by identity, and its node-metadata routes are #2643's
+    /// business, so the mode keeps the behaviour it was measured under.
+    const REINDEX_BRIDGE_KEEPS_IDENTITY: bool;
     /// If false (jq), a `null` *right* operand of `+` passes through
     /// unconditionally for any left-operand type (`7 + null` -> `7`,
     /// `{} + null` -> `{}`) -- jq's own null-symmetric identity for `+`
@@ -339,6 +349,7 @@ impl EvalSemantics for JqSemantics {
     const DEFAULT_HALT_ERROR_CODE: i32 = 5;
     const STRICT_NUMERIC_EQUALITY: bool = false;
     const EQUALITY_SHORT_CIRCUITS_ON_IDENTITY: bool = true;
+    const REINDEX_BRIDGE_KEEPS_IDENTITY: bool = true;
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = false;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = false;
     const COLLAPSE_DUPLICATE_KEYS: bool = true;
@@ -374,6 +385,7 @@ impl EvalSemantics for YqSemantics {
     const DEFAULT_HALT_ERROR_CODE: i32 = 1;
     const STRICT_NUMERIC_EQUALITY: bool = true;
     const EQUALITY_SHORT_CIRCUITS_ON_IDENTITY: bool = false;
+    const REINDEX_BRIDGE_KEEPS_IDENTITY: bool = false;
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = true;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = true;
     const COLLAPSE_DUPLICATE_KEYS: bool = false;
@@ -2201,6 +2213,117 @@ fn embed_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     super::eval_generic::embed_shared_for::<S, _>(&cursor)
 }
 
+/// The storage a container read out of the reindex bridge went *in* as, if
+/// `value` stands at a container of a registered bridge document (#3069) --
+/// see [`bridge_provenance`](super::value::bridge_provenance) for why that
+/// handle is the value a fresh walk would build.
+///
+/// Taken at the depth-0 entry of the two converters a bridged document's
+/// nodes leave through: [`to_owned`] here, for every read inside the bridged
+/// evaluation the #3069 audit found (`[.]`, an operand of `==`/`+`/`-`,
+/// `getpath`, a write's root, `indices`' element list), and
+/// `eval_generic::owned_from_standard_json`, for the bridge's own results
+/// handed back to the generic evaluator (`first(.[])`, `limit(1; .[])`). A
+/// container the table refuses is refused because something *inside* it
+/// does not round-trip, so reusing its children would buy an identity no
+/// jq-visible answer asks for. The gate is one thread-local load when no
+/// bridge document is live, and in yq mode nothing is ever registered.
+pub(crate) fn bridge_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+) -> Option<OwnedValue> {
+    use super::value::bridge_provenance;
+    if !S::REINDEX_BRIDGE_KEEPS_IDENTITY || !bridge_provenance::active() {
+        return None;
+    }
+    // Which document first, from the retained child cursor: a read from any
+    // other document (the input, a sibling bridge) stops here, before the
+    // BP `parent()` hop that naming the container's own node costs.
+    let text = match value {
+        StandardJson::Array(elements) => elements.document_text()?,
+        StandardJson::Object(fields) => fields.document_text()?,
+        _ => return None,
+    };
+    let text = text.as_ptr() as usize;
+    if !bridge_provenance::registered(text) {
+        return None;
+    }
+    let cursor = standard_json_node_cursor(value)?;
+    let node = cursor.bp_position();
+    let shared = bridge_provenance::shared_for(text, node, |source| {
+        bridge_provenance_descend(source, cursor.index().root(cursor.text()), node)
+    })?;
+    // The table places each container by arithmetic over the source rather
+    // than by walking the document (see `bridge_provenance`); a node whose
+    // kind disagrees would mean the two stopped corresponding, and is read
+    // fresh instead.
+    let same_kind = matches!(
+        (&shared, value),
+        (OwnedValue::Array(_), StandardJson::Array(_))
+            | (OwnedValue::Object(_), StandardJson::Object(_))
+    );
+    if !same_kind {
+        debug_assert!(
+            // omni-dev: coverage tolerate-line reason="unreachable: same invariant as the tolerated line below (#3069)"
+            same_kind, // omni-dev: coverage tolerate-line reason="unreachable: same invariant as the tolerated line below (#3069)"
+            "#3069: bridge provenance names a {shared:?} for another kind"
+        ); // omni-dev: coverage tolerate-line reason="unreachable: a bridge document is its source's serialization, so the node at each recorded position is the recorded kind (#3069)"
+        return None; // omni-dev: coverage tolerate-line reason="unreachable: see the debug_assert above (#3069)"
+    }
+    #[cfg(debug_assertions)]
+    {
+        let fresh = to_owned_at_depth::<S, W>(value, None, 0);
+        debug_assert!(
+            fresh
+                .as_ref()
+                .is_ok_and(|fresh| super::value::bridge_round_trip_eq(&shared, fresh)),
+            "#3069: bridge provenance handed back {shared:?} where a fresh walk builds {fresh:?}"
+        );
+    }
+    Some(shared)
+}
+
+/// The source storage for the container at BP position `node` of a bridge
+/// document, found by walking down from `cursor` (the document's root, over
+/// `source`, the value it was serialized from) through only the subtrees
+/// that hold `node`: each sibling ahead of it is skipped by its BP close
+/// ([`DocumentCursor::subtree_end`]), and its source counterpart by index,
+/// so nothing else in the value is read. `None` where the node is not a
+/// container, or its subtree does not round-trip unchanged
+/// ([`reindex_bridge_is_identity`](super::eval_generic::reindex_bridge_is_identity),
+/// which depends on that subtree alone). The first read of each bridge
+/// document takes this route (`bridge_provenance::shared_for`).
+pub(crate) fn bridge_provenance_descend<W: Clone + AsRef<[u64]>>(
+    source: &OwnedValue,
+    cursor: JsonCursor<'_, W>,
+    node: usize,
+) -> Option<OwnedValue> {
+    let (mut source, mut cursor) = (source, cursor);
+    while cursor.bp_position() != node {
+        // Children lie in document order, so the first whose subtree closes
+        // at or after `node` is the one holding it.
+        let mut child = cursor.first_child();
+        (source, cursor) = match source {
+            OwnedValue::Array(items) => items.iter().find_map(|item| {
+                let element = child?;
+                child = element.next_sibling();
+                (node <= element.subtree_end()?).then_some((item, element))
+            })?,
+            OwnedValue::Object(fields) => fields.values().find_map(|field| {
+                let value = child?.next_sibling()?; // past the key's own node
+                child = value.next_sibling();
+                (node <= value.subtree_end()?).then_some((field, value))
+            })?,
+            _ => return None, // omni-dev: coverage tolerate-line reason="unreachable: a scalar has no children, and `node` lies inside the subtree the walk is in (#3069)"
+        };
+        if node < cursor.bp_position() {
+            return None; // an object key's own node, never a container
+        }
+    }
+    (matches!(source, OwnedValue::Array(_) | OwnedValue::Object(_))
+        && super::eval_generic::reindex_bridge_is_identity(source))
+    .then(|| source.clone())
+}
+
 /// The [`BindOrigin`] an `as` binding over `value` should carry (#2889
 /// Stage B): the document node the value *is*, when
 /// [`standard_json_node_cursor`] can name one.
@@ -2254,6 +2377,9 @@ fn to_owned<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     // #2889 Stage B: `eval_generic::to_owned_cursor`'s reuse, on this
     // evaluator's own converter -- see [`embed_shared_for_value`].
     if let Some(shared) = embed_shared_for_value::<S, W>(value) {
+        return Ok(shared);
+    }
+    if let Some(shared) = bridge_shared_for_value::<S, W>(value) {
         return Ok(shared);
     }
     let result = to_owned_at_depth::<S, W>(value, None, 0);
@@ -39324,6 +39450,7 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
                 origin,
                 None,
                 S::TAG == EvalTag::Jq,
+                false,
             );
             resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
         },
@@ -39947,7 +40074,17 @@ fn bind_pattern_body(
             // there as a passthrough of the root let `del((. | .) as {a:$v}
             // ?// $v | $v.x?, $v)` delete the whole document where jq edits
             // `.a` (the bare `.` source already does, a pre-existing gap).
-            substitute_bound_var_at(source, body, name, bound, identity_at, origin, None, false)
+            substitute_bound_var_at(
+                source,
+                body,
+                name,
+                bound,
+                identity_at,
+                origin,
+                None,
+                false,
+                false,
+            )
         }
         Pattern::Object(_) | Pattern::Array(_) => {
             bound_names.extend(bindings.iter().map(|b| b.name.clone()));
@@ -46654,6 +46791,7 @@ pub(crate) fn substitute_bound_var_from<S: EvalSemantics>(
         None,
         node,
         S::TAG == EvalTag::Jq,
+        S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY,
     )
 }
 
@@ -46818,8 +46956,15 @@ fn identity_bind_position<S: EvalSemantics>(
 /// invocation), the marker is `Origin::Untracked` -- carried for the
 /// cursor routes only, never certified by `resolve_node`. With none of the
 /// three this is a plain, unwrapped literal substitution, same as
-/// `substitute_var`.
-#[allow(clippy::too_many_arguments)] // STYLE-0004: the bind's source, body, value and three witnesses, plus the grammar width
+/// `substitute_var` -- except, with `keep_container_identity` (jq mode's
+/// value-position binds, #3069), for an array or object: spliced as literal
+/// syntax, each `$x` would *rebuild* the container, a second allocation jq
+/// never makes (`[nan] as $a | $a == $a` is `true` there, one `jv` read
+/// twice). It gets an `Origin::Untracked` marker instead, so every `$x`
+/// reads the one bound storage. `Untracked` certifies nothing in `path()`
+/// but jq's own storage-identity rule, which a literal could never meet, so
+/// no path answer moves: a constructed value is no node of `.`.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the bind's source, body, value and three witnesses, plus the grammar width and the identity mode
 fn substitute_bound_var_at(
     bind_expr: &Expr,
     body: &Expr,
@@ -46831,6 +46976,7 @@ fn substitute_bound_var_at(
     // Whether #3279's widened passthrough grammar applies: jq mode, except
     // a `?//` alternative, which keeps the pre-#3279 grammar.
     wide: bool,
+    keep_container_identity: bool,
 ) -> Expr {
     let origin = if identity_passthrough(bind_expr, wide) {
         debug_assert!(
@@ -46843,7 +46989,10 @@ fn substitute_bound_var_at(
         identity_at.unwrap_or(Origin::Snapshot)
     } else if let Some(origin) = origin {
         origin
-    } else if node.is_some() {
+    } else if node.is_some()
+        || (keep_container_identity
+            && matches!(bound, OwnedValue::Array(_) | OwnedValue::Object(_)))
+    {
         Origin::Untracked
     } else {
         return substitute_var(body, var_name, bound);
@@ -74840,11 +74989,12 @@ mod tests {
     /// only the input's.
     ///
     /// `$y` ranges over both the input's own handles (the common `. as $y`
-    /// case, sharing storage with `.`) and a separately built copy of each.
-    /// The one pairing exempt from agreement is jq mode with `$y` holding
-    /// the input's very storage and a NaN inside it: the owned route answers
-    /// jq's instance rule there and the bridge, which re-materializes its
-    /// input, does not (#3069's residual, pinned below).
+    /// case, sharing storage with `.`) and a separately built copy of each,
+    /// so jq's instance rule is diffed too: with `$y` holding the input's
+    /// very storage and a NaN inside, both routes answer identity, the
+    /// bridge because it hands its input's storage back out (#3069). Without
+    /// `std` the bridge has no thread-local to register its input in and
+    /// rebuilds, as before #3069, so that one pairing is exempt there.
     #[test]
     fn eval_owned_pure_agrees_with_the_reindex_bridge_on_tracked_vars_2042() {
         let shapes = [
@@ -74910,7 +75060,11 @@ mod tests {
                             Vec<u64>,
                             JqSemantics,
                         >(&expr, value, false));
-                        if !(jq_identical::<JqSemantics>(bound, value) && holds_nan(bound)) {
+                        // Evaluated whatever `std` says, so the helper is covered in
+                        // both builds rather than only where the `||` reaches it.
+                        let nan_identical =
+                            holds_nan(bound) && jq_identical::<JqSemantics>(bound, value);
+                        if cfg!(feature = "std") || !nan_identical {
                             assert_eq!(
                                 fast, bridge,
                                 "jq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
@@ -74938,16 +75092,14 @@ mod tests {
 
     /// #3069: `$y` bound to the very storage `.` holds is `==` to it in jq,
     /// even with a NaN inside (`jv_equal` checks `jv_identical` first), and
-    /// the owned route answers that `true`. yq compares structurally.
-    ///
-    /// The bridge assertion is **not** a spec: it records the known residual
-    /// (`docs/compliance/jq/limitations.md`) that the reindex bridge
-    /// re-materializes its input and loses the identity. When the bridge
-    /// learns to carry it (#3069 Phase 2, with #3189/#3305), flip it to `true`
-    /// and drop the exemption in the #2042 matrix above.
+    /// both the owned route and the reindex bridge answer that `true` -- the
+    /// bridge because a container read back out of it is the storage that
+    /// went in (`bridge_provenance`). yq compares structurally, and its
+    /// bridge rebuilds; so does jq's without `std`, which has no thread-local
+    /// to register the bridge's input in.
     #[cfg(not(feature = "unshared-containers"))]
     #[test]
-    fn eval_owned_pure_keeps_container_identity_the_bridge_drops_3069() {
+    fn eval_owned_pure_and_the_bridge_keep_container_identity_3069() {
         let value = OwnedValue::object_from([(
             "a".to_string(),
             OwnedValue::object_from([("b".to_string(), OwnedValue::Float(f64::NAN))]),
@@ -74964,14 +75116,23 @@ mod tests {
                 false,
                 Reentry::REBUILT,
             )),
-            jq_true
+            jq_true.clone()
         );
         assert_eq!(
             debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
                 &expr, &value, false
             )),
-            jq_false,
-            "known #3069 residual: if the bridge now keeps identity, expect `true` here"
+            if cfg!(feature = "std") {
+                jq_true
+            } else {
+                jq_false.clone() // omni-dev: coverage tolerate-line reason="the no-std arm: `cfg!(feature = \"std\")` is true in every coverage build, so only the other build takes this (#3069)"
+            }
+        );
+        assert_eq!(
+            debug_normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                &expr, &value, false
+            )),
+            jq_false
         );
         assert_eq!(
             debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
@@ -108317,8 +108478,11 @@ mod tests {
         assert_eq!(var.node, Some(node));
         assert!(is_identity_passthrough::<JqSemantics>(&passthrough));
 
-        // Shape: no node -> today's spelling, a literal AST.
-        let literal = substitute_bound_var_from::<JqSemantics>(
+        // Shape: no node -> a literal AST in yq mode, and for a jq-mode
+        // scalar; a jq-mode container is spliced as its own storage instead,
+        // an untracked marker with no node (#3069), so every `$y` reads one
+        // allocation as jq's does.
+        let literal = substitute_bound_var_from::<YqSemantics>(
             &parse(".a").unwrap(),
             &body,
             "y",
@@ -108326,6 +108490,27 @@ mod tests {
             None,
         );
         assert!(matches!(literal, Expr::Object(_)), "got {literal:?}");
+        let scalar = substitute_bound_var_from::<JqSemantics>(
+            &parse(".a.b").unwrap(),
+            &body,
+            "y",
+            &OwnedValue::Int(1),
+            None,
+        );
+        assert!(matches!(scalar, Expr::Literal(_)), "got {scalar:?}");
+        let constructed = substitute_bound_var_from::<JqSemantics>(
+            &parse(".a").unwrap(),
+            &body,
+            "y",
+            &inner,
+            None,
+        );
+        let Expr::TrackedVar(var) = &constructed else {
+            panic!("expected a TrackedVar, got {constructed:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3069 pin itself, only formatted if the let-else pattern fails to match"
+        };
+        assert_eq!(var.origin, Origin::Untracked);
+        assert_eq!(var.node, None);
+        assert_eq!(var.value, inner);
 
         // Resolver: `path(<var>)` with the ambient input equal to the value.
         let index = JsonIndex::build(doc);
@@ -108355,6 +108540,20 @@ mod tests {
         match path_of(untracked_root) {
             QueryResult::Error(e) => assert!(e.is_invalid_path_expression()),
             other => panic!("expected a refusal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the match doesn't hit the expected arm above (#2072)"
+        }
+        // #3069: the constructed container's marker is a literal to the
+        // resolver too -- equal to `.a`'s value, never `.a`'s node.
+        let at_a = |var: Expr| {
+            let cursor = index.root(doc);
+            let expr = Expr::Pipe(vec![
+                parse(".a").unwrap(),
+                Expr::Builtin(Builtin::Path(Box::new(var))),
+            ]);
+            eval::<Vec<u64>, JqSemantics>(&expr, cursor)
+        };
+        match at_a(constructed) {
+            QueryResult::Error(e) => assert!(e.is_invalid_path_expression()),
+            other => panic!("expected a refusal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3069 pin itself, only formatted if the match doesn't hit the expected arm above"
         }
     }
 
