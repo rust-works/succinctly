@@ -76455,9 +76455,10 @@ fn test_as_binding_still_binds_whole_left_expression_in_yq_mode_3397() -> Result
 /// end to end: redefinition, arity overloading, a parameter named like an
 /// earlier zero-arity def, defs nested in a body or in the main filter, calls
 /// in arguments and in builtin arguments, `reduce`/`foreach`/`try`/`as`
-/// patterns, self-recursion, and spines past `OWNED_IDENTITY_DEF_UNFOLD_LIMIT`
-/// (10 defs) on both the value and the path-reading routes. Expected outputs
-/// captured live from `/usr/bin/jq` 1.7.1 (`-nc`), never derived.
+/// patterns, self-recursion, and two 10-def spines. Expected outputs captured
+/// live from `/usr/bin/jq` 1.7.1 (`-nc`), never derived. None of these reads a
+/// node's position, so none reaches the route gates that count `def` levels:
+/// `test_def_spine_route_gate_boundary_unchanged_3307` does.
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_def_spine_programs_match_jq_3307() -> Result<()> {
@@ -76501,9 +76502,10 @@ fn test_def_spine_programs_match_jq_3307() -> Result<()> {
 /// Thousands of top-level defs evaluate, inline and through `include`. Before
 /// the one-pass install each def rebuilt and kept everything below it, so
 /// this took seconds and gigabytes (3000 defs: 1 GB); the assertion is on the
-/// answer, not the cost, which is platform-specific, but a regression back to
-/// `O(M x N)` shows up as this test's wall time. `2999` is what `/usr/bin/jq`
-/// 1.7.1 prints for both spellings.
+/// answer, not the cost, which is platform-specific (the deterministic guard
+/// is the `binding_a_def_spine_is_linear_and_cached_3307` unit test, which
+/// counts nodes). `/usr/bin/jq` 1.7.1 prints `2999` for the inline chain and
+/// `3000` for the included `[g1, g2999] | add`.
 #[test]
 fn test_large_def_spine_evaluates_3307() -> Result<()> {
     let m = 3000;
@@ -76554,6 +76556,37 @@ fn test_def_spine_module_chain_matches_jq_3307() -> Result<()> {
         let (stdout, stderr, code) = run_jq_full(&["-nc", "-L", dir_arg, program], None)?;
         assert_eq!(code, 0, "#3307: `{program}`: stderr={stderr:?}");
         assert_eq!(stdout.trim_end(), want, "#3307: `{program}`");
+    }
+    Ok(())
+}
+
+/// #3307: the route gates that count levels of `def` binding
+/// (`OWNED_IDENTITY_DEF_UNFOLD_LIMIT`, 8) refuse a spine of nine defs, and the
+/// stage then takes the eager route, which answers differently for a read of
+/// the node's position: with 7 and 8 defs `path` is `["a","b"]` and `key` is
+/// `"b"`, with 9 and 10 they are `[]` and `null`. `path/0` and `key/0` are
+/// succinctly's own here (`/usr/bin/jq` 1.7.1 does not define them), so every
+/// row is pinned from the binary before #3307 and is a claim about *this*
+/// route boundary staying where it was, not about jq. One bind of a whole spine
+/// must be charged one level per def, or the 9-def rows would flip to the
+/// 7-def answers.
+#[test]
+fn test_def_spine_route_gate_boundary_unchanged_3307() -> Result<()> {
+    for (defs, path_want, key_want) in [
+        (7, r#"["a","b"]"#, r#""b""#),
+        (8, r#"["a","b"]"#, r#""b""#),
+        (9, "[]", "null"),
+        (10, "[]", "null"),
+    ] {
+        let prefix: String = (0..defs).map(|i| format!("def d{i}: .; ")).collect();
+        for (filter, want) in [
+            (format!(".a | ({prefix} .b) as $x | $x | path"), path_want),
+            (format!(".a.b | ({prefix} . + 0) | key"), key_want),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":{"b":1}}"#))?;
+            assert_eq!(code, 0, "#3307: {defs} defs, `{filter}`: stderr={stderr:?}");
+            assert_eq!(stdout.trim_end(), want, "#3307: {defs} defs, `{filter}`");
+        }
     }
     Ok(())
 }

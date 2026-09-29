@@ -9,17 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **jq: a program or module of many top-level `def`s no longer costs
-  `O(defs x program)`** (#3307). Each `def` was installed over everything
+- **jq: installing a program or module of many top-level `def`s is linear,
+  not `O(defs x program)`** (#3307). Each `def` was installed over everything
   below it and every copy was kept, so 3000 one-literal defs peaked at 1 GB
-  and 10000 at 11.3 GB (10.8 s), and 2000 fat-body defs at 20 GB. A direct
-  run of defs is now installed in one walk that resolves every call with a
-  per-name scope: 3000 defs peak at 16 MB and 10000 at 34 MB (20000: 55 MB),
-  and a program with two or three defs over real data is neutral (`Ir`
-  identical on an AMD 7950X, timings within the noise floor on it and on an
-  Apple M4 Pro). Output, the recursion-depth accounting and the routes that
-  cap how many defs they unfold (nine defs still stay off them) are
-  unchanged. A `def` inside a body is still bound lazily.
+  and 10000 at 11.3 GB (10.8 s). A direct run of defs is now installed in one
+  walk that resolves every call with a per-name scope: 3000 defs peak at
+  16 MB and 10000 at 34 MB (20000: 55 MB), and a program with two or three
+  defs over real data is neutral (`Ir` identical on an AMD 7950X, timings
+  within the noise floor on it and on an Apple M4 Pro). Output is unchanged,
+  and so is the `MAX_EVAL_FRAMES` accounting and the routes that cap how many
+  defs they unfold (nine defs still stay off them). A spine inside a
+  recursive def's body holds less native stack per level, so the ADR-0025
+  floor now trips a little later there (`def f(n): def a: 1; def b: 2; ...`
+  answers at 6600 and 6800 levels, where it refused before): an answer where
+  it refused, never the reverse. A `def`
+  inside a body is still bound lazily. The rest of the cost of a very long
+  program (the resolver's scan of the defs in scope, a chain written through
+  a pipe) is not part of this change; see `docs/compliance/jq/limitations.md`.
 
 - **jq: a streaming stage followed by a projection and a filter no longer
   reindexes what the projection drops** (#3213). Each output of a streaming

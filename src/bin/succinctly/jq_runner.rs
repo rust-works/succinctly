@@ -1871,11 +1871,13 @@ impl ModuleLoader {
     /// the resolver never checks an unreached body either (#2740). What it
     /// buys is that a large utility module used for one function costs one
     /// def in the chain, not all of them, and a wide module chain of which
-    /// the filter uses one def costs one def per level: every chain def is
-    /// installed over the whole program below it at evaluation, so the
-    /// chain's length is the cost that matters (seeding from *every*
-    /// top-level def instead measured 22 MB against 12 MB for a six-level
-    /// forty-def chain the filter walks one def of).
+    /// the filter uses one def costs one def per level: every linked def is
+    /// a def in the chain the evaluator installs, so the chain's length is
+    /// the cost that matters (linear since #3307 installs a direct spine in
+    /// one pass; it was quadratic when each def was installed over the whole
+    /// program below it). Seeding from *every* top-level def instead
+    /// measured 22 MB against 12 MB for a six-level forty-def chain the
+    /// filter walks one def of.
     ///
     /// Every same-name entry is kept together, in declaration order, so the
     /// innermost-first rule among them is the module's own (`def c: 7; def

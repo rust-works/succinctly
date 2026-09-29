@@ -3060,6 +3060,12 @@ fn test_parity_def_spines_3307() {
         "def a: .a; def b: .b; def c: a + b; {a: 1, b: 2} | c",
         "def a: .a; def b: .b; def c: a; def d: b; def e: c; def f: d; def g: e; def h: f; def i: g; def j: h; {a: 1, b: 2} | [j, i]",
     ] {
+        // Both failing the same way would pass a parity check, so each
+        // program has to answer.
+        assert!(
+            !full_outputs(b"null", program).is_empty(),
+            "`{program}` produced nothing"
+        );
         assert_parity(b"null", program);
     }
 }

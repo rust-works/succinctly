@@ -668,8 +668,10 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
 ///   walked, `bound` reset -- see the arm below). `install_def_calls` needs a
 ///   *different* `frames` policy (the larger of its own stale count and the
 ///   ambient depth this pass is walking at) and keeps its own explicit arm.
-/// - `Expr::Shared`: opaque (no recursion at all) in all three, for the
-///   architectural reasons #1371/#2077/#2096 give -- descending would redo
+/// - `Expr::Shared`: opaque (no recursion at all) in all three, and in
+///   `eval::SpineInstaller::walk` (#3307), the def-spine twin of
+///   `install_def_calls`, for the architectural reasons #1371/#2077/#2096
+///   give -- descending would redo
 ///   already-finished substitution and could recapture a caller's variable.
 ///   Kept explicit in all three rather than folded here, despite being
 ///   identical across them, because each function's own comment on this arm
