@@ -49118,3 +49118,19 @@ fn test_yq_nan_equality_unchanged_by_jq_instance_rule_3309() -> Result<()> {
     }
     Ok(())
 }
+
+/// jq mode's container-identity shortcut (#3069) is jq-only: yq v4.53.3
+/// compares a container holding a NaN structurally, even against itself.
+#[test]
+fn test_yq_container_nan_equality_stays_structural_3069() -> Result<()> {
+    for (filter, expected) in [
+        (".a == .a", "false"),
+        (".a != .a", "true"),
+        (".b == .b", "false"),
+        (".a | . == .", "false"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "a: [.nan]\nb: {x: .nan}\n", &[])?;
+        assert_eq!((stdout.trim_end(), code), (expected, 0), "`{filter}`");
+    }
+    Ok(())
+}

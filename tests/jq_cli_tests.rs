@@ -73817,6 +73817,116 @@ fn test_parsed_nan_instances_across_inputs_and_args_3309() -> Result<()> {
     Ok(())
 }
 
+/// jq's `jv_equal` answers `true` for the same array or object allocation
+/// before comparing contents (#3069), so a container holding a *computed*
+/// NaN (`nan`, which never carries #3309's parse identity) equals itself
+/// wherever both operands are still one handle. Every value captured from
+/// `/usr/bin/jq` 1.7.1 with `-nc`.
+#[cfg(not(feature = "unshared-containers"))]
+const CONTAINER_IDENTITY_ROWS_3069: &[(&str, &str)] = &[
+    ("[nan] | . == .", "true"),
+    ("[nan] | . != .", "false"),
+    ("{a:nan} | . == .", "true"),
+    ("nan | [.] | . == .", "true"),
+    ("{a:[nan]} | .a == .a", "true"),
+    ("[nan] | {a:.} | .a == .a", "true"),
+    ("[nan] | . as $a | $a == $a", "true"),
+    ("[nan] | . as $a | {x:$a, y:$a} | .x == .y", "true"),
+    ("[nan] | . as $a | [$a, $a] | .[0] == .[1]", "true"),
+    ("[nan] | . as $a | [$a] | .[0] == $a", "true"),
+    ("[nan] | . as $a | [$a, 1, $a] | unique | length", "2"),
+    ("[nan] | . as $a | IN($a)", "true"),
+    ("[nan] | . as $a | any([$a][]; . == $a)", "true"),
+    ("[nan] | . as $a | try error($a) catch (. == $a)", "true"),
+    (
+        "[nan] | . as $a | {} | setpath([\"a\"]; $a) | .a == $a",
+        "true",
+    ),
+    ("[[nan]] | .[0] as $x | sort | .[0] == $x", "true"),
+    ("[1] | .[0] = nan | . == .", "true"),
+    ("[nan] | . as $a | ($a + []) == $a", "true"),
+];
+
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_container_identity_short_circuits_equality_3069() -> Result<()> {
+    for (filter, expected) in CONTAINER_IDENTITY_ROWS_3069 {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "", &["-nc"])?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (*expected, 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The other side of #3069: each of these builds a *new* allocation (or
+/// compares without an identity check), so jq answers structurally and a
+/// NaN inside keeps the answer `false`. Any of them turning `true` would be
+/// the shortcut firing on two values that were never one handle. Captured
+/// from `/usr/bin/jq` 1.7.1 with `-nc`.
+const CONTAINER_IDENTITY_MUST_NOT_CHANGE_3069: &[(&str, &str)] = &[
+    ("nan == nan", "false"),
+    ("[nan] | .[0] == .[0]", "false"),
+    ("[nan] | [] + . == .", "false"),
+    ("{a:nan} | {} + . == .", "false"),
+    ("[nan] | map(.) == .", "false"),
+    ("[nan] | walk(.) == .", "false"),
+    ("[nan] | sort == .", "false"),
+    ("[nan] | [.[]] == [.[]]", "false"),
+    ("[nan] | . as [$x] | [$x] == [$x]", "false"),
+    ("[nan] | to_entries == to_entries", "false"),
+    ("[nan] | fromstream(tostream) == .", "false"),
+    ("[nan] | . as $a | ($a | .[1] = 1) | .[0:1] == $a", "false"),
+    ("[nan] | . as $a | [$a, [nan]] | unique | length", "2"),
+    // `contains`/`inside` recurse structurally with no container-level
+    // identity check in jq's `jv_contains`.
+    ("[nan] | . as $a | [[$a]] | contains([[$a]])", "false"),
+    ("[nan] | . as $a | $a | inside($a)", "false"),
+    // Ordering has no identity check (`jv_cmp`).
+    ("[nan] | . < .", "true"),
+    ("[nan] | . as $a | [$a, $a] | sort | length", "2"),
+];
+
+#[test]
+fn test_container_identity_must_not_change_3069() -> Result<()> {
+    for (filter, expected) in CONTAINER_IDENTITY_MUST_NOT_CHANGE_3069 {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "", &["-nc"])?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (*expected, 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The #3069 shortcut through document input, which the generic evaluator
+/// reads as a cursor rather than an `OwnedValue` (the tables above all run
+/// under `-n`). Stdin is `[1]`; every value captured from `/usr/bin/jq`
+/// 1.7.1. The last two rows build new containers and must stay `false`.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+fn test_container_identity_through_document_input_3069() -> Result<()> {
+    for (filter, expected) in [
+        (".[0] = nan | . == .", "true"),
+        ("map(nan) | . as $a | $a == $a", "true"),
+        ("[.[] | nan] | . as $a | {x:$a,y:$a} | .x == .y", "true"),
+        ("{a: map(nan)} | .a == .a", "true"),
+        ("map(nan) | [] + . == .", "false"),
+        ("map(nan) | sort == .", "false"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "[1]", &["-c"])?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3293: one row of a `?//`-retry table -- `(filter, stdout, stderr
 /// trace, error message, exit code)`, every value captured from jq 1.7.1.
 /// Each filter writes `A` to stderr once per `?//` attempt, so the trace

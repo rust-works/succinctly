@@ -129,6 +129,16 @@ pub trait EvalSemantics: Copy + Default {
     /// comparison. If false (jq, which has no strict int/float distinction),
     /// `2.0 == 2` is `true`. #950.
     const STRICT_NUMERIC_EQUALITY: bool;
+    /// If true (jq, #3069), equality answers `true` for two handles on the
+    /// *same* array or object storage without comparing their contents --
+    /// jq 1.7.1's `jv_equal` checks `jv_identical` (pointer, offset, size)
+    /// first. The shortcut is unobservable except where a NaN sits inside
+    /// the container: `[nan] | . == .` is `true` in jq, although
+    /// `nan == nan` is `false`. If false (yq), equality is always
+    /// structural: yq v4.53.3 answers `false` for `.a == .a` on
+    /// `a: [.nan]`. Ordering is untouched in both modes, since jq's
+    /// `jv_cmp` has no identity check (`[nan] | . < .` is `true`).
+    const EQUALITY_SHORT_CIRCUITS_ON_IDENTITY: bool;
     /// If false (jq), a `null` *right* operand of `+` passes through
     /// unconditionally for any left-operand type (`7 + null` -> `7`,
     /// `{} + null` -> `{}`) -- jq's own null-symmetric identity for `+`
@@ -328,6 +338,7 @@ impl EvalSemantics for JqSemantics {
     const NULL_MERGES_AS_EMPTY: bool = false;
     const DEFAULT_HALT_ERROR_CODE: i32 = 5;
     const STRICT_NUMERIC_EQUALITY: bool = false;
+    const EQUALITY_SHORT_CIRCUITS_ON_IDENTITY: bool = true;
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = false;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = false;
     const COLLAPSE_DUPLICATE_KEYS: bool = true;
@@ -362,6 +373,7 @@ impl EvalSemantics for YqSemantics {
     const NULL_MERGES_AS_EMPTY: bool = true;
     const DEFAULT_HALT_ERROR_CODE: i32 = 1;
     const STRICT_NUMERIC_EQUALITY: bool = true;
+    const EQUALITY_SHORT_CIRCUITS_ON_IDENTITY: bool = false;
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = true;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = true;
     const COLLAPSE_DUPLICATE_KEYS: bool = false;
@@ -384,9 +396,9 @@ use super::expr::{
 };
 use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
-    infinite_float_preview_text, int_to_f64, jq_literal_int_to_f64, jq_numeric_cmp,
-    numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, same_nan_instance, ArrayVec,
-    NumberRepr, ObjectMap, OwnedValue,
+    infinite_float_preview_text, int_to_f64, jq_identical, jq_literal_int_to_f64, jq_numeric_cmp,
+    numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, ArrayVec, NumberRepr,
+    ObjectMap, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -61922,7 +61934,7 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `[nan] | bsearch(nan)` is `-1` in jq (target < element) but was `-2`
     // from this loop's element-on-the-left probe.
     if elements.len() == 1 {
-        if S::DECNUMBER_LITERALS && same_nan_instance(&elements[0], &x) {
+        if jq_identical::<S>(&elements[0], &x) {
             return QueryResult::Owned(OwnedValue::Int(0));
         }
         return QueryResult::Owned(OwnedValue::Int(
@@ -61945,9 +61957,10 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // and `bsearch` reported absent values as found (#384).
         //
         // jq's probe asks `==` first (`$monkey == $target`), and `==` holds
-        // for one parsed NaN compared with itself (#3309) where the order
-        // answers `Less`.
-        if S::DECNUMBER_LITERALS && same_nan_instance(&elements[mid as usize], &x) {
+        // for one parsed NaN compared with itself (#3309), or a container
+        // holding a NaN compared with its own storage (#3069), where the
+        // order answers `Less`.
+        if jq_identical::<S>(&elements[mid as usize], &x) {
             return QueryResult::Owned(OwnedValue::Int(mid));
         }
         match compare_values::<S>(&elements[mid as usize], &x) {
@@ -74125,6 +74138,13 @@ mod tests {
     /// the `NumberLiteral`-vs-`Int` representation claim
     /// (`produces_fresh_value`) is diffed on the marker's own value, not
     /// only the input's.
+    ///
+    /// `$y` ranges over both the input's own handles (the common `. as $y`
+    /// case, sharing storage with `.`) and a separately built copy of each.
+    /// The one pairing exempt from agreement is jq mode with `$y` holding
+    /// the input's very storage and a NaN inside it: the owned route answers
+    /// jq's instance rule there and the bridge, which re-materializes its
+    /// input, does not (#3069's residual, pinned below).
     #[test]
     fn eval_owned_pure_agrees_with_the_reindex_bridge_on_tracked_vars_2042() {
         let shapes = [
@@ -74156,10 +74176,19 @@ mod tests {
             Origin::Untracked,
         ];
         let values = pure_value_matrix();
+        let copies = pure_value_matrix();
+        let bounds: Vec<&OwnedValue> = values.iter().chain(copies.iter()).collect();
+        fn holds_nan(value: &OwnedValue) -> bool {
+            match value {
+                OwnedValue::Array(items) => items.iter().any(holds_nan),
+                OwnedValue::Object(map) => map.values().any(holds_nan),
+                other => other.as_f64().is_some_and(f64::is_nan),
+            }
+        }
         for src in shapes {
             let parsed = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             for origin in &origins {
-                for bound in &values {
+                for &bound in &bounds {
                     let marker = LazyMarker::new(bound, origin.clone(), None);
                     let expr = substitute_var_impl(&parsed, "y", bound, Some(&marker));
                     assert!(
@@ -74181,10 +74210,12 @@ mod tests {
                             Vec<u64>,
                             JqSemantics,
                         >(&expr, value, false));
-                        assert_eq!(
-                            fast, bridge,
-                            "jq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
-                        );
+                        if !(jq_identical::<JqSemantics>(bound, value) && holds_nan(bound)) {
+                            assert_eq!(
+                                fast, bridge,
+                                "jq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
+                            );
+                        }
                         let fast = debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
                             &expr,
                             value,
@@ -74203,6 +74234,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #3069: `$y` bound to the very storage `.` holds is `==` to it in jq,
+    /// even with a NaN inside (`jv_equal` checks `jv_identical` first), and
+    /// the owned route answers that `true`. yq compares structurally.
+    ///
+    /// The bridge assertion is **not** a spec: it records the known residual
+    /// (`docs/compliance/jq/limitations.md`) that the reindex bridge
+    /// re-materializes its input and loses the identity. When the bridge
+    /// learns to carry it (#3069 Phase 2, with #3189/#3305), flip it to `true`
+    /// and drop the exemption in the #2042 matrix above.
+    #[cfg(not(feature = "unshared-containers"))]
+    #[test]
+    fn eval_owned_pure_keeps_container_identity_the_bridge_drops_3069() {
+        let value = OwnedValue::object_from([(
+            "a".to_string(),
+            OwnedValue::object_from([("b".to_string(), OwnedValue::Float(f64::NAN))]),
+        )]);
+        let parsed = parse("$y == .").unwrap();
+        let marker = LazyMarker::new(&value, Origin::Snapshot, None);
+        let expr = substitute_var_impl(&parsed, "y", &value, Some(&marker));
+        let jq_true = debug_normalize(QueryResult::<Vec<u64>>::Owned(OwnedValue::Bool(true)));
+        let jq_false = debug_normalize(QueryResult::<Vec<u64>>::Owned(OwnedValue::Bool(false)));
+        assert_eq!(
+            debug_normalize(eval_owned_input::<Vec<u64>, JqSemantics>(
+                &expr,
+                &value,
+                false,
+                Reentry::REBUILT,
+            )),
+            jq_true
+        );
+        assert_eq!(
+            debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                &expr, &value, false
+            )),
+            jq_false,
+            "known #3069 residual: if the bridge now keeps identity, expect `true` here"
+        );
+        assert_eq!(
+            debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
+                &expr,
+                &value,
+                false,
+                Reentry::REBUILT,
+            )),
+            jq_false
+        );
     }
 
     /// #2048: the fast path must stay *closed*. Anything that can fan out,
@@ -88149,7 +88228,7 @@ mod tests {
             assert_eq!(idx, -2);
         });
 
-        // The `same_nan_instance` branch (#3309) this arm shares with the
+        // The `jq_identical` branch (#3309) this arm shares with the
         // general loop: `"NaN" | tonumber as $x | $x == $x` is `true` in jq
         // (a bound instance equals itself), unlike two independent `nan`s
         // above, so a one-element array probing itself is "found" at 0, not

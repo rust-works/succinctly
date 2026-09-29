@@ -4048,7 +4048,12 @@ pub(crate) fn is_nan_sentinel(bytes: &[u8]) -> bool {
 /// arithmetic produced, and `owned_value_align_hash` must agree with it).
 /// jq-mode `==` does **not** stop here: [`owned_value_eq`] routes a jq-mode
 /// numeric pair through [`jq_numeric_cmp`] (#2906), and a yq-mode one
-/// through [`numeric_repr_eq_strict`].
+/// through [`numeric_repr_eq_strict`]. jq-mode `==` also answers `true` for
+/// one value *instance* ([`jq_identical`]: a parsed NaN, #3309, or one
+/// container's storage, #3069) where this `PartialEq` still says a NaN is
+/// never equal, so the two differ on a NaN-bearing value compared with
+/// itself. Code that needs jq's answer must call [`owned_value_eq`], not
+/// `==`, `Vec::contains` or `dedup`.
 ///
 /// `NumberLiteral` compares purely on its parsed [`NumberRepr`], never on the
 /// source text -- two spellings of the same number (`1.0` and `1e0`) are
@@ -4086,10 +4091,12 @@ pub(crate) fn numeric_repr_eq_strict(a: NumberRepr, b: NumberRepr) -> bool {
 /// Structural rules (`Null`/`Bool`/`String`/`Array`/`Object`) are
 /// identical in both modes -- only how two *numbers* compare differs, so
 /// this mirrors [`OwnedValue`]'s own `PartialEq`
-/// (`owned_value_eq_at_depth`) exactly, just threading `S` into the
-/// recursion so strictness applies at every nesting depth, not only the
-/// top: `[2.0] == [2]` and `{"a":2.0} == {"a":2}` are `false` in yq,
-/// matching jq's `true` when `S` isn't strict.
+/// (`owned_value_eq_at_depth`), just threading `S` into the recursion so
+/// strictness applies at every nesting depth, not only the top: `[2.0] ==
+/// [2]` and `{"a":2.0} == {"a":2}` are `false` in yq, matching jq's `true`
+/// when `S` isn't strict. The one other departure is jq's instance check
+/// ([`jq_identical`]), run before the contents are compared: it makes a
+/// NaN-bearing value equal to itself, which `PartialEq` never does.
 pub(crate) fn owned_value_eq<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -> bool {
     owned_value_eq_at_depth_generic::<S>(a, b, 0)
 }
@@ -4101,6 +4108,16 @@ pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
 ) -> bool {
     assert_value_tree_depth(depth);
     match (a, b) {
+        // jq's `jv_equal` answers `true` for the same allocation before
+        // looking inside it (#3069). Without a NaN inside, identity already
+        // implies structural equality, so this only changes an answer where
+        // one sits in the container; elsewhere it is a shortcut.
+        (OwnedValue::Array(_), OwnedValue::Array(_))
+        | (OwnedValue::Object(_), OwnedValue::Object(_))
+            if jq_identical::<S>(a, b) =>
+        {
+            true
+        }
         (OwnedValue::Array(a), OwnedValue::Array(b)) => {
             a.len() == b.len()
                 && a.iter()
@@ -4131,7 +4148,7 @@ pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
                     // A NaN is never `Equal` to the comparator, so the
                     // instance check only runs on pairs it already refused.
                     return jq_numeric_cmp(a, b) == Some(core::cmp::Ordering::Equal)
-                        || same_nan_instance(a, b);
+                        || jq_identical::<S>(a, b);
                 }
             }
             a == b
@@ -4230,6 +4247,27 @@ pub(crate) fn same_nan_instance(a: &OwnedValue, b: &OwnedValue) -> bool {
         }
     }
     matches!((tagged_bits(a), tagged_bits(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Whether `a` and `b` are the same value *instance* in jq's sense, the
+/// `jv_identical` check `jv_equal` runs before comparing contents: one
+/// parsed NaN ([`same_nan_instance`], #3309), or two handles on one array or
+/// object's storage (#3069). Always `false` in yq mode.
+///
+/// The one definition of that check: [`owned_value_eq_at_depth_generic`]
+/// runs it before comparing contents, and a caller that orders with
+/// `compare_values` but must answer `==` first (jq's `bsearch`) runs it at
+/// its probe, since the order never reports two NaN-holding values `Equal`,
+/// identical or not.
+pub(crate) fn jq_identical<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -> bool {
+    if !S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY {
+        return false;
+    }
+    match (a, b) {
+        (OwnedValue::Array(a), OwnedValue::Array(b)) => a.ptr_eq(b),
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => a.ptr_eq(b),
+        _ => same_nan_instance(a, b),
+    }
 }
 
 /// Order two `f64`s the way jq's own comparator does: NaN sorts strictly
@@ -6339,6 +6377,51 @@ mod tests {
             OwnedValue::document_nan_instance(true, 0x1000),
             OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() && f.is_sign_negative()
         ));
+    }
+
+    /// jq's `jv_equal` answers `true` for one allocation before looking
+    /// inside it (#3069): two handles on one array or object holding a
+    /// computed NaN are equal in jq mode, at any depth. A structurally equal
+    /// copy is not, yq stays structural, and ordering never short-circuits.
+    #[cfg(not(feature = "unshared-containers"))]
+    #[test]
+    fn test_container_identity_short_circuits_jq_equality_3069() {
+        let nan = OwnedValue::Float(f64::NAN);
+        let array = OwnedValue::array_from(vec![nan.clone()]);
+        let object = OwnedValue::object_from([("a".to_string(), nan.clone())]);
+        for (value, copy) in [
+            (&array, OwnedValue::array_from(vec![nan.clone()])),
+            (
+                &object,
+                OwnedValue::object_from([("a".to_string(), nan.clone())]),
+            ),
+        ] {
+            let handle = value.clone();
+            assert!(owned_value_eq::<JqSemantics>(value, &handle));
+            assert!(jq_identical::<JqSemantics>(value, &handle));
+            // The shortcut applies below the root too: two wrappers sharing
+            // one child compare equal through it.
+            assert!(owned_value_eq::<JqSemantics>(
+                &OwnedValue::array_from(vec![value.clone()]),
+                &OwnedValue::array_from(vec![handle.clone()])
+            ));
+            // A copy with the same contents is a different allocation.
+            assert!(!owned_value_eq::<JqSemantics>(value, &copy));
+            assert!(!jq_identical::<JqSemantics>(value, &copy));
+            // yq compares structurally: `.a == .a` on `a: [.nan]` is `false`.
+            assert!(!owned_value_eq::<YqSemantics>(value, &handle));
+            assert!(!jq_identical::<YqSemantics>(value, &handle));
+            // Ordering has no identity check: `[nan] | . < .` is `true`.
+            assert_eq!(
+                crate::jq::eval::compare_values::<JqSemantics>(value, &handle),
+                core::cmp::Ordering::Less
+            );
+        }
+        // Scalars fall back to the parsed-NaN instance rule (#3309).
+        assert!(!jq_identical::<JqSemantics>(&nan, &nan.clone()));
+        let parsed = OwnedValue::document_nan_instance(false, 0x1000);
+        assert!(jq_identical::<JqSemantics>(&parsed, &parsed.clone()));
+        assert!(!jq_identical::<YqSemantics>(&parsed, &parsed.clone()));
     }
 
     /// The reindex and input bridges carry a parsed NaN's instance through
