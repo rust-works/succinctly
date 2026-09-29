@@ -8788,6 +8788,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 &mut |per_element| {
                     drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
                 },
+                crate::jq::eval::FoldDirectRetry::of(init, input),
                 &mut |v| {
                     outputs.push(v);
                     Demand::Continue
@@ -8845,6 +8846,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 &mut |per_element| {
                     drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
                 },
+                crate::jq::eval::FoldDirectRetry::of(init, input),
                 &mut |v| {
                     outputs.push(v);
                     Demand::Continue
@@ -10231,6 +10233,7 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
         &mut |per_element| {
             drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
         },
+        crate::jq::eval::FoldDirectRetry::of(init, input),
         &mut |v| sink.push(GenericItem::Owned(v)),
     )
 }
@@ -10278,6 +10281,7 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
         &mut |per_element| {
             drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
         },
+        crate::jq::eval::FoldDirectRetry::of(init, input),
         &mut |v| sink.push(GenericItem::Owned(v)),
     )
 }
