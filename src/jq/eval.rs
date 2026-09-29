@@ -41063,7 +41063,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // before. `aborted` is this
         // driver's out-of-band escape slot, reset on every entry because a
         // `?//` in the source re-enters the callback after a stop was
-        // already reported (see `foreach_forks`'s identical `ended`).
+        // already reported (`foreach_forks`'s `ended` is the same slot, generation-stamped since
+        // #3293; this one is not yet).
         let source_control = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
             aborted = None;
             if let Some(control) = charge_budget(&mut budget, "reduce") {
@@ -41427,7 +41428,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // the elements before it still stream (#1872). `aborted` is this
         // driver's out-of-band escape slot, reset on every entry because a
         // `?//` in the source re-enters the callback after a stop was
-        // already reported (see `foreach_forks`'s identical `ended`).
+        // already reported (`foreach_forks`'s `ended` is the same slot, generation-stamped since
+        // #3293; this one is not yet).
         // Every emission goes straight to the sink, so a terminal
         // consumer's refusal of the first output -- or an outer bound's
         // stop -- ends the drive right there. `downstream_stopped` is reset
@@ -49007,8 +49009,9 @@ pub(crate) fn stop_with_eval_escape(slot: &mut Option<EvalEscape>, escape: EvalE
 /// through `stop_with_escape_cell`/`stop_with_downstream` (#3293). The four owned-identity stages in
 /// `eval_generic.rs` share `stop_owned_identity_rest_escape`, an adapter over
 /// [`stop_with_escape`] that answers `Flow::Stopped` instead of
-/// `Demand::Stop` (#2830). The `Flow` kept by [`foreach_forks`] still calls
-/// this beside its own store. The classification rule stays in one place,
+/// `Demand::Stop` (#2830). The `Flow` slots [`foreach_forks`] and
+/// [`reduce_forks`] keep are [`StashedVerdict<Flow>`]s, which call it through
+/// [`stop_with_downstream`]. The classification rule stays in one place,
 /// which is what drifted twice before (#1313, #1457).
 pub(crate) fn mark_nonretryable_escape(control: &Control) {
     if !is_retryable_control(control, false) {
@@ -49091,7 +49094,30 @@ pub(crate) struct StashedVerdict<T> {
 /// A [`StashedVerdict`] holding a bare [`Control`].
 pub(crate) type StashedEscape = StashedVerdict<Control>;
 
-impl<T> StashedVerdict<T> {
+/// A stashed verdict that no `?//` retry may supersede: a `halt` or a decode
+/// failure ([`is_retryable_control`] with `is_last = false`, the same
+/// position-independent exclusion [`mark_nonretryable_escape`] marks). A
+/// retry that moved the generation since the stash did so on some *other*
+/// abandoned alternative's account; it says nothing about a halt, which jq
+/// never retries past, so [`StashedVerdict::take`] and
+/// [`StashedVerdict::settle`] keep it (#3293).
+pub(crate) trait Nonretryable {
+    fn is_nonretryable(&self) -> bool;
+}
+
+impl Nonretryable for Control {
+    fn is_nonretryable(&self) -> bool {
+        !is_retryable_control(self, false)
+    }
+}
+
+impl Nonretryable for Flow {
+    fn is_nonretryable(&self) -> bool {
+        matches!(self, Self::Escaped(control) if control.is_nonretryable())
+    }
+}
+
+impl<T: Nonretryable> StashedVerdict<T> {
     pub(crate) const fn new() -> Self {
         Self {
             slot: core::cell::Cell::new(None),
@@ -49099,20 +49125,37 @@ impl<T> StashedVerdict<T> {
         }
     }
 
+    /// Stash `verdict`, stamped with the retry generation -- the part of
+    /// [`StashedVerdict::stop`]/[`StashedVerdict::stop_with_downstream`] that
+    /// does not depend on what the slot holds.
+    pub(crate) fn stash(&self, verdict: T) {
+        self.at.set(pipe_retry_generation());
+        self.slot.set(Some(verdict));
+    }
+
     /// Call at the top of every invocation of the driver's closure.
     ///
     /// A verdict still stashed here means the closure answered `Stop` and is
     /// running again, which only a `?//` retry may cause -- anything else
     /// would silently discard a real error, so it is asserted the way
-    /// [`resolve_terminal`]'s sink asserts it (#2691).
+    /// [`resolve_terminal`]'s sink asserts it (#2691). A nonretryable verdict
+    /// is the exception: a halt must win, so it is kept (and unasserted) even
+    /// if some wrapper let the closure run again -- the stale `Stop` such a
+    /// wrapper swallows is that wrapper's bug, not a reason to run past a
+    /// `halt`.
     pub(crate) fn begin(&self) {
-        if self.slot.take().is_some() {
-            debug_assert!(
-                terminal_retry::began_since(self.at.get()),
-                "#3293: a driver's closure ran again after stashing a verdict and \
-                 answering Stop, with no `?//` attempt in between"
-            );
+        let Some(verdict) = self.slot.take() else {
+            return;
+        };
+        if verdict.is_nonretryable() {
+            self.slot.set(Some(verdict));
+            return;
         }
+        debug_assert!(
+            terminal_retry::began_since(self.at.get()),
+            "#3293: a driver's closure ran again after stashing a verdict and \
+             answering Stop, with no `?//` attempt in between"
+        );
     }
 
     /// Whether a verdict is currently stashed.
@@ -49126,18 +49169,25 @@ impl<T> StashedVerdict<T> {
     /// Drop the stash if a retry inside the generator that just returned
     /// `flow` consumed it. `direct_retry` is [`direct_pattern_retry`] of
     /// that generator's expression, the `no_std` stand-in for the
-    /// generation.
+    /// generation. A nonretryable verdict is never dropped.
     pub(crate) fn settle(&self, flow: &Flow, direct_retry: bool) {
-        if retry_superseded(flow, self.at.get(), direct_retry) {
-            self.slot.set(None);
+        let verdict = self.slot.take();
+        let keep = match &verdict {
+            Some(v) => v.is_nonretryable() || !retry_superseded(flow, self.at.get(), direct_retry),
+            None => false,
+        };
+        if keep {
+            self.slot.set(verdict);
         }
     }
 
     /// The verdict the drive still owes, or `None` when a retry inside the
     /// driven generator consumed it -- [`Self::settle`], then take.
     pub(crate) fn take(self, flow: &Flow, direct_retry: bool) -> Option<T> {
-        self.settle(flow, direct_retry);
-        self.slot.into_inner()
+        let verdict = self.slot.into_inner()?;
+        let superseded =
+            !verdict.is_nonretryable() && retry_superseded(flow, self.at.get(), direct_retry);
+        (!superseded).then_some(verdict)
     }
 }
 
@@ -49238,6 +49288,20 @@ pub(crate) fn begin_pattern_alternative(index: usize) {
 pub(crate) fn clear_nonretryable_stop() {
     nonretryable_stop::clear();
     terminal_retry::begin_attempt();
+}
+
+/// One `foreach` step's own verdict (see [`try_foreach_step_alternatives`]),
+/// stashed by the UPDATE drive's per-output callback: retry the next `?//`
+/// alternative from this accumulator, or return it with the step's terminal.
+enum FoldUpdateVerdict {
+    Retry(OwnedValue),
+    Return(OwnedValue, Flow),
+}
+
+impl Nonretryable for FoldUpdateVerdict {
+    fn is_nonretryable(&self) -> bool {
+        matches!(self, Self::Return(_, flow) if flow.is_nonretryable())
+    }
 }
 
 /// Try each `?//`-separated pattern alternative (#1365) for one `foreach`
@@ -49384,14 +49448,15 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 // completion/errored/produced nothing," never `Stopped` (nothing
                 // ever answered `Demand::Stop`), which is why the fallback match
                 // below never reaches the `Flow::Stopped` arm.
-                enum StepOutcome {
-                    Retry(OwnedValue),
-                    Return(OwnedValue, Flow),
-                }
-                let mut step_outcome: Option<StepOutcome> = None;
+                // A stamped stash: a `?//` inside UPDATE that retries past a stop
+                // and then produces nothing, or raises, never re-enters
+                // `on_update`, so the abandoned alternative's verdict must not
+                // outlive it (#3293).
+                let step_outcome = StashedVerdict::<FoldUpdateVerdict>::new();
                 let mut last_update: Option<OwnedValue> = None;
 
                 let on_update = &mut |update_val: OwnedValue| -> Demand {
+                    step_outcome.begin();
                     // EXTRACT's own `Flow`, computed the same way whether EXTRACT is
                     // written or implicit, so the arms below decide once rather than
                     // twice (#2180 WP3 review: the `else if sink(..) == Demand::Stop`
@@ -49410,8 +49475,10 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                                 // a budget cap is never retryable -- straight to
                                 // the terminal, same as the pre-#2668 direct
                                 // `return` here.
-                                step_outcome =
-                                    Some(StepOutcome::Return(update_val, Flow::Escaped(control)));
+                                step_outcome.stash(FoldUpdateVerdict::Return(
+                                    update_val,
+                                    Flow::Escaped(control),
+                                ));
                                 return Demand::Stop;
                             }
                             // #2180 WP3: EXTRACT is *driven* through the
@@ -49475,14 +49542,14 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                         // state `0` giving `1`, and the retried alternative runs
                         // UPDATE again on that `1`, giving `2`.
                         Flow::Stopped { .. } if is_retryable_stop(is_last) => {
-                            step_outcome = Some(StepOutcome::Retry(update_val));
+                            step_outcome.stash(FoldUpdateVerdict::Retry(update_val));
                             Demand::Stop
                         }
                         // Nothing left to fall through to: the stop is this
                         // step's terminator, and `update_val` is the accumulator
                         // it leaves behind (see the budget arm above).
                         Flow::Stopped { .. } => {
-                            step_outcome = Some(StepOutcome::Return(
+                            step_outcome.stash(FoldUpdateVerdict::Return(
                                 update_val,
                                 Flow::Stopped { pending: None },
                             ));
@@ -49506,14 +49573,16 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                         // `Demand::Stop` here is exactly what stops UPDATE's own
                         // generator from producing those later outputs at all.
                         Flow::Escaped(control) if is_retryable_control(&control, is_last) => {
-                            step_outcome = Some(StepOutcome::Retry(update_val));
+                            step_outcome.stash(FoldUpdateVerdict::Retry(update_val));
                             Demand::Stop
                         }
                         // Same accumulator-on-abort reasoning as the budget-check
                         // return above.
                         Flow::Escaped(control) => {
-                            step_outcome =
-                                Some(StepOutcome::Return(update_val, Flow::Escaped(control)));
+                            step_outcome.stash(FoldUpdateVerdict::Return(
+                                update_val,
+                                Flow::Escaped(control),
+                            ));
                             Demand::Stop
                         }
                     }
@@ -49528,13 +49597,15 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                     on_update,
                 );
 
-                match step_outcome {
-                    Some(StepOutcome::Retry(update_val)) => {
+                let step_verdict =
+                    step_outcome.take(&update_flow, direct_pattern_retry(&substituted_update));
+                match step_verdict {
+                    Some(FoldUpdateVerdict::Retry(update_val)) => {
                         state = update_val;
                         outcome = Some(AlternativeOutcome::Retry);
                         Demand::Stop
                     }
-                    Some(StepOutcome::Return(update_val, flow)) => {
+                    Some(FoldUpdateVerdict::Return(update_val, flow)) => {
                         state = update_val;
                         outcome = Some(AlternativeOutcome::Return(flow));
                         Demand::Stop
@@ -49666,8 +49737,10 @@ fn drive_eager<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for v in values {
         if per_item(v) == Demand::Stop {
             // The step itself ended; `foreach_forks` already holds the
-            // reason and it outranks whatever this returns.
-            return Flow::Exhausted;
+            // reason. `Stopped`, not `Exhausted`, so that no retry
+            // stand-in ([`FoldDirectRetry`], `no_std`) mistakes this drive for
+            // a `?//` that consumed the stop and ran out of alternatives.
+            return Flow::Stopped { pending: None };
         }
     }
     match control {
@@ -49825,6 +49898,11 @@ pub(crate) type ForeachInitDrive<'a> =
 /// ([`direct_pattern_retry`]) -- the `no_std` stand-in for the retry
 /// generation that [`StashedVerdict::take`] reads, one flag per drive
 /// because the fold stashes one verdict per drive (#3293).
+///
+/// It recognises only an operand that *is* a `?//` bind: one wrapped in
+/// `first`, `limit`, `//`, a pipe or a `def` is fixed on `std` (which reads
+/// the generation) and keeps the previous answer on `no_std`
+/// (`docs/compliance/jq/limitations.md`, "`reduce`/`foreach` and a `?//`").
 #[derive(Clone, Copy)]
 pub(crate) struct FoldDirectRetry {
     init: bool,
@@ -49872,7 +49950,10 @@ impl FoldDirectRetry {
 /// The step's own verdict outranks the source's, and a *fork's* own verdict
 /// (which folds in the step's) outranks INIT's own: a step or fork that
 /// escaped, or that the consumer stopped, aborts the whole construct
-/// whatever `drive_source`/`drive_init` go on to report, mirroring the
+/// whatever `drive_source`/`drive_init` go on to report -- unless a `?//`
+/// inside that driven generator retried past the stop, which supersedes the
+/// verdict ([`StashedVerdict`], #3293) and lets the retry's own outcome (and
+/// the next fork) stand -- mirroring the
 /// pre-#2180 `aborted.or_else(|| input_control)` precedence one level
 /// further out. And an abort at either level never lets the next fork
 /// start -- jq's `break` unwinds past every untried INIT output
@@ -49891,7 +49972,7 @@ impl FoldDirectRetry {
 ///
 /// The budget is charged across every fork, not per fork (#695), the same
 /// "whole tree, not per-branch" accounting `WHILE_UNTIL_MAX_STEPS` uses.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // STYLE-0004: INIT, source and retry flags are one fold's own ambients, as `reduce_forks`
 pub(crate) fn foreach_forks<S: EvalSemantics>(
     patterns: &[Pattern],
     update: &Expr,
@@ -49990,31 +50071,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         }
     });
 
-    match terminal.take(&init_flow, retry.init) {
-        // A fork's own stop ends everything, `pending` dropped the same
-        // reason every other lazy consumer drops it.
-        Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
-        // A fork's own escape, adjudicated against the ambient `?` exactly
-        // as `init_flow`'s own trailing escape is just below -- INIT's own
-        // trailing control (if it goes on to have one) is moot either way,
-        // jq's `break` having already unwound past every untried INIT
-        // output.
-        Some(Flow::Escaped(control)) => finish_fork_flow(Some(control), optional),
-        Some(Flow::Exhausted) => {
-            unreachable!("the per-fork match above never routes Exhausted into stop_with_downstream")
-        }
-        // No fork ever aborted -- `init_flow` is INIT's own generator's raw
-        // terminal (never `Stopped`: our own callback above only answers
-        // `Demand::Stop` after recording `terminal`), the same trailing
-        // control the old `init_control` parameter carried.
-        None => match init_flow {
-            Flow::Exhausted => finish_fork_flow(None, optional),
-            Flow::Escaped(control) => finish_fork_flow(Some(control), optional),
-            Flow::Stopped { .. } => unreachable!(
-                "drive_init's own per-fork callback always records `terminal` before answering Demand::Stop"
-            ),
-        },
-    }
+    finish_fold_forks(terminal, init_flow, retry.init, optional)
 }
 
 /// `reduce`'s demand-driven fork core (#2899) — [`foreach_forks`]'s twin,
@@ -50127,18 +50184,40 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
         }
     });
 
-    match terminal.take(&init_flow, retry.init) {
+    finish_fold_forks(terminal, init_flow, retry.init, optional)
+}
+
+/// The tail both fold cores share: adjudicate the fork verdict `terminal`
+/// against INIT's own trailing flow (#3293).
+///
+/// A fork's own stop ends everything, `pending` dropped the same reason every
+/// other lazy consumer drops it. A fork's own escape is adjudicated against
+/// the ambient `?` exactly as `init_flow`'s own trailing escape is -- INIT's
+/// trailing control (if it goes on to have one) is moot either way, jq's
+/// `break` having already unwound past every untried INIT output. With no
+/// verdict owed, `init_flow` is INIT's generator's own terminal.
+///
+/// That terminal can be `Stopped` even though no fork's verdict is left: a
+/// fork aborted, INIT's `?//` retried past it and re-entered the callback
+/// (which dropped the stale verdict), a later fork finished normally, and the
+/// generator still reports the sticky stop some inner driver never reset. The
+/// abort was superseded, so nothing is owed -- the same answer as `Exhausted`.
+fn finish_fold_forks(
+    terminal: StashedVerdict<Flow>,
+    init_flow: Flow,
+    retry_init: bool,
+    optional: bool,
+) -> Flow {
+    match terminal.take(&init_flow, retry_init) {
         Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
         Some(Flow::Escaped(control)) => finish_fork_flow(Some(control), optional),
         Some(Flow::Exhausted) => {
-            unreachable!("the per-fork match above never routes Exhausted into stop_with_downstream") // omni-dev: coverage tolerate-line reason="unreachable by construction: the per-fork match only ever hands stop_with_downstream a non-Exhausted flow, so `terminal` can never hold Exhausted. `foreach_forks`' identical arm is 0-hit for the same reason and is only unflagged because it predates this diff (#2899)"
+            unreachable!("a fork verdict is never Exhausted: the per-fork match routes only Stopped/Escaped into `terminal`")
+            // omni-dev: coverage tolerate-line reason="unreachable by construction: the per-fork match only ever hands stop_with_downstream a non-Exhausted flow, so `terminal` can never hold Exhausted (#2899)"
         }
         None => match init_flow {
-            Flow::Exhausted => finish_fork_flow(None, optional),
+            Flow::Exhausted | Flow::Stopped { .. } => finish_fork_flow(None, optional),
             Flow::Escaped(control) => finish_fork_flow(Some(control), optional),
-            Flow::Stopped { .. } => unreachable!(
-                "drive_init's own per-fork callback always records `terminal` before answering Demand::Stop"
-            ),
         },
     }
 }
@@ -101146,6 +101225,105 @@ mod tests {
             let filter = r#"[limit(1; if ([1] as $a ?// $b | $a) then 1 else error("E") end)]"#;
             let (got, got_end) = outputs_and_end(b"null", filter);
             assert_eq!((got.len(), got_end.as_str()), (0, "error: E"), "`{filter}`");
+        }
+    }
+
+    /// #3293 slice 4: `foreach_forks`/`reduce_forks` are shared with the
+    /// owned evaluator, and their `no_std` build reads [`FoldDirectRetry`]
+    /// instead of the retry generation, so every fold row runs on this route
+    /// too -- the one `cargo test --no-default-features` reaches. A retry that
+    /// produces nothing or raises supersedes the stashed step/fork verdict
+    /// (source and INIT position), a halt is never superseded, an inner
+    /// fold's own UPDATE-position `?//` does not leak, and an unbounded
+    /// (`repeat`) source, driven eagerly, keeps the step's error. Captured
+    /// from jq 1.7.1 with `-nc`.
+    #[test]
+    fn test_fold_retry_supersedes_stashed_verdict_on_owned_route_3293() {
+        for (filter, values, end) in [
+            (
+                r"reduce ([[1]] as [$a] ?// $b | $a // empty) as $x (0; .+$x)",
+                &["null"][..],
+                "",
+            ),
+            (
+                r"[foreach ([[1]] as [$a] ?// $b | $a // empty) as $x (0; .+$x)]",
+                &["[]"][..],
+                "",
+            ),
+            (
+                r#"reduce 1 as $x (([[1]] as [$a] ?// $b | $a // empty); error("E"))"#,
+                &[][..],
+                "",
+            ),
+            (
+                r#"reduce ([[1]] as [$a] ?// $b | $a | if . == null then error("E2") else . end) as $x (0; error("E1"))"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r"[reduce 1 as $x ((foreach 1 as $v (0; [[1]] as [$a] ?// $b | $a // 7)); . + 1)]",
+                &["[8]"][..],
+                "",
+            ),
+            (
+                r"first(foreach 1 as $x (foreach 1 as $v (0; . as $a ?// $b | $a // empty; . as $a ?// [$b] | .); .))",
+                &["0"][..],
+                "",
+            ),
+            (
+                r#"reduce ([[1]] as [$a] ?// $b | $a // empty) as $x (0; "h"|halt_error(3))"#,
+                &[][..],
+                "halt: 3",
+            ),
+            (
+                r#"reduce ([[1]] as [$a] ?// $b | $a | first(repeat(.))) as $x (0; error("E"))"#,
+                &[][..],
+                "error: E",
+            ),
+            (
+                r"[first(foreach ([[1]] as [$a] ?// [[$b]] | $a // empty) as $x ((0,100); $x; .))]",
+                &["[[1],[1]]"][..],
+                "",
+            ),
+            (
+                r"[first((reduce 1 as $x (([[1]] as [$a] ?// [[$b]] | $a // empty); 5)), 9)]",
+                &["[5,9]"][..],
+                "",
+            ),
+            (
+                r"reduce ([[1]] as [$a] ?// {(empty): $b} | $a) as $x (0; .+$x)",
+                &["null"][..],
+                "",
+            ),
+        ] {
+            let (got, got_end) = outputs_and_end(b"null", filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(
+                (got.as_slice(), got_end.as_str()),
+                (values, end),
+                "`{filter}`"
+            );
+        }
+        // A non-direct source (`(G) // empty`) is recognised only by the retry
+        // generation, which `no_std` does not have (see `FoldDirectRetry`).
+        #[cfg(feature = "std")]
+        for (filter, values) in [
+            (
+                r"reduce (([[1]] as [$a] ?// $b | $a) // empty) as $x (0; .+$x)",
+                &["null"][..],
+            ),
+            (
+                r"[foreach (([[1]] as [$a] ?// $b | $a) // empty) as $x (0; .+$x)]",
+                &["[]"][..],
+            ),
+        ] {
+            let (got, got_end) = outputs_and_end(b"null", filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(
+                (got.as_slice(), got_end.as_str()),
+                (values, ""),
+                "`{filter}`"
+            );
         }
     }
 
