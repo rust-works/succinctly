@@ -9130,29 +9130,29 @@ mod tests {
         let is_as = |e: &Expr| matches!(e, Expr::As { .. });
 
         // `2 * 1 as $x | $x + 10` is `2 * (1 as $x | $x + 10)` in jq.
-        match parse("2 * 1 as $x | $x + 10").unwrap() {
-            Expr::Arithmetic {
-                op: ArithOp::Mul(_),
-                left,
-                right,
-            } => {
-                assert_eq!(*left, int(2));
-                assert!(is_as(&right), "{right:?}");
-            }
-            other => panic!("expected `2 * (binding)`, got {other:?}"),
-        }
+        let product = parse("2 * 1 as $x | $x + 10").unwrap();
+        assert!(
+            matches!(
+                &product,
+                Expr::Arithmetic { op: ArithOp::Mul(_), left, right }
+                    if **left == int(2) && is_as(right)
+            ),
+            "{product:?}"
+        );
         // ... and `(2 * 1) as $x | $x + 10` in yq.
         assert!(is_as(&yq("2 * 1 as $x | $x + 10")));
 
         // Unary minus covers the whole binding: `-1 as $i | $i` is
         // `-(1 as $i | $i)` in jq, with `$i` bound to the *positive* literal.
-        match parse("-1 as $i | $i").unwrap() {
-            Expr::Negate(inner) => match *inner {
-                Expr::As { expr, .. } => assert_eq!(*expr, int(1)),
-                other => panic!("expected a binding under `-`, got {other:?}"),
-            },
-            other => panic!("expected `-(binding)`, got {other:?}"),
-        }
+        let negated = parse("-1 as $i | $i").unwrap();
+        assert!(
+            matches!(
+                &negated,
+                Expr::Negate(inner)
+                    if matches!(&**inner, Expr::As { expr, .. } if **expr == int(1))
+            ),
+            "{negated:?}"
+        );
 
         // jq's `'-' Exp` also covers the multiplicative chain after its
         // operand: `-.a * 2` is `-(.a * 2)`, and so is `-2 * 3`. yq keeps the
