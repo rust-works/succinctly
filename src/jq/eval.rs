@@ -1864,8 +1864,13 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
     /// they are, so `getpath(["b"])` on `{"a":1,"b":tru}` is a
     /// [`QueryResult::OneCursor`] naming a value nothing can read. Mirrors
     /// [`crate::jq::eval_generic::GenericResult::collect_owned`], which
-    /// already reports it (#1247); `None`/`Error`/`Break`/`Halt` collect to
-    /// an empty `Vec` and a `Partial` to its prefix, as there.
+    /// already reports it (#1247).
+    ///
+    /// Only a *decode failure* is an `Err`. A query error, `break` or `halt`
+    /// is not: `None`/`Error`/`Break`/`Halt` collect to an empty `Vec` and a
+    /// `Partial` to its prefix, as in the lossy form and in the generic
+    /// evaluator. Check for [`QueryResult::Error`] (or [`Self::is_error`])
+    /// first if a query error must not read as "no results".
     pub fn try_collect_owned<S: EvalSemantics>(self) -> Result<Vec<OwnedValue>, EvalError> {
         Ok(match self {
             QueryResult::One(v) => vec![super::eval_generic::to_owned::<S, _>(&v)?],
@@ -26379,8 +26384,9 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 /// unwinding panic. The evaluator this entry used before #3457 answered these
 /// up to 384 levels; raising the ceiling is #3429. With the `std` feature
 /// the few guards that still panic (comment-preserving YAML materialization)
-/// are contained the same way; without it there is no unwinding to catch and
-/// they propagate.
+/// are caught and returned the same way, though the default panic hook still
+/// prints its one-line message to stderr first; without `std` there is no
+/// unwinding to catch and they propagate.
 ///
 /// # Other entry points
 ///

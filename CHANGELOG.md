@@ -41,7 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `QueryResult::try_collect_owned` reports an undecodable cursor as an error
   where `collect_owned` (documented lossy) returns `null`; `eval_lenient`
   follows `eval` and keeps an owned `null`/boolean. Cursor-metadata builtins
-  answer from the real document, duplicate keys collapse as in jq, and a yq
+  answer from the real document, duplicate keys collapse as in jq, a computed
+  `null` is `QueryResult::Owned(Null)` where it was `One(Null)` and an empty
+  iteration is `None` where it was `Many([])` (a caller matching those exact
+  variants needs to accept the new ones), and a yq
   owned-target computed index now raises on a negative out-of-range index as yq
   does (`([1,2]+[])[(1*-5)]`, also in the CLI). `succinctly yq`'s own DOM route
   keeps the previous evaluator (it evaluates an already-decoded value, and the
