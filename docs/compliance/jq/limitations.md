@@ -514,6 +514,58 @@ anything else at any depth. The `setpath_*` probes added alongside it pin the re
 surface — wrong-key-type on a real container, out-of-bounds negative and NaN indices, and a
 non-array path argument.
 
+## `as` binds the Term before it, in jq mode (#3397)
+
+jq's grammar makes `Term "as" Patterns '|' Exp` an `Exp` production, so an `as` binds
+only the Term right before it and its body runs to the end of the enclosing expression;
+whatever operator precedes the Term takes the whole binding as its right operand.
+[#3397](https://github.com/rust-works/succinctly/issues/3397) moved jq mode onto that rule:
+`2 * 1 as $x | $x + 10` is `22` (was `12`), `[1 // 2 as $x | $x, 9]` is `[1]`, and
+`-1 as $i | ($i, 100)` is `-1, -100`, with `$i` bound to the positive `1`. jq's `'-' Exp`
+also covers the multiplicative chain after its operand, so `-2 * "ab"` is `-(2 * "ab")`
+(an error, was `null`). **yq mode is unchanged**: real yq binds the whole left expression
+(`2 * 1 as $x | $x + 10` is `12` in yq v4.53.3), and `succinctly yq` does too.
+
+A generated grammar sweep (160,000 random programs over bindings, every binary operator,
+unary minus, `try`/`catch`, `reduce`/`foreach`, `if`, assignment, `?//`, object values and
+`def` bodies, against jq 1.7.1 and the previous build) fixes 6.3% of the programs it draws,
+accepts no program jq rejects, and regresses 16 that matched jq before: 13 are the sign of
+a zero result and 3 are `?//` in an assignment's right-hand side, both below. What it turns
+up is the parse now being *right* in front of gaps that were already there behind a
+parenthesis:
+
+- **Zero's sign in integer arithmetic.** `0 * -1` prints `0` where jq prints `-0`
+  ([#3440](https://github.com/rust-works/succinctly/issues/3440)); programs like
+  `-0 * -1` used to match jq only because the old parse cancelled that bug.
+- **`?//` in an assignment's right-hand side never retries.** jq retries the next
+  alternative when the update's own write step fails; succinctly retries neither there
+  nor in `map`/`map_values` ([#3417](https://github.com/rust-works/succinctly/issues/3417)).
+  `.a |= (-"s" as $x ?// [$x] | 0.5, 2)` is an error in jq and `{"a":-0.5,...}` here, and the
+  parenthesised spelling already was before this change.
+- **Path position.** `L // . as P1 ?// P2 | PATH` under `path`/`del`/`|=` hits the
+  path resolver's rule that its own refusals never retry the next `?//` alternative
+  (#2979), so an update that used to succeed now refuses, and under a postfix `?` the
+  write is dropped; `and`/`or`/unary minus in front of a destructuring `as` reach
+  [#3289](https://github.com/rust-works/succinctly/issues/3289). Both spellings behaved
+  the same way behind parentheses on `main`.
+- **Eager bodies.** `-T as $x | B` is `Negate(As)` and an assignment right-hand side is
+  collected before it is consumed, so *later* outputs of `B` (`input`, `debug`, `stderr`)
+  run before the first is used, where jq is lazy. Distinct from #2267's open note (an
+  assignment's *target* path), and not covered by an earlier entry.
+- **`//` against assignment** (the remaining divergence in
+  [the language reference](../../reference/jq-language.md#operator-precedence)) now also
+  shows inside a binding body on the right of an assignment: `.a = 1 as $x | .a // 1 %= 2`.
+
+Two grammar gaps this change leaves:
+
+- **A `reduce`/`foreach` source is a `Term` in jq** (`reduce 1 + 2 as $x (0; $x)` is a
+  syntax error there) and an alternative-level expression here, unchanged.
+- **Stack per binding.** A binding's body re-enters the operator ladder from
+  `parse_operand`, about 13 native frames per level where `parse_binding` used about 5.
+  `MAX_EXPR_DEPTH` does not count it (a chain of bindings is not paren nesting), so a
+  caller driving the parser from a small stack reaches its overflow point sooner; the CLI
+  parses on a 256 MiB (release) / 2 GiB (debug) thread and is not affected.
+
 ## Where succinctly errors and jq does not
 
 A probe is only admitted to the corpus if jq errors on it, so the corpus is blind to the
@@ -7436,9 +7488,10 @@ this session, so whether it saturates the same way there, yields `INT64_MIN`, or
 compiler/libc is an open question, not a claim to build on (flag for whoever closes #2936
 with x86_64 hardware in reach); and jq parses `-x % y` as `-(x % y)`
 (unary minus binds looser than
-`%`) where succinctly parses `(-x) % y`, a pre-existing precedence gap that only shows at
-this magnitude (`-9223372036854775807 % 10` is `-7` in jq, `-8` here; the parenthesised
-and data-sourced spellings agree on `-8`).
+`%`) where succinctly parsed `(-x) % y` -- a precedence gap that only showed at
+this magnitude (`-9223372036854775807 % 10` is `-7` in jq, was `-8` here; the parenthesised
+and data-sourced spellings agree on `-8`). [#3397](https://github.com/rust-works/succinctly/issues/3397)
+closed the parse: `-x % y` is now `-(x % y)` in jq mode.
 
 **Closed in two steps.** The math builtins (`floor`, `sqrt`, `pow`, …) widening a large
 `Int` with a bare cast (`869389897822472004 | sqrt` was `…647` here against jq's `…645`)
