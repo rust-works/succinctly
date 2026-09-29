@@ -14192,41 +14192,82 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     // explicit step expression) select the float path's NaN-tolerant loop
     // condition in `range_values_f64`, not the runtime step value.
     let implicit_step = step.is_none();
-    let mut emit = |from_val: RangeNum,
-                    to_val: RangeNum,
-                    step_val: RangeNum,
+    // `emit` is the *only* closure in this function that touches `sink` --
+    // it is called from three different nested closures below (`from`'s,
+    // `to`'s, `step`'s), and Rust's borrow checker requires exactly one
+    // live `&mut` capture of `sink` for the whole function, so the #3409
+    // slow path has to be reached through this same closure rather than a
+    // sibling one that would try to capture `sink` a second time.
+    //
+    // Takes raw `OwnedValue`s (not pre-classified `RangeNum`s) and
+    // classifies them itself (#3409): 1-arg/2-arg callers below already
+    // range_num-checked `from`/`to` before calling `emit` at all (and
+    // `return stop(...)` on failure without ever reaching this closure), so
+    // for them the classification here always succeeds and the slow arm is
+    // unreachable -- redundant but cheap (three enum matches per `range()`
+    // call, not per generated value). The range/3 caller does no such
+    // pre-check (jq's own `range/3` never validates types up front either;
+    // see `range_values_generic`'s doc comment), so for it this is the
+    // first and only classification, and either arm can fire.
+    let mut emit = |from: &OwnedValue,
+                    to: &OwnedValue,
+                    step: &OwnedValue,
                     from_literal: Option<&OwnedValue>|
      -> Demand {
-        let (values, truncated) = match (from_val, to_val, step_val) {
-            // `from_literal` is forwarded on this arm too (#3103): an
-            // integer literal generally renders identically to its own
-            // `i64` (so `from_literal` is usually `None` here anyway), but
-            // `-0` is the one legal-JSON exception -- see `each_range`'s own
-            // note.
-            (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
-                range_values_int(f, t, st, from_literal)
+        match (range_num(from), range_num(to), range_num(step)) {
+            (Ok(from_val), Ok(to_val), Ok(step_val)) => {
+                let (values, truncated) = match (from_val, to_val, step_val) {
+                    // `from_literal` is forwarded on this arm too (#3103):
+                    // an integer literal generally renders identically to
+                    // its own `i64` (so `from_literal` is usually `None`
+                    // here anyway), but `-0` is the one legal-JSON
+                    // exception -- see `each_range`'s own note.
+                    (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
+                        range_values_int(f, t, st, from_literal)
+                    }
+                    (f, t, st) => range_values_f64(
+                        f.as_f64(),
+                        t.as_f64(),
+                        st.as_f64(),
+                        implicit_step,
+                        from_literal,
+                    ),
+                };
+                for v in values {
+                    if sink.push(GenericItem::Owned(v)) == Demand::Stop {
+                        return verdict.stop_with_downstream(Flow::Stopped { pending: None });
+                    }
+                }
+                // Truncation only raises once the sink has taken everything
+                // the capped batch held and still wants more --
+                // `each_range`'s #2089 rule, unchanged: `first(range(1e18))`
+                // stops early and never sees this, `[range(1e18)]` does.
+                if truncated {
+                    return stop(Control::Error(range_max_exceeded_error()));
+                }
+                Demand::Continue
             }
-            (f, t, st) => range_values_f64(
-                f.as_f64(),
-                t.as_f64(),
-                st.as_f64(),
-                implicit_step,
-                from_literal,
-            ),
-        };
-        for v in values {
-            if sink.push(GenericItem::Owned(v)) == Demand::Stop {
-                return verdict.stop_with_downstream(Flow::Stopped { pending: None });
+            // #3409: at least one operand isn't a plain number -- only
+            // reachable from range/3 (see this closure's own doc comment).
+            // Real jq's range/3 desugar never type-checks from/to/step
+            // itself; only the `+` that advances to the next value can
+            // raise, and only once a next value is actually demanded.
+            _ => {
+                let result =
+                    crate::jq::eval::range_values_generic::<S>(from.clone(), to, step, &mut |v| {
+                        match sink.push(GenericItem::Owned(v)) {
+                            Demand::Continue => Demand::Continue,
+                            Demand::Stop => {
+                                verdict.stop_with_downstream(Flow::Stopped { pending: None })
+                            }
+                        }
+                    });
+                match result {
+                    Ok(demand) => demand,
+                    Err(e) => stop(Control::Error(e)),
+                }
             }
         }
-        // Truncation only raises once the sink has taken everything the
-        // capped batch held and still wants more -- `each_range`'s #2089
-        // rule, unchanged: `first(range(1e18))` stops early and never sees
-        // this, `[range(1e18)]` does.
-        if truncated {
-            return stop(Control::Error(range_max_exceeded_error()));
-        }
-        Demand::Continue
     };
 
     let from_flow = eval_each_generic::<S, V>(from, value.clone(), optional, cursor, &mut |item| {
@@ -14235,44 +14276,64 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(v) => v,
             Err(control) => return stop(control),
         };
-        let from_val = match range_num(&from_owned) {
-            Ok(n) => n,
-            Err(e) => return stop(Control::Error(e)),
-        };
-        // The one place `from`'s own literal spelling (if any) is still on
-        // hand -- see `each_range`'s own note (#3103).
-        let from_literal = range_from_literal_override(&from_owned);
 
         let Some(to_expr) = to else {
             // `range(n)` -- unreachable from any query today, mirroring
             // `each_range`'s own note on this branch. This `from` is always
             // the synthesized integer `0`, never a literal, so no spelling
-            // to preserve either way.
+            // to preserve either way. `range/1` is a native builtin like
+            // `range/2` (#3409's fallback is `range/3`-only), so it keeps
+            // the eager numeric check -- gating *before* `emit` is called,
+            // not relying on `emit`'s own internal classification, so a
+            // non-numeric `from` here still short-circuits immediately
+            // rather than falling into the slow path.
+            let from_val = match range_num(&from_owned) {
+                Ok(n) => n,
+                Err(e) => return stop(Control::Error(e)),
+            };
             return match from_val {
-                RangeNum::Int(t) => {
-                    emit(RangeNum::Int(0), RangeNum::Int(t), RangeNum::Int(1), None)
-                }
+                RangeNum::Int(t) => emit(
+                    &OwnedValue::Int(0),
+                    &OwnedValue::Int(t),
+                    &OwnedValue::Int(1),
+                    None,
+                ),
                 RangeNum::Float(t) => emit(
-                    RangeNum::Float(0.0),
-                    RangeNum::Float(t),
-                    RangeNum::Float(1.0),
+                    &OwnedValue::Float(0.0),
+                    &OwnedValue::Float(t),
+                    &OwnedValue::Float(1.0),
                     None,
                 ),
             };
         };
+        // The one place `from`'s own literal spelling (if any) is still on
+        // hand for the fast numeric path -- see `each_range`'s own note
+        // (#3103). The slow generic path (#3409) never calls `range_num` on
+        // `from` at all, so it needs no override.
+        let from_literal = range_from_literal_override(&from_owned);
 
         let to_flow =
             eval_each_generic::<S, V>(to_expr, value.clone(), optional, cursor, &mut |to_item| {
                 verdict.begin();
-                let to_val = match generic_item_into_owned::<_, S>(to_item)
-                    .and_then(|v| range_num(&v).map_err(Control::Error))
-                {
-                    Ok(n) => n,
+                let to_owned = match generic_item_into_owned::<_, S>(to_item) {
+                    Ok(v) => v,
                     Err(control) => return stop(control),
                 };
 
                 match step {
-                    None => emit(from_val, to_val, RangeNum::Int(1), from_literal),
+                    // range/2: native builtin semantics, eager numeric check
+                    // on both bounds -- #3409's fallback only applies to
+                    // range/3's jq-defined desugar. Gated the same way as
+                    // range/1 above: before `emit`, not inside it.
+                    None => {
+                        if let Err(e) = range_num(&from_owned) {
+                            return stop(Control::Error(e));
+                        }
+                        if let Err(e) = range_num(&to_owned) {
+                            return stop(Control::Error(e));
+                        }
+                        emit(&from_owned, &to_owned, &OwnedValue::Int(1), from_literal)
+                    }
                     Some(step_expr) => {
                         let step_flow = eval_each_generic::<S, V>(
                             step_expr,
@@ -14281,13 +14342,15 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                             cursor,
                             &mut |step_item| {
                                 verdict.begin();
-                                let step_val = match generic_item_into_owned::<_, S>(step_item)
-                                    .and_then(|v| range_num(&v).map_err(Control::Error))
-                                {
-                                    Ok(n) => n,
+                                let step_owned = match generic_item_into_owned::<_, S>(step_item) {
+                                    Ok(v) => v,
                                     Err(control) => return stop(control),
                                 };
-                                emit(from_val, to_val, step_val, from_literal)
+                                // #3409: no pre-check here -- `emit` itself
+                                // decides fast vs. slow, matching jq's
+                                // range/3, which never type-checks from/to/
+                                // step up front either.
+                                emit(&from_owned, &to_owned, &step_owned, from_literal)
                             },
                         );
                         match step_flow {

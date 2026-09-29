@@ -18033,8 +18033,9 @@ fn test_range_bound_fanout_prefix_then_raises_1556() -> Result<()> {
 /// (`test_range_bound_non_numeric_value_rejected` only ever reaches `to`,
 /// since `range(n)` desugars to `from: Literal(0)`). Covers both the plain
 /// single-value case and the fanout case, where the failure is the *second*
-/// `from` branch and must still abort before `to`/`step` are ever pulled
-/// for it. Live-verified against jq 1.7.1: both exit 5, no stdout.
+/// `from` branch and must still abort (`range/2` only: it classifies `from`
+/// once `to` has been evaluated, matching jq -- see
+/// `range_2_evaluates_to_before_rejecting_from_3409`) for it. Live-verified against jq 1.7.1: both exit 5, no stdout.
 #[test]
 fn test_range_from_bound_non_numeric_value_rejected_1556() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-n", "range(\"x\"; 5)"], None)?;
@@ -65063,21 +65064,13 @@ fn range_bounds_keep_their_fanout_semantics_2698() -> Result<()> {
     Ok(())
 }
 
-/// #2698: a non-numeric bound raises, in each of the three positions -- the
-/// `step` position is the one no other test reached (it is the innermost
-/// closure of `each_range_generic`, so a bad `from` or `to` never gets
-/// there).
-///
-/// The `from`/`to` message matches jq 1.7.1 ("Range bounds must be
-/// numeric"). The `step` one does not: jq adds the step first and reports
-/// `number (0) and string ("a") cannot be added`, while succinctly's
-/// `range_num` rejects all three positions with the same bounds message.
-/// That divergence predates this change -- the old bridge route answered
-/// identically -- so this row pins succinctly's existing behaviour rather
-/// than jq's, and is not a claim of fidelity.
+/// #2698: a non-numeric bound raises in the `from`/`to` positions of
+/// `range/2`, the native-builtin arity -- `step` is `range/3`-only and has
+/// its own test (`range_3_step_non_numeric_matches_jq_add_error_3409`),
+/// since #3409 gave it a genuinely different (jq-matching) message.
 #[test]
 fn range_rejects_a_non_numeric_bound_in_every_position_2698() -> Result<()> {
-    for filter in ["[range(\"a\";3)]", "[range(0;\"b\")]", "[range(0;3;\"c\")]"] {
+    for filter in ["[range(\"a\";3)]", "[range(0;\"b\")]"] {
         let (_, err, code) = run_jq_full(&["-c", filter], Some("null"))?;
         assert_ne!(code, 0, "#2698: `{filter}` must raise");
         assert!(
@@ -65085,6 +65078,44 @@ fn range_rejects_a_non_numeric_bound_in_every_position_2698() -> Result<()> {
             "#2698: `{filter}` -- stderr: {err:?}"
         );
     }
+    Ok(())
+}
+
+/// #3409: jq's native `range/2` evaluates `to` before it rejects a
+/// non-numeric `from` (`range("x"; error("boom"))` raises `boom`;
+/// `range("x"; empty)` is empty) -- captured against `/usr/bin/jq` 1.7.1.
+#[test]
+fn range_2_evaluates_to_before_rejecting_from_3409() -> Result<()> {
+    let (_, err, code) = run_jq_full(&["-n", "-c", "[range(\"x\"; error(\"boom\"))]"], None)?;
+    assert_eq!(code, 5, "stderr: {err:?}");
+    assert!(err.contains("boom"), "stderr: {err:?}");
+    let (out, err, code) = run_jq_full(&["-n", "-c", "[range(\"x\"; empty)]"], None)?;
+    assert_eq!((out.trim(), code), ("[]", 0), "stderr: {err:?}");
+    Ok(())
+}
+
+/// #3409: `range/3`'s `step` position no longer shares `range/2`'s eager
+/// "Range bounds must be numeric" message -- real jq's `range/3` is a
+/// jq-defined `while`-based desugar that never type-checks up front, so a
+/// non-numeric step only raises once the underlying `+` actually runs,
+/// with `+`'s own error. `range_rejects_a_non_numeric_bound_in_every_position_2698`
+/// used to pin all three positions to the same message and said so in its
+/// own comment ("not a claim of fidelity") -- this test replaces that
+/// claim for the `step` position with the real one, captured live against
+/// `/usr/bin/jq` 1.7.1.
+#[test]
+fn range_3_step_non_numeric_matches_jq_add_error_3409() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", "[range(0;3;\"c\")]"], Some("null"))?;
+    assert_ne!(code, 0, "#3409: must raise -- stdout: {out:?}");
+    assert!(
+        err.contains("number (0) and string (\"c\") cannot be added"),
+        "#3409: stderr: {err:?}"
+    );
+
+    // `from` need not be numeric either, and a demand-driven consumer never
+    // reaches the `+` that would raise.
+    let (out, err, code) = run_jq_full(&["-c", "first(range(0;3;\"c\"))"], Some("null"))?;
+    assert_eq!((out.trim(), code), ("0", 0), "#3409: stderr: {err:?}");
     Ok(())
 }
 
@@ -74301,9 +74332,9 @@ fn test_object_construction_retry_supersedes_stashed_sink_verdict_3293() -> Resu
 /// controls are every alternative failing (the last one's error surfaces)
 /// and, in some tables, the same error with no `?//` at all.
 ///
-/// A retry inside the *step* is not pinned here: jq emits `from` before it
-/// type-checks the step (`[range(0; 3; [1])]` raises after `0`), which
-/// succinctly does not, independently of #3293.
+/// A retry inside the *step* is not pinned here: since #3409 succinctly
+/// emits `from` before the step's `+` raises, as jq does
+/// (`[range(0; 3; [1])]` raises after `0`), but no retry rows were added.
 const RETRY_ROWS_RANGE_3293: &[RetryRow3293] = &[
     (
         r#"range(([[1]] as [$a] ?// {k: $b} | ("A"|stderr) | $a))"#,
