@@ -78019,6 +78019,8 @@ fn test_comma_array_preserve_input_echoes_duplicates_3317() -> Result<()> {
         ("[., .] | .[1:]", format!("[{input}]")),
         ("[.a, .b]", r#"[{"x":1,"x":2},{"y":1}]"#.to_string()),
         ("[., .] | .[0].a | length", "1".to_string()),
+        // A navigation miss is `null`, not a node, so this array is owned.
+        ("[.a, .missing]", r#"[{"x":2},null]"#.to_string()),
     ] {
         let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", filter], Some(input))?;
         assert_eq!(code, 0, "#3317 `{filter}`");
@@ -78031,5 +78033,48 @@ fn test_comma_array_preserve_input_echoes_duplicates_3317() -> Result<()> {
         r#"[{"x":2},{"y":1}]"#,
         "jq 1.7.1 collapses"
     );
+    Ok(())
+}
+
+/// #3317: each node is walked once, when the array's shape is known, so the
+/// walk runs after later (pure-navigation) branches have. Every exit walks
+/// the pending nodes in branch order first, so the first failure is still the
+/// one the owned route raised: an earlier node's decode failure beats a later
+/// branch's type error, a navigation miss (`null`, not a node) builds the
+/// pending nodes before it, and a first branch's own error still comes first.
+/// Every row matches `main` before #3317 (jq itself rejects these documents
+/// at parse time, before any filter runs).
+#[test]
+fn test_comma_array_first_failure_in_branch_order_3317() -> Result<()> {
+    let bad_array = r#"[1, {"bad": xyz123}]"#;
+    let bad_member = r#"{"a":{"k":tru},"b":2}"#;
+    for (doc, filter, message) in [
+        (bad_array, "[., .missing]", "unexpected character"),
+        (
+            bad_array,
+            "try [., .missing] catch .",
+            "unexpected character",
+        ),
+        (bad_array, "[.[1], .[5]]", "unexpected character"),
+        (
+            bad_array,
+            "[.missing, .]",
+            r#"Cannot index array with string "missing""#,
+        ),
+        (bad_member, "[.a, .missing]", "invalid boolean"),
+        (bad_member, "[.b, .a]", "invalid boolean"),
+        (bad_member, "[.a, .b] | length", "invalid boolean"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "#3317 `{filter}` on {doc}: stderr={stderr:?}");
+        assert!(
+            stdout.is_empty(),
+            "#3317 `{filter}` on {doc}: stdout={stdout:?}"
+        );
+        assert!(
+            stderr.contains(message),
+            "#3317 `{filter}` on {doc}: stderr={stderr:?}"
+        );
+    }
     Ok(())
 }

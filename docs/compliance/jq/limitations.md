@@ -2486,8 +2486,9 @@ printer, not the evaluator:
 An array constructor over document nodes renders each node from the document, so `[.]`,
 `[., .]` and `[.a, .b]` echo like `.` does. `[., .]` did so only after
 [#3317](https://github.com/rust-works/succinctly/issues/3317), which stopped building each
-comma item as an owned object first; any item computed rather than read (`[., 1]`) still
-makes the whole array owned, and collapsed.
+comma item as an owned object first. Any item that is not a document node still makes the
+whole array owned, and collapsed: a computed one (`[., 1]`), or the `null` a missing key
+reads as (`[.a, .missing]`).
 
 This is the split the flag already has for numbers, not a new one: `--preserve-input`
 echoes `4e4` as written while `.n + 0` still evaluates to `40000`. The flag chooses how a

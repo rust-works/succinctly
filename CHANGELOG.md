@@ -19,11 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container among the nodes now keeps them as cursors, as `[.]` already did:
   46, 24 and 37 MB, with `| length` and `[]` about 2x faster (Apple M5 Max;
   30 MB input: 618 → 166 MB and 888 → 60 MB). Every node is still checked
-  when the array is collected, so a malformed document fails the whole
-  construction in branch order with nothing printed, as before. Consumers
-  that build the array anyway pay that check on top of the build: `[., .] |
-  tojson` +26%, `[., .] as $a | ...` +33% and `.data | map([., .])` over
-  small records +60% in time, with memory unchanged. Under `--preserve-input`
+  before the array is answered, so a malformed document fails the whole
+  construction with the same first error as before and nothing printed.
+  Consumers that build the array anyway pay that check on top of the build:
+  `[., .] | tojson` +25%, `[., .] as $a | ...` +40% and `.data | map([., .])`
+  over small records +60% in time, with memory unchanged. Under `--preserve-input`
   the elements now echo duplicate object keys like `.` and `[.]` do. yq mode,
   and any body with a computed branch (`[., 1]`), keep the owned route.
   `eval_with_cursor`/`eval_with_cursor_using` return `GenericResult::LazySeq`

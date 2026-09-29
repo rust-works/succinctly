@@ -608,8 +608,11 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
   - **A third `LazySource::Cursors` producer, and the first one that validates.**
     `[.]` defers validation to its consumer (the #2103/#2692 contract). A `,` body cannot:
     its branches run in order, and on `main` a malformed node raised before the next
-    branch ran. So each container node passes `validate_cursor` as it is collected, and
-    `LazySource::Cursors { validated: true }` records it. The jq printer's `LazySeq` arm
+    branch ran. The branches are pure navigation, with no side effects, so each node is
+    walked once, when the array's shape is known. Every exit (the answer, the first
+    non-node, an escaping branch) walks the pending nodes in branch order first, so the
+    first failure is the one `main` raised. A cursor answer runs `validate_cursor` over
+    every node, and `LazySource::Cursors { validated: true }` records it. The jq printer's `LazySeq` arm
     reads `LazySeq::is_prevalidated()` and skips its own #3156 walk. A literal slice of such
     a source keeps the flag.
   - **Owned fallbacks.** An all-scalar body (`[.name, .age]`) stays an owned array, since a
@@ -623,8 +626,11 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     - Controls (`.`, `[.]`, `[.[]]`, per-record `[.name, .age]`) are neutral.
     - Accepted cost: a consumer that materializes the array pays the validation walk on top
       of the build. `validate_cursor` allocates each key into its collision map, so on small
-      objects it costs nearly what building does: `[., .] | tojson` +26%,
-      `[., .] as $a | …` +33%, `.data | map([., .])` +60%.
+      objects it costs nearly what building does: `[., .] | tojson` +25%,
+      `[., .] as $a | …` +40%, `.data | map([., .])` +60%.
+    - Residual: an all-scalar body over many nodes holds its cursor list while the values
+      are built, so `[.[0], .[]] | length` over 300k strings peaks at 74 MB instead of
+      64 MB, with neutral time.
 
 ## Critical files
 
