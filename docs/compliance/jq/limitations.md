@@ -1115,7 +1115,7 @@ is the revert that established what the other one costs.
    answers `["c"]` on both
    ([#3136](https://github.com/rust-works/succinctly/issues/3136)).
 
-   Eleven rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
+   Ten rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
    (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
 
    #3049 moved `path(.a as $y | .a | tojson | fromjson | $y)` to the accepting
@@ -1123,7 +1123,6 @@ is the revert that established what the other one costs.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-   | `.a as $y \| path(.a \| $y)`                             | `["a"]`                     | value-mode binding — `eval_as` never resolves its source in path position; the *positional* half of #3037 (its root-of-invocation half is closed)                                                                                                          |
    | `path(.a as $y \| def f: $y; .a \| f)`                   | `["a"]`                     | a `def` inside `path()` resolves as an opaque leaf                                                                                                                                                                        |
    | `path(.a as $y \| ([$y] \| .[0]) as $z \| .a \| $z)`     | `["a"]`                     | the source navigates inside a construction, which the resolver refuses where jq's suspended tracking allows it, so it falls back to a plain value                                                                         |
    | `path((.a \| select(.b)) as $y \| .a \| $y)`             | `["a"]`                     | the witness grammar is pure navigation; a `select`-wrapped source binds by value                                                                                                                                          |
@@ -1564,7 +1563,53 @@ is the revert that established what the other one costs.
    owned-rooted document: `-n 'input | ...'`, a `tojson | fromjson` root) answer since #3179
    and #3069: the resolver stands on `$y`'s own storage at `.a`, so #3177's storage clause
    certifies it without a document-absolute bind path. Pinned in
-   `test_navigated_bind_positional_and_owned_root_rows_answer_3069`. The routes that re-enter the eager evaluator with an *owned*
+   `test_navigated_bind_positional_and_owned_root_rows_answer_3069`.
+
+   **[#3134](https://github.com/rust-works/succinctly/issues/3134) closes the positional half
+   for a bind made from a document node.** Storage identity certifies only a container, so two
+   kinds of marker still refused below the resolver's root, both answered by jq 1.7.1:
+   - a scalar, which has no `Rc` (`.a.b as $z | path(.a.b | $z)` is `["a","b"]`,
+     `(.a.b | $z) = 9` writes);
+   - a node that another bind's `Rc` already stands for. In `.a as $y | .a.b as $z | .a |
+     path(.b | $z)` (jq `["b"]`), `.a` reuses `$y`'s storage, so the `.b` the resolver stands
+     on is `$y`'s materialization, not `$z`'s.
+
+   jq's rule is `jv_identical`, and every value its parser makes is a pointer-compared
+   allocation, so on unmodified input "the value at this position is the bound one" holds
+   exactly when the bind came from that position. The cursor-side funnels (both `path()` arms,
+   and the bridges the assignment family and `del` take) now read where each such marker's
+   node sits below their live cursor (`eval_generic::marker_positions`). Each marker is then
+   stamped `Origin::At` at that position, in a resolver invocation reserved for that one call
+   (`eval::each_path_on_owned_positioned`, `eval::positioned_write_door`). The mint happens at
+   the resolver's own entry and only for its own argument, so a moved root (`.a as $y | def f:
+   path(.a | $y); .x | f`) and a nested invocation never see a position that is not theirs.
+   Equal-valued siblings, iterated elements and written nodes keep refusing, as in jq. This is
+   jq mode only; in yq mode, a write through a variable stays refuse-only
+   (`docs/compliance/yq/limitations.md`). Pinned in
+   `test_navigated_bind_positional_scalar_and_nested_rows_answer_3134`,
+   `test_navigated_bind_positional_controls_refuse_3134` and the sweep's
+   `navigated-bind-positional-*` rows.
+
+   What still refuses where jq answers:
+   - a `?`-wrapped step or a negative index before the variable (`.a.b as $z | path(.a.b? |
+     $z)`, `path(.[-2] | $z)`). The resolver's frame keeps that spelling, so it never equals
+     the canonical position ([#3464](https://github.com/rust-works/succinctly/issues/3464), the
+     same class as the `.a?` row in the table above);
+   - a scalar bind used inside a fold body (`.a.b as $z | reduce (1) as $i (.; path(.a.b |
+     $z))`). That is an owned re-entry, with no cursor to place the bind from
+     ([#3465](https://github.com/rust-works/succinctly/issues/3465));
+   - a scalar relocated into a new container (`.a.b as $z | .a | to_entries | path(.[0].value
+     | $z)`, jq `[0,"value"]`). jq moves the same `jv`, and a scalar has no identity to follow
+     it ([#3466](https://github.com/rust-works/succinctly/issues/3466)).
+
+   Two shapes refuse where jq raises a *different* error:
+   - `(.a.b | $z, .a.b) = 9` (jq: `Cannot index number with string "a"`). The write door
+     declines on any escape and hands the write back to the bridge's own resolver, which has
+     no position for `$z`;
+   - `path(.a | path(.b | $z))`. The inner `path()` enters its own invocation, so it refuses
+     at `$z` before jq's outer `Invalid path expression with result ["b"]`.
+
+   Both refused the same way before #3134. The routes that re-enter the eager evaluator with an *owned*
    accumulator (`reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)`, a `catch` handler) were
    listed here too — `eval.rs`'s own `eval_as` carries no node for a navigated bind, so no
    witness could promote it — until #3177's storage clause certified the marker by the `Rc`

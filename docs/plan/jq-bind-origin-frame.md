@@ -262,11 +262,17 @@ Three findings, in order of what they cost:
   live cursor is the marker's recorded node (`reroot_markers`: the #2642 node-identity proof
   run in the accepting direction, jq mode only). The same change rebased the one funnel
   that never demoted — the assignment family's fallback into `eval_full` — which wrote
-  through a root `Snapshot` re-navigated onto an equal-valued sibling. The **positional**
-  rows (`.a as $y | path(.a | $y)` — jq `["a"]`) stay refuse-only: the marker must certify at
-  a non-root register position, which needs a document-absolute bind path reachable from a
-  value-mode cursor (the `Origin::At` machinery) plus `needs_path_context` routing to decide
-  when to pay for it — scoped separately.
+  through a root `Snapshot` re-navigated onto an equal-valued sibling.
+- **Value-mode bindings, positional case: closed by #3069 and
+  [#3134](https://github.com/rust-works/succinctly/issues/3134).** Containers certify below
+  the root by storage identity (#3177/#3069). A scalar, or a node another bind's `Rc` stands
+  for, is stamped `Origin::At` at its position below the funnel's live cursor. The id of the
+  invocation the mint names is reserved by the funnel (`Frame::reserve_invocation` /
+  `Frame::enter_reserved`), which then enters exactly that invocation on its own argument, so
+  no position outlives the call it was minted for. No bind-time path is recorded; the climb
+  from the marker's node to the root is paid only by a resolver call that holds such a marker.
+  Still open: owned re-entries with no cursor (#3465), spelling-sensitive frame positions
+  (#3464) and relocated scalars (#3466).
 - **Closed by [#3122](https://github.com/rust-works/succinctly/issues/3122).** The
   re-entry contract is one type. Every owned re-entry in `eval.rs` (`eval_each_owned`,
   `eval_owned_input`, `eval_owned_expr_fork`, `eval_owned_multi_first`,
