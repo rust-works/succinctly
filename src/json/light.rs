@@ -1279,7 +1279,7 @@ const EMPTY_CONTAINER_TAG: usize = 1 << (usize::BITS - 1);
 /// `next_sibling()`, so an *exhausted* list is plain `None` and never names
 /// the container a suffix of it came from.
 #[inline]
-fn container_slot<'a, W: AsRef<[u64]>>(container: JsonCursor<'a, W>) -> Option<JsonCursor<'a, W>> {
+fn container_slot<W: AsRef<[u64]>>(container: JsonCursor<'_, W>) -> Option<JsonCursor<'_, W>> {
     match container.first_child() {
         Some(child) => Some(child),
         None if container.bp_pos & EMPTY_CONTAINER_TAG == 0 => Some(JsonCursor {
@@ -1292,13 +1292,13 @@ fn container_slot<'a, W: AsRef<[u64]>>(container: JsonCursor<'a, W>) -> Option<J
 
 /// A slot's navigable cursor: `None` for a tagged empty container.
 #[inline(always)]
-fn slot_current<'a, W>(slot: Option<JsonCursor<'a, W>>) -> Option<JsonCursor<'a, W>> {
+fn slot_current<W>(slot: Option<JsonCursor<'_, W>>) -> Option<JsonCursor<'_, W>> {
     slot.filter(|c| c.bp_pos & EMPTY_CONTAINER_TAG == 0)
 }
 
 /// A slot's tagged empty container, untagged; `None` for any other slot.
 #[inline]
-fn slot_empty_container<'a, W>(slot: Option<JsonCursor<'a, W>>) -> Option<JsonCursor<'a, W>> {
+fn slot_empty_container<W>(slot: Option<JsonCursor<'_, W>>) -> Option<JsonCursor<'_, W>> {
     slot.filter(|c| c.bp_pos & EMPTY_CONTAINER_TAG != 0)
         .map(|c| JsonCursor {
             bp_pos: c.bp_pos & !EMPTY_CONTAINER_TAG,
@@ -1315,7 +1315,7 @@ impl<W> Clone for JsonFields<'_, W> {
 
 impl<W> Copy for JsonFields<'_, W> {}
 
-/// Prints the decoded slot, so [`EMPTY_CONTAINER_TAG`] never shows up as a
+/// Prints the decoded slot, so the empty-container tag never shows up as a
 /// huge `bp_pos` in `{:?}` output (#3180).
 impl<W: core::fmt::Debug> core::fmt::Debug for JsonFields<'_, W> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -9679,13 +9679,13 @@ mod tests {
     /// container.
     #[test]
     fn whole_container_cursor_names_an_empty_container_3180() {
-        fn fields<'a>(v: StandardJson<'a>) -> JsonFields<'a> {
+        fn fields(v: StandardJson<'_>) -> JsonFields<'_> {
             match v {
                 StandardJson::Object(f) => f,
                 _ => panic!("not an object"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every caller passes an object (#3180)"
             }
         }
-        fn elements<'a>(v: StandardJson<'a>) -> JsonElements<'a> {
+        fn elements(v: StandardJson<'_>) -> JsonElements<'_> {
             match v {
                 StandardJson::Array(e) => e,
                 _ => panic!("not an array"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every caller passes an array (#3180)"
