@@ -173,7 +173,10 @@ const MAX_PATTERN_COMPUTED_KEYS: usize = 4096;
 /// `parse_expr`, and unary minus and `try` recurse into it directly. Chained
 /// binary operators, pipes and comma chains are *not* affected, because
 /// those parse with a `while` loop rather than recursion, so a thousand-stage
-/// pipe never nests more than one level deep here.
+/// pipe never nests more than one level deep here. (A chain of *negated*
+/// operands is the one exception since #3397: jq's `'-' Exp` puts the rest of
+/// the chain under the negation, so `-1 * -1 * ...` recurses once per
+/// factor, through `parse_primary` and so under this counter.)
 ///
 /// Real jq fails gracefully rather than crashing on the same inputs
 /// (`jq: error: memory exhausted`, exit 3, at around 10000 nested parens),
@@ -197,8 +200,11 @@ const MAX_PATTERN_COMPUTED_KEYS: usize = 4096;
 /// operator ladder (about 13 native frames, where `parse_binding` used
 /// about 5). A chain far past this limit still parses -- jq accepts a
 /// thousand -- and is bounded by the stack alone, as it always was; it
-/// reaches that bound sooner on a small stack. Bindings nested in
-/// parentheses stay guarded through the paren's own depth unit.
+/// reaches that bound sooner on a small stack. A binding taken inside the
+/// unary-minus arm or a `catch` handler runs inside that arm's own
+/// `parse_primary`, so `bind_as_if_present` hands the body that unit back
+/// (its `credit`) to keep such a chain uncharged too. Bindings nested in
+/// brackets or parentheses stay guarded through the bracket's own depth unit.
 const MAX_EXPR_DEPTH: usize = 256;
 
 /// The variable [`join_expr`] binds `$idx` to. It contains a space, so no
@@ -666,11 +672,6 @@ struct Parser<'a> {
     /// widen this to a return-type change through every intervening
     /// precedence level.
     last_primary_is_term: bool,
-    /// While a `reduce`/`foreach` source is parsed, its `as` belongs to the
-    /// fold, so [`Parser::parse_operand`] must not take it as a Term's own
-    /// binding (#3397). Cleared inside every nested [`Parser::parse_expr`]
-    /// (parentheses, arrays, arguments), where an `as` binds as usual.
-    fold_source_as_reserved: bool,
     /// While an object value (jq's restricted `ExpD`) is parsed, unary minus
     /// covers only its own operand: `'-' ExpD` takes no multiplicative chain,
     /// so `{a: -1 * 2}` is a syntax error in jq (#3397). Cleared inside every
@@ -958,7 +959,6 @@ impl<'a> Parser<'a> {
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
             wrong_arity_call: None,
             last_primary_is_term: true,
-            fold_source_as_reserved: false,
             expd_operand: false,
             last_primary_ended_generic_optional: false,
         }
@@ -2738,7 +2738,16 @@ impl<'a> Parser<'a> {
                                  // #3397: in jq mode a Term followed by `as` binds right
                                  // here, so `-T as $x | B` negates the whole binding, as
                                  // jq's `'-' Exp` does (see `parse_operand`).
-                    let first = self.parse_operand()?;
+                                 //
+                                 // An object value (`ExpD`) takes no binding -- `{a: -.b as $x |
+                                 // $x}` is a syntax error in jq -- so its operand stays a plain
+                                 // primary and the `as` is left for the object parser to refuse.
+                    let first = if self.expd_operand {
+                        self.parse_primary()?
+                    } else {
+                        let term = self.parse_primary()?;
+                        self.bind_as_if_present(term, 1)?
+                    };
                     // jq's `'-' Exp` makes the negation cover the
                     // multiplicative chain after its operand: `-.a * 2` is
                     // `-(.a * 2)`. yq has no unary minus (`-E` is its own
@@ -3277,7 +3286,9 @@ impl<'a> Parser<'a> {
             self.consume_keyword("as");
             self.skip_ws();
             expr = self.parse_as_pattern(expr)?;
-            self.skip_ws();
+            // The same non-associative rule as `bind_as_if_present`: this
+            // loop is that function's `try`-body twin (#3397).
+            self.reject_non_associative_after_binding()?;
         }
 
         // Check for optional catch
@@ -3286,7 +3297,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             // #3397: a Term-level `as` scopes inside the handler in jq mode.
             let handler = self.parse_primary()?;
-            Some(Box::new(self.bind_as_if_present(handler)?))
+            Some(Box::new(self.bind_as_if_present(handler, 1)?))
         } else {
             None
         };
@@ -3343,24 +3354,27 @@ impl<'a> Parser<'a> {
         Ok(Expr::Error(msg))
     }
 
-    /// Parse a reduce expression.
-    /// Syntax: reduce EXPR as $VAR (INIT; UPDATE)
-    /// A `reduce`/`foreach` source: an alternative-level expression whose own
-    /// `as` belongs to the fold, so [`Self::bind_as_if_present`] must not take
-    /// it as a Term's binding (#3397). The flag is restored on every exit, and
-    /// cleared again inside any nested [`Self::parse_expr`].
+    /// A `reduce`/`foreach` source. jq's grammar makes it a `Term` (`reduce
+    /// Term as Patterns (...)`), so in jq mode it is parsed as one: which also
+    /// leaves the fold's own `as` alone, where the Term-level binding
+    /// ([`Self::bind_as_if_present`], #3397) would otherwise take it, and
+    /// refuses the non-Term sources jq refuses (`reduce 1 + 2 as $x ...`).
+    /// yq's lexer takes an alternative-level expression.
     fn parse_fold_source(&mut self) -> Result<Expr, ParseError> {
-        let reserved = core::mem::replace(&mut self.fold_source_as_reserved, true);
-        let source = self.parse_alternative();
-        self.fold_source_as_reserved = reserved;
-        source
+        if self.mode == ParserMode::Jq {
+            self.parse_primary()
+        } else {
+            self.parse_alternative()
+        }
     }
 
+    /// Parse a reduce expression.
+    /// Syntax: reduce EXPR as $VAR (INIT; UPDATE)
     fn parse_reduce_expr(&mut self) -> Result<Expr, ParseError> {
         self.consume_keyword("reduce");
         self.skip_ws();
 
-        // Parse the source: alternative-level, stopping before the fold's own 'as'
+        // Parse the source, stopping before the fold's own 'as'
         let input = self.parse_fold_source()?;
         self.skip_ws();
 
@@ -3403,7 +3417,7 @@ impl<'a> Parser<'a> {
         self.consume_keyword("foreach");
         self.skip_ws();
 
-        // Parse the source: alternative-level, stopping before the fold's own 'as'
+        // Parse the source, stopping before the fold's own 'as'
         let input = self.parse_fold_source()?;
         self.skip_ws();
 
@@ -7289,17 +7303,27 @@ impl<'a> Parser<'a> {
     /// $i (0; .+$i) as $z` is a jq syntax error).
     fn parse_operand(&mut self) -> Result<Expr, ParseError> {
         let term = self.parse_primary()?;
-        self.bind_as_if_present(term)
+        self.bind_as_if_present(term, 0)
     }
 
     /// The `as` binding that follows `term`, if there is one, in jq mode
     /// (#3397) -- the one place a Term-level `as` is taken, shared by
-    /// [`Self::parse_operand`] and the `catch` handler (`try E catch T as $v
-    /// | B` scopes the binding inside the handler, as jq's grammar does).
+    /// [`Self::parse_operand`], the unary-minus arm and the `catch` handler
+    /// (`try E catch T as $v | B` scopes the binding inside the handler, as
+    /// jq's grammar does).
     ///
-    /// Declines, returning `term` untouched, in yq mode, after a non-Term
+    /// Declines, returning `term` untouched, in yq mode and after a non-Term
     /// (so [`Self::parse_binding`]'s `require_term_before_as` still rejects
-    /// it, #3038), and while a `reduce`/`foreach` source is being parsed.
+    /// it, #3038). The caller has just parsed `term` with `parse_primary`,
+    /// which ends by skipping whitespace, so the cursor is on the `as`.
+    ///
+    /// `credit` is how many `parse_primary` depth units the *caller* holds
+    /// open around this call (1 for the unary-minus arm and the `catch`
+    /// handler, which run inside their own primary; 0 for the operand loops).
+    /// The binding's body is given them back: jq accepts, and this parser
+    /// accepted before #3397, a chain of any length of `-T as $v | ...`,
+    /// because the body used to be parsed from the binding loop rather than
+    /// from inside a primary. They are restored on every exit.
     ///
     /// The body is an `Exp` that takes everything to its right that can
     /// extend it, so what still stands after it can only be a second
@@ -7307,38 +7331,44 @@ impl<'a> Parser<'a> {
     /// rejects. It is rejected here, because the operator ladder above would
     /// otherwise take the finished binding as *its* left operand and accept
     /// `(1 as $x | $x == 1) == 1`.
-    fn bind_as_if_present(&mut self, term: Expr) -> Result<Expr, ParseError> {
-        if self.mode != ParserMode::Jq || !self.last_primary_is_term || self.fold_source_as_reserved
+    fn bind_as_if_present(&mut self, term: Expr, credit: usize) -> Result<Expr, ParseError> {
+        if self.mode != ParserMode::Jq || !self.last_primary_is_term || !self.matches_keyword("as")
         {
-            return Ok(term);
-        }
-        let before_ws = self.pos;
-        self.skip_ws();
-        if !self.matches_keyword("as") {
-            self.pos = before_ws;
             return Ok(term);
         }
         self.consume_keyword("as");
         self.skip_ws();
-        let bound = self.parse_as_pattern(term)?;
-        self.skip_ws();
-        if let Some(op) = self.non_associative_operator_ahead() {
-            return Err(ParseError::new(
-                format!("syntax error, unexpected '{op}' after a binding's body"),
-                self.pos,
-            ));
-        }
+        self.expr_depth -= credit;
+        let bound = self.parse_as_pattern(term);
+        self.expr_depth += credit;
+        let bound = bound?;
+        self.reject_non_associative_after_binding()?;
         // A binding is an `Exp`, not a Term: nothing may bind it again.
         self.last_primary_is_term = false;
         Ok(bound)
     }
 
+    /// Reject a second comparison or assignment operator standing after a
+    /// binding's body (see [`Self::bind_as_if_present`]).
+    fn reject_non_associative_after_binding(&mut self) -> Result<(), ParseError> {
+        self.skip_ws();
+        match self.non_associative_operator_ahead() {
+            Some(op) => Err(ParseError::new(
+                format!("syntax error, unexpected '{op}' after a binding's body"),
+                self.pos,
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// The comparison or assignment operator at the cursor, if any -- the
-    /// two operator classes jq declares non-associative.
+    /// two operator classes jq declares non-associative. `|=` is not listed:
+    /// the body's own pipe loop has already taken its `|` by the time this
+    /// runs, so it can never be the operator left standing.
     fn non_associative_operator_ahead(&self) -> Option<&'static str> {
         let ahead = self.peek_str(3);
         [
-            "//=", "==", "!=", "<=", ">=", "|=", "+=", "-=", "*=", "/=", "%=", "<", ">", "=",
+            "//=", "==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "%=", "<", ">", "=",
         ]
         .into_iter()
         .find(|op| ahead.starts_with(op))
@@ -7348,12 +7378,18 @@ impl<'a> Parser<'a> {
     /// what follows it, in jq mode (#3397): jq's `'-' Exp` reads `-1 as $i |
     /// B` as `-(1 as $i | B)` and `-2 * "ab"` as `-(2 * "ab")`, so the sign
     /// must not fold into the token. The unary-minus arm then binds the
-    /// positive literal and absorbs the chain. Consumes nothing.
+    /// positive literal and absorbs the chain. A postfix `?` scopes too:
+    /// `-2? * 3` is `-(2? * 3)`. Consumes nothing.
     fn negation_scopes_over_what_follows(&mut self) -> bool {
+        // The byte right after the literal settles nearly every case.
+        if matches!(self.peek(), None | Some(',' | ']' | ')' | '}' | ';' | '|')) {
+            return false;
+        }
         let start = self.pos;
         self.skip_ws();
         let peek2 = self.peek_str(2);
         let scopes = self.matches_keyword("as")
+            || self.at_postfix_question()
             || match self.peek() {
                 Some('*') => peek2 != "*=",
                 Some('%') => peek2 != "%=",
@@ -7833,15 +7869,13 @@ impl<'a> Parser<'a> {
     /// here: "a pipe chain that stops at a comma" is exactly what yq's higher
     /// pipe precedence makes each comma operand.
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        // #3397: a nested expression is its own scope, even inside a fold
-        // source or an object value.
-        let reserved = core::mem::replace(&mut self.fold_source_as_reserved, false);
+        // #3397: a nested expression is its own scope, even inside an object
+        // value.
         let expd = core::mem::replace(&mut self.expd_operand, false);
         let expr = match self.mode {
             ParserMode::Jq => self.parse_pipe_expr(),
             ParserMode::Yq => self.parse_yq_comma_expr(),
         };
-        self.fold_source_as_reserved = reserved;
         self.expd_operand = expd;
         expr
     }
@@ -11711,6 +11745,42 @@ mod tests {
                 "unexpected error: {}",
                 err.message
             );
+        });
+    }
+
+    /// #3397 review: a binding taken inside the unary-minus arm or a `catch`
+    /// handler runs its body inside that arm's own `parse_primary`, which
+    /// used to charge every link of `-T as $v | ...` / `try E catch T as $v
+    /// | ...` one depth unit, so a chain jq (and the pre-#3397 parser) accepts
+    /// at any length was refused from 256 links, and the nested spellings from
+    /// 128. The body is given the unit back, so the chain costs nothing and
+    /// the nested form costs what its brackets cost.
+    #[test]
+    fn test_binding_chains_through_minus_and_catch_are_not_depth_charged_3397() {
+        with_parser_stack(|| {
+            let links = MAX_EXPR_DEPTH * 2;
+            for link in [
+                "-1 as $a | ",
+                "-. as $a | ",
+                "2 * -1 as $a | ",
+                "try 1 catch 1 as $a | ",
+            ] {
+                parse(&format!("{}1", link.repeat(links)))
+                    .unwrap_or_else(|e| panic!("`{link}` x{links} is a chain: {}", e.message));
+            }
+            let n = MAX_EXPR_DEPTH * 3 / 4;
+            for (open, close) in [("[-1 as $a | ", "]"), ("(try 1 catch 1 as $a | ", ")")] {
+                parse(&format!("{}1{}", open.repeat(n), close.repeat(n)))
+                    .unwrap_or_else(|e| panic!("`{open}` x{n}: {}", e.message));
+                let over = MAX_EXPR_DEPTH + 10;
+                let err = parse(&format!("{}1{}", open.repeat(over), close.repeat(over)))
+                    .expect_err("over-limit bracket nesting is still a parse error");
+                assert!(
+                    err.message.contains("nesting exceeds depth limit"),
+                    "unexpected error: {}",
+                    err.message
+                );
+            }
         });
     }
 
