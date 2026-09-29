@@ -69949,15 +69949,12 @@ fn test_owned_embed_keeps_node_identity_on_the_input_bridge_2889() -> Result<()>
 /// - A cross-bridge marker -- bound before `input` runs, or used after it --
 ///   refuses in jq as well, because `-n` makes `.` `null` at the bind and
 ///   `input`'s own output is what the later stage sees.
-/// - An empty container binds no node on this route at all: `eval.rs`
-///   recovers a value's cursor by hopping `parent()` from the child its
-///   `StandardJson` retains, and `{}`/`[]` retain none (#3180 Stage 2: it
-///   needs the container cursor kept on `JsonFields`/`JsonElements`, a
-///   hot-path change that wants measuring first). The generic evaluator
-///   answers these since #3180 Stage 1 -- see
-///   `test_default_route_empty_container_embed_keeps_identity_3180` -- so
-///   this is the one place the two routes still disagree, and in the safe
-///   direction.
+/// - A binding of an *empty* container embeds, and answers, since #3180
+///   Stage 2 (`test_input_route_empty_container_keeps_embed_identity_3180`);
+///   what stays here is its sibling -- a *different* empty container, equal
+///   in value, which jq refuses and which must never be mistaken for the
+///   bound node.
+/// - A scalar root, which never enters the embed table on this route.
 #[test]
 // jq filter literals are not formatting strings.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -69974,14 +69971,39 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         // (`input | .a as $y | .a | ($y.b) = 9`, jq-accepted and pinned here
         // as a Stage B residual, is answered since #3135 -- see
         // `test_navigated_bind_on_owned_root_answers_3135`.)
-        // An *empty* container has no retained child cursor for
-        // `whole_container_cursor` to hop from, so the bind names no node
-        // and the table stays empty. jq answers `[]`; the generic evaluator
-        // (which carries a real cursor rather than recovering one) answers
-        // it too since #3180 Stage 1, so this is the one place the two
-        // routes still differ.
-        (r"{}", r"input | . as $x | {k:.} | .k | path($x)"),
-        (r"[]", r"input | . as $x | {k:.} | .k | path($x)"),
+        // (An *empty* container's own binding answers since #3180 Stage 2 --
+        // see `test_input_route_empty_container_keeps_embed_identity_3180`.)
+        // A *sibling* empty container is a different node, equal in value:
+        // jq refuses each of these, and an accept would write to the wrong
+        // place.
+        (
+            r#"{"a":{},"b":{}}"#,
+            r"input | .a as $x | .b | {k:.} | .k | path($x)",
+        ),
+        (r#"{"a":[],"b":[]}"#, r"input | .a as $x | .b | path($x)"),
+        (
+            r#"{"a":{},"b":{}}"#,
+            r"input | .a as $x | (.b|{k:.}|.k) | path($x)",
+        ),
+        (
+            r#"{"a":{},"b":{}}"#,
+            r"input | .a as $x | .b | {k:.} | .k | ($x.z) = 1",
+        ),
+        (
+            r#"{"a":{},"b":{}}"#,
+            r"input | .a as $x | .b | {k:.} | .k | del($x.z)",
+        ),
+        (
+            r#"{"a":{},"b":{}}"#,
+            r"input | .a as $x | {k:.} | .k | {j:.} | .j | .b | ($x.z) = 1",
+        ),
+        (
+            r#"{"a":[[],{}]}"#,
+            r"input | .a[1] as $x | {k:.} | .k | {j:.} | .j | .a[0] | path($x)",
+        ),
+        // Binding each element and embedding `.` (the whole array), not the
+        // element: jq refuses.
+        (r"[{}]", r"input | .[] as $x | {k:.} | .k | path($x)"),
         // (Collecting the pipe into an array answers since #3180 -- see
         // `test_input_route_array_collect_keeps_embed_identity_3180`. A
         // second construct-and-navigate hop, `{k:.} | .k | {j:.} | .j`, and
@@ -70002,6 +70024,100 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
             "#2889 Stage B: `{filter}` -- stderr: {stderr:?}"
         );
     }
+    Ok(())
+}
+
+/// #3180 Stage 2: the `eval.rs` (`-n input`) route names an *empty*
+/// `{}`/`[]` as the node an `as` binding froze. `eval.rs` recovers a value's
+/// node from the child cursor its `StandardJson` retains, and an empty
+/// container used to retain none; `JsonFields`/`JsonElements` now keep the
+/// container's own cursor, tagged, for exactly that case. Every expected
+/// output captured live against jq 1.7.1; the rows jq refuses are in
+/// `test_input_bridge_embed_residuals_refuse_cleanly_2889`.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_input_route_empty_container_keeps_embed_identity_3180() -> Result<()> {
+    for (input, filter, want) in [
+        // Empty root, both containers, every embedding construction.
+        ("{}", r"input | . as $x | {k:.} | .k | path($x)", "[]"),
+        ("[]", r"input | . as $x | {k:.} | .k | path($x)", "[]"),
+        ("{}", r"input | . as $x | [.] | .[0] | path($x)", "[]"),
+        ("[]", r"input | . as $x | [.] | .[0] | path($x)", "[]"),
+        ("{}", r"input | . as $x | . + {} | path($x)", "[]"),
+        ("[]", r"input | . as $x | . + [] | path($x)", "[]"),
+        ("{}", r"input | . as $x | {k:$x} | .k | path($x)", "[]"),
+        (
+            "{}",
+            r"input | . as $x | {k:.} | .k | getpath([]) | path($x)",
+            "[]",
+        ),
+        // Collected, over one input and over several.
+        ("{}", r"[input | . as $x | {k:.} | .k | path($x)]", "[[]]"),
+        (
+            "{} []",
+            r"[inputs | . as $x | {k:.} | .k | path($x)]",
+            "[[],[]]",
+        ),
+        // A nested empty container: the binding's node is not the root.
+        (
+            r#"{"a":{}}"#,
+            r"input | .a as $x | .a | {k:.} | .k | path($x)",
+            "[]",
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"input | .a as $x | .a | [.] | .[0] | path($x)",
+            "[]",
+        ),
+        // A second construct-and-navigate hop crosses the reindex bridge
+        // (#3069), whose provenance lookup asks the list which document it
+        // reads -- answered for an empty container now too.
+        (
+            "{}",
+            r"input | . as $x | {k:.} | .k | {j:.} | .j | path($x)",
+            "[]",
+        ),
+        (
+            "[]",
+            r"input | . as $x | [.] | .[0] | [.] | .[0] | path($x)",
+            "[]",
+        ),
+        (
+            r#"{"a":[[],{}]}"#,
+            r"input | .a[1] as $x | {k:.} | .k | {j:.} | .j | .a[1] | path($x)",
+            "[]",
+        ),
+        // The write half, where a wrong answer costs data.
+        (
+            r#"{"a":{}}"#,
+            r"input | .a as $x | .a | {k:.} | .k | ($x.z) = 1",
+            r#"{"z":1}"#,
+        ),
+        (
+            r#"{"a":{}}"#,
+            r"input | .a as $x | .a | {k:.} | .k | del($x.z)",
+            "{}",
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"input | .a as $x | .a | [.] | .[0] | ($x[0]) = 1",
+            "[1]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3180: `{filter}` on {input}: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3180: `{filter}` on {input}");
+    }
+
+    // The same bridged hop on the default route, which reaches the bridge
+    // provenance lookup through the same list method.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r". as $x | {k:.} | .k | {j:.} | .j | path($x)"],
+        Some("{}"),
+    )?;
+    assert_eq!(code, 0, "#3180 default-route bridge hop: stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "[]");
     Ok(())
 }
 
