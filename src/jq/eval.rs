@@ -26423,7 +26423,13 @@ fn contain_depth_panic<'a, W>(f: impl FnOnce() -> QueryResult<'a, W>) -> QueryRe
 /// generic evaluator's bridges use (`eval_generic::eval_on_owned`,
 /// `bridge_to_full_evaluator`), and what [`eval`] itself falls through to
 /// for a query with no path context.
-pub(crate) fn eval_full<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+///
+/// `#[doc(hidden)] pub` (#3457) only so `tests/jq_evaluator_parity_tests.rs`
+/// can keep comparing *this* evaluator against the generic one: [`eval`] is
+/// the generic evaluator, so a parity harness that called it would compare
+/// that evaluator with itself. Not a supported entry point.
+#[doc(hidden)]
+pub fn eval_full<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
 ) -> QueryResult<'a, W> {
@@ -67435,7 +67441,7 @@ mod tests {
         // evaluates the real array length.
         let mut resolved = parse("def length(x): x; length").unwrap();
         resolve_func_calls_all(&mut resolved);
-        match eval::<Vec<u64>, JqSemantics>(&resolved, index.root(json)) {
+        match eval_full::<Vec<u64>, JqSemantics>(&resolved, index.root(json)) {
             QueryResult::Owned(OwnedValue::Int(3)) => {}
             other => panic!("expected Owned(Int(3)), got {other:?}"),
         }
@@ -67444,7 +67450,7 @@ mod tests {
         // node's `builtin_fallback` is still `Some`, so this must name the
         // actual cause instead of reporting a bare arity/name mismatch.
         let unresolved = parse("def length(x): x; length").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&unresolved, index.root(json)) {
+        match eval_full::<Vec<u64>, JqSemantics>(&unresolved, index.root(json)) {
             QueryResult::Error(e) => {
                 assert!(
                     e.message.contains("resolve_func_calls"),
@@ -67473,7 +67479,7 @@ mod tests {
         let expr =
             parse_with_mode_and_extensions("def until(x): x; until(true; .)", ParserMode::Yq, true)
                 .unwrap();
-        match eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)) {
+        match eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(json)) {
             QueryResult::Error(e) => {
                 assert!(
                     e.message.contains("resolve_func_calls"),
@@ -68433,7 +68439,7 @@ mod tests {
             let json = b"null";
             let index = JsonIndex::build(json);
             with_stack_budget(0, || {
-                match eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
                     QueryResult::Error(e) => e,
                     other => panic!("{filter}: expected a refusal, got {other:?}"),
                 }
@@ -68487,7 +68493,7 @@ mod tests {
         ] {
             let expr = parse(filter).expect("parses");
             let refuse = || match with_stack_budget(0, || {
-                eval::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+                eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json))
             }) {
                 QueryResult::Error(e) => assert!(
                     e.message.ends_with("exceeded maximum recursion depth"),
@@ -68501,7 +68507,7 @@ mod tests {
             // Warm the node's bound-body cache with the stack unregistered...
             assert!(
                 !matches!(
-                    eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)),
+                    eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json)),
                     QueryResult::Error(_)
                 ),
                 "{filter}: answers with the stack unregistered"
@@ -68520,7 +68526,7 @@ mod tests {
             let expr = parse(filter).expect("parses");
             let refused = || {
                 matches!(
-                    with_stack_budget(0, || eval::<Vec<u64>, YqSemantics>(
+                    with_stack_budget(0, || eval_full::<Vec<u64>, YqSemantics>(
                         &expr,
                         index.root(json)
                     )),
@@ -68530,7 +68536,7 @@ mod tests {
             assert!(refused(), "{filter}: cold");
             assert!(
                 !matches!(
-                    eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)),
+                    eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(json)),
                     QueryResult::Error(_)
                 ),
                 "{filter}: answers with the stack unregistered"
@@ -68543,7 +68549,7 @@ mod tests {
             &Expr::shared(Expr::Identity),
         );
         assert!(matches!(
-            with_stack_budget(0, || eval::<Vec<u64>, YqSemantics>(&read, index.root(json))),
+            with_stack_budget(0, || eval_full::<Vec<u64>, YqSemantics>(&read, index.root(json))),
             QueryResult::Error(e) if e.message == "exceeded maximum recursion depth"
         ));
 
@@ -68567,8 +68573,9 @@ mod tests {
                 "g",
                 &Expr::shared(Expr::Identity),
             );
-            let result =
-                with_stack_budget(0, || eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)));
+            let result = with_stack_budget(0, || {
+                eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+            });
             match result {
                 QueryResult::Error(e) => {
                     assert_eq!(e.message, "exceeded maximum recursion depth", "{filter}");
@@ -68594,7 +68601,7 @@ mod tests {
                         .expect("parses");
                     let json = b"null";
                     let index = JsonIndex::build(json);
-                    match eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
+                    match eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
                         QueryResult::Error(e) => e.message,
                         _ => String::new(),
                     }
@@ -69518,7 +69525,7 @@ mod tests {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let expr = parse(src).unwrap();
-            let (values, tag) = normalize(eval::<Vec<u64>, JqSemantics>(&expr, cursor));
+            let (values, tag) = normalize(eval_full::<Vec<u64>, JqSemantics>(&expr, cursor));
             assert_eq!(tag, "ok", "`{src}` did not evaluate cleanly");
             values
         }
@@ -69620,6 +69627,22 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse($expr).unwrap();
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                $pattern $(if $guard)? => $body,
+                other => panic!("unexpected result: {:?}", other),
+            }
+        }};
+    }
+
+    /// [`query!`] through the public [`eval`] entry instead of [`eval_full`]:
+    /// for the tests that pin how that entry routes a path-context query to
+    /// the generic evaluator (`key`, ...), which `eval_full` never does.
+    macro_rules! query_entry {
+        ($json:expr, $expr:expr, $pattern:pat $(if $guard:expr)? => $body:expr) => {{
+            let json_bytes: &[u8] = $json;
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr = parse($expr).unwrap();
             match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 $pattern $(if $guard)? => $body,
                 other => panic!("unexpected result: {:?}", other),
@@ -69676,7 +69699,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse_with_mode_and_extensions($expr, ParserMode::Yq, true).unwrap();
-            match eval::<Vec<u64>, YqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, YqSemantics>(&expr, cursor) {
                 $pattern $(if $guard)? => $body,
                 other => panic!("unexpected result: {:?}", other),
             }
@@ -71559,7 +71582,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse(filter).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Error(e) if e.is_decode_failure() => {
                     assert!(
                         e.message.contains("invalid UTF-8"),
@@ -73231,7 +73254,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse("truncate_stream(tostream)").unwrap();
-            if let QueryResult::Error(e) = eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            if let QueryResult::Error(e) = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 assert!(!e.is_decode_failure());
             }
         }
@@ -73894,7 +73917,7 @@ mod tests {
         // bytes rather than raising. The row is kept, asserting the new
         // answer, rather than deleted: the list's point is which builtins read
         // a value, and this is the one that stopped.
-        query!(
+        query_entry!(
             &b"[\"\xff\xfe\"]"[..],
             ".[] | key",
             QueryResult::Owned(OwnedValue::Int(0)) => {}
@@ -73909,7 +73932,7 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let expr = parse_with_mode_and_extensions(".[0:1]", ParserMode::Yq, true).unwrap();
-        match eval::<Vec<u64>, YqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, YqSemantics>(&expr, cursor) {
             QueryResult::Error(e) if e.is_decode_failure() => {}
             other => panic!("unexpected result: {other:?}"),
         }
@@ -74689,7 +74712,7 @@ mod tests {
             let index = JsonIndex::build(b"null");
             let cursor = index.root(b"null");
             let expr = parse(filter).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Partial(prefix, Control::Error(e)) => {
                     assert_eq!(
                         prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
@@ -74711,7 +74734,7 @@ mod tests {
             "IN([1] as [$x] ?// $x | if ($x|type)==\"number\" then $x else error(\"boom\") end)",
         )
         .unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Partial(prefix, Control::Error(e)) => {
                 assert_eq!(
                     prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
@@ -75006,7 +75029,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        eval::<Vec<u64>, JqSemantics>(&expr, cursor)
+        eval_full::<Vec<u64>, JqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -75022,7 +75045,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+        eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -76539,7 +76562,7 @@ mod tests {
         let index = JsonIndex::build(b"null");
         let cursor = index.root(b"null");
         assert_eq!(
-            eval::<Vec<u64>, JqSemantics>(&substituted, cursor)
+            eval_full::<Vec<u64>, JqSemantics>(&substituted, cursor)
                 .collect_owned::<JqSemantics>()
                 .iter()
                 .map(OwnedValue::to_json)
@@ -77875,7 +77898,7 @@ mod tests {
             // construct's own per-value operation, then escapes with the
             // generator's own control.
             let jq_expr = parse(filter).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&jq_expr, index.root(json)) {
+            match eval_full::<Vec<u64>, JqSemantics>(&jq_expr, index.root(json)) {
                 QueryResult::Partial(vs, Control::Error(e)) => {
                     assert_eq!(vs, jq_prefix, "{site}: jq prefix");
                     assert_eq!(e.message, "x", "{site}: jq escape");
@@ -77885,7 +77908,7 @@ mod tests {
 
             // yq mode discards it and escapes bare.
             let yq_expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, true).unwrap();
-            match eval::<Vec<u64>, YqSemantics>(&yq_expr, index.root(json)) {
+            match eval_full::<Vec<u64>, YqSemantics>(&yq_expr, index.root(json)) {
                 QueryResult::Error(e) => assert_eq!(e.message, "x", "{site}: yq escape"),
                 other => panic!("{site}: yq mode must discard the prefix, got {other:?}"),
             }
@@ -80027,7 +80050,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => {
                 assert_eq!(e.message, message, "filter: {filter} ({divergence})");
             }
@@ -80041,7 +80064,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Break(l) => assert_eq!(l, "out", "filter: {filter}"),
             other => panic!("{filter}: expected a bare Break, got {other:?}"),
         }
@@ -80471,7 +80494,7 @@ mod tests {
             let expr = parse(filter).unwrap();
             assert!(
                 matches!(
-                    eval::<Vec<u64>, JqSemantics>(&expr, cursor),
+                    eval_full::<Vec<u64>, JqSemantics>(&expr, cursor),
                     QueryResult::None
                 ),
                 "filter: {filter}"
@@ -82110,7 +82133,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("(.a[] | select((true,true))) |= . + 10").unwrap();
-        let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+        let out: Vec<String> = eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -90036,7 +90059,7 @@ mod tests {
             let expr = parse(filter).unwrap();
             format!(
                 "{:?}",
-                eval::<Vec<u64>, JqSemantics>(&expr, index.root(bytes))
+                eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(bytes))
             )
         };
         for (token, sibling) in [
@@ -90068,7 +90091,7 @@ mod tests {
         for (token, filter) in [("9e999e999", "isnan"), ("8e999e999", "isinfinite")] {
             let index = JsonIndex::build_reindex(token.as_bytes());
             let expr = parse(filter).unwrap();
-            let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(token.as_bytes()));
+            let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(token.as_bytes()));
             assert!(
                 matches!(result, QueryResult::Owned(OwnedValue::Bool(true))),
                 "{token} | {filter} as bridge text: {result:?}"
@@ -90508,7 +90531,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => Err(e.message),
             other => Ok(other
                 .collect_owned::<JqSemantics>()
@@ -93586,7 +93609,7 @@ mod tests {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let expr = parse(filter).expect("parse failed");
-            eval::<Vec<u64>, JqSemantics>(&expr, cursor).collect_owned::<JqSemantics>()
+            eval_full::<Vec<u64>, JqSemantics>(&expr, cursor).collect_owned::<JqSemantics>()
         }
         // OneCursor: identity passes a container through unchanged.
         assert_eq!(owned(br#"{"a":1}"#, ".").len(), 1);
@@ -95842,7 +95865,7 @@ mod tests {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let expr = parse(filter).unwrap();
-            let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+            let out: Vec<String> = eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
                 .collect_owned::<YqSemantics>()
                 .iter()
                 .map(OwnedValue::to_json)
@@ -95868,7 +95891,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("del(.a[].x[1:3])").unwrap();
-        let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+        let out: Vec<String> = eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -98346,7 +98369,7 @@ mod tests {
         // the key's line/column/comments), and `generic_to_query_result`
         // renders a batch of cursors as their borrowed values. Unchanged
         // keys.
-        query!(br#"{"a": 1, "b": 2, "c": 3}"#, ".[] | key",
+        query_entry!(br#"{"a": 1, "b": 2, "c": 3}"#, ".[] | key",
             QueryResult::Many(results) => {
                 assert_eq!(results.len(), 3);
                 // Check that all results are string keys
@@ -98390,7 +98413,7 @@ mod tests {
         // (spine 2416, phase 3), where `key` is a cursor property. The
         // `null` this used to pin was this evaluator's own answer, which is
         // no longer reachable from `eval`.
-        query!(br#"{"a": 1}"#, "key",
+        query_entry!(br#"{"a": 1}"#, "key",
             QueryResult::None => {}
         );
     }
@@ -98399,7 +98422,7 @@ mod tests {
     fn test_key_nested() {
         // Test key on nested access. `OneCursor`, not `Owned`: see
         // `test_key_object` above (#2763).
-        query!(br#"{"outer": {"inner": 42}}"#, ".outer | .[] | key",
+        query_entry!(br#"{"outer": {"inner": 42}}"#, ".outer | .[] | key",
             QueryResult::OneCursor(c) => {
                 assert_eq!(
                     crate::jq::eval_generic::to_owned_cursor::<JqSemantics, _>(&c).expect("decodes"),
@@ -99718,7 +99741,7 @@ mod tests {
         let index = JsonIndex::build(b"[10,20]");
         let cursor = index.root(b"[10,20]");
         let expr = parse(".[] | key | tostring").unwrap();
-        let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+        let out: Vec<String> = eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -99978,7 +100001,7 @@ mod tests {
         let index = crate::json::JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(v) => {
                 assert_eq!(
                     v,
@@ -99999,7 +100022,7 @@ mod tests {
         let index = crate::json::JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(v) => {
                 assert_eq!(
                     v,
@@ -100019,7 +100042,7 @@ mod tests {
         let index = crate::json::JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(v) => {
                 assert_eq!(
                     v,
@@ -101099,7 +101122,7 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                         QueryResult::Owned(OwnedValue::Object(obj)) => {
                             assert_eq!(
                                 obj.get("name"),
@@ -101128,7 +101151,7 @@ mod tests {
             let cursor = index.root(json_bytes);
             let query = format!(r#"load("{path}")"#);
             let expr = parse(&query).unwrap();
-            let result = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+            let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
             let _ = fs::remove_file(path);
             match result {
                 QueryResult::Error(e) => assert!(e.is_decode_failure(), "{e:?}"),
@@ -101144,7 +101167,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(
                             obj.get("name"),
@@ -101165,7 +101188,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         let items = obj.get("items").unwrap();
                         match items {
@@ -101188,7 +101211,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse(r#"load("/tmp/nonexistent_file_12345.yaml")"#).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Error(err) => {
                     assert!(
                         err.message.contains("Failed to read file")
@@ -101206,7 +101229,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch null"#).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Owned(OwnedValue::Null) => {}
                 other => panic!("expected null, got: {other:?}"),
             }
@@ -101219,7 +101242,7 @@ mod tests {
             let cursor = index.root(json_bytes);
             let expr =
                 parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch "not found""#).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Owned(OwnedValue::String(s)) => {
                     assert_eq!(s, "not found");
                 }
@@ -101235,7 +101258,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#". + {{config: load("{path}")}}"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(
                             obj.get("name"),
@@ -101265,7 +101288,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Array(arr)) => {
                         assert_eq!(arr.len(), 2);
                         match &arr[0] {
@@ -101301,7 +101324,7 @@ mod tests {
                 let index = JsonIndex::build(json_bytes);
                 let cursor = index.root(json_bytes);
                 let expr = parse(r"load(.path)").unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(obj.get("loaded"), Some(&OwnedValue::Bool(true)));
                     }
@@ -101338,7 +101361,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(obj.get("a"), Some(&OwnedValue::Null));
                         assert_eq!(obj.get("b"), Some(&OwnedValue::Bool(true)));
@@ -101369,7 +101392,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Array(items)) => {
                         assert_eq!(items, vec![OwnedValue::String("5".to_string())]);
                     }
@@ -101392,7 +101415,7 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                         QueryResult::Owned(OwnedValue::Object(obj)) => {
                             assert_eq!(
                                 obj.get("quoted"),
@@ -101433,7 +101456,7 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                         QueryResult::Owned(OwnedValue::Object(obj)) => {
                             assert_eq!(obj.len(), 1);
                             assert_eq!(
@@ -101455,7 +101478,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(obj.get("a"), Some(&OwnedValue::String("hello".to_string())));
                         assert_eq!(obj.get("b"), Some(&OwnedValue::String("hello".to_string())));
@@ -101481,7 +101504,7 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                         QueryResult::Owned(OwnedValue::Object(obj)) => {
                             assert_eq!(obj.get("a"), Some(&OwnedValue::Int(5)));
                             assert_eq!(obj.get("b"), Some(&OwnedValue::Int(5)));
@@ -102236,7 +102259,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        let result = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+        let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
         let end = match &result {
             QueryResult::Error(e) => format!("error: {e}"),
             QueryResult::Break(label) => format!("break: {label}"),
@@ -103618,7 +103641,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("del(.[.a:1], .[.a:2])").unwrap();
-        let rendered: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+        let rendered: Vec<String> = eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -104665,7 +104688,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a = 5").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104685,7 +104708,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("(.a = 5)?").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104704,7 +104727,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a |= (.+1)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104724,7 +104747,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map(.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104742,7 +104765,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("to_entries").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104759,7 +104782,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("to_entries").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104779,7 +104802,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map_values(.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "object/One: {e:?}"),
             other => panic!("object/One: expected a decode-failure error, got: {other:?}"),
         }
@@ -104787,7 +104810,7 @@ mod tests {
         // Object arm, `Many` shape (`map_values` takes only the first
         // output, per jq semantics -- still must decode-check it).
         let expr = parse("map_values(.,.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "object/Many: {e:?}"),
             other => panic!("object/Many: expected a decode-failure error, got: {other:?}"),
         }
@@ -104797,14 +104820,14 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map_values(.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "array/One: {e:?}"),
             other => panic!("array/One: expected a decode-failure error, got: {other:?}"),
         }
 
         // Array arm, `Many` shape.
         let expr = parse("map_values(.,.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "array/Many: {e:?}"),
             other => panic!("array/Many: expected a decode-failure error, got: {other:?}"),
         }
@@ -104819,7 +104842,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map(.,.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104837,7 +104860,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("path(.a)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104859,7 +104882,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a = .b").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "One: {e:?}"),
             other => panic!("One: expected a decode-failure error, got: {other:?}"),
         }
@@ -104868,7 +104891,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a = (.b, .b)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "Many: {e:?}"),
             other => panic!("Many: expected a decode-failure error, got: {other:?}"),
         }
@@ -104884,7 +104907,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a = 5").unwrap();
-        match eval::<Vec<u64>, YqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, YqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104913,7 +104936,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a += .b").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104935,7 +104958,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("setpath([\"a\"]; 5)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "setpath: {e:?}"),
             other => panic!("setpath: expected a decode-failure error, got: {other:?}"),
         }
@@ -104943,7 +104966,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("del(.a)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "del: {e:?}"),
             other => panic!("del: expected a decode-failure error, got: {other:?}"),
         }
@@ -104951,7 +104974,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("delpaths([[\"a\"]])").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "delpaths: {e:?}"),
             other => panic!("delpaths: expected a decode-failure error, got: {other:?}"),
         }
@@ -104966,7 +104989,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("setpath([\"a\"]; 5)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), Some(&OwnedValue::Int(5)));
             }
@@ -104976,7 +104999,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("del(.a)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), None);
                 assert_eq!(m.get("b"), Some(&OwnedValue::Int(2)));
@@ -104987,7 +105010,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("delpaths([[\"a\"]])").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), None);
                 assert_eq!(m.get("b"), Some(&OwnedValue::Int(2)));
@@ -105012,7 +105035,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("path(.a | tonumber?)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -105035,7 +105058,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("delpaths([[\"a\"]])?").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -105066,7 +105089,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("sort").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Array(items)) => {
                 assert_eq!(items.len(), 1, "expected the field to survive: {items:?}");
                 match &items[0] {
@@ -105101,7 +105124,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("sort").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(_) => {}
             other => panic!(
                 "expected the structurally non-string key to raise instead of being silently dropped, got: {other:?}"
@@ -105121,7 +105144,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("sort").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.message.contains("ambiguous"),
                 "expected a colliding-key error, got: {e:?}"
@@ -105147,7 +105170,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("sort").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(_) => {}
             other => panic!(
                 "expected the trailing unpaired member to raise instead of being silently dropped, got: {other:?}"
@@ -105167,14 +105190,14 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map_values(.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), Some(&OwnedValue::Int(1)));
             }
             other => panic!("object/One: unexpected result: {other:?}"),
         }
         let expr = parse("map_values(.,.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), Some(&OwnedValue::Int(1)));
             }
@@ -105186,14 +105209,14 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map_values(.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Array(vs)) => {
                 assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
             }
             other => panic!("array/One: unexpected result: {other:?}"),
         }
         let expr = parse("map_values(.,.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Array(vs)) => {
                 assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
             }
@@ -105205,14 +105228,14 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a = .b").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), Some(&OwnedValue::Int(2)));
             }
             other => panic!("assign/One: unexpected result: {other:?}"),
         }
         let expr = parse(".a = (.b, .b)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::ManyOwned(vs) => {
                 assert_eq!(vs.len(), 2);
                 for v in vs {
@@ -107633,7 +107656,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(&format!("[{filter}] | tojson")).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::String(s)) => Ok(s),
             QueryResult::Error(e) => Err(e),
             other => panic!("{filter}: unexpected result {other:?}"),
@@ -108005,7 +108028,7 @@ mod tests {
     fn owned_doc_2872(json: &[u8]) -> OwnedValue {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let mut outputs = eval::<Vec<u64>, JqSemantics>(&parse(".").unwrap(), cursor)
+        let mut outputs = eval_full::<Vec<u64>, JqSemantics>(&parse(".").unwrap(), cursor)
             .collect_owned::<JqSemantics>();
         outputs.pop().expect("identity yields the document")
     }
@@ -109217,7 +109240,7 @@ mod tests {
         let path_of = |var: Expr| {
             let cursor = index.root(doc);
             let expr = Expr::Builtin(Builtin::Path(Box::new(var)));
-            eval::<Vec<u64>, JqSemantics>(&expr, cursor)
+            eval_full::<Vec<u64>, JqSemantics>(&expr, cursor)
         };
         // A tracked root snapshot certifies against the root: `path(. as $x
         // | $x)` is `[]` in jq 1.7.1.
@@ -109249,7 +109272,7 @@ mod tests {
                 parse(".a").unwrap(),
                 Expr::Builtin(Builtin::Path(Box::new(var))),
             ]);
-            eval::<Vec<u64>, JqSemantics>(&expr, cursor)
+            eval_full::<Vec<u64>, JqSemantics>(&expr, cursor)
         };
         match at_a(constructed) {
             QueryResult::Error(e) => assert!(e.is_invalid_path_expression()),
@@ -110889,7 +110912,7 @@ mod tests {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let expr = parse(src).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Error(e) => assert!(
                     e.message.starts_with("Invalid path expression"),
                     "{src}: {}",
@@ -111168,7 +111191,7 @@ mod tests {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
             let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
-            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
             match want {
                 Ok(want) => {
                     let got: Vec<String> = got
@@ -111367,7 +111390,7 @@ mod tests {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
             let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
-            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
             match want {
                 Ok(want) => {
                     let got: Vec<String> = got
@@ -111593,7 +111616,7 @@ mod tests {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
             let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
-            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
             match want {
                 Ok(want) => {
                     let got: Vec<String> = got
@@ -111648,7 +111671,7 @@ mod tests {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
             let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
-            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
             match want {
                 Ok(want) => {
                     let got: Vec<String> = got
@@ -111670,7 +111693,7 @@ mod tests {
         let json = br#"{"a":[1,2],"b":[3]}"#;
         let index = JsonIndex::build(json);
         let expr = parse(r"del((.,.) as [$z] ?// {a:$q} | $q)").unwrap();
-        let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+        let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
         let got: Vec<String> = got
             .collect_owned::<JqSemantics>()
             .iter()
@@ -112113,7 +112136,7 @@ mod tests {
         let refuses = |src: &str, want: &str| {
             let expr = parse(src).unwrap();
             let index = JsonIndex::build(doc);
-            match eval::<Vec<u64>, JqSemantics>(&expr, index.root(doc)) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(doc)) {
                 QueryResult::Error(e) => assert_eq!(e.message, want, "{src}"),
                 other => panic!("{src}: expected a refusal, got {other:?}"),
             }
@@ -112127,7 +112150,7 @@ mod tests {
         // orthogonal divergence in the refusal's wording, not its verdict
         // -- `resolve_leaf`'s catch-all names the whole fold's value where
         // jq names the destructuring step).
-        match eval::<Vec<u64>, JqSemantics>(
+        match eval_full::<Vec<u64>, JqSemantics>(
             &parse("path(reduce .b as {c:$x} (.; .b))").unwrap(),
             JsonIndex::build(doc).root(doc),
         ) {
@@ -112154,7 +112177,7 @@ mod tests {
         // though the source element is: `path(foreach (null) as {a:$x} (.;
         // .; $x))` on `{}` refuses (the coincidence needs the *register*'s
         // own value, not just the element's, to be null/bool).
-        match eval::<Vec<u64>, JqSemantics>(
+        match eval_full::<Vec<u64>, JqSemantics>(
             &parse("path(foreach (null) as {a:$x} (.; .; $x))").unwrap(),
             JsonIndex::build(br"{}").root(br"{}"),
         ) {
@@ -112192,7 +112215,7 @@ mod tests {
         // {b:{c:$x}} (.; $x))` raises "Invalid path expression with result
         // 5" in jq 1.7.1, even with a nested object pattern and a SOURCE
         // that is trivially the register (`.`).
-        match eval::<Vec<u64>, JqSemantics>(
+        match eval_full::<Vec<u64>, JqSemantics>(
             &parse("path(reduce . as {b:{c:$x}} (.; $x))").unwrap(),
             JsonIndex::build(doc).root(doc),
         ) {
@@ -114504,7 +114527,7 @@ mod share_audit_2999 {
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
         let (ok, recorded) = share_stats::measure(|| {
-            let result = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+            let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
             let ok = !matches!(result, QueryResult::Error(_));
             drop(result);
             ok
@@ -114562,7 +114585,7 @@ mod share_audit_2999 {
         let cursor = index.root(&json);
         let expr = parse(".[(0,1)] = 0").unwrap();
         let ((), recorded) = share_stats::measure(|| {
-            drop(eval::<Vec<u64>, JqSemantics>(&expr, cursor));
+            drop(eval_full::<Vec<u64>, JqSemantics>(&expr, cursor));
         });
         assert!(!recorded.is_empty());
         for (site, _) in &recorded {
@@ -114628,7 +114651,7 @@ mod touched_edge_cases_2999 {
     fn one_json<S: EvalSemantics>(json: &[u8], expr: &Expr) -> String {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        match eval::<Vec<u64>, S>(expr, cursor) {
+        match eval_full::<Vec<u64>, S>(expr, cursor) {
             QueryResult::Owned(v) => v.to_json(),
             QueryResult::One(v) => to_owned::<S, _>(&v).unwrap().to_json(), // omni-dev: coverage tolerate-line reason="every pinned filter below yields an owned value; kept so a cursor answer still renders rather than panics (#2999)"
             other => panic!("unexpected result: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertions this helper serves (#2999)"
