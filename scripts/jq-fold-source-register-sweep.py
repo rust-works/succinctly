@@ -22,22 +22,25 @@ pinned oracle and the built binary, then classified by direction:
     both-ok-differ    both answer, differently
     both-error-differ both refuse, with different stdout
 
-**The alphabet is part of the claim** (#2041): 92 source shapes -- every
-navigation x every non-navigating tail, plus the shapes the fix must NOT
-change (a literal, an `as` source, an untaken navigating branch). Run
+**The alphabet is part of the claim** (#2041): 117 source shapes -- every
+navigation x every non-navigating tail, the builtins that navigate without
+spelling an INDEX (`..`, `recurse`, `getpath`, `walk`), slices, and the shapes
+the fix must NOT change (a literal, an `as` source, an untaken navigating
+branch). Run
 `--self-test` to print the pools.
 
 Two-sided staleness gate, as the other oracle sweeps have: the run fails on
-any FABRICATE, and on any divergence outside `KNOWN_RESIDUAL_SOURCES` -- the
-sources whose remaining divergences are tracked (#3459: an opaque builtin
-after the navigation; #3460: pointer identity). A residual source that
-*stops* diverging also fails, so the list cannot go stale.
+any divergence outside `KNOWN_RESIDUALS` -- the (source, category) pairs whose
+remaining divergences are tracked (#3459: an opaque builtin that indexes
+inside itself; #3460: pointer identity) -- and on any tracked pair that
+*stops* occurring, so the table cannot go stale. `--print-residuals` prints
+the observed table for regenerating it after a deliberate change.
 
 Usage:
     cargo build --release --features cli
     ./scripts/jq-fold-source-register-sweep.py [--bin PATH] [--jq PATH] [--show K] [--self-test]
     (60k cases, two process spawns each: minutes, not seconds -- not run in CI.)
-Exit 1 on any FABRICATE, any unexpected divergence, or a stale residual entry.
+Exit 1 on any unexpected divergence or a stale residual entry.
 """
 import argparse, collections, concurrent.futures as cf, itertools, re, subprocess, sys
 
@@ -52,18 +55,61 @@ SRCS += [
     '(.a|tostring)|.', '.a|tostring|tonumber?', 'if true then (.a|length) else 1 end',
     '.a as $x | 1', '(.a|tostring), 1', '1, (.a|tostring)', 'first(.a)', 'add?', 'empty',
 ]
+# Sources that navigate without spelling an INDEX (the review of #2159 found
+# `..|tostring` fabricating while the alphabet above could not emit it): the
+# recursion/`getpath`/`walk` builtins, the bare `first`/`last`/`nth`/`map`
+# builtins that index inside themselves, slices (a full slice is the same
+# `jv`, a partial one is not), and controls that must not change.
+SRCS += [
+    '..|tostring', 'recurse|tostring', 'recurse(.[]?)|length', '..', 'recurse',
+    'getpath(["a"])|tostring', 'getpath(["b","c"])|type', 'getpath(["a"])', 'walk(.)|tostring',
+    'first|tostring', 'last|tostring', 'nth(0)|tostring', 'first', 'last', 'map(1)|length',
+    '.[0:1]|tostring', '.[0:]|tostring', '.a[0:1]?|length', '.[1:]|type', '.[0:2]',
+    'range(2)|tostring', 'paths|tostring', 'keys|.[0]', 'to_entries|length', 'tojson|fromjson',
+]
 UPDS = ['.', '.a', '.b', '.[0]', '$k', '1']
 INITS = ['.', '.b', '1', 'null']
 KINDS = ['foreach', 'reduce']
 FORMS = ['path({k} ({s}) as $k ({i}; {u}))', '({k} ({s}) as $k ({i}; {u})) = 9']
 
-# Sources whose remaining divergences are tracked, not fixed. `first`/`add?`
-# index inside the builtin, so the register's position is unknowable to the
-# resolver (#3459); the `tostring` rows are jq's pointer identity on a string
-# and on the accumulator (#3460).
-KNOWN_RESIDUAL_SOURCES = {
-    '.a|first', '.b|first', '.a.c|first', '.[0]|first', '.[]|first', '.a?|first',
-    '(.a,.b)|first', 'add?', '.b|tostring', '1, (.a|tostring)',
+# Divergences that remain, as `source -> the categories it may show`. Gated per
+# (source, category) rather than per source, so an unrelated new divergence on
+# a known source (a `both-ok-differ` where only a `REJECT` is tracked) fails
+# the run instead of hiding behind the source's name. A pair that stops
+# occurring fails too, so the table cannot go stale.
+#
+#   `first`/`last`/`nth`/`map`/`add`, alone or after a navigation -- builtins
+#   that index inside themselves, so the register's position is unknowable
+#   here (#3459). Bare, they leave the resolver's path at the root and read as
+#   a literal: `first|tostring` still FABRICATEs (jq refuses), as it did
+#   before #2159.
+#   `.b|tostring`, `1, (.a|tostring)`, `..`, `recurse`, `.[0:]`, `.[0:2]` --
+#   jq's pointer identity: the accumulator carried across source elements, a
+#   `tostring` of a string, a full slice (#3460).
+KNOWN_RESIDUALS = {
+    '(.a,.b)|first': ['REJECT', 'both-error-differ', 'both-ok-differ'],
+    '..': ['both-error-differ'],
+    '..|tostring': ['both-error-differ'],
+    '.[0:2]': ['REJECT'],
+    '.[0:]|tostring': ['REJECT'],
+    '.[0]|first': ['REJECT', 'both-ok-differ'],
+    '.[]|first': ['REJECT', 'both-error-differ'],
+    '.a.c|first': ['REJECT', 'both-ok-differ'],
+    '.a?|first': ['REJECT', 'both-ok-differ'],
+    '.a|first': ['REJECT', 'both-ok-differ'],
+    '.b|first': ['REJECT', 'both-ok-differ'],
+    '.b|tostring': ['REJECT'],
+    '1, (.a|tostring)': ['REJECT'],
+    'add?': ['REJECT', 'both-ok-differ'],
+    'first': ['FABRICATE', 'REJECT', 'both-ok-differ'],
+    'first|tostring': ['FABRICATE', 'both-ok-differ'],
+    'last': ['FABRICATE', 'REJECT', 'both-ok-differ'],
+    'last|tostring': ['FABRICATE', 'both-ok-differ'],
+    'map(1)|length': ['FABRICATE'],
+    'nth(0)|tostring': ['FABRICATE', 'both-ok-differ'],
+    'recurse': ['both-error-differ'],
+    'recurse(.[]?)|length': ['both-error-differ'],
+    'recurse|tostring': ['both-error-differ'],
 }
 
 
@@ -85,6 +131,8 @@ def main():
     ap.add_argument('--jq', default='/usr/bin/jq')
     ap.add_argument('--show', type=int, default=3)
     ap.add_argument('--self-test', action='store_true')
+    ap.add_argument('--print-residuals', action='store_true',
+                    help='print the observed (source -> categories) table and exit 0')
     args = ap.parse_args()
     cases = [
         (form.format(k=k, s=s, i=i, u=u), inp)
@@ -123,24 +171,28 @@ def main():
     for k, v in counts.most_common():
         print(f'  {v:6}  {k}')
 
-    residual_seen = set()
-    bad = []
-    for cat, f, inp, j, s in diffs:
-        src = source_of(f)
-        if cat == 'FABRICATE' or src not in KNOWN_RESIDUAL_SOURCES:
-            bad.append((cat, f, inp, j, s))
-        else:
-            residual_seen.add(src)
-    stale = KNOWN_RESIDUAL_SOURCES - residual_seen
-    for cat, f, inp, j, s in bad[:args.show]:
-        print(f'[{cat}] {f}   in={inp}\n   jq({j[0]})=[{j[1].strip()}]  succinctly({s[0]})=[{s[1].strip()}]')
+    observed = collections.defaultdict(set)
+    for cat, f, inp, j, s_ in diffs:
+        observed[source_of(f)].add(cat)
+    if args.print_residuals:
+        print('KNOWN_RESIDUALS = {')
+        for src in sorted(observed):
+            print(f'    {src!r}: {sorted(observed[src])!r},')
+        print('}')
+        return 0
+
+    bad = [d for d in diffs if d[0] not in KNOWN_RESIDUALS.get(source_of(d[1]), ())]
+    stale = sorted((src, cat) for src, cats in KNOWN_RESIDUALS.items() for cat in cats
+                   if cat not in observed.get(src, ()))
+    for cat, f, inp, j, s_ in bad[:args.show]:
+        print(f'[{cat}] {f}   in={inp}\n   jq({j[0]})=[{j[1].strip()}]  succinctly({s_[0]})=[{s_[1].strip()}]')
     if counts['timeout']:
         print(f'  ({counts["timeout"]} timed out)')
     if bad:
-        print(f'FAIL: {len(bad)} FABRICATE / unexpected divergences', file=sys.stderr)
+        print(f'FAIL: {len(bad)} divergences outside KNOWN_RESIDUALS', file=sys.stderr)
     if stale:
-        print(f'FAIL: residual sources no longer diverge (remove from KNOWN_RESIDUAL_SOURCES): '
-              f'{sorted(stale)}', file=sys.stderr)
+        print(f'FAIL: KNOWN_RESIDUALS entries that no longer occur (remove them): {stale}',
+              file=sys.stderr)
     return 1 if bad or stale else 0
 
 

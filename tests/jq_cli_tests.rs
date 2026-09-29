@@ -57669,6 +57669,71 @@ fn test_foreach_source_navigation_then_computation_relocates_register_2159() -> 
     Ok(())
 }
 
+/// #2159: the builtins that move jq's register without spelling an `INDEX` --
+/// `..`/`recurse`/`walk` iterate, `getpath` navigates -- are navigation too.
+/// `drive_fold_source` used to drive a source with no `.a`/`.[]`/`.[n]` by
+/// value, as though the register never moved, so `path(foreach (..|tostring)
+/// as $k (.; .))` answered five paths where jq raises after the first, and
+/// `(foreach (recurse|tostring) as $k (.d; .)) = 9` wrote where jq refuses.
+///
+/// The last two rows are the sibling fix in `resolve_foreach`: an element
+/// reached at the fold's *own* register (the root, for `recurse`/`..`, whose
+/// first output is `.` itself) did not move it, so its step is the persistent
+/// register's, not a re-seeded one -- jq runs that step and prints `["b"]`
+/// before the second element raises; succinctly used to raise up front.
+/// Every row is a live jq 1.7.1 capture.
+#[test]
+fn test_foreach_builtin_navigation_source_moves_register_2159() -> Result<()> {
+    const DOC: &str = r#"{"a":1,"b":{"c":2},"d":null}"#;
+    let result_doc = r#"Invalid path expression with result {"a":1,"b":{"c":2},"d":null}"#;
+    for (filter, expected_stdout, needle) in [
+        // Root is the first output of `..` (unmoved: `[]`), then it moves.
+        (
+            "path(foreach (..|tostring) as $k (.; .))",
+            "[]\n",
+            result_doc,
+        ),
+        (
+            "(foreach (recurse|tostring) as $k (.d; .)) = 9",
+            "",
+            "Invalid path expression near attempt to iterate through",
+        ),
+        (
+            "path(foreach (getpath([\"a\"])|tostring) as $k (.; .a))",
+            "",
+            r#"near attempt to access element "a" of {"a":1,"b":{"c":2},"d":null}"#,
+        ),
+        (
+            "path(foreach (walk(.)|tostring) as $k (.; .a))",
+            "",
+            "Invalid path expression near attempt to access element",
+        ),
+        (
+            "path(foreach (., .a) as $k (.; .b))",
+            "[\"b\"]\n",
+            "Invalid path expression near attempt to access element \"b\"",
+        ),
+        (
+            "path(foreach (recurse) as $k (.; .b))",
+            "[\"b\"]\n",
+            "Invalid path expression near attempt to access element \"b\"",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(DOC))?;
+        assert_eq!(stdout, expected_stdout, "`{filter}`: stderr: {stderr:?}");
+        assert!(stderr.contains(needle), "`{filter}`: stderr: {stderr:?}");
+        assert_eq!(code, 5, "`{filter}`: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+
+    // The register-derived elements of `..` all stream: nothing is lost by
+    // routing it through the resolver.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(foreach (..) as $k (.; $k))"], Some(DOC))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n[\"a\"]\n[\"b\"]\n[\"b\",\"c\"]\n[\"d\"]\n");
+    Ok(())
+}
+
 /// #2159 must-not-change guards. A source that only *looks* like it could
 /// navigate -- a literal, an untaken navigating branch, an `as` source (a
 /// subexp in jq, so it never moves the register) -- leaves jq's register
@@ -57692,9 +57757,11 @@ fn test_fold_source_that_never_navigates_leaves_register_alone_2159() -> Result<
         assert_eq!(code, 0, "`{filter}`: stderr: {stderr:?}");
         assert_eq!(stdout.trim(), expected, "`{filter}`");
     }
-    // `reduce`'s UPDATE still navigates against the moved register, so this
-    // raises in both -- pinned so a future per-step `reduce` register does
-    // not silently change which error it is.
+    // jq's UPDATE navigates against the moved register, so this raises in
+    // jq; succinctly raises too, but at `reduce`'s final-emission check
+    // ("with result 1") rather than at UPDATE's `.a` -- `reduce` is
+    // deliberately not re-seeded per step, and only the exit code and empty
+    // stdout are pinned here, not the message.
     let (stdout, stderr, code) = run_jq_full(
         &["-c", "path(reduce (.a|tostring) as $k (.; .a))"],
         Some(DOC),
