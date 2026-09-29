@@ -15,9 +15,9 @@ use succinctly::jq::document::{
     DocumentValue, IndentSpec, JsonConvention, PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use succinctly::jq::eval_generic::{
-    check_nesting_depth, eval_with_cursor, to_owned as generic_to_owned,
-    to_owned_checked as generic_to_owned_checked, validate_cursor, GenericResult, LazyElem,
-    MAX_NESTING_DEPTH,
+    check_nesting_depth, eval_with_cursor, nesting_depth_panic_message,
+    to_owned as generic_to_owned, to_owned_checked as generic_to_owned_checked, validate_cursor,
+    GenericResult, LazyElem,
 };
 use succinctly::jq::walk::{map_builtin_subexprs, map_pattern_subexprs, stamp_loc_file};
 use succinctly::jq::{
@@ -6923,37 +6923,6 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
     }
 }
 
-/// If `payload` (a caught panic's payload) is exactly
-/// `to_owned_cursor_at_depth`'s `MAX_NESTING_DEPTH` guard (#1793), returns
-/// its message; `None` for any other panic, so a caller can `resume_unwind`
-/// anything unrelated rather than silently treating an unexpected panic as
-/// this specific, known one.
-///
-/// An *exact* match against `assert_depth`'s own message template
-/// (`src/jq/value.rs`), not a substring check -- `assert_value_tree_depth`
-/// (`MAX_VALUE_TREE_DEPTH`, 384) shares that same template via the same
-/// underlying `assert_depth` call and produces byte-identical text apart
-/// from the number, so a substring match here would also silently catch
-/// *that* guard's panic (a different failure class, from filter-driven
-/// value growth rather than document nesting) and report it as if it were
-/// this one. Confirmed live by review: `reduce range(400) as $i (null;
-/// [.])` panics via the 384 guard and was being caught here before this
-/// fix narrowed the match.
-///
-/// `assert!`'s formatted message (`"nesting depth exceeds limit of
-/// {MAX_NESTING_DEPTH}"`) panics with a `String` payload, not `&'static
-/// str` -- checked first since it's the only shape this specific guard
-/// actually produces; the `&str` check is defense-in-depth for a future
-/// caller of this same helper against an unformatted `panic!("literal")`.
-fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<String> {
-    let text = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())?;
-    (text == format!("nesting depth exceeds limit of {MAX_NESTING_DEPTH}"))
-        .then(|| text.to_string())
-}
-
 /// One printable result, in whichever representation the evaluator already
 /// had it in (#3009).
 ///
@@ -9620,6 +9589,7 @@ mod tests {
     /// whether any call site still panics with either message.
     #[test]
     fn nesting_depth_panic_message_distinguishes_the_two_guards_3261() {
+        use succinctly::jq::eval_generic::MAX_NESTING_DEPTH;
         let payload_256 = Box::new(format!(
             "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
         )) as Box<dyn core::any::Any + Send>;

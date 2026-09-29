@@ -26369,12 +26369,54 @@ pub fn eval<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // navigation, absent nodes, constructs it has no native arm for), and
     // does so through [`eval_full`], never through here, so the two cannot
     // recurse into each other.
-    if needs_path_context(expr) {
-        return generic_to_query_result::<_, S>(
-            super::eval_generic::eval_with_cursor_using::<S, _>(expr, cursor),
-        );
+    contain_depth_panic(move || {
+        if needs_path_context(expr) {
+            return generic_to_query_result::<_, S>(super::eval_generic::eval_with_cursor_using::<
+                S,
+                _,
+            >(expr, cursor));
+        }
+        eval_full::<W, S>(expr, cursor)
+    })
+}
+
+/// Run `f`, turning the generic evaluator's document-nesting panic
+/// ([`assert_nesting_depth`](super::eval_generic::assert_nesting_depth), 256)
+/// into a `decode_failure`-tagged [`QueryResult::Error`] (#3457).
+///
+/// The CLI wraps every query in `catch_unwind` for this (#1793); a library
+/// caller of [`eval`] has no such net and must never see a raw unwind from
+/// an over-deep document (#2627). The path walkers no longer panic (they
+/// return the same tagged error directly), so this is the backstop for the
+/// guards that still do -- `to_owned_with_comments`,
+/// `owned_from_standard_json_at_depth`, `owned_identity_recurse_step`.
+///
+/// Only that one exact message is caught
+/// ([`nesting_depth_panic_message`](super::eval_generic::nesting_depth_panic_message));
+/// any other panic, including `assert_value_tree_depth`'s 384 guard, keeps
+/// unwinding. The tag makes the error un-swallowable by a `try`/`catch`,
+/// matching what the panic did. Every scope the evaluator installs
+/// (`file_origin`, node origin, the input queue, `with_stack_budget`) is an
+/// RAII guard, so an unwind restores it; the
+/// `eval_depth_panic_leaves_no_scope_behind_3457` test pins that.
+///
+/// Without `std` there is no unwinding to catch, so this is the identity
+/// there, exactly as before.
+#[cfg(any(feature = "std", test))]
+fn contain_depth_panic<'a, W>(f: impl FnOnce() -> QueryResult<'a, W>) -> QueryResult<'a, W> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => match super::eval_generic::nesting_depth_panic_message(&*payload) {
+            Some(message) => QueryResult::Error(EvalError::decode_failure(message)),
+            None => std::panic::resume_unwind(payload),
+        },
     }
-    eval_full::<W, S>(expr, cursor)
+}
+
+#[cfg(not(any(feature = "std", test)))]
+#[inline(always)]
+fn contain_depth_panic<'a, W>(f: impl FnOnce() -> QueryResult<'a, W>) -> QueryResult<'a, W> {
+    f()
 }
 
 /// This evaluator alone, with no generic-evaluator routing: the entry the
@@ -115307,5 +115349,62 @@ mod touched_edge_cases_2999 {
         // The outer nested def hides `a` only, so `b` is still visible: it is
         // rebuilt. Its inner `def b` hides the last visible key: cloned.
         assert_eq!(nested_defs_cached(&installed), vec![false, true]);
+    }
+
+    /// #3457: the `eval()` boundary turns the 256-level nesting panic into a
+    /// tagged error, and only that panic.
+    #[test]
+    fn contain_depth_panic_catches_only_the_nesting_guard_3457() {
+        let caught: QueryResult<'_, Vec<u64>> = contain_depth_panic(|| {
+            crate::jq::eval_generic::assert_nesting_depth(
+                crate::jq::eval_generic::MAX_NESTING_DEPTH,
+            );
+            QueryResult::None
+        });
+        match caught {
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "must escape try/catch: {e:?}");
+                assert_eq!(e.to_string(), "nesting depth exceeds limit of 256");
+            }
+            other => panic!("expected the nesting error, got {other:?}"), // omni-dev: coverage tolerate-line reason="test-only assertion-failure arm"
+        }
+
+        // The 384 guard shares the template but is a different failure class:
+        // it must keep unwinding.
+        let other = std::panic::catch_unwind(|| {
+            contain_depth_panic::<Vec<u64>>(|| {
+                crate::jq::assert_value_tree_depth(crate::jq::MAX_VALUE_TREE_DEPTH);
+                QueryResult::None
+            })
+        });
+        assert!(other.is_err(), "the 384 guard must not be contained");
+
+        // An unrelated panic keeps unwinding too.
+        let unrelated =
+            std::panic::catch_unwind(|| contain_depth_panic::<Vec<u64>>(|| panic!("unrelated")));
+        assert!(unrelated.is_err());
+    }
+
+    /// #3457: a contained depth panic leaves no evaluation scope installed --
+    /// the same thread answers the next query as a fresh one would.
+    #[test]
+    fn eval_depth_panic_leaves_no_scope_behind_3457() {
+        let json = br#"[1]"#;
+        let index = JsonIndex::build(json);
+        let expr = parse("file_index").expect("parse");
+        let probe = || {
+            eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)).collect_owned::<JqSemantics>()
+        };
+        let fresh = probe();
+
+        let caught: QueryResult<'_, Vec<u64>> = contain_depth_panic(|| {
+            let _scope = enter_file_index_scope(7);
+            crate::jq::eval_generic::assert_nesting_depth(
+                crate::jq::eval_generic::MAX_NESTING_DEPTH,
+            );
+            QueryResult::None
+        });
+        assert!(caught.is_error());
+        assert_eq!(probe(), fresh, "the unwound scope must have been restored");
     }
 }
