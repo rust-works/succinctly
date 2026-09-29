@@ -75489,11 +75489,143 @@ const RETRY_ROWS_FOLD_3293: &[RetryRow3293] = &[
         "",
         0,
     ),
+    (
+        r"[reduce 1 as $x ((foreach 1 as $v (0; [[1]] as [$a] ?// $b | $a // 7)); . + 1)]",
+        "[8]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r"first(foreach 1 as $x (foreach 1 as $v (0; . as $a ?// $b | $a // empty; . as $a ?// [$b] | .); .))",
+        "0\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#"[reduce 1 as $x (first(foreach 1 as $v (0; . as $a ?// [$b] | $a; . as $a ?// $b | $a)); if . == 0 then error("R") else . end)]"#,
+        "",
+        "",
+        "Cannot index number with number",
+        5,
+    ),
+    (
+        r"[reduce 1 as $x ((first(foreach 1 as $v (0; ([[1]] as [$a] ?// {k: $b} | $a); ([[1]] as [$a] ?// $b | $a)))); . + 1)]",
+        "",
+        "",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[first(foreach ([[1]] as [$a] ?// [[$b]] | ("A"|stderr) | $a // empty) as $x ((0,100); $x; .))]"#,
+        "[[1],[1]]\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[first((reduce 1 as $x (([[1]] as [$a] ?// [[$b]] | ("A"|stderr) | $a // empty); 5)), 9)]"#,
+        "[5,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"reduce ([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a) as $x (0; .+$x)"#,
+        "null\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[foreach ([[1]] as [$a] ?// {(empty): $b} | ("A"|stderr) | $a) as $x (0; .+$x)]"#,
+        "[]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[5,6] | reduce 1 as $x (path(1 as $a ?// $b | if $a then .[0] else .[1] end); if . == [0] then error("E") else . end)"#,
+        "[1]\n",
+        "",
+        "",
+        0,
+    ),
 ];
 
 #[test]
 fn test_fold_source_and_init_retry_supersedes_stash_3293() -> Result<()> {
     assert_retry_rows_3293(None, "", RETRY_ROWS_FOLD_3293)
+}
+
+/// #3293 slice 4 review: a fold's stashed `halt` is not a verdict a `?//`
+/// retry may supersede. The retry generation moves whenever *any* `?//` in the
+/// drive retried, which says nothing about a halt jq never retries past; the
+/// verdict is kept, so the halt still halts (exit 3, `H` on stderr) instead of
+/// the fold answering `null`. The first row reaches it through a lazy `map`
+/// item over a document, whose retryable error lands in an outer `?//`. Every
+/// value captured from jq 1.7.1.
+#[test]
+fn test_fold_retry_never_supersedes_a_halt_3293() -> Result<()> {
+    for (input, filter) in [
+        (
+            r#"{"m":[1]}"#,
+            r#"reduce (1 as $p ?// {(empty): $q} | ((1 as $a ?// $b | $a) as $v | .m | map(if $v then error("M") else . end))) as $x (0; "H"|halt_error(3)), "after""#,
+        ),
+        (
+            "null",
+            r#"reduce ([[1]] as [$a] ?// $b | $a // empty) as $x (0; "H"|halt_error(3))"#,
+        ),
+        (
+            "null",
+            r#"[foreach ([[1]] as [$a] ?// $b | $a // empty) as $x (0; "H"|halt_error(3))]"#,
+        ),
+        (
+            "null",
+            r#"reduce 1 as $x (([[1]] as [$a] ?// $b | $a // empty); "H"|halt_error(3))"#,
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "--", filter], Some(input))?;
+        assert_eq!((out.as_str(), code), ("", 3), "`{filter}`: stderr {err:?}");
+        assert!(err.starts_with('H'), "`{filter}`: stderr {err:?}");
+    }
+    Ok(())
+}
+
+/// #3293 slice 4 and #2163: a `?//` retry that supersedes a consumer's stop
+/// lets the fold go on to its next INIT fork, and there the source runs
+/// against the real `.` where jq gives it a synthetic `null` -- #2163's open
+/// divergence, reached through more shapes now that the retry is honoured
+/// (`docs/compliance/jq/limitations.md`). These pin *our* answers; jq 1.7.1's
+/// are `[1,3]`, `[[1]]`, and an `E2` error.
+#[test]
+fn test_fold_second_fork_source_reads_real_input_after_retry_2163_3293() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            r#"{"starts":[0,100],"items":[{"a":1},{"a":2}]}"#,
+            r"[first(foreach (.items[]? as {a: $v} ?// $v | $v | numbers) as $x (.starts[]; . + $x))]",
+            "[1,3,101,103]\n",
+        ),
+        (
+            "[[1]]",
+            r"[first(foreach (. as [$a] ?// [[$b]] | $a // empty) as $x ((0,100); $x; .))]",
+            "[[1],[1]]\n",
+        ),
+        (
+            "[[1]]",
+            r#"[reduce (. as [$a] ?// [[$b]] | $a | if . == null then error("E2") end) as $x (([1] as $a ?// $b | $a); .+1)]"#,
+            "[1]\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", "--", filter], Some(input))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (expected, 0),
+            "`{filter}`: stderr {err:?}"
+        );
+    }
+    Ok(())
 }
 
 /// #3293 review: `isempty`/`any`/`all` record the wrapping sink's stop and
