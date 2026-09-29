@@ -19154,18 +19154,20 @@ fn path_context_push_owned_children<V: DocumentValue>(
 /// delegates to it directly, and a missing one is the constant `null`
 /// bound real jq substitutes, pulled through `sink` exactly like any other
 /// single-value generator -- there is only ever one value to pull, so
-/// `sink`'s own `Demand::Stop` has nothing left to stop.
+/// `sink`'s own `Demand::Stop` has nothing left to stop. Answers the
+/// generator's [`Flow`] ([`path_context_component_flow`], #3293).
 fn path_context_component_each_bound<S: EvalSemantics, V: DocumentValue>(
     expr: Option<&Expr>,
     pos: &PathContextPos<V>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
-) -> Option<Control> {
+) -> Flow {
     match expr {
-        Some(e) => path_context_component_each::<S, V>(e, pos, sink),
-        None => {
-            sink(OwnedValue::Null);
-            None
-        }
+        Some(e) => path_context_component_flow::<S, V>(e, pos, sink),
+        // No `?//` to retry, so the sink's stop is reported as one.
+        None => match sink(OwnedValue::Null) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        },
     }
 }
 
@@ -19200,7 +19202,16 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
     // (`owned_identity_values`) needs it restored, not just the outermost.
     let mut targets: LazyTargetSteps<V> = None;
     let was_read_only = yq_read_only_context::active();
-    let mut walk_error: Option<Control> = None;
+    // #3293: both stashes below answer `Demand::Stop` to a bound's
+    // generator, and a `?//` inside that bound retries past the stop
+    // (#1519), so either can describe an alternative jq has abandoned --
+    // `.[([[1]] as [$a] ?// [[$a]] | $a):] | key` on `[10,20,30]` is
+    // `{"start":1,"end":null}`, the second alternative's slice, with no
+    // error from the first's `[1]` (jq 1.7.1's `path(..) | last`; `key` is
+    // succinctly's). `StashedEscape`s: a retry that yields another bound
+    // re-invokes the sink, whose `begin` drops the stash, and one that
+    // yields nothing or raises is recognised from the bound's `Flow`.
+    let walk_error = StashedEscape::new();
     // The end generator's own escape (a `halt` mid-stream, say), separate
     // from `walk_error`: unlike a navigation/target failure, this is a
     // *generator's* escape and must still take yq mode's truncation rule
@@ -19208,10 +19219,18 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
     // already does -- review found the first draft folded it into
     // `walk_error` instead, which bypassed that truncation and let a
     // yq-mode `halt` inside `end` leak a position real yq discards.
-    let mut end_escape: Option<Control> = None;
-    let starts_control = path_context_component_each_bound::<S, V>(start, pos, &mut |s| {
+    let end_escape = StashedEscape::new();
+    let start_direct_retry = start.is_some_and(crate::jq::eval::direct_pattern_retry);
+    let end_direct_retry = end.is_some_and(crate::jq::eval::direct_pattern_retry);
+    let starts_flow = path_context_component_each_bound::<S, V>(start, pos, &mut |s| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside
+        // `start`; it supersedes whatever the retried-past call decided.
+        walk_error.begin();
+        end_escape.begin();
         let _scope = was_read_only.then(yq_read_only_context::enter);
-        let ends_control = path_context_component_each_bound::<S, V>(end, pos, &mut |e| {
+        let ends_flow = path_context_component_each_bound::<S, V>(end, pos, &mut |e| {
+            // #3293: likewise for a retry inside `end`.
+            walk_error.begin();
             let _scope = was_read_only.then(yq_read_only_context::enter);
             let (targets_vec, _) = targets.get_or_insert_with(|| {
                 let mut t = Vec::new();
@@ -19234,7 +19253,7 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
                 let value: Rc<OwnedValue> = match &tpos.node {
                     PathNode::At(c) => match to_owned_cursor::<S, _>(c) {
                         Ok(v) => Rc::new(v),
-                        Err(e) => return stop_with_escape(&mut walk_error, Control::Error(e)),
+                        Err(e) => return walk_error.stop(Control::Error(e)),
                     },
                     PathNode::Absent => Rc::new(OwnedValue::Null),
                     PathNode::Owned(v) => Rc::clone(v),
@@ -19247,38 +19266,38 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
                     out,
                 );
                 if let Some(control) = control {
-                    return stop_with_escape(&mut walk_error, control);
+                    return walk_error.stop(control);
                 }
             }
             Demand::Continue
         });
+        // #3293: a retry inside `end` that yielded nothing, or raised, never
+        // re-invoked `end`'s sink to reset what it stashed.
+        walk_error.settle(&ends_flow, end_direct_retry);
         // An escape in the end stream is raised once per start, after the
         // slices that start produced (`S` outer, `T` middle, jq's own
         // order) -- a walk/target failure inside the `T` sink already took
-        // priority and stopped everything, so only surface `ends_control`
-        // when nothing else already has.
-        if walk_error.is_some() {
+        // priority and stopped everything, so only surface the end stream's
+        // escape when nothing else already has.
+        if walk_error.is_set() {
             return Demand::Stop;
         }
-        match ends_control {
-            Some(control) => {
-                end_escape = Some(control);
-                Demand::Stop
-            }
-            None => Demand::Continue,
+        match ends_flow {
+            Flow::Escaped(control) => end_escape.stop(control),
+            Flow::Exhausted | Flow::Stopped { .. } => Demand::Continue,
         }
     });
-    if let Some(control) = walk_error {
+    if let Some(control) = walk_error.take(&starts_flow, start_direct_retry) {
         return Err(control);
     }
-    if let Some(control) = end_escape {
+    if let Some(control) = end_escape.take(&starts_flow, start_direct_retry) {
         return Err(path_context_component_escape::<S, V>(
             out,
             produced_from,
             control,
         ));
     }
-    if let Some(control) = starts_control {
+    if let Flow::Escaped(control) = starts_flow {
         return Err(path_context_component_escape::<S, V>(
             out,
             produced_from,
@@ -20033,11 +20052,29 @@ fn path_context_component_each<S: EvalSemantics, V: DocumentValue>(
     pos: &PathContextPos<V>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Option<Control> {
+    match path_context_component_flow::<S, V>(expr, pos, sink) {
+        Flow::Escaped(control) => Some(control),
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+    }
+}
+
+/// [`path_context_component_each`], answering the generator's own [`Flow`]
+/// rather than just its escape (#3293). A caller that stashes a verdict
+/// behind its sink's `Demand::Stop` needs to tell a drive that ran out, or
+/// raised, after a `?//` retry inside the component from one its own stop
+/// ended -- [`StashedVerdict::settle`] -- which the `Option<Control>` form
+/// folds together. A decode failure stashed by the pull is reported as the
+/// drive's escape, exactly as the `Option` form reports it.
+fn path_context_component_flow<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
     // `path_context_component_walkable` keeps the constant-only gate, so no
     // `parent` can appear in a component.
     let expr = match path_context_resolve_at_pos::<S, V>(expr, pos) {
         Ok(e) => e,
-        Err(e) => return Some(Control::Error(e)),
+        Err(e) => return Flow::Escaped(Control::Error(e)),
     };
     match &pos.node {
         PathNode::At(c) => {
@@ -20048,10 +20085,7 @@ fn path_context_component_each<S: EvalSemantics, V: DocumentValue>(
                     Err(control) => stop_with_escape(&mut decode_err, control),
                 }
             });
-            decode_err.or(match flow {
-                Flow::Exhausted | Flow::Stopped { .. } => None,
-                Flow::Escaped(control) => Some(control),
-            })
+            decode_err.map_or(flow, Flow::Escaped)
         }
         // `Absent` evaluates the component against the `null` it holds; an
         // `Owned` node against its own value -- the only difference between
@@ -20061,10 +20095,7 @@ fn path_context_component_each<S: EvalSemantics, V: DocumentValue>(
                 PathNode::Owned(v) => v,
                 _ => &OwnedValue::Null,
             };
-            match eval_each_owned::<S>(&expr, value, false, Reentry::REBUILT, sink) {
-                Flow::Escaped(control) => Some(control),
-                Flow::Exhausted | Flow::Stopped { .. } => None,
-            }
+            eval_each_owned::<S>(&expr, value, false, Reentry::REBUILT, sink)
         }
     }
 }

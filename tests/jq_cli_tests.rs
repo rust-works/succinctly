@@ -76208,6 +76208,353 @@ fn test_slice_bound_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_SLICE_BOUND_3293)
 }
 
+/// #3293 slice 6: a `?//` retry inside a *path-mode* slice bound supersedes
+/// what `resolve_slice_expr_sink` stashed for the abandoned alternative, and
+/// what `each_path_on_owned` and `resolve_seq_stage` recorded when the
+/// consumer of `path(f)`, or a stage after the slice, stopped on it. Covers `path`, the write family (`del`, `=`, `|=`, `+=`,
+/// `//=`, `pick`), each way the retry can end, in either bound, a
+/// consumer's stop on the first alternative (`first`, `limit`, `label`)
+/// that must not hide the retry's own error, and a retry in both bounds.
+/// Controls: `?` still prunes, the same error with no `?//` still
+/// raises, and a `halt_error` is not retried. Every value captured from jq
+/// 1.7.1 over `[10,20,30]`.
+const RETRY_ROWS_PATH_SLICE_BOUND_3293: &[RetryRow3293] = &[
+    (
+        r#"path(.[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):])"#,
+        "[{\"start\":0,\"end\":null}]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[:([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)])"#,
+        "[{\"start\":null,\"end\":1}]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[0:([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)])"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[0:([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)])"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(.[0:([[1]] as [$a] ?// {$z} | ("A"|stderr) | $a)])"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#"del(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):])"#,
+        "[10]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(.[:([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)])"#,
+        "[20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):] |= ["x"]"#,
+        "[10,\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[:([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)] |= ["x"]"#,
+        "[\"x\",20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):] = ["x"]"#,
+        "[10,\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):] += ["x"]"#,
+        "[10,20,30,\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"pick(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):])"#,
+        "[20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(.[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]), 9]"#,
+        "[[{\"start\":0,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(.[([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):])]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(.[([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):])"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// $b | ("A"|stderr) | $a // empty):] //= 1"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):])"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#".[([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):] += ["x"]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(.[([[0]] as [$a] ?// {$z} | ("A"|stderr) | $a):])"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#"pick(.[([[0]] as [$a] ?// {$z} | ("A"|stderr) | $a):])"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#"[first(path(.[([0] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):])), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[limit(1; path(.[:([0] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)])), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[first(path(.[([0] as [$a] ?// $b | ("A"|stderr) | if $a == null then empty else $a end):], .[0])), 9]"#,
+        "[[{\"start\":0,\"end\":null}],[0],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(del(.[([0] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):])), 9]"#,
+        "[[],9]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[label $out | path(.[([0] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):]) | ., break $out]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    // A stage after the slice: `resolve_seq_stage`'s own downstream stash.
+    (
+        r#"[first(path(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):] | .[0])), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"path(.[(0, ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)):])"#,
+        "[{\"start\":0,\"end\":null}]\n[{\"start\":1,\"end\":null}]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(.[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):([[2]] as [$c] ?// [[$c]] | ("B"|stderr) | $c)])]"#,
+        "[[{\"start\":0,\"end\":2}]]\n",
+        "ABBABB",
+        "",
+        0,
+    ),
+    (
+        r#"[path(.[([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]?)]"#,
+        "[]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[path(.[([[0]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):]?)]"#,
+        "[]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r"path(.[[0]:])",
+        "",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"path(.[("x", 0):])"#,
+        "",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"path(.[(([[0]] as [$a] ?// [[$a]] | ("A"|stderr) | $a) | if type == "array" then halt_error else . end):])"#,
+        "",
+        "A",
+        "[0]",
+        5,
+    ),
+];
+
+#[test]
+fn test_path_slice_bound_retry_supersedes_stashed_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_PATH_SLICE_BOUND_3293)
+}
+
+/// #3293 slice 6: the same retry through `eval_generic`'s path-context walk
+/// (`path_context_step_computed_slice`), which `key`, `path` and `parent`
+/// after a computed slice reach. Those three are succinctly's, so each row's
+/// answer is jq 1.7.1's for the `path()` spelling in the comment above it.
+/// `first(.[S:] | key)` rows whose retry fails are left out: that shape
+/// evaluates the bound twice with no `?//` at all (#3470). Cursor
+/// route only: over an owned input `key` takes the owned-identity walk
+/// instead, which still keeps the abandoned alternative's bound (a slice 9
+/// site, recorded on #3293).
+const RETRY_ROWS_PATH_CONTEXT_SLICE_3293: &[RetryRow3293] = &[
+    // jq 1.7.1: `path(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]) | last`
+    (
+        r#".[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):] | key"#,
+        "{\"start\":1,\"end\":null}\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `path(.[:([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]) | last`
+    (
+        r#".[:([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)] | key"#,
+        "{\"start\":null,\"end\":1}\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[path(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):])]`
+    (
+        r#"[.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):] | path]"#,
+        "[[{\"start\":1,\"end\":null}]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[path(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]) as $p | getpath($p[:-1])]`
+    (
+        r#"[.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):] | parent]"#,
+        "[[10,20,30]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[path(.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]) | last]`
+    (
+        r#"[.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty):] | key]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `path(.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):]) | last`
+    (
+        r#".[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):] | key"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // jq 1.7.1: `path(.[([[1]] as [$a] ?// {$z} | ("A"|stderr) | $a):]) | last`
+    (
+        r#".[([[1]] as [$a] ?// {$z} | ("A"|stderr) | $a):] | key"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    // jq 1.7.1: `path(.[0:([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]) | last`
+    (
+        r#".[0:([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)] | key"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // jq 1.7.1: `[first(path(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]) | last), 9]`
+    (
+        r#"[first(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):] | key), 9]"#,
+        "[{\"start\":1,\"end\":null},9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[first(path(.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]) | last), 9]`
+    (
+        r#"[first(.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty):] | key), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+#[test]
+fn test_path_context_slice_bound_retry_supersedes_stashed_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_PATH_CONTEXT_SLICE_3293)
+}
+
 /// #3293 review: `first`/`limit`/`nth` reset the wrapping sink's stop per
 /// invocation, so after a `?//` retry inside them they report their own
 /// completion rather than a stale `Stopped`. The #1519 rows pin that an
@@ -76615,6 +76962,7 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("{} | ", RETRY_ROWS_LIMIT_COUNT_STOP_3293),
         ("{} | ", RETRY_ROWS_SKIP_COUNT_3293),
         ("[10,20,30] | ", RETRY_ROWS_SLICE_BOUND_3293),
+        ("[10,20,30] | ", RETRY_ROWS_PATH_SLICE_BOUND_3293),
         ("{} | ", RETRY_ROWS_WRAPPER_STOP_3293),
         ("{} | ", RETRY_ROWS_FOLD_3293),
     ] {
@@ -76661,6 +77009,51 @@ fn test_retry_sink_reset_leaves_yq_mode_unchanged_3293() -> Result<()> {
             "#3293 (yq): `{filter}`: stderr={:?}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+    Ok(())
+}
+
+/// #3293 slice 6, yq mode: the path-mode slice resolver and `path(f)`'s
+/// driver are shared with `succinctly yq`, which has no `?//`, so the retry
+/// stamps must leave its output alone -- including #2351's discard of a
+/// bound's prefix when the bound raises. Every row captured from yq v4.53.3
+/// over `[10,20,30]` (the last over `[1,2,3]`).
+#[test]
+fn test_path_slice_retry_stash_leaves_yq_mode_unchanged_3293() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[10,20,30]", "del(.[(1):])", "[10,20,30]"),
+        ("[10,20,30]", r#".[(0):(1)] |= ["x"]"#, "[10,20,30]"),
+        ("[10,20,30]", r#".[(1):] = ["x"]"#, "[10,20,30]"),
+        ("[10,20,30]", "[.[(1+0):] | path]", "[[]]"),
+        ("[1,2,3]", r#"del(.[(0,1,error("x")):3])"#, ""),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            expected,
+            "#3293 (yq): `{filter}`: stderr={stderr:?}"
+        );
+        if expected.is_empty() {
+            assert!(!output.status.success(), "`{filter}`: exited 0");
+            assert!(stderr.contains("Error: x"), "`{filter}`: stderr={stderr:?}");
+        } else {
+            assert!(output.status.success(), "`{filter}`: stderr={stderr:?}");
+            assert!(stderr.is_empty(), "`{filter}`: stderr={stderr:?}");
+        }
     }
     Ok(())
 }
