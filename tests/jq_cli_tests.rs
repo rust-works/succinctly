@@ -74183,28 +74183,52 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
 }
 
 /// #3266/#3427: on a value the index cannot read, the CLI answers a filter
-/// that navigates past it or wraps it in a single-source collection, but a
-/// multi-source collection materializes its elements and raises. The split is
-/// recorded as out of policy in `docs/compliance/jq/limitations.md` ("The
-/// library `eval()` entry validates what the CLI's entry only navigates"),
-/// where `succinctly::jq::eval` raises on every row here; #3427 tracks the
-/// collection half. jq 1.7.1 rejects every document at parse time (exit 5).
+/// that navigates past it or wraps it in `[.]`, but other collections
+/// materialize it and raise, and so does any filter once an input builtin or
+/// `-s` makes the CLI materialize the whole input. Recorded as out of policy
+/// in `docs/compliance/jq/limitations.md` ("The library `eval()` entry
+/// validates what the CLI's entry only navigates"), where the library entry
+/// `succinctly::jq::eval` raises on every answering row here. jq 1.7.1
+/// rejects every document at parse time (exit 5).
 #[test]
 fn test_unreadable_value_collection_split_3266() -> Result<()> {
-    let rows: &[(&str, &str, &str, i32)] = &[
-        ("[1.2.3]", ".[0] | [.] | length", "1\n", 0),
-        ("[1.2.3]", ".[0] | [limit(1; .)] | length", "1\n", 0),
-        ("[1.2.3]", ".[0] | [., 1] | length", "", 5),
-        ("[1.2.3]", ".[0] | {a: .} | length", "", 5),
-        (r#"[{"a":1,"b":tru}]"#, ".[0] | path(.a)", "[\"a\"]\n", 0),
-        (r#"[{"a":1,"b":tru}]"#, ".[0] | [paths] | length", "2\n", 0),
+    const OBJ: &str = r#"[{"a":1,"b":tru}]"#;
+    let rows: &[(&[&str], &str, &str, &str, i32)] = &[
+        (&["-c"], "[1.2.3]", ".[0] | [.] | length", "1\n", 0),
+        (&["-c"], "[tru]", ".[0] | [.] | length", "1\n", 0),
+        (
+            &["-c"],
+            "[1.2.3]",
+            ".[0] | [limit(1; .)] | length",
+            "1\n",
+            0,
+        ),
+        (&["-c"], "[1.2.3]", ".[0] | path(.)", "[]\n", 0),
+        (&["-c"], "[tru]", ".[0] | [paths]", "[]\n", 0),
+        (&["-c"], "[1.2.3]", ".[0] | getpath([]) | not", "false\n", 0),
+        (&["-c"], OBJ, ".[0] | path(.a)", "[\"a\"]\n", 0),
+        (&["-c"], OBJ, ".[0] | [paths] | length", "2\n", 0),
+        (
+            &["-c"],
+            OBJ,
+            ".[0] | [leaf_paths]",
+            "[[\"a\"],[\"b\"]]\n",
+            0,
+        ),
+        (&["-c"], OBJ, ".[0] | getpath([\"a\"])", "1\n", 0),
+        (&["-c"], "[1.2.3]", ".[0] | [., 1] | length", "", 5),
+        (&["-c"], "[1.2.3]", ".[0] | {a: .} | length", "", 5),
+        (&["-c"], "[1.2.3]", ".[0] | . as $x | [$x] | length", "", 5),
+        (&["-c"], OBJ, ".[0] | path(.a), input_line_number", "", 5),
+        (&["-c", "-s"], OBJ, ".[0][0] | path(.a)", "", 5),
     ];
-    for &(doc, filter, stdout, code) in rows {
-        let (out, err, got) = run_jq_full(&["-c", filter], Some(doc))?;
+    for &(flags, doc, filter, stdout, code) in rows {
+        let args: Vec<&str> = flags.iter().copied().chain([filter]).collect();
+        let (out, err, got) = run_jq_full(&args, Some(doc))?;
         assert_eq!(
             (out.as_str(), got),
             (stdout, code),
-            "{filter} on {doc}: {err:?}"
+            "{flags:?} {filter} on {doc}: {err:?}"
         );
     }
     Ok(())

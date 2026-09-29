@@ -26315,19 +26315,28 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 
 /// Evaluate a jq expression against a JSON cursor.
 ///
-/// # Which entry point
+/// # Relation to the CLI
 ///
-/// The CLI does not use this entry; it evaluates through
-/// [`eval_with_cursor_using`](super::eval_generic::eval_with_cursor_using).
-/// On well-formed input the two agree. They differ on a value the index
-/// cannot read (a malformed number such as `1.2.3`, or a keyword such as
-/// `tru`), which jq rejects at parse time (#3266): this entry collects its
-/// results into owned values, and its `path`/`paths`/`leaf_paths`/`getpath`
-/// walk an owned copy of their input. Building that copy decodes the value,
-/// so `[.] | length` on it, or `path(.a)` on `{"a":1,"b":tru}`, raises
-/// here but answers in the CLI. Call `eval_with_cursor_using` for answers
-/// identical to the CLI's. The split is recorded in
-/// `docs/compliance/jq/limitations.md`; converging the two is #3457.
+/// `succinctly jq` does not evaluate through this function; it uses the
+/// generic evaluator's cursor entries
+/// ([`eval_with_cursor_using`](super::eval_generic::eval_with_cursor_using)
+/// and its streaming twin). `succinctly yq`'s DOM route does call it. This
+/// function hands a query that needs path context (`key`, `parent`, ...) to
+/// that cursor entry and evaluates everything else itself, so the two can
+/// answer differently, on well-formed input too: cursor-metadata builtins
+/// such as `line` answer from fixed defaults here.
+///
+/// On a value the index cannot read (a malformed number such as `1.2.3`, or
+/// a keyword such as `tru`), which jq rejects at parse time, this entry
+/// raises where the cursor entry answers (#3266). It collects its results
+/// into owned values, and its `path`/`paths`/`leaf_paths`/`getpath` walk an
+/// owned copy of their input, and building that copy decodes the value:
+/// `[.] | length` on it, or `path(.a)` on `{"a":1,"b":tru}`, raises here
+/// and answers in the CLI. `eval_with_cursor_using` gives the CLI's
+/// answers, but its path walkers panic on a document nested deeper than 256
+/// levels, where this entry answers (#3429); the CLI catches that panic. The
+/// split is recorded in `docs/compliance/jq/limitations.md`; converging the
+/// two is #3457.
 ///
 /// # Examples
 ///
@@ -114075,7 +114084,8 @@ mod tests {
                     crate::jq::eval_generic::GenericResult::Error(e) => e.is_decode_failure(),
                     _ => false, // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- see the `concrete` match above, same sweep (#3222)"
                 };
-                for (evaluator, raised) in [("eval", concrete), ("eval_using", generic)] {
+                for (evaluator, raised) in [("eval", concrete), ("eval_with_cursor_using", generic)]
+                {
                     if !raised {
                         // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a READERS filter fails to raise (#3222)"
                         escaped.push(format!("{evaluator} `{filter}` on {json}"));
@@ -114141,7 +114151,9 @@ mod tests {
                 let expected = run_generic(good_element);
                 if generic != expected {
                     // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- see the `eval` failure-recording line above, same assertion (#3222)"
-                    disagreed.push(format!("eval_using `{filter}` on {json}: {generic:?}"));
+                    disagreed.push(format!(
+                        "eval_with_cursor_using `{filter}` on {json}: {generic:?}"
+                    ));
                     // omni-dev: coverage end
                 }
             }
@@ -114152,57 +114164,95 @@ mod tests {
         );
     }
 
-    /// #3266: the library entry `eval` validates a value that the CLI's
-    /// entry, `eval_with_cursor_using`, only wraps or navigates past. `eval`
-    /// collects its results into owned values, and its `path`/`paths`/
-    /// `leaf_paths`/`getpath` walk an owned copy of their input, so building
-    /// that copy decodes every value in it -- including a sibling the
-    /// navigation never visits (`path(.a)` with a malformed `"b"`). The
-    /// generic evaluator keeps a single-source collection as cursors and
-    /// walks paths on the cursor, so it answers. jq rejects every document
-    /// here at parse time, so neither answer has a reference.
+    /// #3266: the three library entries give different answers on a value
+    /// the index cannot read (a malformed number `1.2.3`, a keyword `tru`)
+    /// under filters that never read it. `eval_with_cursor_using`, the
+    /// generic evaluator's cursor entry that `succinctly jq` evaluates
+    /// through, holds the input as a cursor and answers where a filter only
+    /// navigates past the value or wraps it in `[.]`. `eval` collects its
+    /// results into owned values, and its `path`/`paths`/`leaf_paths`/
+    /// `getpath` walk an owned copy of their input, so it decodes the value
+    /// -- even a sibling the navigation never visits (`path(.a)` with a
+    /// malformed `"b"`) -- unless the query needs path context (`key`), which
+    /// it hands to the cursor entry. `eval_using` is given a decoded value,
+    /// so it answers some of these and raises on others (even `not`). jq
+    /// rejects every document here at parse time, so no answer has a
+    /// reference.
     ///
     /// Recorded as out of policy in `docs/compliance/jq/limitations.md`
     /// ("The library `eval()` entry validates what the CLI's entry only
-    /// navigates"): the path-family rows break ADR-0018's #2168 instance
-    /// for the library entry. Converging `eval` onto the cursor entry is
-    /// #3457; the collection rows (the last two raise in both evaluators,
-    /// where `[.] | length` answers in one) are #3427. Each row pins both
-    /// evaluators' current answer, so a convergence has to flip a row on
-    /// purpose rather than pass silently.
+    /// navigates"). Converging `eval` onto the cursor entry is #3457; the
+    /// collections that materialize in the cursor entry too (`[., 1]`,
+    /// `{a: .}`, `. as $x | [$x]`) are #3427. Each row pins every entry's
+    /// current answer, so a convergence has to flip a row on purpose rather
+    /// than pass silently.
     #[test]
     fn eval_entry_validates_what_the_cursor_entry_navigates_3266() {
+        use crate::jq::eval_generic::{eval_using, eval_with_cursor_using, GenericResult};
+
         /// `None` = raises a decode failure; `Some(json)` = answers exactly
         /// that one value.
         type Outcome = Option<&'static str>;
-        const ROWS: &[(&str, &str, Outcome, Outcome)] = &[
-            // (document -- the filter runs on its first element, filter,
-            //  `eval`, `eval_with_cursor_using`)
-            ("[1.2.3]", "[.] | length", None, Some("1")),
-            ("[tru]", "[.] | length", None, Some("1")),
-            ("[1.2.3]", "[limit(1; .)] | length", None, Some("1")),
-            ("[1.2.3]", "path(.)", None, Some("[]")),
-            ("[tru]", "path(.)", None, Some("[]")),
-            ("[1.2.3]", "[paths]", None, Some("[]")),
-            ("[tru]", "[paths]", None, Some("[]")),
-            ("[1.2.3]", "getpath([]) | not", None, Some("false")),
-            (r#"[{"a":1,"b":tru}]"#, "path(.a)", None, Some(r#"["a"]"#)),
-            (r#"[{"a":1,"b":tru}]"#, "[paths] | length", None, Some("2")),
+        const OBJ: &str = r#"[{"a":1,"b":tru}]"#;
+        // (document -- the filter runs on its first element, filter,
+        //  `eval`, `eval_using`, `eval_with_cursor_using`)
+        const ROWS: &[(&str, &str, Outcome, Outcome, Outcome)] = &[
+            ("[1.2.3]", "1", Some("1"), Some("1"), Some("1")),
+            ("[1.2.3]", "not", Some("false"), None, Some("false")),
+            ("[1.2.3]", "[.] | length", None, None, Some("1")),
+            ("[tru]", "[.] | length", None, None, Some("1")),
+            ("[1.2.3]", "[limit(1; .)] | length", None, None, Some("1")),
+            ("[tru]", "[limit(1; .)] | length", None, None, Some("1")),
+            ("[1.2.3]", "path(.)", None, None, Some("[]")),
+            ("[tru]", "path(.)", None, None, Some("[]")),
+            ("[1.2.3]", "[paths]", None, Some("[]"), Some("[]")),
+            ("[tru]", "[paths]", None, Some("[]"), Some("[]")),
+            ("[1.2.3]", "getpath([]) | not", None, None, Some("false")),
+            (OBJ, "path(.a)", None, None, Some(r#"["a"]"#)),
+            (OBJ, "[paths] | length", None, Some("2"), Some("2")),
             (
-                r#"[{"a":1,"b":tru}]"#,
+                OBJ,
                 "[leaf_paths]",
                 None,
                 Some(r#"[["a"],["b"]]"#),
+                Some(r#"[["a"],["b"]]"#),
             ),
-            (r#"[{"a":1,"b":tru}]"#, r#"getpath(["a"])"#, None, Some("1")),
-            (r#"[{"a":1,"b":tru}]"#, "[.[]] | length", None, Some("2")),
-            // #3427: a multi-source collection materializes its elements in
-            // the generic evaluator too.
-            ("[1.2.3]", "[., 1] | length", None, None),
-            ("[1.2.3]", "{a: .} | length", None, None),
+            (OBJ, r#"getpath(["a"])"#, None, None, Some("1")),
+            (OBJ, "[.[]] | length", None, Some("2"), Some("2")),
+            // `key` needs path context, so `eval` hands the whole query to
+            // the cursor entry and answers like it.
+            (
+                "[1.2.3]",
+                "select(key == 0) | [.] | length",
+                Some("1"),
+                None,
+                Some("1"),
+            ),
+            (
+                OBJ,
+                "select(key == 0) | path(.a)",
+                Some(r#"["a"]"#),
+                None,
+                Some(r#"["a"]"#),
+            ),
+            // #3427: these collections materialize in the cursor entry too.
+            ("[1.2.3]", "[., 1] | length", None, None, None),
+            ("[1.2.3]", "{a: .} | length", None, None, None),
+            ("[1.2.3]", ". as $x | [$x] | length", None, None, None),
         ];
+        fn generic<V: crate::jq::document::DocumentValue>(r: GenericResult<V>) -> Outcome {
+            match r {
+                GenericResult::Error(e) if e.is_decode_failure() => None,
+                other => match other.into_owned::<JqSemantics>() {
+                    Ok(Some(value)) => Some(value.to_json().leak()),
+                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- every ROWS filter either raises a decode failure or answers one value through the generic evaluator, so this fallback only reports a row that moved (#3266)"
+                    other => Some(format!("{other:?}").leak()),
+                    // omni-dev: coverage end
+                },
+            }
+        }
         let mut moved = Vec::new();
-        for &(json, filter, want_eval, want_generic) in ROWS {
+        for &(json, filter, want_eval, want_using, want_cursor) in ROWS {
             let index = JsonIndex::build(json.as_bytes());
             let element = index
                 .root(json.as_bytes())
@@ -114220,41 +114270,20 @@ mod tests {
                     // omni-dev: coverage end
                 },
             };
-            let generic: Outcome = match crate::jq::eval_generic::eval_with_cursor_using::<
-                JqSemantics,
-                _,
-            >(&expr, element)
-            {
-                crate::jq::eval_generic::GenericResult::Error(e) if e.is_decode_failure() => None,
-                other => match other.into_owned::<JqSemantics>() {
-                    Ok(Some(value)) => Some(value.to_json().leak()),
-                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- every ROWS filter either raises a decode failure or answers one value through the generic evaluator, so this fallback only reports a row that moved (#3266)"
-                    other => Some(format!("{other:?}").leak()),
-                    // omni-dev: coverage end
-                },
-            };
-            if (concrete, generic) != (want_eval, want_generic) {
+            let using = generic(eval_using::<JqSemantics, _>(&expr, element.value()));
+            let cursor = generic(eval_with_cursor_using::<JqSemantics, _>(&expr, element));
+            let got = (concrete, using, cursor);
+            let want = (want_eval, want_using, want_cursor);
+            if got != want {
                 // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a ROWS answer moves (#3266)"
                 moved.push(format!(
-                    "`{filter}` on {json}: eval {concrete:?} (pinned {want_eval:?}), \
-                     eval_with_cursor_using {generic:?} (pinned {want_generic:?})"
+                    "`{filter}` on {json}: (eval, eval_using, eval_with_cursor_using) = \
+                     {got:?}, pinned {want:?}"
                 ));
                 // omni-dev: coverage end
             }
         }
         assert!(moved.is_empty(), "a pinned answer moved: {moved:#?}");
-
-        // The value entry `eval_using` is handed an already-decoded value, so
-        // the malformed number raises before evaluation starts, even under
-        // `not`, which reads nothing (the cursor entry answers `false`).
-        let json = b"[1.2.3]";
-        let index = JsonIndex::build(json);
-        let element = index.root(json).first_child().expect("one element");
-        let expr = parse("not").expect("filter parses");
-        assert!(matches!(
-            crate::jq::eval_generic::eval_using::<JqSemantics, _>(&expr, element.value()),
-            crate::jq::eval_generic::GenericResult::Error(e) if e.is_decode_failure()
-        ));
     }
 }
 
