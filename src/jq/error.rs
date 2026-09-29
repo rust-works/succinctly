@@ -1252,9 +1252,9 @@ impl EvalError {
     }
 
     /// `object key "<key>" is ambiguous: ...` (#1642) — a #1620-class
-    /// decode failure in its own right: two distinct undecodable keys
-    /// whose display fallback collides, so keeping the second silently
-    /// overwrites the first (#1385 forbids treating them as the same key,
+    /// decode failure in its own right: two distinct undecodable (or, in
+    /// YAML, complex -- #2519) keys whose display fallback collides, so
+    /// keeping the second silently overwrites the first (#1385 forbids treating them as the same key,
     /// but a display-keyed map has no way to hold both). This is what
     /// `to_owned`/`materialize` raise instead, via
     /// [`super::document::resolve_display_key`]/[`super::document::DisplayKeyGuard`].
@@ -1271,12 +1271,13 @@ impl EvalError {
     /// of sync with itself the way a duplicated string constant can.
     ///
     /// Called directly (not via a `document.rs`-local wrapper, #1813
-    /// review) from three sites across two crates: `document.rs`'s own
-    /// `resolve_display_key`, `eval.rs`'s `yaml_value_to_owned_checked`
-    /// (`load()`'s YAML path), and `succinctly-cli`'s `yq_runner.rs`
-    /// (`yaml_to_owned_value`, #1749) — `EvalError` is already `pub` from
-    /// `jq::mod`, so a re-exporting wrapper added an extra hop without
-    /// adding any encapsulation.
+    /// review): `document.rs`'s own `resolve_display_key` -- which
+    /// `succinctly-cli`'s `yq_runner.rs` (`yaml_to_owned_value`, #1749)
+    /// now also goes through (#2519) -- plus `eval.rs`'s
+    /// `yaml_value_to_owned_checked` (`load()`'s YAML path) and its
+    /// `StandardJson`-only `map_values`/`pick`/`omit` arms. `EvalError` is
+    /// already `pub` from `jq::mod`, so a re-exporting wrapper added an
+    /// extra hop without adding any encapsulation.
     pub fn colliding_display_key(key: &str) -> Self {
         // Delegates to `Self::decode_failure` (not a second `with_kind`
         // call) so the two constructors can't independently drift out of
@@ -1288,8 +1289,11 @@ impl EvalError {
         ))
     }
 
-    const COLLIDING_DISPLAY_KEY_SUFFIX: &'static str = ": an undecodable key's display form \
-         collides with another key of the same name and cannot be represented";
+    /// "complex or undecodable" since #2519: YAML's complex keys (`? [1]`,
+    /// spelled `""` per #222) reach this raise on every materializing yq
+    /// route, not only a key whose bytes would not decode.
+    const COLLIDING_DISPLAY_KEY_SUFFIX: &'static str = ": a complex or undecodable key's \
+         display form collides with another key of the same name and cannot be represented";
 
     /// Whether this is a [`Self::decode_failure`] — see #1620/#1660. Every
     /// `?`/`try`/`catch` boundary consults this so a decode failure passes

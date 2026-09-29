@@ -2733,8 +2733,8 @@ specific collision raise instead:
 
 ```
 $ echo '{"\ud800":1,"\ud800":2}' | sjq -Sc .
-jq: error (at <stdin>:0): object key "\ud800" is ambiguous: an undecodable key's display
-form collides with another key of the same name and cannot be represented
+jq: error (at <stdin>:0): object key "\ud800" is ambiguous: a complex or undecodable
+key's display form collides with another key of the same name and cannot be represented
 ```
 
 An *ordinary* repeated key (no decode failure on either side) is unaffected and still

@@ -13,8 +13,8 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{
-    effective_keys, tail_gap_ok, DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields,
-    DocumentValue, IndentSpec, JsonConvention,
+    effective_keys, resolve_display_key, tail_gap_ok, DisplayKeyGuard, DocumentCursor,
+    DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
@@ -716,23 +716,24 @@ impl OutputConfig {
 /// collide in a way an `IndexMap<String, _>` cannot represent (#1749),
 /// without materializing a single value (#1349).
 ///
-/// [`yaml_to_owned_value`] performs this same check as it builds its map,
-/// and every route that goes through it is already covered. The
-/// cursor-native evaluator is not: it reaches `OwnedValue` through
-/// `to_owned_with_comments`, whose generic `resolve_display_key` classifies
-/// only *decode-failure* keys as fallback spellings, and a YAML complex key
-/// (`? [1,2]`) decodes cleanly to `""`. Telling those apart needs
-/// [`YamlValue::key_string_kind`], which is not on the `DocumentValue`
-/// trait — the same reason `yaml_to_owned_value` drives [`DisplayKeyGuard`]
-/// by hand rather than going through the generic path.
+/// Since #2519 the cursor-native evaluator's own materializers raise on
+/// such a collision themselves (`resolve_display_key` asks
+/// `DocumentValue::display_key_kind`, which `YamlValue` overrides to flag a
+/// complex key), so every `-i` filter that materializes the colliding
+/// mapping already refuses without this walk. It stays for the filters that
+/// lose the key *before* any display-keyed map is built:
+/// `-i 'to_entries | from_entries'` turns both complex keys into the plain
+/// string `""` (#222), `from_entries` then sees an ordinary duplicate and
+/// keeps the last, and without this walk the merged document is written
+/// back to the user's file (measured with the call stubbed out, #2519).
 ///
 /// **This shares its classification with [`yaml_to_owned_value`] and must
-/// keep doing so**: both call `key_string_kind` and `DisplayKeyGuard::check`
-/// rather than restating the rule, so only the traversal is written twice.
+/// keep doing so**: both call `resolve_display_key` rather than restating
+/// the rule, so only the traversal is written twice.
 /// `validate_yaml_display_keys_agrees_with_yaml_to_owned_value_1349` pins
 /// that the two answer identically.
 fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
-    fn walk<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>, depth: usize) -> Result<()> {
+    fn walk<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>, depth: usize) -> Result<()> {
         // The same limit `yaml_to_owned_value` recurses under; a document
         // deeper than this is refused there rather than overflowing here.
         check_nesting_depth(depth).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -740,15 +741,17 @@ fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
             YamlValue::Mapping(fields) => {
                 let mut seen: IndexMap<String, ()> = IndexMap::new();
                 let mut guard = DisplayKeyGuard::default();
+                // STYLE-0013: `resolve_display_key` directly, not
+                // `DocumentField::checked_key` -- this walks `YamlFields`
+                // from a `YamlCursor` (no `DocumentField` to call it on),
+                // and YAML has no `,`/`:` member delimiters for the
+                // delimiter half to check; only the shared key rule applies.
                 for field in fields {
-                    let (key, is_fallback) = field.key().key_string_kind();
-                    let key = key.into_owned();
-                    if !guard.check(&seen, &key, is_fallback) {
-                        return Err(anyhow::anyhow!(
-                            "{}",
-                            EvalError::colliding_display_key(&key)
-                        ));
-                    }
+                    let key = resolve_display_key(&field.key(), &seen, &mut guard)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                        // Never `None` for YAML (#222), as in
+                        // `yaml_to_owned_value`.
+                        .unwrap_or_default();
                     seen.insert(key, ());
                     walk(field.value_cursor(), depth + 1)?;
                 }
@@ -788,7 +791,7 @@ fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
 /// the one bridge that would otherwise flatten a tag-forced `!!float 2`
 /// to an `Int` (#1176). That variant's doc comment explains why no other
 /// `ResolvedScalar -> OwnedValue` caller wants the same treatment.
-fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<OwnedValue> {
+fn yaml_to_owned_value<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> Result<OwnedValue> {
     match cursor.value() {
         YamlValue::String(s) => {
             let str_value = s
@@ -824,17 +827,19 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
             // #1642/#1738 guard a JSON decode-failure collision: an
             // *ordinary* repeated genuine key still overwrites without
             // complaint (matching jq's own last-key-wins), only a
-            // fallback-spelling collision raises.
+            // fallback-spelling collision raises. Through the shared
+            // `resolve_display_key` since #2519 put YAML's complex-key
+            // classification on `DocumentValue::display_key_kind`, so this
+            // route and every generic materializer answer from one rule.
             let mut guard = DisplayKeyGuard::default();
+            // STYLE-0013: same reason as `validate_yaml_display_keys`'s own
+            // exemption -- a `YamlCursor`-native walk with no delimiters.
             for field in fields {
-                let (key, is_fallback) = field.key().key_string_kind();
-                let key = key.into_owned();
-                if !guard.check(&map, &key, is_fallback) {
-                    return Err(anyhow::anyhow!(
-                        "{}",
-                        EvalError::colliding_display_key(&key)
-                    ));
-                }
+                let key = resolve_display_key(&field.key(), &map, &mut guard)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    // `YamlValue::display_key_kind` never answers `None`: a
+                    // YAML key is never dropped (#222).
+                    .unwrap_or_default();
                 let value = yaml_to_owned_value(field.value_cursor())?;
                 map.insert(key, value);
             }
@@ -7788,14 +7793,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     global_doc_index += inputs.len();
                     (collected, matching_docs > 1)
                 } else {
-                    // #1749's colliding-key guard, which the cursor-native
-                    // evaluator does not apply for itself (#1349 review):
-                    // `resolve_display_key`'s generic
-                    // `key_display_string_kind` only flags a key whose
-                    // *decode* failed, while a YAML complex key decodes
-                    // cleanly to `""`, so two different sequence keys both
-                    // land on `""` and `OwnedValue::Object`'s `IndexMap`
-                    // silently drops one of them.
+                    // #1749's colliding-key guard. Since #2519 the
+                    // cursor-native evaluator raises on a complex-key
+                    // collision itself wherever it materializes the
+                    // mapping; this walk covers the filters that merge the
+                    // keys *before* any display-keyed map exists
+                    // (`to_entries | from_entries`) -- see the function's
+                    // own doc comment.
                     //
                     // Keys only, no values: the cursor-native route
                     // materializes each result itself and raises any

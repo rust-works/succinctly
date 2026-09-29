@@ -2974,6 +2974,125 @@ fn test_yaml_native_dom_ordinary_repeated_key_still_overwrites_1749() -> Result<
     Ok(())
 }
 
+/// #2519: every *generic* materializing route -- stdout's writes, `-P`,
+/// `--arg`, and every builtin that builds a map -- used to key two colliding
+/// complex keys through `resolve_display_key`, which only flagged a
+/// *decode-failure* key as a fallback spelling, so the second silently
+/// replaced the first (`'': v2`, exit 0). Real yq keeps both; succinctly's
+/// `OwnedValue::Object` cannot, so each row must raise #1749's error
+/// instead, with nothing on stdout.
+#[test]
+fn test_yq_generic_routes_raise_on_colliding_complex_keys_2519() -> Result<()> {
+    const TWO: &str = "? [1]\n: v1\n? [2]\n: v2\n";
+    const NESTED: &str = "a:\n  ? [1]\n  : v1\n  ? [2]\n  : v2\n";
+    // A complex key colliding with a *genuine* `""` key: only one side is a
+    // fallback, which `DisplayKeyGuard` refuses just the same.
+    const WITH_GENUINE_EMPTY: &str = "? {a: 1}\n: v1\n\"\": v2\n";
+    let rows: &[(&str, &str, &[&str])] = &[
+        (TWO, ".x = 1", &[]),
+        (TWO, "del(.x)", &[]),
+        (TWO, ". |= .", &[]),
+        (TWO, "tojson", &[]),
+        (TWO, "[.]", &[]),
+        (TWO, "{\"a\": .}", &[]),
+        (TWO, "map_values(.)", &[]),
+        (TWO, "sort_keys(.)", &[]),
+        (TWO, ". * {}", &[]),
+        (TWO, ".", &["-P"]),
+        (TWO, ".", &["--arg", "a", "b"]),
+        (TWO, "walk(.)", &["--jq-extensions"]),
+        (NESTED, ".b = 1", &[]),
+        (WITH_GENUINE_EMPTY, ".x = 1", &[]),
+    ];
+    for &(yaml, filter, args) in rows {
+        let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, args)?;
+        assert_eq!(
+            code, 1,
+            "{filter:?} {args:?} should raise, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("is ambiguous: a complex or undecodable key's display form"),
+            "{filter:?} {args:?}: expected the collision error, got: {stderr}"
+        );
+        assert_eq!(output, "", "{filter:?} {args:?}: nothing may reach stdout");
+    }
+
+    Ok(())
+}
+
+/// #2519's must-not-change rows: routes that never build a display-keyed
+/// map keep *both* entries (spelled `""`, #222) exactly as before the fix --
+/// in particular `select(.)`, whose validation walk deliberately keeps the
+/// decode-failure-only flag rather than refusing what yq streams fine.
+/// Plus the edges the guard must stay out of: a single complex key, and an
+/// ordinary repeated key (still last-key-wins).
+#[test]
+fn test_yq_streaming_routes_keep_both_colliding_complex_keys_2519() -> Result<()> {
+    const TWO: &str = "? [1]\n: v1\n? [2]\n: v2\n";
+    let rows: &[(&str, &str, &[&str], &str)] = &[
+        (TWO, ".", &[], "\"\": v1\n\"\": v2\n"),
+        (
+            TWO,
+            ".",
+            &["-o", "json"],
+            "{\n  \"\": \"v1\",\n  \"\": \"v2\"\n}\n",
+        ),
+        (TWO, "keys", &[], "- ''\n- ''\n"),
+        (
+            TWO,
+            "to_entries",
+            &[],
+            "- key: ''\n  value: v1\n- key: ''\n  value: v2\n",
+        ),
+        (TWO, "length", &[], "2\n"),
+        (TWO, "has(\"\")", &[], "true\n"),
+        (TWO, "select(.)", &[], "\"\": v1\n\"\": v2\n"),
+        ("? [1]\n: v1\nb: 3\n", ".x = 1", &[], "'': v1\nb: 3\nx: 1\n"),
+        ("a: 1\na: 2\n", ".x = 1", &[], "a: 2\nx: 1\n"),
+    ];
+    for &(yaml, filter, args, expected) in rows {
+        let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, args)?;
+        assert_eq!(code, 0, "{filter:?} {args:?} on {yaml:?}, stderr: {stderr}");
+        assert_eq!(output, expected, "{filter:?} {args:?} on {yaml:?}");
+    }
+
+    Ok(())
+}
+
+/// #2519 on `-i`: every filter that materializes the colliding mapping now
+/// raises through the cursor-native evaluator itself, and the file is left
+/// byte-identical. `to_entries | from_entries` is the row that keeps
+/// `validate_yaml_display_keys` alive: `to_entries` has already spelled both
+/// keys as the plain string `""` (#222), so `from_entries` sees an ordinary
+/// duplicate and no display-keyed map ever flags it -- with the pre-walk
+/// stubbed out, that row wrote the merged document back to the file.
+#[test]
+fn test_yq_inplace_refuses_colliding_complex_keys_2519() -> Result<()> {
+    let yaml = "? [1]\n: v1\n? [2]\n: v2\nb: 3\n";
+    for filter in [".x = 1", ".b |= .", "del(.b)", "to_entries | from_entries"] {
+        let mut input_file = NamedTempFile::new()?;
+        write!(input_file, "{yaml}")?;
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-i", filter])
+            .arg(input_file.path())
+            .stdin(Stdio::null())
+            .output()?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(!output.status.success(), "-i {filter:?} should raise");
+        assert!(
+            stderr.contains("is ambiguous"),
+            "-i {filter:?}: expected the collision error, got: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(input_file.path())?,
+            yaml,
+            "-i {filter:?} must leave the file untouched"
+        );
+    }
+
+    Ok(())
+}
+
 /// Runs a yq filter over `yaml` with `extra_args` and asserts it raises with
 /// a stderr containing `expect_stderr` -- shared by
 /// [`test_select_and_write_agree_on_corruption_1803`]'s comparison arms so
@@ -41546,12 +41665,11 @@ mod issue_1349_inplace_presentation {
     /// The whole point of the fix stated as an invariant: for a YAML file,
     /// `-i` writes exactly what the same filter prints to stdout.
     ///
-    /// One deliberate exception, not covered here: two *complex* mapping
-    /// keys whose display spellings collide make `-i` raise and leave the
-    /// file alone (#1749's guard), where stdout silently drops one. Real yq
-    /// keeps both, so both routes diverge from it — `-i` in the safe
-    /// direction. Recorded in `compliance/yq/limitations.md`; pinned by
-    /// `test_yaml_native_dom_raises_on_colliding_complex_key_1749`.
+    /// The one exception #1349 left -- two *complex* mapping keys whose
+    /// display spellings collide made `-i` raise while stdout silently
+    /// dropped one -- is closed by #2519: both routes now raise (real yq
+    /// keeps both keys; `OwnedValue::Object` cannot). The collision rows
+    /// below pin that agreement: same error, and the file left untouched.
     #[test]
     fn test_yq_inplace_matches_stdout_for_the_same_filter_1349() -> Result<()> {
         let cases = [
@@ -41569,6 +41687,31 @@ mod issue_1349_inplace_presentation {
                 stdout,
                 "-i and stdout must agree for `{filter}` on {input:?}"
             );
+        }
+        let colliding = "? [1]\n: v1\n? [2]\n: v2\n";
+        for filter in [".x = 1", ".b |= ."] {
+            let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, colliding, &[])?;
+            assert_eq!(
+                (code, stdout.as_str()),
+                (1, ""),
+                "stdout `{filter}`: {stderr}"
+            );
+            let mut file = NamedTempFile::new()?;
+            write!(file, "{colliding}")?;
+            let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .args(["yq", "-i", filter])
+                .arg(file.path())
+                // CI exports RUST_BACKTRACE=1, and only the `-i` route
+                // returns the error out of `main`, where anyhow's Debug
+                // form appends a backtrace the stdout route never prints.
+                .env_remove("RUST_BACKTRACE")
+                .env_remove("RUST_LIB_BACKTRACE")
+                .stdin(Stdio::null())
+                .output()?;
+            let inplace_stderr = String::from_utf8(output.stderr)?;
+            assert!(!output.status.success(), "-i `{filter}` must raise");
+            assert_eq!(inplace_stderr, stderr, "-i and stdout must raise alike");
+            assert_eq!(std::fs::read_to_string(file.path())?, colliding);
         }
         Ok(())
     }
@@ -41598,7 +41741,7 @@ mod issue_1349_inplace_presentation {
 
     /// The walker `-i` uses to apply #1749's guard shares its
     /// *classification* with `yaml_to_owned_value` (both call
-    /// `key_string_kind` + `DisplayKeyGuard::check`) but writes its own
+    /// `resolve_display_key`, #2519) but writes its own
     /// *traversal*. Pins that the two agree, so the copy cannot drift:
     /// `--slurp` drives `yaml_to_owned_value`, `-i` drives the walker, and
     /// they must accept and reject exactly the same documents.

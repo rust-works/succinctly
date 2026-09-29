@@ -646,8 +646,11 @@ helper cannot give, or the issue that tracks closing the gap. The exemptions in 
 today are `json::light::stream_json_pretty` (needs the resolved position, hence
 `element_gap_ok_at`), `eval_generic`'s validate-only walk (lazy key map, #2061 -- its
 delimiter checks were the #2349 fix, added directly rather than via this route, for the
-same lazy-key reason), `lazy.rs`'s missing trailing-gap check (#2358), and the
-comment-preserving walk (YAML-only in production).
+same lazy-key reason), `lazy.rs`'s missing trailing-gap check (#2358), the
+comment-preserving walk (YAML-only in production), and `yq_runner.rs`'s two
+`YamlCursor`-native key walks, `yaml_to_owned_value` and `validate_yaml_display_keys`
+(no `DocumentField` to route through and no delimiters to check; they call
+`resolve_display_key` for the shared key rule, #2519).
 
 ### Motivation
 
