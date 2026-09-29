@@ -63945,8 +63945,8 @@ pub(crate) fn def_spine_len(then: &Expr, cap: usize) -> usize {
     n
 }
 
-/// Nodes the two def installers have visited on this thread -- test-only, so a
-/// test can count work instead of timing it (#3307).
+// Nodes the two def installers have visited on this thread -- test-only, so a
+// test can count work instead of timing it (#3307).
 #[cfg(test)]
 thread_local! {
     static INSTALL_VISITS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
@@ -64148,7 +64148,7 @@ impl SpineInstaller {
                     self.unmask(name, params.len());
                     return expr.clone();
                 }
-                let new_body = self.walk_def_body(params, body, frames + 1);
+                let new_body = Box::new(self.walk_def_body(params, body, frames + 1));
                 let new_then = Box::new(self.walk(then, frames + 1));
                 self.unmask(name, params.len());
                 Expr::FuncDef {
@@ -64188,14 +64188,14 @@ impl SpineInstaller {
     /// caller has already hidden the def's own key. When nothing is left in
     /// scope the body is cloned, as `install_def_calls` clones a fully
     /// shadowed one.
-    fn walk_def_body(&mut self, params: &[Param], body: &Expr, frames: u32) -> Box<Expr> {
+    fn walk_def_body(&mut self, params: &[Param], body: &Expr, frames: u32) -> Expr {
         for p in params {
             self.mask(p.name(), 0);
         }
         let installed = if self.visible == 0 {
-            Box::new(body.clone())
+            body.clone()
         } else {
-            Box::new(self.walk(body, frames))
+            self.walk(body, frames)
         };
         for p in params {
             self.unmask(p.name(), 0);
@@ -64262,7 +64262,7 @@ fn install_def_spine(first: &Rc<FuncDefData>, then: &Expr, depth: u32) -> Expr {
             Rc::new(FuncDefData {
                 name: name.clone(),
                 params: params.clone(),
-                body: *new_body,
+                body: new_body,
             }),
             frames,
         );
@@ -114196,6 +114196,7 @@ mod touched_edge_cases_2999 {
     /// is the nested binding's at that depth, the head's cache hits at the same
     /// depth and recomputes at another.
     #[test]
+    #[cfg(feature = "std")] // the ambient depth is a thread-local; `no_std` has none
     fn bind_def_spine_seeds_frames_from_the_ambient_depth_3307() {
         let head = spine_node(
             &[("a", "1"), ("b", "a + 1"), ("c", "b + a")],
