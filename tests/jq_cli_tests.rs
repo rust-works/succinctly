@@ -2272,6 +2272,106 @@ fn test_jsonargs_positional_hyphen_prefixed_values_1150() -> Result<()> {
     Ok(())
 }
 
+/// #3412: `--args`/`--jsonargs` placed *before* the filter must not swallow
+/// it. clap's greedy flags capture every following word, so the filter used
+/// to land in `$ARGS.positional` and the program defaulted to `.`
+/// (`jq -nc --args '$ARGS.positional' a b` printed `null`). jq takes the
+/// first non-option word as the program and gives every later word the mode
+/// of the most recent `--args`/`--jsonargs`, including across a mode switch.
+/// Every row captured live against jq 1.7.1.
+#[test]
+fn test_args_before_filter_takes_first_word_as_filter_3412() -> Result<()> {
+    let p = "$ARGS.positional";
+    for (argv, want) in [
+        (vec!["-nc", "--jsonargs", p, "1"], "[1]"),
+        (vec!["-nc", "--jsonargs", p, "NaN", "007"], "[null,7]"),
+        (vec!["-nc", "--args", p, "a", "b"], r#"["a","b"]"#),
+        (vec!["-nc", "--args", p], "[]"),
+        (vec!["-nc", "--jsonargs", p, "-7", "-8"], "[-7,-8]"),
+        (vec!["-nc", "--args", p, "-7", "x"], r#"["-7","x"]"#),
+        // `--` ends the mode switches; the program still comes after it.
+        (vec!["-nc", "--args", "--", p, "a"], r#"["a"]"#),
+        // The filter-first order keeps working, hyphen values included.
+        (vec!["-nc", p, "--args", "a", "b"], r#"["a","b"]"#),
+        (vec!["-nc", p, "--jsonargs", "-7", "-8"], "[-7,-8]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&argv, None)?;
+        assert_eq!(code, 0, "{argv:?}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{argv:?}");
+    }
+    Ok(())
+}
+
+/// #3412: a later `--args`/`--jsonargs` switches the mode for the words after
+/// it, in argv order -- `$ARGS.positional` interleaves the two rather than
+/// listing every string first. It arrived as one more literal `--jsonargs`
+/// string before the fix.
+#[test]
+fn test_args_and_jsonargs_interleave_in_argv_order_3412() -> Result<()> {
+    let p = "$ARGS.positional";
+    for (argv, want) in [
+        (
+            vec!["-nc", p, "--args", "a", "--jsonargs", "1"],
+            r#"["a",1]"#,
+        ),
+        (
+            vec!["-nc", "--args", p, "a", "--jsonargs", "1", "2"],
+            r#"["a",1,2]"#,
+        ),
+        (
+            vec!["-nc", "--jsonargs", p, "1", "--args", "a"],
+            r#"[1,"a"]"#,
+        ),
+        (vec!["-nc", "--args", "--jsonargs", p, "1", "2"], "[1,2]"),
+        (
+            vec![
+                "-nc",
+                "--args",
+                p,
+                "--jsonargs",
+                "1",
+                "--args",
+                "b",
+                "--jsonargs",
+                "2",
+            ],
+            r#"[1,"b",2]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&argv, None)?;
+        assert_eq!(code, 0, "{argv:?}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{argv:?}");
+    }
+    Ok(())
+}
+
+/// #3412: `-f` supplies the program, so no word is taken as the filter and
+/// every word after `--args` is positional. A bad `--jsonargs` value is the
+/// same exit-2 usage error wherever the filter sits.
+#[test]
+fn test_args_before_filter_with_from_file_and_bad_json_3412() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let prog = dir.path().join("prog.jq");
+    std::fs::write(&prog, "$ARGS.positional\n")?;
+    let prog = prog.to_str().expect("utf-8 temp path");
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "-f", prog, "--args", "a", "b"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"["a","b"]"#);
+
+    for argv in [
+        vec!["-nc", "--jsonargs", "$ARGS.positional", "[1,"],
+        vec!["-nc", "$ARGS.positional", "--jsonargs", "[1,"],
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&argv, None)?;
+        assert_eq!(code, 2, "{argv:?}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.starts_with("jq: invalid JSON text passed to --jsonargs\n"),
+            "{argv:?}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// `-L` (`ArgAction::Append`, exactly one value per occurrence -- a
 /// different clap shape from every arg above, which is why #1150's
 /// `allow_hyphen_values` fix didn't cover it -- and short-only, unlike
