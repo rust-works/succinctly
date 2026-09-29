@@ -76463,10 +76463,10 @@ fn test_path_slice_bound_retry_supersedes_stashed_verdict_3293() -> Result<()> {
 /// after a computed slice reach. Those three are succinctly's, so each row's
 /// answer is jq 1.7.1's for the `path()` spelling in the comment above it.
 /// `first(.[S:] | key)` rows whose retry fails are left out: that shape
-/// evaluates the bound twice with no `?//` at all, a separate bug. Cursor
+/// evaluates the bound twice with no `?//` at all (#3470). Cursor
 /// route only: over an owned input `key` takes the owned-identity walk
 /// instead, which still keeps the abandoned alternative's bound (a slice 9
-/// site, recorded on the issue).
+/// site, recorded on #3293).
 const RETRY_ROWS_PATH_CONTEXT_SLICE_3293: &[RetryRow3293] = &[
     // jq 1.7.1: `path(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]) | last`
     (

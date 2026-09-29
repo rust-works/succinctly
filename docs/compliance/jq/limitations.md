@@ -620,6 +620,10 @@ raises in jq and now here). What it leaves:
 - **A computed index** (`path(.[K])`, `del(.[K])`) keeps its own bare slots in
   `resolve_index_expr_sink`: `[first(path(.[([0] as [$a] ?// $b | if $a == null then "x"
   else $a end)])), 9]` is `[[0],9]` here where jq raises. Unchanged by this slice.
+- **Value mode never retries on a consumer's stop through a slice bound** (#3471):
+  `[first(.[([1] as [$a] ?// $b | if $a == null then "x" else $a end):]), 9]` is `[[20,30],9]`
+  here where jq retries and raises -- `eval_slice_expr` collects before the consumer sees an
+  output, the #2180 "materialized before the consumer" family.
 
 ## Where succinctly errors and jq does not
 
