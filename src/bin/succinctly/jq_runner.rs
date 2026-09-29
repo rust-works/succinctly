@@ -6770,7 +6770,7 @@ fn evaluate_input_streaming(
         let index = JsonIndex::build(text.as_bytes());
         InputDoc::Preserve(text, index)
     } else {
-        InputDoc::Bridge(input.input_bridge_doc())
+        InputDoc::Bridge(input.input_bridge_doc::<JqSemantics>())
     };
     let cursor = doc.root();
 

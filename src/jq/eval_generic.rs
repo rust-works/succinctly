@@ -2766,6 +2766,11 @@ fn into_lazy_items<V: DocumentValue, S: EvalSemantics>(
 fn owned_from_standard_json<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     value: &crate::json::light::StandardJson<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
+    // #3069: a container the reindex bridge serialized leaves it as the
+    // storage that went in -- see `eval::bridge_shared_for_value`.
+    if let Some(shared) = super::eval::bridge_shared_for_value::<S, W>(value) {
+        return Ok(shared);
+    }
     owned_from_standard_json_at_depth::<S, W>(value, 0)
 }
 

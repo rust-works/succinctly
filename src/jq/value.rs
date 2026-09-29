@@ -3848,14 +3848,26 @@ impl OwnedValue {
     /// its index here means no call site can index bridge text as if it were
     /// a user document (which would read every NaN, infinity and computed
     /// float as `null`) -- nor the reverse, which is #3034.
+    ///
+    /// In jq mode ([`EvalSemantics::REINDEX_BRIDGE_KEEPS_IDENTITY`], #3069)
+    /// the document also remembers `self`, so a container read back out of
+    /// it is `self`'s own storage rather than a rebuild -- see
+    /// [`bridge_provenance`].
     pub fn reindexed<S: EvalSemantics>(&self) -> Result<ReindexedDoc, EvalError> {
-        Ok(ReindexedDoc::new(self.to_json_for_reindex::<S>()?))
+        Ok(ReindexedDoc::new(
+            self.to_json_for_reindex::<S>()?,
+            S::REINDEX_BRIDGE_KEEPS_IDENTITY.then_some(self),
+        ))
     }
 
     /// [`to_json_input_bridge`](Self::to_json_input_bridge)'s text, indexed
-    /// as bridge text -- see [`reindexed`](Self::reindexed).
-    pub fn input_bridge_doc(&self) -> ReindexedDoc {
-        ReindexedDoc::new(self.to_json_input_bridge())
+    /// as bridge text -- see [`reindexed`](Self::reindexed), including its
+    /// provenance rule.
+    pub fn input_bridge_doc<S: EvalSemantics>(&self) -> ReindexedDoc {
+        ReindexedDoc::new(
+            self.to_json_input_bridge(),
+            S::REINDEX_BRIDGE_KEEPS_IDENTITY.then_some(self),
+        )
     }
 }
 
@@ -3869,12 +3881,29 @@ impl OwnedValue {
 pub struct ReindexedDoc {
     text: String,
     index: crate::json::JsonIndex,
+    /// Whether [`bridge_provenance`] holds this document's source, so
+    /// dropping the document must unregister it.
+    registered: bool,
 }
 
 impl ReindexedDoc {
-    fn new(text: String) -> Self {
+    fn new(text: String, source: Option<&OwnedValue>) -> Self {
         let index = crate::json::JsonIndex::build_reindex(text.as_bytes());
-        Self { text, index }
+        // Only a container has storage to share. The key is the text's heap
+        // buffer, which -- unlike the index's own address, the
+        // `document_token` -- does not move when this struct is returned by
+        // value, and cannot be reused while `self` owns it.
+        let registered = match source {
+            Some(source @ (OwnedValue::Array(_) | OwnedValue::Object(_))) => {
+                bridge_provenance::register(text.as_ptr() as usize, source.clone())
+            }
+            _ => false,
+        };
+        Self {
+            text,
+            index,
+            registered,
+        }
     }
 
     /// The root cursor over the bridge text.
@@ -3885,6 +3914,149 @@ impl ReindexedDoc {
     /// The bridge text itself.
     pub fn text(&self) -> &str {
         &self.text
+    }
+}
+
+impl Drop for ReindexedDoc {
+    fn drop(&mut self) {
+        if self.registered {
+            bridge_provenance::unregister(self.text.as_ptr() as usize);
+        }
+    }
+}
+
+/// The source value behind each live [`ReindexedDoc`], so that reading a
+/// container back out of the bridge returns the storage that went in
+/// (#3069).
+///
+/// jq never copies a value by reading it: `[nan] | [.] == [.]` compares two
+/// handles on one array, and `jv_equal`'s identity check answers `true`
+/// although the NaN inside is unequal to itself. The bridge serializes a
+/// value and re-indexes it as a new document, so every read of a container
+/// used to materialize a fresh, value-equal twin -- a second allocation jq
+/// never makes, which [`jq_identical`] then correctly refuses.
+///
+/// **Soundness.** A registered document is exactly `source`'s serialization,
+/// and an index is immutable, so the container at any node of it is, value
+/// for value, the source subtree that was written there -- whenever the
+/// bridge round-trips that subtree unchanged, which
+/// [`reindex_bridge_is_identity`](super::eval_generic::reindex_bridge_is_identity)
+/// decides per container. Handing back the source's handle therefore changes
+/// no value, only whether storage is shared; the table's own strong reference
+/// makes any later write through either handle copy first. A container the
+/// predicate rejects is simply not in the table and materializes fresh, as
+/// before: a miss costs an identity, never a value. The materializer's depth
+/// limit is not skipped either: [`to_json_for_reindex`](OwnedValue::to_json_for_reindex)
+/// already refused any source deeper than [`MAX_VALUE_TREE_DEPTH`], the same
+/// limit `eval::to_owned` walks under, and a subtree is never deeper than
+/// the tree it sits in.
+///
+/// **Cost.** Registering is one `Rc` clone and a push, per bridge crossing
+/// of a container, and only in jq mode. The node table itself is built on
+/// the first container read out of the document -- one walk over its
+/// containers, no more than the single fresh materialization it replaces --
+/// so a bridged evaluation that only reads scalars never pays for it.
+///
+/// `#[cfg(feature = "std")]` only, the same `thread_local!` shape and
+/// degradation as `eval_generic`'s `embed_table`: without `std` nothing is
+/// registered and every read rebuilds, which is the pre-#3069 behaviour.
+#[cfg(feature = "std")]
+pub(crate) mod bridge_provenance {
+    use super::OwnedValue;
+    use alloc::vec::Vec;
+    use core::cell::OnceCell;
+    use std::cell::{Cell, RefCell};
+
+    /// One live bridge document: its text buffer's address, the value it was
+    /// serialized from, and -- once some read asks -- every container node
+    /// in it, in BP order, with the source storage it stands for (`None`
+    /// where the bridge does not round-trip that subtree unchanged).
+    struct Registration {
+        text: usize,
+        source: OwnedValue,
+        table: OnceCell<Vec<(usize, Option<OwnedValue>)>>,
+    }
+
+    thread_local! {
+        static DOCS: RefCell<Vec<Registration>> = const { RefCell::new(Vec::new()) };
+        /// `!DOCS.is_empty()`, so the materializer's gate is a plain load.
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether any bridge document is registered at all.
+    #[inline]
+    pub(crate) fn active() -> bool {
+        ACTIVE.with(Cell::get)
+    }
+
+    pub(super) fn register(text: usize, source: OwnedValue) -> bool {
+        DOCS.with(|d| {
+            d.borrow_mut().push(Registration {
+                text,
+                source,
+                table: OnceCell::new(),
+            });
+        });
+        ACTIVE.with(|a| a.set(true));
+        true
+    }
+
+    /// Removes the registration for `text` wherever it sits: documents are
+    /// usually dropped innermost first, but nothing guarantees it (a lazy
+    /// result can hold one past a sibling), so this never truncates.
+    pub(super) fn unregister(text: usize) {
+        DOCS.with(|d| {
+            let mut d = d.borrow_mut();
+            if let Some(i) = d.iter().rposition(|r| r.text == text) {
+                d.remove(i);
+            }
+            ACTIVE.with(|a| a.set(!d.is_empty()));
+        });
+    }
+
+    /// The source storage for the container at BP position `node` of the
+    /// bridge document whose text starts at `text`, or `None` when no
+    /// registered document has that text or the container is not one the
+    /// bridge round-trips unchanged. `build` walks the document against its
+    /// source the first time any read of that document asks.
+    pub(crate) fn shared_for(
+        text: usize,
+        node: usize,
+        build: impl FnOnce(&OwnedValue) -> Vec<(usize, Option<OwnedValue>)>,
+    ) -> Option<OwnedValue> {
+        DOCS.with(|d| {
+            let d = d.borrow();
+            let reg = d.iter().rev().find(|r| r.text == text)?;
+            let table = reg.table.get_or_init(|| build(&reg.source));
+            let i = table.binary_search_by_key(&node, |(n, _)| *n).ok()?;
+            table[i].1.clone()
+        })
+    }
+}
+
+/// Without `std` there is nowhere to register a document, so every read
+/// rebuilds -- see the `std` module's doc comment.
+#[cfg(not(feature = "std"))]
+pub(crate) mod bridge_provenance {
+    use super::OwnedValue;
+
+    #[inline]
+    pub(crate) fn active() -> bool {
+        false
+    }
+
+    pub(super) fn register(_text: usize, _source: OwnedValue) -> bool {
+        false
+    }
+
+    pub(super) fn unregister(_text: usize) {}
+
+    pub(crate) fn shared_for(
+        _text: usize,
+        _node: usize,
+        _build: impl FnOnce(&OwnedValue) -> alloc::vec::Vec<(usize, Option<OwnedValue>)>,
+    ) -> Option<OwnedValue> {
+        None
     }
 }
 
@@ -6569,7 +6741,7 @@ mod tests {
     #[test]
     fn test_input_bridge_doc_pairs_bridge_text_with_its_flagged_index_3034() {
         let input = OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN), OwnedValue::Int(1)]);
-        let doc = input.input_bridge_doc();
+        let doc = input.input_bridge_doc::<crate::jq::JqSemantics>();
         assert_eq!(doc.text(), input.to_json_input_bridge());
 
         let mut children = doc.root().children();
