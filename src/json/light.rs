@@ -708,11 +708,14 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         self.index
     }
 
-    /// Check if this cursor points to a container (array or object).
+    /// Check if this cursor points to a container (array or object) that has
+    /// children.
     ///
     /// This is a **fast** operation that only uses the BP structure -
     /// no text_position lookup is needed. Containers have children in
-    /// the BP tree; leaves (strings, numbers, bools, null) don't.
+    /// the BP tree; leaves (strings, numbers, bools, null) don't. An
+    /// **empty** `{}`/`[]` has none either, so it answers `false` here:
+    /// this is "has a subtree", not an array/object type test (#3180).
     ///
     /// Use this when you only need to distinguish containers from leaves
     /// without reading the actual value content.

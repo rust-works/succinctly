@@ -69048,11 +69048,13 @@ fn test_owned_embed_keeps_node_identity_on_the_input_bridge_2889() -> Result<()>
 ///   `input`'s own output is what the later stage sees.
 /// - An empty container binds no node on this route at all: `eval.rs`
 ///   recovers a value's cursor by hopping `parent()` from the child its
-///   `StandardJson` retains, and `{}`/`[]` retain none. The generic
-///   evaluator, which is handed a real cursor, does answer these -- the one
-///   place the two routes still disagree, and in the safe direction
-///   (#3180: it needs the container cursor kept on `JsonFields`/
-///   `JsonElements`, a hot-path change that wants measuring first).
+///   `StandardJson` retains, and `{}`/`[]` retain none (#3180 Stage 2: it
+///   needs the container cursor kept on `JsonFields`/`JsonElements`, a
+///   hot-path change that wants measuring first). The generic evaluator
+///   answers these since #3180 Stage 1 -- see
+///   `test_default_route_empty_container_embed_keeps_identity_3180` -- so
+///   this is the one place the two routes still disagree, and in the safe
+///   direction.
 #[test]
 // jq filter literals are not formatting strings.
 #[allow(clippy::literal_string_with_formatting_args)]
@@ -69073,7 +69075,8 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         // `whole_container_cursor` to hop from, so the bind names no node
         // and the table stays empty. jq answers `[]`; the generic evaluator
         // (which carries a real cursor rather than recovering one) answers
-        // it too, so this is the one place the two routes still differ.
+        // it too since #3180 Stage 1, so this is the one place the two
+        // routes still differ.
         (r"{}", r"input | . as $x | {k:.} | .k | path($x)"),
         (r"[]", r"input | . as $x | {k:.} | .k | path($x)"),
         // (Collecting the pipe into an array answers since #3180 -- see
@@ -69108,6 +69111,153 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         assert!(
             stderr.contains("Invalid path expression"),
             "#2889 Stage B: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3180 Stage 1: the default (generic-evaluator) route names an *empty*
+/// `{}`/`[]` as the node an `as` binding froze, so a construction that places
+/// it keeps jq's pointer identity. The embed gate asked `is_container()`,
+/// which the JSON cursor answers as "has BP children" -- `false` for exactly
+/// the shape a binding registers -- so the exact `(node, document)` lookup
+/// never ran. Every expected output captured live against jq 1.7.1.
+///
+/// The sibling rows are the ones that must keep refusing, as jq does: a
+/// binding of *another* empty container (`.a` vs `.b`) is a different node
+/// even though the two values are equal, and turning that into an accept
+/// would be a write to the wrong place.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_default_route_empty_container_embed_keeps_identity_3180() -> Result<()> {
+    for (input, filter, want) in [
+        // Empty root, both containers, every embedding construction.
+        ("{}", r". as $x | {k:.} | .k | path($x)", "[]"),
+        ("[]", r". as $x | {k:.} | .k | path($x)", "[]"),
+        ("{}", r". as $x | {k:$x} | .k | path($x)", "[]"),
+        ("[]", r". as $x | {k:$x} | .k | path($x)", "[]"),
+        ("{}", r". as $x | [.] | .[0] | path($x)", "[]"),
+        ("[]", r". as $x | [.] | .[0] | path($x)", "[]"),
+        ("{}", r". as $x | . + {} | path($x)", "[]"),
+        ("[]", r". as $x | . + [] | path($x)", "[]"),
+        ("[]", r". as $x | [.] + [] | .[0] | path($x)", "[]"),
+        // A nested empty container: the binding's node is not the root.
+        (
+            r#"{"a":{}}"#,
+            r".a as $x | .a | {k:.} | .k | path($x)",
+            "[]",
+        ),
+        (
+            r#"{"a":[]}"#,
+            r".a as $x | .a | {k:.} | .k | path($x)",
+            "[]",
+        ),
+        (r#"{"a":{}}"#, r". as $x | {k:.} | .k | path($x)", "[]"),
+        // The bound empty container sits *inside* the materialized root
+        // (#3179's nested reuse): the root has children, so `is_container`
+        // was never the obstacle, and these already answered. Pinned so a
+        // change to the nested precheck cannot lose them silently.
+        (r#"{"a":{}}"#, r".a as $y | {k:.} | .k.a | path($y)", "[]"),
+        (r#"{"a":{}}"#, r".a as $y | [.] | .[0].a | path($y)", "[]"),
+        (
+            r#"{"a":{}}"#,
+            r".a as $y | {k:{j:.}} | .k.j.a | path($y)",
+            "[]",
+        ),
+        (r#"{"a":[]}"#, r".a as $y | {k:.} | .k.a | path($y)", "[]"),
+        (r#"{"a":[]}"#, r".a as $y | [.] | .[0].a | path($y)", "[]"),
+        (
+            r#"{"a":[]}"#,
+            r".a as $y | {k:{j:.}} | .k.j.a | path($y)",
+            "[]",
+        ),
+        (
+            r#"{"a":{},"b":{}}"#,
+            r".a as $y | {k:.} | .k.a | path($y)",
+            "[]",
+        ),
+        (
+            r#"{"a":{},"b":{}}"#,
+            r".a as $y | [.] | .[0].a | path($y)",
+            "[]",
+        ),
+        (
+            r#"{"a":{},"b":{}}"#,
+            r".a as $y | {k:{j:.}} | .k.j.a | path($y)",
+            "[]",
+        ),
+        // The write half, where a wrong answer costs data.
+        ("{}", r". as $x | {k:.} | .k | ($x.a) = 9", r#"{"a":9}"#),
+        ("{}", r". as $x | {k:.} | .k | ($x.a) |= 9", r#"{"a":9}"#),
+        ("{}", r". as $x | . + {} | ($x.a) = 9", r#"{"a":9}"#),
+        ("{}", r". as $x | {k:.} | .k | del($x.a)", "{}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3180: `{filter}` on {input}: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3180: `{filter}` on {input}");
+    }
+
+    // Must not move: a *different* empty container is a different node.
+    for (input, filter) in [
+        (
+            r#"{"a":{},"b":{}}"#,
+            r".a as $x | .b | {k:.} | .k | path($x)",
+        ),
+        (
+            r#"{"a":[],"b":[]}"#,
+            r".a as $x | .b | {k:.} | .k | path($x)",
+        ),
+        (r#"{"a":{},"b":{}}"#, r".a as $x | .b | path($x)"),
+        (r#"{"a":[],"b":[]}"#, r".a as $x | .b | path($x)"),
+        (r#"{"a":{},"b":{}}"#, r".a as $x | (.b|{k:.}|.k) | path($x)"),
+        (r#"{"a":[],"b":[]}"#, r".a as $x | (.b|{k:.}|.k) | path($x)"),
+        (r#"{"a":{},"b":{}}"#, r".a as $x | {k:.b} | .k | path($x)"),
+        (r#"{"a":[],"b":[]}"#, r".a as $x | {k:.b} | .k | path($x)"),
+        (r#"{"a":{},"b":{}}"#, r".a as $x | [.b] | .[0] | path($x)"),
+        (r#"{"a":[],"b":[]}"#, r".a as $x | [.b] | .[0] | path($x)"),
+        // Nested: a *sibling's* empty container is not the bound node.
+        (r#"{"a":{}}"#, r".a as $y | {k:.} | .k.b | path($y)"),
+        (r#"{"a":[]}"#, r".a as $y | {k:.} | .k.b | path($y)"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3180: `{filter}` on {input} must refuse, got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3180: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+
+    // `map(.)` detaches a container (`OwnedIdentityRule::DetachesContainer`),
+    // and gates on `is_container()` too. Audited under #3180: every row below
+    // already refused, as in jq, on an empty container -- the JSON cursor's
+    // `is_container` being `false` there does not leak an accept.
+    for (input, filter) in [
+        (r"[]", r"path(map(.))"),
+        (r#"{"a":[]}"#, r"path(map(.))"),
+        (r#"{"a":{}}"#, r"path(map(.))"),
+        (r"[[]]", r"path(map(.))"),
+        (r"[{}]", r"path(map(.))"),
+        (r#"{"a":[]}"#, r"path(.a|map(.))"),
+        (r#"{"a":{}}"#, r"path(.a|map(.))"),
+        (r#"{"a":[]}"#, r".a as $x | .a | map(.) | path($x)"),
+        (r#"{"a":{}}"#, r".a as $x | .a | map(.) | path($x)"),
+        (r#"{"a":[]}"#, r"path(.[]|map(.))"),
+        (r#"{"a":{}}"#, r"path(.[]|map(.))"),
+        (r"[[]]", r"path(.[]|map(.))"),
+        (r"[{}]", r"path(.[]|map(.))"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3180: `{filter}` on {input} must refuse, got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3180: `{filter}` on {input}: stderr={stderr:?}"
         );
     }
     Ok(())

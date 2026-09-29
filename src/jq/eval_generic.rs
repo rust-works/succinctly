@@ -654,14 +654,18 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
     // module's doc comment.
     //
     // Gate order matters, and was measured both ways (#2889 A/B): the
-    // thread-local `active()` load inside `embed_shared_for` is ~1 ns and
-    // false on every path outside a jq-mode `as` body, so it goes first;
-    // `is_container` needs the cursor's text position (a rank/select lookup,
-    // tens of ns) and comes second, so a scalar-heavy walk with a binding in
-    // scope (`to_entries` over a wide object materializes one scalar per
-    // field here) skips the table lookup without every per-item bind
-    // (`.[] | .score as $y`, a fold's own `$u`) paying the position lookup
-    // when no table is active -- the other order cost 3-6% on an M4 Pro.
+    // thread-local `active()` load inside `embed_at_or_within` is ~1 ns and
+    // false on every path outside a jq-mode `as` body, so it goes first, so
+    // that every per-item bind (`.[] | .score as $y`, a fold's own `$u`)
+    // pays nothing when no table is active -- the other order cost 3-6% on
+    // an M4 Pro. #3180: with a binding in scope, a childless node gets the
+    // exact `(node, document)` lookup too, because an empty `{}`/`[]` is one
+    // and is what a binding may name. A scalar is childless as well and can
+    // never hit (scalars never enter the table), so it pays a thread-local
+    // read, a `RefCell` borrow and a scan of the handful of entries for
+    // nothing. Measured on `to_entries`/`[.[]]`/`with_entries` over a wide
+    // object and `. as $y | .score` over users, 2 and 10 MB, on an M4 Pro
+    // and a 7950X: neutral within the same-binary control's band (#3180).
     //
     // #3179: the same table pass also names any bound node *below* depth 0
     // -- `.a as $y | {k:.} | .k.a`, where `{k:.}` materializes the root and
@@ -5717,9 +5721,17 @@ pub(crate) fn embed_witness_of(value: &OwnedValue) -> Option<(usize, usize)> {
 pub(crate) fn embed_shared_for<S: EvalSemantics, C: DocumentCursor>(
     cursor: &C,
 ) -> Option<OwnedValue> {
-    // `active()` before `is_container()`: see `to_owned_cursor`'s call site
-    // for the measured reason the cheap thread-local load must come first.
-    if S::TAG != EvalTag::Jq || !embed_table::active() || !cursor.is_container() {
+    // `active()` first: see `to_owned_cursor`'s call site for the measured
+    // reason the cheap thread-local load must come before anything that
+    // reads the cursor.
+    //
+    // No `is_container()` gate (#3180): the JSON cursor's `is_container` is
+    // "has BP children", so it is `false` for an empty `{}`/`[]`, which is
+    // still an `Rc`-backed value a binding registers and whose identity jq
+    // keeps. The exact `(node, document)` lookup is the whole test -- a
+    // scalar never enters the table, so it can only hit a bound node (and
+    // pays the lookup for nothing; see `to_owned_cursor` for the cost).
+    if S::TAG != EvalTag::Jq || !embed_table::active() {
         return None;
     }
     embed_table::shared_for(cursor.node_id(), cursor.document_token())
@@ -5754,13 +5766,24 @@ fn cursor_height<C: DocumentCursor>(cursor: &C, cap: usize) -> usize {
 /// reuse), or else the nodes strictly inside its subtree that some binding
 /// holds -- empty whenever the depth-0 reuse's own conditions fail, and for
 /// a cursor that cannot name its subtree's extent
-/// ([`DocumentCursor::subtree_end`]). One table pass for both.
+/// ([`DocumentCursor::subtree_end`]). One table pass for both. A cursor with
+/// no children gets only the depth-0 lookup (#3180).
 fn embed_at_or_within<S: EvalSemantics, C: DocumentCursor>(
     cursor: &C,
 ) -> (Option<OwnedValue>, Vec<usize>) {
-    // `active()` before `is_container()`, as in [`embed_shared_for`].
-    if S::TAG != EvalTag::Jq || !embed_table::active() || !cursor.is_container() {
+    // `active()` first, as in [`embed_shared_for`].
+    if S::TAG != EvalTag::Jq || !embed_table::active() {
         return (None, Vec::new());
+    }
+    // #3180: a node with no BP children can still be a binding's own node --
+    // an empty `{}`/`[]` -- so it gets the exact depth-0 lookup. It has no
+    // subtree, so the nested half stays empty and `subtree_end` is never
+    // asked; the `is_container` filter survives for that half only.
+    if !cursor.is_container() {
+        return (
+            embed_table::shared_for(cursor.node_id(), cursor.document_token()),
+            Vec::new(),
+        );
     }
     embed_table::at_or_within(cursor.node_id(), cursor.document_token(), || {
         cursor.subtree_end()
@@ -41100,5 +41123,61 @@ mod tests {
             "dynamic-bound slice off an attached value"
         );
         assert!(control.is_none(), "control: {control:?}");
+    }
+
+    /// #3180: the embed gate names an *empty* container. The JSON cursor's
+    /// `is_container` is "has BP children", so it is `false` for `{}`/`[]`,
+    /// and the old `is_container()` gate never ran the `(node, document)`
+    /// lookup for exactly the node a binding registered.
+    // `std` for the thread-local table; the holdout never shares storage.
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[test]
+    fn embed_gate_finds_an_empty_container_binding_3180() {
+        let doc = br#"{"a":{},"b":1}"#;
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+        let empty = root.first_child().unwrap().next_sibling().unwrap();
+        let scalar = empty.next_sibling().unwrap().next_sibling().unwrap();
+        assert!(!empty.is_container(), "premise: childless");
+        assert!(!scalar.is_container(), "premise: childless");
+
+        let bound = OwnedValue::object_from(std::iter::empty::<(String, OwnedValue)>());
+        let origin = BindOrigin::Node {
+            node: empty.node_id(),
+            document: empty.document_token(),
+        };
+        // No binding in scope: every read is `None`.
+        assert!(embed_shared_for::<JqSemantics, _>(&empty).is_none());
+        let _guard = embed_table_push::<JqSemantics>(Some(&origin), &bound).unwrap();
+
+        // The bound node itself, through both readers.
+        let found = embed_shared_for::<JqSemantics, _>(&empty).unwrap();
+        assert!(found.shares_storage_with(&bound), "the binding's own Rc");
+        let (at, nested) = embed_at_or_within::<JqSemantics, _>(&empty);
+        assert!(at.unwrap().shares_storage_with(&bound));
+        assert!(nested.is_empty(), "a childless node has no subtree");
+
+        // Another childless node -- a scalar -- is not the bound node.
+        assert!(embed_shared_for::<JqSemantics, _>(&scalar).is_none());
+        assert!(embed_at_or_within::<JqSemantics, _>(&scalar).0.is_none());
+
+        // Same `node_id`, other document: the token check rejects it.
+        let other_doc = br#"{"a":{},"b":1}"#;
+        let other_index = JsonIndex::build(other_doc);
+        let other_empty = other_index
+            .root(other_doc)
+            .first_child()
+            .unwrap()
+            .next_sibling()
+            .unwrap();
+        assert_eq!(other_empty.node_id(), empty.node_id(), "premise");
+        assert!(embed_shared_for::<JqSemantics, _>(&other_empty).is_none());
+        assert!(embed_at_or_within::<JqSemantics, _>(&other_empty)
+            .0
+            .is_none());
+
+        // yq mode never shares.
+        assert!(embed_shared_for::<YqSemantics, _>(&empty).is_none());
+        assert!(embed_at_or_within::<YqSemantics, _>(&empty).0.is_none());
     }
 }

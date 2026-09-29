@@ -383,7 +383,13 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None // omni-dev: coverage tolerate-line reason="unreachable: the only caller, eval_generic::embed_at_or_within, is gated on jq semantics, and the YAML cursor (the one implementor without an override) is only ever evaluated under yq semantics (#3179)"
     }
 
-    /// Check if this cursor points to a container (array or object).
+    /// Check if this cursor points to a container (array or object) **with
+    /// children**.
+    ///
+    /// The JSON cursor answers this from the BP tree alone, so an empty
+    /// `{}`/`[]` -- which has no children -- is `false`. Code that needs
+    /// "is this an array or object" (a value's identity, say) must not gate
+    /// on it; it is a cheap "is there a subtree to walk" test (#3180).
     fn is_container(&self) -> bool;
 
     /// Get the byte position in the source text.

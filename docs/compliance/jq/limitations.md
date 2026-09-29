@@ -1409,8 +1409,12 @@ is the revert that established what the other one costs.
    - An **empty container** (`input | . as $x | {k:.} | .k | path($x)` on `{}` or `[]`)
      binds no node at all: `whole_container_cursor` has no retained child cursor to hop
      `parent()` from, so the table never gets an entry. jq answers `[]`; the generic
-     evaluator, handed a real cursor rather than one recovered after the fact, still
-     answers it — the routes disagree here in the safe direction.
+     evaluator, handed a real cursor rather than one recovered after the fact, answers it
+     since #3180's first stage (its embed gate had asked `is_container()`, which the JSON
+     cursor answers as "has children", `false` for an empty `{}`/`[]`; it now does the
+     exact node lookup for a childless cursor too, pinned in
+     `test_default_route_empty_container_embed_keeps_identity_3180`) — the routes disagree
+     here in the safe direction.
      Closing it means keeping the container cursor on `JsonFields`/`JsonElements`, which are
      `Copy` and on the hot iteration path, so it waits on a two-architecture measurement
      ([#3180](https://github.com/rust-works/succinctly/issues/3180)).
