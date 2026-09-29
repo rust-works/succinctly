@@ -1837,17 +1837,13 @@ produces a different *value* depending on whether it edited the file or printed 
 fast path already shared `stream_cursor!` with stdout, so this only ever concerned the
 fallback a non-M2-eligible filter reaches.
 
-**One fork remains between `-i` and stdout**, and it is deliberate. A document with two
-*complex* mapping keys whose display spellings collide (`? [1]\n: v1\n? [2]\n: v2`, both
-`""` per [#222](https://github.com/rust-works/succinctly/issues/222)) makes `-i` raise
-`object key "" is ambiguous` and leave the file untouched
-([#1749](https://github.com/rust-works/succinctly/issues/1749)'s guard), where stdout prints
-`'': v2` and drops the first entry silently. Real yq keeps *both* keys, so both routes
-diverge from it; `-i` diverges in the safe direction, since the alternative is destroying a
-key in the user's own file. Closing the stdout half needs `YamlValue::key_string_kind`'s
-classification on the `DocumentValue` trait — `resolve_display_key`'s generic
-`key_display_string_kind` flags only keys whose *decode* failed, and a complex key decodes
-cleanly to `""`.
+**The one fork #1349 left between `-i` and stdout is closed**
+([#2519](https://github.com/rust-works/succinctly/issues/2519)). A document with two *complex*
+mapping keys whose display spellings collide (`? [1]\n: v1\n? [2]\n: v2`, both `""` per
+[#222](https://github.com/rust-works/succinctly/issues/222)) used to make `-i` raise while
+stdout printed `'': v2` and dropped the first entry silently; both routes now raise the same
+`object key "" is ambiguous` error, and `-i` leaves the file untouched. See the display-key
+collision section below for which routes raise and which keep both entries.
 
 A JSON-sourced `-i` file stays on the materializing route deliberately: a `YamlIndex` accepts
 `[1,]` as a flow sequence, so rerouting it would reopen the hole
@@ -2332,22 +2328,19 @@ collision raise instead:
 
 ```console
 $ printf '"a\qb": 1\n"c\qd": 2\n' | succinctly yq --arg z y '.'
-Error: object key "" is ambiguous: an undecodable key's display form collides with
-another key of the same name and cannot be represented
+Error: object key "" is ambiguous: a complex or undecodable key's display form collides
+with another key of the same name and cannot be represented
 ```
 
 An *ordinary* repeated key (no decode failure on either side) is unaffected and still
 collapses to its last value, matching yq's normal duplicate-key handling.
 
-**`--slurp`/`--eval-all`/`--inplace`'s own DOM fallback catches a second, wider trigger
-the paragraph above's routes do not, as of
-[#1749](https://github.com/rust-works/succinctly/issues/1749).** Those three flags
-materialize through a separate, `YamlCursor`-native conversion
-(`yaml_to_owned_value` in
-[src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs)), not the
-`DocumentValue`-generic path `--arg`/`-P`/`.,.,` use. It reuses the same
-`DisplayKeyGuard`/`colliding_display_key_error` machinery, but drives it with its own
-`YamlValue::key_string_kind` classification, which also flags a **complex** key
+**Every materializing route also catches a second, wider trigger: a complex key**
+([#1749](https://github.com/rust-works/succinctly/issues/1749) for
+`--slurp`/`--eval-all`/`--inplace`, [#2519](https://github.com/rust-works/succinctly/issues/2519)
+for everything else — writes, `-P`, `--arg`, `tojson`, `map_values`, `sort_keys`, `. * {}`,
+`[.]`, `==` and the rest). `resolve_display_key` asks `DocumentValue::display_key_kind`, which
+`YamlValue` overrides with `YamlValue::key_string_kind`: it also flags a **complex** key
 (mapping, sequence, `null`, or a non-scalar/dangling alias -- not just a decode-failure
 string) as a fallback spelling. Real yq keeps both entries in this case too (its
 underlying representation isn't a plain map); succinctly's `OwnedValue::Object`
@@ -2355,18 +2348,26 @@ structurally cannot, so this raises rather than silently discarding one:
 
 ```console
 $ printf '? [1,2]\n: a\n? [3,4]\n: b\n' | succinctly yq --slurp '.[0]'
-Error: object key "" is ambiguous: an undecodable key's display form collides with
-another key of the same name and cannot be represented
+Error: object key "" is ambiguous: a complex or undecodable key's display form collides
+with another key of the same name and cannot be represented
 ```
 
-**This wider trigger is currently `--slurp`/`--eval-all`/`--inplace`-only.** The
-`--arg`/`-P` route's own `key_display_string_kind` (JSON-oriented, shared across every
-`DocumentValue` implementor) does not yet recognize a YAML complex key as fallback --
-only a decode-failure string key, same as the paragraph above -- so the identical input
-through `--arg`/`-P` still silently drops one entry rather than raising. Tracked as
-[#1753](https://github.com/rust-works/succinctly/issues/1753), along with a related gap
-in the `load()` builtin's own separate YAML-mapping conversion, which has no collision
-guard at all.
+**Which routes keep both entries instead.** A route that never builds a display-keyed map
+streams the mapping with both entries, under #222's `""` spelling: `.`, `-o json '.'`, `keys`,
+`to_entries`, `length`, `has`, and `select(.)`. `select`/`if`'s own validation walk
+deliberately keeps the narrower decode-failure-only flag so it does not refuse what yq itself
+streams. This is an [ADR-0018](../../adrs/adr-0018.md) rule-4(b) divergence on the
+materializing routes only: yq keeps both keys there too, and `OwnedValue::Object` cannot until
+a duplicate-capable object exists ([#1344](https://github.com/rust-works/succinctly/issues/1344)).
+
+**Two residuals.** `with_entries(.)` and `to_entries | from_entries` still merge on stdout
+(`'': v2`, exit 0): `to_entries` has already turned both keys into the plain string `""`, so
+`from_entries` sees an ordinary repeated key and no fallback flag survives to catch it. `-i`
+refuses these (its `validate_yaml_display_keys` pre-walk stays for exactly this case). And the
+`load()` builtin's own YAML-mapping conversion is tracked separately in
+[#1753](https://github.com/rust-works/succinctly/issues/1753). The `-i` fast path writing a
+complex key's `""` spelling into the file is
+[#3463](https://github.com/rust-works/succinctly/issues/3463).
 
 ### `any`/`all`/`flatten`/`group_by`/`unique`/`unique_by`/`from_entries` on a non-array — resolved, real yq has its own wording per builtin, not jq's "Cannot iterate" template
 

@@ -1252,8 +1252,8 @@ impl EvalError {
     }
 
     /// `object key "<key>" is ambiguous: ...` (#1642) — a #1620-class
-    /// decode failure in its own right: two distinct undecodable keys
-    /// whose display fallback collides, so keeping the second silently
+    /// decode failure in its own right: two distinct undecodable (or, in
+    /// YAML, complex -- #2519) keys whose display fallback collides, so keeping the second silently
     /// overwrites the first (#1385 forbids treating them as the same key,
     /// but a display-keyed map has no way to hold both). This is what
     /// `to_owned`/`materialize` raise instead, via
@@ -1288,8 +1288,11 @@ impl EvalError {
         ))
     }
 
-    const COLLIDING_DISPLAY_KEY_SUFFIX: &'static str = ": an undecodable key's display form \
-         collides with another key of the same name and cannot be represented";
+    /// "complex or undecodable" since #2519: YAML's complex keys (`? [1]`,
+    /// spelled `""` per #222) reach this raise on every materializing yq
+    /// route, not only a key whose bytes would not decode.
+    const COLLIDING_DISPLAY_KEY_SUFFIX: &'static str = ": a complex or undecodable key's \
+         display form collides with another key of the same name and cannot be represented";
 
     /// Whether this is a [`Self::decode_failure`] — see #1620/#1660. Every
     /// `?`/`try`/`catch` boundary consults this so a decode failure passes

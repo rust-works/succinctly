@@ -7642,6 +7642,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         }
     }
 
+    /// [`YamlValue::key_string_kind`]: the same spelling the trait default
+    /// derives from `decoded_key_str` for every variant (YAML has no raw-span
+    /// override, so a decode failure's fallback is `""` either way), but a
+    /// *complex* key's `""` is flagged as a fallback too, so two of them
+    /// raise on a map build instead of silently merging (#2519). The flag
+    /// comes from the same branch that produced the spelling, so a 2+-hop
+    /// alias key -- spelled `""` by `key_string`'s single-hop arm -- is
+    /// flagged rather than colliding with a genuine `""` key unnoticed.
+    fn display_key_kind(&self) -> Option<(Cow<'_, str>, bool)> {
+        Some(self.key_string_kind())
+    }
+
     fn as_object(&self) -> Option<Self::Fields> {
         match self {
             YamlValue::Mapping(fields) => Some(fields.clone()),

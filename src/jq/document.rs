@@ -1178,6 +1178,31 @@ pub trait DocumentValue: Sized + Clone {
             .map_err(|reason| EvalError::decode_failure(alloc::format!("{reason} in object key")))
     }
 
+    /// The spelling a *map-building* caller keys this entry by, and whether
+    /// that spelling is a **fallback** (`true`) that must never be treated as
+    /// the same key as another entry spelled identically (#1642, #1749,
+    /// #2519). `None` is [`key_display_string`]'s own `None` (#1194).
+    ///
+    /// Consulted only by [`resolve_display_key`], i.e. by a caller about to
+    /// insert into an `IndexMap<String, _>`. It is deliberately *not* what
+    /// [`key_display_string_kind`] answers: that one also feeds read-only
+    /// walks (`push_generic_document_validation_error` behind `select`/`if`)
+    /// that keep both entries on a stream, where refusing a complex-key
+    /// collision would diverge from the reference for no data-loss reason.
+    ///
+    /// The default is [`key_display_string_kind`] -- a fallback is exactly a
+    /// decode failure, which is JSON's whole story. `YamlValue` overrides it
+    /// with `YamlValue::key_string_kind`, which also flags a *complex* key
+    /// (mapping, sequence, `null`, a non-string or unresolved alias): it
+    /// decodes cleanly to `""` (#222), so without this two different complex
+    /// keys looked like an ordinary repeated key and silently merged under
+    /// last-key-wins. An override must return the same *spelling* as the
+    /// default and differ only in the flag, and must derive the flag from
+    /// the branch that produced the spelling, so the two cannot disagree.
+    fn display_key_kind(&self) -> Option<(Cow<'_, str>, bool)> {
+        key_display_string_kind(self)
+    }
+
     /// This value's raw source bytes when it is a string key whose span
     /// needs no decoding -- byte-identical to what
     /// [`key_string`](Self::key_string) would return.
@@ -1893,20 +1918,15 @@ pub struct DisplayKeyGuard {
 }
 
 impl DisplayKeyGuard {
-    /// Checks `key` (with the `is_fallback` flag from `key_display_string_kind`
-    /// [private, JSON's own], or an equivalent per-format classifier -- see
-    /// `YamlValue::key_string_kind` for YAML's own, #1749) against every
+    /// Checks `key` (with the `is_fallback` flag from
+    /// [`DocumentValue::display_key_kind`], which YAML overrides to flag a
+    /// complex key too, #1749/#2519) against every
     /// key already present in `map` and every fallback key this guard has
     /// already approved. Returns `true` when it is safe to insert (a fresh
     /// key, or an ordinary repeat); `false` when inserting would silently
     /// collapse two keys that must stay distinct, in which case the caller
     /// should raise instead.
     ///
-    /// `pub`, not `pub(crate)`: `succinctly-cli`'s `yq_runner.rs`
-    /// (`yaml_to_owned_value`, a `YamlCursor`-native materializer that
-    /// doesn't go through the `DocumentValue`/`resolve_display_key` path)
-    /// needs to drive this guard itself with its own `is_fallback`
-    /// classification, same reasoning the struct itself is `pub` for.
     pub fn check<T>(&mut self, map: &IndexMap<String, T>, key: &str, is_fallback: bool) -> bool {
         let collides = map.contains_key(key)
             && (is_fallback || self.fallback_keys.iter().any(|seen| seen.as_str() == key));
@@ -1939,7 +1959,10 @@ pub fn resolve_display_key<V: DocumentValue, T>(
     map: &IndexMap<String, T>,
     guard: &mut DisplayKeyGuard,
 ) -> Result<Option<String>, EvalError> {
-    let Some((key, is_fallback)) = key_display_string_kind(key) else {
+    // `display_key_kind`, not `key_display_string_kind`: only a map build
+    // needs a YAML complex key flagged as a fallback (#2519) -- see the
+    // trait method for why the read-only walks keep the narrower flag.
+    let Some((key, is_fallback)) = key.display_key_kind() else {
         return Ok(None);
     };
     let key = key.into_owned();
@@ -4667,6 +4690,92 @@ mod decoded_key_str_tests {
             yaml_first_key(b"? [1, 2]\n: 1\n"),
             Some((String::new(), false))
         );
+    }
+
+    /// [`yaml_nth_key`] and [`DocumentValue::display_key_kind`] for the same
+    /// key: `(key_display_string_kind, display_key_kind)`.
+    fn yaml_nth_key_both(
+        yaml: &[u8],
+        nth: usize,
+    ) -> (Option<(String, bool)>, Option<(String, bool)>) {
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let cursor = index.root(yaml);
+        let mapping = cursor.first_child().expect("document content");
+        let mut fields = mapping.value().as_object().expect("a mapping");
+        for _ in 0..nth {
+            let (_, rest) = fields.uncons().expect("enough fields");
+            fields = rest;
+        }
+        let (field, _) = fields.uncons().expect("enough fields");
+        let key = field.key();
+        let own = |kind: Option<(alloc::borrow::Cow<'_, str>, bool)>| {
+            kind.map(|(k, fallback)| (k.into_owned(), fallback))
+        };
+        (
+            own(key_display_string_kind(&key)),
+            own(key.display_key_kind()),
+        )
+    }
+
+    /// #2519: YAML's `display_key_kind` override must spell every key
+    /// exactly as the trait default does and differ *only* in flagging a
+    /// complex key's `""` as a fallback. A different spelling would change
+    /// what a materialized map is keyed by on every yq route, not just
+    /// which collisions raise.
+    #[test]
+    fn yaml_display_key_kind_flags_complex_keys_and_keeps_every_spelling_2519() {
+        // (document, field index, expected display_key_kind flag)
+        let cases: &[(&[u8], usize, bool)] = &[
+            (b"a: 1\n", 0, false),
+            (b"\"\": 1\n", 0, false),
+            (b"\"a\\u0041b\": 1\n", 0, false),
+            (b"\"a\\qb\": 1\n", 0, true),
+            (b"a: &x foo\n*x : 1\n", 1, false),
+            (b"a: &x {p: 1}\n*x : 1\n", 1, true),
+            (b"a: &x [1]\n*x : 1\n", 1, true),
+            (b"a: &x \"b\\qc\"\n*x : 1\n", 1, true),
+            (b"? [1, 2]\n: 1\n", 0, true),
+            (b"? {a: 1}\n: 1\n", 0, true),
+            // An empty explicit key is an empty plain *scalar*, which yq
+            // itself renders as `''` -- a genuine `""` key, so an ordinary
+            // duplicate (the recorded duplicate-key collapse), not complex.
+            (b"?\n: 1\n", 0, false),
+        ];
+        for &(yaml, nth, fallback) in cases {
+            let label = String::from_utf8_lossy(yaml);
+            let (default, yaml_own) = yaml_nth_key_both(yaml, nth);
+            let (default_key, _) = default.expect("YAML never reports a #1194 key");
+            let (own_key, own_fallback) = yaml_own.expect("YAML never reports a #1194 key");
+            assert_eq!(own_key, default_key, "spelling changed for {label:?}");
+            assert_eq!(own_fallback, fallback, "fallback flag for {label:?}");
+        }
+    }
+
+    /// #2519's negative control: JSON keeps the trait default, so its
+    /// `display_key_kind` is `key_display_string_kind` exactly, flag and
+    /// #1194 `None` included -- jq mode's collision rule is unchanged.
+    #[test]
+    fn json_display_key_kind_is_the_default_classification_2519() {
+        let docs: &[&[u8]] = &[
+            br#"{"a":1}"#,
+            br#"{"":1}"#,
+            br#"{"a\q":1}"#,
+            br#"{"\ud800":1}"#,
+            br"{123: 1}",
+        ];
+        for &json in docs {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let fields = cursor.value().as_object().expect("an object");
+            let (field, _) = fields.uncons().expect("at least one field");
+            let key = field.key();
+            assert_eq!(
+                key.display_key_kind(),
+                key_display_string_kind(&key),
+                "{}",
+                String::from_utf8_lossy(json)
+            );
+        }
     }
 
     /// `key_hash_of` and `key_is_malformed` answered from the same
