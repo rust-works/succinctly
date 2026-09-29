@@ -38442,6 +38442,25 @@ mod tests {
         assert_eq!(comma_array_route::<JqSemantics>("[.]", doc), "lazy");
         // yq's printer materializes a sequence anyway, so yq stays owned.
         assert_eq!(comma_array_route::<YqSemantics>("[.a, .b]", doc), "owned");
+        // A body that is not an array construction is none of the three.
+        assert_eq!(comma_array_route::<JqSemantics>(".m", doc), "other");
+    }
+
+    /// #3317: the `,` producer's sequence prints as its `Cursors` source,
+    /// opaque past the count of cursors it holds.
+    #[test]
+    fn test_comma_array_lazyseq_debug_names_its_cursors_source_3317() {
+        let json = r#"{"a":{"x":1},"b":[2]}"#;
+        let index = JsonIndex::build(json.as_bytes());
+        let expr = crate::jq::parse("[., .]").unwrap();
+        let GenericResult::LazySeq(seq) =
+            eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(json.as_bytes()))
+        else {
+            panic!("`[., .]` over a container is a cursor sequence");
+        };
+        let shown = format!("{seq:?}");
+        assert!(shown.contains("LazySource::Cursors"), "{shown}");
+        assert!(shown.contains("len: 2"), "{shown}");
     }
 
     /// #3317: `[., .]` fails exactly when, and with exactly the message,

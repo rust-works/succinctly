@@ -10171,6 +10171,28 @@ fn test_uncaught_break_after_output_keeps_the_prefix() -> Result<()> {
     Ok(())
 }
 
+/// #3317's coverage gap: a `label` wrapping a `map` reaches the runner as a
+/// lazy sequence whose drain raises the `break`, and the runner reports it
+/// as an uncaught `break` (exit 5). Pins today's behaviour, which is NOT
+/// jq's: real jq 1.7.1 prints nothing and exits 0, because the `label`
+/// catches the `break` before the array is ever produced. The drain's
+/// `Break` arm is the only route that exercises this shape, so this is
+/// expected to change (to `""`/0) when that divergence is fixed.
+#[test]
+fn test_label_around_map_break_reaches_the_lazy_drain_arm() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "label $o | map(if . == 2 then break $o else . end)"],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(stdout, "");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.ends_with("break $o not in label\n"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2687: real jq does not treat `break` as a primitive -- it desugars
 /// `break $x` into a *named call* to `error/0`, resolved through ordinary
 /// lexical scope. A `def error:` (arity 0) in scope at the break's own
