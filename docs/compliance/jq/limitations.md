@@ -798,6 +798,40 @@ is the revert that established what the other one costs.
    oracle matrix per arm — left for a follow-up rather than attempted alongside the
    already-substantial change above.
 
+   **`and`/`or`/unary minus track the register the way jq's bytecode does** — for operands
+   whose register movement the resolver can follow
+   ([#3289](https://github.com/rust-works/succinctly/issues/3289), after #2689 and #2760). jq's
+   `and`/`or` are not subexps: `L` moves the register, `R` runs on the `DUP`ed input with the
+   register where `L` left it, and the result is a fresh boolean *at* that register, which
+   `PATH_END` accepts only when it is `jv_identical` to it. The resolver models exactly that,
+   per `L` branch, when every step inside the operands navigates natively, provably leaves the
+   register alone, or composes such steps (`register_movement_tracked`, `src/jq/eval.rs`):
+   `path((.a and .b) \| empty)` on `{"a":1}` refuses near `"b"`, `path(.a and .b)` on
+   `{"a":false}` is `["a"]` (so `del`/`=`/`|=` write there), `path(.a and 5)` on `{"a":0}`
+   refuses, and a later `$var` re-establishes the register the operator left
+   (`path(.a as $y \| -.a \| $y)` is `["a"]`). Three residuals remain:
+
+   - **An operand jq navigates inside but this resolver evaluates by value** (`first`, `last`,
+     `any`, `nth(n)`, `range`, `paths`, a `try`, a `//`, an `if`, a `def`) keeps the eager
+     by-value evaluation it had before #3289, on a trackable input. That is refuse-only where
+     jq accepts, but it also still *accepts* some shapes jq refuses — `path((first and .b?))`
+     on `[true]` is empty here and refuses near `"b"` in jq — tracked as a follow-up. Treating
+     such an operand as though it left the register alone would write where jq refuses
+     (`del(first and .[0])` on `[true]`), which is why it is not attempted.
+   - **A refusal inside a `?//` body is not retried** (`path_alternative_retries`), so
+     `del(. as $x ?// $y \| if $x then (.a and .b) else .c end)` on `{"a":1,"c":2}` refuses
+     where jq retries past its own path error and answers `{"a":1}`. Before #3289 the by-value
+     evaluation happened to give jq's answer there.
+   - **Pointer identity** is modelled only for `null`/`true`/`false` and a full array slice
+     (`.[0:]` is the input itself to jq), so `path(.a as $v \| . as $w \| $v \| (($w \| .a)
+     and .b))` refuses where jq answers.
+
+   A generated sweep (29 operands including the by-value ones above, `and`/`or`/`-`, 10
+   inputs, 10 path contexts including `try`-wrapped and `$var`-rebinding writes; 171,100 rows)
+   against jq 1.7.1 and the pre-#3289 build finds no row where #3289 accepts or answers
+   differently where the earlier build matched jq, and 9,686 rows fixed. yq mode is unchanged
+   by #3289 and keeps its eager evaluation.
+
    The register is also carried **only across stages this resolver can prove did not move
    it** (`cannot_move_register`, `src/jq/eval.rs`) — the same allowlist now gates both
    `resolve_seq`'s plain-pipe carrying *and* #2046's fold-seeded carrying, since both reach
@@ -823,7 +857,9 @@ is the revert that established what the other one costs.
    [#3263](https://github.com/rust-works/succinctly/issues/3263) an array carries the register
    too when the resolver both resolves it live and checks everything jq checks inside it:
    navigation, `..`, `select`, an `if`'s branches, both of jq's `?`s and `try`/`catch`,
-   `recurse(f)`/`recurse(f; cond)` (#2764), and pipes, commas and subexp shapes of those.
+   `recurse(f)`/`recurse(f; cond)` (#2764), `and`/`or`/unary minus over checked operands
+   ([#3289](https://github.com/rust-works/succinctly/issues/3289)), and pipes, commas and
+   subexp shapes of those.
    [#3283](https://github.com/rust-works/succinctly/issues/3283)/[#3284](https://github.com/rust-works/succinctly/issues/3284)
    widened that list further: `builtin_navigation`'s value-independent members (bare
    `first`/`last`/`add`/`any`/`all`/`flatten`, no argument — jq's internal `.[0]`/`.[]` is
