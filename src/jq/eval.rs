@@ -115546,8 +115546,8 @@ mod touched_edge_cases_2999 {
         ) -> (&'static str, String, String) {
             let kind = match &r {
                 QueryResult::Error(_) => "error",
-                QueryResult::Break(_) => "break",
-                QueryResult::Halt(_) => "halt",
+                QueryResult::Break(_) => "break", // omni-dev: coverage tolerate-line reason="no sweep row breaks or halts: kept so a row that starts to is reported as a different kind, not folded into `values` (#3457)"
+                QueryResult::Halt(_) => "halt", // omni-dev: coverage tolerate-line reason="see the arm above (#3457)"
                 QueryResult::Partial(..) => "partial",
                 _ => "values",
             };
@@ -115563,7 +115563,7 @@ mod touched_edge_cases_2999 {
                     .map(OwnedValue::to_json)
                     .collect::<Vec<_>>()
                     .join(" "),
-                Err(e) => format!("decode failure: {}", e.message),
+                Err(e) => format!("decode failure: {}", e.message), // omni-dev: coverage tolerate-line reason="every sweep row is well-formed, so no cursor fails to decode; kept so one that does is reported as a decode failure rather than a value (#3457)"
             };
             (kind, values, message)
         }
@@ -115794,44 +115794,37 @@ mod touched_edge_cases_2999 {
                 .iter()
                 .any(|(m, d, f)| *m == mode && *d == doc && *f == filter)
         };
-        let mut checked = 0;
+        let mut rows: Vec<(&str, &str, &str)> = Vec::new();
         for (doc, filters) in FILTERS {
-            for filter in *filters {
-                let (old, new) = both::<JqSemantics>(doc, filter);
-                checked += 1;
-                if old != new && !is_moved("jq", doc, filter) {
-                    differ.push(format!(
-                        "jq `{filter}` on {doc}:\n    eval_full {old:?}\n    eval      {new:?}"
-                    ));
-                }
-            }
+            rows.extend(filters.iter().map(|f| ("jq", *doc, *f)));
         }
-        for filter in DUP_FILTERS {
-            let (old, new) = both::<JqSemantics>(DUP, filter);
-            checked += 1;
-            if old != new && !is_moved("jq", DUP, filter) {
-                differ.push(format!(
-                    "jq `{filter}` on {DUP}:\n    eval_full {old:?}\n    eval      {new:?}"
-                ));
-            }
-        }
+        rows.extend(DUP_FILTERS.iter().map(|f| ("jq", DUP, *f)));
         for (doc, filters) in YQ_FILTERS {
-            for filter in *filters {
-                let (old, new) = both::<YqSemantics>(doc, filter);
-                checked += 1;
-                if old != new && !is_moved("yq", doc, filter) {
-                    differ.push(format!(
-                        "yq `{filter}` on {doc}:\n    eval_full {old:?}\n    eval      {new:?}"
-                    ));
-                }
+            rows.extend(filters.iter().map(|f| ("yq", *doc, *f)));
+        }
+        let checked = rows.len();
+        for (mode, doc, filter) in rows {
+            let (old, new) = if mode == "jq" {
+                both::<JqSemantics>(doc, filter)
+            } else {
+                both::<YqSemantics>(doc, filter)
+            };
+            if old != new && !is_moved(mode, doc, filter) {
+                // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a row moves off eval_full without being listed in MOVED (#3457)"
+                differ.push(format!(
+                    "{mode} `{filter}` on {doc}:\n    eval_full {old:?}\n    eval      {new:?}"
+                ));
+                // omni-dev: coverage end
             }
         }
         assert!(checked >= 150, "the sweep shrank: {checked} rows");
+        // omni-dev: coverage tolerate reason="the assertion's failure message: only evaluated when a row moved (#3457)"
         assert!(
             differ.is_empty(),
             "eval moved from eval_full:\n{}",
             differ.join("\n")
         );
+        // omni-dev: coverage end
     }
 
     /// #3457: `eval_reindexed` is the hybrid `eval` was, for `succinctly yq`'s
@@ -115877,5 +115870,79 @@ mod touched_edge_cases_2999 {
         let (reindexed, _, entry) = outcome(r#"[{"a":1}]"#, "select(key == 0) | path(.a)");
         assert_eq!(reindexed, r#"["a"]"#);
         assert_eq!(reindexed, entry);
+    }
+
+    /// #3457: `try_collect_owned` reports a cursor over an unreadable value as
+    /// an error where `collect_owned` (documented lossy) yields `null`, and
+    /// keeps a partial result's prefix.
+    #[test]
+    fn try_collect_owned_reports_what_collect_owned_loses_3457() {
+        let run = |json: &str, filter: &str| {
+            let index = JsonIndex::build(json.as_bytes());
+            let expr = parse(filter).expect("filter parses");
+            let root = index.root(json.as_bytes());
+            let lossy = eval::<Vec<u64>, JqSemantics>(&expr, root)
+                .collect_owned::<JqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>();
+            let checked = eval::<Vec<u64>, JqSemantics>(&expr, root)
+                .try_collect_owned::<JqSemantics>()
+                .map(|vs| vs.iter().map(OwnedValue::to_json).collect::<Vec<_>>());
+            (lossy, checked)
+        };
+        // `getpath(["b"])` is a cursor naming the malformed `tru`.
+        let (lossy, checked) = run(r#"{"a":1,"b":tru}"#, r#"getpath(["b"])"#);
+        assert_eq!(lossy, ["null"]);
+        assert!(checked
+            .expect_err("must not become null")
+            .is_decode_failure());
+        // A navigated value that reads fine, one and many, is the same both ways.
+        let (lossy, checked) = run(r#"{"a":1,"b":2}"#, ".a");
+        assert_eq!(
+            (lossy, checked),
+            (vec!["1".to_string()], Ok(vec!["1".to_string()]))
+        );
+        let (lossy, checked) = run(r#"{"a":1,"b":2}"#, ".[]");
+        assert_eq!(checked, Ok(vec!["1".to_string(), "2".to_string()]));
+        assert_eq!(lossy, ["1", "2"]);
+        // Identity is a `OneCursor`; the unreadable element is `null` in the
+        // lossy form and an error in the checked one.
+        let (lossy, checked) = run("[1.2.3]", ".");
+        assert_eq!(lossy, ["[null]"]);
+        assert!(checked
+            .expect_err("must not become null")
+            .is_decode_failure());
+        // Owned results and a partial result's prefix.
+        assert_eq!(
+            run("[]", "1, 2").1,
+            Ok(vec!["1".to_string(), "2".to_string()])
+        );
+        assert_eq!(run("[]", r#"1, error("x")"#).1, Ok(vec!["1".to_string()]));
+        assert_eq!(run("[]", "empty").1, Ok(vec![]));
+        assert_eq!(run("[]", r#"error("x")"#).1, Ok(vec![]));
+    }
+
+    /// #3457: `eval_lenient` keeps an owned `null`/boolean (so `.missing` still
+    /// yields `null`) and drops any other owned value, as it always did.
+    #[test]
+    fn eval_lenient_keeps_owned_null_and_bool_3457() {
+        let run = |json: &str, filter: &str| {
+            let index = JsonIndex::build(json.as_bytes());
+            let expr = parse(filter).expect("filter parses");
+            eval_lenient::<Vec<u64>, JqSemantics>(&expr, index.root(json.as_bytes()))
+                .iter()
+                .map(|v| to_owned_lossy::<JqSemantics, _>(v).to_json())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(r#"{"a":1}"#, ".missing"), ["null"]);
+        assert_eq!(run("[1]", ". == [1]"), ["true"]);
+        assert_eq!(run("[1]", "1 + 1"), Vec::<String>::new());
+        assert_eq!(run("[1]", r#""a" + "b""#), Vec::<String>::new());
+        assert_eq!(
+            run("[1]", "(true, 5, false, null)"),
+            ["true", "false", "null"]
+        );
+        assert_eq!(run("[1]", "empty"), Vec::<String>::new());
     }
 }
