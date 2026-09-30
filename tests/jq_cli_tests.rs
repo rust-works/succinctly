@@ -79119,3 +79119,148 @@ fn test_comma_array_first_failure_in_branch_order_3317() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3476: a `,` head behind a pipe of navigation, `[(., .) | .data]`, keeps
+/// the nodes it reaches as cursors like #3317's `[.data, .data]` does, rather
+/// than building one owned tree per comma item and reindexing it. Every row is
+/// captured live from `/usr/bin/jq` 1.7.1, across the consumers the cursor
+/// sequence answers without materializing (`length`, `.[i]`, `last`, slices)
+/// and the ones that materialize it (`tojson`, `as`, `reduce`), the items that
+/// are not nodes (`.missing`, a computed stage), and `path($x)`, which refuses
+/// there exactly as jq does.
+#[test]
+fn test_comma_head_pipe_array_matches_jq_3476() -> Result<()> {
+    let doc = r#"{"a":{"x":1},"b":[2,{"c":3}],"n":"s","m":3}"#;
+    for (filter, want) in [
+        ("[(., .) | .a]", r#"[{"x":1},{"x":1}]"#),
+        ("[(., .) | .b[]]", r#"[2,{"c":3},2,{"c":3}]"#),
+        ("[(.a, .b) | .[]?]", r#"[1,2,{"c":3}]"#),
+        ("[(.a, .m) | .x?]", "[1]"),
+        ("[(.a, .b) | .[0]?]", "[2]"),
+        ("[(., .) | .n]", r#"["s","s"]"#),
+        ("[(., .) | .missing, 1]", "[null,1,null,1]"),
+        ("[(., .) | .a] | length", "2"),
+        ("[(., .) | .b] | .[1]", r#"[2,{"c":3}]"#),
+        ("[(., .) | .a] | last", r#"{"x":1}"#),
+        ("[(., .) | .a] | .[1:] | length", "1"),
+        ("[(., .) | .a] | tojson", r#""[{\"x\":1},{\"x\":1}]""#),
+        ("[(., .) | .a] as $r | $r | length", "2"),
+        (r#"try [(., .) | .n | error("e")] catch ."#, r#""e""#),
+        ("[(., .) | .n | tonumber?]", "[]"),
+        ("[first((., .) | .a)]", r#"[{"x":1}]"#),
+        ("[limit(1; (., .) | .b[])]", "[2]"),
+        ("first([(., .) | .b[]][])", "2"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "#3476 `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3476 `{filter}`");
+    }
+    for filter in [
+        ". as $x | [(.,.) | .a] | .[0] | path($x)",
+        "reduce range(2) as $i (.; [(., .) | .a]) | length",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "#3476 `{filter}`: stderr={stderr:?}");
+        assert!(stdout.is_empty(), "#3476 `{filter}`: stdout={stdout:?}");
+    }
+    Ok(())
+}
+
+/// #3476: a node the array holds is still validated before anything is
+/// printed, so a malformed one fails the whole construction, in branch order
+/// -- and so is a failure in a branch's own stage ahead of a later branch.
+#[test]
+fn test_comma_head_pipe_array_malformed_writes_nothing_3476() -> Result<()> {
+    let bad_array = r#"[1, {"bad": xyz123}]"#;
+    let bad_member = r#"{"a":{"k":tru},"b":2}"#;
+    for (doc, filter, message) in [
+        (bad_array, "[(., .) | .]", "unexpected character"),
+        (bad_array, "[(., .) | .[1]?]", "unexpected character"),
+        (
+            bad_array,
+            "[(., .) | .[1]] | length",
+            "unexpected character",
+        ),
+        (
+            bad_array,
+            r#"try [(., .) | .[1]?, error("x")] catch ."#,
+            "unexpected character",
+        ),
+        // A branch's own stage fails before the later branch is reached.
+        (
+            bad_array,
+            "[(., .) | .a]",
+            r#"Cannot index array with string "a""#,
+        ),
+        (bad_member, "[(., .) | .]", "invalid boolean"),
+        (bad_member, "[(., .) | .a]", "invalid boolean"),
+        (bad_member, "[(.b, .a) | .]", "invalid boolean"),
+        (bad_member, "[(.a, .b) | .]", "invalid boolean"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "#3476 `{filter}` on {doc}: stderr={stderr:?}");
+        assert!(
+            stdout.is_empty(),
+            "#3476 `{filter}` on {doc}: stdout={stdout:?}"
+        );
+        assert!(
+            stderr.contains(message),
+            "#3476 `{filter}` on {doc}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3476: the array reads only the nodes its pipe answers, as `[.b]`,
+/// `[.b, .b]` and the bare stream `(., .) | .b` always have. The owned route
+/// built each comma item whole first, so `[(., .) | .b]` raised over a
+/// malformed sibling (`.a`) that the answer never contains. jq itself
+/// rejects such a document at parse time, before any filter runs.
+#[test]
+fn test_comma_head_pipe_array_reads_only_answered_nodes_3476() -> Result<()> {
+    let doc = r#"{"a":{"k":tru},"b":2}"#;
+    for (filter, want) in [
+        ("[.b]", "[2]"),
+        ("[.b, .b]", "[2,2]"),
+        ("(., .) | .b", "2\n2"),
+        ("[(., .) | .b]", "[2,2]"),
+        ("[(., .) | .b] | length", "2"),
+        ("[(., .) | .[1]?]", "[]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "#3476 `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3476 `{filter}`");
+    }
+    Ok(())
+}
+
+/// #3476: side effects in a pipe stage run once per item and in the order the
+/// `,` head yields them -- a stage that is not navigation never enters the
+/// route, so `debug`/`input` see exactly the sequence they did before.
+#[test]
+fn test_comma_head_pipe_array_side_effects_in_order_3476() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[(., .) | .a | debug]"], Some(r#"{"a":[1]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[[1],[1]]");
+    assert_eq!(stderr, "[\"DEBUG:\",[1]]\n[\"DEBUG:\",[1]]\n");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(., .) | input]"], Some("1 2 3 4"))?;
+    assert_eq!(code, 5, "the third value has no `input` left");
+    assert_eq!(stdout.trim_end(), "[2,3]");
+    Ok(())
+}
+
+/// #3476: `--preserve-input` renders the array's nodes from the document
+/// (like #3317's `[., .]`), while evaluation still sees jq's collapsed object.
+#[test]
+fn test_comma_head_pipe_array_preserve_input_echoes_duplicates_3476() -> Result<()> {
+    let input = r#"{"a":{"x":1,"x":2},"b":{"y":1}}"#;
+    let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", "[(., .) | .a]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"[{"x":1,"x":2},{"x":1,"x":2}]"#);
+    let (stdout, _, code) = run_jq_full(&["-c", "[(., .) | .a]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"[{"x":2},{"x":2}]"#);
+    Ok(())
+}

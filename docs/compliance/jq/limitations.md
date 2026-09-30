@@ -2543,7 +2543,9 @@ printer, not the evaluator:
 An array constructor over document nodes renders each node from the document, so `[.]`,
 `[., .]` and `[.a, .b]` echo like `.` does. `[., .]` did so only after
 [#3317](https://github.com/rust-works/succinctly/issues/3317), which stopped building each
-comma item as an owned object first. Any item that is not a document node still makes the
+comma item as an owned object first; `[(., .) | .a]` did so only after
+[#3476](https://github.com/rust-works/succinctly/issues/3476), which took a `,` head behind a
+pipe of navigation the same way. Any item that is not a document node still makes the
 whole array owned, and collapsed: a computed one (`[., 1]`), or the `null` a missing key
 reads as (`[.a, .missing]`).
 
