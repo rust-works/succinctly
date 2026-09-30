@@ -49316,3 +49316,22 @@ fn test_def_spine_in_yq_mode_unchanged_3307() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3317: the jq-mode cursor route for `[a, b, ...]` is gated off in yq mode,
+/// whose printer materializes a sequence anyway, so these stay on the owned
+/// route. Captured live from yq v4.53.3: `., .` is a union of one node there,
+/// so `[., .]` holds a single element.
+#[test]
+fn test_comma_array_unchanged_in_yq_mode_3317() -> Result<()> {
+    let input = "a: {x: 1}\nb: [2]\n";
+    for (filter, want) in [
+        ("[.a, .b]", r#"[{"x":1},[2]]"#),
+        ("[., .] | length", "1"),
+        ("[.a, .b] | length", "2"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, input, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "#3317 `{filter}`");
+        assert_eq!(stdout.trim_end(), want, "#3317 `{filter}`");
+    }
+    Ok(())
+}

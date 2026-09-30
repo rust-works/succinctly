@@ -7414,46 +7414,57 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // `to_owned_cursor` wholesale closes that gap by construction rather
         // than by re-deriving its checks a second time -- which
         // `validate_cursor` keeps, since it is that same walk.
-        GenericResult::LazySeq(seq) => match seq.drain_atomic() {
-            // All-or-nothing, matching `materialize_atomic`'s own atomicity
-            // contract ("real jq's array construction is all-or-nothing:
-            // `[1,2,"x"]|map(.+1)` prints nothing to stdout, only the stderr
-            // diagnostic") -- one `Result`, not a partial `JqValue::Array` of
-            // whatever converted before the first bad element (#2066 review:
-            // an earlier revision's `break`-and-fall-through shape printed an
-            // empty `[]` for a single-element failing array instead of
-            // suppressing it entirely).
-            Ok(elems) => {
-                let converted: Result<Vec<JqValue<'_, W>>, EvalError> = elems
-                    .into_iter()
-                    .map(|elem| match elem {
-                        LazyElem::Cursor(c) => {
-                            validate_cursor::<JqSemantics, _>(&c).map(|()| JqValue::Cursor(c))
+        //
+        // Skipped when `is_prevalidated()` (#3317): a jq-mode `[a, b, ...]`
+        // over document nodes already ran this exact walk, under these same
+        // `JqSemantics`, on every cursor before answering -- which is what
+        // keeps a malformed node failing the construction itself, ahead of
+        // any consumer -- so a second walk here would only repeat it (+50%
+        // time on `[., .]`).
+        GenericResult::LazySeq(seq) => {
+            let prevalidated = seq.is_prevalidated();
+            match seq.drain_atomic() {
+                // All-or-nothing, matching `materialize_atomic`'s own atomicity
+                // contract ("real jq's array construction is all-or-nothing:
+                // `[1,2,"x"]|map(.+1)` prints nothing to stdout, only the stderr
+                // diagnostic") -- one `Result`, not a partial `JqValue::Array` of
+                // whatever converted before the first bad element (#2066 review:
+                // an earlier revision's `break`-and-fall-through shape printed an
+                // empty `[]` for a single-element failing array instead of
+                // suppressing it entirely).
+                Ok(elems) => {
+                    let converted: Result<Vec<JqValue<'_, W>>, EvalError> = elems
+                        .into_iter()
+                        .map(|elem| match elem {
+                            LazyElem::Cursor(c) if prevalidated => Ok(JqValue::Cursor(c)),
+                            LazyElem::Cursor(c) => {
+                                validate_cursor::<JqSemantics, _>(&c).map(|()| JqValue::Cursor(c))
+                            }
+                            LazyElem::Owned(v) => JqValue::try_from_owned(v),
+                        })
+                        .collect();
+                    match converted {
+                        Ok(out) => vec![OutputItem::Lazy(JqValue::Array(out))],
+                        Err(e) => {
+                            sink.report(DiagStyle::Jq, &e, at);
+                            vec![]
                         }
-                        LazyElem::Owned(v) => JqValue::try_from_owned(v),
-                    })
-                    .collect();
-                match converted {
-                    Ok(out) => vec![OutputItem::Lazy(JqValue::Array(out))],
-                    Err(e) => {
-                        sink.report(DiagStyle::Jq, &e, at);
-                        vec![]
                     }
                 }
+                Err(jq::Control::Error(e)) => {
+                    sink.report(DiagStyle::Jq, &e, at);
+                    vec![]
+                }
+                Err(jq::Control::Break(label)) => {
+                    sink.report_break(DiagStyle::Jq, &label, at);
+                    vec![]
+                }
+                Err(jq::Control::Halt(code)) => {
+                    sink.request_halt(code);
+                    vec![]
+                }
             }
-            Err(jq::Control::Error(e)) => {
-                sink.report(DiagStyle::Jq, &e, at);
-                vec![]
-            }
-            Err(jq::Control::Break(label)) => {
-                sink.report_break(DiagStyle::Jq, &label, at);
-                vec![]
-            }
-            Err(jq::Control::Halt(code)) => {
-                sink.request_halt(code);
-                vec![]
-            }
-        },
+        }
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);

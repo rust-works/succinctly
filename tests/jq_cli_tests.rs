@@ -10171,6 +10171,28 @@ fn test_uncaught_break_after_output_keeps_the_prefix() -> Result<()> {
     Ok(())
 }
 
+/// #3317's coverage gap: a `label` wrapping a `map` reaches the runner as a
+/// lazy sequence whose drain raises the `break`, and the runner reports it
+/// as an uncaught `break` (exit 5). Pins today's behaviour, which is NOT
+/// jq's: real jq 1.7.1 prints nothing and exits 0, because the `label`
+/// catches the `break` before the array is ever produced. The drain's
+/// `Break` arm is the only route that exercises this shape, so this is
+/// expected to change (to `""`/0) when that divergence is fixed.
+#[test]
+fn test_label_around_map_break_reaches_the_lazy_drain_arm() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "label $o | map(if . == 2 then break $o else . end)"],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(stdout, "");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.ends_with("break $o not in label\n"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2687: real jq does not treat `break` as a primitive -- it desugars
 /// `break $x` into a *named call* to `error/0`, resolved through ordinary
 /// lexical scope. A `def error:` (arity 0) in scope at the break's own
@@ -77875,6 +77897,206 @@ fn test_def_spine_route_gate_boundary_unchanged_3307() -> Result<()> {
             assert_eq!(code, 0, "#3307: {defs} defs, `{filter}`: stderr={stderr:?}");
             assert_eq!(stdout.trim_end(), want, "#3307: {defs} defs, `{filter}`");
         }
+    }
+    Ok(())
+}
+
+/// #3317: `[a, b, ...]` over document nodes keeps them as cursors in jq mode
+/// instead of building one owned tree per item. Every row is captured live
+/// from `/usr/bin/jq` 1.7.1, across the consumers the cursor sequence takes a
+/// fast path for (`length`, `.[i]`, `last`, slices) and the ones that
+/// materialize it (`tojson`, `as`, nesting). The two `path($x)` rows are
+/// #3069's fix, unpinned until now, which this route must keep.
+#[test]
+fn test_comma_array_matches_jq_3317() -> Result<()> {
+    let doc = r#"{"a":{"x":1},"b":[2,{"c":3}],"n":"s","m":3}"#;
+    for (filter, want) in [
+        ("[., .]", format!("[{doc},{doc}]")),
+        ("[(.,.)]", format!("[{doc},{doc}]")),
+        (
+            "[., .[]]",
+            format!(r#"[{doc},{{"x":1}},[2,{{"c":3}}],"s",3]"#),
+        ),
+        (
+            "[.[], .]",
+            format!(r#"[{{"x":1}},[2,{{"c":3}}],"s",3,{doc}]"#),
+        ),
+        ("[., 1]", format!("[{doc},1]")),
+        ("[1, .]", format!("[1,{doc}]")),
+        ("[.a, .b]", r#"[{"x":1},[2,{"c":3}]]"#.to_string()),
+        ("[.n, .m]", r#"["s",3]"#.to_string()),
+        ("[.a, .n]", r#"[{"x":1},"s"]"#.to_string()),
+        ("[., empty]", format!("[{doc}]")),
+        ("[., .] | length", "2".to_string()),
+        ("[., .] | .[1]", doc.to_string()),
+        ("[., .] | .[-1]", doc.to_string()),
+        ("[., .] | .[1:]", format!("[{doc}]")),
+        ("[., .] | .[5]", "null".to_string()),
+        ("[., .] | last", doc.to_string()),
+        ("[., .] | reverse | length", "2".to_string()),
+        ("[., .] | tojson | length", "89".to_string()),
+        ("[., .] | has(1)", "true".to_string()),
+        ("[., .] | map(type)", r#"["object","object"]"#.to_string()),
+        ("[., .] | [tostream] | length", "19".to_string()),
+        ("[., .] == [., .]", "true".to_string()),
+        ("[[., .]] | length", "1".to_string()),
+        ("{k: [., .]} | .k | length", "2".to_string()),
+        ("[., .] as $a | $a | length", "2".to_string()),
+        ("[[., .] | length]", "[2]".to_string()),
+        ("def f: [., .]; f | length", "2".to_string()),
+        ("first([., .][]) | .n", r#""s""#.to_string()),
+        ("[limit(1; ., .)] | length", "1".to_string()),
+        ("[first(., .)] | length", "1".to_string()),
+        ("label $out | [., break $out]", String::new()),
+        ("[., (.a // 5)] | .[1]", r#"{"x":1}"#.to_string()),
+        ("[., .] | map(length) | first", "4".to_string()),
+        (
+            r#"try ([., .] | map(error("e")) | first) catch ."#,
+            r#""e""#.to_string(),
+        ),
+        (
+            "reduce range(1) as $i (.; [., .]) | length",
+            "2".to_string(),
+        ),
+        (". as $x | [.,.] | last | path($x)", "[]".to_string()),
+        (
+            ". as $x | [.,.] | .[1:] | .[0] | path($x)",
+            "[]".to_string(),
+        ),
+        (". as $x | [.,.] | .[0] | ($x | length)", "4".to_string()),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "#3317 `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3317 `{filter}`");
+    }
+    Ok(())
+}
+
+/// #3317: a node is validated as the array collects it, so a malformed
+/// document still fails the whole construction before anything reaches
+/// stdout -- including `try [., error("x")] catch .`, where the decode
+/// failure comes first in branch order and is not catchable, and consumers
+/// the cursor sequence answers without materializing (`length`, `.[0]`).
+#[test]
+fn test_comma_array_malformed_writes_nothing_3317() -> Result<()> {
+    for (doc, message) in [
+        (r#"[1, {"bad": xyz123}]"#, "unexpected character"),
+        (r#"{"a":1,}"#, "Invalid JSON text"),
+    ] {
+        for filter in [
+            "[., .]",
+            "[., .[]]",
+            "[.[], .]",
+            "[., 1]",
+            "[1, .]",
+            "[., .] | length",
+            "[., .] | .[0]",
+            "first([., .][])",
+            "[., .][]",
+            r#"try [., error("x")] catch ."#,
+            r#"[., (1, error("y"))]"#,
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(code, 5, "#3317 `{filter}` on {doc}: stderr={stderr:?}");
+            assert!(
+                stdout.is_empty(),
+                "#3317 `{filter}` on {doc}: stdout={stdout:?}"
+            );
+            assert!(
+                stderr.contains(message),
+                "#3317 `{filter}` on {doc}: stderr={stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3317: side effects in a `,` body run once, in branch order, and `input`
+/// consumes exactly one value -- the collection walks branches exactly as
+/// the owned route did (captured live from `/usr/bin/jq` 1.7.1).
+#[test]
+fn test_comma_array_side_effects_in_order_3317() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[., debug]"], Some(r#"{"a":[1]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"[{"a":[1]},{"a":[1]}]"#);
+    assert_eq!(stderr.trim_end(), r#"["DEBUG:",{"a":[1]}]"#);
+
+    let (stdout, _, code) =
+        run_jq_full(&["-c", "[., input]"], Some(r#"{"a":[1]} {"b":2} {"c":3}"#))?;
+    assert_eq!(code, 5, "the third value has no `input` left");
+    assert_eq!(stdout.trim_end(), r#"[{"a":[1]},{"b":2}]"#);
+    Ok(())
+}
+
+/// #3317: under `--preserve-input` the elements of `[., .]` render from the
+/// document like `.` and `[.]` already did, so a duplicate key survives
+/// (`docs/compliance/jq/limitations.md`); evaluation still sees jq's
+/// collapsed object. Default mode keeps jq's collapse.
+#[test]
+fn test_comma_array_preserve_input_echoes_duplicates_3317() -> Result<()> {
+    let input = r#"{"a":{"x":1,"x":2},"b":{"y":1}}"#;
+    for (filter, want) in [
+        ("[., .]", format!("[{input},{input}]")),
+        ("[., .] | .[0]", input.to_string()),
+        ("[., .] | .[1:]", format!("[{input}]")),
+        ("[.a, .b]", r#"[{"x":1,"x":2},{"y":1}]"#.to_string()),
+        ("[., .] | .[0].a | length", "1".to_string()),
+        // A navigation miss is `null`, not a node, so this array is owned.
+        ("[.a, .missing]", r#"[{"x":2},null]"#.to_string()),
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", filter], Some(input))?;
+        assert_eq!(code, 0, "#3317 `{filter}`");
+        assert_eq!(stdout.trim_end(), want, "#3317 `{filter}`");
+    }
+    let (stdout, _, code) = run_jq_full(&["-c", "[.a, .b]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim_end(),
+        r#"[{"x":2},{"y":1}]"#,
+        "jq 1.7.1 collapses"
+    );
+    Ok(())
+}
+
+/// #3317: each node is walked once, when the array's shape is known, so the
+/// walk runs after later (pure-navigation) branches have. Every exit walks
+/// the pending nodes in branch order first, so the first failure is still the
+/// one the owned route raised: an earlier node's decode failure beats a later
+/// branch's type error, a navigation miss (`null`, not a node) builds the
+/// pending nodes before it, and a first branch's own error still comes first.
+/// Every row matches `main` before #3317 (jq itself rejects these documents
+/// at parse time, before any filter runs).
+#[test]
+fn test_comma_array_first_failure_in_branch_order_3317() -> Result<()> {
+    let bad_array = r#"[1, {"bad": xyz123}]"#;
+    let bad_member = r#"{"a":{"k":tru},"b":2}"#;
+    for (doc, filter, message) in [
+        (bad_array, "[., .missing]", "unexpected character"),
+        (
+            bad_array,
+            "try [., .missing] catch .",
+            "unexpected character",
+        ),
+        (bad_array, "[.[1], .[5]]", "unexpected character"),
+        (
+            bad_array,
+            "[.missing, .]",
+            r#"Cannot index array with string "missing""#,
+        ),
+        (bad_member, "[.a, .missing]", "invalid boolean"),
+        (bad_member, "[.b, .a]", "invalid boolean"),
+        (bad_member, "[.a, .b] | length", "invalid boolean"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "#3317 `{filter}` on {doc}: stderr={stderr:?}");
+        assert!(
+            stdout.is_empty(),
+            "#3317 `{filter}` on {doc}: stdout={stdout:?}"
+        );
+        assert!(
+            stderr.contains(message),
+            "#3317 `{filter}` on {doc}: stderr={stderr:?}"
+        );
     }
     Ok(())
 }

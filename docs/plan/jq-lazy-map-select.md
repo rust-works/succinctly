@@ -599,6 +599,39 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     unrelated work); CI's own dual-architecture Perf Regression Guard is the independent x86_64
     confirmation.
 
+- Array construction over a `,` body, `[a, b, ...]`:
+  [#3317](https://github.com/rust-works/succinctly/issues/3317) — **landed**. #2575's lazy
+  arm only caught a cursor-shaped *result*, and a `,` body never produced one: the
+  `Expr::Comma` arm builds every item with `to_owned_cursor`, so `[., .]` held two whole
+  copies of the document (215 MB on 8.4 MB, jq 1.7.1 ~140 MB). In jq mode, a body whose every
+  branch is `path_expr_is_cursor_navigable` now goes through `comma_array_generic` instead.
+  - **A third `LazySource::Cursors` producer, and the first one that validates.**
+    `[.]` defers validation to its consumer (the #2103/#2692 contract). A `,` body cannot:
+    its branches run in order, and on `main` a malformed node raised before the next
+    branch ran. The branches are pure navigation, with no side effects, so each node is
+    walked once, when the array's shape is known. Every exit (the answer, the first
+    non-node, an escaping branch) walks the pending nodes in branch order first, so the
+    first failure is the one `main` raised. A cursor answer runs `validate_cursor` over
+    every node, and `LazySource::Cursors { validated: true }` records it. The jq printer's `LazySeq` arm
+    reads `LazySeq::is_prevalidated()` and skips its own #3156 walk. A literal slice of such
+    a source keeps the flag.
+  - **Owned fallbacks.** An all-scalar body (`[.name, .age]`) stays an owned array, since a
+    boxed sequence per record costs more than it saves. So does a body where navigation
+    yields a non-node (`[.a, .missing]`). A computed branch (`[., 1]`) never enters, and
+    neither does yq, whose printer materializes a `LazySeq` anyway.
+  - **Measured** (Apple M5 Max, interleaved, min of 7, output identical):
+    - 10 MB: `[., .]` 215 → 46 MB, `[., .] | length` 312 → 24 MB (−55% time), `[., .][]`
+      396 → 37 MB (−53%).
+    - 30 MB: `[., .]` 618 → 166 MB.
+    - Controls (`.`, `[.]`, `[.[]]`, per-record `[.name, .age]`) are neutral.
+    - Accepted cost: a consumer that materializes the array pays the validation walk on top
+      of the build. `validate_cursor` allocates each key into its collision map, so on small
+      objects it costs nearly what building does: `[., .] | tojson` +25%,
+      `[., .] as $a | …` +40%, `.data | map([., .])` +60%.
+    - Residual: an all-scalar body over many nodes holds its cursor list while the values
+      are built, so `[.[0], .[]] | length` over 300k strings peaks at 74 MB instead of
+      64 MB, with neutral time.
+
 ## Critical files
 
 - `src/jq/eval_generic.rs` — `GenericResult` enum, `LazyKeys`/`LazyIndexRange` variants, the
