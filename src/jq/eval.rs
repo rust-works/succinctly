@@ -43039,9 +43039,11 @@ fn stop_on_abort(slot: &StashedVerdict<RecurseAbort>, end: Option<RecurseAbort>)
 }
 
 /// A `recurse` abort a `?//` retry may not supersede (#3293): the
-/// [`RECURSE_MAX_ITEMS`] cap, and an escape (raised, or deferred behind a
-/// consumer's stop) that is a `halt` or a decode failure -- the ones
-/// [`stop_on_abort`] marks nonretryable.
+/// [`RECURSE_MAX_ITEMS`] cap, and an escape that is a `halt` or a decode
+/// failure, whether raised (`Escaped`) or deferred behind a consumer's stop
+/// (`Stopped(Some(..))`). [`stop_on_abort`] also marks the first two in the
+/// side channel; a deferred one is only kept here, never dropped by a later
+/// retry, which is what it did before #3293 too.
 impl Nonretryable for RecurseAbort {
     fn is_nonretryable(&self) -> bool {
         let escape_is_nonretryable =
@@ -43379,7 +43381,7 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
         } else {
             eval_each_owned::<S>(demoted_f, &node, false, Reentry::Proven, &mut run)
         };
-        settle_recurse_end(abort, flow, f)
+        settle_recurse_end(abort, flow, if level == 0 { f } else { demoted_f })
     }
 
     /// `select(cond) | r` for one child of `f`: visit `child` once per truthy
@@ -102887,6 +102889,16 @@ mod tests {
             (
                 format!("[recurse({direct}; true)]"),
                 vec![r"[[10,20,30],[10],[20,30]]"],
+                "",
+            ),
+            (
+                r#"[recurse(if length==3 then .[0:1], .[1:] elif length==1 then error("E") else empty end; ([1] as $q ?// $b | if $q then true else length>1 end))]"#.to_string(),
+                vec![r"[[10,20,30],[10],[20,30]]"],
+                "",
+            ),
+            (
+                r#"[path(recurse(if length==3 then .[0:1], .[1:] elif length==1 then error("E") else empty end; ([1] as $q ?// $b | if $q then true else length>1 end)))]"#.to_string(),
+                vec![r#"[[],[{"start":0,"end":1}],[{"start":1,"end":null}]]"#],
                 "",
             ),
             (

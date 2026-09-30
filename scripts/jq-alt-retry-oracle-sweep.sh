@@ -482,6 +482,33 @@ RC_ENTRIES=(
   'del-recurse::::del(recurse(__F__))'
   'update-recurse::::(recurse(__F__)) |= .'
 )
+# `?//` in `recurse`'s `cond` (the gate): alternative 1 lets the child through
+# and its expansion raises `E`; the retry rejects it, passes another, raises,
+# or fails to destructure.
+RG_VARIANTS=(
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then true else length>1 end)'
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then true else empty end)'
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then true else error("E2") end)'
+  '([1] as $q ?// {$z} | ("A"|stderr) as $_ | true)'
+)
+RG_ENTRIES=(
+  'recurse-gate::::[recurse(if length==3 then .[0:1], .[1:] elif length==1 then error("E") else empty end; __C__)]'
+  'path-recurse-gate::::[path(recurse(if length==3 then .[0:1], .[1:] elif length==1 then error("E") else empty end; __C__))]'
+)
+for rg_entry in "${RG_ENTRIES[@]}"; do
+  rg_rest="$rg_entry"
+  rg_label="${rg_rest%%::*}"
+  rg_rest="${rg_rest#*::}"
+  rg_tag="${rg_rest%%::*}"
+  rg_template="${rg_rest#*::}"
+  for v in "${RG_VARIANTS[@]}"; do
+    rg_filled="${rg_template//__C__/$v}"
+    for c in "${R_CONSUMERS[@]}"; do
+      run_case "$rg_label" "${c//__W__/$rg_filled}" "$rg_tag" "$RETRY_STDIN_FILE"
+    done
+  done
+done
+
 for rc_entry in "${RC_ENTRIES[@]}"; do
   rc_rest="$rc_entry"
   rc_label="${rc_rest%%::*}"
