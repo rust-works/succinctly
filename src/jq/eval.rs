@@ -32928,11 +32928,47 @@ impl Frame {
     /// regress. [`Origin::Untracked`] (#2072: a navigated bind made outside
     /// any resolver invocation) never certifies -- there is no invocation
     /// for it to have been made in.
+    ///
+    /// Value-blind: a by-value reader calls [`Frame::certifies_value`], which
+    /// adds jq's empty-array position rule (#3494).
     fn certifies(&self, origin: &Origin) -> bool {
         match origin {
             Origin::Snapshot | Origin::SnapshotAt { .. } => true,
             Origin::At { invocation, path } => self.names(*invocation, path),
             Origin::Untracked => false,
+        }
+    }
+
+    /// [`Frame::certifies`] for a marker whose value is `value`, which in jq
+    /// mode must also name this frame's *position* when `value` is an empty
+    /// array (#3494). Every by-value reader goes through here; `certifies`
+    /// alone is the value-blind half.
+    ///
+    /// `certifies` admits a [`Origin::Snapshot`]/[`Origin::SnapshotAt`]
+    /// marker by value, sound because a strict subtree of a finite document
+    /// never equals the whole. A slice of the root is the exception, and only
+    /// for an empty array: jq's `.[0:]` of a non-empty array *is* the input
+    /// (`jv_identical`), but the slice of `[]` is a fresh `[]`, equal by value
+    /// and not identical (captured live against jq 1.7.1: `[] | path(. as $x
+    /// | .[0:] | $x)` refuses `with result []`). The register then stands at
+    /// the slice, not where the marker was bound, so an empty array is
+    /// admitted only when the two positions agree -- `[] | del(. as $x |
+    /// (true and true) | $x)`, whose register never left the root, is jq's
+    /// `null`. A position-less [`Origin::Snapshot`] cannot prove that, so it
+    /// refuses.
+    ///
+    /// jq mode only (ADR-0018): the rule models `jv_identical`'s pointer
+    /// comparison, which yq has no counterpart of, so yq keeps the by-value
+    /// rule it always had.
+    fn certifies_value<S: EvalSemantics>(&self, origin: &Origin, value: &OwnedValue) -> bool {
+        if S::TAG != EvalTag::Jq || !matches!(value, OwnedValue::Array(items) if items.is_empty()) {
+            return self.certifies(origin);
+        }
+        match origin {
+            Origin::At { invocation, path } | Origin::SnapshotAt { invocation, path } => {
+                self.names(*invocation, path)
+            }
+            Origin::Snapshot | Origin::Untracked => false,
         }
     }
 
@@ -39122,10 +39158,13 @@ fn fans_out(expr: &Expr) -> bool {
 ///   still holding by the very same pointer, never rebuilt — or
 /// - a `null`/`true`/`false`.
 ///
+/// A frozen snapshot's by-value rule has one exception: an *empty array* is
+/// never vouched for by value alone (#3494, [`Frame::certifies_value`]).
+///
 /// Kept as one function precisely because it is now consulted from two
 /// unrelated places: a second, hand-inlined copy of this rule would be free
 /// to drift from jq's without either copy's tests noticing.
-fn register_identical(
+fn register_identical<S: EvalSemantics>(
     register: &OwnedValue,
     register_frame: &Frame,
     value: &OwnedValue,
@@ -39142,7 +39181,9 @@ fn register_identical(
                 // differs between them is which "raise now" guards defer
                 // (see [`Snapshot`]'s own doc comment), not how they are
                 // recognised here.
-                Snapshot::Marked(origin) | Snapshot::At(origin) => register_frame.certifies(origin),
+                Snapshot::Marked(origin) | Snapshot::At(origin) => {
+                    register_frame.certifies_value::<S>(origin, value)
+                }
             })
 }
 
@@ -39210,7 +39251,7 @@ fn marker_identical<S: EvalSemantics>(
 ) -> bool {
     (S::TAG == EvalTag::Jq && marker.value.shares_storage_with(target))
         || (marker.value == *target
-            && (frame.certifies(&marker.origin)
+            && (frame.certifies_value::<S>(&marker.origin, target)
                 || null_bool_identical(&marker.value, target)
                 || (S::TAG == EvalTag::Jq && anchored_identical(marker, frame))))
 }
@@ -39584,8 +39625,8 @@ impl FoldRegister {
         // alone (`identical()`'s whole job) cannot substitute for this.
         let identical_eligible = cannot_move_register(expr);
         match owned {
-            Ok(branches) => Ok(self.relocate(branches, identical_eligible)),
-            Err((prefix, e)) => Err((self.relocate(prefix, identical_eligible), e)),
+            Ok(branches) => Ok(self.relocate::<S>(branches, identical_eligible)),
+            Err((prefix, e)) => Err((self.relocate::<S>(prefix, identical_eligible), e)),
         }
     }
 
@@ -39621,8 +39662,15 @@ impl FoldRegister {
     /// `resolve_node`'s own finer-grained tracking already, correctly,
     /// marked it untracked. See [`relocate`](Self::relocate)'s own doc
     /// comment for the gate that gives this its precondition back.
-    fn identical(&self, value: &OwnedValue, snapshot: &Snapshot, eligible: bool) -> bool {
-        eligible && self.trackable && register_identical(&self.value, &self.frame, value, snapshot)
+    fn identical<S: EvalSemantics>(
+        &self,
+        value: &OwnedValue,
+        snapshot: &Snapshot,
+        eligible: bool,
+    ) -> bool {
+        eligible
+            && self.trackable
+            && register_identical::<S>(&self.value, &self.frame, value, snapshot)
     }
 
     /// `identical_eligible` -- **#2860**: whether `self.identical`'s
@@ -39648,7 +39696,7 @@ impl FoldRegister {
     /// `resolve()` call and has no single expression to gate on -- see
     /// that call site's own doc comment for why `identical()` must stay
     /// available there.
-    fn relocate<'a>(
+    fn relocate<'a, S: EvalSemantics>(
         &self,
         branches: Vec<PathBranch<'a>>,
         identical_eligible: bool,
@@ -39659,7 +39707,7 @@ impl FoldRegister {
                 if b.trackable {
                     let path = PathPrefix::extend_many(&self.path, b.path.to_vec());
                     PathBranch::new(path, b.value, true)
-                } else if self.identical(
+                } else if self.identical::<S>(
                     &b.value,
                     &b.snapshot,
                     // #2896: #2860's gate exists to stop *position-blind*
@@ -41192,7 +41240,7 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
         // *wrong* direction for that mode, with no real-yq oracle to verify
         // it against either way.
         let source_trackable =
-            path_trackable || reg.identical(value, snapshot, S::TAG == EvalTag::Jq);
+            path_trackable || reg.identical::<S>(value, snapshot, S::TAG == EvalTag::Jq);
         // The widened acceptance above answers a *value*-identity question
         // independent of `doc_branch`'s own path-derived snapshot, so
         // `path_snapshot` (unconditionally `doc_branch`'s own marker,
@@ -41230,7 +41278,7 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
     // fix; flagged here rather than silently left inconsistent so a future
     // audit of this area starts from an accurate account instead of
     // assuming both gates cover the same risk.
-    let at_register = reg.identical(null, &Snapshot::No, true);
+    let at_register = reg.identical::<S>(null, &Snapshot::No, true);
     FoldSourceAmbient {
         value: null,
         trackable: at_register,
@@ -42050,7 +42098,11 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                         // this is unconditional.
                         let acc_effective = acc.as_ref().unwrap_or(&OwnedValue::Null);
                         acc_at_register = acc_at_register
-                            || reg.identical(acc_effective, &acc_snapshot, S::TAG == EvalTag::Jq);
+                            || reg.identical::<S>(
+                                acc_effective,
+                                &acc_snapshot,
+                                S::TAG == EvalTag::Jq,
+                            );
                         let acc_input = acc.take().unwrap_or(OwnedValue::Null);
                         if let Some(control) =
                             charge_alternative_update(&mut budget, &mut ran_update, "reduce")
@@ -42175,7 +42227,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // `identical()` must stay available here (see this call's own
         // surrounding doc comment for why a trackable-but-not-at-register
         // accumulator still needs it).
-        if emit_branches(reg.relocate(vec![final_branch], true), sink) == Demand::Stop {
+        if emit_branches(reg.relocate::<S>(vec![final_branch], true), sink) == Demand::Stop {
             fork_outcome.stash(ResolveFlow::Stopped);
             return Demand::Stop;
         }
@@ -42422,7 +42474,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 trackable: walked_reg.is_input,
                                 frame: frame.extend(&walked_reg.path),
                             };
-                            let at_register = register_identical(
+                            let at_register = register_identical::<S>(
                                 &step_reg.value,
                                 &step_reg.frame,
                                 &state,
@@ -42438,7 +42490,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                         trackable: true,
                                         frame: frame.extend(path),
                                     };
-                                    let at_register = register_identical(
+                                    let at_register = register_identical::<S>(
                                         &step_reg.value,
                                         &step_reg.frame,
                                         &state,
@@ -42516,7 +42568,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                         frame: reg.frame.clone(),
                                     },
                                     state_at_register
-                                        || reg.identical(
+                                        || reg.identical::<S>(
                                             &state,
                                             &state_snapshot,
                                             S::TAG == EvalTag::Jq,
@@ -45931,7 +45983,7 @@ fn trackable_step_register_eligible<S: EvalSemantics>(branch_trackable: bool) ->
 /// This only ever turns a refusal into an answer, so getting it *wrong*
 /// costs an accepted path jq refuses — the dangerous direction, and why
 /// every clause above is a conjunct rather than a heuristic.
-fn reestablishes_register(
+fn reestablishes_register<S: EvalSemantics>(
     facts: &StepRegisterFacts,
     register: Option<&OwnedValue>,
     register_frame: &Frame,
@@ -45940,7 +45992,7 @@ fn reestablishes_register(
     !facts.navigated
         && facts.stage_preserves_register
         && register.is_some_and(|reg| {
-            register_identical(reg, register_frame, resulting, &facts.step_snapshot)
+            register_identical::<S>(reg, register_frame, resulting, &facts.step_snapshot)
         })
 }
 
@@ -46479,7 +46531,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             carried_register.as_deref()
         };
         let reestablished =
-            reestablishes_register(&facts, register_entering, &stage_frame, &resulting);
+            reestablishes_register::<S>(&facts, register_entering, &stage_frame, &resulting);
         let path = if reestablished {
             Rc::clone(&prefix)
         } else {
@@ -110282,6 +110334,73 @@ mod tests {
         };
         assert!(marker_identical::<JqSemantics>(&snapshot, &rebuilt, &frame));
         assert!(marker_identical::<YqSemantics>(&snapshot, &rebuilt, &frame));
+    }
+
+    /// #3494: in jq mode a marker certifies a non-empty array by value alone
+    /// but an empty one only where its bind position is the frame's own --
+    /// the slice of `[]` is a fresh `[]`, so the register at the slice is not
+    /// the root the marker was bound at -- and a position-less marker never
+    /// does. yq keeps the by-value rule (no `jv_identical` to model).
+    #[test]
+    fn certifies_value_needs_a_position_for_an_empty_array_3494() {
+        let invocation = 7;
+        let root = PathPrefix::root();
+        let slice = PathPrefix::extend(&root, Expr::Field("slice".to_string()));
+        let at_root = Frame::at(invocation, Rc::clone(&root));
+        let at_slice = Frame::at(invocation, slice);
+        let position_less = Frame::enter(&Expr::Identity);
+        assert!(position_less.at.is_none(), "no position to certify against");
+        let one = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let empty = OwnedValue::array();
+        // A separate `[]`, as a slice of the root builds: equal, not identical.
+        let fresh = OwnedValue::array();
+        let bound_at_root = Origin::SnapshotAt {
+            invocation,
+            path: BindPath(Rc::clone(&root)),
+        };
+
+        // Non-empty: by value, wherever the register stands.
+        assert!(at_slice.certifies_value::<JqSemantics>(&bound_at_root, &one));
+        assert!(position_less.certifies_value::<JqSemantics>(&Origin::Snapshot, &one));
+        // Empty: only at the position the marker was bound.
+        assert!(at_root.certifies_value::<JqSemantics>(&bound_at_root, &empty));
+        assert!(!at_slice.certifies_value::<JqSemantics>(&bound_at_root, &empty));
+        let at_root_mark = Origin::At {
+            invocation,
+            path: BindPath(Rc::clone(&root)),
+        };
+        assert!(at_root.certifies_value::<JqSemantics>(&at_root_mark, &empty));
+        assert!(!at_slice.certifies_value::<JqSemantics>(&at_root_mark, &empty));
+        // ... and never from a marker that carries no position.
+        assert!(!position_less.certifies_value::<JqSemantics>(&Origin::Snapshot, &empty));
+        assert!(!at_root.certifies_value::<JqSemantics>(&Origin::Untracked, &empty));
+        // yq keeps the by-value rule.
+        assert!(at_slice.certifies_value::<YqSemantics>(&bound_at_root, &empty));
+        assert!(position_less.certifies_value::<YqSemantics>(&Origin::Snapshot, &empty));
+
+        // Both by-value readers agree.
+        let snapshot = Tracked {
+            value: empty.clone(),
+            origin: bound_at_root.clone(),
+            node: None,
+        };
+        assert!(marker_identical::<JqSemantics>(&snapshot, &fresh, &at_root));
+        assert!(!marker_identical::<JqSemantics>(
+            &snapshot, &fresh, &at_slice
+        ));
+        assert!(marker_identical::<YqSemantics>(
+            &snapshot, &fresh, &at_slice
+        ));
+        let mark = Snapshot::Marked(bound_at_root);
+        assert!(register_identical::<JqSemantics>(
+            &empty, &at_root, &fresh, &mark
+        ));
+        assert!(!register_identical::<JqSemantics>(
+            &empty, &at_slice, &fresh, &mark
+        ));
+        assert!(register_identical::<YqSemantics>(
+            &empty, &at_slice, &fresh, &mark
+        ));
     }
 
     /// #2889: `RootWitness::of_owned` reports the node an owned value still

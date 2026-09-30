@@ -59229,6 +59229,146 @@ fn test_path_register_equal_array_copy_is_not_the_register_3456() -> Result<()> 
     ])
 }
 
+/// #3494 (#3425 regression): an empty array is never identical to the
+/// register. jq's `.[0:]` of a non-empty array is the same array, but the
+/// slice of `[]` -- and any empty slice -- is a fresh `[]`, so `$x` is not
+/// the register and a `path`/`del`/`|=` through it refuses. Every row
+/// captured from jq 1.7.1.
+#[test]
+fn test_and_or_path_empty_array_slice_is_not_the_register_3494() -> Result<()> {
+    assert_path_rows_3289(&[
+        // Fix rows: accepted before the fix.
+        (
+            r"[]",
+            r"path(. as $x | (.[0:] and true) | $x)",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(. as $x | (.[0:0] and true) | $x)",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(. as $x | (.[0:] or true) | $x)",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        (
+            r"[]",
+            r"del(. as $x | (.[0:] and true) | $x)",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(. as $x | (.[0:] and true) | $x | .[0]?)",
+            "",
+            "Invalid path expression near attempt to access element 0 of []",
+            5,
+        ),
+        // The bare slice, no `and`: the same by-value rule accepted it.
+        (
+            r"[]",
+            r"path(. as $x | .[0:] | $x)",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(. as $x | .[0:0] | $x)",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        // Was refused with the wrong message (`A slice of an array can only be assigned another array`).
+        (
+            r"[]",
+            r"(. as $x | (.[0:] and true) | $x) |= 9",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        // Guard rows: an empty slice of a non-empty input, and nested empties, already refused.
+        (
+            r"[1]",
+            r"path(. as $x | (.[0:0] and true) | $x)",
+            "",
+            "Invalid path expression with result [1]",
+            5,
+        ),
+        (
+            r"[[]]",
+            r"path(.[0] as $x | (.[0][0:] and true) | $x)",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(.a as $x | (.a[0:] and true) | $x)",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        // Positive controls: an empty array that really is the register (no
+        // slice) stays accepted, and so does the full slice of a non-empty
+        // array, which *is* the input.
+        (r"[]", r"path(. as $x | $x)", "[]\n", "", 0),
+        // The register never left the root, so the empty array *is* the
+        // register (the sweep found `del` refusing these on a first cut).
+        (
+            r"[]",
+            r"del(. as $x | (true and true) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"[]",
+            r"path(. as $x | (true and true) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[]",
+            r"(. as $x | (true and true) | $x) |= 9",
+            "9\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(. as $x | .[0:] | $x)",
+            "[{\"start\":0,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(. as $x | (.[0:] and true) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(. as $x | (.[0:] and true) | $x)",
+            "[{\"start\":0,\"end\":null}]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3456 (round 2: wrappers dropping a correctly reported register). `?`,
 /// `try` and `first(..)` around an `and` must hand the register on as it
 /// stands, so the later navigation refuses -- or, where jq's own no-write
