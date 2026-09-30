@@ -314,6 +314,14 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// share a key by the map coming up short. `eval_generic::anchor_step`
     /// reads that as "no member is shadowed" without decoding a single key.
     ///
+    /// **Contract for an implementor answering `true`:** the owned value of an
+    /// object has exactly one entry per *distinct* display key
+    /// ([`key_display_string`]) of its members and no others, and an array
+    /// has one element per child cursor in `first_child`/`next_sibling`
+    /// order. Nothing checks this; the differential test in `eval_generic`
+    /// (`anchor_step_by_nodes_agrees_with_the_generic_walk_3483`) is the
+    /// place to add a format that claims it.
+    ///
     /// Conservative in the safe direction: `false` (the default) sends the
     /// caller to the walk that decodes every key. JSON answers `true`. YAML
     /// does not claim it -- a `<<` merge key can add entries no member of

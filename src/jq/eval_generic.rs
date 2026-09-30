@@ -42972,8 +42972,9 @@ mod tests {
 
     /// #3483: the node-only step and the generic walk that decodes every key
     /// answer alike for every node of every shape -- shadowing duplicates,
-    /// escaped keys, key nodes, empty and nested containers -- and the count
-    /// gate takes the fast path exactly when no member is shadowed.
+    /// escaped and undecodable keys, key nodes, empty and nested containers --
+    /// and the count gate takes the fast path exactly when no member is
+    /// shadowed.
     #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
     #[test]
     fn anchor_step_by_nodes_agrees_with_the_generic_walk_3483() {
@@ -42989,7 +42990,7 @@ mod tests {
         }
 
         // (document, whether some object in it has a shadowed member)
-        let docs: [(&[u8], bool); 8] = [
+        let docs: [(&[u8], bool); 10] = [
             (br#"{"a":{"b":1,"c":2},"x":[5,6,7],"e":{}}"#, false),
             (br#"{"d":1,"d":2,"x":[1]}"#, true),
             (br#"{"a":{"k":1,"k":{"k":3}},"b":[[1],[2,[3]]]}"#, true),
@@ -42998,6 +42999,10 @@ mod tests {
             (br#"[[],{},[{}],{"":1,"a":[]}]"#, false),
             (br"[1,2,3,4,5,6,7,8,9,10]", false),
             (br#"{"a":1,"b":{"c":{"d":{"e":[0,{"f":null}]}}}}"#, false),
+            // Distinct undecodable keys spell distinct fallbacks (`keys` shows
+            // them raw), so none shadows another; an embedded NUL is a real key.
+            (br#"{"a":{"\ud800":1,"\ud801":2,"k":3}}"#, false),
+            (br#"{"a":{"k":3,"k\u0000":4}}"#, false),
         ];
         for (doc, shadowed) in docs {
             let index = JsonIndex::build(doc);
