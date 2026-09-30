@@ -6583,7 +6583,7 @@ fn anchor_step_by_nodes<C: DocumentCursor>(
         let mut found: Option<C> = None;
         while let Some(k) = key {
             let Some(value) = k.next_sibling() else {
-                return NodeStep::Decline;
+                return NodeStep::Decline; // omni-dev: coverage tolerate-line reason="unreachable for the one format that claims materializes_members_one_to_one: a JSON object's children always pair key-then-value; kept so an implementor whose mapping could end on a key declines instead of miscounting (#3483)"
             };
             members += 1;
             if found.is_none() && value.node_id() == child {
@@ -6600,7 +6600,7 @@ fn anchor_step_by_nodes<C: DocumentCursor>(
         let key = key.value();
         match key_display_string(&key) {
             Some(name) => NodeStep::Step(OwnedValue::string(name.into_owned())),
-            None => NodeStep::Decline,
+            None => NodeStep::Decline, // omni-dev: coverage tolerate-line reason="unreachable for JSON: a key node always decodes or falls back to its raw spelling, so key_display_string is Some; kept so a format whose key can be non-string declines to the generic walk (#3483)"
         }
     } else if held.as_array().is_some() {
         let mut index = 0i64;
@@ -43035,6 +43035,60 @@ mod tests {
             }
             assert_eq!(declined, shadowed, "{}", String::from_utf8_lossy(doc));
         }
+    }
+
+    /// #3483: the branches the differential test's well-formed documents
+    /// cannot reach. An array refuses a node that is no child of it; a `held`
+    /// that is neither an object nor an array declines; a format that does not
+    /// claim one entry per child (YAML) declines and the generic walk answers.
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[test]
+    fn anchor_step_by_nodes_refuses_and_declines_off_the_happy_path_3483() {
+        // A node that is no child of an array: the array's own parent.
+        let doc: &[u8] = br#"{"x":[5,6],"y":7}"#;
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+        let array = root.first_child().unwrap().next_sibling().unwrap();
+        let held = to_owned_cursor::<JqSemantics, _>(&array).unwrap();
+        assert_eq!(
+            anchor_step_by_nodes(&array, root.node_id(), &held),
+            NodeStep::Refuse
+        );
+        assert_eq!(anchor_step(&array, root.node_id(), Some(&held)), None);
+
+        // A held value that is neither container leaves the decision to the
+        // generic walk.
+        assert_eq!(
+            anchor_step_by_nodes(
+                &array,
+                array.first_child().unwrap().node_id(),
+                &OwnedValue::Int(1)
+            ),
+            NodeStep::Decline
+        );
+
+        // YAML does not claim the one-to-one contract: the hook declines and
+        // `anchor_step` answers exactly as the walk with no held value does.
+        let yaml: &[u8] = b"a: 1\nb: 2\n";
+        let yindex = crate::yaml::YamlIndex::build(yaml).unwrap();
+        let mapping = yindex.root(yaml).first_child().unwrap();
+        let yheld = to_owned_cursor::<JqSemantics, _>(&mapping).unwrap();
+        let mut member = mapping.first_child();
+        let mut checked = 0;
+        while let Some(m) = member {
+            let id = m.node_id();
+            assert_eq!(
+                anchor_step_by_nodes(&mapping, id, &yheld),
+                NodeStep::Decline
+            );
+            assert_eq!(
+                anchor_step(&mapping, id, Some(&yheld)),
+                anchor_step(&mapping, id, None)
+            );
+            checked += 1;
+            member = m.next_sibling();
+        }
+        assert_eq!(checked, 4, "two keys and two values");
     }
 
     /// `def d0: .; def d1: .; ...` (`defs` of them) over `main`.
