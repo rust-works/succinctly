@@ -19418,6 +19418,37 @@ fn path_context_hop<V: DocumentValue>(
     })
 }
 
+/// The result of a path-context walk arm that pulled a generator `driver`
+/// (`if`'s condition, `limit`'s or `skip`'s count) through
+/// [`path_context_component_flow`] and stashed the walk's own failure behind
+/// its sink's stop (#3293).
+///
+/// A `?//` inside `driver` may have retried past that stop and then produced
+/// nothing or raised, in which case the stash describes an alternative jq
+/// abandoned and [`StashedEscape::take`] drops it. Otherwise a surviving
+/// stash is the walk's failure and outranks the generator's own escape, and
+/// that escape is reported after the positions already produced.
+fn path_context_count_walk_result<S: EvalSemantics, V: DocumentValue>(
+    walk_error: StashedEscape,
+    flow: Flow,
+    driver: &Expr,
+    out: &mut Vec<PathContextPos<V>>,
+    produced_from: usize,
+) -> Result<(), Control> {
+    let direct_retry = crate::jq::eval::direct_pattern_retry(driver);
+    if let Some(control) = walk_error.take(&flow, direct_retry) {
+        return Err(control);
+    }
+    match flow {
+        Flow::Escaped(control) => Err(path_context_component_escape::<S, V>(
+            out,
+            produced_from,
+            control,
+        )),
+        Flow::Exhausted | Flow::Stopped { .. } => Ok(()),
+    }
+}
+
 /// Take one navigational stage from `pos`, pushing every position it reaches.
 ///
 /// Only the shapes [`path_context_is_navigational`] admits arrive here; the
@@ -19637,10 +19668,17 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             // hands to *this* sink, but the branch this sink steps is the
             // `if`'s own remaining work, not a downstream consumer of
             // `cond`'s output).
+            //
+            // #3293: `walk_error` is a `StashedEscape`. A `?//` inside `cond`
+            // retries past the branch failure this sink stopped on; a retry
+            // that emits again drops the stale escape at the top of the
+            // sink, and one that produces nothing or raises supersedes it
+            // afterwards (`path_context_count_walk_result`).
             let was_read_only = yq_read_only_context::active();
             let produced_from = out.len();
-            let mut walk_error: Option<Control> = None;
-            let control = path_context_component_each::<S, V>(cond, pos, &mut |c| {
+            let walk_error = StashedEscape::new();
+            let flow = path_context_component_flow::<S, V>(cond, pos, &mut |c| {
+                walk_error.begin();
                 let _scope = was_read_only.then(yq_read_only_context::enter);
                 let branch = if c.is_truthy() {
                     then_branch
@@ -19649,15 +19687,10 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                 };
                 match path_context_step_generic::<S, V>(branch, pos, out) {
                     Ok(()) => Demand::Continue,
-                    Err(control) => stop_with_escape(&mut walk_error, control),
+                    Err(control) => walk_error.stop(control),
                 }
             });
-            if let Some(control) = walk_error {
-                return Err(control);
-            }
-            control.map_or(Ok(()), |c| {
-                Err(path_context_component_escape::<S, V>(out, produced_from, c))
-            })
+            path_context_count_walk_result::<S, V>(walk_error, flow, cond, out, produced_from)
         }
         Expr::Label { name, body } => match path_context_step_generic::<S, V>(body, pos, out) {
             Err(Control::Break(label)) if label == *name => Ok(()),
@@ -19701,27 +19734,25 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             //
             // `was_read_only`: see `path_context_step_computed_index`'s own
             // doc comment -- same defensive re-entry, same reason.
+            //
+            // #3293: `walk_error` is a `StashedEscape`, as in `Expr::If`'s arm.
             let was_read_only = yq_read_only_context::active();
             let produced_from = out.len();
-            let mut walk_error: Option<Control> = None;
-            let control = path_context_component_each::<S, V>(n, pos, &mut |n_value| {
+            let walk_error = StashedEscape::new();
+            let flow = path_context_component_flow::<S, V>(n, pos, &mut |n_value| {
+                walk_error.begin();
                 let _scope = was_read_only.then(yq_read_only_context::enter);
                 let take = match classify_limit_n(n_value) {
                     Ok(LimitN::Unlimited) => None,
                     Ok(LimitN::Take(n)) => Some(n),
-                    Err(e) => return stop_with_escape(&mut walk_error, Control::Error(e)),
+                    Err(e) => return walk_error.stop(Control::Error(e)),
                 };
                 match path_context_step_bounded::<S, V>(expr, take, pos, out) {
                     Ok(()) => Demand::Continue,
-                    Err(control) => stop_with_escape(&mut walk_error, control),
+                    Err(control) => walk_error.stop(control),
                 }
             });
-            if let Some(control) = walk_error {
-                return Err(control);
-            }
-            control.map_or(Ok(()), |c| {
-                Err(path_context_component_escape::<S, V>(out, produced_from, c))
-            })
+            path_context_count_walk_result::<S, V>(walk_error, flow, n, out, produced_from)
         }
         // #2968: `skip(n; body)` -- `limit`'s twin in the walk. The body is
         // stepped in full (there is no bound to stop it at; every dropped
@@ -19743,29 +19774,27 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         // `was_read_only`: see `path_context_step_computed_index`'s own doc
         // comment -- same defensive re-entry, same reason.
         Expr::Builtin(Builtin::Skip(n, expr)) => {
+            //
+            // #3293: `walk_error` is a `StashedEscape`, as in `Expr::If`'s arm.
             let was_read_only = yq_read_only_context::active();
             let produced_from = out.len();
-            let mut walk_error: Option<Control> = None;
-            let control = path_context_component_each::<S, V>(n, pos, &mut |n_value| {
+            let walk_error = StashedEscape::new();
+            let flow = path_context_component_flow::<S, V>(n, pos, &mut |n_value| {
+                walk_error.begin();
                 let _scope = was_read_only.then(yq_read_only_context::enter);
                 let drop = match classify_skip_n(n_value) {
                     Ok(n) => n,
-                    Err(e) => return stop_with_escape(&mut walk_error, Control::Error(e)),
+                    Err(e) => return walk_error.stop(Control::Error(e)),
                 };
                 let mut branch = Vec::new();
                 let stepped = path_context_step_generic::<S, V>(expr, pos, &mut branch);
                 out.extend(branch.into_iter().skip(drop));
                 match stepped {
                     Ok(()) => Demand::Continue,
-                    Err(control) => stop_with_escape(&mut walk_error, control),
+                    Err(control) => walk_error.stop(control),
                 }
             });
-            if let Some(control) = walk_error {
-                return Err(control);
-            }
-            control.map_or(Ok(()), |c| {
-                Err(path_context_component_escape::<S, V>(out, produced_from, c))
-            })
+            path_context_count_walk_result::<S, V>(walk_error, flow, n, out, produced_from)
         }
         // `last(body)` is jq 1.7.1's `reduce body as $x (null; $x)`: the
         // last position, or `null` at this same position when there was

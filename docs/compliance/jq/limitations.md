@@ -625,6 +625,33 @@ raises in jq and now here). What it leaves:
   here where jq retries and raises -- `eval_slice_expr` collects before the consumer sees an
   output, the #2180 "materialized before the consumer" family.
 
+## Path-mode `if`/`select` conditions and a `?//` retry (#3293)
+
+A `?//` in the condition of an `if` or `select` under `path`/`del`/`=`/`|=`/`pick` retries past
+the failure its first alternative sent the branch (or the stage after `select`) into, as jq's
+does (`path(if ([1] as $q ?// $b | $q) then error("E") else .a end)` is `["a"]`, was `E`), and
+a consumer's `first`/`limit` stop is retried past the same way (`[first(path(.a | select([1]
+as $q ?// $b | $q | if . == null then error("E2") else . end) | .a)), 9]` raises `E2` in jq
+and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` arms of
+`path_context_step_generic`) follows. What it leaves:
+
+- **`no_std` recognises only a direct bind**, for the reason the fold section above gives: a
+  condition that *is* a `?//` bind is covered for `if`, and one wrapped in `first`, `//` or a
+  pipe keeps the previous answer there. `select` is a pipe stage whose own check
+  (`resolve_seq_stage`) compares the whole `select(...)` rather than its condition, so
+  `path(.a | select([1] as $q ?// $b | $q) | error("E"))` keeps the first alternative's `E`
+  in `no_std`.
+- **`key` after `if`/`limit`/`skip` over an owned input** takes the owned-identity walk, which
+  never retries (`{"a":{"a":1}} | [(if ([1] as $q ?// $b | $q) then error("E") else .a end) |
+  key]` raises `E` after a single attempt; the cursor route prints `["a"]`). `key` is a
+  succinctly extension, so the oracle is jq's `path()` spelling. Recorded on #3293 for its
+  closing slice.
+- **`limit`/`skip` type-check their count eagerly**: `[limit(([1] as $q ?// $b | $q); 1,2,3)]`
+  is `[1,2,3]` in jq 1.7.1 (an array compares greater than `0`) and "limit requires
+  non-negative integer" here, after a single attempt -- the #2180 "arguments are evaluated
+  before the retry" family, not a stale slot. jq 1.7.1 has no `skip`, so its rows follow
+  `limit`'s.
+
 ## Where succinctly errors and jq does not
 
 A probe is only admitted to the corpus if jq errors on it, so the corpus is blind to the
