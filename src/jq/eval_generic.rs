@@ -25319,8 +25319,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // hands back its input `jv` (#3191). jq mode only: in yq
                 // mode materializing the node reads its YAML tag, and
                 // `!!str 1.5 | tonumber` must stay the number 1.5.
-                let owned = to_owned_with_cursor::<_, S>(&value, cursor);
-                GenericResult::Owned(owned_or_suppress!(owned, optional)) // omni-dev: coverage tolerate-line reason="unreachable: to_owned_with_cursor of a document number literal cannot fail, so the macro's error arms never run (#3191)"
+                let n = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional); // omni-dev: coverage tolerate-line reason="unreachable: to_owned_with_cursor of a document number literal cannot fail, so the macro's error arms never run (#3191)"
+                GenericResult::Owned(n)
             } else if let Some(literal) = value.number_literal() {
                 GenericResult::Owned(OwnedValue::from_number_literal::<S>(&literal))
             } else if let Some(i) = value.as_i64() {
