@@ -43018,7 +43018,7 @@ impl RecurseAbort {
 /// stop a `?//` alternative retries past. Without it,
 /// `recurse(. as [$a] ?// $a | if type == "number" then ("h"|halt_error(3))
 /// else .[] end)` on `[1]` halted twice where jq halts once.
-fn stop_on_abort(slot: &mut Option<RecurseAbort>, end: Option<RecurseAbort>) -> Demand {
+fn stop_on_abort(slot: &StashedVerdict<RecurseAbort>, end: Option<RecurseAbort>) -> Demand {
     let Some(abort) = end else {
         return Demand::Continue;
     };
@@ -43034,8 +43034,44 @@ fn stop_on_abort(slot: &mut Option<RecurseAbort>, end: Option<RecurseAbort>) -> 
         }
         stopped @ RecurseAbort::Stopped(_) => stopped,
     };
-    *slot = Some(abort);
+    slot.stash(abort);
     Demand::Stop
+}
+
+/// A `recurse` abort a `?//` retry may not supersede (#3293): the
+/// [`RECURSE_MAX_ITEMS`] cap, and an escape (raised, or deferred behind a
+/// consumer's stop) that is a `halt` or a decode failure -- the ones
+/// [`stop_on_abort`] marks nonretryable.
+impl Nonretryable for RecurseAbort {
+    fn is_nonretryable(&self) -> bool {
+        let escape_is_nonretryable =
+            |escape: &EvalEscape| Control::from(escape.clone()).is_nonretryable();
+        match self {
+            Self::Capped => true,
+            Self::Escaped(escape) => escape_is_nonretryable(escape),
+            Self::Stopped(pending) => pending.as_ref().is_some_and(escape_is_nonretryable),
+        }
+    }
+}
+
+/// The abort a native `recurse` level still owes once the generator it drove
+/// has returned `flow`: [`StashedVerdict::take_unless`] with the retry rule,
+/// then [`native_recurse_end`] (#3293). A `?//` inside `f` (or `cond`) that
+/// retried past the stop `stop_on_abort` answered, and then produced nothing
+/// or raised, leaves a stash for an alternative jq has abandoned:
+/// `[recurse(if length==3 then ([1] as $q ?// $b | if $q then .[0:1] else
+/// .[1:] end) elif length==1 then error("E") else empty end)]` on
+/// `[10,20,30]` is `[[10,20,30],[10],[20,30]]` in jq 1.7.1, not the abandoned
+/// alternative's `E`. A retry that emits again resets the stash at the top of
+/// the level's sink instead.
+fn settle_recurse_end(
+    abort: StashedVerdict<RecurseAbort>,
+    flow: Flow,
+    generator: &Expr,
+) -> Option<RecurseAbort> {
+    let direct_retry = direct_pattern_retry(generator);
+    let abort = abort.take_unless(|at| retry_superseded(&flow, at, direct_retry));
+    native_recurse_end(abort, flow)
 }
 
 /// How a native `recurse` level ended, from the abort its sink recorded and
@@ -43325,24 +43361,25 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
             return self.expand_queued(node);
         };
         let (f, demoted_f, demoted_cond) = (self.f, self.demoted_f, self.demoted_cond);
-        let mut abort = None;
+        let abort = StashedVerdict::new();
         // #3036: level 0 is the walk's own input, unrebuilt -- `f` runs on
         // it bridged; every deeper node is a value `f` produced. `cond`
         // gates a child `f` just produced, which is never the ambient root
         // at any level, so it always takes the pre-demoted, bridged route.
         let mut run = |child: OwnedValue| {
+            abort.begin(); // #3293
             let end = match demoted_cond {
                 None => self.visit(child, level + 1),
                 Some(cond) => self.gate(cond, child, level + 1),
             };
-            stop_on_abort(&mut abort, end)
+            stop_on_abort(&abort, end)
         };
         let flow = if level == 0 {
             eval_each_owned::<S>(f, &node, false, Reentry::Proven, &mut run)
         } else {
             eval_each_owned::<S>(demoted_f, &node, false, Reentry::Proven, &mut run)
         };
-        native_recurse_end(abort, flow)
+        settle_recurse_end(abort, flow, f)
     }
 
     /// `select(cond) | r` for one child of `f`: visit `child` once per truthy
@@ -43359,15 +43396,16 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
     /// on every gated child.
     fn gate(&mut self, cond: &Expr, child: OwnedValue, level: u32) -> Option<RecurseAbort> {
         let _scope = self.budget.scope();
-        let mut abort = None;
+        let abort = StashedVerdict::new();
         let flow = eval_each_owned::<S>(cond, &child, false, Reentry::Proven, &mut |verdict| {
+            abort.begin(); // #3293
             if verdict.is_truthy() {
-                stop_on_abort(&mut abort, self.visit(child.clone(), level))
+                stop_on_abort(&abort, self.visit(child.clone(), level))
             } else {
                 Demand::Continue
             }
         });
-        native_recurse_end(abort, flow)
+        settle_recurse_end(abort, flow, cond)
     }
 
     /// Visit the subtree below an already-delivered `node` with an explicit
@@ -43719,7 +43757,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
             self.frame.unknown()
         };
         let (f, cond, keep) = (self.f, self.cond, self.keep);
-        let mut abort = None;
+        let abort = StashedVerdict::new();
         let flow = resolve_against_cow_sink::<S>(
             f,
             current,
@@ -43728,6 +43766,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
             &node_frame,
             keep,
             &mut |child| {
+                abort.begin(); // #3293
                 let child = PathBranch {
                     path: PathPrefix::extend_many(&prefix, child.path.to_vec()),
                     value: child.value,
@@ -43742,9 +43781,12 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
                     None => self.visit(child, level + 1),
                     Some(cond) => self.gate(cond, child, !is_null_current, level + 1),
                 };
-                stop_on_abort(&mut abort, end)
+                stop_on_abort(&abort, end)
             },
         );
+        // #3293: see [`settle_recurse_end`].
+        let direct_retry = direct_pattern_retry(f);
+        let abort = abort.take_unless(|at| resolve_retry_superseded(&flow, at, direct_retry));
         match flow {
             ResolveFlow::Exhausted => abort,
             ResolveFlow::Stopped => abort.or(Some(RecurseAbort::Stopped(None))),
@@ -43769,21 +43811,22 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
         level: u32,
     ) -> Option<RecurseAbort> {
         let _scope = self.budget.scope();
-        let mut abort = None;
+        let abort = StashedVerdict::new();
         let flow = eval_each_owned::<S>(
             cond,
             &child.value,
             false,
             Reentry::REBUILT,
             &mut |verdict| {
+                abort.begin(); // #3293
                 if open && verdict.is_truthy() {
-                    stop_on_abort(&mut abort, self.visit(Self::delivered(&child), level))
+                    stop_on_abort(&abort, self.visit(Self::delivered(&child), level))
                 } else {
                     Demand::Continue
                 }
             },
         );
-        native_recurse_end(abort, flow)
+        settle_recurse_end(abort, flow, cond)
     }
 
     /// The branch the sink sees for a visited `node`.
@@ -102814,6 +102857,66 @@ mod tests {
             assert_eq!(
                 (got.len(), got_end.as_str()),
                 (0, "error: E2"),
+                "`{filter}`"
+            );
+        }
+    }
+
+    /// #3293 slice 8b: `recurse`'s native walkers (`ValueRecurseWalk` and
+    /// `PathRecurseWalk`, `expand` and `gate`) stash the abort a deeper node
+    /// raised, and a `?//` in `f` retries past it. A retry that answers
+    /// supersedes the stash (the sink resets it), and one that produces
+    /// nothing or raises supersedes it after the drive. In `no_std` only an
+    /// `f` that *is* a `?//` bind is recognised
+    /// ([`direct_pattern_retry`]); the wrapped form needs the retry
+    /// generation. Captured from jq 1.7.1 with `-c` over `[10,20,30]`.
+    #[test]
+    fn test_recurse_retry_supersedes_stashed_abort_3293() {
+        let direct = r#"([1] as $q ?// $b | if length==3 then (if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)"#;
+        for (filter, values, end) in [
+            (
+                format!("[recurse({direct})]"),
+                vec![r"[[10,20,30],[10],[20,30]]"],
+                "",
+            ),
+            (
+                format!("[path(recurse({direct}))]"),
+                vec![r#"[[],[{"start":0,"end":1}],[{"start":1,"end":null}]]"#],
+                "",
+            ),
+            (
+                format!("[recurse({direct}; true)]"),
+                vec![r"[[10,20,30],[10],[20,30]]"],
+                "",
+            ),
+            (
+                r#"[recurse(([1] as $q ?// $b | if length==3 then (if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end))]"#.to_string(),
+                vec![],
+                "error: E2",
+            ),
+            (
+                r#"[recurse(([1] as $q ?// $b | if length==3 then (if $q then .[0:1] else .[1:] end) elif length==1 then ("h"|halt_error(3)) else empty end))]"#.to_string(),
+                vec![],
+                "halt: 3",
+            ),
+        ] {
+            let (got, got_end) = outputs_and_end(b"[10,20,30]", &filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(
+                (got, got_end.as_str()),
+                (values, end),
+                "`{filter}`"
+            );
+        }
+        // `f` wrapped in an `if`: not a direct bind, so `no_std` keeps the
+        // previous answer (recorded in `limitations.md`).
+        #[cfg(feature = "std")]
+        {
+            let filter = r#"[recurse(if length==3 then ([1] as $q ?// $b | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)]"#;
+            let (got, got_end) = outputs_and_end(b"[10,20,30]", filter);
+            assert_eq!(
+                (got, got_end.as_str()),
+                (vec![r"[[10,20,30],[10],[20,30]]".to_string()], ""),
                 "`{filter}`"
             );
         }
