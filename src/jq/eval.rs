@@ -49785,6 +49785,10 @@ pub(crate) fn is_retryable_control(control: &Control, is_last: bool) -> bool {
 /// `Flow::Stopped { pending }` retry-decision point before deciding to
 /// retry") for `nth`'s skipped-item decode failure; it is implemented once,
 /// here.
+///
+/// A sink that stashes a verdict behind such a stop must not let the stash
+/// outlive the retry it triggers: see [`stop_with_escape`]'s re-invocation
+/// contract and [`StashedVerdict`] (#3293).
 pub(crate) fn is_retryable_stop(is_last: bool) -> bool {
     !is_last && !nonretryable_stop::is_set()
 }
@@ -50052,6 +50056,17 @@ mod nonretryable_stop {
 /// half of that rule -- `Halt` and decode failures, the two escapes that
 /// never retry wherever they land -- and leaves the `is_last` half to the
 /// `?//` that will actually make the decision.
+///
+/// **Re-invocation contract (#3293).** A closure that stashes here and
+/// answers `Stop` can be *called again*, and only a `?//` retry inside the
+/// generator it is driven by can cause that. The bare slot this fills then
+/// describes an alternative jq has abandoned, so a driver either keeps the
+/// slot in a [`StashedVerdict`] (`begin` at the top of the closure, `take`
+/// or `settle` against the drive's [`Flow`] after it), or resets every
+/// per-invocation verdict -- the slot *and* any stop flag -- at the top of
+/// the closure and checks [`retry_superseded`] on exit. A retry that
+/// produces nothing or raises never reaches the closure, so the reset alone
+/// is not enough.
 pub(crate) fn stop_with_escape(slot: &mut Option<Control>, control: Control) -> Demand {
     mark_nonretryable_escape(&control);
     *slot = Some(control);

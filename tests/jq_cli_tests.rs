@@ -77350,10 +77350,9 @@ fn test_path_slice_bound_retry_supersedes_stashed_verdict_3293() -> Result<()> {
 /// after a computed slice reach. Those three are succinctly's, so each row's
 /// answer is jq 1.7.1's for the `path()` spelling in the comment above it.
 /// `first(.[S:] | key)` rows whose retry fails are left out: that shape
-/// evaluates the bound twice with no `?//` at all (#3470). Cursor
-/// route only: over an owned input `key` takes the owned-identity walk
-/// instead, which still keeps the abandoned alternative's bound (a slice 9
-/// site, recorded on #3293).
+/// evaluates the bound twice with no `?//` at all (#3470). Slice 9 runs the
+/// same rows over an owned input, where `key` takes the owned-identity walk
+/// (`owned_identity_computed_step`).
 const RETRY_ROWS_PATH_CONTEXT_SLICE_3293: &[RetryRow3293] = &[
     // jq 1.7.1: `path(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]) | last`
     (
@@ -77719,9 +77718,9 @@ fn test_path_cond_retry_supersedes_stashed_verdict_3293() -> Result<()> {
 /// (`path_context_step_generic`'s `if`, `limit` and `skip` arms), which `key`
 /// after them reaches. `key` is succinctly's, so each row's answer is jq
 /// 1.7.1's for the `path()` spelling in the comment above it; jq 1.7.1 has no
-/// `skip`, so its row follows `limit`'s. Cursor route only: over an owned
-/// input `key` takes the owned-identity walk, which does not retry at all (a
-/// slice 9 site). Input `{"a":{"a":1}}`.
+/// `skip`, so its row follows `limit`'s. Slice 9 runs the same rows over an
+/// owned input, where `key` takes the owned-identity walk
+/// (`eval_owned_identity_stages`'s `if`/`limit` arms). Input `{"a":{"a":1}}`.
 const RETRY_ROWS_PATH_CONTEXT_COND_3293: &[RetryRow3293] = &[
     // jq 1.7.1: `[path(if T then error("E") else .a end) | last]`
     (
@@ -79282,10 +79281,9 @@ fn test_path_index_retry_supersedes_stashed_verdict_3293() -> Result<()> {
 /// #3293 slice 5: the same retry through `eval_generic`'s path-context walk
 /// (`path_context_step_computed_index`), which `key` and `path` after a
 /// computed index reach. Those are succinctly's, so each row's answer is
-/// jq 1.7.1's for the `path()` spelling in the comment above it. Cursor route
-/// only: over an owned input `key` takes the owned-identity walk instead,
-/// which still keeps the abandoned alternative's key (a slice 9 site,
-/// recorded on #3293). `first(.[K] | key)` rows whose retry fails after a
+/// jq 1.7.1's for the `path()` spelling in the comment above it. Slice 9 runs
+/// the same rows over an owned input, where `key` takes the owned-identity
+/// walk (`owned_identity_computed_step`). `first(.[K] | key)` rows whose retry fails after a
 /// satisfied first alternative are left out: the walk collects every
 /// position before `first` can stop it, so the `?//` is never asked to
 /// retry (the #2180 "materialized before the consumer" family, with #3470's
@@ -79874,6 +79872,62 @@ fn test_counted_bool_consumers_reset_their_stop_across_retry_3293() -> Result<()
     Ok(())
 }
 
+/// #3293 slice 9: `key` after an `if` condition or a `limit` count whose `?//`
+/// retries past a failure raised *after* it. Over an owned input the
+/// owned-identity walk collected the condition's outputs before running the
+/// branch, so the retry never ran (one `A`, then the abandoned
+/// alternative's `E`); the branch now runs inside the condition's own sink.
+/// `key` is succinctly's, so each row's answer is jq 1.7.1's for the
+/// `path()` spelling; jq 1.7.1 has no `skip`. Input `{"a":[1,2]}`, run on the
+/// cursor route here and on the owned route by the table's own test below.
+const RETRY_ROWS_OWNED_IDENTITY_3293: &[RetryRow3293] = &[
+    // jq 1.7.1: `path(if T then error("E") else .a end) | last`
+    (
+        r#"if ([1] as $q ?// $b | ("A"|stderr) as $_ | $q) then error("E") else .a end | key"#,
+        "\"a\"\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `path(first(.a | if T then error("E") else .[] end)) | last`
+    (
+        r#"first(.a | if ([1] as $q ?// $b | ("A"|stderr) as $_ | $q) then error("E") else .[] end) | key"#,
+        "0\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `path(limit(K; .a[])) | last`, `K`'s retry answering `1`
+    (
+        r#"limit(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then error("E") else 1 end); .a[]) | key"#,
+        "0\n",
+        "AA",
+        "",
+        0,
+    ),
+    // the retry raising `E2` surfaces it, not the abandoned `E`
+    (
+        r#"if ([1] as [$q] ?// $b | ("A"|stderr) as $_ | if $q then $q else error("E2") end) then error("E") else .a end | key"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // control: no `?//`, the branch's error surfaces
+    (
+        r#"if true then error("E") else .a end | key"#,
+        "",
+        "",
+        "E",
+        5,
+    ),
+];
+
+#[test]
+fn test_owned_identity_retry_supersedes_stashed_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(Some(r#"{"a":[1,2]}"#), "", RETRY_ROWS_OWNED_IDENTITY_3293)
+}
+
 /// #3293 slice 2: every table above again, with the operand's input built
 /// under `-n` so it is an owned value and the query runs on `eval.rs`'s
 /// evaluator -- the twins of the cursor-route sinks those tables pin. A
@@ -79901,8 +79955,26 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("[10,20,30] | ", RETRY_ROWS_PATH_FOLD_3293),
         ("[10,20,30] | ", RETRY_ROWS_RECURSE_3293),
         (r#"{"a":{"a":1}} | "#, RETRY_ROWS_PATH_INDEX_3293),
+        // slice 9: `key` over an owned input takes the owned-identity walk.
+        ("[10,20,30] | ", RETRY_ROWS_PATH_CONTEXT_SLICE_3293),
+        (r#"{"a":{"a":1}} | "#, RETRY_ROWS_PATH_CONTEXT_COND_3293),
+        (r#"{"a":{"a":1}} | "#, RETRY_ROWS_PATH_CONTEXT_INDEX_3293),
+        (r#"{"a":[1,2]} | "#, RETRY_ROWS_OWNED_IDENTITY_3293),
     ] {
-        assert_retry_rows_3293(None, prefix, rows)?;
+        // #3512: an owned-input `[... | key]` (or `| path`) collector prints the array it
+        // had collected after the error its body raises, with or without a
+        // `?//`; the collector rows that expect that error are not this
+        // audit's.
+        let rows: Vec<RetryRow3293> = rows
+            .iter()
+            .copied()
+            .filter(|&(filter, _, _, _, exit)| {
+                !(exit == 5
+                    && filter.starts_with('[')
+                    && (filter.contains("| key") || filter.contains("| path]")))
+            })
+            .collect();
+        assert_retry_rows_3293(None, prefix, &rows)?;
     }
     Ok(())
 }
@@ -79952,6 +80024,46 @@ fn test_retry_sink_reset_leaves_yq_mode_unchanged_3293() -> Result<()> {
             "#3293 (yq): `{filter}`: stderr={:?}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+    Ok(())
+}
+
+/// #3293 slice 9, yq mode: the owned-identity walk's computed index and slice
+/// (`owned_identity_computed_step`) are shared with `succinctly yq`, which has
+/// no `?//` (and no `if`/`limit`/`skip`, which yq v4.53.3's lexer rejects), so
+/// driving the bound and the indexing as one must leave its `key` alone.
+/// `-n` builds the input as an owned value. Every row captured from yq
+/// v4.53.3; in yq mode a slice keeps its container's position.
+#[test]
+fn test_owned_identity_computed_step_leaves_yq_mode_unchanged_3293() -> Result<()> {
+    for (filter, expected) in [
+        (
+            r#"{"a":{"b":1,"c":[10,20,30]}} | .a | .[("c")] | key"#,
+            r#""c""#,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[10,20,30]}} | .a.c | .[(1):] | key"#,
+            r#""c""#,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[10,20,30]}} | .a.c | .[(0):(1)] | key"#,
+            r#""c""#,
+        ),
+        (
+            r#"{"a":{"b":1,"c":[10,20,30]}} | .a | [.[("b","c")] | key]"#,
+            r#"["b","c"]"#,
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-n", "-o", "json", "-I", "0", filter])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            expected,
+            "#3293 (yq): `{filter}`: stderr={stderr:?}"
+        );
+        assert!(output.status.success(), "`{filter}`: stderr={stderr:?}");
     }
     Ok(())
 }

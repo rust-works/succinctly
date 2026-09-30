@@ -659,12 +659,13 @@ follows too. What it leaves:
 - **`no_std` recognises only a direct bind**, for the reason the fold section above gives: a
   key that *is* a `?//` bind is covered, and one behind a comma or a pipe keeps the previous
   answer there.
-- **`key` after a computed index over an owned input** takes the owned-identity walk, which
-  keeps the abandoned alternative's key and evaluates the key generator once more than jq does
-  (`{"a":{"a":1}} | .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] | key` prints `AAA`
-  where the cursor route and jq's `path(...) | last` print `AA`). `key` is a succinctly
-  extension, so the oracle is jq's `path()` spelling. Recorded on #3293 for its closing slice,
-  with the slice 6 and 7 variants.
+- **`key` after a computed index over an owned input** takes the owned-identity walk
+  (`owned_identity_computed_step`). It used to evaluate the key generator on its own and again
+  inside the indexing, pairing the abandoned alternative's key with the retried alternative's
+  value, and ran the key's side effects twice (`{"a":{"a":1}} | .[([["a"]] as [$q] ?// [[$q]] |
+  ("A"|stderr) | $q)] | key` printed `AAA`); the key stream and the indexing are now one drive,
+  as on the cursor route, and it prints `AA` like jq's `path(...) | last`. `key` is a succinctly
+  extension, so the oracle is jq's `path()` spelling (#3293 slice 9).
 - **`first(.[K] | key)` on the cursor route** collects the walk's positions before the
   consumer can stop it, so a retry that only a stop would trigger is never made -- the #2180
   "materialized before the consumer" family, with #3470.
@@ -699,11 +700,17 @@ and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` 
   (`resolve_seq_stage`) compares the whole `select(...)` rather than its condition, so
   `path(.a | select([1] as $q ?// $b | $q) | error("E"))` keeps the first alternative's `E`
   in `no_std`.
-- **`key` after `if`/`limit`/`skip` over an owned input** takes the owned-identity walk, which
-  never retries (`{"a":{"a":1}} | [(if ([1] as $q ?// $b | $q) then error("E") else .a end) |
-  key]` raises `E` after a single attempt; the cursor route prints `["a"]`). `key` is a
-  succinctly extension, so the oracle is jq's `path()` spelling. Recorded on #3293 for its
-  closing slice.
+- **`key` after `if`/`limit` over an owned input** takes the owned-identity walk, which
+  collected the condition's (or count's) outputs before running the branch, so a `?//` in it
+  never retried (`{"a":{"a":1}} | (if ([1] as $q ?// $b | $q) then error("E") else .a end) |
+  key` raised `E` after a single attempt; the cursor route prints `"a"`). The branch now runs
+  inside the condition's own sink (`owned_identity_drive_each`, #3293 slice 9). `key` is a
+  succinctly extension, so the oracle is jq's `path()` spelling.
+- **`skip(n; f) | key` over an owned input** names the input's key, not the skipped-to
+  element's, with or without a `?//` (#3513); an owned-input `[... | key]` collector prints the
+  array it had collected after the error its body raises (#3512); and on the cursor route
+  `limit(1; .[] | <retrying body>) | key` runs the `?//` retry past `limit`'s own stop (#3514).
+  None is a stale slot.
 - **`paths(f)` evaluates `f` once per path, with no retry**: `[paths(if ([1] as $q ?// $b |
   $q) then error("E") else true end)]` is `[["a"],["a","a"]]` in jq 1.7.1 and `E` here after a
   single attempt (#3366, a second shape of its root-probe divergence).
