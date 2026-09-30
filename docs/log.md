@@ -169,3 +169,4 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 - Test suite structure (`tests/`)
 
 - 2026-09-23: Updated the jq evaluator map for #3025's lossless long-number reindex bridge, bounded owned operations, and projected array collection. Sources: `src/jq/value.rs`, `src/jq/eval.rs`, `src/jq/eval_generic.rs`, the #3025 spike and implementation results, and the pinned jq/yq differential checks.
+- 2026-10-01: Updated the jq evaluator map for #3439's `select` door on owned values (which stages answer from the tree instead of the reindex bridge) and the attribution that `range/3`'s generic loop is linear. Sources: `src/jq/eval.rs`, issue #3439.

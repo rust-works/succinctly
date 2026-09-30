@@ -66012,6 +66012,38 @@ fn range_3_step_non_numeric_matches_jq_add_error_3409() -> Result<()> {
     Ok(())
 }
 
+/// #3439: a container `from` whose every step is a fresh, longer array
+/// (`range([]; {}; [1])` -- array < object, so the loop continues) piped into a
+/// `select` answers what jq does. The `select` is decided from the emitted
+/// array itself rather than from a JSON round trip of it, which made this
+/// quadratic in the emitted length (2000 steps ~ 2M element serializations
+/// before; linear now). Outputs captured live against `/usr/bin/jq` 1.7.1.
+#[test]
+fn range_3_container_from_into_select_matches_jq_3439() -> Result<()> {
+    for (filter, want) in [
+        (
+            "first(range([]; {}; [1]) | select(length == 2000)) | length",
+            "2000",
+        ),
+        (
+            "[limit(3; range([]; {}; [1]) | select(length > 1))]",
+            "[[1,1],[1,1,1],[1,1,1,1]]",
+        ),
+        (
+            "first(range([]; {}; [1]) | select(length == 3) | select(.[2] == 1) | length)",
+            "3",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-n", "-c", filter], None)?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "#3439: `{filter}` -- stderr: {err:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2698: a `range` bound validates only what it reads -- the #2103/#2173
 /// divergence, one construct over, recorded in `limitations.md`.
 ///

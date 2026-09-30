@@ -9741,6 +9741,10 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     if let Some(flow) = projection_peel::<S>(expr, input, optional, reentry, sink) {
         return flow;
     }
+    // #3439: a `select` whose condition the tree can answer.
+    if let Some(flow) = owned_select_door::<S>(expr, input, optional, reentry, sink) {
+        return flow;
+    }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
     let expr = reentry.reroot::<S>(expr);
@@ -9756,6 +9760,81 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
         sink(item.into_owned_lossy::<S>())
     })
+}
+
+/// `select(cond)` over an owned value, decided from the tree instead of
+/// through the re-index bridge (#3439).
+///
+/// A generator that emits a large computed container into a `select` --
+/// `range([]; {}; [1]) | select(length == n)`, `while(...; . + [1]) |
+/// select(...)` -- reaches [`eval_each_owned`] once per output, and with no
+/// door here each visit serialized the whole container to JSON and indexed it
+/// to evaluate one condition: linear per output, quadratic over the run, where
+/// jq shares the value and pays nothing. The producing loop was never the
+/// cost (`range_values_generic` appends in place once its sink lets go of the
+/// value), the bridge was.
+///
+/// The condition is answered by [`eval_owned_pure_in`] with `lengths` on, the
+/// grammar [`eval_owned_pure`] already pins against the bridge (comparisons,
+/// `and`/`or`/`not`, `type`, navigation as an operand) plus `length` over a
+/// container. `select` yields its input unchanged, so a truthy answer emits
+/// `input` itself -- a refcount bump for a container -- and a falsy one emits
+/// nothing. A condition outside that grammar, or `length` of anything but an
+/// array or object, declines and the bridge answers exactly as before, so the
+/// door can only ever take a shape it can answer identically: its diagnostics
+/// stay the bridge's.
+///
+/// Taken under the same gate as [`projection_peel`] -- no proof on the
+/// re-entry ([`Reentry::REBUILT`]), no embed table in scope -- because inside
+/// an `as` body a `select` that stands on an embedded node is
+/// [`embed_peel_step`]'s to answer, and `optional` is the one setting
+/// [`eval_owned_pure`]'s own contract excludes (its `?`-suppression rules
+/// stay the bridge's).
+///
+/// A `select` that is the first stage of a longer pipe re-enters
+/// [`eval_each_owned`] with the rest on the same input, so `select(...) |
+/// select(...)` chains, and any stage behind them keeps its own doors.
+fn owned_select_door<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    if optional || reentry != Reentry::REBUILT || super::eval_generic::embed_table_active() {
+        return None;
+    }
+    let (cond, rest) = match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::Select(cond)) => (cond, &[][..]),
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
+            [first, rest @ ..] => match unwrap_paren(first) {
+                Expr::Builtin(Builtin::Select(cond)) => (cond, rest),
+                _ => return None,
+            },
+            [] => return None,
+        },
+        _ => return None,
+    };
+    let verdict = match eval_owned_pure_in::<S>(cond, input, ResultPosition::Operand, true)? {
+        Ok(verdict) => verdict,
+        Err(error) => return Some(Flow::Escaped(Control::Error(error))),
+    };
+    if !verdict.is_truthy() {
+        return Some(Flow::Exhausted);
+    }
+    if rest.is_empty() {
+        return Some(match sink(input.clone()) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
+    Some(eval_each_owned::<S>(
+        &Expr::Pipe(rest.to_vec()),
+        input,
+        optional,
+        Reentry::REBUILT,
+        sink,
+    ))
 }
 
 /// Take a pipe's leading `.field`/`.[n]` natively, then re-enter with the
@@ -49477,8 +49556,36 @@ fn eval_owned_pure<S: EvalSemantics>(
     input: &OwnedValue,
     position: ResultPosition,
 ) -> Option<Result<OwnedValue, EvalError>> {
+    eval_owned_pure_in::<S>(expr, input, position, false)
+}
+
+/// [`eval_owned_pure`]'s body, with `lengths` opting in one more operand:
+/// `length` over an owned array or object, answered by [`eval_owned_length`]
+/// (#3439).
+///
+/// `lengths` is a parameter and not an arm of [`eval_owned_pure`] because
+/// that function also decides what [`closed_expr_to_owned`] and the
+/// resolver's owned evaluation accept, and #3477 kept `length` out of the
+/// shared evaluator for that reason. Only [`owned_select_door`], which reads
+/// the answer as a truth value, asks for it, so a `length` in a `select`
+/// condition is settled from the tree instead of through the re-index bridge.
+///
+/// Every recursive call below passes `lengths` on, so a `length` nested in a
+/// comparison, a boolean or a pipe stage is reached under the same flag as
+/// the condition around it.
+fn eval_owned_pure_in<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    position: ResultPosition,
+    lengths: bool,
+) -> Option<Result<OwnedValue, EvalError>> {
     match expr {
-        Expr::Paren(inner) => eval_owned_pure::<S>(inner, input, position),
+        Expr::Paren(inner) => eval_owned_pure_in::<S>(inner, input, position, lengths),
+        // A fresh integer, never a subvalue of `input`, so it is admitted in
+        // either position (see `eval_owned_length`). Everything that is not
+        // an array or an object declines, and the bridge keeps its
+        // diagnostics and its per-mode rules.
+        Expr::Builtin(Builtin::Length) if lengths => eval_owned_length(expr, input).map(Ok),
         // `eval_single`'s own `Expr::Literal` arm, verbatim.
         Expr::Literal(lit) => Some(Ok(literal_to_owned(lit))),
         // `eval_single`'s own `Expr::TrackedVar` arm, verbatim (#2042). The
@@ -49551,11 +49658,11 @@ fn eval_owned_pure<S: EvalSemantics>(
         // `.a.b`'s message — pinned by
         // `compare_condition_reports_the_right_operands_error_first_2048`.
         Expr::Compare { op, left, right } => {
-            let r = match eval_owned_pure::<S>(right, input, ResultPosition::Operand)? {
+            let r = match eval_owned_pure_in::<S>(right, input, ResultPosition::Operand, lengths)? {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
-            let l = match eval_owned_pure::<S>(left, input, ResultPosition::Operand)? {
+            let l = match eval_owned_pure_in::<S>(left, input, ResultPosition::Operand, lengths)? {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
@@ -49566,8 +49673,8 @@ fn eval_owned_pure<S: EvalSemantics>(
         // *without evaluating the right operand at all* (which is what makes
         // `false and error("x")` answer `false` rather than raising), and
         // otherwise the answer is the right operand's own truthiness.
-        Expr::And(left, right) => eval_owned_pure_boolean::<S>(left, right, input, false),
-        Expr::Or(left, right) => eval_owned_pure_boolean::<S>(left, right, input, true),
+        Expr::And(left, right) => eval_owned_pure_boolean::<S>(left, right, input, false, lengths),
+        Expr::Or(left, right) => eval_owned_pure_boolean::<S>(left, right, input, true, lengths),
         // A pure pipe threads one value stage to stage — `eval_pipe`'s own
         // shape once every stage is single-output (and, per
         // [`is_owned_pure_expr`], once no stage needs path context, which is
@@ -49588,13 +49695,18 @@ fn eval_owned_pure<S: EvalSemantics>(
             for stage in rest {
                 let stage_input = current.as_ref().unwrap_or(input);
                 current = Some(
-                    match eval_owned_pure::<S>(stage, stage_input, ResultPosition::Operand)? {
+                    match eval_owned_pure_in::<S>(
+                        stage,
+                        stage_input,
+                        ResultPosition::Operand,
+                        lengths,
+                    )? {
                         Ok(v) => v,
                         Err(e) => return Some(Err(e)),
                     },
                 );
             }
-            eval_owned_pure::<S>(last, current.as_ref().unwrap_or(input), position)
+            eval_owned_pure_in::<S>(last, current.as_ref().unwrap_or(input), position, lengths)
         }
         _ => None,
     }
@@ -49627,15 +49739,16 @@ fn eval_owned_pure_boolean<S: EvalSemantics>(
     right: &Expr,
     input: &OwnedValue,
     short_circuit: bool,
+    lengths: bool,
 ) -> Option<Result<OwnedValue, EvalError>> {
-    let l = match eval_owned_pure::<S>(left, input, ResultPosition::Operand)? {
+    let l = match eval_owned_pure_in::<S>(left, input, ResultPosition::Operand, lengths)? {
         Ok(v) => v,
         Err(e) => return Some(Err(e)),
     };
     if l.is_truthy() == short_circuit {
         return Some(Ok(OwnedValue::Bool(short_circuit)));
     }
-    let r = match eval_owned_pure::<S>(right, input, ResultPosition::Operand)? {
+    let r = match eval_owned_pure_in::<S>(right, input, ResultPosition::Operand, lengths)? {
         Ok(v) => v,
         Err(e) => return Some(Err(e)),
     };
@@ -53121,6 +53234,17 @@ pub(crate) fn range_values_f64(
 /// numeric paths have: it computes the next value anyway (needed either way
 /// to keep looping), so checking it costs one extra `compare_values` call,
 /// not a second traversal.
+///
+/// **Cost (#3439).** Each step is O(|step|) when the consumer lets go of the
+/// emitted value before this loop advances: `current` is then uniquely owned
+/// when [`arith_add`] runs, so a container `from` grows in place
+/// (`Rc::make_mut` finds no second handle). Only a consumer that *keeps*
+/// every value forces a copy per step, and that is quadratic in jq too -- jq's
+/// `while` desugar holds the value across the `+` for the same reason. A
+/// consumer that drops each value but is slow anyway is paying downstream, not
+/// here: `first(range([]; {}; [1]) | select(length == n))` was quadratic
+/// because the owned-value bridge serialized each emitted array to evaluate
+/// the `select`, see [`owned_select_door`].
 pub(crate) fn range_values_generic<S: EvalSemantics>(
     from: OwnedValue,
     to: &OwnedValue,
@@ -94433,6 +94557,223 @@ mod tests {
         assert!(run(".i | select(true)", &input, Reentry::Proven).is_none());
     }
 
+    /// The door's answer for `filter` over `input`, in the shape
+    /// [`normalize`] gives the bridge's: every value it emitted and how the
+    /// evaluation ended. `None` when the door declined.
+    fn select_door_outcome<S: EvalSemantics>(
+        filter: &str,
+        input: &OwnedValue,
+    ) -> Option<(Vec<OwnedValue>, String)> {
+        let expr = parse(filter).unwrap_or_else(|e| panic!("parse {filter:?}: {e:?}"));
+        let mut out = Vec::new();
+        let flow = owned_select_door::<S>(&expr, input, false, Reentry::REBUILT, &mut |v| {
+            out.push(v);
+            Demand::Continue
+        })?;
+        let tag = match flow {
+            Flow::Exhausted => "ok".to_string(),
+            Flow::Escaped(Control::Error(e)) => format!("error:{}", e.message),
+            _ => panic!("{filter:?} on {input:?} neither finished nor raised"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the door's sink never stops and it never breaks or halts (#3439)"
+        };
+        Some((out, tag))
+    }
+
+    /// What a consumer of `(values, how the evaluation ended)` can observe of
+    /// it: the ending, and each value under every printer the CLI can reach
+    /// it through (jq's, `--preserve-input`'s, yq's, the input bridge's).
+    ///
+    /// Not `Debug`: the bridge re-reads its serialization, so a number nested
+    /// in a container comes back as `NumberLiteral(Int(2), "2")` where the
+    /// door hands back the `Int(2)` it was given -- two spellings of one
+    /// value that every printer renders alike, which is exactly what this
+    /// records.
+    fn select_door_observable(outcome: &(Vec<OwnedValue>, String)) -> (Vec<[String; 4]>, &str) {
+        let printed = outcome
+            .0
+            .iter()
+            .map(|v| {
+                [
+                    v.to_json(),
+                    v.to_json_jq_preserve(),
+                    v.to_json_yq(),
+                    v.to_json_input_bridge(),
+                ]
+            })
+            .collect();
+        (printed, outcome.1.as_str())
+    }
+
+    /// #3439: [`owned_select_door`] answers what the reindex bridge answers
+    /// for every value x condition it takes, in both modes -- the emitted
+    /// value (its spelling included), the emptiness of a falsy condition, and
+    /// the text of a raised error -- and declines the rest, so the bridge
+    /// keeps its diagnostics.
+    #[test]
+    fn owned_select_door_agrees_with_the_reindex_bridge_3439() {
+        let mut values = pure_value_matrix();
+        values.push(OwnedValue::array_from(
+            (0..40).map(OwnedValue::Int).collect(),
+        ));
+        values.push(OwnedValue::array_from(vec![
+            OwnedValue::from_number_literal::<JqSemantics>("1.50"),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Int(i64::MAX),
+            OwnedValue::from_number_literal::<JqSemantics>("100000000000000000000"),
+        ]));
+        let conds = [
+            "select(length == 0)",
+            "select(length == 1)",
+            "select(length > 1)",
+            "select(length)",
+            "select(length | . > 1)",
+            "select(length == 1 and type == \"array\")",
+            "select(length == 2 or type == \"object\")",
+            "select(type == \"array\")",
+            "select(.a == 1)",
+            "select(.a.b == 2)",
+            "select(.[0] == 1)",
+            "select(. == .)",
+            "select(not)",
+            "select(true)",
+            "select(false)",
+            "select(null)",
+            "(select(length > 0))",
+            ". | select(length > 0)",
+            "select(length > 0) | select(type != \"null\")",
+            "select(length > 0) | length",
+            "select(true) | select(false)",
+        ];
+        let (mut taken, mut declined) = (0, 0);
+        for src in conds {
+            for value in &values {
+                let expr = parse(src).unwrap();
+                let jq = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let yq = normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                    &expr, value, false,
+                ));
+                let door_jq = select_door_outcome::<JqSemantics>(src, value);
+                let door_yq = select_door_outcome::<YqSemantics>(src, value);
+                for (mode, door, bridge) in [("jq", door_jq, jq), ("yq", door_yq, yq)] {
+                    let Some(door) = door else {
+                        declined += 1;
+                        continue;
+                    };
+                    taken += 1;
+                    assert_eq!(
+                        select_door_observable(&door),
+                        select_door_observable(&bridge),
+                        "{mode} mode: {src:?} on {value:?} disagrees with the reindex bridge"
+                    );
+                }
+            }
+        }
+        assert!(taken > 300, "the matrix must reach the door: {taken}");
+        assert!(declined > 0, "the matrix must reach the declines too");
+    }
+
+    /// #3439: the door is only for shapes it can answer identically. `length`
+    /// of a scalar keeps the bridge's diagnostics and per-mode rules, and a
+    /// condition outside the pure grammar is the bridge's outright; a `?`, a
+    /// proven re-entry and a value that is not the whole input's root are
+    /// gated out.
+    #[test]
+    fn owned_select_door_declines_what_it_cannot_answer_identically_3439() {
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        let run = |filter: &str, input: &OwnedValue, optional: bool, reentry: Reentry| {
+            let expr = parse(filter).unwrap();
+            owned_select_door::<JqSemantics>(&expr, input, optional, reentry, &mut |_| {
+                Demand::Continue
+            })
+        };
+        // Answered.
+        assert!(run("select(length == 2)", &array, false, Reentry::REBUILT).is_some());
+        // `length` of a scalar / string / null / bool is not this door's.
+        for scalar in [
+            OwnedValue::Int(-3),
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::string("abc"),
+        ] {
+            assert!(
+                run("select(length == 3)", &scalar, false, Reentry::REBUILT).is_none(),
+                "{scalar:?}"
+            );
+        }
+        // Outside the pure grammar: a generator, a builtin that computes.
+        for src in [
+            "select(.[])",
+            "select(keys == [0, 1])",
+            "select(map(. + 1))",
+        ] {
+            assert!(run(src, &array, false, Reentry::REBUILT).is_none(), "{src}");
+        }
+        // Not a `select` at all, or a `select` that is not the first stage.
+        for src in [
+            ".",
+            "length",
+            "length | select(. == 2)",
+            "map(select(true))",
+        ] {
+            assert!(run(src, &array, false, Reentry::REBUILT).is_none(), "{src}");
+        }
+        // Gated: `?`-suppression stays the bridge's, and so does a re-entry
+        // that already carries a proof.
+        assert!(run("select(length == 2)", &array, true, Reentry::REBUILT).is_none());
+        assert!(run("select(length == 2)", &array, false, Reentry::Proven).is_none());
+    }
+
+    /// #3439: the door never serializes its input, and [`eval_each_owned`]
+    /// reaches it. A value nested past [`MAX_VALUE_TREE_DEPTH`] cannot cross
+    /// the reindex bridge at all (#3261 -- it raises the depth-limit error),
+    /// so a `select` that answers over one is a `select` that did not take
+    /// the bridge.
+    #[test]
+    fn owned_select_door_is_reached_and_skips_the_bridge_3439() {
+        let mut deep = OwnedValue::Null;
+        for _ in 0..crate::jq::value::MAX_VALUE_TREE_DEPTH {
+            deep = OwnedValue::array_from(vec![deep]);
+        }
+        let expr = parse("select(length == 1)").unwrap();
+        assert!(matches!(
+            eval_owned_input_bridge::<Vec<u64>, JqSemantics>(&expr, &deep, false),
+            QueryResult::Error(_)
+        ));
+        let mut out = Vec::new();
+        let flow =
+            eval_each_owned::<JqSemantics>(&expr, &deep, false, Reentry::REBUILT, &mut |v| {
+                out.push(v);
+                Demand::Continue
+            });
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!((&out[0], &deep), (OwnedValue::Array(a), OwnedValue::Array(b)) if a.ptr_eq(b))
+        );
+    }
+
+    /// `eval_owned_pure` is shared with `closed_expr_to_owned` and the
+    /// resolver, so the `length` operand [`owned_select_door`] opts into
+    /// (#3439) must not leak into it: the default entry point still declines
+    /// a `length` anywhere in its grammar (#3477).
+    #[test]
+    fn eval_owned_pure_still_declines_length_by_default_3439() {
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        for src in ["length == 1", "length > 0 and type == \"array\"", "length"] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_pure::<JqSemantics>(&expr, &array, ResultPosition::Operand).is_none(),
+                "{src}"
+            );
+            assert!(
+                eval_owned_pure_in::<JqSemantics>(&expr, &array, ResultPosition::Operand, true)
+                    .is_some(),
+                "{src}"
+            );
+        }
+    }
+
     #[test]
     fn test_query_result_collect_owned_cursor_arms() {
         // Covers the One / OneCursor / Many arms via real evaluation.
@@ -115688,6 +116029,37 @@ mod share_audit_2999 {
         let json = format!("[{}]", body.join(",")).into_bytes();
         assert_forced(&json, "reduce .[] as $r ({}; .[$r.name] = $r.score)", &[]);
         assert_forced(&json, "reduce .[] as $r ({}; .x[$r.name] += $r.score)", &[]);
+    }
+
+    /// #3439: `range/3`'s generic loop appends to its accumulator in place
+    /// once its consumer lets go of each value -- the run forces exactly one
+    /// `make_mut` copy (step one, where the caller still holds the `from`
+    /// operand it cloned), never one per step. The per-step `array unwrap`
+    /// is `arith_add` consuming its *right* operand, a clone of the
+    /// one-element `step` that the loop still holds: it costs the length of
+    /// `step`, not of the accumulator. Pins the attribution the issue got wrong:
+    /// the quadratic cost of `first(range([]; {}; [1]) | select(length ==
+    /// N))` was the re-index bridge serializing each emitted array, not a
+    /// second reference forcing a `make_mut` copy. The retaining consumer is
+    /// the control: it holds every value, so every step copies -- as jq's
+    /// does, and no loop can avoid.
+    #[test]
+    fn range_3_generic_loop_appends_in_place_3439() {
+        assert_forced(
+            b"null",
+            "first(range([]; {}; [1]) | select(length == 300))",
+            &[(Kind::ArrayMakeMut, 1), (Kind::ArrayUnwrap, 300)],
+        );
+        assert_forced(
+            b"null",
+            "[limit(300; range([]; {}; [1]) | length)] | length",
+            &[(Kind::ArrayMakeMut, 1), (Kind::ArrayUnwrap, 299)],
+        );
+        assert_forced(
+            b"null",
+            "last(limit(300; range([]; {}; [1]))) | length",
+            &[(Kind::ArrayMakeMut, 299), (Kind::ArrayUnwrap, 299)],
+        );
     }
 
     /// The eager single-path route owns its document outright: nothing is
