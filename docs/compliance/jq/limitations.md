@@ -960,8 +960,9 @@ is the revert that established what the other one costs.
      `del(. as $x ?// $y \| if $x then (.a and .b) else .c end)` on `{"a":1,"c":2}` refuses
      where jq retries past its own path error and answers `{"a":1}`. Before #3289 the by-value
      evaluation happened to give jq's answer there.
-   - **Pointer identity** is modelled only for `null`/`true`/`false` and a full array slice
-     (`.[0:]` is the input itself to jq), so `path(.a as $v \| . as $w \| $v \| (($w \| .a)
+   - **Pointer identity** is modelled only for `null`/`true`/`false` and a full slice of a
+     non-empty array (`.[0:]` is the input itself to jq; an empty slice is a fresh `[]`, never
+     identical -- #3494), so `path(.a as $v \| . as $w \| $v \| (($w \| .a)
      and .b))` refuses where jq answers.
 
    A generated sweep (29 operands including the by-value ones above, `and`/`or`/`-`, 10
