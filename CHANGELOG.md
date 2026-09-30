@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from `succinctly::jq`). They `Deref` to `String`/`str` and convert with
   `From`/`.into()`; `into_string()`/`into_boxed()` move the value out.
 
+- **jq: `[.] as $a | $a | length` no longer holds the array twice or reindexes
+  it** (#3477). Binding a cursor sequence with `as` builds the whole owned
+  tree, and `$a | length` then serialized and indexed that tree on top of it:
+  168 MB on an 8.4 MB document (jq 1.7.1: 122 MB), and 294 MB for
+  `[., .] as $a | $a | length`. `length` over an owned array or object is now
+  answered from the tree, and a comma sequence that names a container node
+  twice (`[., .]`) builds it once and shares it, as jq's own `jv` does. Both
+  forms now peak at 112 MB, which is the owned tree the binding holds (release
+  build, Apple M5 Max; 26 MB to 20 MB at 1 MB, 842 MB to 318 MB at 30 MB for
+  `[., .]`). Output is unchanged. Every other consumer of a bound array
+  (`.[]`, `first`, `has`, `keys`, `map`, `tojson`) still indexes the whole tree.
+
 - **jq: `[(., .) | .data]` no longer builds each comma item as an owned tree**
   (#3476). #3473's cursor route covered a `,` sitting directly inside `[...]`;
   the same body behind a pipe (`[(., .) | .data]`) still built one owned tree
