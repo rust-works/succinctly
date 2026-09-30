@@ -103289,7 +103289,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let expr = parse(".[(0,1):(2,3)]").unwrap();
         let Expr::SliceExpr { target, start, end } = &expr else {
-            panic!("expected a computed slice, got {expr:?}");
+            panic!("expected a computed slice, got {expr:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the shape assertion the test makes (#3471)"
         };
         let mut pushed = Vec::new();
         let flow = each_slice_expr::<Vec<u64>, JqSemantics>(
