@@ -432,14 +432,23 @@ S_ENTRIES=(
   'del-reduce-source::::del(reduce __S__ as $x (.; .[$x:]))'
   'update-foreach-source::::(foreach __S__ as $x (.; .[$x:])) |= 5'
 )
+# The step *succeeds* on the first alternative and a consumer's stop reaches the
+# source's `?//` (#3293 review). Only the retries that produce nothing or raise:
+# an answering retry over-delivers in jq (a documented, unreproduced shape).
+SOK_VARIANTS=("${S_VARIANTS[1]}" "${S_VARIANTS[2]}")
+SOK_ENTRIES=(
+  'path-foreach-source-step-ok::::path(foreach __S__ as $x (.; .[0:]))'
+  'path-foreach-extract-source-step-ok::::path(foreach __S__ as $x (.; .; .[0:]))'
+)
 I_ENTRIES=(
   'path-reduce-init::::path(reduce 1 as $x (__I__; if length>2 then error("E") else . end))'
   'path-foreach-init::::path(foreach 1 as $x (__I__; if length>2 then error("E") else . end))'
   'path-foreach-extract-init::::path(foreach 1 as $x (__I__; .; if length>2 then error("E") else . end))'
   'del-reduce-init::::del(reduce 1 as $x (__I__; if length>2 then error("E") else . end))'
 )
-for fold_family in S I; do
+for fold_family in S SOK I; do
   if [[ "$fold_family" == S ]]; then entries=("${S_ENTRIES[@]}"); variants=("${S_VARIANTS[@]}"); token=__S__
+  elif [[ "$fold_family" == SOK ]]; then entries=("${SOK_ENTRIES[@]}"); variants=("${SOK_VARIANTS[@]}"); token=__S__
   else entries=("${I_ENTRIES[@]}"); variants=("${I_VARIANTS[@]}"); token=__I__; fi
   for f_entry in "${entries[@]}"; do
     f_rest="$f_entry"

@@ -42235,9 +42235,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // over-delivery jq shows there (`[limit(1; path(foreach (1 as $x
         // ?// $y | (stderr|1)) as $v (.; .)))]` is `[[],[]]` in jq 1.7.1)
         // is not reproduced; see limitations.md.
-        let mut downstream_stopped = false;
+        // The retry generation at which the consumer stopped, if it did
+        // (#3293): a `?//` in the source that retries past that stop and then
+        // produces nothing or raises supersedes it, as it does `aborted`.
+        let mut downstream_stopped: Option<u64> = None;
         let source_flow = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
-            downstream_stopped = false;
+            downstream_stopped = None;
             aborted.begin();
             if let Some(control) = charge_budget(&mut budget, "foreach") {
                 return aborted.stop(control);
@@ -42506,7 +42509,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                         outcome = Some(if is_retryable_stop(is_last) {
                                             FoldStepOutcome::Retry
                                         } else {
-                                            downstream_stopped = true;
+                                            downstream_stopped = Some(pipe_retry_generation());
                                             FoldStepOutcome::Return(Demand::Stop)
                                         });
                                         return Demand::Stop;
@@ -42543,7 +42546,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                     outcome = Some(if is_retryable_stop(is_last) {
                                         FoldStepOutcome::Retry
                                     } else {
-                                        downstream_stopped = true;
+                                        downstream_stopped = Some(pipe_retry_generation());
                                         FoldStepOutcome::Return(Demand::Stop)
                                     });
                                     return Demand::Stop;
@@ -42571,13 +42574,14 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // The source stream's own trailing control belongs to this fork
         // too, applied after its own inner drive — mirrors `eval_foreach`'s
         // #534-follow-up fix exactly.
-        if downstream_stopped {
+        let source_direct_retry = direct_pattern_retry(input);
+        if downstream_stopped
+            .is_some_and(|at| !retry_superseded(&source_flow, at, source_direct_retry))
+        {
             fork_outcome.stash(ResolveFlow::Stopped);
             return Demand::Stop;
         }
-        if let Some(control) =
-            reclaim_fold_escape(aborted, source_flow, direct_pattern_retry(input))
-        {
+        if let Some(control) = reclaim_fold_escape(aborted, source_flow, source_direct_retry) {
             // The stop this fork answers is *not* retryable: a `?//` in INIT
             // would otherwise take it for an ordinary satisfied-consumer stop
             // and try its next alternative, running the fold again past a
@@ -102797,6 +102801,19 @@ mod tests {
             assert_eq!(
                 (got.as_slice(), got_end.as_str()),
                 (values, end),
+                "`{filter}`"
+            );
+        }
+        // A consumer's stop reaching the source's `?//` is recognised through
+        // `first`'s own retry-generation rule (`each_take_n`), which `no_std`
+        // does not have.
+        #[cfg(feature = "std")]
+        {
+            let filter = r#"[first(path(foreach ([1] as $q ?// $b | $q | if . == null then error("E2") else . end) as $x (.; .[0:]))), 9]"#;
+            let (got, got_end) = outputs_and_end(b"[10,20,30]", filter);
+            assert_eq!(
+                (got.len(), got_end.as_str()),
+                (0, "error: E2"),
                 "`{filter}`"
             );
         }

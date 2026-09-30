@@ -78009,6 +78009,56 @@ const RETRY_ROWS_PATH_FOLD_3293: &[RetryRow3293] = &[
         "E",
         5,
     ),
+    // fold-source-step-ok: the step succeeds on alternative 1 and a consumer's stop reaches the source's `?//`
+    (
+        r#"[first(path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .[0:]))), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .; .[0:]))), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .[0:])) |= 5"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .[0:]))]"#,
+        "[[{\"start\":0,\"end\":null}]]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)) as $x (.; .[0:]))), 9]"#,
+        "[[{\"start\":0,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)) as $x (.; .; .[0:]))), 9]"#,
+        "[[{\"start\":0,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)) as $x (.; .[0:]))]"#,
+        "[[{\"start\":0,\"end\":null}]]\n",
+        "A",
+        "",
+        0,
+    ),
 ];
 
 #[test]
