@@ -59221,7 +59221,7 @@ fn test_path_register_equal_array_copy_is_not_the_register_3456() -> Result<()> 
         ),
         (
             r#"{"a":[1]}"#,
-            r#"path(.a as $v | . as $w | $v | (($w | .a) and .b))"#,
+            r"path(.a as $v | . as $w | $v | (($w | .a) and .b))",
             "",
             r#"Cannot index array with string "b""#,
             5,
@@ -59284,10 +59284,11 @@ fn test_path_register_fold_source_that_navigates_moves_the_register_3456() -> Re
 }
 
 /// #3456 (round 2: an O(N^3) gate on long `and` chains). A 256-operand chain
-/// answers jq's refusal, and does so in a bounded time: the margin is
-/// generous (see #2036's test for why), so only a superlinear regression
-/// -- about 0.07s here, against minutes for a cubic gate at this length --
-/// fails it.
+/// answers jq's refusal, and does so in a bounded time. The margin is generous
+/// (see #2036's test for why), so this guards the catastrophic case only -- a
+/// cubic gate takes minutes at this length, against about 0.07s standalone --
+/// and a milder superlinear slowdown passes. The finer net is the sweep's
+/// chain rows (`scripts/jq-path-register-sweep.py`), which report TIMEOUT.
 #[test]
 fn test_path_register_long_and_chain_is_bounded_3456() -> Result<()> {
     let chain = vec![".a"; 256].join(" and ");
