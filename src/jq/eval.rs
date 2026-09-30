@@ -44243,15 +44243,25 @@ fn resolve_target_for_pair<'a, S: EvalSemantics>(
 /// needs the whole list first.
 ///
 /// Keeps the generator's own partial prefix on escape (#896): keys already
-/// delivered stay delivered, and the escape rides back as the return value
-/// for the caller to rank against `target`'s (which outranks it).
+/// delivered stay delivered, and the generator's [`Flow`] rides back as the
+/// return value for the caller to rank against `target`'s (which outranks
+/// it) -- [`index_key_trailing`] extracts the escape.
+///
+/// #3293: the [`Flow`] itself, not just the trailing escape, so the caller
+/// can tell whether a `?//` retry inside the key superseded a verdict its
+/// sink stashed ([`StashedVerdict::take`]).
 fn drive_index_key<S: EvalSemantics>(
     key: &Expr,
     value: &OwnedValue,
     trackable: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
-) -> Option<EvalEscape> {
-    match eval_each_owned::<S>(key, value, false, Reentry::at_register(trackable), sink) {
+) -> Flow {
+    eval_each_owned::<S>(key, value, false, Reentry::at_register(trackable), sink)
+}
+
+/// A [`drive_index_key`] generator's own trailing escape, if it ended in one.
+fn index_key_trailing(flow: Flow) -> Option<EvalEscape> {
+    match flow {
         Flow::Exhausted => None,
         // `pending` is dropped, with every other Stage-2 consumer (see
         // [`Flow::Stopped`]): the caller stops only because `target` already
@@ -44338,12 +44348,27 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
     // The escape that aborts the whole call, raised once the driver has
     // unwound -- `target`'s own, or the #843 refusal below. Neither can
     // travel out through the sink, whose answer is a [`Demand`].
-    let mut target_escape: Option<EvalEscape> = None;
-    // Whether the *consumer's* sink asked to stop. Distinct from
-    // `target_escape`: a stop is not an error, and per [`ResolveFlow::Stopped`]
-    // it discards whatever trailing escape the generators had already
-    // computed, so the two cannot share one slot.
-    let mut stopped = false;
+    //
+    // #3293: a [`StashedEscape`], not a bare slot. A `?//` inside `key`
+    // retries past the stop this stash answers (#1519), so it can describe an
+    // alternative jq has already abandoned: `path(.[([["a"]] as [$q] ?//
+    // [[$q]] | $q)])` on `{"a":{"a":1}}` is `["a"]` in jq 1.7.1, with no
+    // "Cannot index object with array" from the first alternative's `["a"]`.
+    // A retry that produces another key re-invokes the sink, whose `begin`
+    // drops the stale stash; one that produces nothing, raises or fails to
+    // destructure never does, and `take` recognises it from the key
+    // generator's own `Flow`.
+    let stash = StashedEscape::new();
+    // Whether the *consumer's* sink asked to stop. Distinct from `stash`:
+    // a stop is not an error, and per [`ResolveFlow::Stopped`] it discards
+    // whatever trailing escape the generators had already computed, so the
+    // two cannot share one slot. Stamped with the retry generation it was
+    // recorded at, and superseded by a retry the same way `stash` is:
+    // `[first(path(.[([["a"]] as [$q] ?// $b | if $q then $q else error("E2")
+    // end)])), 9]` raises the retry's `E2` in jq 1.7.1 rather than reporting
+    // the abandoned alternative's satisfied `first`.
+    let mut stopped_at: Option<u64> = None;
+    let key_direct_retry = direct_pattern_retry(key);
     let mut first_key = true;
 
     // The two structural "is this target trackable" checks (#843/#986) run
@@ -44397,7 +44422,11 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
     // used to be stated twice here and there. The per-pair reservation
     // that used to sit alongside it is gone; nothing accumulates in
     // either resolver any more.
-    let key_escape = drive_index_key::<S>(key, value, trackable, &mut |k| {
+    let key_flow = drive_index_key::<S>(key, value, trackable, &mut |k| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside `key`;
+        // it supersedes whatever the retried-past call decided.
+        stash.begin();
+        stopped_at = None;
         // The shared exit every escape arm below funnels through, so parking
         // the escape and stopping the driver can't drift between arms.
         // Nothing is folded in as a prefix any more: every branch produced
@@ -44408,10 +44437,12 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
             // #2924: routes through the shared helper so this stop -- like
             // every other escape-behind-a-stop in this file -- is
             // classified for a `?//` sitting inside `key`'s own body,
-            // rather than stashing `target_escape` directly.
-            ($control:expr) => {
-                return stop_with_eval_escape(&mut target_escape, $control)
-            };
+            // rather than stashing the escape directly;
+            // `StashedVerdict::stop` records it (#3293).
+            ($control:expr) => {{
+                let escape: EvalEscape = $control;
+                return stash.stop(Control::from(escape));
+            }};
         }
         // #843: `target` is a no-op read of the untracked value itself, so
         // this key is the first real navigation attempted against it -- see
@@ -44571,7 +44602,7 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
             );
             // Untracked targets were rejected above.
             if sink(PathBranch::new(path, next_value, true)) == Demand::Stop {
-                stopped = true;
+                stopped_at = Some(pipe_retry_generation());
                 return Demand::Stop;
             }
         }
@@ -44585,20 +44616,29 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
         // jq's generator never reaches.
         if let Some(control) = this_escape {
             // #2924: same reasoning as the `escape!` macro above.
-            return stop_with_eval_escape(&mut target_escape, control);
+            return stash.stop(Control::from(control));
         }
         Demand::Continue
     });
+    // #3293: a retry inside `key` that produced nothing, or raised, never
+    // re-invoked the sink to reset what it recorded, and supersedes the
+    // consumer's stop and the stash alike.
+    if stopped_at.is_some_and(|at| retry_superseded(&key_flow, at, key_direct_retry)) {
+        stopped_at = None;
+    }
     // A consumer's own stop outranks both trailing escapes, and discards
     // them: once it is satisfied jq never resumes the generator, so an
     // error the producer had already reached is never raised (see
     // [`ResolveFlow::Stopped`]). Checked first for that reason.
-    if stopped {
+    if stopped_at.is_some() {
         return ResolveFlow::Stopped;
     }
-    // `target_escape` first: see the comment above for why jq's evaluation
-    // order surfaces it ahead of `key_escape`.
-    flow_result(target_escape.or(key_escape))
+    // The stash first: see the comment above for why jq's evaluation order
+    // surfaces `target`'s escape ahead of the key generator's own.
+    if let Some(control) = stash.take(&key_flow, key_direct_retry) {
+        return ResolveFlow::Escaped(EvalEscape::from(control));
+    }
+    flow_result(index_key_trailing(key_flow))
 }
 
 /// Resolve `E[S:T]` in path context, with or without a trailing `?`.
@@ -49970,16 +50010,21 @@ pub(crate) fn stop_with_escape(slot: &mut Option<Control>, control: Control) -> 
     Demand::Stop
 }
 
-/// [`stop_with_escape`] for `resolve_index_expr_sink` (#2924) and the live
-/// negation arm of [`resolve_node_sink`] (#3299), whose
-/// out-of-band slot holds an [`EvalEscape`] rather than a bare [`Control`] --
-/// their return type ([`ResolveFlow`]) has a dedicated `Escaped` variant, so
-/// the escape each stashes is never lost at its own boundary the way it would
-/// be for a driver returning bare `Flow`/`Demand`. They still owe `?//` the same
-/// classification `stop_with_escape` records, though: the key/bound/operand
-/// generator they are driving sees only this stop, and if a `?//` sits
-/// inside that generator's own body it needs `nonretryable_stop` set to
-/// classify it correctly, exactly as any other escape-behind-a-stop does.
+/// [`stop_with_escape`] for the live negation arm of [`resolve_node_sink`]
+/// (#3299), whose out-of-band slot holds an [`EvalEscape`] rather than a bare
+/// [`Control`]. Its return type ([`ResolveFlow`]) has a dedicated `Escaped`
+/// variant, so the escape it stashes is never lost at its own boundary the way
+/// it would be for a driver returning bare `Flow`/`Demand`. It still owes `?//`
+/// the same classification `stop_with_escape` records, though: the operand
+/// generator it is driving sees only this stop, and if a `?//` sits inside that
+/// generator's own body it needs `nonretryable_stop` set to classify it
+/// correctly, exactly as any other escape-behind-a-stop does.
+///
+/// `resolve_index_expr_sink` (#2924) and `resolve_slice_expr_sink` were its
+/// other callers. They stash into a [`StashedEscape`] since #3293, which a
+/// `?//` retry inside their key or bound can supersede, and reach the same
+/// classification through [`stop_with_escape_cell`].
+///
 /// Round-trips through [`stop_with_escape`] itself, the same shape
 /// [`stop_with_error`] below uses -- not just its classifier -- so a second
 /// responsibility added to that plumbing later is inherited here for free,
@@ -103016,6 +103061,74 @@ mod tests {
         }
     }
 
+    /// #3293 slice 5: `resolve_index_expr_sink`'s stash (`target_escape` and
+    /// the consumer's stop) is reached through the library `eval()` as well,
+    /// and its `no_std` build reads [`direct_pattern_retry`] of the key it
+    /// drives, so a key that *is* a `?//` bind is recognised there. A retry
+    /// that answers, produces nothing, or raises supersedes the failure the
+    /// abandoned alternative stopped on; a halt is never superseded; an
+    /// untracked target still refuses the retry's own key. Captured from jq
+    /// 1.7.1 with `-c` over `{"a":{"a":1}}`.
+    #[test]
+    fn test_path_index_retry_supersedes_stashed_verdict_3293() {
+        let answers = r#"([["a"]] as [$q] ?// [[$q]] | $q)"#;
+        let nothing = r#"([["a"]] as [$q] ?// $b | $q // empty)"#;
+        let raises = r#"([["a"]] as [$q] ?// $b | $q | if . == null then error("E2") else . end)"#;
+        let last = r#"([["a"]] as [$q] ?// {$z} | $q)"#;
+        let halts = r#"([["a"]] as [$q] ?// [[$q]] | if ($q|type) == "array" then ("h"|halt_error(3)) else $q end)"#;
+        for (filter, values, end) in [
+            (format!("path(.[{answers}])"), vec![r#"["a"]"#], ""),
+            (format!("[path(.[{nothing}])]"), vec!["[]"], ""),
+            (format!("path(.[{raises}])"), vec![], "error: E2"),
+            (
+                format!("path(.[{last}])"),
+                vec![],
+                r#"error: Cannot index array with string "z""#,
+            ),
+            (format!("del(.[{answers}])"), vec!["{}"], ""),
+            (format!(".[{answers}] = 5"), vec![r#"{"a":5}"#], ""),
+            (format!(".[{answers}] |= 5"), vec![r#"{"a":5}"#], ""),
+            (format!("pick(.[{answers}])"), vec![r#"{"a":{"a":1}}"#], ""),
+            (
+                format!("[path(.[{answers}] | .a)]"),
+                vec![r#"[["a","a"]]"#],
+                "",
+            ),
+            (
+                format!("[path(try .[{answers}] catch .)]"),
+                vec![r#"[["a"]]"#],
+                "",
+            ),
+            (
+                format!("path(1 | .[{answers}])"),
+                vec![],
+                r#"error: Invalid path expression near attempt to access element "a" of 1"#,
+            ),
+            (format!("path(.[{halts}])"), vec![], "halt: 3"),
+            // The cursor route's `key` walk (`path_context_step_computed_index`).
+            (format!(".[{answers}] | key"), vec![r#""a""#], ""),
+            (format!(".[{nothing}] | key"), vec![], ""),
+            (format!(".[{raises}] | key"), vec![], "error: E2"),
+        ] {
+            let (got, got_end) = outputs_and_end(br#"{"a":{"a":1}}"#, &filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!((got, got_end.as_str()), (values, end), "`{filter}`");
+        }
+        // A consumer's stop reaching the key's `?//` is recognised through
+        // `first`'s own retry-generation rule (`each_take_n`), which `no_std`
+        // does not have.
+        #[cfg(feature = "std")]
+        {
+            let filter = format!("[first(path(.[{raises}])), 9]");
+            let (got, got_end) = outputs_and_end(br#"{"a":{"a":1}}"#, &filter);
+            assert_eq!(
+                (got.len(), got_end.as_str()),
+                (0, "error: E2"),
+                "`{filter}`"
+            );
+        }
+    }
+
     /// #3293 slice 4: `foreach_forks`/`reduce_forks` are shared with the
     /// owned evaluator, and their `no_std` build reads [`FoldDirectRetry`]
     /// instead of the retry generation, so every fold row runs on this route
@@ -115307,8 +115420,10 @@ mod touched_edge_cases_2999 {
     }
 
     /// #2924: `stop_with_eval_escape` -- the helper `resolve_index_expr_sink`
-    /// and `resolve_slice_expr_sink` now route through instead of stashing
-    /// `target_escape`/`inner_escape` directly -- must classify exactly like
+    /// and `resolve_slice_expr_sink` routed through instead of stashing
+    /// `target_escape`/`inner_escape` directly (they stash into a
+    /// `StashedEscape` now, #3293, which round-trips through the same
+    /// classification) -- must classify exactly like
     /// its `Control`-shaped sibling [`stop_with_escape`]: `Halt` and an
     /// uncatchable `Error` set [`nonretryable_stop`], an ordinary `Error` or
     /// `Break` does not. Unit-level rather than an end-to-end jq repro

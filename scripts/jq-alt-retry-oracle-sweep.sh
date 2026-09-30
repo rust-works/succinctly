@@ -256,18 +256,32 @@ R_ENTRIES=(
   'del-bind-source::::del(__B__ as $y | .[$y:])'
   'update-bind-source::::(__B__ as $y | .[$y:]) |= ["x"]'
   'pick-bind-source::::pick(__B__ as $y | .[$y:])'
-  # -- open: the path-mode computed index (resolve_index_expr_sink). --
-  'path-index::#3293 slice 5::path(.[__B__])'
-  'del-index::#3293 slice 5::del(.[__B__])'
 )
+# The path-mode computed index (slice 5) is the IX family below, over an object:
+# on this array input an array-valued first alternative is jq's `indices` search
+# (#3506), so a `.[__B__]` row here never exercised the failure it was written for.
 
 # Fed from a file, never a pipe — see jq-fanout-oracle-sweep.sh's own
 # documented SIGPIPE lesson (a filter that never reads `input` leaves the
 # writer holding data, killing a `printf | jq` pipeline with SIGPIPE under
 # load and recording a phantom exit-code divergence).
-STDIN_FILE="$(mktemp -t jq-alt-retry-sweep-stdin)"
-RETRY_STDIN_FILE="$(mktemp -t jq-alt-retry-sweep-retry-stdin)"
-trap 'rm -f "$STDIN_FILE" "$RETRY_STDIN_FILE" /tmp/jq-alt-retry-sweep.err /tmp/succ-alt-retry-sweep.err' EXIT
+#
+# Every temp file goes through `mk_tmp`, so one EXIT trap removes all of them and
+# a family added later cannot forget to extend it. The stderr captures are
+# per-run `mktemp` files too: fixed `/tmp` names collide when two sweeps (or two
+# sessions) run at once, and record a phantom divergence.
+SWEEP_TMP=()
+mk_tmp() { # mk_tmp VAR PREFIX: create a temp file, name it in VAR
+  local created
+  created="$(mktemp -t "$2")"
+  SWEEP_TMP+=("$created")
+  printf -v "$1" '%s' "$created"
+}
+trap 'rm -f "${SWEEP_TMP[@]}"' EXIT
+mk_tmp STDIN_FILE jq-alt-retry-sweep-stdin
+mk_tmp RETRY_STDIN_FILE jq-alt-retry-sweep-retry-stdin
+mk_tmp JQ_ERR_FILE jq-alt-retry-sweep-jq-err
+mk_tmp SUCC_ERR_FILE jq-alt-retry-sweep-succ-err
 printf '1' > "$STDIN_FILE"
 printf '%s' "$RETRY_INPUT" > "$RETRY_STDIN_FILE"
 
@@ -299,10 +313,10 @@ run_case() {
   total=$((total + 1))
 
   local jq_out jq_err jq_code succ_out succ_err succ_code
-  jq_out="$("$JQ" -c "$filter" <"$stdin_file" 2>/tmp/jq-alt-retry-sweep.err)" && jq_code=0 || jq_code=$?
-  jq_err="$(cat /tmp/jq-alt-retry-sweep.err)"
-  succ_out="$("$SUCC" jq -c "$filter" <"$stdin_file" 2>/tmp/succ-alt-retry-sweep.err)" && succ_code=0 || succ_code=$?
-  succ_err="$(cat /tmp/succ-alt-retry-sweep.err)"
+  jq_out="$("$JQ" -c "$filter" <"$stdin_file" 2>"$JQ_ERR_FILE")" && jq_code=0 || jq_code=$?
+  jq_err="$(cat "$JQ_ERR_FILE")"
+  succ_out="$("$SUCC" jq -c "$filter" <"$stdin_file" 2>"$SUCC_ERR_FILE")" && succ_code=0 || succ_code=$?
+  succ_err="$(cat "$SUCC_ERR_FILE")"
 
   if [[ "$jq_out" != "$succ_out" || "$jq_err" != "$succ_err" || "$jq_code" != "$succ_code" ]]; then
     diverged=$((diverged + 1))
@@ -360,9 +374,8 @@ done
 # constructs navigate `.a`. Entries are `LABEL::TAG::TEMPLATE`, like R_ENTRIES
 # (slice 7 closed every one, so none is tagged now).
 COND_INPUT='{"a":{"a":1}}'
-COND_STDIN_FILE="$(mktemp -t jq-alt-retry-sweep-cond-stdin)"
+mk_tmp COND_STDIN_FILE jq-alt-retry-sweep-cond-stdin
 printf '%s' "$COND_INPUT" > "$COND_STDIN_FILE"
-trap 'rm -f "$STDIN_FILE" "$RETRY_STDIN_FILE" "$COND_STDIN_FILE" /tmp/jq-alt-retry-sweep.err /tmp/succ-alt-retry-sweep.err' EXIT
 T_VARIANTS=(
   '([1] as $q ?// $b | ("A"|stderr) | $q)'
   '([1] as $q ?// $b | ("A"|stderr) | $q // empty)'
@@ -522,6 +535,84 @@ for rc_entry in "${RC_ENTRIES[@]}"; do
     done
   done
 done
+
+# #3293 slice 5 (path-mode computed index): a `?//` in `.[K]`'s key whose first
+# alternative is an array, so indexing the object fails at the sink, and whose
+# retry is the string key. The key generators' endings: the retry answers,
+# produces nothing, raises, fails to destructure (the last alternative's error
+# must surface), and -- the last two -- answers first and fails on the retry a
+# consumer's stop causes (the retry raises, or yields an unusable key). Own
+# input, since the constructs index an object. Key generators are not
+# path-tracked by jq, so the plain `("A"|stderr) | ...` marker is safe.
+# Entries are `LABEL::TAG::TEMPLATE`, `__X__` standing for the key.
+IX_INPUT='{"a":{"a":1}}'
+mk_tmp IX_STDIN_FILE jq-alt-retry-sweep-ix-stdin
+printf '%s' "$IX_INPUT" > "$IX_STDIN_FILE"
+IX_VARIANTS=(
+  '([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)'
+  '([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)'
+  '([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)'
+  '([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)'
+)
+IX_STOP_VARIANTS=(
+  '([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)'
+  '([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else ["x"] end)'
+)
+IX_ENTRIES=(
+  'ix-path::::path(.[__X__])'
+  'ix-path-nested::::path(.a | .[__X__])'
+  'ix-path-then-field::::path(.[__X__] | .a)'
+  'ix-path-optional::::path(.[__X__]?)'
+  'ix-del::::del(.[__X__])'
+  'ix-assign::::.[__X__] = 5'
+  'ix-update::::.[__X__] |= 5'
+  'ix-update-nested::::.a[__X__] |= 5'
+  'ix-alt-assign::::.[__X__] //= 1'
+  'ix-add-assign::::.[__X__] += 1'
+  'ix-pick::::pick(.[__X__])'
+  'ix-try::::path(try .[__X__] catch .)'
+  'ix-bind-source::::path(__X__ as $k | .[$k])'
+  'ix-label::::path(label $out | .[__X__])'
+  'ix-comma::::path(.[__X__], .a)'
+  'ix-def::::path(def f: .[__X__]; f)'
+  'ix-first::::path(first(.[__X__]))'
+  'ix-limit::::path(limit(1; .[__X__]))'
+  'ix-alt::::path(.[__X__] // .a)'
+  'ix-if::::path(if true then .[__X__] else . end)'
+  'ix-select::::path(.a | select(.a) | .[__X__])'
+  'ix-untracked::::path(1 | .[__X__])'
+  'ix-reduce::::path(reduce 1 as $x (.; .[__X__]))'
+  'ix-recurse::::[path(recurse(if type == "object" then .[__X__] else empty end))]'
+  'ix-walk-paths::::path(.. | select(type == "object") | .[__X__])'
+  # `paths(f)` evaluates `f` once per path and never retries (#3366), whatever
+  # `f` is; the index is only the failing operation.
+  'ix-paths::#3366::paths(.[__X__])'
+)
+# Path-mode `foreach` evaluates its UPDATE before a consumer can stop it
+# (#3507), so a `?//` in the UPDATE is never asked to retry on a stop: only the
+# stop variants under a `first`/`limit` consumer diverge, and only for that
+# reason. The endings that need no stop are swept untagged.
+IX_FOREACH_TEMPLATE='path(foreach 1 as $x (.; .[__X__]))'
+run_ix_family() {
+  local label="$1" tag="$2" template="$3"; shift 3
+  local x filled c
+  for x in "$@"; do
+    filled="${template//__X__/$x}"
+    for c in "${R_CONSUMERS[@]}"; do
+      run_case "$label" "${c//__W__/$filled}" "$tag" "$IX_STDIN_FILE"
+    done
+  done
+}
+for ix_entry in "${IX_ENTRIES[@]}"; do
+  ix_rest="$ix_entry"
+  ix_label="${ix_rest%%::*}"
+  ix_rest="${ix_rest#*::}"
+  ix_tag="${ix_rest%%::*}"
+  ix_template="${ix_rest#*::}"
+  run_ix_family "$ix_label" "$ix_tag" "$ix_template" "${IX_VARIANTS[@]}" "${IX_STOP_VARIANTS[@]}"
+done
+run_ix_family ix-foreach '' "$IX_FOREACH_TEMPLATE" "${IX_VARIANTS[@]}"
+run_ix_family ix-foreach-stop '#3507' "$IX_FOREACH_TEMPLATE" "${IX_STOP_VARIANTS[@]}"
 
 printf '%s' "$divergence_log"
 echo "== $total cases vs $JQ: $unexpected unexpected, $((diverged - unexpected)) known, $((total - diverged)) matched =="

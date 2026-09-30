@@ -20886,8 +20886,19 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
     // read as nothing, not as a real `"zz"` position, inside this operand).
     let mut targets: LazyTargetSteps<V> = None;
     let was_read_only = yq_read_only_context::active();
-    let mut walk_error: Option<Control> = None;
-    let components_control = path_context_component_each::<S, V>(key, pos, &mut |component| {
+    // #3293: a [`StashedEscape`], not a bare slot. It answers `Demand::Stop`
+    // to the key's generator, and a `?//` inside the key retries past that
+    // stop (#1519), so it can describe an alternative jq has abandoned --
+    // `.[([["a"]] as [$q] ?// [[$q]] | $q)] | key` on `{"a":{"a":1}}` is
+    // `"a"`, the second alternative's key, with no error from the first's
+    // `["a"]` (jq 1.7.1's `path(..) | last`; `key` is succinctly's). A retry
+    // that yields another key re-invokes the sink, whose `begin` drops the
+    // stash; one that yields nothing or raises is recognised from the key
+    // generator's `Flow`.
+    let walk_error = StashedEscape::new();
+    let key_direct_retry = crate::jq::eval::direct_pattern_retry(key);
+    let components_flow = path_context_component_flow::<S, V>(key, pos, &mut |component| {
+        walk_error.begin();
         let _scope = was_read_only.then(yq_read_only_context::enter);
         let (targets, _) = targets.get_or_insert_with(|| {
             let mut t = Vec::new();
@@ -20904,7 +20915,7 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
                     };
                     match path_context_step_generic::<S, V>(&step, tpos, out) {
                         Ok(()) => {}
-                        Err(control) => return stop_with_escape(&mut walk_error, control),
+                        Err(control) => return walk_error.stop(control),
                     }
                 }
                 // A component no navigation can take (`null`, a boolean, a
@@ -20918,19 +20929,19 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
                         path_node_type_name::<V>(&tpos.node),
                         &component,
                     ));
-                    return stop_with_escape(&mut walk_error, err);
+                    return walk_error.stop(err);
                 }
             }
         }
         Demand::Continue
     });
-    if let Some(control) = walk_error {
+    if let Some(control) = walk_error.take(&components_flow, key_direct_retry) {
         return Err(control);
     }
     // The key stream's own escape (a `halt` after some keys, #1897) is
     // reported after every position the keys before it reached -- jq's
     // key-outer/target-inner order -- and the target's after that.
-    if let Some(control) = components_control {
+    if let Flow::Escaped(control) = components_flow {
         return Err(path_context_component_escape::<S, V>(
             out,
             produced_from,
