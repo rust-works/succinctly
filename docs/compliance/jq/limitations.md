@@ -638,13 +638,45 @@ raises in jq and now here). What it leaves:
   bound that *is* a `?//` bind is covered, and one behind a comma (`.[(0, ([[1]] as [$a] ?//
   $b | $a // empty)):]`) keeps the previous error when its retry produces nothing or raises.
   The same holds for `path(f)`'s consumer stop, whose operand is the whole path expression.
-- **A computed index** (`path(.[K])`, `del(.[K])`) keeps its own bare slots in
-  `resolve_index_expr_sink`: `[first(path(.[([0] as [$a] ?// $b | if $a == null then "x"
-  else $a end)])), 9]` is `[[0],9]` here where jq raises. Unchanged by this slice.
+- **A computed index** (`path(.[K])`, `del(.[K])`) kept its own bare slots in
+  `resolve_index_expr_sink` at this slice; the next section closes it.
 - **Value mode never retries on a consumer's stop through a slice bound** (#3471):
   `[first(.[([1] as [$a] ?// $b | if $a == null then "x" else $a end):]), 9]` is `[[20,30],9]`
   here where jq retries and raises -- `eval_slice_expr` collects before the consumer sees an
   output, the #2180 "materialized before the consumer" family.
+
+## Path-mode computed index and a `?//` retry (#3293)
+
+A `?//` in a computed index's key under `path`/`del`/`=`/`|=`/`+=`/`//=`/`pick` retries past the
+indexing error its first alternative hit, as jq's does (`del(.[([["a"]] as [$q] ?// [[$q]] |
+$q)])` on `{"a":{"a":1}}` is `{}`, was "Cannot index object with array"), and a consumer's
+`first`/`limit` stop is retried past the same way (`[first(path(.[([["a"]] as [$q] ?// $b | if
+$q then "a" else error("E2") end)])), 9]` raises `E2` in jq and now here). Everything that
+reaches the index sink follows: `try`, `label`, `def`, comma, `//`, `select`, `reduce` and
+`recurse` over it. The cursor route's `key`/`path` walk (`path_context_step_computed_index`)
+follows too. What it leaves:
+
+- **`no_std` recognises only a direct bind**, for the reason the fold section above gives: a
+  key that *is* a `?//` bind is covered, and one behind a comma or a pipe keeps the previous
+  answer there.
+- **`key` after a computed index over an owned input** takes the owned-identity walk, which
+  keeps the abandoned alternative's key and evaluates the key generator once more than jq does
+  (`{"a":{"a":1}} | .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] | key` prints `AAA`
+  where the cursor route and jq's `path(...) | last` print `AA`). `key` is a succinctly
+  extension, so the oracle is jq's `path()` spelling. Recorded on #3293 for its closing slice,
+  with the slice 6 and 7 variants.
+- **`first(.[K] | key)` on the cursor route** collects the walk's positions before the
+  consumer can stop it, so a retry that only a stop would trigger is never made -- the #2180
+  "materialized before the consumer" family, with #3470.
+- **Path-mode `foreach` evaluates its UPDATE before a consumer can stop it** (#3507):
+  `[first(path(foreach 1 as $x (.; .[K]))), 9]` with a key whose retry raises after a satisfied
+  first alternative is `[["a"],9]` after a single attempt here and an error in jq. Not a stale
+  slot: no retry happens at all.
+- **`paths(f)` evaluates `f` once per path, with no retry** (#3366): `paths(.[K])` is jq's
+  `["a"]` and an error here.
+- **An array key on an array is unimplemented** (#3506): jq's `.[[2]]` is a subarray search,
+  and `path(.[[2]])`, `del(.[[2]])` and `.[[2]] = 5` have answers of their own; succinctly
+  refuses all of them with "Cannot index array with array", with or without a `?//`.
 
 ## Path-mode `if`/`select` conditions and a `?//` retry (#3293)
 
