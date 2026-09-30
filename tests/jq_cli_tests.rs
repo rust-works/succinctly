@@ -77555,6 +77555,472 @@ fn test_path_context_cond_retry_supersedes_stashed_verdict_3293() -> Result<()> 
     )
 }
 
+/// #3293 slice 8a: a `?//` retry inside the *source* of a path-mode `as` bind
+/// (`path(SRC as $y | BODY)`) supersedes the verdict the retried-past
+/// alternative left in `resolve_bind_source_sink`'s stash. The source's first
+/// alternative binds an array, which `.[$y:]` refuses; the retry answers,
+/// produces nothing, raises, or fails to destructure. `first`/`limit` rows pin
+/// a consumer's own stop, the write rows (`del`, `|=`, `=`, `//=`, `pick`) the
+/// shared resolver's accept direction. Controls: no `?//` at all, `?`, and a
+/// `halt_error` in the source, which is never retried. Input `[10,20,30]`;
+/// every value captured from jq 1.7.1 with `-c`.
+const RETRY_ROWS_PATH_BIND_SOURCE_3293: &[RetryRow3293] = &[
+    // bind-source
+    (
+        r#"path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q) as $y | .[$y:])"#,
+        "[{\"start\":null,\"end\":null}]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty) as $y | .[$y:])"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end) as $y | .[$y:])"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(([1] as $q ?// {$z} | ("A"|stderr) as $_ | $q) as $y | .[$y:])"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q) as $y | if $y then error("E") else .[0:] end)"#,
+        "[{\"start\":0,\"end\":null}]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q) as $y | .[$y:])), 9]"#,
+        "[[{\"start\":null,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end) as $y | .[$y:])), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q) as $y | .[$y:])), 9]"#,
+        "[[{\"start\":null,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end) as $y | .[$y:])), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q) as $y | .[$y:]), 9]"#,
+        "[[{\"start\":null,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end) as $y | .[$y:]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"del(([1] as $q ?// $b | ("A"|stderr) as $_ | $q) as $y | .[$y:])"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(([1] as $q ?// $b | ("A"|stderr) as $_ | $q) as $y | .[$y:]) |= ["x"]"#,
+        "[\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(([1] as $q ?// $b | ("A"|stderr) as $_ | $q) as $y | .[$y:]) = ["x"]"#,
+        "[\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty) as $y | .[$y:]) //= 1"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"pick(([1] as $q ?// $b | ("A"|stderr) as $_ | $q) as $y | .[$y:])"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end) as $y | .[$y:])"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r"path(1 as $y | .[[$y]:])",
+        "",
+        "",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"path((([1] as $q ?// $b | ("A"|stderr) as $_ | $q) | if . then halt_error else . end) as $y | .[0:])"#,
+        "",
+        "A",
+        "[1]",
+        5,
+    ),
+    (
+        r#"[path(([1] as $q ?// $b | ("A"|stderr) as $_ | $q) as $y | .[$y:])?, 9]"#,
+        "[[{\"start\":null,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+/// #3293 slice 8a: a `?//` retry in a path-mode `reduce`/`foreach`'s *source*
+/// or INIT supersedes the verdicts the retried-past alternative left in
+/// `resolve_reduce`/`resolve_foreach` (`aborted`, the source step's escape;
+/// `fork_outcome`, the INIT fork's). The source's first alternative binds an
+/// array that `.[$x:]` refuses (for INIT, the first alternative's fork
+/// raises in UPDATE); the retry answers, produces nothing, raises, or -- for
+/// INIT -- fails to destructure. A destructuring `?//` alternative *in a
+/// fold source* is left out: jq path-tracks that source and words the last
+/// alternative's error differently (#3489). Input `[10,20,30]`; every value
+/// captured from jq 1.7.1 with `-c`.
+const RETRY_ROWS_PATH_FOLD_3293: &[RetryRow3293] = &[
+    // fold-source
+    (
+        r#"path(reduce (([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)) as $x (.; .[$x:]))"#,
+        "",
+        "AA",
+        "Invalid path expression with result null",
+        5,
+    ),
+    (
+        r#"path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)) as $x (.; .[$x:]))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)) as $x (.; .; .[$x:]))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(reduce (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .[$x:]))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .[$x:]))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .; .[$x:]))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(reduce (([1] as $q ?// $b | ("A"|stderr) as $_ | $q)) as $x (.; .[$x:]))"#,
+        "",
+        "AA",
+        "Invalid path expression near attempt to access element {\"start\":nu... of null",
+        5,
+    ),
+    (
+        r#"path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q)) as $x (.; .[$x:]))"#,
+        "",
+        "AA",
+        "Invalid path expression near attempt to access element {\"start\":nu... of null",
+        5,
+    ),
+    (
+        r#"[first(path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .[$x:]))), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)) as $x (.; .[$x:]))), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .[$x:]))), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)) as $x (.; .[$x:]))), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .[$x:])), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)) as $x (.; .[$x:])), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(reduce (([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)) as $x (.; .[$x:]))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"(foreach (([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)) as $x (.; .[$x:])) |= 5"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(reduce (([1] as $q ?// $b | ("A"|stderr) as $_ | $q)) as $x (.; error("E")))"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (r#"path(reduce 1 as $x (.; error("E")))"#, "", "", "E", 5),
+    (
+        r#"path(reduce (([1] as $q ?// $b | ("A"|stderr) as $_ | $q) | if . then halt_error else . end) as $x (.; .))"#,
+        "",
+        "A",
+        "[1]",
+        5,
+    ),
+    // fold-init
+    (
+        r#"path(reduce 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end); if length>2 then error("E") else . end))"#,
+        "[{\"start\":1,\"end\":null}]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(foreach 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end); if length>2 then error("E") else . end))"#,
+        "[{\"start\":1,\"end\":null}]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(reduce 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else empty end); if length>2 then error("E") else . end))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(foreach 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else empty end); if length>2 then error("E") else . end))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(reduce 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else error("E2") end); if length>2 then error("E") else . end))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(foreach 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else error("E2") end); if length>2 then error("E") else . end))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(reduce 1 as $x (([1] as $q ?// {$z} | ("A"|stderr) as $_ | .); if length>2 then error("E") else . end))"#,
+        "",
+        "A",
+        "Invalid path expression near attempt to access element \"z\" of [1]",
+        5,
+    ),
+    (
+        r#"path(foreach 1 as $x (([1] as $q ?// {$z} | ("A"|stderr) as $_ | .); if length>2 then error("E") else . end))"#,
+        "",
+        "A",
+        "Invalid path expression near attempt to access element \"z\" of [1]",
+        5,
+    ),
+    (
+        r#"path(foreach 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end); .; if length>2 then error("E") else . end))"#,
+        "[{\"start\":1,\"end\":null}]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(foreach 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else error("E2") end); .; if length>2 then error("E") else . end))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(path(reduce 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end); if length>2 then error("E") else . end))), 9]"#,
+        "[[{\"start\":1,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(foreach 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else empty end); if length>2 then error("E") else . end))), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; path(reduce 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end); if length>2 then error("E") else . end))), 9]"#,
+        "[[{\"start\":1,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; path(foreach 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else empty end); if length>2 then error("E") else . end))), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(reduce 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end); if length>2 then error("E") else . end)), 9]"#,
+        "[[{\"start\":1,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(foreach 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else empty end); if length>2 then error("E") else . end)), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(reduce 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end); if length>2 then error("E") else . end))"#,
+        "[10]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(reduce 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end); if length>2 then error("E") else . end)) |= ["x"]"#,
+        "[10,\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"pick(foreach 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end); if length>2 then error("E") else . end))"#,
+        "[20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(foreach 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else error("E2") end); if length>2 then error("E") else . end))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(reduce 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end); error("E")))"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
+        r#"path(reduce 1 as $x (([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then halt_error else . end); .))"#,
+        "",
+        "A",
+        "[10,20,30]",
+        5,
+    ),
+    (
+        r#"path(reduce 1 as $x (.; if length>2 then error("E") else . end))"#,
+        "",
+        "",
+        "E",
+        5,
+    ),
+];
+
+#[test]
+fn test_path_bind_source_retry_supersedes_stashed_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_PATH_BIND_SOURCE_3293)
+}
+
+#[test]
+fn test_path_fold_retry_supersedes_stashed_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_PATH_FOLD_3293)
+}
+
 /// #3293 review: `first`/`limit`/`nth` reset the wrapping sink's stop per
 /// invocation, so after a `?//` retry inside them they report their own
 /// completion rather than a stale `Stopped`. The #1519 rows pin that an
@@ -77966,6 +78432,8 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         (r#"{"a":{"a":1}} | "#, RETRY_ROWS_PATH_COND_3293),
         ("{} | ", RETRY_ROWS_WRAPPER_STOP_3293),
         ("{} | ", RETRY_ROWS_FOLD_3293),
+        ("[10,20,30] | ", RETRY_ROWS_PATH_BIND_SOURCE_3293),
+        ("[10,20,30] | ", RETRY_ROWS_PATH_FOLD_3293),
     ] {
         assert_retry_rows_3293(None, prefix, rows)?;
     }
@@ -77989,6 +78457,9 @@ fn test_retry_sink_reset_leaves_yq_mode_unchanged_3293() -> Result<()> {
         ("(.missing | key) and true", "false"),
         (r#"{"k": .a}"#, r#"{"k":1}"#),
         (".[.k]", "1"),
+        // slice 8a: the path-mode bind source is shared with yq's `=` and `del`
+        ("(.a as $y | .b) = 5", r#"{"a":1,"b":5,"k":"a"}"#),
+        ("del(.a as $y | .b)", r#"{"a":1,"k":"a"}"#),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .args(["yq", "-o", "json", "-I", "0", filter])

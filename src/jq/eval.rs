@@ -39753,9 +39753,10 @@ impl FoldRegister {
 /// those is changing a fold's values too.
 ///
 /// A source with a `?//` re-enters `step` after a stop has been reported
-/// (#1519's retry, seen from the consuming side): the caller resets its
-/// slot on every entry and stashes through [`stop_with_escape`], which is
-/// what keeps a halted step from being retried -- `path(foreach (1 as $x
+/// (#1519's retry, seen from the consuming side): the caller keeps a
+/// [`StashedEscape`] that resets on every entry and stashes through
+/// [`stop_with_escape`]'s marking, which is what keeps a halted step from
+/// being retried -- `path(foreach (1 as $x
 /// ?// $y | 1) as $v (.; stderr | error("u")))` on `1` writes `1null` then
 /// raises `u` in jq 1.7.1 (the retry runs the step on the reset state),
 /// while the same shape with `halt_error` halts once.
@@ -39771,7 +39772,7 @@ fn drive_fold_source<S: EvalSemantics>(
     ambient: &FoldSourceAmbient<'_>,
     relocate_base: Option<&Rc<PathPrefix>>,
     step: &mut dyn FnMut(FoldSourceValue) -> Demand,
-) -> Option<Control> {
+) -> Flow {
     let has_navigation = any_subexpr(source, &mut |e| {
         matches!(
             e,
@@ -39792,9 +39793,9 @@ fn drive_fold_source<S: EvalSemantics>(
             &ambient.frame,
             Keep::First,
         ) {
-            Err((_, e @ EvalEscape::Halt(_))) => Some(e.into()),
+            Err((_, e @ EvalEscape::Halt(_))) => Flow::Escaped(e.into()),
             Err((_, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => {
-                Some(Control::Error(e))
+                Flow::Escaped(Control::Error(e))
             }
             _ => drive_fold_source_by_value::<S>(source, ambient.value, ambient.trackable, step),
         };
@@ -39823,8 +39824,9 @@ fn drive_fold_source<S: EvalSemantics>(
         },
     );
     match flow {
-        ResolveFlow::Exhausted | ResolveFlow::Stopped => None,
-        ResolveFlow::Escaped(e) => Some(e.into()),
+        ResolveFlow::Exhausted => Flow::Exhausted,
+        ResolveFlow::Stopped => Flow::Stopped { pending: None },
+        ResolveFlow::Escaped(e) => Flow::Escaped(e.into()),
     }
 }
 
@@ -39836,8 +39838,8 @@ fn drive_fold_source_by_value<S: EvalSemantics>(
     value: &OwnedValue,
     trackable: bool,
     step: &mut dyn FnMut(FoldSourceValue) -> Demand,
-) -> Option<Control> {
-    match eval_each_owned::<S>(
+) -> Flow {
+    eval_each_owned::<S>(
         source,
         value,
         false,
@@ -39848,10 +39850,7 @@ fn drive_fold_source_by_value<S: EvalSemantics>(
                 register_path: None,
             })
         },
-    ) {
-        Flow::Exhausted | Flow::Stopped { .. } => None,
-        Flow::Escaped(control) => Some(control),
-    }
+    )
 }
 
 /// A fold's verdict once [`drive_fold_source`] returns: the step's own
@@ -39859,16 +39858,27 @@ fn drive_fold_source_by_value<S: EvalSemantics>(
 /// no trailing escape; an escaped drive never stopped), and reclaiming the
 /// stash clears the non-retryable side channel [`stop_with_escape`] set,
 /// the same way [`resume_from_escape`] does for a [`Flow`]-shaped reclaim.
-fn reclaim_fold_escape(aborted: Option<Control>, source: Option<Control>) -> Option<Control> {
-    if aborted.is_some() {
+fn reclaim_fold_escape(
+    aborted: StashedEscape,
+    source: Flow,
+    direct_retry: bool,
+) -> Option<Control> {
+    // #3293: a `?//` in the source that retried past the step's stop and then
+    // produced nothing, or raised, supersedes the stash (`take`); a retry that
+    // emitted again already reset it at the top of the step.
+    if let Some(control) = aborted.take(&source, direct_retry) {
         // `nonretryable_stop::clear()` directly, as `resume_from_escape`
         // does -- not `clear_nonretryable_stop()`, which since #2691 also
         // announces a `?//` attempt to `resolve_terminal`'s sink. A reclaim
         // is not an attempt, and bumping here would let a producer that
         // drove past `Demand::Stop` after a fold-step escape slip the check.
         nonretryable_stop::clear();
+        return Some(control);
     }
-    aborted.or(source)
+    match source {
+        Flow::Escaped(control) => Some(control),
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+    }
 }
 
 /// One value a fold's source stream produced, alongside whether *that
@@ -40095,20 +40105,34 @@ fn resolve_bind_source_sink<S: EvalSemantics>(
         };
     }
 
-    let mut stashed: Option<ResolveFlow> = None;
+    // #3293: a [`StashedVerdict`], as in `resolve_cond_fork_stream`. A `?//`
+    // inside `source` retries past the stop `bind` answered (#1519); a retry
+    // that emits again drops the stale answer at the top of the sink, and one
+    // that produces nothing or raises supersedes it at the exit.
+    // `path(([1] as $q ?// $b | $q) as $y | .[$y:])` is a slice in jq 1.7.1,
+    // not the abandoned alternative's "slice indices must be integers".
+    let stashed: StashedVerdict<ResolveFlow> = StashedVerdict::new();
     let flow = eval_each_owned::<S>(
         source,
         value,
         false,
         Reentry::at_register(trackable),
-        &mut |bound| match bind(bound, None) {
-            ResolveFlow::Exhausted => Demand::Continue,
-            other => {
-                stashed = Some(other);
-                Demand::Stop
+        &mut |bound| {
+            stashed.begin();
+            match bind(bound, None) {
+                ResolveFlow::Exhausted => Demand::Continue,
+                other => {
+                    if let ResolveFlow::Escaped(escape) = &other {
+                        mark_nonretryable_escape(&Control::from(escape.clone()));
+                    }
+                    stashed.stash(other);
+                    Demand::Stop
+                }
             }
         },
     );
+    let direct_retry = direct_pattern_retry(source);
+    let stashed = stashed.take_unless(|at| retry_superseded(&flow, at, direct_retry));
     resolve_stream_flow(flow, stashed)
 }
 
@@ -41616,7 +41640,7 @@ fn settle_fold_alternative(
     is_last: bool,
     elem: &FoldSourceValue,
     reg: &FoldRegister,
-    aborted: &mut Option<Control>,
+    aborted: &StashedEscape,
 ) -> FoldStepOutcome {
     if let Some(outcome) = outcome {
         return outcome;
@@ -41630,7 +41654,7 @@ fn settle_fold_alternative(
             if walk_escape_retries(&control, is_last, fold_walk_refusal_is_guess(elem, reg)) {
                 FoldStepOutcome::Retry
             } else {
-                FoldStepOutcome::Return(stop_with_escape(aborted, control))
+                FoldStepOutcome::Return(aborted.stop(control))
             }
         }
     }
@@ -41704,8 +41728,11 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     let mut fork_index = 0usize;
     // Set by the sink when a fork ends the whole call; it outranks INIT's
     // own trailing escape, which jq never reaches once a consumer has
-    // stopped.
-    let mut fork_outcome: Option<ResolveFlow> = None;
+    // stopped. A [`StashedVerdict`] (#3293): a `?//` in INIT retries past the
+    // stop a fork answered (#1519), and a retry that emits again resets the
+    // stash at the top of `drive_fork`, one that produces nothing or raises
+    // supersedes it after the drive.
+    let fork_outcome: StashedVerdict<ResolveFlow> = StashedVerdict::new();
 
     // Shared across every INIT fork (#695), same "whole tree, not
     // per-branch" accounting `eval_reduce` itself uses.
@@ -41719,6 +41746,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     let alternatives = alternative_names.as_deref();
     let mut drive_fork = |init_branch: PathBranch<'a>| -> Demand {
         let init_branch = &init_branch;
+        fork_outcome.begin(); // #3293
         let fork_index = {
             let i = fork_index;
             fork_index += 1;
@@ -41762,7 +41790,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // result {...}" on both binaries, before and after this change) —
         // that boundary is the canary this seeding must not move.
         let mut acc_snapshot = accumulator_provenance::<S>(init_branch, frame);
-        let mut aborted: Option<Control> = None;
+        let aborted: StashedEscape = StashedVerdict::new();
         // #2031: unlike `resolve_foreach` below, every step here is checked
         // against the fold's own persistent `reg`, never a per-step
         // register seeded from a trackable source element — confirmed live
@@ -41818,12 +41846,15 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // before. `aborted` is this
         // driver's out-of-band escape slot, reset on every entry because a
         // `?//` in the source re-enters the callback after a stop was
-        // already reported (`foreach_forks`'s `ended` is the same slot, generation-stamped since
-        // #3293; this one is not yet).
-        let source_control = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
-            aborted = None;
+        // already reported (`foreach_forks`'s `ended` is the same slot). A
+        // [`StashedEscape`] since #3293: a retry that emits again resets it at
+        // the top of the step, and one that produces nothing or raises never
+        // re-enters the step, so [`reclaim_fold_escape`] supersedes it against
+        // the source drive's own verdict.
+        let source_flow = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
+            aborted.begin();
             if let Some(control) = charge_budget(&mut budget, "reduce") {
-                return stop_with_escape(&mut aborted, control);
+                return aborted.stop(control);
             }
             // #2979: one attempt per `?//` alternative, in order -- jq's
             // `bind_alternation_matchers` wraps the whole step (pattern,
@@ -41927,10 +41958,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                         if let Some(control) =
                             charge_alternative_update(&mut budget, &mut ran_update, "reduce")
                         {
-                            outcome = Some(FoldStepOutcome::Return(stop_with_escape(
-                                &mut aborted,
-                                control,
-                            )));
+                            outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                             return Demand::Stop;
                         }
                         match reg.resolve::<S>(
@@ -41982,24 +42010,23 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                 outcome = Some(if path_alternative_retries(&e, is_last) {
                                     FoldStepOutcome::Retry
                                 } else {
-                                    FoldStepOutcome::Return(stop_with_escape(
-                                        &mut aborted,
-                                        e.into(),
-                                    ))
+                                    FoldStepOutcome::Return(aborted.stop(e.into()))
                                 });
                                 Demand::Stop
                             }
                         }
                     },
                 );
-                match settle_fold_alternative(outcome, walk, is_last, &elem, &reg, &mut aborted) {
+                match settle_fold_alternative(outcome, walk, is_last, &elem, &reg, &aborted) {
                     FoldStepOutcome::Retry => continue,
                     FoldStepOutcome::Return(demand) => return demand,
                 }
             }
             unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every arm of the loop's last iteration returns -- a walk refusal, an exhausted walk, and a step outcome that never retries on the last alternative (#2979, #2872)"
         });
-        if let Some(control) = reclaim_fold_escape(aborted, source_control) {
+        if let Some(control) =
+            reclaim_fold_escape(aborted, source_flow, direct_pattern_retry(input))
+        {
             // The stop this fork answers is *not* retryable: a `?//` in INIT
             // would otherwise take it for an ordinary satisfied-consumer stop
             // and try its next alternative, running the fold again past a
@@ -42009,7 +42036,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             // `stop_with_escape` makes for the fold's own inner escapes --
             // this is the one escape that leaves through INIT's sink instead.
             mark_nonretryable_escape(&control);
-            fork_outcome = Some(ResolveFlow::Escaped(control.into()));
+            fork_outcome.stash(ResolveFlow::Escaped(control.into()));
             return Demand::Stop;
         }
         // Final emission: the accumulator, re-checked against the
@@ -42052,7 +42079,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // surrounding doc comment for why a trackable-but-not-at-register
         // accumulator still needs it).
         if emit_branches(reg.relocate(vec![final_branch], true), sink) == Demand::Stop {
-            fork_outcome = Some(ResolveFlow::Stopped);
+            fork_outcome.stash(ResolveFlow::Stopped);
             return Demand::Stop;
         }
         Demand::Continue
@@ -42066,7 +42093,12 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         keep,
         &mut drive_fork,
     );
-    if let Some(outcome) = fork_outcome {
+    // #3293: a `?//` in INIT that retried past the stop a fork answered and
+    // then produced nothing, or raised, supersedes that fork's stash.
+    let init_direct_retry = direct_pattern_retry(init);
+    if let Some(outcome) =
+        fork_outcome.take_unless(|at| resolve_retry_superseded(&init_flow, at, init_direct_retry))
+    {
         return outcome;
     }
     match init_flow {
@@ -42130,8 +42162,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     let mut fork_index = 0usize;
     // Set by the sink when a fork ends the whole call; it outranks INIT's
     // own trailing escape, which jq never reaches once a consumer has
-    // stopped.
-    let mut fork_outcome: Option<ResolveFlow> = None;
+    // stopped. A [`StashedVerdict`] (#3293): a `?//` in INIT retries past the
+    // stop a fork answered (#1519), and a retry that emits again resets the
+    // stash at the top of `drive_fork`, one that produces nothing or raises
+    // supersedes it after the drive.
+    let fork_outcome: StashedVerdict<ResolveFlow> = StashedVerdict::new();
 
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
     // #2388: see `resolve_reduce`'s identical hoist.
@@ -42141,6 +42176,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     let alternatives = alternative_names.as_deref();
     let mut drive_fork = |init_branch: PathBranch<'a>| -> Demand {
         let init_branch = &init_branch;
+        fork_outcome.begin(); // #3293
         let fork_index = {
             let i = fork_index;
             fork_index += 1;
@@ -42173,7 +42209,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // document root, which is what the filed repro's `getpath(["a"])`
         // composes against inside UPDATE.
         let mut state_snapshot = accumulator_provenance::<S>(init_branch, frame);
-        let mut aborted: Option<Control> = None;
+        let aborted: StashedEscape = StashedVerdict::new();
         // The source is driven by demand (#2235): each element is folded
         // here, inside the drive, before the next one is pulled, so a step
         // that raises stops the source with nothing past it evaluated --
@@ -42183,8 +42219,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // the elements before it still stream (#1872). `aborted` is this
         // driver's out-of-band escape slot, reset on every entry because a
         // `?//` in the source re-enters the callback after a stop was
-        // already reported (`foreach_forks`'s `ended` is the same slot, generation-stamped since
-        // #3293; this one is not yet).
+        // already reported (`foreach_forks`'s `ended` is the same slot). A
+        // [`StashedEscape`] since #3293: a retry that emits again resets it at
+        // the top of the step, and one that produces nothing or raises never
+        // re-enters the step, so [`reclaim_fold_escape`] supersedes it against
+        // the source drive's own verdict.
         // Every emission goes straight to the sink, so a terminal
         // consumer's refusal of the first output -- or an outer bound's
         // stop -- ends the drive right there. `downstream_stopped` is reset
@@ -42197,11 +42236,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // ?// $y | (stderr|1)) as $v (.; .)))]` is `[[],[]]` in jq 1.7.1)
         // is not reproduced; see limitations.md.
         let mut downstream_stopped = false;
-        let source_control = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
+        let source_flow = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
             downstream_stopped = false;
-            aborted = None;
+            aborted.begin();
             if let Some(control) = charge_budget(&mut budget, "foreach") {
-                return stop_with_escape(&mut aborted, control);
+                return aborted.stop(control);
             }
             // #2979: one attempt per `?//` alternative, in order -- see
             // `resolve_reduce`'s identical loop for jq's backtracking rules
@@ -42388,10 +42427,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         if let Some(control) =
                             charge_alternative_update(&mut budget, &mut ran_update, "foreach")
                         {
-                            outcome = Some(FoldStepOutcome::Return(stop_with_escape(
-                                &mut aborted,
-                                control,
-                            )));
+                            outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                             return Demand::Stop;
                         }
                         // An UPDATE escape still delivers the outputs before it, as
@@ -42438,10 +42474,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             state = update_branch.value.clone().into_owned();
                             if let Some(ext_expr) = &bound_extract {
                                 if let Some(control) = charge_budget(&mut budget, "foreach") {
-                                    outcome = Some(FoldStepOutcome::Return(stop_with_escape(
-                                        &mut aborted,
-                                        control,
-                                    )));
+                                    outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
                                     return Demand::Stop;
                                 }
                                 let extract_reg =
@@ -42482,10 +42515,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                         outcome = Some(if path_alternative_retries(&e, is_last) {
                                             FoldStepOutcome::Retry
                                         } else {
-                                            FoldStepOutcome::Return(stop_with_escape(
-                                                &mut aborted,
-                                                e.into(),
-                                            ))
+                                            FoldStepOutcome::Return(aborted.stop(e.into()))
                                         });
                                         return Demand::Stop;
                                     }
@@ -42524,14 +42554,14 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             outcome = Some(if path_alternative_retries(&e, is_last) {
                                 FoldStepOutcome::Retry
                             } else {
-                                FoldStepOutcome::Return(stop_with_escape(&mut aborted, e.into()))
+                                FoldStepOutcome::Return(aborted.stop(e.into()))
                             });
                             return Demand::Stop;
                         }
                         Demand::Continue
                     },
                 );
-                match settle_fold_alternative(outcome, walk, is_last, &elem, &reg, &mut aborted) {
+                match settle_fold_alternative(outcome, walk, is_last, &elem, &reg, &aborted) {
                     FoldStepOutcome::Retry => continue,
                     FoldStepOutcome::Return(demand) => return demand,
                 }
@@ -42542,10 +42572,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // too, applied after its own inner drive — mirrors `eval_foreach`'s
         // #534-follow-up fix exactly.
         if downstream_stopped {
-            fork_outcome = Some(ResolveFlow::Stopped);
+            fork_outcome.stash(ResolveFlow::Stopped);
             return Demand::Stop;
         }
-        if let Some(control) = reclaim_fold_escape(aborted, source_control) {
+        if let Some(control) =
+            reclaim_fold_escape(aborted, source_flow, direct_pattern_retry(input))
+        {
             // The stop this fork answers is *not* retryable: a `?//` in INIT
             // would otherwise take it for an ordinary satisfied-consumer stop
             // and try its next alternative, running the fold again past a
@@ -42555,7 +42587,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             // `stop_with_escape` makes for the fold's own inner escapes --
             // this is the one escape that leaves through INIT's sink instead.
             mark_nonretryable_escape(&control);
-            fork_outcome = Some(ResolveFlow::Escaped(control.into()));
+            fork_outcome.stash(ResolveFlow::Escaped(control.into()));
             return Demand::Stop;
         }
         Demand::Continue
@@ -42569,7 +42601,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         keep,
         &mut drive_fork,
     );
-    if let Some(outcome) = fork_outcome {
+    // #3293: a `?//` in INIT that retried past the stop a fork answered and
+    // then produced nothing, or raised, supersedes that fork's stash.
+    let init_direct_retry = direct_pattern_retry(init);
+    if let Some(outcome) =
+        fork_outcome.take_unless(|at| resolve_retry_superseded(&init_flow, at, init_direct_retry))
+    {
         return outcome;
     }
     match init_flow {
@@ -102689,6 +102726,73 @@ mod tests {
             ),
         ] {
             let (got, got_end) = outputs_and_end(br#"{"a":{"a":1}}"#, filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(
+                (got.as_slice(), got_end.as_str()),
+                (values, end),
+                "`{filter}`"
+            );
+        }
+    }
+
+    /// #3293 slice 8a: the path-mode `as` bind source
+    /// (`resolve_bind_source_sink`) and the path-mode folds' source and INIT
+    /// stashes (`resolve_reduce`/`resolve_foreach`'s `aborted` and
+    /// `fork_outcome`) are reached through the library `eval()` as well, and
+    /// their `no_std` builds read [`direct_pattern_retry`] of the generator
+    /// they drive. A `?//` retry that answers, produces nothing, or raises
+    /// supersedes the failure the abandoned alternative stopped on; a halt is
+    /// never superseded. Captured from jq 1.7.1 with `-c` over `[10,20,30]`.
+    #[test]
+    fn test_path_bind_source_and_fold_retry_supersedes_stashed_verdict_3293() {
+        for (filter, values, end) in [
+            (
+                r"path(([1] as $q ?// $b | $q) as $y | .[$y:])",
+                &[r#"[{"start":null,"end":null}]"#][..],
+                "",
+            ),
+            (
+                r"path(([1] as $q ?// $b | $q // empty) as $y | .[$y:])",
+                &[][..],
+                "",
+            ),
+            (
+                r#"path(([1] as $q ?// $b | $q | if . == null then error("E2") else . end) as $y | .[$y:])"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r"path(([1] as $q ?// {$z} | $q) as $y | .[$y:])",
+                &[][..],
+                r#"error: Cannot index array with string "z""#,
+            ),
+            (
+                r#"path(reduce ([1] as $q ?// $b | $q | if . == null then error("E2") else . end) as $x (.; .[$x:]))"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r"[path(foreach ([1] as $q ?// $b | $q // empty) as $x (.; .[$x:]))]",
+                &["[]"][..],
+                "",
+            ),
+            (
+                r#"path(reduce 1 as $x (([1] as $q ?// $b | if $q then . else .[1:] end); if length>2 then error("E") else . end))"#,
+                &[r#"[{"start":1,"end":null}]"#][..],
+                "",
+            ),
+            (
+                r#"path(foreach 1 as $x (([1] as $q ?// $b | if $q then . else error("E2") end); if length>2 then error("E") else . end))"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r#"path(([1] as $q ?// $b | if $q then ("h"|halt_error(3)) else . end) as $y | .[0:])"#,
+                &[][..],
+                "halt: 3",
+            ),
+        ] {
+            let (got, got_end) = outputs_and_end(b"[10,20,30]", filter);
             let got: Vec<&str> = got.iter().map(String::as_str).collect();
             assert_eq!(
                 (got.as_slice(), got_end.as_str()),
