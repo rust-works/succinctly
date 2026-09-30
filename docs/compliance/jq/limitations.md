@@ -1254,7 +1254,7 @@ is the revert that established what the other one costs.
    answers `["c"]` on both
    ([#3136](https://github.com/rust-works/succinctly/issues/3136)).
 
-   Eleven rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
+   Ten rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
    (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
 
    #3049 moved `path(.a as $y | .a | tojson | fromjson | $y)` to the accepting
@@ -1268,11 +1268,28 @@ is the revert that established what the other one costs.
    | `path((.a \| select(.b)) as $y \| .a \| $y)`             | `["a"]`                     | the witness grammar is pure navigation; a `select`-wrapped source binds by value                                                                                                                                          |
    | `path((.a // 1) as $y \| .a \| $y)`                      | `["a"]`                     | same: a `//` source binds by value                                                                                                                                                                                        |
    | `path((if .a then .a else .b end) as $y \| .a \| $y)`    | `["a"]`                     | same: an `if` source binds by value                                                                                                                                                                                       |
-   | `path(.a? as $y \| .a \| $y)`                            | `["a"]`                     | a `?` step is a distinct path component, so it never matches the plain spelling on either side (spelling, not node identity)                                                                                              |
+   | `path(.a? as $y \| .a \| $y)`                            | `["a"]`                     | a `?` on the bind *source* is outside the witness grammar, so it binds by value (a `?` on a later step agrees since #3464)                                                                                                |
    | `path(.a[0:3] as $y \| .a \| $y)` on `{"a":[1,2,3]}`     | `["a"]`                     | jq's full slice *is* the array; the bind path ends in a slice component and `.a` does not                                                                                                                                 |
    | `path(.a as $y \| (.c \| $y \| .b) as $w \| .a.b \| $w)` | `["a","b"]`                 | a marker is re-rooted only at the head of a source (`$y.b as $w`, `(($y \| .b) \| .c) as $w`); elsewhere it is certified against the ambient position                                                                     |
-   | `path(.a[1:] as $y \| .a[1:3] \| $y)` on `{"a":[1,2,3]}` | `["a",{"start":1,"end":3}]` | jq's `.a[1:]` and `.a[1:3]` of a 3-array are the same jv (same offset and length); the slice components differ, so the spelling never matches                                                                             |
    | `path(.a as $y \| .a \| 5 \| reduce (1) as $i (0; $y))`  | `["a"]`                     | after a literal the register is only *carried*, and a fold whose INIT is untracked seeds its own register from the ambient literal — pre-existing: `path(. as $x \| 5 \| reduce (1) as $i (0; $x))` refuses too (jq `[]`) |
+
+   **[#3464](https://github.com/rust-works/succinctly/issues/3464), now closed: a position's
+   spelling.** A position minted inside a resolver keeps the spelling of the step that reached
+   it, and `Frame::names` used to compare those spellings, so two routes to one node refused:
+   `path(.a.b as $y | .a | .b? | $y)`, `path(.x[1] as $y | .x[-1] | $y)`, `.x[1.0]`, `.x[1.7]`,
+   `path(.x[-1:] as $y | .x[1:] | $y)`, `path(.a[1:] as $y | .a[1:3] | $y)` on a 3-array. `same_frame_position`
+   (`src/jq/eval.rs`) folds them: a `?` wrapper takes its inner step, an index ignores the spelling it
+   reports itself by, and two indexes or two slices agree when they resolve to the same in-range
+   slot or the same non-empty range of the same array in the invocation's own root
+   (`invocation_roots`, now recorded whenever the frame has a position over a container root).
+   A slice is never folded onto its container (#3494), and an empty range never agrees
+   (`path(.x[5:] as $y | .x[6:] | $y)` refuses in jq too). The emitted path is unchanged. Pinned in
+   `test_resolver_frame_position_is_spelling_insensitive_3464` and
+   `test_resolver_frame_position_spelling_controls_refuse_3464`. What stays refuse-only is not a
+   spelling comparison and refuses with identical spelling on both sides:
+   `first`/`last` (the resolver does not track them), a `?` on the bind *source*, a fractional
+   index on the bind side, and a full-range fractional slice
+   ([#3519](https://github.com/rust-works/succinctly/issues/3519)).
 
    Two related divergences were pre-existing and out of scope for #2042, tracked separately:
    **[#2642](https://github.com/rust-works/succinctly/issues/2642), now closed.** The *root*

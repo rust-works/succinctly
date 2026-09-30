@@ -971,10 +971,9 @@ source-rebuilt-container:the source navigates inside a construction, which jq's 
 select-wrapped-source:the witness grammar is pure navigation (is_pure_navigation); a select-wrapped source binds by value
 alternative-source:the witness grammar is pure navigation; a // source binds by value
 if-source:the witness grammar is pure navigation; an if source binds by value
-optional-source-spelling:a ? component never matches a plain one on either side (path spelling, not node identity)
+optional-source-spelling:a ? on the bind source is outside the witness grammar (is_pure_navigation), so it binds by value; a ? on a later step matches since #3464
 full-slice-is-the-array:jq's full slice is the array itself; the bind path ends in a slice component, .a does not
 marker-not-at-head:a marker is re-rooted only at the head of a source; elsewhere it is certified against the ambient position
-slice-spelling:jq's .a[1:] and .a[1:3] of a 3-array are the same jv; the slice components differ, so the spelling never matches (open-ended twin of full-slice-is-the-array)
 destructure-bind-after-pattern:#2649 residue 1 -- a plain bind on the ambient input after a pattern moved the register: resolve_bind_source needs a trackable stage, and the pattern's body stage is not
 destructure-alt-navigation:#2649 residue 3 -- the body navigates the ambient input, which raises a near-access refusal the artefact guard cannot tell from an artefact, so the ?// does not retry
 destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nested Pipe gets no register, so $q[0] inside a comma raises near-access (limitations.md, #2042)
