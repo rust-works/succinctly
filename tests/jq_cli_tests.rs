@@ -59142,6 +59142,172 @@ fn test_and_or_negate_path_never_writes_where_jq_refuses_3289() -> Result<()> {
     Ok(())
 }
 
+// #3456: one pinned row family per round-2 category from #3289's reviews
+// (PR #3425). The originals are not recoverable (#3456's plan, §0), so these
+// are rebuilt against `/usr/bin/jq` 1.7.1, and every row here passed on
+// `main` when it was pinned: they are the `must-not-write` guard the
+// path-register producer migration (#3456's B1-B3) has to keep green, not a
+// record of a fix. Rows that still diverge from jq are #3428's, and stay out
+// until they are fixed. `scripts/jq-path-register-sweep.py` is the wider net.
+
+/// #3456 (round 2: a catchable refusal). A refusal jq raises inside
+/// `try ... catch` is jq's own error and is handled; the handler's own
+/// output is then not a path, so the write refuses -- it must never fall
+/// through to writing at the root.
+#[test]
+fn test_path_register_catch_handler_output_is_not_a_write_target_3456() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1}"#,
+            r"(try ((.a and .b) | empty) catch 1) |= 9",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(try ((.a and .b) | empty) catch .)",
+            "",
+            r#"Invalid path expression with result "Invalid path expression n"#,
+            5,
+        ),
+    ])
+}
+
+/// #3456 (round 2: `?//` retrying past a resolver refusal, and a stale pipe
+/// `downstream` hiding a retried alternative's error). jq's `?//` retries
+/// only on an error in the *pattern destructure*, so a path error in the body
+/// is final; and that error still surfaces when the body is piped onward.
+#[test]
+fn test_path_register_alt_pattern_body_refusal_is_final_3456() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1}"#,
+            r"del(. as [$x] ?// $y | (.a and .b))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as [$x] ?// $y | (.a and .b) | .c)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of {"a":1}"#,
+            5,
+        ),
+    ])
+}
+
+/// #3456 (round 2: a structurally-equal array copy, or an empty-array slice,
+/// treated as pointer-identical). jq's `.[0:]` hands back the very same
+/// array, but a copy that merely *compares equal* to the register is a
+/// different value to `jv_identical`, and `.[0:0]` is a fresh empty array.
+#[test]
+fn test_path_register_equal_array_copy_is_not_the_register_3456() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r"[[]]",
+            r"del(.[0] as $v | . as $w | .[0:0] | (.[0:0] and true))",
+            "",
+            "Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[[1],[1]]",
+            r"path(.[0] as $v | . as $w | $v | (($w | .[0]) and .[1]))",
+            "",
+            "Invalid path expression with result false",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(.a as $v | . as $w | $v | (($w | .a) and .b))",
+            "",
+            r#"Cannot index array with string "b""#,
+            5,
+        ),
+    ])
+}
+
+/// #3456 (round 2: wrappers dropping a correctly reported register). `?`,
+/// `try` and `first(..)` around an `and` must hand the register on as it
+/// stands, so the later navigation refuses -- or, where jq's own no-write
+/// leaves the document alone, does exactly that.
+#[test]
+fn test_path_register_wrappers_carry_the_register_through_3456() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":true}"#,
+            r"del(.a | (first(.a and true)) | .b)",
+            "",
+            r#"Cannot index boolean with string "a""#,
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"(.a as $y | try (.a and true) | try ($y | .b)) |= 9",
+            "{\"a\":true}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(.a | ((.a and true)?) | .b)",
+            "{\"a\":true}\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3456 (round 2: `FoldRegister` assuming SOURCE never moved the register).
+/// `reduce`/`foreach` whose SOURCE navigates (`getpath`, #2896) leave the
+/// register somewhere the fold's entry state does not describe.
+#[test]
+fn test_path_register_fold_source_that_navigates_moves_the_register_3456() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":[true]}"#,
+            r#"del(foreach .[] as $k (.; getpath(["a"]); .b))"#,
+            "",
+            r#"Cannot index array with string "b""#,
+            5,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r#"del(reduce .[] as $k (.; getpath(["a"])) | .b)"#,
+            "",
+            r#"Invalid path expression near attempt to access element "b" of [true]"#,
+            5,
+        ),
+    ])
+}
+
+/// #3456 (round 2: an O(N^3) gate on long `and` chains). A 256-operand chain
+/// answers jq's refusal, and does so in a bounded time. The margin is generous
+/// (see #2036's test for why), so this guards the catastrophic case only -- a
+/// cubic gate takes minutes at this length, against about 0.07s standalone --
+/// and a milder superlinear slowdown passes. The finer net is the sweep's
+/// chain rows (`scripts/jq-path-register-sweep.py`), which report TIMEOUT.
+#[test]
+fn test_path_register_long_and_chain_is_bounded_3456() -> Result<()> {
+    let chain = vec![".a"; 256].join(" and ");
+    let filter = format!("del({chain})");
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":true}"#))?;
+    let elapsed = start.elapsed();
+    assert_eq!((stdout.as_str(), code), ("", 5), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"near attempt to access element "a" of {"a":true}"#),
+        "{stderr:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "a 256-operand `and` chain took {elapsed:?} -- superlinear gate regressed"
+    );
+    Ok(())
+}
+
 /// #2760 seen from the side that does damage: `del()` and `|=` consume the
 /// same resolution, so the missing refusal was a **refused edit reported as
 /// a successful no-op** -- the document came back unchanged at exit 0 where

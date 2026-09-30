@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""Directional differential sweep for jq's path register (#3456, #3289, #3428).
+
+Runs a generated grid of path-mode programs through the pinned jq oracle
+(`/usr/bin/jq` 1.7.1) and one or more succinctly builds, then classifies each
+row per build by comparing **stdout and exit code** with jq's.
+
+**Why directional.** Path mode has one dangerous failure: succinctly
+*accepts* -- and so `del`/`=`/`|=` *writes* -- where jq refuses. A refusal jq
+does not make only costs an answer (ADR-0018's refuse-only direction), so the
+two directions are not weighed alike. The grid is what three review rounds on
+#3289 kept finding holes in, so the axes here are deliberately wider than any
+one review's: operands x combinators x inputs x contexts, with the round-2
+categories (`try ... catch`, `?//`, array-copy identity, wrapper stacks,
+retried alternatives after a pipe, SOURCE-navigating `reduce`/`foreach`, long
+`and` chains) as explicit context and operand axes, not a hoped-for
+by-product.
+
+**Builds.** `--candidate` is the build under test. Each `--base LABEL=PATH`
+is a reference build; the *first* one is the directional base the exit code
+is judged against. Typical use while changing the register contract:
+
+  --base pre3425=<build at 452940f6e> --base main=<build of main>
+
+so a row can be attributed to #3425's own change (pre3425 vs main) or to the
+candidate (main vs candidate).
+
+**Row classes** (per build, against jq):
+
+  MATCH         same stdout and exit code
+  ACCEPT_WRONG  jq refused (exit != 0), the build succeeded -- the dangerous one
+  REFUSE_WRONG  jq succeeded, the build refused (safe direction)
+  DIFF          both succeeded with different output, or both failed with
+                different exit codes
+  TIMEOUT       the build exceeded --timeout (an O(N^3) gate shows up here);
+                re-run serially once before it is believed, since a loaded
+                box can time out a row a quiet one answers
+  ORACLE_TIMEOUT  jq itself timed out: the row says nothing and is skipped
+
+A row where the two sides both fail with the same exit code still needs the
+same stdout to be a MATCH: `path(...)` can print results before it errors.
+
+**FAIL** (exit status 1) is any row where the candidate is worse than the
+first base: newly ACCEPT_WRONG, newly DIFF, newly REFUSE_WRONG where the base
+matched jq (a lost match, even in the safe direction: a refuse-only fallback
+has leaked under `try` before, #3186/#3267, and the producer migration is
+expected to flip nothing), newly TIMEOUT, or a build that is ACCEPT_WRONG /
+DIFF in both but writes a *different* document (a wrong write that moved).
+Every other flip -- including every improvement -- is *reported*, and each
+needs its own oracle capture before it is claimed: this script proves the
+direction, not the reason.
+
+**Reading a clean run.** A build is only as good as the rows it can reach. The
+summary prints the per-class totals for every build, so "0 FAIL" over a grid
+where the base is already ACCEPT_WRONG on thousands of rows reads differently
+from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
+not generate: add the generator pattern here before claiming a shape is safe.
+
+This is a verification tool, not a CI gate. The pinned `*_3456` rows in
+`tests/jq_cli_tests.rs` are what CI enforces (one per round-2 category); run
+this after touching `PathBranch::register`, `Frame::register_loss`, or any
+path-mode producer/consumer of them in `src/jq/eval.rs`.
+
+Usage:
+  cargo build --release --features cli
+  ./scripts/jq-path-register-sweep.py --candidate target/release/succinctly \\
+      --base main=/path/to/main-build [--base pre3425=/path/to/older-build]
+  ./scripts/jq-path-register-sweep.py --candidate ... --sample 2000 --seed 7
+  ./scripts/jq-path-register-sweep.py --candidate ... --list-axes
+"""
+
+import argparse
+import concurrent.futures
+import itertools
+import json
+import os
+import pathlib
+import random
+import subprocess
+import sys
+import time
+
+ORACLE = "/usr/bin/jq"
+ORACLE_VERSION = "jq-1.7.1"
+
+# ---------------------------------------------------------------------------
+# Axes
+# ---------------------------------------------------------------------------
+
+# Operands. `and`/`or`/`-` are not subexps in jq, so each of these moves (or
+# does not move) jq's path register differently inside them. The by-value
+# group is the #3428 family: jq navigates inside them, the resolver
+# evaluates them by value.
+OPERANDS = [
+    # native navigation
+    ".",
+    ".a",
+    ".b",
+    ".[0]",
+    ".[]?",
+    "..",
+    ".[0:]",
+    ".[0:0]",
+    "getpath([\"a\"])",
+    "select(true)",
+    # cannot navigate / cannot move the register
+    "true",
+    "null",
+    "5",
+    "empty",
+    "tostring",
+    "length",
+    # by-value operands jq navigates inside (#3428)
+    "first",
+    "last",
+    "any",
+    "all",
+    "nth(0)",
+    "range(2)",
+    "paths",
+    "first(.[]?)",
+    "limit(1; .[]?)",
+    "isempty(.[]?)",
+    "[.[]?]",
+    # wrappers and control flow around the above
+    "try .a",
+    "(.a // .b)",
+    "if . then .a else .b end",
+    "(. as $v | .a)",  # `as` extends right: unparenthesised it swallows the combinator
+]
+
+# The other side of a two-operand shape. Chosen so that, against the inputs
+# below, `R` sometimes navigates off a register `L` moved and sometimes
+# lands on a value identical to it.
+COMPANIONS = [".b?", ".[0]", "true", ".a"]
+
+INPUTS = [
+    "null",
+    "true",
+    "[true]",
+    "[]",
+    "[[]]",
+    "[[1],[1]]",
+    '{"a":true}',
+    '{"a":1,"b":2}',
+    '{"a":[true]}',
+    '{"a":false,"b":null}',
+]
+
+# Contexts wrap a shape `X` in a path-consuming expression. `X` is spliced in
+# as-is; the templates that need it grouped (`|=`, `=`, `try`, `?`, `//`, `as`
+# bodies) parenthesise it themselves. Round-2 categories are tagged.
+CONTEXTS = [
+    ("path", "path({X})"),
+    ("collect-path", "[path({X})]"),
+    ("del", "del({X})"),
+    ("update", "({X}) |= 9"),
+    ("assign", "({X}) = 9"),
+    ("try-del", "del(try ({X}))"),
+    ("try-catch", "del(try ({X}) catch .)"),  # round 2: catchable refusal
+    ("try-catch-update", "(try ({X}) catch .) |= 9"),  # round 2
+    ("optional", "del(({X})?)"),  # round 2: wrapper drops register
+    ("first-wrap", "del(first({X}))"),  # round 2: wrapper
+    ("alt-wrap", "del(({X}) // .a)"),  # round 2: wrapper
+    ("var-rebind", "del(. as $x | ({X}) | $x)"),
+    ("var-rebind-nav", "del(.a? as $y | try ({X}) | try ($y | .b))"),  # round 2
+    ("nested", "del(.a? | ({X}))"),
+    ("alt-pattern", "del(. as [$q] ?// $q | ({X}))"),  # round 2: ?// retry
+    ("alt-pattern-pipe", "del(. as [$q] ?// $q | ({X}) | .c)"),  # round 2: stale downstream
+    ("reduce-source", "del(reduce .[]? as $k (.; {X}))"),  # round 2: SOURCE navigates
+    ("foreach-source", "del(foreach .[]? as $k (.; {X}; .b?))"),  # round 2
+]
+
+# Long chains are the O(N^3) row: a timing axis, not a correctness one.
+CHAIN_LENGTHS = [16, 64, 256]
+CHAIN_CONTEXTS = ["path", "del", "update"]
+
+
+def shapes_for(operand):
+    """Every combinator shape an operand takes part in."""
+    yield f"-({operand})"
+    for c in COMPANIONS:
+        yield f"{operand} and {c}"
+        yield f"{c} and {operand}"
+        yield f"{operand} or {c}"
+        yield f"{c} or {operand}"
+
+
+def build_rows():
+    """The grid and the chain rows, separately: (label, input, program).
+
+    The chain rows are the timing axis and are never sampled away.
+    """
+    ctx = dict(CONTEXTS)
+    rows = []
+    chains = []
+    for operand in OPERANDS:
+        for shape in shapes_for(operand):
+            for cname, template in CONTEXTS:
+                program = template.replace("{X}", shape)
+                for doc in INPUTS:
+                    rows.append((f"{cname}|{shape}", doc, program))
+    for n in CHAIN_LENGTHS:
+        for cname in CHAIN_CONTEXTS:
+            chain = " and ".join([".a"] * n)
+            program = ctx[cname].replace("{X}", chain)
+            for doc in ('{"a":true}', '{"a":false}', "[true]"):
+                chains.append((f"chain{n}|{cname}", doc, program))
+    return rows, chains
+
+
+# ---------------------------------------------------------------------------
+# Running and classifying
+# ---------------------------------------------------------------------------
+
+
+def run_one(argv, doc, timeout):
+    """(stdout, exit code); exit code is None on timeout."""
+    try:
+        p = subprocess.run(
+            argv,
+            input=doc.encode(),
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return ("", None)
+    return (p.stdout.decode("utf-8", "replace"), p.returncode)
+
+
+def classify(oracle, result):
+    """Class of one build's result against jq's."""
+    if oracle[1] is None:
+        return "ORACLE_TIMEOUT"
+    if result[1] is None:
+        return "TIMEOUT"
+    if result == oracle:
+        return "MATCH"
+    if oracle[1] != 0 and result[1] == 0:
+        return "ACCEPT_WRONG"
+    if oracle[1] == 0 and result[1] != 0:
+        return "REFUSE_WRONG"
+    # Both succeeded with different output, or both failed with different
+    # stdout or exit codes. The stderr message is deliberately not compared:
+    # it is not what this sweep tests, and it differs by design where the
+    # resolver refuses with its by-value "with result" text.
+    return "DIFF"
+
+
+def evaluate(row, builds, timeout):
+    label, doc, program = row
+    oracle = run_one([ORACLE, "-c", program], doc, timeout)
+    classes = {}
+    outputs = {}
+    for name, path in builds:
+        res = run_one([path, "jq", "-c", program], doc, timeout)
+        outputs[name] = res
+        classes[name] = classify(oracle, res)
+    return {
+        "label": label,
+        "input": doc,
+        "program": program,
+        "oracle": oracle,
+        "outputs": outputs,
+        "classes": classes,
+    }
+
+
+def is_regression(rec, base, cand):
+    """Whether the candidate is worse than the directional base on this row."""
+    b, c = rec["classes"][base], rec["classes"][cand]
+    if "ORACLE_TIMEOUT" in (b, c):
+        return False
+    if c == b:
+        # Same class is not "no change" when the class is wrong: a write that
+        # moved from one wrong target to another is invisible to the label.
+        return c in ("ACCEPT_WRONG", "DIFF") and rec["outputs"][base] != rec["outputs"][cand]
+    if c == "TIMEOUT":
+        return True
+    if c == "ACCEPT_WRONG":
+        return True
+    if c == "DIFF" and b == "MATCH":
+        return True
+    if c == "REFUSE_WRONG" and b == "MATCH":
+        # Safe direction, but a match lost is still a flip worth failing on;
+        # the docstring says why.
+        return True
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--candidate", help="build under test")
+    ap.add_argument(
+        "--base",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help="reference build; repeatable; the first is the directional base",
+    )
+    ap.add_argument("--sample", type=int, default=0, help="run a seeded sample of N rows")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--timeout", type=float, default=20.0)
+    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
+    ap.add_argument("--show", type=int, default=25, help="max rows printed per section")
+    ap.add_argument("--json", metavar="PATH", help="write every non-MATCH row as JSON lines")
+    ap.add_argument("--list-axes", action="store_true", help="print the grid's size and exit")
+    args = ap.parse_args()
+
+    grid, chains = build_rows()
+    if args.list_axes:
+        print(f"operands={len(OPERANDS)} companions={len(COMPANIONS)} inputs={len(INPUTS)} "
+              f"contexts={len(CONTEXTS)}")
+        print(f"rows={len(grid) + len(chains)} ({len(grid)} grid + {len(chains)} chain)")
+        return 0
+    if not args.candidate:
+        ap.error("--candidate is required")
+
+    builds = []
+    for spec in args.base:
+        if "=" not in spec:
+            ap.error(f"--base wants LABEL=PATH, got {spec!r}")
+        label, path = spec.split("=", 1)
+        if label == "candidate" or label in [n for n, _ in builds]:
+            ap.error(f"--base label {label!r} is reserved or repeated")
+        builds.append((label, path))
+    builds.append(("candidate", args.candidate))
+    for name, path in builds:
+        if not os.access(path, os.X_OK):
+            print(f"error: {name} build {path!r} is not executable", file=sys.stderr)
+            return 2
+    ver = subprocess.run([ORACLE, "--version"], capture_output=True, text=True).stdout.strip()
+    if not ver.startswith(ORACLE_VERSION):
+        print(f"error: oracle is {ver!r}, expected {ORACLE_VERSION}*", file=sys.stderr)
+        return 2
+
+    rows = grid
+    if args.sample and args.sample < len(rows):
+        random.Random(args.seed).shuffle(rows)
+        rows = rows[: args.sample]
+    rows = rows + chains  # the timing axis is never sampled away
+    print(f"{len(rows)} rows x {len(builds)} builds + oracle; {args.jobs} jobs", file=sys.stderr)
+
+    started = time.time()
+    records = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        for i, rec in enumerate(pool.map(lambda r: evaluate(r, builds, args.timeout), rows), 1):
+            records.append(rec)
+            if i % 2000 == 0:
+                print(f"  {i}/{len(rows)} ({time.time() - started:.0f}s)", file=sys.stderr)
+
+    # A timeout under `--jobs` parallelism can be load, not the row. Re-run
+    # each such row alone, once, and believe that answer.
+    retry = [i for i, rec in enumerate(records)
+             if "TIMEOUT" in rec["classes"].values() or rec["oracle"][1] is None]
+    if retry:
+        print(f"re-running {len(retry)} timed-out row(s) serially", file=sys.stderr)
+        for i in retry:
+            records[i] = evaluate(rows[i], builds, args.timeout)
+
+    names = [n for n, _ in builds]
+    print("\nper-build class totals (vs jq 1.7.1):")
+    classes = ["MATCH", "ACCEPT_WRONG", "REFUSE_WRONG", "DIFF", "TIMEOUT", "ORACLE_TIMEOUT"]
+    print(f"  {'build':<12}" + "".join(f"{c:>15}" for c in classes))
+    for n in names:
+        counts = {c: 0 for c in classes}
+        for rec in records:
+            counts[rec["classes"][n]] += 1
+        print(f"  {n:<12}" + "".join(f"{counts[c]:>15}" for c in classes))
+
+    base = names[0] if len(names) > 1 else None
+    cand = "candidate"
+    regressions = []
+    if base:
+        regressions = [r for r in records if is_regression(r, base, cand)]
+        improvements = [
+            r for r in records
+            if r["classes"][cand] != r["classes"][base] and not is_regression(r, base, cand)
+        ]
+        print(f"\ncandidate vs {base}: {len(regressions)} regression(s), "
+              f"{len(improvements)} other flip(s)")
+        for title, group in (("REGRESSIONS (fail)", regressions), ("other flips", improvements)):
+            if not group:
+                continue
+            print(f"\n{title}, first {min(len(group), args.show)} of {len(group)}:")
+            for r in group[: args.show]:
+                print(f"  [{r['label']}] input={r['input']}")
+                print(f"    program: {r['program']}")
+                print(f"    jq       : {r['oracle']}")
+                print(f"    {base:<9}: {r['outputs'][base]}  {r['classes'][base]}")
+                print(f"    candidate: {r['outputs'][cand]}  {r['classes'][cand]}")
+    else:
+        print("\n(no --base given: totals only, no directional check)")
+
+    if args.json:
+        with open(args.json, "w") as fh:
+            for rec in records:
+                if any(c != "MATCH" for c in rec["classes"].values()):
+                    fh.write(json.dumps(rec) + "\n")
+
+    if regressions:
+        print(f"\nFAIL: {len(regressions)} regression(s) vs {base}")
+        return 1
+    print("\nOK" if base else "\ndone")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
