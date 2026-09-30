@@ -849,6 +849,13 @@ to clear — an idle M4 Pro reads +0.09% median with a per-row range of -1.8%..+
 that number, #332's +1.1% median across 22 workloads was arguable; with it, the consistent
 sign was decisive, and the fix was restructured before merge.
 
+**When the cost is memory, time peak RSS too.** `scripts/rss-ab.py` applies the same
+interleave, exit-code and identity gates, and reports min-of-N wall *and* peak RSS for a
+base, a head and an optional holdout, over a fixed row table (the #3182 corpus of 200k/2M
+scalar arrays and 10 MB documents). A value-layout change is judged on that second column
+as much as the first: #3182's option D moved peak RSS by +8% to +50% on those rows, which a
+wall-clock harness would have reported as a 0-22% slowdown and nothing more.
+
 **Vary the tool flags when the change is flag-sensitive.** The harness passes `yq -o <fmt>
 -I0` and nothing else. `--extra-args` replaces that flag list, so a run can exercise `-P`,
 `--tab`, `-S`, or a different indent width. It needs the `=` form, since argparse reads a
