@@ -208,12 +208,20 @@ pub fn assert_nesting_depth(depth: usize) {
 /// `validate_json_delimiters`, reached before any user filter runs) that
 /// already threads a `Result` and has no such concern.
 pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
+    check_depth_with(depth, EvalError::new)
+}
+
+/// The one [`MAX_NESTING_DEPTH`] comparison and message behind
+/// [`check_nesting_depth`] and [`guard_nesting_depth`], which differ only in
+/// how the error is tagged (`make`).
+#[inline]
+fn check_depth_with(depth: usize, make: fn(String) -> EvalError) -> Result<(), EvalError> {
     if depth < MAX_NESTING_DEPTH {
         Ok(())
     } else {
-        Err(EvalError::new(
-            super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
-        ))
+        Err(make(super::value::nesting_depth_exceeded_message(
+            MAX_NESTING_DEPTH,
+        )))
     }
 }
 
@@ -259,14 +267,8 @@ pub fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Opt
 /// on a deep document rather than an unwinding panic, and the CLI needs no
 /// `catch_unwind` to report it.
 #[inline]
-fn guard_nesting_depth(depth: usize) -> Result<(), EvalError> {
-    if depth < MAX_NESTING_DEPTH {
-        Ok(())
-    } else {
-        Err(EvalError::decode_failure(
-            super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
-        ))
-    }
+pub(crate) fn guard_nesting_depth(depth: usize) -> Result<(), EvalError> {
+    check_depth_with(depth, EvalError::decode_failure)
 }
 
 /// A document number's double under `S`'s number model, for the
@@ -1818,7 +1820,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
     under_alias: bool,
     head_foot_read: HeadFootRead,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
-    assert_nesting_depth(depth);
+    guard_nesting_depth(depth)?;
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
     // getter: the write path re-emits this verbatim after one space.
     let own_comment = cursor.and_then(DocumentCursor::line_comment_raw);
@@ -2930,7 +2932,7 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
     use crate::json::light::StandardJson;
-    assert_nesting_depth(depth);
+    guard_nesting_depth(depth)?;
     Ok(match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
@@ -11062,34 +11064,45 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
 /// `recurse(.[]?)`, so a node whose members cannot be listed ends its own
 /// branch silently -- except for the decode failure `?` never catches
 /// (#1620), which escapes.
+///
+/// Iterative (#3457): a pre-order walk over an explicit work stack, not a
+/// native recursion per level. The library `eval` now reaches this arm and
+/// has no evaluation thread of its own to size, so a recursion here overflowed
+/// the caller's stack on a document a few thousand levels deep (2,500 on a 2
+/// MB test thread) -- an abort, where the previous entry raised a catchable
+/// depth error. Children are pushed in reverse so they pop in document order,
+/// and each node's members are listed only once it has been delivered, as
+/// before, so the order of outputs and errors is unchanged.
 fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: V::Cursor,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    if matches!(sink.push(GenericItem::OneCursor(cursor)), Demand::Stop) {
-        return Flow::Stopped { pending: None };
-    }
-    let mut children: Vec<(Rc<PathTrail>, PathNode<V>)> = Vec::new();
-    let stepped = path_step_generic::<S, V, _>(
-        &Expr::Iterate,
-        &PathNode::At(cursor),
-        &PathTrail::root(),
-        S::COLLAPSE_DUPLICATE_KEYS,
-        &mut children,
-    );
-    match stepped {
-        Ok(()) => {}
-        Err(e) if e.is_uncatchable_at_value_position() => return Flow::Escaped(Control::Error(e)),
-        // `.[]?`: a scalar, or a malformed container, ends the branch.
-        Err(_) => {}
-    }
-    for (_, child) in children {
-        let PathNode::At(c) = child else {
-            unreachable!("a step from a live node reaches live children")
-        };
-        match each_recurse_cursor_generic::<S, V>(c, sink) {
-            Flow::Exhausted => {}
-            other => return other,
+    let mut pending: Vec<V::Cursor> = vec![cursor];
+    while let Some(cursor) = pending.pop() {
+        if matches!(sink.push(GenericItem::OneCursor(cursor)), Demand::Stop) {
+            return Flow::Stopped { pending: None };
+        }
+        let mut children: Vec<(Rc<PathTrail>, PathNode<V>)> = Vec::new();
+        let stepped = path_step_generic::<S, V, _>(
+            &Expr::Iterate,
+            &PathNode::At(cursor),
+            &PathTrail::root(),
+            S::COLLAPSE_DUPLICATE_KEYS,
+            &mut children,
+        );
+        match stepped {
+            Ok(()) => {}
+            Err(e) if e.is_uncatchable_at_value_position() => {
+                return Flow::Escaped(Control::Error(e))
+            }
+            // `.[]?`: a scalar, or a malformed container, ends the branch.
+            Err(_) => {}
+        }
+        for (_, child) in children.into_iter().rev() {
+            let PathNode::At(c) = child else {
+                unreachable!("a step from a live node reaches live children")
+            };
+            pending.push(c);
         }
     }
     Flow::Exhausted
@@ -26911,8 +26924,7 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             out,
         ),
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
-            owned_identity_recurse_step::<S, V>(value, id, out);
-            Ok(())
+            owned_identity_recurse_step::<S, V>(value, id, out).map_err(Control::Error)
         }
         // #2771: a literal has no position of its own. Reached only from
         // `owned_identity_operand` (its top-level `strip_parens` short-circuit
@@ -26944,8 +26956,8 @@ fn owned_identity_recurse_step<S: EvalSemantics, V: DocumentValue>(
     value: &OwnedValue,
     id: &OwnedIdentity<V>,
     out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
-) {
-    assert_nesting_depth(id.ancestors.len());
+) -> Result<(), EvalError> {
+    guard_nesting_depth(id.ancestors.len())?;
     out.push((value.clone(), id.clone()));
     let (children, _suppressed) = owned_nav_children::<S>(&Expr::Iterate, value, true);
     let parent = Rc::new(value.clone());
@@ -26954,8 +26966,9 @@ fn owned_identity_recurse_step<S: EvalSemantics, V: DocumentValue>(
             Some(component) => id.child(&parent, component),
             None => id.clone(),
         };
-        owned_identity_recurse_step::<S, V>(&child, &child_id, out);
+        owned_identity_recurse_step::<S, V>(&child, &child_id, out)?;
     }
+    Ok(())
 }
 
 /// This stage's own `key`/`path`/`file_index` reads, rewritten to the
@@ -37871,9 +37884,10 @@ mod tests {
     /// #1017: `owned_from_standard_json` is a third, independent copy of the
     /// cursor-to-`OwnedValue` conversion `to_owned`/`to_owned_cursor` are
     /// already guarded above (#998) -- same limit, same construction, its
-    /// own guard.
+    /// own guard. Reports the limit as a decode-failure-tagged error rather
+    /// than panicking since #3457, like the other two.
     #[test]
-    fn owned_from_standard_json_panics_past_nesting_depth_limit_1017() {
+    fn owned_from_standard_json_errors_past_nesting_depth_limit_1017() {
         let json = linear_nest(255);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
@@ -37883,13 +37897,11 @@ mod tests {
         let json = linear_nest(256);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
-        let value = cursor.value();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            owned_from_standard_json::<JqSemantics, _>(&value)
-        }));
+        let err = owned_from_standard_json::<JqSemantics, _>(&cursor.value())
+            .expect_err("owned_from_standard_json should error at depth 256");
         assert!(
-            result.is_err(),
-            "owned_from_standard_json should panic at depth 256"
+            err.is_decode_failure(),
+            "expected decode failure, got: {err:?}"
         );
     }
 

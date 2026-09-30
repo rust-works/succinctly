@@ -89,6 +89,13 @@
 //! oracle using the equivalent `path(f)` spelling of each query, which yields
 //! the same path values; only the routing differs.
 //!
+//! Every call goes through `eval_reindexed`, the hybrid `jq::eval` was before
+//! #3457 (a query that reads path context runs on the generic evaluator,
+//! everything else on eval.rs's own): the write-path builtins this file times
+//! live in eval.rs, and `jq::eval` itself has been the generic evaluator
+//! since, so timings taken through it would not be comparable with this
+//! file's earlier numbers.
+//!
 //! Run with:
 //! ```bash
 //! cargo bench --bench jq_write_path_bench
@@ -96,7 +103,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
-use succinctly::jq::{eval, parse, Expr, JqSemantics, OwnedValue, QueryResult};
+use succinctly::jq::{eval_reindexed, parse, Expr, JqSemantics, OwnedValue, QueryResult};
 use succinctly::json::JsonIndex;
 
 const SIZES: &[usize] = &[1_000, 10_000, 100_000];
@@ -176,7 +183,7 @@ fn comma_through_iterate_doc(n: usize) -> Vec<u8> {
 fn eval_one(expr: &Expr, json: &[u8]) -> OwnedValue {
     let index = JsonIndex::build(json);
     let cursor = index.root(json);
-    let result = eval::<Vec<u64>, JqSemantics>(expr, cursor);
+    let result = eval_reindexed::<Vec<u64>, JqSemantics>(expr, cursor);
     match result {
         QueryResult::Owned(v) => v,
         other => panic!("expected exactly one non-error output, got {other:?}"),
@@ -205,7 +212,7 @@ fn bench_del_array(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -234,7 +241,7 @@ fn bench_del_object(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -270,7 +277,7 @@ fn bench_assign_array(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -309,7 +316,7 @@ fn bench_update_array(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -339,7 +346,7 @@ fn bench_path_trailing_iterate(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -384,7 +391,7 @@ fn bench_computed_key_with_trailing_iterate(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -446,7 +453,7 @@ fn bench_del_computed_key_with_trailing_iterate(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -491,7 +498,7 @@ fn bench_del_computed_key_with_trailing_iterate_object(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -533,7 +540,7 @@ fn bench_del_comma_through_iterate(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -642,7 +649,7 @@ fn bench_del_filtered_descent_depth(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(d), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -681,7 +688,7 @@ fn bench_del_shared_prefix_depth(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(d), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -720,7 +727,7 @@ fn bench_del_shared_prefix_width(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(k), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -788,7 +795,7 @@ fn bench_two_branch_path_depth(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(d), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -827,7 +834,7 @@ fn bench_two_branch_assign_depth(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(d), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -856,7 +863,7 @@ fn bench_two_branch_del_depth(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(d), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -982,7 +989,7 @@ fn bench_comma_shape(
     group.bench_with_input(BenchmarkId::from_parameter(param), &json, |b, json| {
         b.iter(|| {
             let cursor = index.root(black_box(json));
-            black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
         });
     });
 }
@@ -1062,7 +1069,7 @@ fn bench_path_paren_chain_ast(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(k), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -1133,7 +1140,7 @@ fn bench_path_if_fanout_ast(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(width), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -1189,7 +1196,7 @@ fn bench_path_recursive_def_ast(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(k), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -1283,7 +1290,7 @@ fn bench_path_leading_iterate_comma(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(elems), &json, |b, json| {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
-                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
             });
         });
     }
@@ -1337,7 +1344,7 @@ fn bench_recurse_family_bounded(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new(label, n), &json, |b, json| {
                 b.iter(|| {
                     let cursor = index.root(black_box(json));
-                    black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                    black_box(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, cursor))
                 });
             });
         }

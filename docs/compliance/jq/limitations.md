@@ -8084,8 +8084,10 @@ narrowing:
   where the previous evaluator answered up to 384. Past it they return
   `nesting depth exceeds limit of 256` as a `QueryResult::Error`, tagged as a decode failure so
   a `try` in the filter does not swallow it, and never as an unwinding panic: the walkers report
-  it as an error, and `eval()` contains the panic of the few guards that still panic (with the
-  `std` feature; without it there is no unwinding to catch). Raising the ceiling is
+  it as an error, as do the comment-preserving and standard-JSON materializers and the owned
+  `..` walk, and `eval()` contains a 256-level panic from anywhere else, such as the public
+  `JqValue::materialize` (with the `std` feature; without it there is no unwinding to
+  catch). Raising the ceiling is
   [#3429](https://github.com/rust-works/succinctly/issues/3429). Pinned by
   `test_public_eval_path_family_over_depth_is_a_clean_error_3457`
   (`tests/jq_library_eval_nesting_depth_tests.rs`).
@@ -8093,10 +8095,12 @@ narrowing:
   `OneCursor`, but a computed `null` is `Owned(Null)` where it was `One(Null)` and an empty
   iteration is `None` where it was `Many([])`. The values are the same.
   `QueryResult::collect_owned` turns a cursor over an unreadable value into `null` (as it
-  always did for `.`); `QueryResult::try_collect_owned` reports it as an `Err`, and is what to
+  always did for `.`); `QueryResult::collect_owned_checked` reports it as an `Err`, and is what to
   use where a wrong answer is worse than an error.
 - **`eval_lenient`** follows `eval`. It now also returns an owned `null` or boolean (so
-  `.missing` still yields `null`); any other owned value it still drops, as before.
+  `.missing` still yields `null`); an owned result holding any other value is dropped whole, as
+  before, never returned as a shorter list (`.[] | if . > 1 then "big" else null end` on
+  `[1,2,3]` is empty, not `[null]`).
 - **Cursor-metadata builtins** (`line`, `column`, `at_offset`, `at_position`, `document_index`,
   `anchor`, `style`, `line_comment`) answer from the real document; the previous evaluator
   answered fixed defaults and rejected `at_offset`/`at_position`.

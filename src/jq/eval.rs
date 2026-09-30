@@ -1866,12 +1866,13 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
     /// [`crate::jq::eval_generic::GenericResult::collect_owned`], which
     /// already reports it (#1247).
     ///
-    /// Only a *decode failure* is an `Err`. A query error, `break` or `halt`
+    /// Named `_checked`, not `try_`, because what it checks is decoding: only
+    /// a *decode failure* is an `Err`. A query error, `break` or `halt`
     /// is not: `None`/`Error`/`Break`/`Halt` collect to an empty `Vec` and a
     /// `Partial` to its prefix, as in the lossy form and in the generic
     /// evaluator. Check for [`QueryResult::Error`] (or [`Self::is_error`])
     /// first if a query error must not read as "no results".
-    pub fn try_collect_owned<S: EvalSemantics>(self) -> Result<Vec<OwnedValue>, EvalError> {
+    pub fn collect_owned_checked<S: EvalSemantics>(self) -> Result<Vec<OwnedValue>, EvalError> {
         Ok(match self {
             QueryResult::One(v) => vec![super::eval_generic::to_owned::<S, _>(&v)?],
             QueryResult::OneCursor(c) => vec![super::eval_generic::to_owned::<S, _>(&c.value())?],
@@ -1900,7 +1901,7 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
     ///
     /// **Lossy:** a cursor whose value cannot be decoded (a malformed number,
     /// an unquoted keyword) becomes `null` rather than an error. Use
-    /// [`Self::try_collect_owned`] when that distinction matters (#3457).
+    /// [`Self::collect_owned_checked`] when that distinction matters (#3457).
     pub fn collect_owned<S: EvalSemantics>(self) -> Vec<OwnedValue> {
         match self {
             QueryResult::One(v) => vec![to_owned_lossy::<S, _>(&v)],
@@ -26366,11 +26367,31 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 /// `{"a":1,"b":tru}` answers `["a"]`, as they do in the CLI (#3266).
 /// Cursor-metadata builtins such as `line` answer from the real document.
 ///
+/// # Result variants
+///
+/// Which [`QueryResult`] variant carries an answer depends on the filter's
+/// form, not just on the value, and these are the guarantees:
+///
+/// - the bare filter `.` is [`QueryResult::OneCursor`] (the input, undecoded,
+///   with its position);
+/// - any other filter that yields one value the document holds is
+///   [`QueryResult::One`], *including one that yields the input itself*
+///   (`. | .`, `first(.)`), which is the value but no longer a cursor;
+/// - a value the filter computes (`.a + 1`, a missing field's `null`) is
+///   [`QueryResult::Owned`]/[`QueryResult::ManyOwned`], and an empty
+///   iteration is [`QueryResult::None`].
+///
+/// A caller that needs a cursor's position should ask for `.` and navigate
+/// from the cursor itself, and one that matches on variants should accept
+/// the owned ones too. Before #3457 a missing field's `null` was
+/// `One(Null)` and an empty iteration `Many([])`; those are now `Owned(Null)`
+/// and `None`.
+///
 /// # Results and decode failures
 ///
 /// A cursor result ([`QueryResult::OneCursor`], and the values inside
 /// [`QueryResult::One`]/[`QueryResult::Many`]) is *not* decoded here, so the
-/// value it names may still be unreadable. [`QueryResult::try_collect_owned`]
+/// value it names may still be unreadable. [`QueryResult::collect_owned_checked`]
 /// reports that as an `Err`; [`QueryResult::collect_owned`] is the lossy form
 /// and turns it into `null`. Use the former wherever a wrong answer is worse
 /// than an error.
@@ -26382,11 +26403,13 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 /// a [`QueryResult::Error`]. The error is tagged as a decode failure, so a
 /// `try` in the filter does not swallow it, and it is a return value, not an
 /// unwinding panic. The evaluator this entry used before #3457 answered these
-/// up to 384 levels; raising the ceiling is #3429. With the `std` feature
-/// the few guards that still panic (comment-preserving YAML materialization)
-/// are caught and returned the same way, though the default panic hook still
-/// prints its one-line message to stderr first; without `std` there is no
-/// unwinding to catch and they propagate.
+/// up to 384 levels; raising the ceiling is #3429. Every depth guard the
+/// evaluator itself reaches reports the error this way. As a backstop, with
+/// the `std` feature a panic of the 256-level guard from anywhere else (the
+/// public `JqValue::materialize` still panics there by contract) is caught
+/// and returned the same way, though the default panic hook still prints its
+/// one-line message to stderr first; without `std` there is no unwinding to
+/// catch and it propagates.
 ///
 /// # Other entry points
 ///
@@ -26489,10 +26512,11 @@ pub fn eval_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// The CLI wraps every query in `catch_unwind` for this (#1793); a library
 /// caller of [`eval`] has no such net and must never see a raw unwind from
-/// an over-deep document (#2627). The path walkers no longer panic (they
-/// return the same tagged error directly), so this is the backstop for the
-/// guards that still do -- `to_owned_with_comments`,
-/// `owned_from_standard_json_at_depth`, `owned_identity_recurse_step`.
+/// an over-deep document (#2627). No guard the evaluator reaches panics any
+/// more (the path walkers, `to_owned_with_comments`,
+/// `owned_from_standard_json_at_depth` and `owned_identity_recurse_step` all
+/// return the same tagged error directly), so this is a backstop for a
+/// 256-level panic from outside it, such as `JqValue::materialize`.
 ///
 /// Only that one exact message is caught
 /// ([`nesting_depth_panic_message`](super::eval_generic::nesting_depth_panic_message));
@@ -26579,10 +26603,14 @@ fn generic_to_query_result<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Follows [`eval`] (#3457), whose generic evaluator answers a computed value
 /// (a missing field's `null`, `1 == 1`, `.a + 1`) as an owned value rather
 /// than a borrowed one. A `Vec<StandardJson>` can only carry the two of those
-/// with no text to borrow, `null` and booleans, so those are returned and any
-/// other owned value (a number, string, array or object built by the filter)
-/// is still dropped, as it always was. Use [`eval`] and match on
-/// [`QueryResult`] to see every result.
+/// with no text to borrow, `null` and booleans, so an owned result made only
+/// of those is returned (`.missing` still yields `null`). An owned result that
+/// holds any other value (a number, string, array or object built by the
+/// filter) is dropped *whole*, as every owned result always was: returning
+/// only its `null`/boolean members would hand back a shorter list that reads
+/// as the complete answer (`.[] | if . > 1 then "big" else null end` would
+/// yield `[null]`). Use [`eval`] and match on [`QueryResult`] to see every
+/// result.
 pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
@@ -26601,7 +26629,12 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => Vec::new(),
         QueryResult::Error(_) => Vec::new(),
         QueryResult::Owned(v) => borrowed(&v).into_iter().collect(),
-        QueryResult::ManyOwned(vs) => vs.iter().filter_map(borrowed).collect(),
+        // All or nothing: a partial list would pass for the whole answer.
+        QueryResult::ManyOwned(vs) => vs
+            .iter()
+            .map(borrowed)
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default(),
         QueryResult::Break(_) => Vec::new(), // Break without matching label
         QueryResult::Halt(_) => Vec::new(),  // Halt: not representable as borrowed StandardJson
         QueryResult::Partial(..) => Vec::new(), // Same: not representable as borrowed StandardJson
@@ -115638,7 +115671,7 @@ mod touched_edge_cases_2999 {
             // Every sweep row is well-formed, so none fails to decode; one that
             // did would be reported as a decode failure rather than a value.
             let values = r
-                .try_collect_owned::<S>()
+                .collect_owned_checked::<S>()
                 .map(|vs| {
                     vs.iter()
                         .map(OwnedValue::to_json)
@@ -115946,11 +115979,11 @@ mod touched_edge_cases_2999 {
         assert_eq!(reindexed, entry);
     }
 
-    /// #3457: `try_collect_owned` reports a cursor over an unreadable value as
+    /// #3457: `collect_owned_checked` reports a cursor over an unreadable value as
     /// an error where `collect_owned` (documented lossy) yields `null`, and
     /// keeps a partial result's prefix.
     #[test]
-    fn try_collect_owned_reports_what_collect_owned_loses_3457() {
+    fn collect_owned_checked_reports_what_collect_owned_loses_3457() {
         let run = |json: &str, filter: &str| {
             let index = JsonIndex::build(json.as_bytes());
             let expr = parse(filter).expect("filter parses");
@@ -115961,7 +115994,7 @@ mod touched_edge_cases_2999 {
                 .map(OwnedValue::to_json)
                 .collect::<Vec<_>>();
             let checked = eval::<Vec<u64>, JqSemantics>(&expr, root)
-                .try_collect_owned::<JqSemantics>()
+                .collect_owned_checked::<JqSemantics>()
                 .map(|vs| vs.iter().map(OwnedValue::to_json).collect::<Vec<_>>());
             (lossy, checked)
         };
@@ -115997,8 +116030,9 @@ mod touched_edge_cases_2999 {
         assert_eq!(run("[]", r#"error("x")"#).1, Ok(vec![]));
     }
 
-    /// #3457: `eval_lenient` keeps an owned `null`/boolean (so `.missing` still
-    /// yields `null`) and drops any other owned value, as it always did.
+    /// #3457: `eval_lenient` keeps an owned result made only of `null`/booleans
+    /// (so `.missing` still yields `null`) and drops any owned result holding
+    /// another value whole, rather than returning a truncated list.
     #[test]
     fn eval_lenient_keeps_owned_null_and_bool_3457() {
         let run = |json: &str, filter: &str| {
@@ -116013,9 +116047,13 @@ mod touched_edge_cases_2999 {
         assert_eq!(run("[1]", ". == [1]"), ["true"]);
         assert_eq!(run("[1]", "1 + 1"), Vec::<String>::new());
         assert_eq!(run("[1]", r#""a" + "b""#), Vec::<String>::new());
+        assert_eq!(run("[1]", "(true, false, null)"), ["true", "false", "null"]);
+        // Not `["true", "false", "null"]`: the `5` cannot be carried, and a
+        // list without it would read as the whole answer.
+        assert_eq!(run("[1]", "(true, 5, false, null)"), Vec::<String>::new());
         assert_eq!(
-            run("[1]", "(true, 5, false, null)"),
-            ["true", "false", "null"]
+            run("[1,2,3]", r#".[] | if . > 1 then "big" else null end"#),
+            Vec::<String>::new()
         );
         assert_eq!(run("[1]", "empty"), Vec::<String>::new());
     }
