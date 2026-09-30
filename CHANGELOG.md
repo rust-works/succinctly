@@ -422,11 +422,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pulled output as jq's `_assign` does (`(.|stderr)[("a","b")] = (1,2)` fires
   it four times, not two; `first(...)` fires it once). `|=` likewise reads only
   the first output of its update, so `[1] | .[0] |= (1, input)` no longer reads
-  an input. A 5,940-shape differential sweep against jq 1.7.1 went from 1,215
-  divergences to none. yq mode is unchanged. Each output after the first now
-  re-derives the input document instead of taking it by move; a single-output
-  `.users[0].name = "x"` on a 7 MB document is 37% faster and peaks 32% lower
-  on an Apple M5 Max, and the other assignment shapes measured are within noise.
+  an input. A 7,128-shape differential sweep against jq 1.7.1 went from 1,615
+  divergences to none. yq mode is unchanged. A right side with several outputs
+  decodes the input twice, not once; a single-output `.users[0].name = "x"` on
+  a 7 MB document is 37% faster and peaks 32% lower on an Apple M5 Max, and the
+  other assignment shapes measured are within noise (x86_64 not measured).
 
 - **Deep recursion refuses instead of overflowing the stack, whatever its
   shape** (#3262, #3294, ADR-0025). The recursion guard counted the structure

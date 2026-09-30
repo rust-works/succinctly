@@ -4466,20 +4466,21 @@ both. `|=` reads only the first output of its update, as jq's `_modify` does, so
 `[1] | .[0] |= (1, input)` no longer reads an input. This is what #2267's second step could
 not have while the right side was collected eagerly (it fired the target for outputs a
 downstream `first` never pulled: 87 regressions against 69 fixes on a 5,000-shape sweep);
-with a lazy right side it is a per-output re-resolution and nothing more. The same 5,940-shape
+with a lazy right side it is a per-output re-resolution and nothing more. The same 7,128-shape
 differential sweep (`scripts/jq-assign-rhs-oracle-sweep.py`: path x operator x right side x
-consumer, `input`/`debug` observable) that the eager route failed 1,215 times against jq 1.7.1
+consumer, `input`/`debug`/`stderr` observable) that the eager route failed 1,615 times against jq 1.7.1
 now has no divergence in stdout, `debug` trace or exit code.
 
 yq keeps the eager route: real yq applies only the *last* output of a multi-output right side,
 once, to every path, and resolves and vivifies its targets before the right side runs (#2481),
 so it needs the whole right side and has no `input`/`debug`/`stderr` to be lazy about.
 
-Costs: a right side that is pulled lazily cannot know an output is the last, so each output
-after the first re-derives the input document instead of taking it by move, and the streaming
+Costs: a right side that is pulled lazily cannot know an output is the last, so the first
+output takes the input document by move, the second decodes it once more, and later outputs
+clone that copy (two decodes however many outputs, not one per output); the streaming
 route's per-output spine copy is charged once per output rather than once per extra output
 (`.[(0,1)] = (1,2)` copies the spine twice, where it copied once). A single-output right side
-takes the input by move, as before. Measured on a 7 MB generated `users` document (release,
+takes the input by move, as before, and `.users[0].id = range(N)` scales linearly in N. Measured on a 7 MB generated `users` document (release,
 interleaved, 15 repetitions, outputs identical, Apple M5 Max under other sessions' load; a
 control run of the same binary against itself spans -2.5% to +1.7% on minimum and -9.5% to
 +10.3% on median): `.users[0].name = "x"` and `.users[0].name //= "y"` fall 319 -> 198 ms and

@@ -4,23 +4,24 @@
 Cross-products path x operator x right-hand side x consumer, runs every program
 under `succinctly jq -nc` and under the pinned `/usr/bin/jq` with stdin
 "1 2 3 4 5 6" (so `input` in the target or the right side is observable), and
-compares (stdout, `debug` trace lines, exit code). Error *messages* are not
-compared: their wording is tracked elsewhere, and the exit code says whether
-both raised.
+compares (stdout, everything written to stderr before the error message, exit
+code). That covers `debug` lines and `stderr` writes, so it counts how often a
+target or right side ran; the error message itself is not compared, since its
+wording is tracked elsewhere and the exit code says whether both raised.
 
 The point of the sweep is the shapes a hand-picked matrix misses: a consumer
 that stops early (`first`, `limit`, `isempty`) over a right side or a target
 with a side effect, and the per-output re-resolution of the target. On the
-eager route it replaced, 1,215 of 5,940 cases diverged; the lazy generator has
+eager route it replaced, 1,615 of 7,128 cases diverged; the lazy generator has
 none.
 
 usage:
     cargo build --features cli
     scripts/jq-assign-rhs-oracle-sweep.py [--show N] [binary]
 
-`binary` defaults to target/debug/succinctly. Every divergence is written to
-`.ai/scratch/assign-rhs-divergences.txt`; the first N (default 10) are echoed.
-Exit status is 1 if there is any divergence.
+`binary` defaults to target/debug/succinctly under the repository root. Every
+divergence is written to `.ai/scratch/assign-rhs-divergences.txt` there; the
+first N (default 10) are echoed. Exit status is 1 if there is any divergence.
 """
 import itertools
 import os
@@ -28,6 +29,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ORACLE = "/usr/bin/jq"
 STDIN = b"1 2 3 4 5 6"
 DOC = '{"a":1,"b":[1,2,3]}'
@@ -38,6 +40,8 @@ PATHS = [
     ".b[]",
     '.[("a","b")]',
     '(.|debug("P"))["a"]',
+    '(.|stderr)["a"]',
+    "(.|stderr).b[(0,1)]",
     '.[(.|debug("P")|"a")]',
     ".b[(0,1)]",
     "(.a,.b[0])",
@@ -76,8 +80,9 @@ def observe(argv):
         r = subprocess.run(argv, input=STDIN, capture_output=True, timeout=10)
     except subprocess.TimeoutExpired:
         return ("TIMEOUT", "", -1)
-    err = r.stderr.decode(errors="replace")
-    trace = "".join(line + "\n" for line in err.splitlines() if line.startswith('["DEBUG:"'))
+    # Everything before the error message: `debug` lines and `stderr` writes.
+    # An error message follows a `stderr` write on the same line, so cut there.
+    trace = r.stderr.decode(errors="replace").split("jq: error")[0]
     return (r.stdout.decode(errors="replace"), trace, r.returncode)
 
 
@@ -88,7 +93,7 @@ def main():
         i = args.index("--show")
         show = int(args[i + 1])
         del args[i : i + 2]
-    binary = args[0] if args else "target/debug/succinctly"
+    binary = args[0] if args else os.path.join(ROOT, "target/debug/succinctly")
     if not os.access(binary, os.X_OK):
         sys.exit(f"error: {binary} not found; run: cargo build --features cli")
     if not os.access(ORACLE, os.X_OK):
@@ -110,8 +115,9 @@ def main():
         results = list(pool.map(one, programs))
     bad = [(p, want, got) for p, want, got in results if want != got]
     print(f"cases={len(programs)} divergences={len(bad)}")
-    os.makedirs(".ai/scratch", exist_ok=True)
-    with open(".ai/scratch/assign-rhs-divergences.txt", "w") as out:
+    scratch = os.path.join(ROOT, ".ai/scratch")
+    os.makedirs(scratch, exist_ok=True)
+    with open(os.path.join(scratch, "assign-rhs-divergences.txt"), "w") as out:
         for p, want, got in bad:
             out.write(f"{p}\n  jq  : {want!r}\n  succ: {got!r}\n")
     for p, want, got in bad[:show]:
@@ -121,4 +127,5 @@ def main():
     sys.exit(1 if bad else 0)
 
 
-main()
+if __name__ == "__main__":
+    main()

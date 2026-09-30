@@ -27406,43 +27406,16 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // -- see `YqAssignNoopCheck::Continue`'s doc comment. Since #2481 that
     // reuse rides through `yq_prepare_assign_targets`, which also owns the
     // dynamic-path resolution in yq mode (real yq resolves its left side
-    // first, #1412); only jq mode still resolves here from scratch, exactly
-    // as this function always did before either check existed.
+    // first, #1412). jq mode resolves per RHS output in `assign_one` (#3448).
     let (pristine, paths) = match yq_targets {
         // yq mode: `yq_prepare_assign_targets` already resolved the paths
         // and vivified them; its working copy *is* yq's document, so the
         // writes below splice into that rather than into the untouched
         // input (#2481).
         Some(YqAssignTargets { doc, paths, .. }) => (doc, paths),
-        None => {
-            // #1953: a non-decode-failure to_owned error (a #1194
-            // malformed-member error -- a #1642 collision error is itself
-            // tagged as a decode failure and so is unaffected by this)
-            // respects `optional` like every other fallible step at this
-            // boundary (per this function's own doc comment above) -- only
-            // a genuine decode failure is unconditional.
-            let pristine = match to_owned::<S, _>(&input) {
-                Ok(pristine) => pristine,
-                Err(e) => return suppress_or_raise(e, optional),
-            };
-            let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
-                Ok(paths) => paths,
-                // `?` swallows only a genuine error; a halt always escapes,
-                // so `(.[(halt_error(3))] = 1)?` still halts instead of
-                // becoming `QueryResult::None` (#791).
-                Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
-                Err((_, escape)) => return escape.into(),
-            };
-            let mut paths = paths;
-            // #1351: same redirect `yq_assign_noop_check` applies on its
-            // own arm -- a no-op here in jq mode (no table is ever installed).
-            alias_identity::redirect_paths(
-                &mut paths,
-                &pristine,
-                alias_identity::Redirect::THROUGH,
-            );
-            (pristine, paths)
-        }
+        // jq mode never reaches here (#3448): `yq_prepare_assign_targets` is
+        // `Some` in every yq call, and jq is `each_assign`.
+        None => unreachable!("jq mode's `=` is `each_assign` (#3448)"), // omni-dev: coverage tolerate-line reason="unreachable: eval_assign returns collect_assign for JqSemantics before this point, and yq_prepare_assign_targets is Some for every YqSemantics call (#3448)"
     };
 
     // `=` has no filter of its own: `write_one` writes `value` directly via
@@ -28803,13 +28776,9 @@ fn fork_rhs_over_paths<'a, W: Clone + AsRef<[u64]>, State>(
 /// value` for compound assignment, `. // value` for alternative
 /// assignment) fresh per output, so `update_path`'s per-path `Identity`
 /// resolves to that output's own spliced value, not a shared one.
-#[allow(clippy::too_many_arguments)] // STYLE-0004: `yq_targets` (#2481) joins the
-                                     // `path_expr`/`input` pair it *replaces* in yq mode -- both are still needed for jq
-                                     // mode's own resolve, so bundling them would mean a struct whose two halves are never
-                                     // live at the same time.
+///
+/// yq mode only (#3448): jq's `op=`/`//=` is [`each_assign`].
 fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    path_expr: &Expr,
-    input: StandardJson<'a, W>,
     optional: bool,
     scalar_slice_noop: bool,
     rhs_values: Vec<OwnedValue>,
@@ -28827,34 +28796,13 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(early_return) => return early_return,
     };
 
-    // jq mode never reaches here (#3448): see `eval_assign`.
-    debug_assert!(
-        S::TAG == EvalTag::Yq,
-        "jq mode's `op=`/`//=` is `each_assign`"
-    );
-
     let (pristine, paths) = match yq_targets {
         // yq mode: already resolved and auto-created before the right side
         // ran (#2481), and that working copy is the document every write
         // splices into.
         Some(YqAssignTargets { doc, paths, .. }) => (doc, paths),
-        None => {
-            // #1953: a non-decode-failure to_owned error respects `optional`
-            // like the sibling `resolve_dynamic_indexes` arm just below (and
-            // `eval_assign`/`eval_update`'s matching sites) -- only a genuine
-            // decode failure is unconditional.
-            let pristine = match to_owned::<S, _>(&input) {
-                Ok(v) => v,
-                Err(e) => return suppress_or_raise(e, optional),
-            };
-            let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
-                Ok(paths) => paths,
-                // `?` swallows only a genuine error; a halt always escapes (#791).
-                Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
-                Err((_, escape)) => return escape.into(),
-            };
-            (pristine, paths)
-        }
+        // jq mode never reaches here (#3448): see `eval_assign`.
+        None => unreachable!("jq mode's `op=`/`//=` is `each_assign` (#3448)"), // omni-dev: coverage tolerate-line reason="unreachable: eval_compound_assign/eval_alternative_assign return collect_assign for JqSemantics before this point, and yq_prepare_assign_targets is Some for every YqSemantics call (#3448)"
     };
     let scalar_noop = scalar_slice_noop && S::TAG == EvalTag::Yq;
     // #1351: a compound/alternative assign whose path *ends* at an alias
@@ -28975,8 +28923,6 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // scope, with the corrected understanding recorded on
     // `through_slice`'s own `Null` arm instead of folded in here.
     eval_update_multi::<W, S>(
-        path_expr,
-        input,
         optional,
         matches!(op, AssignOp::Add),
         rhs_values,
@@ -29057,8 +29003,6 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // has no oracle for this operator, so it's judged by consistency with
     // `|=`'s own already-correct multi-output-filter behavior instead.
     eval_update_multi::<W, S>(
-        path_expr,
-        input,
         optional,
         true,
         rhs_values,
@@ -29166,6 +29110,12 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut parked: Option<Control> = None;
     // `Error` under `optional` ends the fan-out quietly.
     let mut swallowed = false;
+    // The input is materialised once per call, at most: the first output
+    // consumes its copy (a single-output `.a = 5` never clones the document),
+    // and the second output decodes it again and keeps that one to clone from
+    // for every later output -- so N outputs cost two decodes, not N.
+    let mut first_output = true;
+    let mut decoded: Option<OwnedValue> = None;
     let flow = eval_each::<W, S>(value_expr, input.clone(), optional, &mut |item| {
         let value = match item.into_owned::<S>() {
             Ok(value) => value,
@@ -29175,12 +29125,19 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             Err(e) => return stop_with_escape(&mut parked, Control::Error(e)),
         };
-        match assign_one::<W, S>(kind, path_expr, value, &input, streaming, optional) {
-            Ok(Some(doc)) => sink(Item::Owned(doc)),
-            Ok(None) => {
+        let pristine = assign_pristine::<S, W>(&input, &mut first_output, &mut decoded);
+        // #1953: a non-decode-failure `to_owned` error respects `optional`;
+        // a genuine decode failure is unconditional.
+        let pristine = match pristine {
+            Ok(pristine) => pristine,
+            Err(e) if suppresses(&e, optional) => {
                 swallowed = true;
-                Demand::Stop
+                return Demand::Stop;
             }
+            Err(e) => return stop_with_escape(&mut parked, Control::Error(e)),
+        };
+        match assign_one::<S>(kind, path_expr, value, pristine, streaming) {
+            Ok(doc) => sink(Item::Owned(doc)),
             // `?` swallows a genuine error, never a decode failure (#1953) or
             // a halt (#791).
             Err(EvalEscape::Error(e)) if suppresses(&e, optional) => {
@@ -29198,9 +29155,30 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// The input as an owned document for the next RHS output of [`each_assign`].
+///
+/// Its own function, and not inline, so the decode failure it returns is the
+/// caller's to classify: `optional` suppresses a non-decode failure and never
+/// a decode failure (#1953, STYLE-0012), which `each_assign` decides where it
+/// holds `optional`.
+fn assign_pristine<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
+    input: &StandardJson<'_, W>,
+    first_output: &mut bool,
+    decoded: &mut Option<OwnedValue>,
+) -> Result<OwnedValue, EvalError> {
+    if core::mem::take(first_output) {
+        return to_owned::<S, _>(input);
+    }
+    if let Some(shared) = decoded {
+        return Ok(shared.clone());
+    }
+    let pristine = to_owned::<S, _>(input)?;
+    *decoded = Some(pristine.clone());
+    Ok(pristine)
+}
+
 /// One RHS output's document: `value` written to every path the target
-/// resolves to against `input`. `Ok(None)` is a `to_owned` failure `optional`
-/// suppresses (#1953; a decode failure is unconditional).
+/// resolves to against `pristine`, the input as it was.
 ///
 /// **Streaming route: two documents, not one.** When the path can produce a
 /// second path, the paths are resolved one at a time and each write is applied
@@ -29215,22 +29193,16 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// **Eager route: one document.** A path that resolves to at most one path has
 /// nothing for a stop to suppress and no "between" to interleave, so it is
-/// resolved once, written once, into the one document -- the input's own
-/// materialisation, moved rather than cloned. The last path takes `value` by
-/// move; earlier ones clone it.
-fn assign_one<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+/// resolved once, written once, into the one document -- `pristine` itself,
+/// moved rather than cloned. The last path takes `value` by move; earlier ones
+/// clone it.
+fn assign_one<S: EvalSemantics>(
     kind: AssignKind,
     path_expr: &Expr,
     value: OwnedValue,
-    input: &StandardJson<'_, W>,
+    pristine: OwnedValue,
     streaming: bool,
-    optional: bool,
-) -> Result<Option<OwnedValue>, EvalEscape> {
-    let pristine = match to_owned::<S, _>(input) {
-        Ok(pristine) => pristine,
-        Err(e) if suppresses(&e, optional) => return Ok(None),
-        Err(e) => return Err(EvalEscape::Error(e)),
-    };
+) -> Result<OwnedValue, EvalEscape> {
     // What `op=`/`//=` writes at each path: the operator over the value the
     // right side already produced, so the path's own `.` is the target's.
     let filter = match kind {
@@ -29245,11 +29217,11 @@ fn assign_one<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Box::new(owned_to_expr(&value)),
         )),
     };
-    debug_assert!(
-        !alias_identity::active(),
-        "alias identity is yq-only (#1351); jq mode must not reach the assignment write"
-    );
     if streaming {
+        debug_assert!(
+            !alias_identity::active(),
+            "alias identity is yq-only (#1351); jq mode must not reach the streaming write"
+        );
         let mut result = pristine.clone();
         let mut write_one = |result: &mut OwnedValue, path: &Expr| match &filter {
             // Cloned for *every* path, including the last: a streaming
@@ -29279,7 +29251,7 @@ fn assign_one<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             StreamedWrites::ResolutionFailed(escape) | StreamedWrites::WriteFailed(escape) => {
                 Err(escape)
             }
-            StreamedWrites::Done => Ok(Some(result)),
+            StreamedWrites::Done => Ok(result),
         };
     }
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
@@ -29304,7 +29276,7 @@ fn assign_one<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
     }
-    Ok(Some(result))
+    Ok(result)
 }
 
 /// The keyword spelling of a [`MetaSlot`], for error messages.
@@ -31007,18 +30979,18 @@ fn update_root_with_filter<S: EvalSemantics>(
     let positioned = position_update_filter::<S>(filter_expr, pos)?;
     let filter_expr = positioned.as_ref().unwrap_or(filter_expr);
     let run = || eval_owned_multi_first::<S>(filter_expr, root, reentry);
-    let outputs = match pos {
+    let output = match pos {
         Some(pos) => super::eval_generic::with_absolute_path_base(pos.path.clone(), run)?,
         None => run()?,
     };
-    let wrote = !outputs.is_empty();
+    let wrote = output.is_some();
     if !wrote {
         if let Some(deletes) = deletes.as_mut() {
             deletes.record();
         }
     }
     if wrote || (S::TAG != EvalTag::Yq && deletes.is_none()) {
-        *root = outputs.into_iter().next().unwrap_or(OwnedValue::Null);
+        *root = output.unwrap_or(OwnedValue::Null);
     }
     Ok(wrote)
 }
@@ -32627,7 +32599,7 @@ fn eval_owned_multi_first<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     reentry: Reentry,
-) -> Result<Vec<OwnedValue>, EvalEscape> {
+) -> Result<Option<OwnedValue>, EvalEscape> {
     // Demand-driven (#3448): the sink stops the generator at its first
     // output, so a later output -- and any `input`/`debug`/`stderr` inside it
     // -- never runs, as in jq's `label $out | (f | ., break $out)`. That also
@@ -32639,7 +32611,7 @@ fn eval_owned_multi_first<S: EvalSemantics>(
         Demand::Stop
     });
     match (first, flow) {
-        (Some(v), _) => Ok(vec![v]),
+        (Some(v), _) => Ok(Some(v)),
         // A control with nothing produced before it has no prefix to fall
         // back to, so it escapes: a bare `Error`, a bare `break` (#824) and
         // a bare `halt` (#791) alike -- `label $out | (.a |= (break $out))`
@@ -32647,7 +32619,7 @@ fn eval_owned_multi_first<S: EvalSemantics>(
         // turning the halt into an empty filter would silently assign `null`
         // instead of halting.
         (None, Flow::Escaped(control)) => Err(control.into()),
-        (None, _) => Ok(Vec::new()),
+        (None, _) => Ok(None),
     }
 }
 
@@ -76239,7 +76211,7 @@ mod tests {
         let values =
             eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null, Reentry::REBUILT)
                 .unwrap();
-        assert_eq!(values, vec![OwnedValue::Int(1)]);
+        assert_eq!(values, Some(OwnedValue::Int(1)));
     }
 
     #[test]
@@ -76272,7 +76244,7 @@ mod tests {
         let values =
             eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null, Reentry::REBUILT)
                 .unwrap();
-        assert_eq!(values, vec![OwnedValue::Int(1)]);
+        assert_eq!(values, Some(OwnedValue::Int(1)));
     }
 
     #[test]
@@ -76292,9 +76264,11 @@ mod tests {
         let values =
             eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null, Reentry::REBUILT)
                 .unwrap();
-        assert!(values.is_empty());
+        assert_eq!(values, None);
     }
 
+    // The input queue exists only with `std`.
+    #[cfg(feature = "std")]
     #[test]
     fn eval_owned_multi_first_never_evaluates_past_the_first_output_3448() {
         // jq's `_modify` reads only the update's first output
@@ -76308,7 +76282,7 @@ mod tests {
         let values =
             eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null, Reentry::REBUILT)
                 .unwrap();
-        assert_eq!(values, vec![OwnedValue::Int(7)]);
+        assert_eq!(values, Some(OwnedValue::Int(7)));
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(1)));
         assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(2)));
         assert_eq!(pop_remaining_input(), None);
