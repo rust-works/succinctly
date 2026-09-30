@@ -4334,6 +4334,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 }));
                 match outcome {
                     Ok(written) => written?,
+                    // omni-dev: coverage tolerate reason="unreachable from any query this suite can build since #3457: the path walkers were the sites that panicked at MAX_NESTING_DEPTH here (sort/join/map, path()/paths/setpath/del()/assignment on a deep document), and they now return a decode-failure-tagged error, so a deep document is reported through the ordinary Err arm instead. The panic sites still in the evaluator (lazy.rs cursor_to_owned, owned_identity_recurse_step, owned_from_standard_json_at_depth, the YAML comment-preserving materialization) are not reached by a jq-mode CLI query at 250-500 levels, probed by hand; the catch is kept as the net for them and for a future guard that panics, and nesting_depth_panic_message itself is pinned by a unit test (#3457)"
                     Err(payload) => {
                         // `&*payload`, not `&payload` -- `payload` is a
                         // `Box<dyn Any + Send>`, and a bare `&payload`
@@ -4369,6 +4370,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         // reaches it on the same iteration; this one didn't).
                     }
                 }
+                // omni-dev: coverage end
                 // halt/halt_error (#791) outranks everything else, including
                 // remaining values/files still to process. The panic arm above
                 // used to `continue` past this check and repeat it itself;

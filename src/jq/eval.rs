@@ -68702,6 +68702,76 @@ mod tests {
         }
     }
 
+    /// #3457: `eval_pipe` applied to a stage that yields several borrowed
+    /// values, each of which the rest of the pipe answers with several more
+    /// (`.a[] | .[]`), keeps them borrowed and in order. `eval()` used to reach
+    /// this fold on every such pipe; it now routes through the generic
+    /// evaluator, so `eval_full` is what drives this file's own.
+    #[test]
+    fn eval_pipe_keeps_many_borrowed_values_of_many_in_order_3457() {
+        let json = br#"{"a":[[1,2],[3]]}"#;
+        let index = JsonIndex::build(json);
+        for (filter, want) in [
+            (".a[] | .[]", vec!["1", "2", "3"]),
+            (".a[] | .[0], .[0]", vec!["1", "1", "3", "3"]),
+        ] {
+            let expr = parse(filter).expect("parses");
+            let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+                .collect_owned::<JqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>();
+            assert_eq!(got, want, "{filter}");
+        }
+    }
+
+    /// ADR-0025 (#3262), through the library entry (#3457): `eval()` runs the
+    /// generic cursor evaluator, whose own `DefCall` arms -- its owned-identity
+    /// route among them -- take the same floor as `eval_full`'s. The test
+    /// above drives `eval_full` (this file's evaluator) only, so it no longer
+    /// reaches those arms once `eval()` stopped being an alias of it.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_library_entry_checks_the_native_stack_floor_3457() {
+        let json = br#"{"a":{"b":1}}"#;
+        let index = JsonIndex::build(json);
+        for filter in [
+            "def f: .a; f | key",
+            "def f(g): g; f(.a) | key",
+            "def f: .a; [f | parent]",
+            "def f: .; f | .a",
+            "def f: .a; [path(f)]",
+            "def f(g): g; f(.a) |= 2",
+            "def f: .a; first(f)",
+            "def f: .; .a | to_entries | f | key",
+            "def f: .; .a | to_entries | f | parent",
+        ] {
+            let expr = parse(filter).expect("parses");
+            let refuse = || match with_stack_budget(0, || {
+                eval::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+            }) {
+                QueryResult::Error(e) => assert!(
+                    e.message.ends_with("exceeded maximum recursion depth"),
+                    "{filter}: {}",
+                    e.message
+                ),
+                other => panic!("{filter}: expected a refusal, got {other:?}"),
+            };
+            // Cold: the call is refused while its body is bound.
+            refuse();
+            // Warm the node's bound-body cache with the stack unregistered...
+            assert!(
+                !matches!(
+                    eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)),
+                    QueryResult::Error(_)
+                ),
+                "{filter}: answers with the stack unregistered"
+            );
+            // ...so the arm itself refuses the already-bound body.
+            refuse();
+        }
+    }
+
     /// ADR-0025 (#3262): on a registered thread, recursion whose native stack
     /// per level the frame count cannot predict refuses instead of overflowing
     /// -- here on an 8 MiB thread, where the lazy-link chain would otherwise
