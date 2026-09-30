@@ -601,8 +601,29 @@ regressed. What it leaves:
   "H"|halt_error(3))` writes `H` twice where jq writes it once (exit code 3 both); the
   `try` driver's own unstamped slot lets the source continue past a stashed halt. Unchanged
   by #3293.
-- **Path-mode folds** (`resolve_reduce`/`resolve_foreach`, under `path`/`del`/`|=`) keep their
-  own bare escape slots and were not touched.
+- **Path-mode folds** (`resolve_reduce`/`resolve_foreach`, under `path`/`del`/`|=`) were
+  untouched by this slice; see the next section.
+
+## Path-mode `as` binds, folds and a `?//` retry (#3293)
+
+A `?//` in the SOURCE of a path-mode `as` bind, or in a path-mode `reduce`/`foreach`'s SOURCE or
+INIT, retries past the failure its first alternative sent the body (or the fold's UPDATE) into,
+as jq's does (`path(([1] as $q ?// $b | $q) as $y | .[$y:])` on `[10,20,30]` is
+`[{"start":null,"end":null}]`, was that path followed by "Array/string slice indices must be
+integers"; `path(reduce ([1] as $q ?// $b | $q | if . == null then error("E2") else . end) as
+$x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
+
+- **`no_std` recognises only a direct bind**, for the reason the fold section above gives: a
+  source or INIT that *is* a `?//` bind is covered, and one wrapped in `first`, `//` or a pipe
+  keeps the previous answer there.
+- **A destructuring alternative in a fold source words its error differently** (#3489): jq
+  path-tracks a fold's source, so `path(reduce ([1] as $q ?// {$z} | $q) as $x (.; .[$x:]))`
+  raises `Invalid path expression near attempt to access element "z" of [1]` where succinctly
+  raises `Cannot index array with string "z"`. Both raise after one attempt; only the wording
+  differs.
+- **`path(reduce 1 as $x (.; .[null:]))`** is `[]` in jq 1.7.1 and an error here, with or
+  without a `?//` (the slice returns the whole array, which jq treats as the accumulator's own
+  node). Unrelated to the retry, and unchanged.
 
 ## Path-mode slice bounds and a `?//` retry (#3293)
 

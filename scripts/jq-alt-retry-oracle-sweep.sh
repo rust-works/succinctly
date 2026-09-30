@@ -249,6 +249,13 @@ R_ENTRIES=(
   'pick-slice::::pick(.[__B__:])'
   'path-slice-optional::::path(.[__B__:]?)'
   'path-slice-then-index::::path(.[__B__:] | .[0])'
+  # -- slice 8a: CLOSED. The path-mode `as` bind's source
+  #    (resolve_bind_source_sink); its source is untracked in jq, so the
+  #    `("A"|stderr) | ...` marker is safe here. --
+  'path-bind-source::::path(__B__ as $y | .[$y:])'
+  'del-bind-source::::del(__B__ as $y | .[$y:])'
+  'update-bind-source::::(__B__ as $y | .[$y:]) |= ["x"]'
+  'pick-bind-source::::pick(__B__ as $y | .[$y:])'
   # -- open: the path-mode computed index (resolve_index_expr_sink). --
   'path-index::#3293 slice 5::path(.[__B__])'
   'del-index::#3293 slice 5::del(.[__B__])'
@@ -396,6 +403,64 @@ for t_entry in "${T_ENTRIES[@]}"; do
     t_filled="${t_template//__T__/$t}"
     for c in "${T_CONSUMERS[@]}"; do
       run_case "$t_label" "${c//__W__/$t_filled}" "$t_tag" "$COND_STDIN_FILE"
+    done
+  done
+done
+
+# #3293 slice 8a (path-mode folds): a `?//` in a fold's SOURCE or INIT whose
+# first alternative sends the fold's UPDATE into an error the retry avoids.
+# jq path-tracks a fold's source, so the attempt marker is `("A"|stderr) as $_ |`
+# here (a bare `("A"|stderr) | ...` resets jq's path register), and the source
+# variants leave out a destructuring alternative (#3489 words that error
+# differently). `__S__` is the source, `__I__` INIT; the first alternative of
+# each binds `[1]` (or leaves INIT whole), which UPDATE refuses.
+S_VARIANTS=(
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | $q)'
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | $q // empty)'
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | $q | if . == null then error("E2") else . end)'
+)
+I_VARIANTS=(
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else .[1:] end)'
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else empty end)'
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then . else error("E2") end)'
+  '([1] as $q ?// {$z} | ("A"|stderr) as $_ | .)'
+)
+S_ENTRIES=(
+  'path-reduce-source::::path(reduce __S__ as $x (.; .[$x:]))'
+  'path-foreach-source::::path(foreach __S__ as $x (.; .[$x:]))'
+  'path-foreach-extract-source::::path(foreach __S__ as $x (.; .; .[$x:]))'
+  'del-reduce-source::::del(reduce __S__ as $x (.; .[$x:]))'
+  'update-foreach-source::::(foreach __S__ as $x (.; .[$x:])) |= 5'
+)
+# The step *succeeds* on the first alternative and a consumer's stop reaches the
+# source's `?//` (#3293 review). Only the retries that produce nothing or raise:
+# an answering retry over-delivers in jq (a documented, unreproduced shape).
+SOK_VARIANTS=("${S_VARIANTS[1]}" "${S_VARIANTS[2]}")
+SOK_ENTRIES=(
+  'path-foreach-source-step-ok::::path(foreach __S__ as $x (.; .[0:]))'
+  'path-foreach-extract-source-step-ok::::path(foreach __S__ as $x (.; .; .[0:]))'
+)
+I_ENTRIES=(
+  'path-reduce-init::::path(reduce 1 as $x (__I__; if length>2 then error("E") else . end))'
+  'path-foreach-init::::path(foreach 1 as $x (__I__; if length>2 then error("E") else . end))'
+  'path-foreach-extract-init::::path(foreach 1 as $x (__I__; .; if length>2 then error("E") else . end))'
+  'del-reduce-init::::del(reduce 1 as $x (__I__; if length>2 then error("E") else . end))'
+)
+for fold_family in S SOK I; do
+  if [[ "$fold_family" == S ]]; then entries=("${S_ENTRIES[@]}"); variants=("${S_VARIANTS[@]}"); token=__S__
+  elif [[ "$fold_family" == SOK ]]; then entries=("${SOK_ENTRIES[@]}"); variants=("${SOK_VARIANTS[@]}"); token=__S__
+  else entries=("${I_ENTRIES[@]}"); variants=("${I_VARIANTS[@]}"); token=__I__; fi
+  for f_entry in "${entries[@]}"; do
+    f_rest="$f_entry"
+    f_label="${f_rest%%::*}"
+    f_rest="${f_rest#*::}"
+    f_tag="${f_rest%%::*}"
+    f_template="${f_rest#*::}"
+    for v in "${variants[@]}"; do
+      f_filled="${f_template//$token/$v}"
+      for c in "${R_CONSUMERS[@]}"; do
+        run_case "$f_label" "${c//__W__/$f_filled}" "$f_tag" "$RETRY_STDIN_FILE"
+      done
     done
   done
 done
