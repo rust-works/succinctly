@@ -640,10 +640,6 @@ raises in jq and now here). What it leaves:
   The same holds for `path(f)`'s consumer stop, whose operand is the whole path expression.
 - **A computed index** (`path(.[K])`, `del(.[K])`) kept its own bare slots in
   `resolve_index_expr_sink` at this slice; the next section closes it.
-- **Value mode never retries on a consumer's stop through a slice bound** (#3471):
-  `[first(.[([1] as [$a] ?// $b | if $a == null then "x" else $a end):]), 9]` is `[[20,30],9]`
-  here where jq retries and raises -- `eval_slice_expr` collects before the consumer sees an
-  output, the #2180 "materialized before the consumer" family.
 
 ## Path-mode computed index and a `?//` retry (#3293)
 

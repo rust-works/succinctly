@@ -10999,6 +10999,15 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::IndexExpr { target, key } if streams_escaped_generator_prefix::<S>() => {
             each_index_expr_generic::<S, V>(target, key, value, optional, cursor, sink)
         }
+        // Likewise for a computed slice's bounds (#3471): the slices are pushed
+        // as each `(s, e)` pair produces them, so a `?//` inside a bound sees
+        // a wrapping consumer's stop. yq mode keeps the eager fallback (real
+        // yq has no multi-valued bound model, #2372).
+        Expr::SliceExpr { target, start, end } if streams_escaped_generator_prefix::<S>() => {
+            each_slice_expr_generic::<S, V>(target, start, end, value, optional, cursor, &mut |v| {
+                sink.push(GenericItem::Owned(v))
+            })
+        }
         Expr::Object(entries) => {
             let mut acc = Vec::new();
             each_object_entries_generic::<S, V>(entries, value, optional, cursor, &mut acc, sink)
@@ -17237,6 +17246,81 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    // The collector over `each_slice_expr_generic`: the outputs the worker
+    // pushes are gathered into one result, so `eval_single` and every other
+    // eager caller see the same `GenericResult` as before the worker was split
+    // out (#3471).
+    let mut out: Vec<OwnedValue> = Vec::new();
+    let flow =
+        each_slice_expr_generic::<S, V>(target, start, end, value, optional, cursor, &mut |v| {
+            out.push(v);
+            Demand::Continue
+        });
+    match flow {
+        // #1048: a zero-result collapse here (every (start, end) pair
+        // optional-suppressed, or an empty `start` stream that never
+        // evaluated `end` or the target at all) must be `None`, not
+        // `ManyOwned(vec![])`.
+        Flow::Exhausted => owned_vec_to_generic_result(out),
+        // The collector never asks the worker to stop, and the worker
+        // converts its own stashed stops into `Escaped`, so a `Stopped` here
+        // is some enclosing driver still reporting a stale stop (#3293
+        // review: `isempty`/`any` did, before their reset). Finish with what
+        // was produced rather than abort the process over it -- but loudly in
+        // a debug build, so a driver that regresses into a stale stop fails
+        // the suite instead of truncating the slice unseen.
+        Flow::Stopped { .. } => {
+            // omni-dev: coverage tolerate reason="unreachable: every consumer that records a wrapping stop resets it per invocation (#3293), so a stash-less Stopped needs one that regresses"
+            if cfg!(debug_assertions) {
+                unreachable!("a stash-less Stopped reached the slice collector (#3293)");
+            }
+            owned_vec_to_generic_result(out)
+            // omni-dev: coverage end
+        }
+        // #1528: `start`'s own trailing escape still has to reach the final
+        // result -- a successful pull doesn't mean `start` itself didn't
+        // escape after producing `out`'s own values (in yq mode it
+        // produced none, #2351). `end`'s own escape is handled per-`s` in
+        // the worker (#2225), not here.
+        Flow::Escaped(control) => partial_generic(out, control),
+    }
+}
+
+/// Demand-forwarding worker behind [`eval_slice_expr`] (#3471): the same
+/// `S as $s | T as $t | E | .[$s:$t]` evaluation, with each finished slice
+/// pushed to `sink` the moment its `(s, e)` pair produces it instead of
+/// collected first. A consumer's `Demand::Stop` therefore reaches the bound
+/// generators while they are still the live top of the call stack, so a `?//`
+/// inside `start` or `end` sees the break jq's `first`/`limit`/`isempty` raise
+/// and retries (`[first(.[(1 as $x ?// $y | 1):]), 9]` is `[[20,30],[20,30],9]`
+/// in jq 1.7.1, where the collected result answered `[[20,30],9]`). Twin of
+/// `eval::each_slice_expr`; the sibling [`each_index_expr_generic`] does the
+/// same for a computed index.
+///
+/// A pair's own escape is stashed only after the slices it produced before
+/// escaping have been delivered, and dropped if the sink stopped while taking
+/// them: a consumer that has what it wanted never reaches the error, as in
+/// jq. A stop the sink caused comes back as `Flow::Stopped`; an escape as
+/// `Flow::Escaped`, whose prefix is already in the sink.
+///
+/// The stop-forwarding dispatch is jq mode only, for the reason
+/// [`each_index_expr_generic`] gives: yq mode's bound rules retroactively
+/// discard a prefix, which a delivered push cannot be recalled to do
+/// ([`streams_escaped_generator_prefix`]). The caller gates on it;
+/// `eval_slice_expr`'s collector runs in both modes because it never stops,
+/// so what it collects is exactly what the eager version did.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `eval_slice_expr`'s six parameters plus the sink,
+                                     // each threaded straight through; a struct would just
+                                     // rename the same fields.
+fn each_slice_expr_generic<S: EvalSemantics, V: DocumentValue>(
+    target: &Expr,
+    start: &Option<Box<Expr>>,
+    end: &Option<Box<Expr>>,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
     // #2546: the bounds are pulled one value at a time through
     // `eval_each_generic`'s sink protocol -- `start` outermost, `end`
     // re-pulled per start value inside it, the target re-evaluated per
@@ -17264,187 +17348,14 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     // `Expr::SliceExpr`'s own match arm above), so this site -- not
     // `eval::eval_slice_expr`'s sibling -- is what a real `succinctly
     // jq`/`succinctly yq` invocation hits.
-    let mut out: Vec<OwnedValue> = Vec::new();
 
     // The sinks' escape hatch (#2138's shape): a sink can only answer
     // `Demand`, so the control that ended the pull is stashed here,
     // `Demand::Stop` ends the pull, and it is read once the pull returns.
-    // #3293: stashed apart from `out` so a
-    // `?//` retry inside either bound can supersede it without taking the
-    // outputs already produced with it (see `eval::StashedVerdict`). One
-    // invocation of either sink records at most one.
+    // #3293: a `?//` retry inside either bound can supersede the stash
+    // (see `eval::StashedVerdict`); one invocation of either sink records at
+    // most one.
     let stash = StashedEscape::new();
-
-    // The shared exit every escape arm below funnels through, so folding
-    // the running `out` in as a `Partial` prefix can't drift between arms
-    // -- the single-accumulator counterpart of `eval_index_expr`'s
-    // `escape_generic!` above (that macro's own cursor/owned promotion has
-    // nothing to do here: `out` is always `Vec<OwnedValue>`, never a
-    // separate cursor accumulator). Runs from inside a sink, so it stashes
-    // its control and stops the pull rather than `return`ing a
-    // `GenericResult` directly; the running `out` is folded in as the
-    // `Partial` prefix once the pull returns.
-    macro_rules! escape {
-        ($control:expr) => {{
-            return stash.stop($control);
-        }};
-    }
-
-    // One `(s, e)` pair's worth of work: evaluate `target` fresh (#2143 --
-    // jq's desugaring puts `E` inside both bindings, so a side effect in
-    // `E` fires once per pair; verified against jq 1.7.1: `[10,20,30] |
-    // [(stderr)[(0,1):(2,3)]]` writes `[10,20,30]` to stderr four times),
-    // slice each of its outputs by this pair, fold the results into `out`.
-    // Was the body of the innermost `for e in &ends` loop; `s`/`e` are now
-    // macro parameters fed one pair at a time from the sinks below, but
-    // every line inside is otherwise unchanged.
-    macro_rules! process_pair {
-        ($s:expr, $e:expr) => {{
-            let s: &ComputedSliceBound = $s;
-            let e: &ComputedSliceBound = $e;
-            // #2138's labeled block, for the same reason `eval_index_expr`'s
-            // `process_one_key!` has one: there is no enclosing loop for the
-            // old `GenericResult::None => continue` arm to continue out of.
-            'process_pair: {
-                // Borrowed and owned targets are kept apart so the common
-                // (borrowed) case never materializes the document --
-                // mirrors `eval_index_expr`.
-                enum Targets<V> {
-                    Borrowed(Vec<V>),
-                    Owned(Vec<OwnedValue>),
-                }
-                let targets = match eval_single::<S, V>(target, value.clone(), false, cursor) {
-                    GenericResult::Error(e) => escape!(Control::Error(e)),
-                    GenericResult::Break(label) => escape!(Control::Break(label)),
-                    GenericResult::Halt(code) => escape!(Control::Halt(code)),
-                    // Zero outputs for *this* (s, e) pair contributes
-                    // nothing to it -- not a whole-function short-circuit,
-                    // now that E's own output count can vary across pairs
-                    // (mirrors `eval_index_expr`'s identical per-key
-                    // treatment).
-                    GenericResult::None => break 'process_pair,
-                    // #2226: this (s, e) pair's own target generator may
-                    // have produced some values before escaping (a
-                    // break/halt/error partway through its own stream) --
-                    // apply the slice to each of those already-produced
-                    // values and fold them into `out` before escaping,
-                    // mirroring `eval_index_expr`'s identical fix for its
-                    // own target `Partial` arm, rather than discarding
-                    // them. jq-only (review finding, same gate as
-                    // `eval_index_expr` above): real yq does not stream a
-                    // target's own escaped generator's prefix --
-                    // live-verified against yq v4.53.3,
-                    // `([1,2],[3,4],error("x"))[(0,1):(1,2)]` prints only
-                    // `Error: x`. yq mode keeps the old conservative
-                    // discard.
-                    //
-                    // #2374: the gate/fold/escape tail is
-                    // `eval::fold_escaped_generator_prefix`, the family's
-                    // one definition, shared with `eval_index_expr` above
-                    // and both of `eval.rs`'s siblings. `promote:` is empty
-                    // here -- `out` is already `Vec<OwnedValue>`, so there
-                    // is no cursor accumulator to promote first.
-                    GenericResult::Partial(vs, control) => {
-                        fold_escaped_generator_prefix! {
-                            semantics: S,
-                            escape: escape,
-                            prefix: vs,
-                            control: control,
-                            promote: {},
-                            accumulator: out,
-                            fold: |t| slice_owned_value_read_computed::<S>(t, s, e, optional),
-                        }
-                    }
-                    GenericResult::One(v) => Targets::Borrowed(vec![v]),
-                    GenericResult::Many(vs) => Targets::Borrowed(vs),
-                    GenericResult::OneCursor(c) => Targets::Borrowed(vec![c.value()]),
-                    GenericResult::ManyCursor(cs) => {
-                        Targets::Borrowed(cs.iter().map(DocumentCursor::value).collect())
-                    }
-                    // See `eval_index_expr`'s identical arm for the
-                    // accepted, pre-existing error-swallowing note that
-                    // also applies to `LazySeq` here.
-                    owned @ (GenericResult::Owned(_)
-                    | GenericResult::ManyOwned(_)
-                    | GenericResult::LazyKeys { .. }
-                    | GenericResult::LazyIndexRange(_)
-                    | GenericResult::LazySeq(_)) => match owned.collect_owned::<S>() {
-                        Ok(vs) => Targets::Owned(vs),
-                        Err(err) => escape!(Control::Error(err)),
-                    },
-                };
-                match &targets {
-                    Targets::Borrowed(ts) => {
-                        if out.try_reserve(ts.len()).is_err() {
-                            escape!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
-                        }
-                        for t in ts {
-                            match slice_one_generic_computed::<S, V>(t.clone(), s, e, optional) {
-                                GenericResult::Owned(v) => out.push(v),
-                                GenericResult::None => {}
-                                // #2143 (review): a later (s, e)
-                                // pair's/target's slice-application error
-                                // must not discard the values already
-                                // produced by earlier ones -- same "later
-                                // step's error outranks an earlier
-                                // already-produced prefix, which still
-                                // survives as Partial" rule this
-                                // function's own target-evaluation escape
-                                // above follows, mirroring
-                                // `eval_index_expr`'s identical treatment
-                                // of a later key's index error.
-                                // Pre-existing gap (predates #2143,
-                                // confirmed live against jq 1.7.1:
-                                // `[1,2,3,4] | (.,5)[(1-1):(1+1)]` prints
-                                // `[1,2]` before raising "Cannot index
-                                // number with object"; this arm used to
-                                // discard it), fixed here now that it sits
-                                // directly beneath the target-evaluation
-                                // fix above making the same claim.
-                                GenericResult::Error(e) => escape!(Control::Error(e)),
-                                // #2182: was a wildcard `_ =>` -- verified
-                                // by reading `slice_one_generic`'s own body
-                                // exhaustively: every return path resolves
-                                // to `Owned`/`None`/`Error`, so this is a
-                                // provably closed set today. Spelled out
-                                // per-variant so a future `GenericResult`
-                                // variant it starts returning is a compile
-                                // error here, not a silent absorption into
-                                // a catch-all.
-                                GenericResult::One(_)
-                                | GenericResult::OneCursor(_)
-                                | GenericResult::Many(_)
-                                | GenericResult::ManyCursor(_)
-                                | GenericResult::LazyKeys { .. }
-                                | GenericResult::LazyIndexRange(_)
-                                | GenericResult::LazySeq(_)
-                                | GenericResult::ManyOwned(_)
-                                | GenericResult::Break(_)
-                                | GenericResult::Halt(_)
-                                | GenericResult::Partial(..) => {
-                                    unreachable!("slice_one_generic yields Owned/None/Error")
-                                }
-                            }
-                        }
-                    }
-                    Targets::Owned(ts) => {
-                        if out.try_reserve(ts.len()).is_err() {
-                            escape!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
-                        }
-                        for t in ts {
-                            match slice_owned_value_read_computed::<S>(t, s, e, optional) {
-                                Ok(Some(v)) => out.push(v),
-                                Ok(None) => {}
-                                // #2143 (review): same fix as the Borrowed
-                                // arm above.
-                                Err(e) => escape!(Control::Error(e)),
-                            }
-                        }
-                    }
-                }
-            }
-        }};
-    }
 
     // `end`'s own `?//` fallback for the retry generation, decided once.
     let end_direct_retry = end
@@ -17458,8 +17369,20 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         let mut end_sink = |e: ComputedSliceBound| -> Demand {
             // #3293: likewise for a retry inside `end`.
             stash.begin();
-            process_pair!(&s, &e);
-            Demand::Continue
+            let (slices, escape) =
+                slice_pair_generic::<S, V>(target, &s, &e, value.clone(), optional, cursor);
+            // #3471: the pair's slices go to the consumer first. A stop here
+            // is the consumer's own (no stash), and the pair's escape -- which
+            // jq would only reach by pulling past that output -- is dropped.
+            for slice in slices {
+                if sink(slice) == Demand::Stop {
+                    return Demand::Stop;
+                }
+            }
+            match escape {
+                Some(control) => stash.stop(control),
+                None => Demand::Continue,
+            }
         };
         let end_flow =
             each_slice_bound_generic::<S, V>(end, value.clone(), cursor, f64::ceil, &mut end_sink);
@@ -17471,17 +17394,17 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         }
         match end_flow {
             Flow::Exhausted => Demand::Continue,
-            // Only `escape!` stops the inner pull, and its stash was returned
-            // just above; a stash-less stop is a stale enclosing driver's
-            // (#3293), left for the pull's own exit to judge.
-            Flow::Stopped { .. } => Demand::Stop, // omni-dev: coverage tolerate-line reason="unreachable: a real stop always comes with a stash, returned above (#3293)"
+            // The consumer stopped the pull (its stash-less stop), or a stale
+            // enclosing driver's did (#3293) -- either way the outer pull
+            // stops too, and its own exit judges which.
+            Flow::Stopped { .. } => Demand::Stop,
             // #2225: this `s`'s own `end` evaluation escaped after
             // producing some values -- in jq mode those are already
-            // sliced into `out` (the pushes *are* the prefix, #1528); in
-            // yq mode `each_slice_bound_generic` delivered none of them
-            // (#2351). Either way the escape is raised now, before a
-            // *later* `s` could contribute past it.
-            Flow::Escaped(control) => escape!(control),
+            // delivered (the pushes *are* the prefix, #1528); in yq mode
+            // `each_slice_bound_generic` delivered none of them (#2351).
+            // Either way the escape is raised now, before a *later* `s`
+            // could contribute past it.
+            Flow::Escaped(control) => stash.stop(control),
         }
     };
 
@@ -17491,42 +17414,189 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     // A per-pair escape always stashes its control before stopping the
     // pull -- checked first, it outranks anything the start stream's own
     // tail could still report, unless a retry inside `start` superseded it.
-    let direct_retry = start
-        .as_deref()
-        .is_some_and(crate::jq::eval::direct_pattern_retry);
-    if let Some(control) = stash.take(&flow, direct_retry) {
-        return partial_generic(out, control);
+    // #1528: otherwise `start`'s own trailing escape (or the consumer's stop)
+    // is the verdict; `end`'s own escape is handled per-`s` above (#2225).
+    stash.resume(
+        flow,
+        start
+            .as_deref()
+            .is_some_and(crate::jq::eval::direct_pattern_retry),
+    )
+}
+
+/// One `(s, e)` pair's worth of [`each_slice_expr_generic`]'s work: evaluate
+/// `target` fresh (#2143 -- jq's desugaring puts `E` inside both bindings, so
+/// a side effect in `E` fires once per pair; verified against jq 1.7.1:
+/// `[10,20,30] | [(stderr)[(0,1):(2,3)]]` writes `[10,20,30]` to stderr four
+/// times), slice each of its outputs by this pair, and return the slices
+/// with the control that ended the pair, if any. The slices are the
+/// `Partial` prefix when there is one (#2226): they are still delivered,
+/// ahead of the escape.
+///
+/// Was the `process_pair!` macro inside `eval_slice_expr` (#3471 split it
+/// out so the driver can deliver a pair's slices before stashing its
+/// escape); every line of the body is otherwise unchanged.
+fn slice_pair_generic<S: EvalSemantics, V: DocumentValue>(
+    target: &Expr,
+    s: &ComputedSliceBound,
+    e: &ComputedSliceBound,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    let mut out: Vec<OwnedValue> = Vec::new();
+
+    // Every escape arm below funnels through here, so the running `out` is
+    // returned as the escape's prefix and can't drift between arms -- the
+    // single-accumulator counterpart of `eval_index_expr`'s
+    // `escape_generic!` (that macro's cursor/owned promotion has nothing to
+    // do here: `out` is always `Vec<OwnedValue>`).
+    macro_rules! escape {
+        ($control:expr) => {{
+            return (out, Some($control));
+        }};
     }
-    match flow {
-        // #1048: a zero-result collapse here (every (start, end) pair
-        // optional-suppressed, or an empty `start` stream that never
-        // evaluated `end` or the target at all) must be `None`, not
-        // `ManyOwned(vec![])`.
-        Flow::Exhausted => owned_vec_to_generic_result(out),
-        // Our sinks only ask the pull to stop through `escape!`, which
-        // stashes a control that only a retry can supersede, and a retry ends
-        // a drive `Exhausted`/`Escaped` -- every consumer that records a
-        // wrapping stop resets it per invocation (#3293). A `Stopped` with an
-        // empty stash would mean some enclosing driver still reports a stale
-        // stop; finish with what was produced rather than abort the process
-        // over it (#3293 review: `isempty`/`any` did, before their reset) --
-        // but loudly in a debug build, so a driver that regresses into a
-        // stale stop fails the suite instead of truncating the slice unseen.
-        Flow::Stopped { .. } => {
-            // omni-dev: coverage tolerate reason="unreachable: every consumer that records a wrapping stop resets it per invocation (#3293), so a stash-less Stopped needs one that regresses"
-            if cfg!(debug_assertions) {
-                unreachable!("a stash-less Stopped reached the slice collector (#3293)");
-            }
-            owned_vec_to_generic_result(out)
-            // omni-dev: coverage end
+
+    'process_pair: {
+        // Borrowed and owned targets are kept apart so the common
+        // (borrowed) case never materializes the document --
+        // mirrors `eval_index_expr`.
+        enum Targets<V> {
+            Borrowed(Vec<V>),
+            Owned(Vec<OwnedValue>),
         }
-        // #1528: `start`'s own trailing escape still has to reach the final
-        // result -- a successful pull doesn't mean `start` itself didn't
-        // escape after producing `out`'s own values (in yq mode it
-        // produced none, #2351). `end`'s own escape is handled per-`s`
-        // above (#2225), not here.
-        Flow::Escaped(control) => partial_generic(out, control),
+        let targets = match eval_single::<S, V>(target, value.clone(), false, cursor) {
+            GenericResult::Error(e) => escape!(Control::Error(e)),
+            GenericResult::Break(label) => escape!(Control::Break(label)),
+            GenericResult::Halt(code) => escape!(Control::Halt(code)),
+            // Zero outputs for *this* (s, e) pair contributes
+            // nothing to it -- not a whole-function short-circuit,
+            // now that E's own output count can vary across pairs
+            // (mirrors `eval_index_expr`'s identical per-key
+            // treatment).
+            GenericResult::None => break 'process_pair,
+            // #2226: this (s, e) pair's own target generator may
+            // have produced some values before escaping (a
+            // break/halt/error partway through its own stream) --
+            // apply the slice to each of those already-produced
+            // values and fold them into `out` before escaping,
+            // mirroring `eval_index_expr`'s identical fix for its
+            // own target `Partial` arm, rather than discarding
+            // them. jq-only (review finding, same gate as
+            // `eval_index_expr` above): real yq does not stream a
+            // target's own escaped generator's prefix --
+            // live-verified against yq v4.53.3,
+            // `([1,2],[3,4],error("x"))[(0,1):(1,2)]` prints only
+            // `Error: x`. yq mode keeps the old conservative
+            // discard.
+            //
+            // #2374: the gate/fold/escape tail is
+            // `eval::fold_escaped_generator_prefix`, the family's
+            // one definition, shared with `eval_index_expr` above
+            // and both of `eval.rs`'s siblings. `promote:` is empty
+            // here -- `out` is already `Vec<OwnedValue>`, so there
+            // is no cursor accumulator to promote first.
+            GenericResult::Partial(vs, control) => {
+                fold_escaped_generator_prefix! {
+                    semantics: S,
+                    escape: escape,
+                    prefix: vs,
+                    control: control,
+                    promote: {},
+                    accumulator: out,
+                    fold: |t| slice_owned_value_read_computed::<S>(t, s, e, optional),
+                }
+            }
+            GenericResult::One(v) => Targets::Borrowed(vec![v]),
+            GenericResult::Many(vs) => Targets::Borrowed(vs),
+            GenericResult::OneCursor(c) => Targets::Borrowed(vec![c.value()]),
+            GenericResult::ManyCursor(cs) => {
+                Targets::Borrowed(cs.iter().map(DocumentCursor::value).collect())
+            }
+            // See `eval_index_expr`'s identical arm for the
+            // accepted, pre-existing error-swallowing note that
+            // also applies to `LazySeq` here.
+            owned @ (GenericResult::Owned(_)
+            | GenericResult::ManyOwned(_)
+            | GenericResult::LazyKeys { .. }
+            | GenericResult::LazyIndexRange(_)
+            | GenericResult::LazySeq(_)) => match owned.collect_owned::<S>() {
+                Ok(vs) => Targets::Owned(vs),
+                Err(err) => escape!(Control::Error(err)),
+            },
+        };
+        match &targets {
+            Targets::Borrowed(ts) => {
+                if out.try_reserve(ts.len()).is_err() {
+                    escape!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
+                }
+                for t in ts {
+                    match slice_one_generic_computed::<S, V>(t.clone(), s, e, optional) {
+                        GenericResult::Owned(v) => out.push(v),
+                        GenericResult::None => {}
+                        // #2143 (review): a later (s, e)
+                        // pair's/target's slice-application error
+                        // must not discard the values already
+                        // produced by earlier ones -- same "later
+                        // step's error outranks an earlier
+                        // already-produced prefix, which still
+                        // survives as Partial" rule this
+                        // function's own target-evaluation escape
+                        // above follows, mirroring
+                        // `eval_index_expr`'s identical treatment
+                        // of a later key's index error.
+                        // Pre-existing gap (predates #2143,
+                        // confirmed live against jq 1.7.1:
+                        // `[1,2,3,4] | (.,5)[(1-1):(1+1)]` prints
+                        // `[1,2]` before raising "Cannot index
+                        // number with object"; this arm used to
+                        // discard it), fixed here now that it sits
+                        // directly beneath the target-evaluation
+                        // fix above making the same claim.
+                        GenericResult::Error(e) => escape!(Control::Error(e)),
+                        // #2182: was a wildcard `_ =>` -- verified
+                        // by reading `slice_one_generic`'s own body
+                        // exhaustively: every return path resolves
+                        // to `Owned`/`None`/`Error`, so this is a
+                        // provably closed set today. Spelled out
+                        // per-variant so a future `GenericResult`
+                        // variant it starts returning is a compile
+                        // error here, not a silent absorption into
+                        // a catch-all.
+                        GenericResult::One(_)
+                        | GenericResult::OneCursor(_)
+                        | GenericResult::Many(_)
+                        | GenericResult::ManyCursor(_)
+                        | GenericResult::LazyKeys { .. }
+                        | GenericResult::LazyIndexRange(_)
+                        | GenericResult::LazySeq(_)
+                        | GenericResult::ManyOwned(_)
+                        | GenericResult::Break(_)
+                        | GenericResult::Halt(_)
+                        | GenericResult::Partial(..) => {
+                            unreachable!("slice_one_generic yields Owned/None/Error")
+                        }
+                    }
+                }
+            }
+            Targets::Owned(ts) => {
+                if out.try_reserve(ts.len()).is_err() {
+                    escape!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
+                }
+                for t in ts {
+                    match slice_owned_value_read_computed::<S>(t, s, e, optional) {
+                        Ok(Some(v)) => out.push(v),
+                        Ok(None) => {}
+                        // #2143 (review): same fix as the Borrowed
+                        // arm above.
+                        Err(e) => escape!(Control::Error(e)),
+                    }
+                }
+            }
+        }
     }
+
+    (out, None)
 }
 
 /// Pull one slice bound (`start` or `end`) against `value`/`cursor`, one
@@ -36309,6 +36379,70 @@ mod tests {
             }
             other => panic!("expected Partial(_, Error), got {other:?}"),
         }
+    }
+
+    /// #3471: a `?//` in a computed slice's bound retries when a wrapping
+    /// consumer stops on the slice's first output, on the cursor route. jq
+    /// 1.7.1 captures: each row is the `-c` output of the filter over
+    /// `[10,20,30]`.
+    #[test]
+    fn test_computed_slice_bound_retry_reaches_consumer_stop_3471() {
+        let json = br"[10,20,30]";
+        let index = JsonIndex::build(json);
+        for (filter, expected) in [
+            (
+                "[first(.[(1 as $x ?// $y | 1):]), 9]",
+                "[[20,30],[20,30],9]",
+            ),
+            ("[limit(1; .[:(1 as $x ?// $y | 1)]), 9]", "[[10],[10],9]"),
+            ("[isempty(.[(1 as $x ?// $y | 1):]), 9]", "[false,false,9]"),
+            // a consumer that wants two outputs never breaks, so no retry
+            ("[limit(2; .[(1 as $x ?// $y | 1):]), 9]", "[[20,30],9]"),
+            // the retry in `end` re-runs per start value
+            (
+                "[first(.[(0,1):(1 as $x ?// $y | 2)]), 9]",
+                "[[10,20],[10,20],9]",
+            ),
+        ] {
+            let expr = crate::jq::parse(filter).unwrap();
+            let got = eval_with_cursor(&expr, index.root(json))
+                .collect_owned::<JqSemantics>()
+                .unwrap();
+            assert_eq!(
+                got.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                vec![expected],
+                "`{filter}`"
+            );
+        }
+    }
+
+    /// #3471: the sink-driven slice worker stops at the consumer's first
+    /// refusal -- one push out of the four `(s, e)` pairs -- and reports the
+    /// stop rather than an escape; the pairs it never reached are never
+    /// evaluated (`stderr` would print for each).
+    #[test]
+    fn test_each_slice_expr_generic_stops_at_the_first_refusal_3471() {
+        let json = br"[10,20,30]";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".[(0,1):(2,3)]").unwrap();
+        let Expr::SliceExpr { target, start, end } = &expr else {
+            panic!("expected a computed slice, got {expr:?}");
+        };
+        let mut pushed = Vec::new();
+        let flow = each_slice_expr_generic::<JqSemantics, _>(
+            target,
+            start,
+            end,
+            index.root(json).value(),
+            false,
+            Some(index.root(json)),
+            &mut |v| {
+                pushed.push(v.to_json());
+                Demand::Stop
+            },
+        );
+        assert!(matches!(flow, Flow::Stopped { .. }));
+        assert_eq!(pushed, vec!["[10,20]"]);
     }
 
     /// #2372 review: yq mode keeps the pre-fix conservative discard, same
