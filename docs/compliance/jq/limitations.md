@@ -545,14 +545,6 @@ front of gaps that were already there behind a parenthesis:
   write is dropped; `and`/`or`/unary minus in front of a destructuring `as` reach
   [#3289](https://github.com/rust-works/succinctly/issues/3289). Both spellings behaved
   the same way behind parentheses on `main`.
-- **An assignment's right-hand side is collected eagerly**
-  ([#3448](https://github.com/rust-works/succinctly/issues/3448)), so under an early-exit
-  consumer (`first`, `limit`, `nth`, `any`, `isempty`) the *later* outputs of the right-hand
-  side (`input`, `debug`, `stderr`) run where jq is lazy. `[first(.a = (1, input)), input]`
-  already did on `main`; `.a = 1 as $x | ($x, input)` used to mis-parse as `(.a = 1) as $x |
-  ...` and now reaches it too. Under full consumption that spelling is a fix. Distinct from
-  #2267's open note (an assignment's *target* path). `-T as $x | B` itself is lazy in every
-  demand-driven consumer.
 - **`//` against assignment** (the remaining divergence in
   [the language reference](../../reference/jq-language.md#operator-precedence)) now also
   shows inside a binding body on the right of an assignment: `.a = 1 as $x | .a // 1 %= 2`.
@@ -4463,19 +4455,38 @@ between two faithful options. The eager route was not faithful here: it fires si
 effects jq never fires and raises a different error. The same structural sharing
 (#2999) that would retire `=`'s second document retires this one.
 
-**Still open, tracked on #2267.** jq re-resolves an assignment's path once per
-right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer generator),
-so `echo '{}' | jq -c '(.|stderr)[("a","b")] = (1,2)'` fires the target four times where
-this fires it twice. It cannot be fixed while `collect_rhs_outputs` is eager --
-re-resolving per output then fires the target for outputs a downstream consumer never
-pulls, which is *worse*: it was implemented, measured at 87 regressions against 69 fixes
-on a 5,000-shape sweep, and backed out. `first((.|debug("E"))["a"] = (1,2))` fires `E`
-twice under it where jq fires it once, and with `input` in the path it changes stdout;
-`first((.|stderr)["a"] = (1,2))` is pinned as a holdout so a re-attempt fails loudly. The
-streaming write above is deliberately gated to a *single* RHS output for the same reason —
-one output means one output document, so none of that class is reachable from it. The
-`op=`/`//=` family shares both the rule and the gap (`(.|stderr)[(0,1)] += (1,"x")` fires
-twice where jq fires three times, pinned as a #2974 holdout).
+**Closed by #3448: the right side is the outer generator.** jq re-resolves an assignment's
+path once per right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer
+generator), and its right side is lazy, so a consumer that stops early never runs the later
+outputs. Both halves now hold in jq mode. `=`, `op=` and `//=` pull one right-hand output at a
+time, resolve the target against the untouched input, write, hand that document on, and answer
+the consumer's stop back into the right side: `echo '{}' | jq -c '(.|stderr)[("a","b")] =
+(1,2)'` fires the target four times, and `first((.|debug("E"))["a"] = (1,2))` fires it once, in
+both. `|=` reads only the first output of its update, as jq's `_modify` does, so
+`[1] | .[0] |= (1, input)` no longer reads an input. This is what #2267's second step could
+not have while the right side was collected eagerly (it fired the target for outputs a
+downstream `first` never pulled: 87 regressions against 69 fixes on a 5,000-shape sweep);
+with a lazy right side it is a per-output re-resolution and nothing more. The same 5,940-shape
+differential sweep (`scripts/jq-assign-rhs-oracle-sweep.py`: path x operator x right side x
+consumer, `input`/`debug` observable) that the eager route failed 1,215 times against jq 1.7.1
+now has no divergence in stdout, `debug` trace or exit code.
+
+yq keeps the eager route: real yq applies only the *last* output of a multi-output right side,
+once, to every path, and resolves and vivifies its targets before the right side runs (#2481),
+so it needs the whole right side and has no `input`/`debug`/`stderr` to be lazy about.
+
+Costs: a right side that is pulled lazily cannot know an output is the last, so each output
+after the first re-derives the input document instead of taking it by move, and the streaming
+route's per-output spine copy is charged once per output rather than once per extra output
+(`.[(0,1)] = (1,2)` copies the spine twice, where it copied once). A single-output right side
+takes the input by move, as before. Measured on a 7 MB generated `users` document (release,
+interleaved, 15 repetitions, outputs identical, Apple M5 Max under other sessions' load; a
+control run of the same binary against itself spans -2.5% to +1.7% on minimum and -9.5% to
++10.3% on median): `.users[0].name = "x"` and `.users[0].name //= "y"` fall 319 -> 198 ms and
+365 -> 230 ms (-37%) and peak RSS 117 -> 80 MB (-32%); `.users[].score |= . + 1`, `+= 1`,
+`.users[(0,1)].score = 0`, `.users[0].id = (1,2)` and `(.users[] | select(.age > 30)).score
+|= . + 1` move -1.8% to +2.8% on minimum (medians inside the control's band) and by at most
+2.4 MB on peak RSS. x86_64 is not measured.
 
 ## Reading a path is indexing
 

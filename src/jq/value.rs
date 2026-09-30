@@ -2064,7 +2064,7 @@ fn format_positive_shifted_plain(
 //    deep copy, and the copy happens lazily -- `DerefMut` runs
 //    `Rc::make_mut`, which clones the storage only if another handle still
 //    shares it. The write routes that must keep an unmutated document
-//    beside a written one (`eval_assign_streaming`, `fork_rhs_over_paths`,
+//    beside a written one (`assign_one`, `fork_rhs_over_paths`,
 //    the `Iterate` fan-out in `set_path`) used to deep-copy the whole tree
 //    for that separation; now they copy exactly the spine they write.
 //

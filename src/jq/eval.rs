@@ -6483,6 +6483,27 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             sink,
         ),
 
+        // #3448: jq's `=`/`op=`/`//=` run their right side as the outer
+        // generator, so a consumer that stops after one document must stop
+        // the RHS too. yq keeps its eager collapse-to-last route below.
+        Expr::Assign { path, value: rhs } if S::TAG == EvalTag::Jq => {
+            each_assign::<W, S>(AssignKind::Set, path, rhs, value, optional, sink)
+        }
+        Expr::CompoundAssign {
+            op,
+            path,
+            value: rhs,
+        } if S::TAG == EvalTag::Jq => each_assign::<W, S>(
+            AssignKind::Compound(compound_arith_op(*op)),
+            path,
+            rhs,
+            value,
+            optional,
+            sink,
+        ),
+        Expr::AlternativeAssign { path, value: rhs } if S::TAG == EvalTag::Jq => {
+            each_assign::<W, S>(AssignKind::Alt, path, rhs, value, optional, sink)
+        }
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
     }
 }
@@ -27298,6 +27319,11 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // jq mode is one demand-driven generator (#3448), collected here; every
+    // other line below is yq's eager route.
+    if S::TAG == EvalTag::Jq {
+        return collect_assign::<W, S>(AssignKind::Set, path_expr, value_expr, input, optional);
+    }
     if S::TAG == EvalTag::Yq {
         if let Some(e) = yq_metadata_builtin_as_assign_path_error(path_expr) {
             return QueryResult::Error(e);
@@ -27354,84 +27380,9 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(early_return) => return early_return,
     };
 
-    // #2267: jq's `=` is `_assign(paths; $value)`, i.e. `reduce path(paths)
-    // as $p (.; setpath($p; $value))` -- a genuinely lazy pipeline that
-    // pulls *one* path, applies its write, and only then asks for the next.
-    // A write that fails validation ends the `reduce` before the generator
-    // is ever resumed, so the side effects `path_expr` would have fired
-    // producing the later paths never fire at all:
-    //
-    // ```console
-    // $ echo '[10,20,30]' | jq -c '(.|stderr)[(0,1):(2,3)] = 99' 1>/dev/null
-    //   [10,20,30]                     <- once; was 4 times here
-    // $ echo null | jq -c '(.|stderr)[(-1,-2)] = 1' 1>/dev/null
-    //   null                           <- once; was twice here
-    // ```
-    //
-    // Three conditions, each of them load-bearing:
-    //
-    // - **jq mode only.** yq resolves its left side first and vivifies it
-    //   (#2481/#1412), so its paths are already resolved by
-    //   `yq_prepare_assign_targets` before the right side even runs; there
-    //   is no generator left here to stop. Real yq also has no `path()`,
-    //   no `stderr`/`debug`, and rejects a computed comma bound outright,
-    //   so none of these orderings are expressible through its surface.
-    // - **A single RHS output.** jq binds `$value` as the *outer*
-    //   generator and re-runs `path(paths)` per output. Re-resolving per
-    //   output is a separate change (this issue's step 2) that was
-    //   implemented, measured at 87 regressions against 69 fixes, and
-    //   backed out: `collect_rhs_outputs` is eager where jq's RHS is lazy,
-    //   so it fires the target for outputs a downstream consumer never
-    //   pulls (`first((.|debug("E"))["a"] = (1,2))` is one `E` on jq, two
-    //   with that change). One RHS output means one output document, so
-    //   there is nothing for `first`/`limit` to truncate and none of that
-    //   class is reachable -- see `limitations.md` and the holdout test.
-    // - **A path that can produce a second path.** The streaming route
-    //   keeps a second document (see below), which is worth paying only
-    //   where stopping the generator can suppress something.
-    //   `needs_path_prepass` false means the expression *is* its own single
-    //   static path; `assignment_path_needs_streaming` false means it
-    //   resolves to at most one path, so there is no later path for a
-    //   stopped generator to skip. Both keep the eager route, which for
-    //   those shapes produces the identical outcome with one document
-    //   instead of two -- `.[$k] = v` among them. Whether reaching that one
-    //   path is *observable* is not part of the question (#2976): the same
-    //   resolver call fires the same side effects on either route.
-    if S::TAG == EvalTag::Jq
-        && rhs_values.len() == 1
-        && needs_path_prepass(path_expr)
-        && assignment_path_needs_streaming(path_expr)
-    {
-        debug_assert!(
-            yq_targets.is_none(),
-            "jq mode never prepares yq assign targets (#2481)"
-        );
-        let value = rhs_values
-            .into_iter()
-            .next()
-            .expect("gated on exactly one RHS output");
-        return eval_assign_streaming::<W, S>(
-            path_expr,
-            &input,
-            terminal,
-            optional,
-            RetryResumes::Yes,
-            &mut |result, path| {
-                // `false, false` for the two yq no-op flags, as the eager route's
-                // own `yq_noop` computes to in jq mode.
-                //
-                // Cloned for *every* path, including the last. The eager route
-                // moves the value into its final path (`is_last_path`), which a
-                // streaming producer cannot know without looking ahead -- and
-                // looking ahead is precisely what must not happen here, since
-                // resolving path N+1 before writing path N is the divergence the
-                // streaming route exists to fix. The cost is exactly one extra
-                // clone per call, on a route already gated to computed paths.
-                set_path::<S>(result, path, value.clone(), false, false).map_err(EvalEscape::from)
-            },
-        );
-    }
-
+    // jq mode never reaches here (#3448): its `=` is [`each_assign`], which
+    // re-resolves the target per RHS output and writes each path as it is
+    // resolved (#2267). yq resolved and vivified its targets above.
     // Resolve computed keys against the *original* document, before any
     // write, then apply them to every RHS output in turn: `.[("a","b")] =
     // (1,2)` assigns both keys per output, forking into two whole documents
@@ -28236,7 +28187,7 @@ pub(crate) fn yq_assign_rhs_document<S: EvalSemantics>(
 
 /// Can resolving `expr` as an assignment's path produce a *second* path?
 ///
-/// The streaming write ([`eval_assign_streaming`]) exists to stop the path
+/// The streaming write ([`assign_one`]'s streaming route) exists to stop the path
 /// generator when a write fails. [`resolve_dynamic_indexes`] *is*
 /// [`resolve_dynamic_indexes_sink`] under an always-`Continue` sink, so the
 /// eager and streaming routes differ in exactly two ways: whether a `Stop`
@@ -28669,96 +28620,6 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
     }
 }
 
-/// The demand-driven write loop for a single-output assignment (#2267, and
-/// #2974 for `op=`/`//=`): resolve one path, apply its write, and stop the
-/// path generator the moment a write fails.
-///
-/// jq's `reduce path(paths) as $p (.; setpath($p; $value))` (`=`) and
-/// `$value as $tmp | _modify(paths; . op $tmp)` (`op=`), transposed from this
-/// evaluator's own resolve-every-path-then-write-them-all shape. Only reached
-/// under the three conditions stated at `eval_assign`'s call site; in
-/// particular the right side has exactly one output here, already folded
-/// into `write`, which is why there is no RHS fork left to do and the result
-/// is a single document. `|=` shares the loop itself,
-/// [`stream_path_writes`], and shapes its own result.
-///
-/// **Two documents, not one.** `pristine` is what the path generator
-/// resolves against and must stay unmutated for the whole call; `result` is
-/// what the writes accumulate into. That is jq's own separation -- `reduce`
-/// evaluates its source against the outer `.` while the accumulator moves
-/// underneath it -- and it is observable, not a formality: on
-/// `{"a":"b","b":1}`, `.[(.a,.a)] = 5` is `{"a":"b","b":5}` in jq 1.7.1,
-/// where resolving the second `.a` against the *written* document would
-/// have read back `5` and raised `Cannot index object with number`. jq pays
-/// nothing for the separation (its values are refcounted and `setpath`
-/// copies on write); here it costs one document clone.
-///
-/// **Measured** (Apple M-series, release, 1.5 MB / 200,000-element array,
-/// peak RSS): `.[(0,1)] = 0` goes 74.8 MB -> 88.5 MB, **+18%**. That is the
-/// price of the interleave, and it is charged only where a *second path*
-/// can exist: [`assignment_path_needs_streaming`] keeps `.[$k] = 0` on the
-/// eager route (58.9 MB -> 57.5 MB, unchanged), and a static path and
-/// `del(...)` are untouched either way. (#2974 put `|=` and `op=` on the same
-/// route, under the same gate.) #2976 widened that gate
-/// from "one inert path" to "at most one path", which took `.[length - 1]`,
-/// `.[(.a | stderr)]` and `(. | debug)[0]` off this route as well: each of
-/// them drops 18-21% (96 MB -> 78.5 MB on an M5 Max), landing exactly where
-/// `.[$k] = 0` already sat.
-///
-/// What is left is irreducible by any gate: `.[(0,1)] = 0` genuinely needs
-/// both documents, and only structural sharing in `OwnedValue` removes its
-/// cost.
-fn eval_assign_streaming<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    path_expr: &Expr,
-    input: &StandardJson<'a, W>,
-    terminal: Option<Control>,
-    optional: bool,
-    retry_resumes: RetryResumes,
-    write: &mut dyn FnMut(&mut OwnedValue, &Expr) -> Result<(), EvalEscape>,
-) -> QueryResult<'a, W> {
-    // #1953: a non-decode-failure `to_owned` error respects `optional` like
-    // every other fallible step at this boundary; only a genuine decode
-    // failure is unconditional. Same rule as the eager arm this replaces.
-    let pristine = match to_owned::<S, _>(input) {
-        Ok(pristine) => pristine,
-        Err(e) => return suppress_or_raise(e, optional),
-    };
-    let mut result = pristine.clone();
-
-    match stream_path_writes::<S>(path_expr, &pristine, &mut result, retry_resumes, write) {
-        // A resolution escape discards everything, writes included -- the
-        // eager arm's `Err((_, escape))` did the same with its
-        // already-resolved prefix, and jq's `reduce` likewise discards its
-        // accumulator when the source generator raises.
-        StreamedWrites::ResolutionFailed(escape) => match escape {
-            EvalEscape::Error(_) if optional => QueryResult::None,
-            escape => escape.into(),
-        },
-        // A failed write is atomic for the whole call, exactly as
-        // `fork_rhs_over_paths` makes it atomic per RHS output: with one
-        // output there is no strictly-earlier document to survive it.
-        StreamedWrites::WriteFailed(escape) => match escape {
-            EvalEscape::Error(_) if optional => owned_vec_to_result(Vec::new()),
-            other => partial(Vec::new(), other.into()),
-        },
-        StreamedWrites::Done => {
-            let docs = vec![result];
-            match terminal {
-                None => owned_vec_to_result(docs),
-                Some(Control::Error(e)) => {
-                    if optional {
-                        owned_vec_to_result(docs)
-                    } else {
-                        partial(docs, Control::Error(e))
-                    }
-                }
-                Some(Control::Break(label)) => partial(docs, Control::Break(label)),
-                Some(Control::Halt(code)) => partial(docs, Control::Halt(code)),
-            }
-        }
-    }
-}
-
 /// Whether a `?//` retry inside the path clears a write escape an earlier
 /// alternative parked (#2974 review).
 ///
@@ -28794,7 +28655,7 @@ enum StreamedWrites {
 /// `result`, and stop the generator at the first write that raises.
 ///
 /// `pristine` must stay unmutated for the whole call (see
-/// [`eval_assign_streaming`]'s "two documents" note); `result` accumulates.
+/// [`assign_one`]'s "two documents" note); `result` accumulates.
 ///
 /// **The parked escape is classified**, through [`stop_with_escape`]. `=`'s
 /// write can only raise a write error, but `|=`'s runs a whole filter, which
@@ -28954,7 +28815,7 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     rhs_values: Vec<OwnedValue>,
     terminal: Option<Control>,
     yq_targets: Option<YqAssignTargets>,
-    mut build_filter: impl FnMut(OwnedValue) -> Expr,
+    build_filter: impl FnMut(OwnedValue) -> Expr,
 ) -> QueryResult<'a, W> {
     let (rhs_values, terminal) = match normalize_rhs_values_for_fork::<W, S>(
         rhs_values,
@@ -28966,39 +28827,11 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(early_return) => return early_return,
     };
 
-    // #2974: `op=`/`//=` is jq's `$value as $tmp | _modify(paths; . op
-    // $tmp)`, so like `=` (#2267) it stops the path generator at the first
-    // write that fails -- `(.|stderr)[(0,1)] += "x"` on `[1,2]` fires the
-    // target once in jq 1.7.1, not twice. The same three conditions as
-    // `eval_assign`'s, for the same reasons; a multi-output right side keeps
-    // the fork below, which is #2267's still-open re-resolution half.
-    if S::TAG == EvalTag::Jq
-        && rhs_values.len() == 1
-        && needs_path_prepass(path_expr)
-        && assignment_path_needs_streaming(path_expr)
-    {
-        debug_assert!(
-            yq_targets.is_none(),
-            "jq mode never prepares yq assign targets (#2481)"
-        );
-        let value = rhs_values
-            .into_iter()
-            .next()
-            .expect("gated on exactly one RHS output");
-        let filter = build_filter(value);
-        // `false, None`: `scalar_noop` is yq-only, and see the eager arm
-        // below for why this filter reads no target position.
-        return eval_assign_streaming::<W, S>(
-            path_expr,
-            &input,
-            terminal,
-            optional,
-            RetryResumes::No,
-            &mut |result, path| {
-                update_path::<S>(result, path, &filter, false, false, None).map(|_wrote| ())
-            },
-        );
-    }
+    // jq mode never reaches here (#3448): see `eval_assign`.
+    debug_assert!(
+        S::TAG == EvalTag::Yq,
+        "jq mode's `op=`/`//=` is `each_assign`"
+    );
 
     let (pristine, paths) = match yq_targets {
         // yq mode: already resolved and auto-created before the right side
@@ -29060,6 +28893,10 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if S::TAG == EvalTag::Jq {
+        let kind = AssignKind::Compound(compound_arith_op(op));
+        return collect_assign::<W, S>(kind, path_expr, value_expr, input, optional);
+    }
     // #1233: same RHS-discarding no-op as `eval_assign` (see
     // `yq_assign_skip_rhs`'s own doc comment) -- applies uniformly across
     // every compound operator, not just `Add`, unlike the write-level
@@ -29075,13 +28912,7 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     // Convert to update: .path op= value  becomes  .path |= . op value
-    let arith_op = match op {
-        AssignOp::Add => ArithOp::Add,
-        AssignOp::Sub => ArithOp::Sub,
-        AssignOp::Mul(flags) => ArithOp::Mul(flags),
-        AssignOp::Div => ArithOp::Div,
-        AssignOp::Mod => ArithOp::Mod,
-    };
+    let arith_op = compound_arith_op(op);
 
     // jq evaluates the RHS of `a op= b` once against the original input `.`,
     // not against the sub-value at `a` (confirmed against real jq: `(.a,.b)
@@ -29167,6 +28998,9 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if S::TAG == EvalTag::Jq {
+        return collect_assign::<W, S>(AssignKind::Alt, path_expr, value_expr, input, optional);
+    }
     // #1233: same RHS-discarding no-op as `eval_assign`/`eval_compound_assign`
     // (see `yq_assign_skip_rhs`'s own doc comment). `//=` isn't real yq
     // syntax at all (confirmed live, same as `/=`/`%=`), so this is judged
@@ -29237,6 +29071,240 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             )
         },
     )
+}
+
+/// Which write [`each_assign`] applies for each right-hand-side output.
+#[derive(Clone, Copy)]
+enum AssignKind {
+    /// `.path = value`
+    Set,
+    /// `.path op= value`, i.e. `.path |= . op value`
+    Compound(ArithOp),
+    /// `.path //= value`, i.e. `.path |= . // value`
+    Alt,
+}
+
+/// A compound-assignment operator's arithmetic operator.
+fn compound_arith_op(op: AssignOp) -> ArithOp {
+    match op {
+        AssignOp::Add => ArithOp::Add,
+        AssignOp::Sub => ArithOp::Sub,
+        AssignOp::Mul(flags) => ArithOp::Mul(flags),
+        AssignOp::Div => ArithOp::Div,
+        AssignOp::Mod => ArithOp::Mod,
+    }
+}
+
+/// The value-position entry of jq mode's `=`/`op=`/`//=` (#3448): run
+/// [`each_assign`] into a collecting sink. Every output is delivered before a
+/// terminal control, as the eager fork loop this replaced did, so a consumer
+/// that does not stop early sees the same documents in the same order.
+fn collect_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    kind: AssignKind,
+    path_expr: &Expr,
+    value_expr: &Expr,
+    input: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let mut docs: Vec<OwnedValue> = Vec::new();
+    let flow = each_assign::<W, S>(kind, path_expr, value_expr, input, optional, &mut |item| {
+        docs.push(item.into_owned_from_owned_producer::<S>());
+        Demand::Continue
+    });
+    match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(docs),
+        Flow::Escaped(control) => partial(docs, control),
+    }
+}
+
+/// jq mode's `=`, `op=` and `//=` as a demand-driven generator (#3448).
+///
+/// jq defines `=` as `def _assign(paths; $value): reduce path(paths) as $p
+/// (.; setpath($p; $value))` and `op=`/`//=` as `$value as $tmp |
+/// _modify(paths; . op $tmp)`. Either way the right side is the *outer*
+/// generator: each of its outputs binds `$value` and runs the whole path
+/// reduction once, producing one document. So the loop is, per RHS output:
+/// pull it, resolve the target path(s) against the untouched input, write,
+/// hand the document to `sink` -- and answer `sink`'s [`Demand`] back into the
+/// RHS generator. A consumer that stops after the first document (`first`,
+/// `limit`, `isempty`, `any`) therefore never runs the later RHS outputs, or
+/// any `input`/`debug`/`stderr` inside them; the eager collect this replaced
+/// ran them all before the first document existed.
+///
+/// The target is resolved once per pulled RHS output, not once per call: a
+/// target with side effects (`(.|debug("E"))["a"] = (1,2)`) fires once per
+/// document jq produces, and not at all for an output nobody pulled. That
+/// re-resolution is what #2267's second half asked for and could not have on
+/// an eager RHS -- it fired the target for outputs a downstream `first`
+/// never asked for.
+///
+/// Terminal rules, unchanged from the fork loop: a write that fails on output
+/// *j* keeps the documents for outputs `< j` and ends the fan-out; a control
+/// escaping the RHS after *k* outputs delivers those *k* documents, then
+/// escapes; an `Error` under `optional` (`(.a = ...)?`) is swallowed at that
+/// boundary while a `break`/`halt` never is (#791); a zero-output RHS is zero
+/// documents and never resolves the path.
+///
+/// jq mode only: yq's collapse-to-last (`normalize_rhs_values_for_fork`)
+/// needs the whole right side, and its target is resolved and vivified before
+/// the right side runs (#2481), so it keeps the eager route.
+fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    kind: AssignKind,
+    path_expr: &Expr,
+    value_expr: &Expr,
+    input: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    debug_assert!(
+        S::TAG == EvalTag::Jq,
+        "yq mode keeps the eager assignment route (#3448)"
+    );
+    // Whether the path can yield a second path -- the streaming write's gate,
+    // unchanged (#2267, #2974, #2976).
+    let streaming = needs_path_prepass(path_expr) && assignment_path_needs_streaming(path_expr);
+    let mut parked: Option<Control> = None;
+    // `Error` under `optional` ends the fan-out quietly.
+    let mut swallowed = false;
+    let flow = eval_each::<W, S>(value_expr, input.clone(), optional, &mut |item| {
+        let value = match item.into_owned::<S>() {
+            Ok(value) => value,
+            Err(e) if suppresses(&e, optional) => {
+                swallowed = true;
+                return Demand::Stop;
+            }
+            Err(e) => return stop_with_escape(&mut parked, Control::Error(e)),
+        };
+        match assign_one::<W, S>(kind, path_expr, value, &input, streaming, optional) {
+            Ok(Some(doc)) => sink(Item::Owned(doc)),
+            Ok(None) => {
+                swallowed = true;
+                Demand::Stop
+            }
+            // `?` swallows a genuine error, never a decode failure (#1953) or
+            // a halt (#791).
+            Err(EvalEscape::Error(e)) if suppresses(&e, optional) => {
+                swallowed = true;
+                Demand::Stop
+            }
+            Err(escape) => stop_with_escape(&mut parked, escape.into()),
+        }
+    });
+    match resume_from_escape(parked, flow) {
+        Flow::Escaped(Control::Error(e)) if suppresses(&e, optional) => Flow::Exhausted,
+        // A stop this function raised itself is not the consumer's.
+        Flow::Stopped { .. } if swallowed => Flow::Exhausted,
+        flow => flow,
+    }
+}
+
+/// One RHS output's document: `value` written to every path the target
+/// resolves to against `input`. `Ok(None)` is a `to_owned` failure `optional`
+/// suppresses (#1953; a decode failure is unconditional).
+///
+/// **Streaming route: two documents, not one.** When the path can produce a
+/// second path, the paths are resolved one at a time and each write is applied
+/// before the next path is asked for, stopping the generator at the first
+/// write that fails -- jq's `reduce` over `path(paths)`. `pristine` is what the
+/// generator resolves against and must stay unmutated; `result` accumulates.
+/// That is jq's own separation and it is observable: on `{"a":"b","b":1}`,
+/// `.[(.a,.a)] = 5` is `{"a":"b","b":5}` in jq 1.7.1, where resolving the
+/// second `.a` against the *written* document would have read back `5` and
+/// raised `Cannot index object with number`. It costs one document clone,
+/// charged only where a second path can exist.
+///
+/// **Eager route: one document.** A path that resolves to at most one path has
+/// nothing for a stop to suppress and no "between" to interleave, so it is
+/// resolved once, written once, into the one document -- the input's own
+/// materialisation, moved rather than cloned. The last path takes `value` by
+/// move; earlier ones clone it.
+fn assign_one<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    kind: AssignKind,
+    path_expr: &Expr,
+    value: OwnedValue,
+    input: &StandardJson<'_, W>,
+    streaming: bool,
+    optional: bool,
+) -> Result<Option<OwnedValue>, EvalEscape> {
+    let pristine = match to_owned::<S, _>(input) {
+        Ok(pristine) => pristine,
+        Err(e) if suppresses(&e, optional) => return Ok(None),
+        Err(e) => return Err(EvalEscape::Error(e)),
+    };
+    // What `op=`/`//=` writes at each path: the operator over the value the
+    // right side already produced, so the path's own `.` is the target's.
+    let filter = match kind {
+        AssignKind::Set => None,
+        AssignKind::Compound(op) => Some(Expr::Arithmetic {
+            op,
+            left: Box::new(Expr::Identity),
+            right: Box::new(owned_to_expr(&value)),
+        }),
+        AssignKind::Alt => Some(Expr::Alternative(
+            Box::new(Expr::Identity),
+            Box::new(owned_to_expr(&value)),
+        )),
+    };
+    debug_assert!(
+        !alias_identity::active(),
+        "alias identity is yq-only (#1351); jq mode must not reach the assignment write"
+    );
+    if streaming {
+        let mut result = pristine.clone();
+        let mut write_one = |result: &mut OwnedValue, path: &Expr| match &filter {
+            // Cloned for *every* path, including the last: a streaming
+            // producer cannot know which is last without resolving the next.
+            None => {
+                set_path::<S>(result, path, value.clone(), false, false).map_err(EvalEscape::from)
+            }
+            Some(filter) => {
+                update_path::<S>(result, path, filter, false, false, None).map(|_wrote| ())
+            }
+        };
+        // `=` resumes after a `?//` retry; `|=` and `op=` do not (see
+        // [`RetryResumes`]).
+        let retry = match kind {
+            AssignKind::Set => RetryResumes::Yes,
+            AssignKind::Compound(_) | AssignKind::Alt => RetryResumes::No,
+        };
+        return match stream_path_writes::<S>(
+            path_expr,
+            &pristine,
+            &mut result,
+            retry,
+            &mut write_one,
+        ) {
+            // A resolution escape discards everything, writes included, as
+            // jq's `reduce` discards its accumulator when the generator raises.
+            StreamedWrites::ResolutionFailed(escape) | StreamedWrites::WriteFailed(escape) => {
+                Err(escape)
+            }
+            StreamedWrites::Done => Ok(Some(result)),
+        };
+    }
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
+        Ok(paths) => paths,
+        Err((_, escape)) => return Err(escape),
+    };
+    let mut result = pristine;
+    let last_path = paths.len().saturating_sub(1);
+    let mut value = value;
+    for (i, path) in paths.iter().enumerate() {
+        match &filter {
+            None => {
+                let value = if i == last_path {
+                    core::mem::replace(&mut value, OwnedValue::Null)
+                } else {
+                    value.clone()
+                };
+                set_path::<S>(&mut result, path, value, false, false)?;
+            }
+            Some(filter) => {
+                update_path::<S>(&mut result, path, filter, false, false, None)?;
+            }
+        }
+    }
+    Ok(Some(result))
 }
 
 /// The keyword spelling of a [`MetaSlot`], for error messages.
@@ -32544,55 +32612,42 @@ fn eval_owned_multi<S: EvalSemantics>(
     escape.map_or(Ok(values), Err)
 }
 
-/// Like [`eval_owned_multi`], but keeps `collect_owned`'s old "just give me
-/// the prefix" policy for a `Partial` instead of surfacing its trailing
-/// control as an error (#694).
+/// `|=`'s own first-output read of its update filter (#694, #3448): the
+/// filter's first output, or nothing, evaluated *no further than that output*.
 ///
 /// The only correct caller is `update_path`'s `Expr::Identity` arm (`|=`'s
 /// own update-filter evaluation): jq's `_modify` wraps each per-path update
 /// in `label $out | ... | ., break $out`, so only the *first* output of the
 /// update filter is ever observed — anything after it, including a trailing
-/// `error(...)`, is never evaluated by real jq and must not surface here
-/// either. Verified against jq 1.7.1: `.a |= (1, error("x"))` is `{"a":1}`,
-/// not an error, while `.a |= (error("x"), 1)` — nothing produced before the
-/// error — does raise it, which the plain `Error`/`Break` arms below already
-/// cover.
+/// `error(...)` or an `input`, is never evaluated by real jq and must not be
+/// here either. Verified against jq 1.7.1: `.a |= (1, error("x"))` is
+/// `{"a":1}`, not an error, while `.a |= (error("x"), 1)` — nothing produced
+/// before the error — does raise it, which the bare-escape arm below covers.
 fn eval_owned_multi_first<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     reentry: Reentry,
 ) -> Result<Vec<OwnedValue>, EvalEscape> {
-    first_outputs::<S>(eval_owned_input::<Vec<u64>, S>(expr, input, false, reentry))
-}
-
-/// [`eval_owned_multi_first`]'s first-output rule over an owned result.
-fn first_outputs<S: EvalSemantics>(
-    result: QueryResult<'_, Vec<u64>>,
-) -> Result<Vec<OwnedValue>, EvalEscape> {
-    match result {
-        QueryResult::Error(e) => Err(e.into()),
-        // A *bare* break — nothing produced before it — has no prefix to
-        // fall back to, so it must propagate rather than becoming a
-        // synthetic "not in label" error: `label $out | (.a |= (break
-        // $out))` with the label outside produces no output at all in real
-        // jq (the break unwinds the whole expression, including the update
-        // that never got a value to write), not a raised error (#824,
-        // mirroring the bare-`Halt` case below). A `Partial`'s
-        // trailing break, by contrast, is exactly the "just give me the
-        // prefix" case this function's doc comment already covers — the
-        // `other` arm below keeps producing the update filter's first
-        // output and silently drops the break, which is what real jq does
-        // too (confirmed live: `.a |= (2, break $out)` is `{"a":2}`).
-        QueryResult::Break(label) => Err(EvalEscape::Break(label)),
-        // Unlike a `Partial`'s trailing control (kept as "just give me the
-        // prefix" per this function's doc comment, since real jq's `_modify`
-        // never evaluates far enough to see it), a *bare* halt has no prior
-        // output to fall back to — `collect_owned()` would turn it into
-        // `Ok(vec![])`, which `update_path`'s `Expr::Identity` arm then reads
-        // as an empty filter and silently assigns `null` instead of halting
-        // (#791).
-        QueryResult::Halt(code) => Err(EvalEscape::Halt(code)),
-        other => Ok(other.collect_owned::<S>()),
+    // Demand-driven (#3448): the sink stops the generator at its first
+    // output, so a later output -- and any `input`/`debug`/`stderr` inside it
+    // -- never runs, as in jq's `label $out | (f | ., break $out)`. That also
+    // makes "a control after the first output is dropped" structural: nothing
+    // evaluates far enough to raise one.
+    let mut first: Option<OwnedValue> = None;
+    let flow = eval_each_owned::<S>(expr, input, false, reentry, &mut |v| {
+        first = Some(v);
+        Demand::Stop
+    });
+    match (first, flow) {
+        (Some(v), _) => Ok(vec![v]),
+        // A control with nothing produced before it has no prefix to fall
+        // back to, so it escapes: a bare `Error`, a bare `break` (#824) and
+        // a bare `halt` (#791) alike -- `label $out | (.a |= (break $out))`
+        // with the label outside produces no output at all in real jq, and
+        // turning the halt into an empty filter would silently assign `null`
+        // instead of halting.
+        (None, Flow::Escaped(control)) => Err(control.into()),
+        (None, _) => Ok(Vec::new()),
     }
 }
 
@@ -76220,6 +76275,45 @@ mod tests {
         assert_eq!(values, vec![OwnedValue::Int(1)]);
     }
 
+    #[test]
+    fn eval_owned_multi_first_propagates_a_bare_halt() {
+        // Nothing produced before the halt, so there is no first output to
+        // fall back to: the halt escapes rather than reading as an empty
+        // filter (#791).
+        let expr = parse("halt_error(3)").unwrap();
+        let err = eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null, Reentry::REBUILT)
+            .unwrap_err();
+        assert_eq!(err, EvalEscape::Halt(3));
+    }
+
+    #[test]
+    fn eval_owned_multi_first_is_empty_for_an_empty_filter() {
+        let expr = parse("empty").unwrap();
+        let values =
+            eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null, Reentry::REBUILT)
+                .unwrap();
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn eval_owned_multi_first_never_evaluates_past_the_first_output_3448() {
+        // jq's `_modify` reads only the update's first output
+        // (`label $out | (f | ., break $out)`), so `input` in a later output
+        // is never read. Both queued inputs must still be there afterwards.
+        seed_remaining_inputs(
+            vec![(OwnedValue::Int(1), 0, 1), (OwnedValue::Int(2), 0, 2)],
+            None,
+        );
+        let expr = parse("7, input").unwrap();
+        let values =
+            eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null, Reentry::REBUILT)
+                .unwrap();
+        assert_eq!(values, vec![OwnedValue::Int(7)]);
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(1)));
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(2)));
+        assert_eq!(pop_remaining_input(), None);
+    }
+
     /// Evaluate `Identity`/`Field`/`Index` against an `OwnedValue` the way
     /// `eval_single` (backing every top-level query, via `index_object_by_name`/
     /// `index_array_by_position`) does: serialize, build a real `JsonIndex`,
@@ -77105,7 +77199,7 @@ mod tests {
     ///
     /// An `Err` is not a failure: a resolution escape discards everything on
     /// both routes (`eval_assign`'s `Err((_, escape))` arm and
-    /// `eval_assign_streaming`'s `if let Err(escape)`), so the two remain
+    /// `assign_one`'s streaming route), so the two remain
     /// indistinguishable however many paths were produced before it.
     #[test]
     fn every_eager_assignment_path_really_resolves_to_at_most_one_path_2976() {
@@ -116561,17 +116655,20 @@ mod share_audit_2999 {
         );
     }
 
-    /// A multi-output right side forks one document per output. Only the
-    /// last output takes the pristine document by move; every earlier one
-    /// clones it and copies the spine on its first write -- so N outputs
-    /// cost N - 1 spine copies, not N deep copies.
+    /// A multi-output right side forks one document per output, each written
+    /// through the streaming route (#3448): the target is resolved against an
+    /// untouched pristine copy per output, so every output copies the spine
+    /// once on its first write -- N outputs cost N spine copies, not N deep
+    /// copies. (The eager fork this replaced let the last output take the
+    /// pristine document by move, N - 1; a right side pulled lazily cannot
+    /// know an output is the last.)
     #[test]
-    fn rhs_fork_copies_the_spine_once_per_extra_output() {
-        assert_forced(&ints(1000), ".[(0,1)] = (1,2)", &[(Kind::ArrayMakeMut, 1)]);
+    fn rhs_fork_copies_the_spine_once_per_output() {
+        assert_forced(&ints(1000), ".[(0,1)] = (1,2)", &[(Kind::ArrayMakeMut, 2)]);
         assert_forced(
             &ints(1000),
             ".[(0,1)] = (1,2,3)",
-            &[(Kind::ArrayMakeMut, 2)],
+            &[(Kind::ArrayMakeMut, 3)],
         );
     }
 

@@ -411,6 +411,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: an assignment's right-hand side is lazy, and its target is re-resolved
+  per right-hand output** (#3448). `=`, `+=`, `-=`, `*=`, `/=`, `%=` and `//=`
+  ran every output of their right side before the first document existed, so
+  `first`, `limit`, `nth`, `any` and `isempty` still ran the later outputs and
+  their `input`/`debug`/`stderr`: `[first(.a = (1, input)), input]` read two
+  inputs where jq reads one, and with one input left it failed with `break`
+  where jq prints. They now pull one right-hand output at a time and answer a
+  consumer's stop back into the right side, resolving the target once per
+  pulled output as jq's `_assign` does (`(.|stderr)[("a","b")] = (1,2)` fires
+  it four times, not two; `first(...)` fires it once). `|=` likewise reads only
+  the first output of its update, so `[1] | .[0] |= (1, input)` no longer reads
+  an input. A 5,940-shape differential sweep against jq 1.7.1 went from 1,215
+  divergences to none. yq mode is unchanged. Each output after the first now
+  re-derives the input document instead of taking it by move; a single-output
+  `.users[0].name = "x"` on a 7 MB document is 37% faster and peaks 32% lower
+  on an Apple M5 Max, and the other assignment shapes measured are within noise.
+
 - **Deep recursion refuses instead of overflowing the stack, whatever its
   shape** (#3262, #3294, ADR-0025). The recursion guard counted the structure
   of a `def`'s body, but what runs out is native stack, and some ordinary

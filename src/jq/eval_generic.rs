@@ -11423,6 +11423,20 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             each_recurse_generic::<S, V>(f, Some(cond), value, cursor, sink)
         }
 
+        // #3448: jq's `=`/`op=`/`//=` run their right side as the outer
+        // generator, so a consumer that stops after one document must stop
+        // the RHS -- `first(.a = (1, input))` never reads the second input. The
+        // eager wildcard below collected every RHS output first. Reached only
+        // when the positioned-stage arm above did not take the expression (no
+        // path context to read at the cursor), through the same
+        // demand-forwarding bridge the live-input deferrals use; `eval.rs`'s
+        // `eval_each` owns the loop. yq keeps its eager collapse-to-last.
+        Expr::Assign { .. } | Expr::CompoundAssign { .. } | Expr::AlternativeAssign { .. }
+            if S::TAG == EvalTag::Jq =>
+        {
+            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        }
+
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
     }
 }

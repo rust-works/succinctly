@@ -20285,15 +20285,16 @@ fn update_streaming_interleaves_input_reads_2974() -> Result<()> {
     Ok(())
 }
 
-/// #2974 holdouts, pinned to succinctly's own output rather than jq's so a
-/// change trips here:
+/// #2974 holdouts:
 ///
-/// - A multi-output right side keeps the eager fork, which is #2267's
-///   still-open re-resolution half: jq fires the target three times here.
-/// - `key`/`parent` are succinctly extensions (no oracle). A filter that
-///   reads `parent` keeps the eager route, because its view of the document
-///   has every target vivified before any filter runs; one that only reads
-///   `key` streams. Both answer what they did before #2974.
+/// - A multi-output right side re-resolves the target per output, as jq does
+///   (#3448 closed #2267's re-resolution half): jq fires the target three
+///   times here, and so does this.
+/// - `key`/`parent` are succinctly extensions (no oracle), pinned to
+///   succinctly's own output so a change trips here. A filter that reads
+///   `parent` keeps the eager route, because its view of the document has
+///   every target vivified before any filter runs; one that only reads `key`
+///   streams. Both answer what they did before #2974.
 #[test]
 fn update_streaming_holdouts_2974() -> Result<()> {
     let (stdout, stderr, code) =
@@ -20301,8 +20302,8 @@ fn update_streaming_holdouts_2974() -> Result<()> {
     assert_eq!(code, 5, "{stderr:?}");
     assert_eq!(stdout, "[2,3]\n");
     assert!(
-        stderr.starts_with("[1,2][1,2]jq: error"),
-        "two fires, not jq's three: {stderr:?}"
+        stderr.starts_with("[1,2][1,2][1,2]jq: error"),
+        "three fires, as in jq: {stderr:?}"
     );
 
     for (filter, want) in [
@@ -20475,28 +20476,26 @@ fn test_streaming_write_carries_the_rhs_terminal_and_optional_2267() -> Result<(
     Ok(())
 }
 
-/// #2267 (must-not-change): the three conditions gating the streaming write,
-/// each pinned by the shape that would take the eager route if it were
-/// dropped.
+/// #2267 (must-not-change): the conditions gating the streaming write, each
+/// pinned by the shape that would take the eager route if it were dropped.
 ///
-/// A static path has no generator to stop, a multi-output RHS must keep the
-/// eager route (step 2's backed-out regression class), and `|=`/`del()`/
-/// `path()` do not go through `eval_assign` at all. Every expectation here
-/// is jq 1.7.1's, and every one of them also held before the streaming
-/// write existed -- that is the point of the test.
+/// A static path has no generator to stop, and `|=`/`del()`/`path()` do not
+/// go through `each_assign` at all. Every expectation here is jq 1.7.1's; all
+/// but the multi-output right side also held before the streaming write
+/// existed (#3448 moved that one from two fires to jq's four).
 #[test]
 fn test_streaming_write_gate_leaves_neighbouring_shapes_alone_2267() -> Result<()> {
     for (filter, input, expected_stdout, expected_fired) in [
         // Static path: one path, no prepass, eager route.
         (r"(.|stderr).a = 5", r#"{"a":1}"#, "{\"a\":5}\n", 1),
-        // Multi-output RHS: eager route, and still the *pre-existing*
-        // twice-not-four-times count step 2 would have changed (#2267's own
-        // `limitations.md` entry), deliberately unchanged here.
+        // Multi-output RHS: the target is re-resolved once per pulled output,
+        // as in jq -- four fires, where this fired twice until #3448 made the
+        // right side lazy (#2267's re-resolution half).
         (
             r#"(.|stderr)[("a","b")] = (1,2)"#,
             "{}",
             "{\"a\":1,\"b\":1}\n{\"a\":2,\"b\":2}\n",
-            2,
+            4,
         ),
         // `+=`/`//=` route through `eval_update_multi`, not `eval_assign`.
         (
@@ -20526,15 +20525,13 @@ fn test_streaming_write_gate_leaves_neighbouring_shapes_alone_2267() -> Result<(
 }
 
 /// #2267 (must-not-change): the write paths whose target must still be
-/// resolved exactly once per path -- not once per (RHS output x path).
+/// resolved exactly once per path, and the `first(...)` holdout.
 ///
-/// This is the pin for a fix that was tried and backed out. Re-resolving an
-/// assignment's path per right-hand-side output does match jq's
-/// `_assign(paths; $value)` *when every output is consumed*, but jq's RHS
-/// generator is lazy and this one is not, so under `first`/`limit`/`break`
-/// the re-resolution fires target side effects for outputs jq never
-/// evaluates -- and with `input` in the path it changes stdout. The two
-/// halves are one mechanism; see the issue.
+/// `first((.|stderr)["a"] = (1,2))` is the pin for a fix that was tried and
+/// backed out while the right side was collected eagerly: re-resolving the
+/// target per right-hand-side output fired it for outputs `first` never
+/// pulls. Since #3448 the right side is lazy and the target is re-resolved per
+/// *pulled* output, so this still fires once -- as jq does.
 #[test]
 fn test_write_paths_resolve_once_per_path_2267() -> Result<()> {
     for (filter, input) in [
@@ -83118,6 +83115,187 @@ fn test_slice_bound_retry_reaches_consumer_stop_on_owned_route_3471() -> Result<
     Ok(())
 }
 
+/// #3448: an assignment's right side is jq's *outer* generator, so a consumer
+/// that stops after one document never runs the later right-hand outputs --
+/// `input` in them is not read. Every row is `[CONSUMER(OBJ | .a OP (1,
+/// input))], input` over stdin `1 2 3`, expected output captured from
+/// /usr/bin/jq 1.7.1: the closing `input` reads the *second* value only if the
+/// right side ran no further than its first output.
+#[test]
+fn test_assign_rhs_stops_at_an_early_exit_consumer_3448() -> Result<()> {
+    const ROWS: &[(&str, &str)] = &[
+        (
+            r#"[first({"a":0} | .a = (1, input))], input"#,
+            "[{\"a\":1}]\n1\n",
+        ),
+        (
+            r#"[limit(1; {"a":0} | .a = (1, input))], input"#,
+            "[{\"a\":1}]\n1\n",
+        ),
+        (
+            r#"[nth(0; {"a":0} | .a = (1, input))], input"#,
+            "[{\"a\":1}]\n1\n",
+        ),
+        (
+            r#"[isempty({"a":0} | .a = (1, input))], input"#,
+            "[false]\n1\n",
+        ),
+        (
+            r#"[any({"a":0} | .a = (1, input); . != null)], input"#,
+            "[true]\n1\n",
+        ),
+        (
+            r#"[first({"a":0} | .a |= (1, input))], input"#,
+            "[{\"a\":1}]\n1\n",
+        ),
+        (
+            r#"[limit(1; {"a":0} | .a |= (1, input))], input"#,
+            "[{\"a\":1}]\n1\n",
+        ),
+        (
+            r#"[nth(0; {"a":0} | .a |= (1, input))], input"#,
+            "[{\"a\":1}]\n1\n",
+        ),
+        (
+            r#"[isempty({"a":0} | .a |= (1, input))], input"#,
+            "[false]\n1\n",
+        ),
+        (
+            r#"[any({"a":0} | .a |= (1, input); . != null)], input"#,
+            "[true]\n1\n",
+        ),
+        (
+            r#"[first({"a":10} | .a += (1, input))], input"#,
+            "[{\"a\":11}]\n1\n",
+        ),
+        (
+            r#"[limit(1; {"a":10} | .a += (1, input))], input"#,
+            "[{\"a\":11}]\n1\n",
+        ),
+        (
+            r#"[nth(0; {"a":10} | .a += (1, input))], input"#,
+            "[{\"a\":11}]\n1\n",
+        ),
+        (
+            r#"[isempty({"a":10} | .a += (1, input))], input"#,
+            "[false]\n1\n",
+        ),
+        (
+            r#"[any({"a":10} | .a += (1, input); . != null)], input"#,
+            "[true]\n1\n",
+        ),
+        (
+            r#"[first({"a":10} | .a -= (1, input))], input"#,
+            "[{\"a\":9}]\n1\n",
+        ),
+        (
+            r#"[limit(1; {"a":10} | .a -= (1, input))], input"#,
+            "[{\"a\":9}]\n1\n",
+        ),
+        (
+            r#"[nth(0; {"a":10} | .a -= (1, input))], input"#,
+            "[{\"a\":9}]\n1\n",
+        ),
+        (
+            r#"[isempty({"a":10} | .a -= (1, input))], input"#,
+            "[false]\n1\n",
+        ),
+        (
+            r#"[any({"a":10} | .a -= (1, input); . != null)], input"#,
+            "[true]\n1\n",
+        ),
+        (
+            r#"[first({"a":10} | .a *= (1, input))], input"#,
+            "[{\"a\":10}]\n1\n",
+        ),
+        (
+            r#"[limit(1; {"a":10} | .a *= (1, input))], input"#,
+            "[{\"a\":10}]\n1\n",
+        ),
+        (
+            r#"[nth(0; {"a":10} | .a *= (1, input))], input"#,
+            "[{\"a\":10}]\n1\n",
+        ),
+        (
+            r#"[isempty({"a":10} | .a *= (1, input))], input"#,
+            "[false]\n1\n",
+        ),
+        (
+            r#"[any({"a":10} | .a *= (1, input); . != null)], input"#,
+            "[true]\n1\n",
+        ),
+        (
+            r#"[first({"a":10} | .a /= (1, input))], input"#,
+            "[{\"a\":10}]\n1\n",
+        ),
+        (
+            r#"[limit(1; {"a":10} | .a /= (1, input))], input"#,
+            "[{\"a\":10}]\n1\n",
+        ),
+        (
+            r#"[nth(0; {"a":10} | .a /= (1, input))], input"#,
+            "[{\"a\":10}]\n1\n",
+        ),
+        (
+            r#"[isempty({"a":10} | .a /= (1, input))], input"#,
+            "[false]\n1\n",
+        ),
+        (
+            r#"[any({"a":10} | .a /= (1, input); . != null)], input"#,
+            "[true]\n1\n",
+        ),
+        (
+            r#"[first({"a":10} | .a %= (1, input))], input"#,
+            "[{\"a\":0}]\n1\n",
+        ),
+        (
+            r#"[limit(1; {"a":10} | .a %= (1, input))], input"#,
+            "[{\"a\":0}]\n1\n",
+        ),
+        (
+            r#"[nth(0; {"a":10} | .a %= (1, input))], input"#,
+            "[{\"a\":0}]\n1\n",
+        ),
+        (
+            r#"[isempty({"a":10} | .a %= (1, input))], input"#,
+            "[false]\n1\n",
+        ),
+        (
+            r#"[any({"a":10} | .a %= (1, input); . != null)], input"#,
+            "[true]\n1\n",
+        ),
+        (
+            r#"[first({"a":null} | .a //= (1, input))], input"#,
+            "[{\"a\":1}]\n1\n",
+        ),
+        (
+            r#"[limit(1; {"a":null} | .a //= (1, input))], input"#,
+            "[{\"a\":1}]\n1\n",
+        ),
+        (
+            r#"[nth(0; {"a":null} | .a //= (1, input))], input"#,
+            "[{\"a\":1}]\n1\n",
+        ),
+        (
+            r#"[isempty({"a":null} | .a //= (1, input))], input"#,
+            "[false]\n1\n",
+        ),
+        (
+            r#"[any({"a":null} | .a //= (1, input); . != null)], input"#,
+            "[true]\n1\n",
+        ),
+    ];
+    for &(filter, expected) in ROWS {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], Some("1 2 3"))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "#3448 `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3471 must-not-change: the bound streams and side-effect order of an
 /// uncontested slice, the Partial prefix before a bound's error, and a
 /// consumer that takes one output from a multi-valued start. jq 1.7.1.
@@ -83202,5 +83380,169 @@ fn test_computed_slice_under_consumer_stays_within_the_stack_budget_3471() -> Re
     let (_, err, code) = run_jq_full(&["-c", &filter(100_000)], Some("[10,20,30]"))?;
     assert_eq!(code, 5, "a refusal, not a signal: {err:?}");
     assert!(err.contains("maximum recursion depth"), "{err:?}");
+    Ok(())
+}
+
+/// #3448: the same laziness, plus what jq does under *full* consumption, for
+/// every assignment shape that has a side effect to be lazy about -- `input`,
+/// `debug`, an `error` after the first output. A row is `(filter, stdin,
+/// stdout, stderr's `debug` lines, exit code)`, captured from /usr/bin/jq
+/// 1.7.1; the `debug` lines are the count of times the target or the right
+/// side ran. `|=` takes only its update's first output, `=`/`op=` run the
+/// target once per right-hand output that is actually pulled.
+#[test]
+fn test_assign_rhs_and_target_side_effect_counts_match_jq_3448() -> Result<()> {
+    const ROWS: &[(&str, &str, &str, &str, i32)] = &[
+        (
+            r"[first(.a = (1 as $x | ($x, input))), input]",
+            "1 2 3",
+            "[{\"a\":1},1]\n",
+            "",
+            0,
+        ),
+        (
+            r"first(.a = (1 as $x | ($x, input)))",
+            "1",
+            "{\"a\":1}\n",
+            "",
+            0,
+        ),
+        (r"first(.a |= (1, input))", "1", "{\"a\":1}\n", "", 0),
+        (r"first(.a += (1, input))", "1", "{\"a\":1}\n", "", 0),
+        (r"first(.a //= (1, input))", "1", "{\"a\":1}\n", "", 0),
+        (
+            r"[1] | .[0] |= (1, input) | ., input",
+            "1 2",
+            "[1]\n1\n",
+            "",
+            0,
+        ),
+        (
+            r"[.[(1,input)|tostring] = (1, input)], input",
+            "1 2 3",
+            "[{\"1\":1},{\"1\":2,\"3\":2}]\n",
+            "",
+            5,
+        ),
+        (
+            r"[.a = (1, input)], input",
+            "1 2 3",
+            "[{\"a\":1},{\"a\":1}]\n2\n",
+            "",
+            0,
+        ),
+        (
+            r"[.a |= (input, 5)], input",
+            "1 2 3",
+            "[{\"a\":1}]\n2\n",
+            "",
+            0,
+        ),
+        (
+            r#"first(.a = (1, (2|debug("R"))))"#,
+            "",
+            "{\"a\":1}\n",
+            "",
+            0,
+        ),
+        (r#".a |= (1, (2|debug("R")))"#, "", "{\"a\":1}\n", "", 0),
+        (
+            r#"[limit(2; .a = (1, (2|debug("R")), (3|debug("S"))))]"#,
+            "",
+            "[{\"a\":1},{\"a\":2}]\n",
+            "[\"DEBUG:\",\"R\"]\n",
+            0,
+        ),
+        (
+            r#"[(.|debug("E"))["a"] = (1,2)]"#,
+            "",
+            "[{\"a\":1},{\"a\":2}]\n",
+            "[\"DEBUG:\",\"E\"]\n[\"DEBUG:\",\"E\"]\n",
+            0,
+        ),
+        (
+            r#"[(.|debug("E"))["a"] += (1,2)]"#,
+            "",
+            "[{\"a\":1},{\"a\":2}]\n",
+            "[\"DEBUG:\",\"E\"]\n[\"DEBUG:\",\"E\"]\n",
+            0,
+        ),
+        (
+            r#"[(.|debug("E"))["a"] //= (1,2)]"#,
+            "",
+            "[{\"a\":1},{\"a\":2}]\n",
+            "[\"DEBUG:\",\"E\"]\n[\"DEBUG:\",\"E\"]\n",
+            0,
+        ),
+        (
+            r#"[first((.|debug("E"))["a"] = (1,2))]"#,
+            "",
+            "[{\"a\":1}]\n",
+            "[\"DEBUG:\",\"E\"]\n",
+            0,
+        ),
+        (
+            r#"[first((.|debug("E"))["a"] += (1,2))]"#,
+            "",
+            "[{\"a\":1}]\n",
+            "[\"DEBUG:\",\"E\"]\n",
+            0,
+        ),
+        (
+            r#"[first((.|debug("E"))["a"] //= (1,2))]"#,
+            "",
+            "[{\"a\":1}]\n",
+            "[\"DEBUG:\",\"E\"]\n",
+            0,
+        ),
+        (r#"[(.a = (1, error("x")))?]"#, "", "[{\"a\":1}]\n", "", 0),
+        (r"[.a = empty]", "", "[]\n", "", 0),
+        (r#"first(.a = (1, error("x")))"#, "", "{\"a\":1}\n", "", 0),
+        (r#".a |= (error("x"), 2)"#, "", "", "", 5),
+        (
+            r#"{"a":1} | .a |= (2, error("x"))"#,
+            "",
+            "{\"a\":2}\n",
+            "",
+            0,
+        ),
+    ];
+    for &(filter, stdin, stdout, debug, exit) in ROWS {
+        let (out, err, code) = run_jq_full(&["-nc", filter], Some(stdin))?;
+        let trace: String = err
+            .lines()
+            .filter(|line| line.starts_with("[\"DEBUG:\""))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(
+            (out.as_str(), trace.as_str(), code),
+            (stdout, debug, exit),
+            "#3448 `{filter}` on {stdin:?}: stderr={err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3448: the generic evaluator's route (a DSV document, jq mode) forwards a
+/// consumer's stop into an assignment's right side too.
+#[test]
+fn test_assign_rhs_is_lazy_on_the_generic_route_3448() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"a,b\n1,2\n")?;
+    let path = file.path().to_str().expect("utf-8 temp path");
+    let run = |filter: &str| -> Result<(String, String)> {
+        let (out, err, code) = run_jq_full(&["--input-dsv", ",", "-c", filter, path], None)?;
+        assert_eq!(code, 0, "#3448 `{filter}`: stderr={err:?}");
+        Ok((out, err))
+    };
+    // A consumer that stops after one document never runs `debug` in the
+    // second right-hand output.
+    let (out, err) = run(r#"first(.[0] = (1, (2|debug("R"))))"#)?;
+    assert_eq!(out, "[1,\"b\"]\n[1,\"2\"]\n");
+    assert!(!err.contains("DEBUG"), "stderr={err:?}");
+    // Full consumption runs it, once per row.
+    let (out, err) = run(r#"[.[0] = (1, (2|debug("R")))]"#)?;
+    assert_eq!(out, "[[1,\"b\"],[2,\"b\"]]\n[[1,\"2\"],[2,\"2\"]]\n");
+    assert_eq!(err.matches("DEBUG").count(), 2, "stderr={err:?}");
     Ok(())
 }
