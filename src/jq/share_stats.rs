@@ -53,6 +53,12 @@ pub enum Kind {
     ArrayUnwrap,
     /// A shared object map was consumed by value (`into_index_map`/`into_iter` cloned).
     ObjectUnwrap,
+    /// A string promoted to shared storage by a bind (#3191) was written
+    /// through, or consumed by value, while another handle still held it.
+    StringCopy,
+    /// A number spelling promoted by a bind (#3191) was consumed by value
+    /// while another handle still held it.
+    LiteralCopy,
 }
 
 impl Kind {
@@ -63,6 +69,8 @@ impl Kind {
             Self::ObjectMakeMut => "object make_mut",
             Self::ArrayUnwrap => "array unwrap",
             Self::ObjectUnwrap => "object unwrap",
+            Self::StringCopy => "string copy",
+            Self::LiteralCopy => "literal copy",
         }
     }
 }
@@ -253,6 +261,8 @@ mod tests {
             Kind::ObjectMakeMut,
             Kind::ArrayUnwrap,
             Kind::ObjectUnwrap,
+            Kind::StringCopy,
+            Kind::LiteralCopy,
         ]
         .into_iter()
         .enumerate()
@@ -267,12 +277,14 @@ mod tests {
             );
         }
         let text = exit_report(&events);
-        assert_eq!(text.lines().count(), 4);
+        assert_eq!(text.lines().count(), 6);
         for label in [
             "array make_mut",
             "object make_mut",
             "array unwrap",
             "object unwrap",
+            "string copy",
+            "literal copy",
         ] {
             assert!(text.contains(label), "{text}");
         }

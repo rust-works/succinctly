@@ -1333,7 +1333,7 @@ mod tests {
     #[test]
     fn test_stream_yaml_string_root_drops_ambiguous_styling_852() {
         let mut buf = String::new();
-        OwnedValue::String("true".to_string())
+        OwnedValue::String("true".to_string().into())
             .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "true");
@@ -1994,7 +1994,7 @@ mod tests {
     #[test]
     fn test_stream_string() {
         let mut buf = String::new();
-        OwnedValue::String("hello".to_string())
+        OwnedValue::String("hello".to_string().into())
             .stream_json(
                 &mut buf,
                 IndentSpec::COMPACT,
@@ -2008,7 +2008,7 @@ mod tests {
     #[test]
     fn test_stream_string_escaping() {
         let mut buf = String::new();
-        OwnedValue::String("hello\nworld".to_string())
+        OwnedValue::String("hello\nworld".to_string().into())
             .stream_json(
                 &mut buf,
                 IndentSpec::COMPACT,
@@ -2019,7 +2019,7 @@ mod tests {
         assert_eq!(buf, "\"hello\\nworld\"");
 
         buf.clear();
-        OwnedValue::String("tab\there".to_string())
+        OwnedValue::String("tab\there".to_string().into())
             .stream_json(
                 &mut buf,
                 IndentSpec::COMPACT,
@@ -2030,7 +2030,7 @@ mod tests {
         assert_eq!(buf, "\"tab\\there\"");
 
         buf.clear();
-        OwnedValue::String("quote\"here".to_string())
+        OwnedValue::String("quote\"here".to_string().into())
             .stream_json(
                 &mut buf,
                 IndentSpec::COMPACT,
@@ -2063,7 +2063,10 @@ mod tests {
     fn test_stream_object() {
         let mut buf = String::new();
         let mut map = IndexMap::new();
-        map.insert("name".to_string(), OwnedValue::String("Alice".to_string()));
+        map.insert(
+            "name".to_string(),
+            OwnedValue::String("Alice".to_string().into()),
+        );
         map.insert("age".to_string(), OwnedValue::Int(30));
         OwnedValue::Object(map.into())
             .stream_json(
@@ -2083,7 +2086,10 @@ mod tests {
         // inside another container (object-in-object, array-in-object).
         let mut buf = String::new();
         let mut inner = IndexMap::new();
-        inner.insert("name".to_string(), OwnedValue::String("Alice".to_string()));
+        inner.insert(
+            "name".to_string(),
+            OwnedValue::String("Alice".to_string().into()),
+        );
         let mut outer = IndexMap::new();
         outer.insert("user".to_string(), OwnedValue::Object(inner.into()));
         outer.insert(
@@ -2127,7 +2133,10 @@ mod tests {
         // key or punctuation around it) must propagate out of the recursive
         // call rather than being silently swallowed.
         let mut map = IndexMap::new();
-        map.insert("a".to_string(), OwnedValue::String("boom".to_string()));
+        map.insert(
+            "a".to_string(),
+            OwnedValue::String("boom".to_string().into()),
+        );
         let mut out = FailOnMarker { marker: "boom" };
         let result = OwnedValue::Object(map.into()).stream_json(
             &mut out,
@@ -2329,7 +2338,7 @@ mod tests {
         assert!(OwnedValue::Bool(false).is_falsy());
         assert!(!OwnedValue::Bool(true).is_falsy());
         assert!(!OwnedValue::Int(0).is_falsy());
-        assert!(!OwnedValue::String(String::new()).is_falsy());
+        assert!(!OwnedValue::String(String::new().into()).is_falsy());
     }
 
     /// `depth` levels of single-element array nesting: `[[[...[null]...]]]`.

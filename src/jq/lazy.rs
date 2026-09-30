@@ -249,8 +249,8 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             // is jq's printing, `null`): it is the NaN it holds. Its instance
             // only matters to `==`, which never runs on a `JqValue`.
             OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => JqValue::Float(f),
-            OwnedValue::NumberLiteral(_, literal) => JqValue::NumberLiteral(literal),
-            OwnedValue::String(s) => JqValue::String(s),
+            OwnedValue::NumberLiteral(_, literal) => JqValue::NumberLiteral(literal.into()),
+            OwnedValue::String(s) => JqValue::String(s.into_string()),
             OwnedValue::Array(arr) => JqValue::Array(
                 arr.into_iter()
                     .map(|v| Self::from_owned_at_depth(v, depth + 1))
@@ -551,7 +551,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::NumberLiteral(literal) => {
                 OwnedValue::from_number_literal::<JqSemantics>(literal)
             }
-            JqValue::String(s) => OwnedValue::String(s.clone()),
+            JqValue::String(s) => OwnedValue::String(s.clone().into()),
             JqValue::Array(arr) => OwnedValue::Array(
                 arr.iter()
                     .map(|v| v.materialize_at_depth(depth + 1))
@@ -614,7 +614,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::NumberLiteral(literal) => {
                 OwnedValue::from_number_literal::<JqSemantics>(literal)
             }
-            JqValue::String(s) => OwnedValue::String(s.clone()),
+            JqValue::String(s) => OwnedValue::String(s.clone().into()),
             JqValue::Array(arr) => OwnedValue::Array(
                 arr.iter()
                     .map(|v| v.try_materialize_at_depth(depth + 1))
@@ -654,7 +654,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::NumberLiteral(literal) => {
                 OwnedValue::from_number_literal_boxed::<JqSemantics>(literal)
             }
-            JqValue::String(s) => OwnedValue::String(s),
+            JqValue::String(s) => OwnedValue::String(s.into()), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
             JqValue::Array(arr) => OwnedValue::Array(
                 arr.into_iter()
                     .map(|v| v.into_owned_at_depth(depth + 1))
@@ -895,7 +895,7 @@ fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
         let Some(s) = key_display_string(&key) else {
             return Err(fields.malformed_member_error());
         };
-        keys.push(OwnedValue::String(s.into_owned()));
+        keys.push(OwnedValue::String(s.into_owned().into()));
     }
     // #1956: matches `eval_generic.rs`'s own `distinct_key_cursors_checked`/
     // `keys_are_well_formed`, which both check this via `is_malformed()`.
@@ -1435,7 +1435,7 @@ mod tests {
             OwnedValue::Array(items) => {
                 assert_eq!(items.len(), 3);
                 assert_eq!(items[0], OwnedValue::Int(1));
-                assert_eq!(items[1], OwnedValue::String("hello".to_string()));
+                assert_eq!(items[1], OwnedValue::String("hello".to_string().into()));
                 assert_eq!(items[2], OwnedValue::Null);
             }
             _ => panic!("expected array"),
@@ -1907,7 +1907,7 @@ mod tests {
         let materialize_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
         assert_eq!(
             materialize_val.materialize().unwrap(),
-            OwnedValue::String("hello".to_string())
+            OwnedValue::String("hello".to_string().into())
         );
 
         let index = JsonIndex::build(json);
@@ -1915,7 +1915,7 @@ mod tests {
         let into_owned_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
         assert_eq!(
             into_owned_val.into_owned().unwrap(),
-            OwnedValue::String("hello".to_string())
+            OwnedValue::String("hello".to_string().into())
         );
     }
 
@@ -2254,8 +2254,8 @@ mod tests {
             lazy_keys_array_to_owned(&fields, true).unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("b".to_string()),
-                    OwnedValue::String("a".to_string()),
+                    OwnedValue::String("b".to_string().into()),
+                    OwnedValue::String("a".to_string().into()),
                 ]
                 .into()
             )
@@ -2270,7 +2270,9 @@ mod tests {
         };
         assert_eq!(
             lazy_keys_array_to_owned(&fields, true).expect("preserved, not raised (#1642)"),
-            OwnedValue::array_from(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())])
+            OwnedValue::array_from(vec![OwnedValue::String(
+                "\u{FFFD}\u{FFFD}".to_string().into()
+            )])
         );
     }
 
@@ -2445,7 +2447,7 @@ mod tests {
                 .expect("a nested undecodable key is preserved, not raised on (#1642)"),
             OwnedValue::Array(
                 vec![OwnedValue::Array(
-                    vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())].into()
+                    vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string().into())].into()
                 )]
                 .into()
             )
@@ -2462,7 +2464,7 @@ mod tests {
                 IndexMap::from([(
                     "x".to_string(),
                     OwnedValue::Array(
-                        vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())].into()
+                        vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string().into())].into()
                     )
                 )])
                 .into()

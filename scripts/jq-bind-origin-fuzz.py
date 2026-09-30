@@ -379,6 +379,23 @@ def embed_write_program(rng):
     target = rng.choice(navs) + " | $x" + rng.choice(EMBED_WRITE_TAILS)
     return f". as $x | {construct} | " + rng.choice(EMBED_WRITE_WRAPS) % target
 
+# #3191: a scalar *root* bound by `. as $x` -- the one shape whose identity
+# only the bind-time promotion gives. `doc()` always draws an object root,
+# so a stock run never binds one; `--scalar-root-p` swaps the document for a
+# scalar and draws this program. Stages come from the scalar pools and the
+# placements, so a promoted handle is passed through (KEEPS), rebuilt (FRESH)
+# and placed/navigated back out (EMBEDS) in random order before the use.
+SCALAR_ROOTS = [1, 5, 1.0, -0.0, 100000000000000000000, "s", "abc", ""]
+SCALAR_ROOT_USES = [
+    "path($x)", "path(. | $x)", "($x) = 9", "($x) |= 9", "[path($x)]",
+    "([.] | path(.[0] | $x))", "({k:.} | path(.k | $x))", "(. as $y | path($y))",
+]
+
+def scalar_root_program(rng):
+    stages = [rng.choice(SCALAR_KEEPS + SCALAR_FRESH + EMBEDS + PASSTHROUGH)
+              for _ in range(rng.randrange(0, 4))]
+    return " | ".join([". as $x"] + stages + [rng.choice(SCALAR_ROOT_USES)])
+
 # #3049: `[f]` keeps path tracking live even when its input is tracked.
 # Earlier pools generated array values but not this tracked-input placement
 # with navigation *inside* the constructor followed by an empty consumer.
@@ -631,6 +648,10 @@ def main():
                     help="probability a document holds equal-valued empty `{}`/`[]` siblings "
                          "(#3180). The stock leaves have none, so the empty-container bind is "
                          "unreachable by default -- run at 1.0 to weight the sweep onto it")
+    ap.add_argument("--scalar-root-p", type=float, default=0.0,
+                    help="probability a program binds a scalar document root (#3191). doc() "
+                         "always draws an object root, so the bind-time promotion of a scalar "
+                         "is unreachable by default -- run at 1.0 to weight the sweep onto it")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     pin = open("tests/data/jq-golden/JQ_VERSION").read().strip()
@@ -670,7 +691,11 @@ def main():
         dv = doc(rng, a.empty_p)
         d = json.dumps(dv)
         r = rng.random()
-        if a.positional_bind_p and rng.random() < a.positional_bind_p:
+        if a.scalar_root_p and rng.random() < a.scalar_root_p:
+            dv = rng.choice(SCALAR_ROOTS)
+            d = json.dumps(dv)
+            f = scalar_root_program(rng)
+        elif a.positional_bind_p and rng.random() < a.positional_bind_p:
             f = positional_bind_program(rng)
         elif a.embed_write_p and rng.random() < a.embed_write_p:
             f = embed_write_program(rng)

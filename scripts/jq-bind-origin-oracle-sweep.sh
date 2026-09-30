@@ -96,12 +96,13 @@
 # `. + 0`), plus jq's constant pool (`def f: 5; f as $x | f` is one `jv`, two
 # literals are two, two equal document scalars are two nodes). jq's rule is
 # pointer identity for strings and number literals and value identity for
-# `null`/`bool`/a computed number. succinctly's scalars have no storage
-# identity: ADR-0024's option D (a refcounted `String` and spelling) was built
-# and measured on 2026-09-20 and rejected -- +8% to +50% peak RSS on
-# scalar-heavy rows for the rows it recovers -- so the rows jq answers stay
-# refuse-only here (the safe direction) and are pinned below with that reason,
-# while the rows jq refuses agree.
+# `null`/`bool`/a computed number. ADR-0024's option D (refcount *every*
+# string and spelling) was built and rejected on its RSS cost (#3182); since
+# #3191 a scalar gets storage identity only when a plain `as` bind promotes it
+# (`SharableString::promote`, at `embed_table_push`), which costs nothing for a
+# scalar nothing binds. The placements and passthroughs agree; what stays
+# refuse-only below (the safe direction) is the bridged-builtin class, a
+# destructuring bind, and jq's constant pool, each with its reason.
 #
 # The `owned-embed-*` rows are #2889 Phase 2: an *identity* bind (`. as $x`)
 # whose value is later re-materialized by an embedding stage jq keeps the
@@ -663,7 +664,7 @@ owned-embed-path-nested-rebuilt-sibling	{"a":1}	. as $x | [.,{a:1}] | path(.[1] 
 owned-embed-path-nested-rebuilt-copy	{"a":1}	. as $x | [{"a":1}] | path(.[0] | $x)
 owned-embed-path-nested-past-embed	{"a":1}	. as $x | [.] | path(.[0] | .a | $x)
 owned-embed-refuse-path-nested-ancestor-bind	{"a":{"b":1}}	. as $x | .a as $y | [.] | path(.[0].a | $y)
-owned-embed-refuse-path-nested-scalar	1	. as $x | [.] | path(.[0] | $x)
+owned-embed-path-nested-scalar	1	. as $x | [.] | path(.[0] | $x)
 owned-embed-refuse-path-nested-comma	{"a":1}	. as $x | [.] | (path(.[0] | $x), path(.[0] | $x | .a))
 owned-embed-refuse-path-nested-wrapper	{"a":1}	. as $x | [.] | [limit(1; path(.[] | $x))]
 owned-embed-path-nested-del	{"a":1}	. as $x | [.] | del(.[0] | $x)
@@ -780,8 +781,8 @@ owned-embed-array-input-object-member	[1,2]	. as $x | {k:.} | .k | path($x)
 owned-embed-agree-array-input-element	[1,2]	. as $x | [.] | .[0] | path($x)
 owned-embed-array-input-add	[1,2]	. as $x | [.] | add | path($x)
 owned-embed-array-input-concat-write	[1,2]	. as $x | . + [] | ($x[0]) = 9
-owned-embed-refuse-scalar-string-root	"s"	. as $x | {k:.} | .k | path($x)
-owned-embed-refuse-scalar-number-root	5	. as $x | {k:.} | .k | path($x)
+owned-embed-scalar-string-root	"s"	. as $x | {k:.} | .k | path($x)
+owned-embed-scalar-number-root	5	. as $x | {k:.} | .k | path($x)
 owned-embed-agree-scalar-string-element	"s"	. as $x | [.] | .[0] | path($x)
 owned-embed-agree-scalar-number-element	5	. as $x | [.] | .[0] | path($x)
 owned-embed-agree-array-negative-index	{"a":1}	. as $x | [.] | .[-1] | path($x)
@@ -850,6 +851,10 @@ scalar-string-keeps-if	"abc"	. as $x | if . then . else . end | path($x)
 scalar-string-keeps-select	"abc"	. as $x | select(true) | path($x)
 scalar-string-keeps-getpath-empty	"abc"	. as $x | getpath([]) | path($x)
 scalar-string-keeps-setpath-empty	"abc"	. as $x | setpath([]; .) | path($x)
+scalar-string-keeps-strings-filter	"abc"	. as $x | strings | path($x)
+scalar-number-keeps-numbers-filter	1.50	. as $x | numbers | path($x)
+scalar-string-keeps-walk	"abc"	. as $x | walk(.) | path($x)
+scalar-string-keeps-reduce-rebind	"abc"	. as $x | reduce . as $y (null; $y) | path($x)
 scalar-string-keeps-limit	"abc"	. as $x | limit(1; .) | path($x)
 scalar-string-keeps-first-f	"abc"	. as $x | first(.) | path($x)
 scalar-string-keeps-recurse	"abc"	. as $x | recurse | path($x)
@@ -862,6 +867,9 @@ scalar-string-keeps-destructure-alt	"abc"	. as $x | . as [$a] ?// $a | $a | path
 scalar-string-keeps-length-bind	"abc"	. as $x | length as $l | . | path($x)
 scalar-string-keeps-test-bind	"abc"	. as $x | test("a") as $t | . | path($x)
 scalar-string-keeps-startswith-bind	"abc"	. as $x | startswith("a") as $b | . | path($x)
+scalar-string-fresh-full-slice-of-placed	"abc"	. as $x | {k:.} | .k | .[0:] | path($x)
+scalar-string-fresh-full-closed-slice-of-placed	"abc"	. as $x | {k:.} | .k | .[0:3] | path($x)
+scalar-string-fresh-full-slice-write	"abc"	. as $x | ([.] | min) | .[0:] | ($x) = 9
 scalar-string-fresh-ascii-downcase	"abc"	. as $x | ascii_downcase | path($x)
 scalar-string-fresh-ascii-upcase	"abc"	. as $x | ascii_upcase | path($x)
 scalar-string-fresh-ltrimstr-match	"abc"	. as $x | ltrimstr("a") | path($x)
@@ -961,9 +969,6 @@ destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nest
 carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
 in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
-navigated-bind-anchor-rebuilt-parent:#3134 -- jq keeps the scalar jv through a copy-on-write of its parent; the anchor proves identity only while the parent is the document's own unmodified container
-navigated-bind-anchor-new-parent:#3134 -- jq places the same scalar jv in a new array; a scalar has no storage for a new container to share, and its anchor is the old parent
-navigated-bind-anchor-relocated:#3134 -- to_entries moves the same scalar jv into a new object; the scalar twin of #3178's relocation, which only real scalar identity could follow
 navigated-bind-anchor-owned-root:#3134 -- eval.rs's own bind sites mint no node for a scalar (a scalar StandardJson keeps no cursor), so no anchor is pushed on an owned-rooted document
 owned-embed-refuse-path-nested-del-fractional:#3188 -- the write door will not re-spell a fractional index: del(.[-0.5]) deletes element 0 here and nothing in jq (#3302), so the static spelling would be a wrong answer
 owned-embed-refuse-path-nested-del-slice:#3188 -- a slice component has no static spelling the evaluator indexes by (.[{"start":0,"end":1}], #3300), so the write door declines
@@ -978,45 +983,25 @@ catch-payload-own-node-refuse-only:#3133 -- error(.) raises the register node it
 computed-identity-bind-mixed-if:#3133 -- an if source with one arm a computed `.` and the other a marker binds Untracked on an untracked stage (the condition is not evaluated); jq evaluates it and binds the marker
 fold-body-fanout-declines:#3145 review -- the register reaches a fold body only when that body cannot fan out: a nested pipe sees it while a sibling branch of the same multi-output body does not, so an UPDATE that refused wholesale could half-succeed and drive a ?// retry jq never performs, writing a key jq never names. Refusing the whole body is the safe side of that asymmetry
 fold-body-fanout-declines-del:#3145 review -- the del twin: jq writes {"a":{}}, the half-success wrote nothing at exit 0, and declining refuses loudly instead
-owned-embed-refuse-scalar-string-root:#2889/#3182 -- a scalar root is not Rc-backed, so it can never enter or be witnessed by the embed table. ADR-0024's option D (refcounted `String`/spelling) was built and measured on 2026-09-20 and rejected: +8% to +50% peak RSS on scalar-heavy rows for the identity it buys, see the ADR's option D result
-owned-embed-refuse-scalar-number-root:same as owned-embed-refuse-scalar-string-root, for a number root
-owned-embed-refuse-path-nested-scalar:same as owned-embed-refuse-scalar-string-root, at a nested position (#3177)
-scalar-string-keeps-tostring:same as owned-embed-refuse-scalar-string-root
-scalar-string-keeps-text:same as owned-embed-refuse-scalar-string-root
-scalar-string-keeps-tostring-twice:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-ltrimstr-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-ltrimstr-nonstring-arg:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-rtrimstr-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-sub-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-gsub-nomatch:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-add-one:same as owned-embed-refuse-scalar-string-root
-scalar-string-keeps-min-one:same as owned-embed-refuse-scalar-string-root
-scalar-string-keeps-max-one:same as owned-embed-refuse-scalar-string-root
-scalar-string-keeps-sort-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-unique-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-flatten-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-reverse-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-setpath-empty:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-string-keeps-reduce-empty:same as owned-embed-refuse-scalar-string-root
-scalar-string-keeps-destructure-alt:same as owned-embed-refuse-scalar-string-root
-scalar-number-keeps-tonumber:same as owned-embed-refuse-scalar-string-root
-scalar-number-keeps-abs:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-number-keeps-add-one:same as owned-embed-refuse-scalar-string-root
-scalar-number-keeps-min-one:same as owned-embed-refuse-scalar-string-root
-scalar-number-keeps-sort-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-number-keeps-unique-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-number-keeps-max-by-one:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-number-keeps-setpath-empty:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-number-keeps-reduce-empty:same as owned-embed-refuse-scalar-string-root
-scalar-number-keeps-ltrimstr-passthrough:same as owned-embed-refuse-scalar-string-root; this builtin is also bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), so it would stay refuse-only even with scalar storage identity
-scalar-constant-pool-number-def:same as owned-embed-refuse-scalar-string-root: the literal's value is a fresh materialization on each evaluation here, where jq's constant pool loads one `jv`; the two-literal twin refuses in both
-scalar-constant-pool-string-def:same as owned-embed-refuse-scalar-string-root: the literal's value is a fresh materialization on each evaluation here, where jq's constant pool loads one `jv`; the two-literal twin refuses in both
-scalar-document-element-embed-number:same as owned-embed-refuse-scalar-string-root
-scalar-root-nested-embed-string:same as owned-embed-refuse-scalar-string-root
-scalar-root-embed-write-string:same as owned-embed-refuse-scalar-string-root
-scalar-root-float-literal:same as owned-embed-refuse-scalar-string-root
-scalar-nested-embed-yq-untouched-number:same as owned-embed-refuse-scalar-string-root
-navigated-bind-positional-relocated-scalar:#3466 -- to_entries moves the scalar jv into a new container; a scalar has no identity to follow it
+scalar-string-keeps-tostring-twice:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-ltrimstr-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-ltrimstr-nonstring-arg:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-rtrimstr-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-sub-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-gsub-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-flatten-one:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-setpath-empty:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-strings-filter:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-number-keeps-numbers-filter:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-walk:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-reduce-rebind:#3191 -- a fold rebinding the value as its own accumulator (`reduce . as $y (null; $y)`) runs its UPDATE through the owned re-index bridge (the #2889 owned-embed-fold-if-identity mechanism), which hands path() a fresh copy
+scalar-string-keeps-destructure-alt:#3191 -- only a plain `as $x` bind promotes a scalar; a destructuring bind (`as [$a] ?// $a`) materializes its variable fresh, so `$a` is a copy of the node `$x` holds rather than its storage
+scalar-number-keeps-abs:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-number-keeps-max-by-one:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-number-keeps-setpath-empty:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-number-keeps-ltrimstr-passthrough:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-constant-pool-number-def:#3191 -- jq's constant pool loads one `jv` for a def's literal across calls; here each evaluation of a literal is a fresh value and only a bind promotes one, so the two calls are two storages (the two-literal twin refuses in both)
+scalar-constant-pool-string-def:same as scalar-constant-pool-number-def, for a string literal
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then

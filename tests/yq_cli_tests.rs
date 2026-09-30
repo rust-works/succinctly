@@ -49366,3 +49366,24 @@ fn test_comma_head_pipe_array_unchanged_in_yq_mode_3476() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3191's review: jq mode's `tonumber` on a document number now hands the
+/// node back through the embed table (so a bound number literal keeps its
+/// identity), and doing that in yq mode read the node's explicit YAML tag --
+/// `!!str 1.5 | tonumber` came back the *string* `"1.5"`, so `. + 1`
+/// concatenated. yq mode keeps its own parse. Captured from yq v4.53.3.
+#[test]
+fn test_tonumber_on_a_tagged_number_ignores_the_tag_3191() -> Result<()> {
+    for (input, filter, want) in [
+        ("a: !!str 1.5\n", ".a | tonumber | . + 1", "2.5"),
+        ("a: !!str 1.5\n", ".a | tonumber", "1.5"),
+        ("a: !!str 1e3\n", ".a | tonumber | . + 1", "1001"),
+        ("a: !!str 1e3\n", ".a | tonumber", "1e3"),
+        ("a: 1.50\n", ".a | tonumber", "1.50"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(code, 0, "`{filter}` on {input:?}");
+        assert_eq!(output.trim_end(), want, "`{filter}` on {input:?}");
+    }
+    Ok(())
+}

@@ -557,7 +557,7 @@ impl EvalError {
     /// on the same value instead of reformatting it via jq's rules.
     pub fn from_value_with(tag: EvalTag, value: OwnedValue) -> Self {
         let message = match &value {
-            OwnedValue::String(s) => s.clone(),
+            OwnedValue::String(s) => String::clone(s),
             other => {
                 let mut message = String::new();
                 let _ = stream_value_preview(tag, other, &mut message);
@@ -578,7 +578,9 @@ impl EvalError {
     pub fn payload(self) -> OwnedValue {
         match self.value {
             EvalErrorPayload::Value(v) => v,
-            EvalErrorPayload::None | EvalErrorPayload::Kind(_) => OwnedValue::String(self.message),
+            EvalErrorPayload::None | EvalErrorPayload::Kind(_) => {
+                OwnedValue::String(self.message.into())
+            }
         }
     }
 
@@ -1760,7 +1762,7 @@ mod tests {
     use super::*;
 
     fn s(v: &str) -> OwnedValue {
-        OwnedValue::String(v.to_string())
+        OwnedValue::String(v.to_string().into())
     }
 
     #[test]
@@ -1837,7 +1839,7 @@ mod tests {
         let literal: Box<str> = format!("{mantissa}.5e400").into();
         let value = OwnedValue::NumberLiteral(
             super::super::value::NumberRepr::Float(f64::INFINITY),
-            literal,
+            literal.into(),
         );
         let result = dump_truncated(&value);
         assert!(
@@ -1861,7 +1863,8 @@ mod tests {
     fn dump_truncated_bounds_a_near_zero_literal_with_a_huge_saturated_exponent() {
         let exponent = "9".repeat(100_000);
         let literal: Box<str> = format!("0.005e-{exponent}").into();
-        let value = OwnedValue::NumberLiteral(super::super::value::NumberRepr::Float(0.0), literal);
+        let value =
+            OwnedValue::NumberLiteral(super::super::value::NumberRepr::Float(0.0), literal.into());
         let result = dump_truncated(&value);
         assert!(
             result.len() < 100,
@@ -1897,7 +1900,7 @@ mod tests {
         // not just a bare top-level value.
         let mut obj = indexmap::IndexMap::new();
         obj.insert("a".to_string(), OwnedValue::Float(f64::INFINITY));
-        obj.insert("b".to_string(), OwnedValue::String("x".to_string()));
+        obj.insert("b".to_string(), OwnedValue::String("x".to_string().into()));
         assert_eq!(
             EvalError::from_value(OwnedValue::Object(obj.into())).message,
             r#"{"a":1.7976931348623157e+308,"b":"x"}"#
@@ -2059,7 +2062,7 @@ mod tests {
         assert_eq!(err.value, EvalErrorPayload::None);
         assert_eq!(
             err.payload(),
-            OwnedValue::String("Cannot iterate over number (1)".to_string())
+            OwnedValue::String("Cannot iterate over number (1)".to_string().into())
         );
     }
 
