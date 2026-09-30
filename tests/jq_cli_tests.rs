@@ -69305,6 +69305,84 @@ fn test_navigated_bind_anchor_controls_refuse_3134() -> Result<()> {
     Ok(())
 }
 
+/// #3483: a bind below an already-bound ancestor names the bound member's
+/// key (or its index) without decoding every sibling's key. The rows cover
+/// what that walk must still get right -- the answer on wide objects and
+/// arrays, an escaped key spelled two ways, a shadowing duplicate (which
+/// keeps the full comparison), nested arrays -- and the one refusal that
+/// must not turn into an answer: an equal value at another position. Every
+/// expected output captured live against jq 1.7.1.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_bound_ancestor_anchor_names_the_step_without_decoding_siblings_3483() -> Result<()> {
+    let wide = r#"{"a":{"k0":1,"k1":1,"k2":1,"k3":1}}"#;
+    let list = r#"{"a":[0,1,2,3,4,5,6,7,8,9]}"#;
+    for (input, filter, expected) in [
+        (
+            r#"{"k0":1,"k1":2,"k2":3,"k3":4,"k4":5,"k5":6,"k6":7,"k7":8}"#,
+            r". as $u | .k5 as $n | path(.k5 | $n)",
+            r#"["k5"]"#,
+        ),
+        (
+            wide,
+            r".a as $y | .a.k2 as $z | .a | path(.k2 | $z)",
+            r#"["k2"]"#,
+        ),
+        (
+            r#"{"ab":{"x":1,"y":1}}"#,
+            r".ab as $y | .ab.x as $z | .ab | path(.x | $z)",
+            r#"["x"]"#,
+        ),
+        (
+            r#"{"a":{"b":1,"c":2}}"#,
+            r".a as $y | .a.b as $z | .a | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        // A duplicate key: the member the later one shadows is never bound.
+        (
+            r#"{"a":{"k":1,"k":2}}"#,
+            r".a as $y | .a.k as $z | .a | path(.k | $z)",
+            r#"["k"]"#,
+        ),
+        (
+            r#"{"a":{"b":1,"ab":2,"ab":3}}"#,
+            r".a as $y | .a.ab as $z | .a | path(.ab | $z)",
+            r#"["ab"]"#,
+        ),
+        (
+            list,
+            r".a as $y | .a[7] as $z | .a | path(.[7] | $z)",
+            "[7]",
+        ),
+        (
+            r#"{"a":[[1],[2,[3]],[4]]}"#,
+            r".a as $y | .a[1][1] as $z | .a | path(.[1][1] | $z)",
+            "[1,1]",
+        ),
+        (
+            r#"{"a":{"b":[1,{"c":2}]}}"#,
+            r".a as $y | .a.b[1].c as $z | path(.a.b[1].c | $z)",
+            r#"["a","b",1,"c"]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3483: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    // The register is an equal value one element over: still refused.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r".a as $y | .a[7] as $z | .a | path(.[6] | $z)"],
+        Some(list),
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert!(stderr.contains("Invalid path expression"), "{stderr:?}");
+    Ok(())
+}
+
 /// #3179: an embed of a bound node reached through a container built from
 /// one of its *ancestors*. The materializer now takes the binding's own
 /// value for a nested container, not only at its depth 0, so `{k:.}`'s copy

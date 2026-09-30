@@ -3652,6 +3652,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         JsonCursor::parent(self)
     }
 
+    /// A JSON object's owned value holds one entry per distinct key, and its
+    /// array one element per child: no merge keys, no wrapper nodes (#3483).
+    #[inline]
+    fn materializes_members_one_to_one(&self) -> bool {
+        true
+    }
+
     #[inline]
     fn same_node(&self, other: &Self) -> bool {
         self.bp_pos == other.bp_pos

@@ -6469,8 +6469,11 @@ pub(crate) fn embed_anchor_push<S: EvalSemantics, C: DocumentCursor>(
         let mut steps = Vec::new();
         let mut cur = anchor.at_node_id(node)?;
         while let Some(parent) = cur.document_parent() {
-            steps.push(anchor_step(&parent, cur.node_id())?);
-            if let Some(held) = embed_table::shared_for(parent.node_id(), document) {
+            // The ancestor's held value first (#3483): `anchor_step` reads its
+            // length instead of decoding every member's key.
+            let held = embed_table::shared_for(parent.node_id(), document);
+            steps.push(anchor_step(&parent, cur.node_id(), held.as_ref())?);
+            if let Some(held) = held {
                 steps.reverse();
                 return Some(embed_table::push_anchor(
                     parent.node_id(),
@@ -6494,7 +6497,21 @@ pub(crate) fn embed_anchor_push<S: EvalSemantics, C: DocumentCursor>(
 /// not a child of `parent`, and for a member a later one with the same key
 /// shadows -- the owned value keeps only the last (jq's own parse does the
 /// same), so the shadowed node is in no value the resolver can stand on.
-fn anchor_step<C: DocumentCursor>(parent: &C, child: usize) -> Option<OwnedValue> {
+///
+/// `held` is `parent`'s own materialization when a binding holds one (#3483):
+/// where the format materializes one entry per child
+/// ([`DocumentCursor::materializes_members_one_to_one`]) it lets
+/// [`anchor_step_by_nodes`] answer with one key decoded, not one per member.
+fn anchor_step<C: DocumentCursor>(
+    parent: &C,
+    child: usize,
+    held: Option<&OwnedValue>,
+) -> Option<OwnedValue> {
+    match held.map(|held| anchor_step_by_nodes(parent, child, held)) {
+        Some(NodeStep::Step(step)) => return Some(step),
+        Some(NodeStep::Refuse) => return None,
+        Some(NodeStep::Decline) | None => {}
+    }
     let value = parent.value();
     if let Some(fields) = value.as_object() {
         let mut f = fields;
@@ -6522,6 +6539,82 @@ fn anchor_step<C: DocumentCursor>(parent: &C, child: usize) -> Option<OwnedValue
         None
     } else {
         None
+    }
+}
+
+/// What [`anchor_step_by_nodes`] decided (#3483).
+#[derive(Debug, PartialEq)]
+enum NodeStep {
+    /// The step from the parent down to the bound node.
+    Step(OwnedValue),
+    /// No step exists: the bound node is a key node, no child of the parent,
+    /// or a member a later duplicate shadows.
+    Refuse,
+    /// Not decided here; the caller runs the generic walk that decodes every
+    /// key.
+    Decline,
+}
+
+/// [`anchor_step`] by node identity alone (#3483).
+///
+/// The walk hops the children (`first_child`/`next_sibling`) comparing node
+/// ids, so no key or value is materialized for a member that is not the
+/// bound one. An object decodes exactly one key -- the bound member's -- and
+/// rules out a shadowing duplicate by counting: `held` holds one entry per
+/// *distinct* key, so it is as long as the member count exactly when no two
+/// members spell the same key. A shorter map means a duplicate somewhere and
+/// declines, keeping the full comparison for the case that needs it.
+///
+/// Declines for a format that does not materialize one entry per child, for
+/// a `held` that is neither an object nor an array, and for an object whose
+/// children do not pair up, so every irregular shape keeps the answer the
+/// generic walk gives it.
+fn anchor_step_by_nodes<C: DocumentCursor>(
+    parent: &C,
+    child: usize,
+    held: &OwnedValue,
+) -> NodeStep {
+    if !parent.materializes_members_one_to_one() {
+        return NodeStep::Decline;
+    }
+    if let Some(map) = held.as_object() {
+        let mut key = parent.first_child();
+        let mut members = 0usize;
+        let mut found: Option<C> = None;
+        while let Some(k) = key {
+            let Some(value) = k.next_sibling() else {
+                return NodeStep::Decline; // omni-dev: coverage tolerate-line reason="unreachable for the one format that claims materializes_members_one_to_one: a JSON object's children always pair key-then-value; kept so an implementor whose mapping could end on a key declines instead of miscounting (#3483)"
+            };
+            members += 1;
+            if found.is_none() && value.node_id() == child {
+                found = Some(k);
+            }
+            key = value.next_sibling();
+        }
+        if members != map.len() {
+            return NodeStep::Decline;
+        }
+        let Some(key) = found else {
+            return NodeStep::Refuse;
+        };
+        let key = key.value();
+        match key_display_string(&key) {
+            Some(name) => NodeStep::Step(OwnedValue::string(name.into_owned())),
+            None => NodeStep::Decline, // omni-dev: coverage tolerate-line reason="unreachable for JSON: a key node always decodes or falls back to its raw spelling, so key_display_string is Some; kept so a format whose key can be non-string declines to the generic walk (#3483)"
+        }
+    } else if held.as_array().is_some() {
+        let mut index = 0i64;
+        let mut node = parent.first_child();
+        while let Some(n) = node {
+            if n.node_id() == child {
+                return NodeStep::Step(OwnedValue::Int(index));
+            }
+            index += 1;
+            node = n.next_sibling();
+        }
+        NodeStep::Refuse
+    } else {
+        NodeStep::Decline
     }
 }
 
@@ -42875,6 +42968,127 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// #3483: the node-only step and the generic walk that decodes every key
+    /// answer alike for every node of every shape -- shadowing duplicates,
+    /// escaped and undecodable keys, key nodes, empty and nested containers --
+    /// and the count gate takes the fast path exactly when no member is
+    /// shadowed.
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[test]
+    fn anchor_step_by_nodes_agrees_with_the_generic_walk_3483() {
+        type Cursor<'a> = crate::json::light::JsonCursor<'a, Vec<u64>>;
+
+        fn visit(c: &Cursor<'_>, out: &mut Vec<usize>) {
+            out.push(c.node_id());
+            let mut child = c.first_child();
+            while let Some(n) = child {
+                visit(&n, out);
+                child = n.next_sibling();
+            }
+        }
+
+        // (document, whether some object in it has a shadowed member)
+        let docs: [(&[u8], bool); 10] = [
+            (br#"{"a":{"b":1,"c":2},"x":[5,6,7],"e":{}}"#, false),
+            (br#"{"d":1,"d":2,"x":[1]}"#, true),
+            (br#"{"a":{"k":1,"k":{"k":3}},"b":[[1],[2,[3]]]}"#, true),
+            (br#"{"a\u0062":1,"ab":2,"\u00e9":3,"q\"":4}"#, true),
+            (br#"{"a\u0062":1,"c":2,"\u00e9":3,"q\"":[{"z":0}]}"#, false),
+            (br#"[[],{},[{}],{"":1,"a":[]}]"#, false),
+            (br"[1,2,3,4,5,6,7,8,9,10]", false),
+            (br#"{"a":1,"b":{"c":{"d":{"e":[0,{"f":null}]}}}}"#, false),
+            // Distinct undecodable keys spell distinct fallbacks (`keys` shows
+            // them raw), so none shadows another; an embedded NUL is a real key.
+            (br#"{"a":{"\ud800":1,"\ud801":2,"k":3}}"#, false),
+            (br#"{"a":{"k":3,"k\u0000":4}}"#, false),
+        ];
+        for (doc, shadowed) in docs {
+            let index = JsonIndex::build(doc);
+            let root = index.root(doc);
+            let mut nodes = Vec::new();
+            visit(&root, &mut nodes);
+            let mut declined = false;
+            for id in &nodes {
+                let cur = root.at_node_id(*id).unwrap();
+                let Some(parent) = cur.document_parent() else {
+                    continue;
+                };
+                let held = to_owned_cursor::<JqSemantics, _>(&parent).unwrap();
+                let generic = anchor_step(&parent, *id, None);
+                let step = |n: NodeStep| match n {
+                    NodeStep::Step(v) => Some(Some(v)),
+                    NodeStep::Refuse => Some(None),
+                    NodeStep::Decline => None,
+                };
+                assert_eq!(
+                    anchor_step(&parent, *id, Some(&held)),
+                    generic,
+                    "node {id} of {}",
+                    String::from_utf8_lossy(doc) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- a panic-message format argument for the #3483 differential test's own assertion, evaluated only if that assert's own condition is false (#3483)"
+                );
+                match step(anchor_step_by_nodes(&parent, *id, &held)) {
+                    Some(fast) => assert_eq!(fast, generic, "fast path, node {id}"),
+                    None => declined = true,
+                }
+            }
+            assert_eq!(declined, shadowed, "{}", String::from_utf8_lossy(doc));
+        }
+    }
+
+    /// #3483: the branches the differential test's well-formed documents
+    /// cannot reach. An array refuses a node that is no child of it; a `held`
+    /// that is neither an object nor an array declines; a format that does not
+    /// claim one entry per child (YAML) declines and the generic walk answers.
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    #[test]
+    fn anchor_step_by_nodes_refuses_and_declines_off_the_happy_path_3483() {
+        // A node that is no child of an array: the array's own parent.
+        let doc: &[u8] = br#"{"x":[5,6],"y":7}"#;
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+        let array = root.first_child().unwrap().next_sibling().unwrap();
+        let held = to_owned_cursor::<JqSemantics, _>(&array).unwrap();
+        assert_eq!(
+            anchor_step_by_nodes(&array, root.node_id(), &held),
+            NodeStep::Refuse
+        );
+        assert_eq!(anchor_step(&array, root.node_id(), Some(&held)), None);
+
+        // A held value that is neither container leaves the decision to the
+        // generic walk.
+        assert_eq!(
+            anchor_step_by_nodes(
+                &array,
+                array.first_child().unwrap().node_id(),
+                &OwnedValue::Int(1)
+            ),
+            NodeStep::Decline
+        );
+
+        // YAML does not claim the one-to-one contract: the hook declines and
+        // `anchor_step` answers exactly as the walk with no held value does.
+        let yaml: &[u8] = b"a: 1\nb: 2\n";
+        let yindex = crate::yaml::YamlIndex::build(yaml).unwrap();
+        let mapping = yindex.root(yaml).first_child().unwrap();
+        let yheld = to_owned_cursor::<JqSemantics, _>(&mapping).unwrap();
+        let mut member = mapping.first_child();
+        let mut checked = 0;
+        while let Some(m) = member {
+            let id = m.node_id();
+            assert_eq!(
+                anchor_step_by_nodes(&mapping, id, &yheld),
+                NodeStep::Decline
+            );
+            assert_eq!(
+                anchor_step(&mapping, id, Some(&yheld)),
+                anchor_step(&mapping, id, None)
+            );
+            checked += 1;
+            member = m.next_sibling();
+        }
+        assert_eq!(checked, 4, "two keys and two values");
     }
 
     /// `def d0: .; def d1: .; ...` (`defs` of them) over `main`.
