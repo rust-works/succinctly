@@ -24898,6 +24898,13 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// already-produced values too (jq mode only — see the `Partial` arm's own
 /// comment below for the yq-mode carve-out), not just the cross-pair
 /// accumulator.
+///
+/// #3471: this function is now the *collector* over [`each_slice_expr`],
+/// which owns the bound streaming and escape ordering described above, and
+/// [`slice_pair`], which does one `(s, e)` pair's slicing; the `out`
+/// this text calls the running accumulator is the collector's `Vec`, filled
+/// from the worker's pushes, and each pair's own prefix is what
+/// `slice_pair` returns alongside its escape.
 fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     target: &Expr,
     start: &Option<Box<Expr>>,
@@ -24909,10 +24916,24 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // gathered into one result, so `eval_single` and every other eager caller
     // see the same `QueryResult` as before the worker was split out (#3471).
     let mut out: Vec<OwnedValue> = Vec::new();
+    // #1634: every push stays behind a fallible reservation. `slice_pair`
+    // reserves per pair, but the collector's own `Vec` spans every pair, so it
+    // reserves as it grows too; a refusal stops the worker and escapes below.
+    let mut refused = false;
     let flow = each_slice_expr::<W, S>(target, start, end, value, optional, &mut |v| {
+        if out.try_reserve(1).is_err() {
+            refused = true; // omni-dev: coverage tolerate-line reason="unreachable in a test: needs the allocator to refuse a one-element growth of the collector (#1634)"
+            return Demand::Stop; // omni-dev: coverage tolerate-line reason="unreachable in a test: see the line above (#1634)"
+        }
         out.push(v);
         Demand::Continue
     });
+    if refused {
+        // omni-dev: coverage tolerate reason="unreachable in a test: needs the allocator to refuse a one-element growth of the collector (#1634)"
+        let refusal = cannot_reserve_cross_product(&[out.len().saturating_add(1)]);
+        return partial(out, Control::Error(refusal));
+        // omni-dev: coverage end
+    }
     match flow {
         // An empty `start` stream never evaluated `end` or the target at
         // all, and collapses to `None` here like any other zero-result
@@ -24955,6 +24976,12 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `-n`, `-R`, `--inplace`, `--split-exp`) and for an owned pipe input; the
 /// sibling [`each_index_expr`] does the same for a computed index.
 ///
+/// What follows the consumer is the *bound* generators and the pair loop. The
+/// pair's `target` is still evaluated to completion before its first slice is
+/// delivered, as in [`eval_index_expr`], so a side effect in a later target
+/// output still runs where jq's lazy target would have stopped (tracked
+/// separately, #3520).
+///
 /// The stop-forwarding dispatch is jq mode only, for the reason
 /// [`each_index_expr`] gives: yq mode's bound rules retroactively discard a
 /// prefix, which a delivered push cannot be recalled to do
@@ -24977,8 +25004,8 @@ fn each_slice_expr<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // before its next value (and side effect) is ever asked for, and
     // `end`'s side effects interleave with each start value's, the way
     // jq's own `S as $s | T as $t | E | .[$s:$t]` compilation does. See
-    // `eval_generic::eval_slice_expr` -- the twin an ordinary CLI read
-    // actually hits -- for the live jq-1.7.1 rows; this is the bridge
+    // `eval_generic::each_slice_expr_generic` -- the twin an ordinary CLI
+    // read actually hits -- for the live jq-1.7.1 rows; this is the bridge
     // route's (`--slurp`, `-n`, `-R`, `--inplace`, `--split-exp`) copy of
     // the same rewrite, kept in step with it line for line. A bound rides
     // through as a [`ComputedSliceBound`], ruled on at the slice step after

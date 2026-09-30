@@ -82706,3 +82706,24 @@ fn test_slice_bound_consumer_stop_leaves_path_mode_alone_3471() -> Result<()> {
     assert_eq!((out.as_str(), code), ("[[10],9]\n", 0), "{err:?}");
     Ok(())
 }
+
+/// #3471: a computed slice under a consumer now runs through the streaming
+/// worker (`eval_each` -> `each_slice_expr` -> bound sinks -> `slice_pair`), a
+/// deeper native stack than the eager `eval_single` arm it replaced. A
+/// recursion built through it must still finish at depth 1000 (jq 1.7.1:
+/// `[0,9]`) and refuse, rather than overflow the native stack, when the
+/// recursion is far past the evaluator's limit (ADR-0025).
+#[test]
+fn test_computed_slice_under_consumer_stays_within_the_stack_budget_3471() -> Result<()> {
+    let filter = |n: u32| {
+        format!(
+            "def r($n): if $n == 0 then 0 else (.[(r($n-1)):] | length) end; [first(r({n})), 9]"
+        )
+    };
+    let (out, err, code) = run_jq_full(&["-c", &filter(1000)], Some("[10,20,30]"))?;
+    assert_eq!((out.as_str(), code), ("[0,9]\n", 0), "{err:?}");
+    let (_, err, code) = run_jq_full(&["-c", &filter(100_000)], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "a refusal, not a signal: {err:?}");
+    assert!(err.contains("maximum recursion depth"), "{err:?}");
+    Ok(())
+}

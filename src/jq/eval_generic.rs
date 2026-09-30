@@ -17238,6 +17238,13 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
 /// as the escape's prefix, same as every other per-iteration escape here
 /// (verified live: `.[0:(1,2,error("boom"))]` prints the slices for `1`
 /// and `2` before raising).
+///
+/// #3471: this function is now the *collector* over [`each_slice_expr_generic`],
+/// which owns the bound streaming and escape ordering described above, and
+/// [`slice_pair_generic`], which does one `(s, e)` pair's slicing; the `out`
+/// this text calls the running accumulator is the collector's `Vec`, filled
+/// from the worker's pushes, and each pair's own prefix is what
+/// `slice_pair_generic` returns alongside its escape.
 fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     target: &Expr,
     start: &Option<Box<Expr>>,
@@ -17251,11 +17258,25 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     // eager caller see the same `GenericResult` as before the worker was split
     // out (#3471).
     let mut out: Vec<OwnedValue> = Vec::new();
+    // #1634: every push stays behind a fallible reservation. `slice_pair_generic`
+    // reserves per pair, but the collector's own `Vec` spans every pair, so it
+    // reserves as it grows too; a refusal stops the worker and escapes below.
+    let mut refused = false;
     let flow =
         each_slice_expr_generic::<S, V>(target, start, end, value, optional, cursor, &mut |v| {
+            if out.try_reserve(1).is_err() {
+                refused = true; // omni-dev: coverage tolerate-line reason="unreachable in a test: needs the allocator to refuse a one-element growth of the collector (#1634)"
+                return Demand::Stop; // omni-dev: coverage tolerate-line reason="unreachable in a test: see the line above (#1634)"
+            }
             out.push(v);
             Demand::Continue
         });
+    if refused {
+        // omni-dev: coverage tolerate reason="unreachable in a test: needs the allocator to refuse a one-element growth of the collector (#1634)"
+        let refusal = cannot_reserve_cross_product(&[out.len().saturating_add(1)]);
+        return partial_generic(out, Control::Error(refusal));
+        // omni-dev: coverage end
+    }
     match flow {
         // #1048: a zero-result collapse here (every (start, end) pair
         // optional-suppressed, or an empty `start` stream that never
@@ -17303,6 +17324,12 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
 /// jq. A stop the sink caused comes back as `Flow::Stopped`; an escape as
 /// `Flow::Escaped`, whose prefix is already in the sink.
 ///
+/// What follows the consumer is the *bound* generators and the pair loop. The
+/// pair's `target` is still evaluated to completion before its first slice is
+/// delivered, as in [`eval_index_expr`], so a side effect in a later target
+/// output still runs where jq's lazy target would have stopped (tracked
+/// separately, #3520).
+///
 /// The stop-forwarding dispatch is jq mode only, for the reason
 /// [`each_index_expr_generic`] gives: yq mode's bound rules retroactively
 /// discard a prefix, which a delivered push cannot be recalled to do
@@ -17343,11 +17370,12 @@ fn each_slice_expr_generic<S: EvalSemantics, V: DocumentValue>(
     // site, unchanged.
     //
     // The result is always owned: slicing constructs a fresh array/string,
-    // same invariant as `eval::eval_slice_expr`. This is the actual dispatch
-    // path for an ordinary `.[$s:$e]` CLI read (see the comment on
-    // `Expr::SliceExpr`'s own match arm above), so this site -- not
-    // `eval::eval_slice_expr`'s sibling -- is what a real `succinctly
-    // jq`/`succinctly yq` invocation hits.
+    // same invariant as `eval::each_slice_expr`. This is the actual worker
+    // for an ordinary `.[$s:$e]` CLI read (see the comment on
+    // `Expr::SliceExpr`'s own match arm above; `eval_slice_expr` is its
+    // collector for the eager callers), so this site -- not
+    // `eval::each_slice_expr`, its bridged-route twin -- is what a real
+    // `succinctly jq`/`succinctly yq` invocation hits.
 
     // The sinks' escape hatch (#2138's shape): a sink can only answer
     // `Demand`, so the control that ended the pull is stashed here,
