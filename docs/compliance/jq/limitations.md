@@ -674,6 +674,11 @@ follows too. What it leaves:
   slot: no retry happens at all.
 - **`paths(f)` evaluates `f` once per path, with no retry** (#3366): `paths(.[K])` is jq's
   `["a"]` and an error here.
+- **`getpath(K)` in path mode evaluates `K` once, with no retry** (the #3487 "arguments
+  evaluated eagerly" family, not the index sink): `path(getpath(([["a"]] as [$q] ?// [[$q]] |
+  [$q])))` on `{"a":{"a":1}}` is `["a"]` in jq after two attempts and "Cannot index object with
+  array" here after one, and `del(getpath(K))` likewise. Recorded on #3293 for its closing slice
+  with `path_context_step_getpath`.
 - **An array key on an array is unimplemented** (#3506): jq's `.[[2]]` is a subarray search,
   and `path(.[[2]])`, `del(.[[2]])` and `.[[2]] = 5` have answers of their own; succinctly
   refuses all of them with "Cannot index array with array", with or without a `?//`.

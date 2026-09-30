@@ -50011,17 +50011,20 @@ pub(crate) fn stop_with_escape(slot: &mut Option<Control>, control: Control) -> 
 }
 
 /// [`stop_with_escape`] for the live negation arm of [`resolve_node_sink`]
-/// (#3299) -- `resolve_index_expr_sink` (#2924) and `resolve_slice_expr_sink`
-/// stash into a [`StashedEscape`] since #3293, which a `?//` retry inside
-/// their key or bound can supersede -- whose
-/// out-of-band slot holds an [`EvalEscape`] rather than a bare [`Control`] --
-/// their return type ([`ResolveFlow`]) has a dedicated `Escaped` variant, so
-/// the escape each stashes is never lost at its own boundary the way it would
-/// be for a driver returning bare `Flow`/`Demand`. They still owe `?//` the same
-/// classification `stop_with_escape` records, though: the key/bound/operand
-/// generator they are driving sees only this stop, and if a `?//` sits
-/// inside that generator's own body it needs `nonretryable_stop` set to
-/// classify it correctly, exactly as any other escape-behind-a-stop does.
+/// (#3299), whose out-of-band slot holds an [`EvalEscape`] rather than a bare
+/// [`Control`]. Its return type ([`ResolveFlow`]) has a dedicated `Escaped`
+/// variant, so the escape it stashes is never lost at its own boundary the way
+/// it would be for a driver returning bare `Flow`/`Demand`. It still owes `?//`
+/// the same classification `stop_with_escape` records, though: the operand
+/// generator it is driving sees only this stop, and if a `?//` sits inside that
+/// generator's own body it needs `nonretryable_stop` set to classify it
+/// correctly, exactly as any other escape-behind-a-stop does.
+///
+/// `resolve_index_expr_sink` (#2924) and `resolve_slice_expr_sink` were its
+/// other callers. They stash into a [`StashedEscape`] since #3293, which a
+/// `?//` retry inside their key or bound can supersede, and reach the same
+/// classification through [`stop_with_escape_cell`].
+///
 /// Round-trips through [`stop_with_escape`] itself, the same shape
 /// [`stop_with_error`] below uses -- not just its classifier -- so a second
 /// responsibility added to that plumbing later is inherited here for free,

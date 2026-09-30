@@ -265,9 +265,23 @@ R_ENTRIES=(
 # documented SIGPIPE lesson (a filter that never reads `input` leaves the
 # writer holding data, killing a `printf | jq` pipeline with SIGPIPE under
 # load and recording a phantom exit-code divergence).
-STDIN_FILE="$(mktemp -t jq-alt-retry-sweep-stdin)"
-RETRY_STDIN_FILE="$(mktemp -t jq-alt-retry-sweep-retry-stdin)"
-trap 'rm -f "$STDIN_FILE" "$RETRY_STDIN_FILE" /tmp/jq-alt-retry-sweep.err /tmp/succ-alt-retry-sweep.err' EXIT
+#
+# Every temp file goes through `mk_tmp`, so one EXIT trap removes all of them and
+# a family added later cannot forget to extend it. The stderr captures are
+# per-run `mktemp` files too: fixed `/tmp` names collide when two sweeps (or two
+# sessions) run at once, and record a phantom divergence.
+SWEEP_TMP=()
+mk_tmp() { # mk_tmp VAR PREFIX: create a temp file, name it in VAR
+  local created
+  created="$(mktemp -t "$2")"
+  SWEEP_TMP+=("$created")
+  printf -v "$1" '%s' "$created"
+}
+trap 'rm -f "${SWEEP_TMP[@]}"' EXIT
+mk_tmp STDIN_FILE jq-alt-retry-sweep-stdin
+mk_tmp RETRY_STDIN_FILE jq-alt-retry-sweep-retry-stdin
+mk_tmp JQ_ERR_FILE jq-alt-retry-sweep-jq-err
+mk_tmp SUCC_ERR_FILE jq-alt-retry-sweep-succ-err
 printf '1' > "$STDIN_FILE"
 printf '%s' "$RETRY_INPUT" > "$RETRY_STDIN_FILE"
 
@@ -299,10 +313,10 @@ run_case() {
   total=$((total + 1))
 
   local jq_out jq_err jq_code succ_out succ_err succ_code
-  jq_out="$("$JQ" -c "$filter" <"$stdin_file" 2>/tmp/jq-alt-retry-sweep.err)" && jq_code=0 || jq_code=$?
-  jq_err="$(cat /tmp/jq-alt-retry-sweep.err)"
-  succ_out="$("$SUCC" jq -c "$filter" <"$stdin_file" 2>/tmp/succ-alt-retry-sweep.err)" && succ_code=0 || succ_code=$?
-  succ_err="$(cat /tmp/succ-alt-retry-sweep.err)"
+  jq_out="$("$JQ" -c "$filter" <"$stdin_file" 2>"$JQ_ERR_FILE")" && jq_code=0 || jq_code=$?
+  jq_err="$(cat "$JQ_ERR_FILE")"
+  succ_out="$("$SUCC" jq -c "$filter" <"$stdin_file" 2>"$SUCC_ERR_FILE")" && succ_code=0 || succ_code=$?
+  succ_err="$(cat "$SUCC_ERR_FILE")"
 
   if [[ "$jq_out" != "$succ_out" || "$jq_err" != "$succ_err" || "$jq_code" != "$succ_code" ]]; then
     diverged=$((diverged + 1))
@@ -360,9 +374,8 @@ done
 # constructs navigate `.a`. Entries are `LABEL::TAG::TEMPLATE`, like R_ENTRIES
 # (slice 7 closed every one, so none is tagged now).
 COND_INPUT='{"a":{"a":1}}'
-COND_STDIN_FILE="$(mktemp -t jq-alt-retry-sweep-cond-stdin)"
+mk_tmp COND_STDIN_FILE jq-alt-retry-sweep-cond-stdin
 printf '%s' "$COND_INPUT" > "$COND_STDIN_FILE"
-trap 'rm -f "$STDIN_FILE" "$RETRY_STDIN_FILE" "$COND_STDIN_FILE" /tmp/jq-alt-retry-sweep.err /tmp/succ-alt-retry-sweep.err' EXIT
 T_VARIANTS=(
   '([1] as $q ?// $b | ("A"|stderr) | $q)'
   '([1] as $q ?// $b | ("A"|stderr) | $q // empty)'
@@ -533,9 +546,8 @@ done
 # path-tracked by jq, so the plain `("A"|stderr) | ...` marker is safe.
 # Entries are `LABEL::TAG::TEMPLATE`, `__X__` standing for the key.
 IX_INPUT='{"a":{"a":1}}'
-IX_STDIN_FILE="$(mktemp -t jq-alt-retry-sweep-ix-stdin)"
+mk_tmp IX_STDIN_FILE jq-alt-retry-sweep-ix-stdin
 printf '%s' "$IX_INPUT" > "$IX_STDIN_FILE"
-trap 'rm -f "$STDIN_FILE" "$RETRY_STDIN_FILE" "$COND_STDIN_FILE" "$IX_STDIN_FILE" /tmp/jq-alt-retry-sweep.err /tmp/succ-alt-retry-sweep.err' EXIT
 IX_VARIANTS=(
   '([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)'
   '([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)'
