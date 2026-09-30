@@ -94652,6 +94652,13 @@ mod tests {
     /// keeps its diagnostics.
     #[test]
     fn owned_select_door_agrees_with_the_reindex_bridge_3439() {
+        fn holds_nan(value: &OwnedValue) -> bool {
+            match value {
+                OwnedValue::Array(items) => items.iter().any(holds_nan),
+                OwnedValue::Object(map) => map.values().any(holds_nan),
+                other => other.as_f64().is_some_and(f64::is_nan),
+            }
+        }
         let mut values = pure_value_matrix();
         values.push(OwnedValue::array_from(
             (0..40).map(OwnedValue::Int).collect(),
@@ -94712,6 +94719,22 @@ mod tests {
                         continue;
                     };
                     taken += 1;
+                    // #3069: jq answers `. == .` true by identity even with a
+                    // NaN inside (`jv_equal` checks `jv_identical` first), and
+                    // the door agrees because it emits `input` itself. The
+                    // bridge keeps that identity only through a thread-local,
+                    // which `no_std` lacks, so there it rebuilds the
+                    // container and answers structurally (false) -- the bridge
+                    // is the side that diverges from jq, exactly as
+                    // `eval_owned_pure_agrees_with_the_reindex_bridge_on_tracked_vars_2042`
+                    // already tolerates.
+                    let bridge_lacks_identity = mode == "jq"
+                        && !cfg!(feature = "std")
+                        && src == "select(. == .)"
+                        && holds_nan(value);
+                    if bridge_lacks_identity {
+                        continue;
+                    }
                     assert_eq!(
                         select_door_observable(&door),
                         select_door_observable(&bridge),
