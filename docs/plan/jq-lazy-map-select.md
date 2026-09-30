@@ -639,7 +639,7 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     `as` and assignment, and (b) (the sink route) would still collect owned items, so it
     instead *distributes*: a pipe of pure navigation with a `,` head is the `,` of one pipe
     per branch, which `comma_array_generic` already collects as cursors
-    (`distribute_comma_head`). 36 MB, 26 MB with `| length`. One behaviour moves: the array
+    (`split_comma_head`). 36 MB, 26 MB with `| length`. One behaviour moves: the array
     reads only the nodes its pipe answers, so a malformed sibling the answer never contains no
     longer raises, as `[.b]` and `(., .) | .b` already did.
 

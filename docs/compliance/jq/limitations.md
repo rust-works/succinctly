@@ -3450,6 +3450,21 @@ the same lazy-vs-atomic parse divergence the section above records for
 partial output; a whole-input pre-validate (`--validate`) still rejects
 all of these.
 
+An array constructor over a `,` head behind a pipe is one more filter that answers without
+reading the token ([#3476](https://github.com/rust-works/succinctly/issues/3476)). It built each
+comma item whole before the pipe ran, so it raised over a malformed sibling its answer never
+held; it now reads only the nodes the pipe answers, as `[.b]` and the stream `(., .) | .b`
+always did:
+
+```
+$ echo '{"a":{"k":tru},"b":2}' | jq  -c '[(., .) | .b]'   # (parses nothing) exit 5
+$ echo '{"a":{"k":tru},"b":2}' | sjq -c '[(., .) | .b]'   # [2,2]             exit 0
+$ echo '{"a":{"k":tru},"b":2}' | sjq -c '[(., .) | .a]'   # (raises)          exit 5
+```
+
+The `.a` row shows the rule still holds: a node the array *holds* is validated before anything
+prints.
+
 ### PR #2291 code review: eleven more sibling paths, found by a systematic sweep
 
 Code review on the PR carrying the section above found and live-confirmed
