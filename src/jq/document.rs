@@ -308,6 +308,21 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// Navigate to the parent container.
     fn parent(&self) -> Option<Self>;
 
+    /// Whether a container this cursor stands on materializes one entry per
+    /// child, so the length of its owned value *is* its child count (#3483):
+    /// an object holds one key per member pair, and two members can only
+    /// share a key by the map coming up short. `eval_generic::anchor_step`
+    /// reads that as "no member is shadowed" without decoding a single key.
+    ///
+    /// Conservative in the safe direction: `false` (the default) sends the
+    /// caller to the walk that decodes every key. JSON answers `true`. YAML
+    /// does not claim it -- a `<<` merge key can add entries no member of
+    /// the mapping spells, so a duplicate and a merged-in key could cancel
+    /// in the count.
+    fn materializes_members_one_to_one(&self) -> bool {
+        false
+    }
+
     /// The parent *within the document*: [`parent`](Self::parent), except
     /// that a document root has none. JSON has a single root; YAML's
     /// [`parent`](Self::parent) of a document root is the document stream,
