@@ -1268,10 +1268,22 @@ pub struct JsonFields<'a, W = Vec<u64>> {
 /// container cursor next to the slot would grow both `Copy` types by a word
 /// on the hottest JSON iteration path; the top bit of a BP position is free
 /// instead (a BP vector that long does not fit in the address space on a
-/// 64-bit target), so the tag costs no bytes. A container whose position
-/// already has the bit set -- reachable only on a 32-bit target -- is stored
-/// as plain `None`: an under-report, never a wrong answer.
-const EMPTY_CONTAINER_TAG: usize = 1 << (usize::BITS - 1);
+/// 64-bit target), so the tag costs no bytes.
+///
+/// On a target narrower than 64 bits the bit is *not* free -- a real child's
+/// position can reach it on a multi-GiB input, and [`slot_current`] would
+/// then read that child as the end of its list and silently truncate the
+/// iteration. There the tag is `0`, [`TAGGING`] is off, and an empty
+/// container is stored as plain `None`: an under-report (its bind names no
+/// node, exactly as before #3180), never a wrong answer.
+const EMPTY_CONTAINER_TAG: usize = if TAGGING { 1 << (usize::BITS - 1) } else { 0 };
+
+/// Whether [`EMPTY_CONTAINER_TAG`] may be used: only where the top bit of a
+/// BP position cannot belong to a real node.
+const TAGGING: bool = usize::BITS >= 64;
+
+// Without tagging the tag must be inert: `slot_current` masks with it.
+const _: () = assert!(TAGGING || EMPTY_CONTAINER_TAG == 0);
 
 /// The slot a freshly opened container's list starts from: its first child,
 /// or the container itself tagged with [`EMPTY_CONTAINER_TAG`] when it has
@@ -1280,14 +1292,12 @@ const EMPTY_CONTAINER_TAG: usize = 1 << (usize::BITS - 1);
 /// the container a suffix of it came from.
 #[inline]
 fn container_slot<W: AsRef<[u64]>>(container: JsonCursor<'_, W>) -> Option<JsonCursor<'_, W>> {
-    match container.first_child() {
-        Some(child) => Some(child),
-        None if container.bp_pos & EMPTY_CONTAINER_TAG == 0 => Some(JsonCursor {
+    container.first_child().or_else(|| {
+        TAGGING.then_some(JsonCursor {
             bp_pos: container.bp_pos | EMPTY_CONTAINER_TAG,
             ..container
-        }),
-        None => None,
-    }
+        })
+    })
 }
 
 /// A slot's navigable cursor: `None` for a tagged empty container.
@@ -1316,13 +1326,16 @@ impl<W> Clone for JsonFields<'_, W> {
 impl<W> Copy for JsonFields<'_, W> {}
 
 /// Prints the decoded slot, so the empty-container tag never shows up as a
-/// huge `bp_pos` in `{:?}` output (#3180).
+/// huge `bp_pos` in `{:?}` output (#3180). A list that is not an untouched
+/// empty container prints exactly the one field it always did.
 impl<W: core::fmt::Debug> core::fmt::Debug for JsonFields<'_, W> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("JsonFields")
-            .field("key_cursor", &self.current())
-            .field("empty_container", &self.empty_container().is_some())
-            .finish()
+        let mut shown = f.debug_struct("JsonFields");
+        shown.field("key_cursor", &self.current());
+        if self.empty_container().is_some() {
+            shown.field("empty_container", &true);
+        }
+        shown.finish()
     }
 }
 
@@ -1778,10 +1791,12 @@ impl<W> Copy for JsonElements<'_, W> {}
 /// See [`JsonFields`]'s `Debug` (#3180).
 impl<W: core::fmt::Debug> core::fmt::Debug for JsonElements<'_, W> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("JsonElements")
-            .field("element_cursor", &self.current())
-            .field("empty_container", &self.empty_container().is_some())
-            .finish()
+        let mut shown = f.debug_struct("JsonElements");
+        shown.field("element_cursor", &self.current());
+        if self.empty_container().is_some() {
+            shown.field("empty_container", &true);
+        }
+        shown.finish()
     }
 }
 
@@ -9677,6 +9692,7 @@ mod tests {
     /// navigation reader still sees an empty list. A list that is merely
     /// *exhausted* or partly consumed names nothing: it is a suffix, not the
     /// container.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn whole_container_cursor_names_an_empty_container_3180() {
         fn fields(v: StandardJson<'_>) -> JsonFields<'_> {
@@ -9771,6 +9787,7 @@ mod tests {
 
     /// #3180: the empty-container tag never shows in `{:?}` output -- the
     /// derived impl would have printed the tagged `bp_pos` as a huge number.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn empty_container_debug_hides_the_tag_3180() {
         let tag = EMPTY_CONTAINER_TAG.to_string();
@@ -9779,7 +9796,7 @@ mod tests {
             let shown = format!("{:?}", index.root(json).value());
             assert!(!shown.contains(&tag), "{shown}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- panic-message format argument (#3180)"
             let empty = json.len() == 2;
-            assert_eq!(shown.contains("empty_container: true"), empty);
+            assert_eq!(shown.contains("empty_container"), empty, "{shown}");
         }
     }
 

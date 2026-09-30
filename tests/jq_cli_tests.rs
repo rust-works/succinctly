@@ -70034,7 +70034,12 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
 /// container's own cursor, tagged, for exactly that case. Every expected
 /// output captured live against jq 1.7.1; the rows jq refuses are in
 /// `test_input_bridge_embed_residuals_refuse_cleanly_2889`.
-#[cfg(not(feature = "unshared-containers"))]
+#[cfg(all(
+    not(feature = "unshared-containers"),
+    // The empty-container tag lives in a BP position's top bit, which a
+    // narrower target cannot spare: there the route refuses, as before.
+    target_pointer_width = "64"
+))]
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_input_route_empty_container_keeps_embed_identity_3180() -> Result<()> {
