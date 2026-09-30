@@ -1844,7 +1844,7 @@ impl<'a> Parser<'a> {
         match lit {
             Literal::Null => Some(OwnedValue::Null),
             Literal::Bool(b) => Some(OwnedValue::Bool(*b)),
-            Literal::String(s) => Some(OwnedValue::String(s.clone())),
+            Literal::String(s) => Some(OwnedValue::String(s.clone().into())),
             Literal::Int(n) if *n >= 0 => Some(OwnedValue::Int(*n)),
             Literal::Float(f) if !f.is_sign_negative() => Some(OwnedValue::Float(*f)),
             Literal::NumberLiteral(repr, text) if !text.starts_with('-') => {

@@ -129,8 +129,9 @@ pub struct Tracked {
 ///   the bind's own `Rc` for a later materialization of the same node and
 ///   reading `RootWitness::of_owned` back at the funnel, on both the
 ///   generic evaluator's route and (Stage B) `eval.rs`'s own
-///   `eval_as`/`each_as` bind sites. A scalar root (not `Rc`-backed), a
-///   value re-indexed before the read (`sort`/`unique`/`reverse`/
+///   `eval_as`/`each_as` bind sites (strings and number literals too since
+///   #3191, promoted to shared storage at the bind). A value re-indexed
+///   before the read (`sort`/`unique`/`reverse`/
 ///   `to_entries`/`getpath`/a slice), a fold over an owned input (#3328)
 ///   or a fold's own loop variable (#3329), and a few Stage-B-only shapes on the
 ///   `-n 'input | ...'` route stay documented refuse-only residuals, not

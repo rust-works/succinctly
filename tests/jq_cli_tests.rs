@@ -66720,30 +66720,6 @@ fn test_owned_embed_navigated_inside_path_argument_3177() -> Result<()> {
     Ok(())
 }
 
-/// What #3177 leaves refused, each a mechanism of its own (see
-/// `docs/compliance/jq/limitations.md`'s #2889 residual table). Every jq
-/// 1.7.1 answer captured live; refusing is the safe direction (ADR-0018).
-/// The wrapper rows this used to pin (`path()` under a comma, `limit`,
-/// `first`, `label`, `?`, as an `as`/`reduce` source or a binary operand,
-/// and behind `with_entries`/`add`/a no-op `|=`) answer since #3069's
-/// bridge provenance: see `test_bridge_provenance_keeps_path_identity_3069`.
-/// The nested-ancestor row (`. as $x | .a as $y | [.] | path(.[0].a |
-/// $y)`) answers since #3134's anchor: see
-/// `test_navigated_bind_anchor_rows_answer_3134`.
-#[test]
-#[allow(clippy::literal_string_with_formatting_args)]
-fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
-    // A scalar is not `Rc`-backed, so there is no storage to share, and a
-    // scalar *root* has no parent to anchor on either (#3134) -- jq `[0]`.
-    let filter = r". as $x | [.] | path(.[0] | $x)";
-    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("1"))?;
-    assert_eq!(
-        code, 5,
-        "#3177 residual: `{filter}`: stdout={stdout:?} stderr={stderr:?}"
-    );
-    Ok(())
-}
-
 /// #3178: `sort`, `unique`, `reverse` and `to_entries` build their result
 /// from their input's own children in jq, and a literal `getpath` answers a
 /// node, so an embed of `$x` keeps its identity through them. Every
@@ -66928,8 +66904,9 @@ fn test_owned_embed_identity_through_relocating_builtins_3178() -> Result<()> {
         );
     }
     // A value-equal copy is a different node, and jq refuses it: the other
-    // side of each tie-break above, a `getpath` that misses, and a scalar,
-    // which is not `Rc`-backed and so shares no storage (#3182).
+    // side of each tie-break above, and a `getpath` that misses. (A bound
+    // scalar through a one-element `sort` answers since #3191, as in jq --
+    // `test_scalar_bind_keeps_node_identity_3191`.)
     for (input, filter) in [
         (
             r#"{"a":1}"#,
@@ -66948,7 +66925,6 @@ fn test_owned_embed_identity_through_relocating_builtins_3178() -> Result<()> {
             r#". as $x | {k:.} | getpath(["z"]) | path($x)"#,
         ),
         (r#"{"a":1}"#, r". as $x | [.] | getpath([5]) | path($x)"),
-        ("1", r". as $x | [.] | sort | .[0] | path($x)"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
@@ -68969,8 +68945,10 @@ fn test_navigated_bind_positional_and_owned_root_rows_answer_3069() -> Result<()
     Ok(())
 }
 
-/// #3134: a navigated bind the storage clause cannot certify -- a scalar,
-/// which is not `Rc`-backed, or a node below an already-bound ancestor,
+/// #3134: a navigated bind the storage clause cannot certify -- a scalar
+/// with no storage (`null`, `bool`, a computed number; a string or number
+/// literal has promoted storage since #3191), or a node below an
+/// already-bound ancestor,
 /// whose materialization is the ancestor's, not its own -- is certified by
 /// its *anchor*: the container it sits in shares storage with the one the
 /// embed table holds, and the register stands the recorded steps below it.
@@ -69777,6 +69755,106 @@ fn test_navigated_bind_yq_mode_unchanged_3037() -> Result<()> {
 }
 
 // ============================================================================
+// #3191: a bound string or number literal keeps its node identity
+// ============================================================================
+
+/// jq's `jv_identical` is pointer equality for strings and number literals
+/// too, so a scalar bound by `as` keeps its identity through everything
+/// that places or hands back its `jv` -- and loses it through everything
+/// that allocates a fresh one. succinctly promotes a bound scalar to shared
+/// storage at the bind (`SharableString::promote`, #3191), so both halves
+/// hold here as well. Every row captured live from `/usr/bin/jq` 1.7.1.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_scalar_bind_keeps_node_identity_3191() -> Result<()> {
+    for (input, filter, want) in [
+        // Placements, then navigation back out.
+        (r#""s""#, r". as $x | {k:.} | .k | path($x)", r"[]"),
+        (r"5", r". as $x | {k:.} | .k | path($x)", r"[]"),
+        (r"1.0", r". as $x | {k:.} | .k | path($x)", r"[]"),
+        (r#""s""#, r". as $x | [.] | .[0] | path($x)", r"[]"),
+        (r#""s""#, r". as $x | {k:[.]} | .k[0] | path($x)", r"[]"),
+        (
+            r#""s""#,
+            r". as $x | {k:.} | .k as $y | .k | path($y)",
+            r"[]",
+        ),
+        (r"[5,5]", r".[0] as $x | {k:.[0]} | .k | path($x)", r"[]"),
+        (
+            r#"["s","t"]"#,
+            r".[0] as $x | [.[0]] | .[0] | path($x)",
+            r"[]",
+        ),
+        (r"1", r". as $x | [.] | path(.[0] | $x)", r"[0]"),
+        // Builtins jq hands its input `jv` back from.
+        (r#""abc""#, r". as $x | tostring | path($x)", r"[]"),
+        (r#""abc""#, r". as $x | @text | path($x)", r"[]"),
+        (r"5", r". as $x | tonumber | path($x)", r"[]"),
+        (r"5", r". as $x | [.] | add | path($x)", r"[]"),
+        (r#""abc""#, r". as $x | [.] | min | path($x)", r"[]"),
+        (r"1", r". as $x | [.] | sort | .[0] | path($x)", r"[]"),
+        // The write half: `$x` names the node, so a write through it lands.
+        (r#""s""#, r". as $x | {k:.} | .k | $x = 1", r"1"),
+        (r"5", r". as $x | [.] | .[0] | ($x) |= . + 1", r"6"),
+        (r#""s""#, r". as $x | {k:.} | del(.k | $x)", r"{}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (want, 0),
+            "#3191: `{filter}` on `{input}`: stderr={stderr:?}"
+        );
+    }
+    // Fresh storage in jq, so jq refuses: a rebuilt or computed equal value,
+    // every builtin that allocates its result, two equal document scalars,
+    // and two equal literals. These are the rows a pass-through where jq
+    // allocates would fabricate an answer on -- the unsafe direction.
+    //
+    // And, last, the rows jq answers that stay refused here: builtins the
+    // generic evaluator bridges through the owned re-index round trip
+    // (`ltrimstr`, `sub`, `abs`), and jq's constant pool (`def f: 5` is
+    // one `jv` across calls). Refusing is the safe direction; see
+    // `docs/compliance/jq/limitations.md`.
+    for (input, filter) in [
+        (r#""s""#, r#". as $x | {k:"s"} | .k | path($x)"#),
+        (r"5", r". as $x | {k:5} | .k | path($x)"),
+        (r"5", r". as $x | {k:(.+0)} | .k | path($x)"),
+        (r#""s""#, r". as $x | ascii_downcase | path($x)"),
+        (r#""s""#, r#". as $x | . + "" | path($x)"#),
+        (r#""s""#, r". as $x | tojson | fromjson | path($x)"),
+        (r#""abc""#, r". as $x | .[0:] | path($x)"),
+        // A full-range slice of the *placed* handle too: the cursor route's
+        // hand-the-input-back shortcut would carry the promoted identity
+        // through it, and a write through `$x` would then land where jq
+        // refuses (found by the bind-origin fuzz, #3191).
+        (r#""abc""#, r". as $x | {k:.} | .k | .[0:] | path($x)"),
+        (r#""abc""#, r". as $x | {k:.} | .k | .[0:3] | path($x)"),
+        (r#""abc""#, r". as $x | ([.] | min) | .[0:] | ($x) = 9"),
+        (r"5", r". as $x | . + 0 | path($x)"),
+        (r"5", r". as $x | floor | path($x)"),
+        (r"5", r". as $x | tostring | tonumber | path($x)"),
+        (r#"["s","s"]"#, r".[0] as $x | .[1] | path($x)"),
+        (r#""s""#, r#""s" as $x | "s" | path($x)"#),
+        (r#""abc""#, r#". as $x | ltrimstr("z") | path($x)"#),
+        (r#""abc""#, r#". as $x | sub("z";"y") | path($x)"#),
+        (r"5", r". as $x | abs | path($x)"),
+        (r"5", r"def f: 5; f as $x | f | path($x)"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3191: `{filter}` on `{input}` must refuse: stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3191: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
 // #2889: a construction that merely *places* a bound node keeps its identity
 // ============================================================================
 
@@ -70562,11 +70640,9 @@ fn test_owned_embed_rebuilt_copies_still_refuse_2889() -> Result<()> {
         (r"[1,2]", r". as $x | [] + . | path($x)"),
         // A non-empty right operand computes a new container.
         (r#"{"a":1}"#, r". as $x | . + {a:1} | path($x)"),
-        // Scalars are not `Rc`-backed, so they never enter the table -- a
-        // documented residual of #2889, and the safe direction (jq answers
-        // `[]` for both).
-        (r#""s""#, r". as $x | {k:.} | .k | path($x)"),
-        (r"5", r". as $x | {k:.} | .k | path($x)"),
+        // A scalar root keeps its identity through a placement since #3191
+        // (`test_scalar_bind_keeps_node_identity_3191`); its rebuilt-copy
+        // twins are pinned there too.
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(

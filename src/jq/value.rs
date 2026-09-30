@@ -2691,6 +2691,478 @@ impl<'a, V: Clone> IntoIterator for &'a mut ArrayOf<V> {
     }
 }
 
+/// Report a copy that a promoted scalar (#3191) forced, attributed to the
+/// wrapper method's caller -- [`note_forced_copy`]'s twin for the scalar
+/// wrappers, defined in every build because the scalar wrappers exist in
+/// the `unshared-containers` holdout too (where nothing is ever promoted,
+/// so it never fires).
+macro_rules! note_scalar_copy {
+    ($kind:ident) => {
+        #[cfg(any(test, feature = "share-stats"))]
+        super::share_stats::forced(super::share_stats::Kind::$kind);
+    };
+}
+
+/// The backing store for [`OwnedValue::String`]: inline, or refcounted once
+/// a bind has promoted it (#3191).
+///
+/// This is the promote-on-bind replacement for ADR-0024's rejected option D.
+///
+/// jq's `jv_identical` is pointer equality for every allocated `jv`,
+/// strings included, and the embed table (#2889) and the resolver's
+/// storage clause (#3177) read that identity: `. as $x | {k:.} | .k |
+/// path($x)` on `"s"` answers `[]` in jq because both handles are the same
+/// `jv`. Identity is only ever asked of a value some `$x` holds, and a
+/// scalar only reaches a `$x` through a bind, so only a *bound* string
+/// needs shared storage: `promote`, called from the bind
+/// site, moves it behind an `Rc`; every clone after that is a pointer bump
+/// and [`ptr_eq`](Self::ptr_eq) reports the identity. A string nothing
+/// binds stays inline and costs exactly what it did before -- no header,
+/// no extra allocation. Option D refcounted *every* string and paid +8% to
+/// +50% peak RSS for it (ADR-0024's "Option D result").
+///
+/// `Owned(String) | Shared(Rc<String>)` is 24 bytes, the size of the bare
+/// `String` it replaces: the tag lives in `String`'s capacity niche, so
+/// `OwnedValue` stays 32 (pinned below).
+///
+/// A write through a shared handle ([`DerefMut`]) copies once and leaves
+/// the handle `Owned` again: the written string is fresh storage in jq too
+/// (`. + ""` is a new `jv`). A write through a *unique* shared handle takes
+/// the `String` back out of its `Rc` without copying, so a string-building
+/// fold stays linear.
+///
+/// Same transparency contract as [`ArrayOf`]/[`ObjectMapOf`]: [`Deref`] to
+/// the `String`, [`From`] for everything a `String` is built from, a `Debug`
+/// that prints the bare string, and equality against `str`/`String` in both
+/// directions. Only *construction* from a bare `String` needs `.into()`
+/// (or [`OwnedValue::string`]), and moving the `String` back out is
+/// [`into_string`](Self::into_string).
+#[derive(Clone)]
+pub struct SharableString(SharableStringInner);
+
+/// [`SharableString`]'s two states.
+#[derive(Clone)]
+enum SharableStringInner {
+    Owned(String),
+    // Never built under the holdout, which promotes nothing.
+    #[cfg_attr(feature = "unshared-containers", allow(dead_code))]
+    Shared(alloc::rc::Rc<String>),
+}
+
+impl SharableString {
+    /// An empty string.
+    #[inline]
+    pub const fn new() -> Self {
+        Self(SharableStringInner::Owned(String::new()))
+    }
+
+    /// Move the string behind a refcount, so every later clone shares it
+    /// and [`ptr_eq`](Self::ptr_eq) can report the identity (#3191). A
+    /// no-op when it is already shared, and under the `unshared-containers`
+    /// holdout, where nothing is ever shared.
+    #[inline]
+    #[cfg_attr(
+        feature = "unshared-containers",
+        allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)
+    )]
+    pub(crate) fn promote(&mut self) {
+        #[cfg(not(feature = "unshared-containers"))]
+        if let SharableStringInner::Owned(s) = &mut self.0 {
+            self.0 = SharableStringInner::Shared(alloc::rc::Rc::new(core::mem::take(s)));
+        }
+    }
+
+    /// Whether `self` and `other` are two handles on the *same* promoted
+    /// storage -- jq's `jv_identical` for strings (#3191). `false` whenever
+    /// either side is inline: an unpromoted string was never bound, so no
+    /// `$x` can be asking about it. Sound as an identity test for the reason
+    /// [`ArrayOf::ptr_eq`] gives: a write through either handle copies
+    /// first and un-shares it, so while this is `true` neither has been
+    /// written through since they were split.
+    #[inline]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (SharableStringInner::Shared(a), SharableStringInner::Shared(b)) => {
+                alloc::rc::Rc::ptr_eq(a, b)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this handle is on promoted, refcounted storage.
+    #[inline]
+    pub fn is_shared(&self) -> bool {
+        matches!(self.0, SharableStringInner::Shared(_))
+    }
+
+    /// Consume the wrapper, yielding the `String` it wraps -- by move when
+    /// it is inline or this handle was the last one, by copy otherwise.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn into_string(self) -> String {
+        match self.0 {
+            SharableStringInner::Owned(s) => s,
+            SharableStringInner::Shared(rc) => alloc::rc::Rc::try_unwrap(rc).unwrap_or_else(|rc| {
+                note_scalar_copy!(StringCopy);
+                (*rc).clone()
+            }),
+        }
+    }
+
+    /// The string as a `&str`.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self
+    }
+}
+
+impl Default for SharableString {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for SharableString {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for SharableString {}
+
+impl PartialOrd for SharableString {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SharableString {
+    #[inline]
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl core::hash::Hash for SharableString {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
+
+/// Transparent, so `{:?}` on an `OwnedValue::String` prints the bare string
+/// exactly as it did before the wrapper existed (see [`ArrayOf`]'s `Debug`).
+impl core::fmt::Debug for SharableString {
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl core::fmt::Display for SharableString {
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&**self, f)
+    }
+}
+
+impl Deref for SharableString {
+    type Target = String;
+
+    #[inline]
+    fn deref(&self) -> &String {
+        match &self.0 {
+            SharableStringInner::Owned(s) => s,
+            SharableStringInner::Shared(rc) => rc,
+        }
+    }
+}
+
+/// The copy-on-write point: a shared string is copied here, once, and the
+/// handle becomes inline again; a unique shared handle gives its `String`
+/// back without copying.
+impl DerefMut for SharableString {
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    fn deref_mut(&mut self) -> &mut String {
+        if let SharableStringInner::Shared(rc) = &mut self.0 {
+            if alloc::rc::Rc::strong_count(rc) > 1 {
+                note_scalar_copy!(StringCopy);
+            }
+            // `make_mut` copies only when shared; either way the `Rc` is
+            // unique afterwards, so its `String` moves out without a copy.
+            let s = core::mem::take(alloc::rc::Rc::make_mut(rc));
+            self.0 = SharableStringInner::Owned(s);
+        }
+        match &mut self.0 {
+            SharableStringInner::Owned(s) => s,
+            SharableStringInner::Shared(rc) => alloc::rc::Rc::make_mut(rc),
+        }
+    }
+}
+
+impl AsRef<str> for SharableString {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self
+    }
+}
+
+impl core::borrow::Borrow<str> for SharableString {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self
+    }
+}
+
+impl From<String> for SharableString {
+    #[inline]
+    fn from(inner: String) -> Self {
+        Self(SharableStringInner::Owned(inner))
+    }
+}
+
+impl From<&str> for SharableString {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Self::from(String::from(s))
+    }
+}
+
+impl From<&String> for SharableString {
+    #[inline]
+    fn from(s: &String) -> Self {
+        Self::from(s.clone())
+    }
+}
+
+impl From<Cow<'_, str>> for SharableString {
+    #[inline]
+    fn from(s: Cow<'_, str>) -> Self {
+        Self::from(s.into_owned())
+    }
+}
+
+impl From<Box<str>> for SharableString {
+    #[inline]
+    fn from(s: Box<str>) -> Self {
+        Self::from(String::from(s))
+    }
+}
+
+impl From<char> for SharableString {
+    #[inline]
+    fn from(c: char) -> Self {
+        Self::from(String::from(c))
+    }
+}
+
+impl From<SharableString> for String {
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    fn from(s: SharableString) -> Self {
+        s.into_string()
+    }
+}
+
+impl PartialEq<str> for SharableString {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for SharableString {
+    #[inline]
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for SharableString {
+    #[inline]
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<SharableString> for str {
+    #[inline]
+    fn eq(&self, other: &SharableString) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<SharableString> for &str {
+    #[inline]
+    fn eq(&self, other: &SharableString) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<SharableString> for String {
+    #[inline]
+    fn eq(&self, other: &SharableString) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+/// The source spelling an [`OwnedValue::NumberLiteral`] carries: inline, or
+/// refcounted once a bind has promoted it (#3191).
+///
+/// [`SharableString`]'s twin.
+///
+/// jq compares a number *literal* by address in `jv_identical` (a computed
+/// number, `Int`/`Float` here, by value), so a bound document number needs
+/// shared storage for the same reason a bound string does. The spelling is
+/// never written, so there is no copy-on-write point; consuming a shared
+/// one by value ([`into_boxed`](Self::into_boxed)) copies.
+///
+/// `Rc<Box<str>>` rather than `Rc<str>`, deliberately: `Owned(Box<str>) |
+/// Shared(Rc<Box<str>>)` is 16 bytes, the tag in the thin pointer's null
+/// niche, so `NumberLiteral` stays 32 bytes; with `Rc<str>`'s fat pointer
+/// the enum is 24 and `OwnedValue` grows to 40.
+#[derive(Clone)]
+pub struct SharableLiteral(SharableLiteralInner);
+
+/// [`SharableLiteral`]'s two states.
+#[derive(Clone)]
+enum SharableLiteralInner {
+    Owned(Box<str>),
+    // Never built under the holdout, which promotes nothing.
+    #[cfg_attr(feature = "unshared-containers", allow(dead_code))]
+    Shared(alloc::rc::Rc<Box<str>>),
+}
+
+impl SharableLiteral {
+    /// See `SharableString::promote`.
+    #[inline]
+    #[cfg_attr(
+        feature = "unshared-containers",
+        allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)
+    )]
+    pub(crate) fn promote(&mut self) {
+        #[cfg(not(feature = "unshared-containers"))]
+        if let SharableLiteralInner::Owned(s) = &mut self.0 {
+            self.0 = SharableLiteralInner::Shared(alloc::rc::Rc::new(core::mem::take(s)));
+        }
+    }
+
+    /// See [`SharableString::ptr_eq`].
+    #[inline]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (SharableLiteralInner::Shared(a), SharableLiteralInner::Shared(b)) => {
+                alloc::rc::Rc::ptr_eq(a, b)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this handle is on promoted, refcounted storage.
+    #[inline]
+    pub fn is_shared(&self) -> bool {
+        matches!(self.0, SharableLiteralInner::Shared(_))
+    }
+
+    /// Consume the wrapper, yielding the spelling -- by move when it is
+    /// inline or this handle was the last one, by copy otherwise.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn into_boxed(self) -> Box<str> {
+        match self.0 {
+            SharableLiteralInner::Owned(s) => s,
+            SharableLiteralInner::Shared(rc) => {
+                alloc::rc::Rc::try_unwrap(rc).unwrap_or_else(|rc| {
+                    note_scalar_copy!(LiteralCopy);
+                    (*rc).clone()
+                })
+            }
+        }
+    }
+}
+
+impl Deref for SharableLiteral {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        match &self.0 {
+            SharableLiteralInner::Owned(s) => s,
+            SharableLiteralInner::Shared(rc) => rc,
+        }
+    }
+}
+
+impl PartialEq for SharableLiteral {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for SharableLiteral {}
+
+impl core::fmt::Debug for SharableLiteral {
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl core::fmt::Display for SharableLiteral {
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&**self, f)
+    }
+}
+
+impl AsRef<str> for SharableLiteral {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self
+    }
+}
+
+impl core::borrow::Borrow<str> for SharableLiteral {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self
+    }
+}
+
+impl From<Box<str>> for SharableLiteral {
+    #[inline]
+    fn from(s: Box<str>) -> Self {
+        Self(SharableLiteralInner::Owned(s))
+    }
+}
+
+impl From<&str> for SharableLiteral {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Self::from(Box::<str>::from(s))
+    }
+}
+
+impl From<String> for SharableLiteral {
+    #[inline]
+    fn from(s: String) -> Self {
+        Self::from(s.into_boxed_str())
+    }
+}
+
+impl From<SharableLiteral> for Box<str> {
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    fn from(s: SharableLiteral) -> Self {
+        s.into_boxed()
+    }
+}
+
 /// An owned JSON value.
 ///
 /// This is used for values that are constructed during evaluation
@@ -2723,9 +3195,10 @@ pub enum OwnedValue {
     /// number, the result collapses to plain `Int`/`Float` (see
     /// `into_plain_number`) -- matching jq, where only values that reach
     /// output untouched keep their original spelling.
-    NumberLiteral(NumberRepr, Box<str>),
-    /// JSON string
-    String(String),
+    NumberLiteral(NumberRepr, SharableLiteral),
+    /// JSON string (inline, or refcounted once a bind has promoted it --
+    /// see [`SharableString`] for why, #3191)
+    String(SharableString),
     /// JSON array (the elements are held behind one refcounted pointer and
     /// copied on the first write through a shared handle -- see
     /// [`ArrayVec`] for why)
@@ -2878,7 +3351,7 @@ impl OwnedValue {
         let Some(repr) = parse_i64_or_f64_in::<S>(&literal) else {
             return Self::Null;
         };
-        Self::NumberLiteral(repr, literal)
+        Self::NumberLiteral(repr, literal.into())
     }
 
     /// The reindex bridge's NaN/infinity tokens (#472/#1083), decoded to
@@ -3226,7 +3699,7 @@ impl OwnedValue {
 
     /// Create a string value.
     pub fn string(s: impl Into<String>) -> Self {
-        Self::String(s.into())
+        Self::String(s.into().into())
     }
 
     /// Create an empty array.
@@ -3244,15 +3717,18 @@ impl OwnedValue {
         Self::Object(IndexMap::new().into())
     }
 
-    /// Whether this value and `other` are the same *container storage* --
-    /// jq's `jv_identical` for arrays and objects, which is pointer
-    /// equality there (#2889).
+    /// Whether this value and `other` are the same *storage* -- jq's
+    /// `jv_identical` for arrays, objects, strings and number literals,
+    /// which is pointer equality there (#2889; strings and literals #3191).
     ///
-    /// `false` for every scalar pairing, and for an array against an
-    /// object: neither is refcounted storage two handles can share, so
-    /// there is no pointer identity to report. jq's own scalar identity is
-    /// by value, a rule its callers here (`marker_identical`'s null/bool
-    /// carve-out, `owned_value_eq`) already apply separately.
+    /// A string or number literal has storage to compare only once a bind
+    /// has promoted it ([`SharableString::promote`]); an inline one answers
+    /// `false`, which is exact rather than conservative: nothing but a bind
+    /// can be asked about, and a bind promotes. `false` too for `null`,
+    /// `bool`, a computed `Int`/`Float`, and a mismatched pairing: jq's
+    /// identity for those is by value, a rule its callers here
+    /// (`marker_identical`'s null/bool carve-out, `owned_value_eq`) apply
+    /// separately, or a refusal (a computed number).
     ///
     /// Two readers: the embed table's `witness_of` (`std` only -- the
     /// table is a stub without a `thread_local!`) and the resolver's
@@ -3263,6 +3739,8 @@ impl OwnedValue {
         match (self, other) {
             (Self::Array(a), Self::Array(b)) => a.ptr_eq(b),
             (Self::Object(a), Self::Object(b)) => a.ptr_eq(b),
+            (Self::String(a), Self::String(b)) => a.ptr_eq(b),
+            (Self::NumberLiteral(_, a), Self::NumberLiteral(_, b)) => a.ptr_eq(b),
             _ => false,
         }
     }
@@ -5030,7 +5508,7 @@ impl From<Literal> for OwnedValue {
             }
             Literal::Int(n) => Self::Int(n),
             Literal::Float(f) => Self::Float(f),
-            Literal::String(s) => Self::String(s),
+            Literal::String(s) => Self::String(s.into()),
         }
     }
 }
@@ -5055,13 +5533,13 @@ impl From<f64> for OwnedValue {
 
 impl From<String> for OwnedValue {
     fn from(s: String) -> Self {
-        Self::String(s)
+        Self::String(s.into())
     }
 }
 
 impl From<&str> for OwnedValue {
     fn from(s: &str) -> Self {
-        Self::String(s.to_string())
+        Self::String(s.to_string().into())
     }
 }
 
@@ -5093,6 +5571,170 @@ mod tests {
     /// the shipped shape's.
     /// Same 64-bit gate as the crate's other exact-size pins (`EvalError`,
     /// `Expr`): 32-bit targets shrink the pointer-sized fields.
+    /// The promote-on-bind wrappers (#3191) cost nothing in layout: a
+    /// `SharableString` is exactly a `String` (the `Owned | Shared` tag
+    /// rides `String`'s capacity niche) and a `SharableLiteral` exactly a
+    /// `Box<str>` (the tag rides the thin `Rc`'s null niche). If either
+    /// grew, `OwnedValue` would grow with it -- `Rc<str>` for the spelling
+    /// would make it 40 -- and every element would pay.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn sharable_scalars_are_the_size_of_what_they_replace_3191() {
+        assert_eq!(
+            core::mem::size_of::<SharableString>(),
+            core::mem::size_of::<String>()
+        );
+        assert_eq!(
+            core::mem::size_of::<SharableLiteral>(),
+            core::mem::size_of::<Box<str>>()
+        );
+    }
+
+    /// A string is inline until promoted, and has no identity to report
+    /// while it is: a clone is a copy, and `ptr_eq` is `false` even against
+    /// itself. Promotion makes every later clone the same storage.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn sharable_string_shares_only_once_promoted_3191() {
+        let mut s = SharableString::from("abc");
+        assert!(!s.is_shared());
+        assert!(!s.ptr_eq(&s.clone()));
+        assert!(!s.ptr_eq(&s));
+        s.promote();
+        assert!(s.is_shared());
+        let t = s.clone();
+        assert!(s.ptr_eq(&t));
+        assert_eq!(s, t);
+        // An equal string promoted separately is different storage -- jq's
+        // two `"s"` literals are two `jv`s.
+        let mut u = SharableString::from("abc");
+        u.promote();
+        assert!(!s.ptr_eq(&u));
+        assert_eq!(s, u);
+        // Promoting twice keeps the storage.
+        let mut v = t.clone();
+        v.promote();
+        assert!(v.ptr_eq(&s));
+    }
+
+    /// A write through a shared handle copies once and leaves that handle
+    /// inline -- the written string is fresh storage, as `. + ""` is in jq
+    /// -- while the other handle keeps the original. A write through the
+    /// *last* handle copies nothing.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn sharable_string_write_unshares_3191() {
+        use crate::jq::share_stats::{self, Kind};
+
+        let mut s = SharableString::from("abc");
+        s.promote();
+        let held = s.clone();
+        let ((), recorded) = share_stats::measure(|| s.push('d'));
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0.kind, Kind::StringCopy);
+        assert_eq!(s, "abcd");
+        assert_eq!(held, "abc");
+        assert!(!s.is_shared());
+        assert!(!s.ptr_eq(&held));
+
+        let mut last = held;
+        let ((), recorded) = share_stats::measure(|| last.push('!'));
+        assert!(recorded.is_empty(), "{recorded:?}");
+        assert_eq!(last, "abc!");
+        assert!(!last.is_shared());
+    }
+
+    /// `into_string` moves when it can and copies (recorded) when another
+    /// handle still holds the storage.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn sharable_string_into_string_moves_unless_shared_3191() {
+        use crate::jq::share_stats::{self, Kind};
+
+        let (inline, recorded) = share_stats::measure(|| SharableString::from("a").into_string());
+        assert_eq!(inline, "a");
+        assert!(recorded.is_empty());
+
+        let mut s = SharableString::from("b");
+        s.promote();
+        let (unique, recorded) = share_stats::measure(|| s.into_string());
+        assert_eq!(unique, "b");
+        assert!(recorded.is_empty(), "{recorded:?}");
+
+        let mut s = SharableString::from("c");
+        s.promote();
+        let held = s.clone();
+        let (copied, recorded) = share_stats::measure(|| String::from(s));
+        assert_eq!(copied, "c");
+        assert_eq!(recorded[0].0.kind, Kind::StringCopy);
+        assert!(held.is_shared());
+    }
+
+    /// The number-spelling twin: inline until promoted, one storage for
+    /// every clone after, and `into_boxed` copies only while shared.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn sharable_literal_shares_only_once_promoted_3191() {
+        use crate::jq::share_stats::{self, Kind};
+
+        let mut l = SharableLiteral::from("1.0");
+        assert!(!l.is_shared());
+        assert!(!l.ptr_eq(&l.clone()));
+        l.promote();
+        let m = l.clone();
+        assert!(l.ptr_eq(&m));
+        assert!(m.is_shared());
+        assert_eq!(&*m, "1.0");
+        assert_eq!(l, m);
+        let (boxed, recorded) = share_stats::measure(|| Box::<str>::from(l));
+        assert_eq!(&*boxed, "1.0");
+        assert_eq!(recorded[0].0.kind, Kind::LiteralCopy);
+        let (boxed, recorded) = share_stats::measure(|| m.into_boxed());
+        assert_eq!(&*boxed, "1.0");
+        assert!(recorded.is_empty(), "{recorded:?}");
+    }
+
+    /// `shares_storage_with` reads the promoted storage of a string and a
+    /// number spelling (#3191), and never answers `true` for storage a bind
+    /// did not promote, nor across kinds.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn shares_storage_with_reads_promoted_scalars_3191() {
+        let inline = OwnedValue::string("s");
+        assert!(!inline.shares_storage_with(&inline.clone()));
+
+        let mut s = OwnedValue::string("s");
+        let OwnedValue::String(inner) = &mut s else {
+            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- built as a string on the line above (#3191)"
+        };
+        inner.promote();
+        assert!(s.shares_storage_with(&s.clone()));
+        assert!(!s.shares_storage_with(&OwnedValue::string("s")));
+
+        let mut n = OwnedValue::NumberLiteral(NumberRepr::Int(5), "5".into());
+        assert!(!n.shares_storage_with(&n.clone()));
+        let OwnedValue::NumberLiteral(_, spelling) = &mut n else {
+            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- built as a number literal on the line above (#3191)"
+        };
+        spelling.promote();
+        assert!(n.shares_storage_with(&n.clone()));
+        assert!(!n.shares_storage_with(&OwnedValue::Int(5)));
+        assert!(!n.shares_storage_with(&s));
+    }
+
+    /// The holdout never promotes: its A/B twin must not share a scalar
+    /// either, or it measures a sharing binary against a sharing binary.
+    #[test]
+    #[cfg(feature = "unshared-containers")]
+    fn unshared_containers_holdout_never_promotes_a_scalar_3191() {
+        let mut s = SharableString::from("abc");
+        s.promote();
+        assert!(!s.is_shared());
+        let mut l = SharableLiteral::from("5");
+        l.promote();
+        assert!(!l.is_shared());
+    }
+
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn owned_value_is_32_bytes_because_its_containers_are_one_pointer_3000() {
@@ -5599,7 +6241,7 @@ mod tests {
         assert!(!OwnedValue::Bool(false).is_truthy());
         assert!(OwnedValue::Bool(true).is_truthy());
         assert!(OwnedValue::Int(0).is_truthy()); // 0 is truthy in jq!
-        assert!(OwnedValue::String(String::new()).is_truthy()); // "" is truthy in jq!
+        assert!(OwnedValue::String(String::new().into()).is_truthy()); // "" is truthy in jq!
         assert!(OwnedValue::array().is_truthy()); // [] is truthy in jq!
     }
 
@@ -5609,7 +6251,10 @@ mod tests {
         assert_eq!(OwnedValue::Bool(true).type_name(), "boolean");
         assert_eq!(OwnedValue::Int(42).type_name(), "number");
         assert_eq!(OwnedValue::Float(2.5).type_name(), "number");
-        assert_eq!(OwnedValue::String(String::new()).type_name(), "string");
+        assert_eq!(
+            OwnedValue::String(String::new().into()).type_name(),
+            "string"
+        );
         assert_eq!(OwnedValue::array().type_name(), "array");
         assert_eq!(
             OwnedValue::Object(IndexMap::new().into()).type_name(),
@@ -5688,7 +6333,7 @@ mod tests {
     fn test_to_json_round_trips_through_a_parser() {
         for cp in (0u32..=0xFF).chain([0x2028, 0x1F600]) {
             let c = char::from_u32(cp).unwrap();
-            let value = OwnedValue::String(String::from(c));
+            let value = OwnedValue::String(String::from(c).into());
             let json = value.to_json();
             let parsed: serde_json::Value =
                 serde_json::from_str(&json).unwrap_or_else(|e| panic!("U+{cp:04X}: {json:?}: {e}"));
@@ -9012,7 +9657,7 @@ mod tests {
             OwnedValue::Float(f64::NEG_INFINITY),
             OwnedValue::Float(f64::NAN),
             OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), ".nan".into()),
-            OwnedValue::String(String::new()),
+            OwnedValue::String(String::new().into()),
             OwnedValue::String("s".into()),
             OwnedValue::array(),
             OwnedValue::Object(indexmap::IndexMap::new().into()),

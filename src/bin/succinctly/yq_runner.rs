@@ -810,7 +810,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> Re
             // Quoted strings should always be treated as strings (yq-compatible behavior)
             // Only unquoted scalars should undergo type detection
             if !s.is_unquoted() {
-                return Ok(OwnedValue::String(str_value.into_owned()));
+                return Ok(OwnedValue::String(str_value.into_owned().into()));
             }
 
             // Resolve plain scalars per the YAML 1.2 core schema
@@ -1297,7 +1297,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         }
         OwnedValue::Float(f)
     } else if let Some(s) = value.as_str() {
-        OwnedValue::String(s.into_owned())
+        OwnedValue::String(s.into_owned().into())
     } else if let Some(reason) = value.string_decode_error() {
         // #1975: matches `eval_generic::to_owned_at_depth`'s identical arm
         // (#1247) -- `as_str` above answered `None`, but the value *is* a
@@ -1895,7 +1895,9 @@ fn walk_alias_groups<W: AsRef<[u64]> + Clone>(
     match cursor.value() {
         YamlValue::Mapping(fields) => {
             for field in fields {
-                path.push(OwnedValue::String(field.key().key_string().into_owned()));
+                path.push(OwnedValue::String(
+                    field.key().key_string().into_owned().into(),
+                ));
                 walk_alias_groups(field.value_cursor(), path, defs, aliases);
                 path.pop();
             }
@@ -2794,7 +2796,7 @@ fn write_split_result(
         }
     };
 
-    if !written_files.insert(filename.clone()) {
+    if !written_files.insert(filename.to_string()) {
         eprintln!("Warning: --split-exp path '{filename}' written more than once; overwriting");
     }
 
@@ -2803,7 +2805,7 @@ fn write_split_result(
     no_color_config.use_color = false;
     output_value(&mut buf, result, comments, &no_color_config, None)?;
 
-    std::fs::write(&filename, &buf)
+    std::fs::write(&*filename, &buf)
         .with_context(|| format!("failed to write --split-exp output file: {filename}"))
 }
 
@@ -3341,7 +3343,7 @@ fn meta_path_from_value(path: &OwnedValue, current: &OwnedValue) -> Option<Vec<M
     let mut out = Vec::with_capacity(steps.len());
     for step in steps {
         let step = match step {
-            OwnedValue::String(k) => MetaPathStep::Key(k.clone()),
+            OwnedValue::String(k) => MetaPathStep::Key(k.to_string()),
             OwnedValue::Int(i) if *i >= 0 => MetaPathStep::Index(*i as usize),
             OwnedValue::Int(i) => {
                 let Some(OwnedValue::Array(items)) = owned_value_at(current, &out) else {
@@ -3731,7 +3733,7 @@ fn apply_meta_assign_writes(
             MetaEffect::Style(style) => {
                 if matches!(*style, "double" | "single") {
                     if let Some(plain) = plain_scalar_text(node_value) {
-                        *node_value = OwnedValue::String(plain);
+                        *node_value = OwnedValue::String(plain.into());
                     }
                 }
                 node.meta_mut().style = style;
@@ -3973,7 +3975,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
                 keys.sort();
             }
             Ok(vec![no_comments(OwnedValue::Array(
-                keys.into_iter().map(OwnedValue::String).collect(),
+                keys.into_iter().map(OwnedValue::string).collect(),
             ))])
         }
         // Same reasoning as `LazyKeys` above, for array `keys`/
@@ -4441,7 +4443,7 @@ fn output_value<W: Write>(
         // (`unknown anchor 'x' referenced`). Making the streaming path
         // agree with this one is issue #1350.
         let body = if let OwnedValue::String(s) = value {
-            s.clone()
+            String::clone(s)
         } else {
             // A root anchor is written only for a container, matching
             // `YamlCursor::write_leading_anchor` in `light.rs` — real yq
@@ -5624,7 +5626,7 @@ fn parse_variables(args: &YqCommand) -> Result<EvalContext> {
     for chunk in args.arg.chunks(2) {
         if chunk.len() == 2 {
             let name = chunk[0].clone();
-            let value = OwnedValue::String(chunk[1].clone());
+            let value = OwnedValue::String(chunk[1].clone().into());
             context.named.insert(name, value);
         }
     }
@@ -7273,7 +7275,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // yq -R -s (jq semantics): the entire input (all files
             // concatenated) becomes a single string; no line splitting and
             // no array wrap.
-            let slurped = OwnedValue::String(input_content);
+            let slurped = OwnedValue::String(input_content.into());
             let results = evaluate_input(&slurped, &program.expr, &mut sink)?;
             for result in results {
                 let split_separator =
@@ -7290,7 +7292,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         } else {
             // Without --slurp, process each line independently
             for line in input_content.lines() {
-                let input = OwnedValue::String(line.to_string());
+                let input = OwnedValue::String(line.to_string().into());
                 let results = evaluate_input(&input, &program.expr, &mut sink)?;
                 for result in results {
                     let split_separator =
@@ -8333,7 +8335,7 @@ mod tests {
                 if let OwnedValue::Object(map) = value {
                     assert_eq!(
                         map.get("name"),
-                        Some(&OwnedValue::String("Alice".to_string()))
+                        Some(&OwnedValue::String("Alice".to_string().into()))
                     );
                 } else {
                     panic!("expected object");
@@ -8536,9 +8538,9 @@ mod tests {
                 if let OwnedValue::Object(map) = value {
                     if let Some(OwnedValue::Array(arr)) = map.get("items") {
                         assert_eq!(arr.len(), 3);
-                        assert_eq!(arr[0], OwnedValue::String("one".to_string()));
-                        assert_eq!(arr[1], OwnedValue::String("two".to_string()));
-                        assert_eq!(arr[2], OwnedValue::String("three".to_string()));
+                        assert_eq!(arr[0], OwnedValue::String("one".to_string().into()));
+                        assert_eq!(arr[1], OwnedValue::String("two".to_string().into()));
+                        assert_eq!(arr[2], OwnedValue::String("three".to_string().into()));
                     } else {
                         panic!("expected array for items, got {:?}", map.get("items"));
                     }
@@ -8563,7 +8565,7 @@ mod tests {
                     if let Some(OwnedValue::Object(person)) = map.get("person") {
                         assert_eq!(
                             person.get("name"),
-                            Some(&OwnedValue::String("Alice".to_string()))
+                            Some(&OwnedValue::String("Alice".to_string().into()))
                         );
                         assert_eq!(person.get("age"), Some(&OwnedValue::Int(30)));
                     } else {
@@ -8589,9 +8591,9 @@ mod tests {
                 if let OwnedValue::Object(map) = value {
                     if let Some(OwnedValue::Array(arr)) = map.get("items") {
                         assert_eq!(arr.len(), 3);
-                        assert_eq!(arr[0], OwnedValue::String("one".to_string()));
-                        assert_eq!(arr[1], OwnedValue::String("two".to_string()));
-                        assert_eq!(arr[2], OwnedValue::String("three".to_string()));
+                        assert_eq!(arr[0], OwnedValue::String("one".to_string().into()));
+                        assert_eq!(arr[1], OwnedValue::String("two".to_string().into()));
+                        assert_eq!(arr[2], OwnedValue::String("three".to_string().into()));
                     } else {
                         panic!("expected array for items, got {:?}", map.get("items"));
                     }
@@ -8616,7 +8618,7 @@ mod tests {
                     if let Some(OwnedValue::Object(person)) = map.get("person") {
                         assert_eq!(
                             person.get("name"),
-                            Some(&OwnedValue::String("Alice".to_string()))
+                            Some(&OwnedValue::String("Alice".to_string().into()))
                         );
                         assert_eq!(person.get("age"), Some(&OwnedValue::Int(30)));
                     } else {
@@ -8645,7 +8647,7 @@ mod tests {
                             if let Some(OwnedValue::Object(level3)) = level2.get("level2") {
                                 assert_eq!(
                                     level3.get("value"),
-                                    Some(&OwnedValue::String("deep".to_string()))
+                                    Some(&OwnedValue::String("deep".to_string().into()))
                                 );
                             } else {
                                 panic!("expected object for level2");
@@ -8702,7 +8704,7 @@ mod tests {
         if let OwnedValue::Object(map) = &results[0] {
             assert_eq!(
                 map.get("name"),
-                Some(&OwnedValue::String("Alice".to_string()))
+                Some(&OwnedValue::String("Alice".to_string().into()))
             );
             assert_eq!(map.get("age"), Some(&OwnedValue::Int(30)));
         } else {
@@ -8717,7 +8719,7 @@ mod tests {
         let results = eval_yaml(yaml, &expr);
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], OwnedValue::String("Alice".to_string()));
+        assert_eq!(results[0], OwnedValue::String("Alice".to_string().into()));
     }
 
     #[test]
@@ -8745,7 +8747,7 @@ mod tests {
         let results = eval_yaml(yaml, &expr);
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], OwnedValue::String("Alice".to_string()));
+        assert_eq!(results[0], OwnedValue::String("Alice".to_string().into()));
     }
 
     #[test]
@@ -8766,7 +8768,7 @@ mod tests {
             if let OwnedValue::Object(map) = &arr[0] {
                 assert_eq!(
                     map.get("name"),
-                    Some(&OwnedValue::String("Alice".to_string()))
+                    Some(&OwnedValue::String("Alice".to_string().into()))
                 );
             } else {
                 panic!("expected object");
@@ -8774,7 +8776,7 @@ mod tests {
             if let OwnedValue::Object(map) = &arr[1] {
                 assert_eq!(
                     map.get("name"),
-                    Some(&OwnedValue::String("Bob".to_string()))
+                    Some(&OwnedValue::String("Bob".to_string().into()))
                 );
             } else {
                 panic!("expected object");
@@ -8782,7 +8784,7 @@ mod tests {
             if let OwnedValue::Object(map) = &arr[2] {
                 assert_eq!(
                     map.get("name"),
-                    Some(&OwnedValue::String("Charlie".to_string()))
+                    Some(&OwnedValue::String("Charlie".to_string().into()))
                 );
             } else {
                 panic!("expected object");
@@ -8981,7 +8983,10 @@ mod tests {
                 vec![OwnedValue::Float(1.0), OwnedValue::Int(2)].into()
             ))
         );
-        assert_eq!(map.get("s"), Some(&OwnedValue::String("x".to_string())));
+        assert_eq!(
+            map.get("s"),
+            Some(&OwnedValue::String("x".to_string().into()))
+        );
         assert_eq!(map.get("b"), Some(&OwnedValue::Bool(true)));
         assert_eq!(map.get("n"), Some(&OwnedValue::Null));
 
@@ -9678,7 +9683,7 @@ mod tests {
             OwnedValue::Bool(false),
             OwnedValue::Bool(true),
             OwnedValue::Int(0),
-            OwnedValue::String(String::new()),
+            OwnedValue::String(String::new().into()),
         ];
         let hashes: Vec<u64> = distinct.iter().map(owned_value_align_hash).collect();
         for i in 0..hashes.len() {
