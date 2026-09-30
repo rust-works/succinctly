@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a string or number bound by `as` keeps jq's node identity** (#3191).
+  `. as $x | {k:.} | .k | path($x)` on `"s"` or `5` answers `[]` as in jq 1.7.1,
+  where it refused before, and the same holds through `[.] | .[0]`, `tostring`,
+  `@text`, `tonumber`, one-element `add`/`min`/`max`/`sort`, and writes through
+  `$x`. Only a bound scalar in a program that reads a variable in path position
+  gets shared storage, so nothing else pays for it. On the #3182 corpus, peak RSS
+  and wall time match a build with promotion disabled on the Apple M4 Pro and the
+  AMD Ryzen 9 7950X; ADR-0024's "Promote-on-bind result" has the table. Builtins
+  bridged through the owned round trip (`ltrimstr`/`sub` with no match, `abs`,
+  `strings`, `walk(.)`, ...) still refuse, the safe direction. **Library
+  users:** `OwnedValue::String` now holds a `SharableString` and
+  `OwnedValue::NumberLiteral`'s spelling a `SharableLiteral` (both re-exported
+  from `succinctly::jq`). They `Deref` to `String`/`str` and convert with
+  `From`/`.into()`; `into_string()`/`into_boxed()` move the value out.
+
 - **jq: `[(., .) | .data]` no longer builds each comma item as an owned tree**
   (#3476). #3473's cursor route covered a `,` sitting directly inside `[...]`;
   the same body behind a pipe (`[(., .) | .data]`) still built one owned tree
