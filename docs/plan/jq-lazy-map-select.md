@@ -612,7 +612,8 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     walked once, when the array's shape is known. Every exit (the answer, the first
     non-node, an escaping branch) walks the pending nodes in branch order first, so the
     first failure is the one `main` raised. A cursor answer runs `validate_cursor` over
-    every node, and `LazySource::Cursors { validated: true }` records it. The jq printer's `LazySeq` arm
+    every node (since #3478 that walk is deferred to the consumer, below), and
+    `LazySource::Cursors { check }` records it (`CursorCheck`). The jq printer's `LazySeq` arm
     reads `LazySeq::is_prevalidated()` and skips its own #3156 walk. A literal slice of such
     a source keeps the flag.
   - **Owned fallbacks.** An all-scalar body (`[.name, .age]`) stays an owned array, since a
@@ -639,9 +640,31 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
       **Measured** (Apple M5 Max, interleaved, min of 9, 1/4/10 MB, output identical, peak RSS
       unchanged or lower): `[., .] | length` −37%/−39%/−42%, `[., .] | tojson | length`
       −8%/−9%/−10%, `[., .] as $a | $a | length` −11%/−14%/−14%, `.data | map([., .]) | length`
-      −17%/−19%/−21%; controls (`.`, `[.]`, `. | tojson`, `[.data[]]`) within ±2%. What is
-      left of the +25-60% is the duplicate walk itself, which only a consumer that skips it
-      (validate-on-materialize, #3478's Option 4) can remove.
+      −17%/−19%/−21%; controls (`.`, `[.]`, `. | tojson`, `[.data[]]`) within ±2%.
+    - **Validate on materialize** (#3478, Option 4): what was left of the +25-60% was the
+      walk itself, which a consumer that builds the array does anyway (`to_owned_cursor` is
+      the same walk). `comma_array_generic` now answers `LazySource::Cursors { check:
+      CursorCheck::Pending }` without walking, and the walk is settled by whoever consumes
+      it, fail-closed: `LazySource::advance` walks the rest before its first element (every
+      iterating consumer, the printer included); `materialize_atomic`'s instruction-free path
+      skips it, because its build walks each node in order and so raises the same first
+      error; the direct-read stages of `fold_lazy_seq_stage` (`.[n]`, `last`, slices)
+      `settle()` first; and `push_one_generic`, the one place a lazy item reaches a sink,
+      settles it unless the sink says `materializes_lazy_items` -- true only for the bind
+      helpers (`as $x`, `as [$a]`) and `eval_each_pipe_generic`'s driver, whose first act on
+      a lazy item is to materialize it or fold it through stages that each do. A new sink
+      defaults to settling, so it can be slower but never observe an unwalked array.
+      The semantics do not move (ADR-0018: no divergence to record): `[., .] | length`,
+      `.[0]` and `first` still fail whole on a malformed node, first error in branch order,
+      and no `debug`/`input`/`error` runs before that failure
+      (`test_comma_array_deferred_walk_settles_before_anything_observable_3478`, and a
+      differential of 4,620 filter x document runs against the pre-change binary, which
+      catches each of the three layers when it is disabled).
+      **Measured against #3473's tip** (interleaved, min of 9, 1/4/10 MB, output identical,
+      peak RSS unchanged or lower; ARM = Apple M5 Max, x86_64 = Ryzen 9 7950X, 10 MB):
+      `[., .] | length` −41% / −29%, `[., .] | tojson | length` −20% / −14%,
+      `[., .] as $a | $a | length` −29% / −21%, `.data | map([., .]) | length` −40% / −38%,
+      printing `[., .]` −17% / −12%; controls (`.`, `[.]`, `. | tojson`) within ±1.5%.
     - Residual: an all-scalar body over many nodes holds its cursor list while the values
       are built, so `[.[0], .[]] | length` over 300k strings peaks at 74 MB instead of
       64 MB, with neutral time.

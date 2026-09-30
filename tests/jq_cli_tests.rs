@@ -81430,6 +81430,109 @@ fn test_comma_array_first_failure_in_branch_order_3317() -> Result<()> {
     Ok(())
 }
 
+/// #3478: a `,` array's nodes are walked by whoever consumes the array (the
+/// build itself, when the consumer materializes it), not when the array is
+/// constructed -- but never later than anything else can be observed. The
+/// first node here is well formed and the second is not, so a consumer that
+/// read the first without walking the rest (`.[0]`, `first`, an index, a
+/// slice) would answer where `main` failed, and a `debug` or `input` that ran
+/// between the construction and the walk would print before the error.
+///
+/// Every row is the array failing whole: exit 5, nothing on stdout, the one
+/// decode failure on stderr and no `DEBUG` line, in either node order.
+#[test]
+fn test_comma_array_deferred_walk_settles_before_anything_observable_3478() -> Result<()> {
+    let doc = r#"{"a":{"k":1},"b":{"k":tru}}"#;
+    for array in ["[.a, .b]", "[.b, .a]", "[.a, .a, .b]"] {
+        for template in [
+            "ARR",
+            "ARR | length",
+            "ARR | first",
+            "ARR | last",
+            "ARR | .[0]",
+            "ARR | .[1]",
+            "ARR | .[-1]",
+            "ARR | .[:1]",
+            "ARR | .[1:]",
+            "ARR | .[]",
+            "ARR | map(.k) | length",
+            "ARR | tojson",
+            "ARR | tostring",
+            "ARR | debug | length",
+            "ARR | select(length > 0)",
+            "ARR as $v | 1",
+            "ARR as $v | debug | $v",
+            "ARR as [$p, $q] | 1",
+            "(ARR, debug)",
+            "[ARR, (1 | debug)]",
+            "first(ARR, debug)",
+            "reduce ARR as $v (0; . + 1)",
+            r#"try ARR catch "caught""#,
+            "ARR | . == .",
+            // Side effects in a later stage's own arguments must not run
+            // ahead of the array's walk either.
+            "ARR | .[(1 | debug)]",
+            "ARR | map(., (1 | debug))",
+            "ARR | first(.[], (1 | debug))",
+            "ARR | limit((1 | debug); .[])",
+            "ARR | (1 | debug) as $x | length",
+            "ARR | if (1 | debug) then length else 0 end",
+            "ARR | has((0 | debug))",
+        ] {
+            let filter = template.replace("ARR", array);
+            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(doc))?;
+            assert_eq!(code, 5, "#3478 `{filter}`: stderr={stderr:?}");
+            assert!(stdout.is_empty(), "#3478 `{filter}`: stdout={stdout:?}");
+            assert!(
+                stderr.contains("invalid boolean"),
+                "#3478 `{filter}`: stderr={stderr:?}"
+            );
+            assert!(
+                !stderr.contains("DEBUG"),
+                "#3478 `{filter}` ran a side effect before the array failed: stderr={stderr:?}"
+            );
+            assert_eq!(
+                stderr.matches("jq: error").count(),
+                1,
+                "#3478 `{filter}`: stderr={stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3478: on a well-formed document every consumer of a `,` array answers
+/// exactly as before the walk moved -- the same rows, in the same order, with
+/// side effects running once and in branch order.
+#[test]
+fn test_comma_array_deferred_walk_answers_unchanged_3478() -> Result<()> {
+    let doc = r#"{"a":{"k":1},"b":{"k":2}}"#;
+    for (filter, want) in [
+        ("[.a, .b]", r#"[{"k":1},{"k":2}]"#),
+        ("[.a, .b] | length", "2"),
+        ("[.a, .b] | first", r#"{"k":1}"#),
+        ("[.a, .b] | last", r#"{"k":2}"#),
+        ("[.a, .b] | .[1]", r#"{"k":2}"#),
+        ("[.a, .b] | .[-1]", r#"{"k":2}"#),
+        ("[.a, .b] | .[1:]", r#"[{"k":2}]"#),
+        ("[.a, .b] | map(.k)", "[1,2]"),
+        ("[.a, .b] | tojson", r#""[{\"k\":1},{\"k\":2}]""#),
+        ("[.a, .b] as $v | $v | length", "2"),
+        ("[.a, .b] as [$p, $q] | $q", r#"{"k":2}"#),
+        ("reduce ([.a, .b] | .[]) as $v (0; . + $v.k)", "3"),
+        ("[[.a, .b], [.b, .a]] | map(length)", "[2,2]"),
+        (
+            ".. | select(type == \"object\") | [.k?] | length",
+            "1\n1\n1",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "#3478 `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3478 `{filter}`");
+    }
+    Ok(())
+}
+
 /// #3476: a `,` head behind a pipe of navigation, `[(., .) | .data]`, keeps
 /// the nodes it reaches as cursors like #3317's `[.data, .data]` does, rather
 /// than building one owned tree per comma item and reindexing it. Every row is
