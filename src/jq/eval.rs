@@ -102361,6 +102361,55 @@ mod tests {
         }
     }
 
+    /// #3293 slice 7: the cursor route's `key` walk (`path_context_step_generic`'s
+    /// `if`, `limit` and `skip` arms) reads `direct_pattern_retry` of the
+    /// generator it drives, so its `no_std` half runs here too. `key` is
+    /// succinctly's, so each row's answer is jq 1.7.1's for the `path()`
+    /// spelling; jq has no `skip`, so its rows follow `limit`'s.
+    #[test]
+    fn test_path_context_cond_retry_supersedes_stashed_verdict_3293() {
+        for (filter, values, end) in [
+            (
+                r#"[(if ([1] as $q ?// $b | $q) then error("E") else .a end) | key]"#,
+                &[r#"["a"]"#][..],
+                "",
+            ),
+            (
+                r#"[(if ([1] as $q ?// $b | $q // empty) then error("E") else .a end) | key]"#,
+                &["[]"][..],
+                "",
+            ),
+            (
+                r#"[(if ([1] as $q ?// $b | $q | if . == null then error("E2") else . end) then error("E") else .a end) | key]"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r#"[limit(([1] as [$a] ?// $b | if $a == null then 0 else $a end); error("E")) | key]"#,
+                &["[]"][..],
+                "",
+            ),
+            (
+                r#"[limit(([1] as [$a] ?// $b | if $a == null then error("E2") else $a end); error("E")) | key]"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r#"[skip(([1] as [$a] ?// $b | if $a == null then error("E2") else $a end); .a, error("E")) | key]"#,
+                &[][..],
+                "error: E2",
+            ),
+        ] {
+            let (got, got_end) = outputs_and_end(br#"{"a":{"a":1}}"#, filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(
+                (got.as_slice(), got_end.as_str()),
+                (values, end),
+                "`{filter}`"
+            );
+        }
+    }
+
     /// #3293 slice 4: `foreach_forks`/`reduce_forks` are shared with the
     /// owned evaluator, and their `no_std` build reads [`FoldDirectRetry`]
     /// instead of the retry generation, so every fold row runs on this route

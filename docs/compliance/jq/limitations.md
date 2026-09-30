@@ -646,6 +646,9 @@ and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` 
   key]` raises `E` after a single attempt; the cursor route prints `["a"]`). `key` is a
   succinctly extension, so the oracle is jq's `path()` spelling. Recorded on #3293 for its
   closing slice.
+- **`paths(f)` evaluates `f` once per path, with no retry**: `[paths(if ([1] as $q ?// $b |
+  $q) then error("E") else true end)]` is `[["a"],["a","a"]]` in jq 1.7.1 and `E` here after a
+  single attempt. A different site from the resolver above (a slice 9 row on #3293).
 - **`limit`/`skip` type-check their count eagerly**: `[limit(([1] as $q ?// $b | $q); 1,2,3)]`
   is `[1,2,3]` in jq 1.7.1 (an array compares greater than `0`) and "limit requires
   non-negative integer" here, after a single attempt -- the #2180 "arguments are evaluated

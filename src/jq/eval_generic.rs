@@ -19425,7 +19425,7 @@ fn path_context_hop<V: DocumentValue>(
 ///
 /// A `?//` inside `driver` may have retried past that stop and then produced
 /// nothing or raised, in which case the stash describes an alternative jq
-/// abandoned and [`StashedEscape::take`] drops it. Otherwise a surviving
+/// abandoned and [`StashedVerdict::take`] drops it. Otherwise a surviving
 /// stash is the walk's failure and outranks the generator's own escape, and
 /// that escape is reported after the positions already produced.
 fn path_context_count_walk_result<S: EvalSemantics, V: DocumentValue>(
@@ -19773,9 +19773,9 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         //
         // `was_read_only`: see `path_context_step_computed_index`'s own doc
         // comment -- same defensive re-entry, same reason.
+        //
+        // #3293: `walk_error` is a `StashedEscape`, as in `Expr::If`'s arm.
         Expr::Builtin(Builtin::Skip(n, expr)) => {
-            //
-            // #3293: `walk_error` is a `StashedEscape`, as in `Expr::If`'s arm.
             let was_read_only = yq_read_only_context::active();
             let produced_from = out.len();
             let walk_error = StashedEscape::new();
