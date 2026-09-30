@@ -49349,3 +49349,20 @@ fn test_comma_array_unchanged_in_yq_mode_3317() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3476: the jq-mode route for `[(a, b) | c]` is gated off in yq mode, which
+/// keeps answering what it did. Captured live from yq v4.53.3.
+#[test]
+fn test_comma_head_pipe_array_unchanged_in_yq_mode_3476() -> Result<()> {
+    let input = "a: {x: 1}\nb: [2]\n";
+    for (filter, want) in [
+        ("[(.a, .b) | .[]?]", "[1,2]"),
+        ("[(., .) | .a]", r#"[{"x":1}]"#),
+        ("[(.a, .b) | length]", "[1,1]"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, input, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "#3476 `{filter}`");
+        assert_eq!(stdout.trim_end(), want, "#3476 `{filter}`");
+    }
+    Ok(())
+}

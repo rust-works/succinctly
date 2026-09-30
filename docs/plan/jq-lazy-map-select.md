@@ -631,6 +631,17 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     - Residual: an all-scalar body over many nodes holds its cursor list while the values
       are built, so `[.[0], .[]] | length` over 300k strings peaks at 74 MB instead of
       64 MB, with neutral time.
+  - **A `,` head behind a pipe:**
+    [#3476](https://github.com/rust-works/succinctly/issues/3476) — **landed**. `[(., .) | .data]`
+    reached `Expr::Pipe`, whose `Expr::Comma` head answers one owned tree per item, then
+    reindexed each for `.data` (293 MB on 8.4 MB; the bare stream took 26 MB). Direction (a)
+    (`Comma` answering `ManyCursor`) would change the result shape for pipes, path context,
+    `as` and assignment, and (b) (the sink route) would still collect owned items, so it
+    instead *distributes*: a pipe of pure navigation with a `,` head is the `,` of one pipe
+    per branch, which `comma_array_generic` already collects as cursors
+    (`split_comma_head`). 36 MB, 26 MB with `| length`. One behaviour moves: the array
+    reads only the nodes its pipe answers, so a malformed sibling the answer never contains no
+    longer raises, as `[.b]` and `(., .) | .b` already did.
 
 ## Critical files
 

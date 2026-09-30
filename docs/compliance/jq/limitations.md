@@ -2543,7 +2543,9 @@ printer, not the evaluator:
 An array constructor over document nodes renders each node from the document, so `[.]`,
 `[., .]` and `[.a, .b]` echo like `.` does. `[., .]` did so only after
 [#3317](https://github.com/rust-works/succinctly/issues/3317), which stopped building each
-comma item as an owned object first. Any item that is not a document node still makes the
+comma item as an owned object first; `[(., .) | .a]` did so only after
+[#3476](https://github.com/rust-works/succinctly/issues/3476), which took a `,` head behind a
+pipe of navigation the same way. Any item that is not a document node still makes the
 whole array owned, and collapsed: a computed one (`[., 1]`), or the `null` a missing key
 reads as (`[.a, .missing]`).
 
@@ -3447,6 +3449,21 @@ read the bad token -- `.[]|type`, `map(type)` on `[nul]`, `.b`, a bare
 the same lazy-vs-atomic parse divergence the section above records for
 partial output; a whole-input pre-validate (`--validate`) still rejects
 all of these.
+
+An array constructor over a `,` head behind a pipe is one more filter that answers without
+reading the token ([#3476](https://github.com/rust-works/succinctly/issues/3476)). It built each
+comma item whole before the pipe ran, so it raised over a malformed sibling its answer never
+held; it now reads only the nodes the pipe answers, as `[.b]` and the stream `(., .) | .b`
+always did:
+
+```
+$ echo '{"a":{"k":tru},"b":2}' | jq  -c '[(., .) | .b]'   # (parses nothing) exit 5
+$ echo '{"a":{"k":tru},"b":2}' | sjq -c '[(., .) | .b]'   # [2,2]             exit 0
+$ echo '{"a":{"k":tru},"b":2}' | sjq -c '[(., .) | .a]'   # (raises)          exit 5
+```
+
+The `.a` row shows the rule still holds: a node the array *holds* is validated before anything
+prints.
 
 ### PR #2291 code review: eleven more sibling paths, found by a systematic sweep
 

@@ -3672,8 +3672,12 @@ fn fold_generic_owned_values<V: DocumentValue, S: EvalSemantics>(
 ///
 /// A computed branch (`[., 1]`) never comes here: its array ends up owned
 /// whatever the others are, so `Expr::Array` keeps it on the `Comma` route.
+/// A `,` head behind a pipe of navigation comes here too (#3476): `exprs` are
+/// the head's branches and `tail` the stages each one is piped through
+/// ([`split_comma_head`]); a plain `,` body has an empty `tail`.
 fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
+    tail: &[Expr],
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
@@ -3684,7 +3688,12 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     // it then, and the answer is this owned array.
     let mut owned: Option<Vec<OwnedValue>> = None;
     for expr in exprs {
-        let result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
+        let mut result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
+        if !tail.is_empty() {
+            // The `Expr::Pipe` arm's own staged fold, which is all a pipe of
+            // pure navigation reaches there.
+            result = fold_pipe_stages::<S, V>(result, tail, optional);
+        }
         let escape = match (owned.as_mut(), result) {
             (None, GenericResult::OneCursor(c)) => {
                 nodes.push(c);
@@ -3742,6 +3751,47 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     GenericResult::Owned(OwnedValue::array_from(owned_or_err!(
         to_owned_all_cursors::<S, _>(&nodes)
     )))
+}
+
+/// `(a, b, ...) | rest`, split into its `,` branches and the tail each one
+/// runs through, when the whole pipe is pure navigation (#3476); `None` for
+/// any other body.
+///
+/// `[(., .) | .data]` reached `Expr::Pipe`, whose head `Expr::Comma` answers
+/// one owned tree per item, and `.data` then ran against each through a
+/// reindex: 293 MB on an 8.4 MB document where `(., .) | .data | length`
+/// took 26 MB. A pipe applies `rest` to each output of its head in order, so
+/// the pipe is the same outputs in the same order as the `,` of one pipe per
+/// branch -- which is [`comma_array_generic`]'s own body shape, so it keeps
+/// each `.data` as its node and answers the same cursor sequence
+/// `[.data, .data]` does. The tail is run per branch by
+/// [`comma_array_generic`] itself, so nothing is rebuilt per evaluation.
+///
+/// The regrouping is sound because every stage is
+/// [`path_expr_is_cursor_navigable`]: no side effect for it to reorder, the
+/// argument [`comma_array_generic`] already makes for running a later
+/// branch's failure ahead of an earlier one's decode, and no stage the
+/// `Expr::Pipe` arm routes differently (path context, an `as` head, the owned
+/// identity pipe). **Widening that predicate widens this route** -- a stage
+/// with a side effect or its own routing must not be admitted to it without
+/// revisiting both, and the unit test `test_comma_head_pipe_array_route_3476`
+/// pins today's edge.
+///
+/// One thing does change: a node the pipe *discards* is no longer walked
+/// (`[(., .) | .data]` no longer decodes the rest of the document), as
+/// `[.data]` and `(., .) | .data | length` never did.
+fn split_comma_head(body: &Expr) -> Option<(&[Expr], &[Expr])> {
+    let Expr::Pipe(stages) = unwrap_paren(body) else {
+        return None;
+    };
+    let (head, rest) = stages.split_first()?;
+    let Expr::Comma(branches) = unwrap_paren(head) else {
+        return None;
+    };
+    if rest.is_empty() || !stages.iter().all(path_expr_is_cursor_navigable) {
+        return None;
+    }
+    Some((branches, rest))
 }
 
 /// [`validate_cursor`] over `nodes` in order, stopping at the first failure.
@@ -9655,8 +9705,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             if S::TAG == EvalTag::Jq {
                 if let Expr::Comma(exprs) = unwrap_paren(inner) {
                     if exprs.iter().all(path_expr_is_cursor_navigable) {
-                        return comma_array_generic::<S, V>(exprs, value, optional, cursor);
+                        return comma_array_generic::<S, V>(exprs, &[], value, optional, cursor);
                     }
+                }
+                // #3476: the same body behind a pipe, `[(., .) | .data]`.
+                if let Some((branches, tail)) = split_comma_head(inner) {
+                    return comma_array_generic::<S, V>(branches, tail, value, optional, cursor);
                 }
             }
             let inner_result = eval_single::<S, _>(inner, value, optional, cursor);
@@ -39086,6 +39140,82 @@ mod tests {
         assert_eq!(comma_array_route::<YqSemantics>("[.a, .b]", doc), "owned");
         // A body that is not an array construction is none of the three.
         assert_eq!(comma_array_route::<JqSemantics>(".m", doc), "other");
+    }
+
+    /// #3476: a `,` head behind a pipe of pure navigation takes the same
+    /// route as a `,` body, and everything that route does not take stays
+    /// owned.
+    #[test]
+    fn test_comma_head_pipe_array_route_3476() {
+        let doc = r#"{"a":{"x":1},"b":[2],"n":"s","m":3}"#;
+        for query in [
+            "[(., .) | .a]",
+            "[(., .) | .[]]",
+            "[((., .)) | .a]",
+            "[(., .) | .a | .]",
+            "[(.a, .b) | .[]?]",
+        ] {
+            let want = if query == "[(.a, .b) | .[]?]" {
+                // Every item a scalar (`1`, `2`): a small array is cheaper.
+                "owned"
+            } else {
+                "prevalidated"
+            };
+            assert_eq!(
+                comma_array_route::<JqSemantics>(query, doc),
+                want,
+                "{query}"
+            );
+        }
+        for query in [
+            // Every item a scalar: a small array is cheaper than a sequence.
+            "[(., .) | .m]",
+            // A navigation miss is a computed `null`.
+            "[(., .) | .missing]",
+            // A computed stage is not pure navigation.
+            "[(., .) | .a | length]",
+            "[(., .) | .a | select(.x)]",
+            // Parsed as `(.a, .b) | (.[]?, 1)`: a literal in the tail.
+            "[(.a, .b) | .[]?, 1]",
+            // The head is not a `,`: nothing to distribute.
+            "[.a | (., .)]",
+            // The `,` sits under a `?`, which the head match does not see through.
+            "[((., .))? | .a]",
+        ] {
+            assert_eq!(
+                comma_array_route::<JqSemantics>(query, doc),
+                "owned",
+                "{query}"
+            );
+        }
+        // yq never enters: its own union pipe (#2451) is not this route, so
+        // what it answered before is unchanged (`prevalidated` is jq's alone).
+        assert_ne!(
+            comma_array_route::<YqSemantics>("[(., .) | .a]", doc),
+            "prevalidated"
+        );
+    }
+
+    /// #3476: which bodies [`split_comma_head`] takes, independent of what
+    /// the route then does with them.
+    #[test]
+    fn test_split_comma_head_3476() {
+        let body = |query: &str| match crate::jq::parse(query).unwrap() {
+            Expr::Array(inner) => *inner,
+            other => panic!("`{query}` is not an array construction: {other:?}"),
+        };
+        let split = |query: &str| {
+            split_comma_head(&body(query)).map(|(branches, tail)| (branches.len(), tail.len()))
+        };
+        assert_eq!(split("[(., .) | .a]"), Some((2, 1)));
+        assert_eq!(split("[(.a, .b, .c) | .x | .y]"), Some((3, 2)));
+        assert_eq!(split("[((., .)) | .a]"), Some((2, 1)));
+        // No pipe, no `,` head, a computed stage, or a `,` under a `?`.
+        assert_eq!(split("[., .]"), None);
+        assert_eq!(split("[.a | (., .)]"), None);
+        assert_eq!(split("[(., .) | length]"), None);
+        assert_eq!(split("[(., .) | . + 1]"), None);
+        assert_eq!(split("[((., .))? | .a]"), None);
     }
 
     /// #3317: the `,` producer's sequence prints as its `Cursors` source,
