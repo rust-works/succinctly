@@ -109190,15 +109190,6 @@ mod tests {
                 "path(.[0] as $y | .[-2] | $y)",
                 r"[[-2]]",
             ),
-            // slice-spelling, refuse-only until #3464: jq's `.a[1:]` and
-            // `.a[1:3]` of a 3-array are the same jv (same offset and
-            // length), and `same_frame_position` now resolves both bounds
-            // against the array
-            (
-                br#"{"a":[1,2,3]}"#,
-                "path(.a[1:] as $y | .a[1:3] | $y)",
-                r#"[["a",{"start":1,"end":3}]]"#,
-            ),
             // catch-handler-var, refuse-only until #3133: jq restores the
             // register to the `try`'s entry when it catches, and the
             // handler now runs with that register in hand, so `$y` -- which
@@ -109485,6 +109476,32 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// slice-spelling (#3464): jq's `.a[1:]` and `.a[1:3]` of a 3-array are
+    /// the same jv (same offset and length), and `same_frame_position`
+    /// resolves both bounds against the invocation's root to see it. The root
+    /// is `std` only (`invocation_roots`), so this row lives outside the
+    /// shared accepting matrix, which also runs under `--no-default-features`.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_path_bind_origin_slice_spelling_accepts_3464() {
+        assert_eq!(
+            bind_origin_outputs(br#"{"a":[1,2,3]}"#, "path(.a[1:] as $y | .a[1:3] | $y)")
+                .expect("jq answers this"),
+            r#"[["a",{"start":1,"end":3}]]"#
+        );
+    }
+
+    /// The `no_std` degradation of the row above: with no root recorded the
+    /// two slice spellings cannot be resolved, so a differing pair refuses,
+    /// as [`same_frame_position`] documents.
+    #[test]
+    #[cfg(not(feature = "std"))]
+    fn test_path_bind_origin_slice_spelling_refuses_without_a_root_3464() {
+        assert!(
+            bind_origin_outputs(br#"{"a":[1,2,3]}"#, "path(.a[1:] as $y | .a[1:3] | $y)").is_err()
+        );
     }
 
     /// The refusing half of the matrix: every row is a shape where a
