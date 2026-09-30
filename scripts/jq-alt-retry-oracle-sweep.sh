@@ -465,6 +465,64 @@ for fold_family in S SOK I; do
   done
 done
 
+# #3293 slice 8b (`recurse`): `f`'s first `?//` alternative yields a child whose
+# own expansion raises `E`; the retry answers, produces nothing, raises, or
+# fails to destructure. The marker is `as $_` (jq path-tracks `path(recurse(f))`).
+# `__F__` stands for `f`; input is RETRY_INPUT (`[10,20,30]`).
+RC_VARIANTS=(
+  'if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end'
+  'if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else empty end) elif length==1 then error("E") else empty end'
+  'if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end'
+  'if length==3 then ([1] as $q ?// {$z} | ("A"|stderr) as $_ | .[0:1]) elif length==1 then error("E") else empty end'
+)
+RC_ENTRIES=(
+  'recurse::::[recurse(__F__)]'
+  'recurse-cond::::[recurse(__F__; true)]'
+  'path-recurse::::[path(recurse(__F__))]'
+  'del-recurse::::del(recurse(__F__))'
+  'update-recurse::::(recurse(__F__)) |= .'
+)
+# `?//` in `recurse`'s `cond` (the gate): alternative 1 lets the child through
+# and its expansion raises `E`; the retry rejects it, passes another, raises,
+# or fails to destructure.
+RG_VARIANTS=(
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then true else length>1 end)'
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then true else empty end)'
+  '([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then true else error("E2") end)'
+  '([1] as $q ?// {$z} | ("A"|stderr) as $_ | true)'
+)
+RG_ENTRIES=(
+  'recurse-gate::::[recurse(if length==3 then .[0:1], .[1:] elif length==1 then error("E") else empty end; __C__)]'
+  'path-recurse-gate::::[path(recurse(if length==3 then .[0:1], .[1:] elif length==1 then error("E") else empty end; __C__))]'
+)
+for rg_entry in "${RG_ENTRIES[@]}"; do
+  rg_rest="$rg_entry"
+  rg_label="${rg_rest%%::*}"
+  rg_rest="${rg_rest#*::}"
+  rg_tag="${rg_rest%%::*}"
+  rg_template="${rg_rest#*::}"
+  for v in "${RG_VARIANTS[@]}"; do
+    rg_filled="${rg_template//__C__/$v}"
+    for c in "${R_CONSUMERS[@]}"; do
+      run_case "$rg_label" "${c//__W__/$rg_filled}" "$rg_tag" "$RETRY_STDIN_FILE"
+    done
+  done
+done
+
+for rc_entry in "${RC_ENTRIES[@]}"; do
+  rc_rest="$rc_entry"
+  rc_label="${rc_rest%%::*}"
+  rc_rest="${rc_rest#*::}"
+  rc_tag="${rc_rest%%::*}"
+  rc_template="${rc_rest#*::}"
+  for v in "${RC_VARIANTS[@]}"; do
+    rc_filled="${rc_template//__F__/$v}"
+    for c in "${R_CONSUMERS[@]}"; do
+      run_case "$rc_label" "${c//__W__/$rc_filled}" "$rc_tag" "$RETRY_STDIN_FILE"
+    done
+  done
+done
+
 printf '%s' "$divergence_log"
 echo "== $total cases vs $JQ: $unexpected unexpected, $((diverged - unexpected)) known, $((total - diverged)) matched =="
 if ((diverged > unexpected)); then

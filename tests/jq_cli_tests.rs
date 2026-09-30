@@ -78227,6 +78227,329 @@ const RETRY_ROWS_PATH_FOLD_3293: &[RetryRow3293] = &[
     ),
 ];
 
+/// #3293 slice 8b: a `?//` retry inside `recurse(f)` / `recurse(f; cond)`'s
+/// generator supersedes the abort the walk stashed when a deeper node failed
+/// (`stop_on_abort`, the value and path walkers' `expand`/`gate`). `f`'s
+/// first alternative yields a child whose own expansion raises `E`; the
+/// retry answers, produces nothing, raises, or fails to destructure.
+/// `first`/`limit` rows pin a consumer's stop, the write rows (`del`, `|=`,
+/// `pick`) the shared path walker. Controls: no `?//`, `?`, and a `halt_error`
+/// in a deeper node, which is never retried. Input `[10,20,30]`; every value
+/// captured from jq 1.7.1 with `-c`.
+const RETRY_ROWS_RECURSE_3293: &[RetryRow3293] = &[
+    // recurse
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)]"#,
+        "[[10,20,30],[10],[20,30]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end))]"#,
+        "[[],[{\"start\":0,\"end\":1}],[{\"start\":1,\"end\":null}]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end; true)]"#,
+        "[[10,20,30],[10],[20,30]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end; true))]"#,
+        "[[],[{\"start\":0,\"end\":1}],[{\"start\":1,\"end\":null}]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else empty end) elif length==1 then error("E") else empty end)]"#,
+        "[[10,20,30],[10]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else empty end) elif length==1 then error("E") else empty end))]"#,
+        "[[],[{\"start\":0,\"end\":1}]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else empty end) elif length==1 then error("E") else empty end; true)]"#,
+        "[[10,20,30],[10]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else empty end) elif length==1 then error("E") else empty end; true))]"#,
+        "[[],[{\"start\":0,\"end\":1}]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end))]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end; true)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end; true))]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// {$z} | ("A"|stderr) as $_ | .[0:1]) elif length==1 then error("E") else empty end)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[path(recurse(if length==3 then ([1] as $q ?// {$z} | ("A"|stderr) as $_ | .[0:1]) elif length==1 then error("E") else empty end))]"#,
+        "",
+        "A",
+        "Invalid path expression near attempt to access element \"z\" of [1]",
+        5,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// {$z} | ("A"|stderr) as $_ | .[0:1]) elif length==1 then error("E") else empty end; true)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[path(recurse(if length==3 then ([1] as $q ?// {$z} | ("A"|stderr) as $_ | .[0:1]) elif length==1 then error("E") else empty end; true))]"#,
+        "",
+        "A",
+        "Invalid path expression near attempt to access element \"z\" of [1]",
+        5,
+    ),
+    (
+        r#"[first(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)), 9]"#,
+        "[[10,20,30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end))), 9]"#,
+        "[[],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#"[first(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end)), 9]"#,
+        "[[10,20,30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(2; recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)), 9]"#,
+        "[[10,20,30],[10],[20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(2; path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end))), 9]"#,
+        "[[],[{\"start\":0,\"end\":1}],[{\"start\":1,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(2; recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end)), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end), 9]"#,
+        "[[10,20,30],[10],[20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)), 9]"#,
+        "[[],[{\"start\":0,\"end\":1}],[{\"start\":1,\"end\":null}],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end) | select(length==2)), 9]"#,
+        "[[20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)) | select(length==2)), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end) | select(length==2)), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end) | length]"#,
+        "[3,1,2]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end) | .[0]]"#,
+        "[10,10,20]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end))"#,
+        "null\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else empty end))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)) |= ."#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)) |= [9]"#,
+        "[9,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"pick(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end))"#,
+        "[10,20,30]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // recurse-gate
+    (
+        r#"[recurse(if length==3 then .[0:1], .[1:] elif length==1 then error("E") else empty end; ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then true else length>1 end))]"#,
+        "[[10,20,30],[10],[20,30]]\n",
+        "AAA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(recurse(if length==3 then .[0:1], .[1:] elif length==1 then error("E") else empty end; ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then true else length>1 end)))]"#,
+        "[[],[{\"start\":0,\"end\":1}],[{\"start\":1,\"end\":null}]]\n",
+        "AAA",
+        "",
+        0,
+    ),
+    (
+        r#"[recurse(if length==3 then .[0:1], .[1:] elif length==1 then error("E") else empty end; ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then true else error("E2") end))]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(recurse(if length==3 then .[0:1], .[1:] elif length==1 then error("E") else empty end; ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then true else length>1 end))), 9]"#,
+        "[[10,20,30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    // recurse-control
+    (
+        r#"[recurse(if length==3 then .[0:1] elif length==1 then error("E") else empty end)]"#,
+        "",
+        "",
+        "E",
+        5,
+    ),
+    (
+        r#"[path(recurse(if length==3 then .[0:1] elif length==1 then error("E") else empty end))]"#,
+        "",
+        "",
+        "E",
+        5,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then ("h"|halt_error) else empty end)]"#,
+        "",
+        "A",
+        "h",
+        5,
+    ),
+    (
+        r#"[path(recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then ("h"|halt_error) else empty end))]"#,
+        "",
+        "A",
+        "h",
+        5,
+    ),
+    (
+        r#"[recurse(if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else empty end)?, 9]"#,
+        "[[10,20,30],[10],[20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
 #[test]
 fn test_path_bind_source_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_PATH_BIND_SOURCE_3293)
@@ -78235,6 +78558,11 @@ fn test_path_bind_source_retry_supersedes_stashed_verdict_3293() -> Result<()> {
 #[test]
 fn test_path_fold_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_PATH_FOLD_3293)
+}
+
+#[test]
+fn test_recurse_retry_supersedes_stashed_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_RECURSE_3293)
 }
 
 /// #3293 review: `first`/`limit`/`nth` reset the wrapping sink's stop per
@@ -78650,6 +78978,7 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("{} | ", RETRY_ROWS_FOLD_3293),
         ("[10,20,30] | ", RETRY_ROWS_PATH_BIND_SOURCE_3293),
         ("[10,20,30] | ", RETRY_ROWS_PATH_FOLD_3293),
+        ("[10,20,30] | ", RETRY_ROWS_RECURSE_3293),
     ] {
         assert_retry_rows_3293(None, prefix, rows)?;
     }
@@ -78676,6 +79005,10 @@ fn test_retry_sink_reset_leaves_yq_mode_unchanged_3293() -> Result<()> {
         // slice 8a: the path-mode bind source is shared with yq's `=` and `del`
         ("(.a as $y | .b) = 5", r#"{"a":1,"b":5,"k":"a"}"#),
         ("del(.a as $y | .b)", r#"{"a":1,"k":"a"}"#),
+        // slice 8b: `recurse`'s walkers are shared with yq's `..`
+        ("del(.. | select(. == 1))", r#"{"b":true,"k":"a"}"#),
+        ("(.. | select(. == 1)) = 5", r#"{"a":5,"b":true,"k":"a"}"#),
+        ("[..] | length", "4"),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
             .args(["yq", "-o", "json", "-I", "0", filter])

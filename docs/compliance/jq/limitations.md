@@ -677,6 +677,27 @@ and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` 
   cursor route's value-mode `limit` already retries. jq 1.7.1 has no `skip`, so its rows follow
   `limit`'s.
 
+## `recurse` and a `?//` retry in `f` or `cond` (#3293)
+
+A `?//` in the generator `recurse(f)` / `recurse(f; cond)` drives retries past the abort a deeper
+node raised, as jq's does: `[recurse(if length==3 then ([1] as $q ?// $b | if $q then .[0:1] else
+.[1:] end) elif length==1 then error("E") else empty end)]` on `[10,20,30]` is
+`[[10,20,30],[10],[20,30]]` (the first alternative's child `[10]` fails when it is expanded; the
+retry's child is fine), was the abandoned alternative's `E`. The value and path walkers, and so
+`path(recurse(f))`, `del`, `|=` and `pick` over it, follow. What it leaves:
+
+- **`no_std` recognises only a direct bind**, for the reason the fold section above gives: an `f`
+  that *is* a `?//` bind is covered, and one wrapped in an `if`, `first` or a pipe keeps the
+  previous answer there (the example above errors).
+- **The queued order** (`expand_queued`, used past the native stack budget) collects `f` in full
+  before it descends into any child, so no retry can follow a child's failure there and its stash
+  needed no change. No row here runs queued: it starts only in a walk deeper than the native
+  budget.
+- **`while`/`until` never retry a `?//` in their update** (a single attempt, then the error):
+  `[.|while(length>0; U)]` with a `?//` in `U` is jq's `[[10,20,30],[10],[20,30]]` and an error
+  here. Not a stale slot: the route materialises the update before the retry can happen, the #2180
+  "materialized before the consumer" family (#3410).
+
 ## Where succinctly errors and jq does not
 
 A probe is only admitted to the corpus if jq errors on it, so the corpus is blind to the
