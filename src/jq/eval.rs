@@ -6728,7 +6728,7 @@ fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let all_var_names = pattern_alternatives_var_names(patterns);
     // #3466: the ambient node's cursor, when this bind follows the document
     // at all; a source's own node is re-resolved against it.
-    let anchor = destructure_identity_tracked::<S>(patterns)
+    let anchor = destructure_identity_tracked::<S>(patterns, body)
         .then(|| standard_json_node_cursor(&value))
         .flatten();
 
@@ -6819,15 +6819,13 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // the body's whole extent, exactly as `each_as`'s does, and
                 // so is registered in the embed table; the guards drop with
                 // this binding set, so nothing outlives an alternative.
-                #[allow(clippy::collection_is_never_read)]
-                // held for their `Drop`, which pops the table
-                let mut embedded = Vec::new();
+                let mut embedded = super::eval_generic::EmbedGuards::default();
                 let substituted_body = substitute_destructured_bindings::<S>(
                     body,
                     bindings,
                     all_var_names,
                     |origin, bound| {
-                        embedded.extend(super::eval_generic::embed_table_push::<S>(origin, bound));
+                        embedded.hold(super::eval_generic::embed_table_push::<S>(origin, bound));
                     },
                 );
 
@@ -65145,12 +65143,16 @@ const MAX_TRACKED_PATTERN_ENTRIES: usize = 64;
 
 /// Whether a destructuring bind follows the document node each variable
 /// sits at (#3466): jq mode only, only for a program that can read a
-/// variable's identity ([`scalar_identity_readable`], #3191's gate), and
-/// only for a pattern narrow enough to walk cheaply. Anything else binds by
-/// value exactly as before.
+/// variable's identity ([`destructure_identity_readable`], #3191's gate
+/// asked of `body` where no entry point decided), and only for a pattern
+/// narrow enough to walk cheaply. Anything else binds by value exactly as
+/// before.
 ///
-/// [`scalar_identity_readable`]: super::eval_generic::scalar_identity_readable
-pub(crate) fn destructure_identity_tracked<S: EvalSemantics>(patterns: &[Pattern]) -> bool {
+/// [`destructure_identity_readable`]: super::eval_generic::destructure_identity_readable
+pub(crate) fn destructure_identity_tracked<S: EvalSemantics>(
+    patterns: &[Pattern],
+    body: &Expr,
+) -> bool {
     fn entries(pattern: &Pattern) -> usize {
         match pattern {
             Pattern::Var(_) => 0,
@@ -65159,7 +65161,7 @@ pub(crate) fn destructure_identity_tracked<S: EvalSemantics>(patterns: &[Pattern
         }
     }
     S::TAG == EvalTag::Jq
-        && super::eval_generic::scalar_identity_readable()
+        && super::eval_generic::destructure_identity_readable(body)
         && patterns.iter().map(entries).sum::<usize>() <= MAX_TRACKED_PATTERN_ENTRIES
 }
 
@@ -65219,6 +65221,9 @@ fn cursor_child<C: DocumentCursor>(cur: &C, key: &PatternKey<'_>) -> Option<C> {
         PatternKey::Position(i) => array_element_cursor(cur, *i),
         PatternKey::Computed(OwnedValue::String(s)) => object_member_cursor(cur, s.as_ref()),
         PatternKey::Computed(OwnedValue::Int(i)) => array_element_cursor(cur, *i),
+        PatternKey::Computed(OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => {
+            array_element_cursor(cur, *i)
+        }
         PatternKey::Computed(_) => None,
     }
 }

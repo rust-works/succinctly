@@ -6411,6 +6411,27 @@ mod embed_table {
 /// The RAII guard [`embed_table_push`] returns (#2889).
 pub(crate) type EmbedGuard = embed_table::Guard;
 
+/// The guards of one destructuring binding set's variables (#3466), released
+/// newest-first -- the LIFO order [`embed_table`]'s `Guard` documents -- where
+/// a bare `Vec` would drop them oldest-first.
+#[derive(Default)]
+pub(crate) struct EmbedGuards(Vec<EmbedGuard>);
+
+impl EmbedGuards {
+    /// Keep `guard`, if the push made one, alive until `self` drops.
+    pub(crate) fn hold(&mut self, guard: Option<EmbedGuard>) {
+        self.0.extend(guard);
+    }
+}
+
+impl Drop for EmbedGuards {
+    fn drop(&mut self) {
+        while let Some(guard) = self.0.pop() {
+            drop(guard);
+        }
+    }
+}
+
 /// Register `value` as the in-scope materialization of the document node
 /// `origin` names, for as long as the returned guard lives (#2889).
 ///
@@ -6815,6 +6836,18 @@ pub(crate) fn embed_anchors_active() -> bool {
 /// promoted handle through where jq allocates.
 pub(crate) fn scalar_identity_readable() -> bool {
     anchor_scope::get() != AnchorScope::Off
+}
+
+/// [`scalar_identity_readable`] for a bind whose `body` is at hand (#3466):
+/// where no entry point decided the program's scope ([`AnchorScope::Unknown`]),
+/// ask of the body, as [`embed_anchor_push`] does, so a bind whose body can
+/// never start a resolver pays nothing.
+pub(crate) fn destructure_identity_readable(body: &Expr) -> bool {
+    match anchor_scope::get() {
+        AnchorScope::Off => false,
+        AnchorScope::On => true,
+        AnchorScope::Unknown => super::eval::may_enter_resolver(body),
+    }
 }
 
 /// Whether any `as` binding's value is currently registered in the embed
@@ -12305,7 +12338,7 @@ fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     let all_var_names = pattern_alternatives_var_names(patterns);
     // #3466: whether this bind follows the document at all.
-    let tracked = crate::jq::eval::destructure_identity_tracked::<S>(patterns);
+    let tracked = crate::jq::eval::destructure_identity_tracked::<S>(patterns, body);
 
     fanout_arg_each_generic_with_origin::<S, V, _>(
         expr,
@@ -12408,16 +12441,14 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
                 // does -- the embed table, and where the storage clause
                 // cannot certify it, its anchor. The guards drop with this
                 // binding set, so nothing outlives an alternative.
-                #[allow(clippy::collection_is_never_read)]
-                // held for their `Drop`, which pops the table
-                let mut embedded = Vec::new();
+                let mut embedded = EmbedGuards::default();
                 let substituted_body = crate::jq::eval::substitute_destructured_bindings::<S>(
                     body,
                     bindings,
                     all_var_names,
                     |origin, bound| {
-                        embedded.extend(embed_table_push::<S>(origin, bound));
-                        embedded.extend(embed_anchor_push::<S, _>(
+                        embedded.hold(embed_table_push::<S>(origin, bound));
+                        embedded.hold(embed_anchor_push::<S, _>(
                             origin,
                             bound,
                             cursor.as_ref(),

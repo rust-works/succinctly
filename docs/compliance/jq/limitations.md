@@ -1857,7 +1857,12 @@ is the revert that established what the other one costs.
    `destructure-bind-node-*` rows. **Still refuse-only:** the source is a *constructed* value --
    `[.a.b] as [$z] \| path(.a.b \| $z)` is `["a","b"]` in jq, whose array holds the very `jv`,
    but an element of a freshly built array has no node here, and carrying identity through
-   construction is the per-element `Rc` #3191 declined. `succinctly yq` is unchanged.
+   construction is the per-element `Rc` #3191 declined. The routes that bind a pattern from an
+   *owned* value stay by-value too, so they refuse as they did: a `reduce`/`foreach` loop
+   pattern, a fold UPDATE (`reduce (1) as $i (.; . as {a:$v} \| path(.a \| $v))`, jq `["a"]`),
+   the owned-identity pipe (`-n 'input \| . as {a:$v} \| ...'`) and a pattern over a scalar the
+   borrowed evaluator reaches -- none has a cursor to follow. A pattern wider than 64 entries
+   binds by value as well. `succinctly yq` is unchanged.
 
    `?//` alternatives retry as they do in value mode, with one deliberate exception: the
    **artefact guard**. This resolver can raise refusals jq never raises — until

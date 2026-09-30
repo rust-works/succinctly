@@ -83779,3 +83779,63 @@ fn test_destructuring_bind_constructed_source_stays_refuse_only_3466() -> Result
     );
     Ok(())
 }
+
+/// #3466: a repeated key binds the last member (jq's own parse and ours agree
+/// on which value the variable holds), and a computed key steps by its
+/// evaluated value -- a literal `0`, a computed `-1`, an out-of-range one --
+/// end to end (rows captured from jq 1.7.1).
+#[test]
+fn test_destructuring_bind_duplicate_and_computed_keys_3466() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1,"a":2}"#,
+            ". as {a:$z} | path(.a | $z)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "[10,20,30]",
+            "0 as $k | . as {($k):$z} | path(.[0] | $z)",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (
+            "[10,20,30]",
+            "(0-1) as $k | . as {($k):$z} | path(.[-1] | $z)",
+            "[-1]\n",
+            "",
+            0,
+        ),
+        (
+            "[10,20,30]",
+            "(0-4) as $k | . as {($k):$z} | path(.[-3] | $z)",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+    ])
+}
+
+/// #3466: a pattern of more than 64 entries binds by value, so the per-step
+/// member scan cannot go quadratic on a very wide one. jq answers both
+/// widths; the 65-entry one is refuse-only here, and is the boundary this
+/// pins (`MAX_TRACKED_PATTERN_ENTRIES`).
+#[test]
+fn test_destructuring_bind_wide_pattern_binds_by_value_3466() -> Result<()> {
+    let pattern = |entries: usize| {
+        let rest: String = (1..entries).map(|i| format!(", $k{i}")).collect();
+        format!(". as {{a:$v{rest}}} | path(.a | $v)")
+    };
+    let input = r#"{"a":{"b":1}}"#;
+    let (stdout, _, code) = run_jq_full(&["-c", &pattern(64)], Some(input))?;
+    assert_eq!((stdout.as_str(), code), ("[\"a\"]\n", 0));
+    let (stdout, stderr, code) = run_jq_full(&["-c", &pattern(65)], Some(input))?;
+    assert_eq!(code, 5, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("Invalid path expression with result"),
+        "{stderr:?}"
+    );
+    Ok(())
+}
