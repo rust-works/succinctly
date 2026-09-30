@@ -43026,7 +43026,7 @@ mod tests {
                     anchor_step(&parent, *id, Some(&held)),
                     generic,
                     "node {id} of {}",
-                    String::from_utf8_lossy(doc)
+                    String::from_utf8_lossy(doc) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- a panic-message format argument for the #3483 differential test's own assertion, evaluated only if that assert's own condition is false (#3483)"
                 );
                 match step(anchor_step_by_nodes(&parent, *id, &held)) {
                     Some(fast) => assert_eq!(fast, generic, "fast path, node {id}"),
