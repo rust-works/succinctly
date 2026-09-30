@@ -79264,3 +79264,59 @@ fn test_comma_head_pipe_array_preserve_input_echoes_duplicates_3476() -> Result<
     assert_eq!(stdout.trim_end(), r#"[{"x":2},{"x":2}]"#);
     Ok(())
 }
+
+/// #3476: a tail of several stages, one of them answering several cursors
+/// (`.[]?`), runs per branch through the pipe fold. Answers, and the first
+/// failure in branch order, match `/usr/bin/jq` 1.7.1 -- and a malformed node
+/// the array holds still fails the whole construction with nothing printed.
+#[test]
+fn test_comma_head_pipe_array_multi_stage_tail_3476() -> Result<()> {
+    for (doc, filter, want) in [
+        (
+            r#"{"a":[{"x":1},{"x":2}],"b":[{"x":3},{"x":4}]}"#,
+            "[(.a, .b) | .[]? | .x]",
+            "[1,2,3,4]",
+        ),
+        (
+            r#"{"a":[{"x":1},{"x":[2]}],"b":[{"x":3}]}"#,
+            "[(.a, .b) | .[]? | .x]",
+            "[1,[2],3]",
+        ),
+        (
+            r#"{"a":[{"x":{"y":1}},{"x":{"y":2}}],"b":[{"x":{"y":3}}]}"#,
+            "[(.a, .b) | .[] | .x | .y]",
+            "[1,2,3]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "#3476 `{filter}` on {doc}: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3476 `{filter}` on {doc}");
+    }
+    for (doc, message) in [
+        // A later element of a later branch fails: nothing is printed.
+        (
+            r#"{"a":[{"x":1},{"x":2}],"b":[{"x":3},5]}"#,
+            r#"Cannot index number with string "x""#,
+        ),
+        (
+            r#"{"a":[{"x":1}],"b":[{"x":2},5,{"x":3}]}"#,
+            r#"Cannot index number with string "x""#,
+        ),
+        // The first branch already fails.
+        (
+            r#"{"a":[1,2],"b":"s"}"#,
+            r#"Cannot index number with string "x""#,
+        ),
+        // A malformed node the array holds (jq rejects it at parse time).
+        (r#"{"a":[{"x":1}],"b":[{"x":tru}]}"#, "invalid boolean"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", "[(.a, .b) | .[]? | .x]"], Some(doc))?;
+        assert_eq!(code, 5, "#3476 on {doc}: stderr={stderr:?}");
+        assert!(stdout.is_empty(), "#3476 on {doc}: stdout={stdout:?}");
+        assert!(
+            stderr.contains(message),
+            "#3476 on {doc}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
