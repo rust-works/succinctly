@@ -643,6 +643,33 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     37 → 11 MB at 1 MB; 5x faster wall at 10 MB). One behaviour moves: the array
     reads only the nodes its pipe answers, so a malformed sibling the answer never contains no
     longer raises, as `[.b]` and `(., .) | .b` already did.
+  - **Binding one of these arrays:**
+    [#3477](https://github.com/rust-works/succinctly/issues/3477) — **landed**.
+    `[.] as $a | $a | length` peaked at 168 MB on 8.4 MB (jq 1.7.1 122 MB) and
+    `[., .] as $a | $a | length` at 294 MB, against 19 and 24 MB for the bare `| length`. Two
+    separable costs, each measured with a bind-only control (`... as $a | 1`: 112 MB and
+    204 MB): binding materializes the whole owned tree, and a consumer without a native
+    answer then serializes and indexes that tree on top of it (+56 MB and +90 MB).
+    - **`length` needs no index.** `eval_owned_length` answers a container's count from the
+      tree, from both owned re-entries (`eval_each_owned`, `eval_on_owned`) and as a
+      pipe-front step of `projection_peel`. It is a helper of its own, not an arm of
+      `eval_owned_fast_path`, which also evaluates owned-assign right sides and the
+      resolver's conditions and would have widened both.
+    - **A comma sequence builds a repeated node once.** `[., .]` materialized two copies of
+      the document where jq holds one `jv`. `to_owned_all_cursors_shared` remembers a
+      container by node id (never by value: `[.x, .y]` with equal values stays two builds)
+      and is used only by the validated `,` producer, the one source that can name a node
+      twice. Sharing one storage also turns three rows the bind-origin sweep had as
+      refuse-only into agreements (`[., .] as $a | $a[0] as $y | $a[1] | path($y)`).
+    - **Measured** (release, Apple M5 Max, the box under heavy load, so RSS only): `[.] as
+      $a | $a | length` 168 → 112 MB, `[., .] as $a | $a | length` 294 → 112 MB (1 MB:
+      26 → 20 and 39 → 20 MB; 30 MB: 457 → 315 and 842 → 318 MB). The residual is the owned
+      tree the binding holds.
+    - **Not done.** Every other consumer of a bound array (`.[]`, `first`, `has`, `keys`,
+      `map`, `tojson`) still indexes the whole tree. A binding that holds the cursor
+      sequence itself would take the residual to ~20 MB but needs a value type `Expr` cannot
+      carry (it is not generic over the document), and touches every `TrackedVar` site the
+      #2889 / #3135 / #3177 identity rests on.
 
 ## Critical files
 

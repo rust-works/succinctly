@@ -8773,6 +8773,39 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
     })
 }
 
+/// `length` over an owned array or object, answered from the tree instead of
+/// through the re-index bridge (#3477): `[.] as $a | $a | length` held the
+/// bound array and then serialized and indexed all of it to count its
+/// elements.
+///
+/// The answer is a fresh integer, never a subvalue of `input`, so none of the
+/// spelling or identity concerns that keep navigation out of
+/// [`eval_owned_pure`]'s `Fresh` position apply. An owned object is already
+/// key-deduplicated, so its `len` is the count the bridge would read back.
+/// Everything else -- `null`, a string, a number, a boolean -- declines, and
+/// the bridge keeps its diagnostics and its per-mode rules.
+///
+/// Deliberately not an arm of [`eval_owned_fast_path`]: that function is also
+/// the stage evaluator behind `closed_expr_to_owned` (an owned-assign right
+/// side) and the resolver's owned evaluation, and a new arm there would widen
+/// what both accept. Called from the two owned re-entries that reach the
+/// bridge, [`eval_each_owned`] and `eval_generic::eval_on_owned`.
+pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
+    match expr {
+        Expr::Paren(inner) => eval_owned_length(inner, input),
+        Expr::Pipe(stages) => match stages.as_slice() {
+            [only] => eval_owned_length(only, input),
+            _ => None,
+        },
+        Expr::Builtin(Builtin::Length) => match input {
+            OwnedValue::Array(items) => Some(OwnedValue::Int(items.len() as i64)),
+            OwnedValue::Object(fields) => Some(OwnedValue::Int(fields.len() as i64)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// `add`/`min`/`max` over an owned container, computed here instead of
 /// through the re-index bridge -- but *only* when the answer turns out to
 /// be a document node an in-scope binding still holds (#2889).
@@ -9635,6 +9668,13 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     if let Some(flow) = eval_each_owned_fast_path::<S>(expr, input, optional, sink) {
         return flow;
     }
+    // #3477: a count needs no index over the container it counts.
+    if let Some(length) = eval_owned_length(expr, input) {
+        return match sink(length) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        };
+    }
     // #2889: `add`/`min`/`max` hand back one of their inputs rather than
     // computing a new value, and the round trip below would rebuild that
     // input as a copy. Before the peel, which cannot help here -- the fold
@@ -9771,15 +9811,23 @@ fn projection_peel<S: EvalSemantics>(
         flat.extend_from_slice(rest);
         return projection_peel::<S>(&Expr::Pipe(flat), input, optional, reentry, sink);
     }
-    if !matches!(first, Expr::Field(_) | Expr::Index { .. }) {
+    // #3477: a leading `length` steps to the count, then the rest runs on it.
+    let counted = eval_owned_length(first, input);
+    if counted.is_none() && !matches!(first, Expr::Field(_) | Expr::Index { .. }) {
         return None;
     }
     let rest = Expr::Pipe(rest.to_vec());
     if needs_path_context(&rest) {
         return None;
     }
-    let Ok(Some(child)) = eval_owned_navigation::<S>(first, input, optional)? else {
-        return None;
+    let child = match counted {
+        Some(count) => count,
+        None => {
+            let Ok(Some(child)) = eval_owned_navigation::<S>(first, input, optional)? else {
+                return None;
+            };
+            child
+        }
     };
     Some(eval_each_owned::<S>(
         &rest,
@@ -75905,6 +75953,56 @@ mod tests {
     /// path does not.
     fn debug_normalize<W: Clone + AsRef<[u64]>>(r: QueryResult<'_, W>) -> String {
         format!("{:?}", normalize(r))
+    }
+
+    /// #3477: `eval_owned_length` answers every container the way the
+    /// reindex bridge does, in both modes, and declines everything else so
+    /// the bridge keeps its diagnostics and per-mode rules.
+    #[test]
+    fn eval_owned_length_agrees_with_the_reindex_bridge_3477() {
+        let mut values = pure_value_matrix();
+        values.push(OwnedValue::array_from(vec![]));
+        values.push(OwnedValue::object_from(Vec::<(String, OwnedValue)>::new()));
+        values.push(OwnedValue::array_from(vec![
+            OwnedValue::Int(1),
+            OwnedValue::Null,
+            OwnedValue::String("x".into()),
+        ]));
+        let mut answered = 0;
+        for value in &values {
+            for src in ["length", "(length)", ". | length"] {
+                let expr = parse(src).unwrap();
+                let expr = match &expr {
+                    // `. | length` is a two-stage pipe: only the one-stage
+                    // spellings are this helper's to answer.
+                    Expr::Pipe(stages) if stages.len() > 1 => {
+                        assert!(eval_owned_length(&expr, value).is_none(), "{src}");
+                        continue;
+                    }
+                    _ => expr,
+                };
+                let is_container = matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
+                let Some(fast) = eval_owned_length(&expr, value) else {
+                    assert!(!is_container, "{src:?} on {value:?} declined a container");
+                    continue;
+                };
+                assert!(
+                    is_container,
+                    "{src:?} on {value:?} answered a non-container"
+                );
+                answered += 1;
+                let jq = debug_normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let yq = debug_normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                    &expr, value, false,
+                ));
+                let fast = debug_normalize(QueryResult::<Vec<u64>>::Owned(fast));
+                assert_eq!(fast, jq, "jq mode: {src:?} on {value:?}");
+                assert_eq!(fast, yq, "yq mode: {src:?} on {value:?}");
+            }
+        }
+        assert!(answered > 10, "the matrix must reach the container arms");
     }
 
     #[test]

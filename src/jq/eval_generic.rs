@@ -765,6 +765,36 @@ pub fn to_owned_all_cursors<'a, S: EvalSemantics, C: DocumentCursor + 'a>(
     cursors.into_iter().map(to_owned_cursor::<S, _>).collect()
 }
 
+/// [`to_owned_all_cursors`], except that a container node named more than
+/// once is built once and shared (#3477).
+///
+/// `[., .] as $a` held two whole copies of the document where jq holds one
+/// `jv` twice. Sharing is keyed by node id, never by value, so two distinct
+/// nodes that happen to be equal stay separate. Only containers are
+/// remembered: a scalar is cheaper to rebuild than to look up, and a
+/// container is where the copy costs anything. Every cursor here comes from
+/// one document, so an id names one node.
+fn to_owned_all_cursors_shared<S: EvalSemantics, C: DocumentCursor>(
+    cursors: &[C],
+) -> Result<Vec<OwnedValue>, EvalError> {
+    let mut built: alloc::collections::BTreeMap<usize, OwnedValue> =
+        alloc::collections::BTreeMap::new();
+    let mut out = vec_with_capacity(cursors.len());
+    for cursor in cursors {
+        let id = cursor.node_id();
+        if let Some(shared) = built.get(&id) {
+            out.push(shared.clone());
+            continue;
+        }
+        let value = to_owned_cursor::<S, _>(cursor)?;
+        if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+            built.insert(id, value.clone());
+        }
+        out.push(value);
+    }
+    Ok(out)
+}
+
 /// [`to_owned_all_cursors`]'s prefix-preserving sibling (#2145): on a decode
 /// failure, returns whatever converted successfully *before* the failing
 /// cursor instead of discarding it -- `.collect::<Result<Vec<_>, _>>()`
@@ -2736,8 +2766,21 @@ impl<V: DocumentValue> LazySeq<V> {
         // each to `OwnedValue` -- is pure overhead here. Map cursors
         // straight to `OwnedValue` in one pass instead.
         if self.instructions.is_none() && self.pending.is_empty() {
-            if let LazySource::Cursors { cursors, next, .. } = &self.source {
+            if let LazySource::Cursors {
+                cursors,
+                next,
+                validated,
+            } = &self.source
+            {
                 let remaining = &cursors[*next..];
+                // #3477: only the `,` producer can name a node twice
+                // (`[., .]`); `[.]` has one node and `[.[]]` distinct
+                // children, where a per-element lookup would be pure cost.
+                if *validated {
+                    return to_owned_all_cursors_shared::<S, _>(remaining)
+                        .map(OwnedValue::array_from)
+                        .map_err(Control::Error);
+                }
                 return to_owned_all_cursors::<S, _>(remaining)
                     .map(OwnedValue::array_from)
                     .map_err(Control::Error);
@@ -3045,6 +3088,11 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // through the bridge too, and this arm is speed-only.
     if let Expr::Builtin(Builtin::ToString) = expr {
         return GenericResult::Owned(tostring_owned::<S>(owned));
+    }
+
+    // #3477: a count needs no index over the container it counts.
+    if let Some(length) = crate::jq::eval::eval_owned_length(expr, &owned) {
+        return GenericResult::Owned(length);
     }
 
     // #2889: `add`/`min`/`max` relocate one of their inputs rather than
@@ -39276,6 +39324,95 @@ mod tests {
             comma_array_route::<YqSemantics>("[(., .) | .a]", doc),
             "prevalidated"
         );
+    }
+
+    /// The outputs `filter` prints over `json` through the sink evaluator
+    /// (jq mode), and how many times the reindex bridge ran to get them.
+    fn outputs_and_reindexes(json: &str, filter: &str) -> (Vec<String>, usize) {
+        let before = crate::jq::value::reindex_count::get();
+        let (out, control) = drive_each_sink::<JqSemantics>(json.as_bytes(), filter);
+        assert!(control.is_none(), "{filter}: {control:?}");
+        let after = crate::jq::value::reindex_count::get();
+        (
+            out.iter().map(OwnedValue::to_json).collect(),
+            after - before,
+        )
+    }
+
+    /// #3477: counting a bound array needs no index over it. Binding a
+    /// cursor sequence materializes it, and `$a | length` then serialized and
+    /// indexed the whole owned tree to answer a number it already held.
+    #[test]
+    fn test_bound_array_length_needs_no_reindex_3477() {
+        let doc = r#"{"a":{"b":1},"c":[1,2]}"#;
+        for (query, want) in [
+            ("[.] as $a | $a | length", "1"),
+            ("[., .] as $a | $a | length", "2"),
+            ("[.a, .c] as $a | $a | length", "2"),
+            ("[.[]] as $a | $a | length", "2"),
+            // A pipe-front `length` peels, and its rest runs on the count.
+            ("[.] as $a | $a | length | tostring", r#""1""#),
+            ("[., .] as $a | $a | length | . + 1", "3"),
+            // The bound value is an object too.
+            (". as $o | {k: .} as $a | $a | length", "1"),
+        ] {
+            let (out, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(out, [want], "{query}");
+            assert_eq!(reindexes, 0, "{query} reindexed");
+        }
+    }
+
+    /// #3477: a comma sequence that names a container node twice builds it
+    /// once when it is materialized, and shares by node, never by value.
+    #[test]
+    fn test_comma_sequence_materialization_shares_a_repeated_node_3477() {
+        let doc = r#"{"a":{"x":1},"b":{"x":1},"c":[1,2]}"#;
+        let materialize = |query: &str| -> Vec<OwnedValue> {
+            let index = JsonIndex::build(doc.as_bytes());
+            let expr = parse(query).unwrap();
+            let GenericResult::LazySeq(seq) =
+                eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(doc.as_bytes()))
+            else {
+                panic!("{query} is not a cursor sequence"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3477)"
+            };
+            let OwnedValue::Array(items) = seq.materialize_atomic::<JqSemantics>().unwrap() else {
+                panic!("{query} did not materialize an array"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3477)"
+            };
+            items.iter().cloned().collect()
+        };
+        // The same node twice: one build, two handles.
+        let items = materialize("[., .]");
+        assert!(items[0].shares_storage_with(&items[1]));
+        let items = materialize("[.a, .a, .c]");
+        assert!(items[0].shares_storage_with(&items[1]));
+        assert!(!items[0].shares_storage_with(&items[2]));
+        // Equal values at two nodes are two builds.
+        let items = materialize("[.a, .b]");
+        assert_eq!(items[0], items[1]);
+        assert!(!items[0].shares_storage_with(&items[1]));
+    }
+
+    /// #3477: what the `length` bypass does not answer keeps the bridge, and
+    /// every answer -- bypassed or not -- is the one `main` gave.
+    #[test]
+    fn test_bound_array_length_declines_keep_the_bridge_3477() {
+        let doc = r#"{"a":{"b":1},"c":[1,2],"n":null,"s":"héllo","x":-5}"#;
+        for (query, want) in [
+            // Non-containers decline to the bridge's own rules.
+            ("[.n] as $a | $a[0] | length", "0"),
+            ("[.s] as $a | $a[0] | length", "5"),
+            ("[.x] as $a | $a[0] | length", "5"),
+            // The element a navigation lands on is the bridge's to count.
+            ("[.] as $a | $a[0] | length", "5"),
+            ("[.] as $a | $a[0].c | length", "2"),
+            // Not a bare `length`: the bridge answers, unchanged.
+            ("[.] as $a | $a | utf8bytelength?", ""),
+            ("[.] as $a | $a | [length, length]", "[1,1]"),
+        ] {
+            let (out, _) = outputs_and_reindexes(doc, query);
+            let want: Vec<&str> = if want.is_empty() { vec![] } else { vec![want] };
+            assert_eq!(out, want, "{query}");
+        }
     }
 
     /// #3476: which bodies [`split_comma_head`] takes, independent of what
