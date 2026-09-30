@@ -19,7 +19,8 @@ usage:
     cargo build --features cli
     scripts/jq-assign-rhs-oracle-sweep.py [--show N] [binary]
 
-`binary` defaults to target/debug/succinctly under the repository root. Every
+`binary` defaults to target/debug/succinctly under the repository root. The
+oracle is /usr/bin/jq unless `JQ_ORACLE` names another jq 1.7.1. Every
 divergence is written to `.ai/scratch/assign-rhs-divergences.txt` there; the
 first N (default 10) are echoed. Exit status is 1 if there is any divergence.
 """
@@ -30,7 +31,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ORACLE = "/usr/bin/jq"
+# The pinned oracle is jq 1.7.1; `JQ_ORACLE` names one where /usr/bin/jq is another
+# version (a distro jq 1.6, say).
+ORACLE = os.environ.get("JQ_ORACLE", "/usr/bin/jq")
 STDIN = b"1 2 3 4 5 6"
 DOC = '{"a":1,"b":[1,2,3]}'
 
