@@ -6214,10 +6214,17 @@ pub(crate) fn embed_table_push<S: EvalSemantics>(
     let Some(BindOrigin::Node { node, document }) = origin else {
         return None;
     };
+    // A scalar's identity is only ever read by a resolver certifying a
+    // marker, so a program that reads no variable in path position
+    // (`AnchorScope::Off`, decided once per program by
+    // `with_anchor_scope`) never promotes one: `[.[] as $s | {k: $s}]` would
+    // otherwise keep an `Rc` box per element in its output for an identity
+    // nothing can ask about. Declining costs at most the pre-#3191 refusal.
+    let scalar_identity_readable = anchor_scope::get() != AnchorScope::Off;
     match value {
         OwnedValue::Array(_) | OwnedValue::Object(_) => {}
-        OwnedValue::String(s) => s.promote(),
-        OwnedValue::NumberLiteral(_, spelling) => spelling.promote(),
+        OwnedValue::String(s) if scalar_identity_readable => s.promote(),
+        OwnedValue::NumberLiteral(_, spelling) if scalar_identity_readable => spelling.promote(),
         _ => return None,
     }
     Some(embed_table::push(*node, *document, value.clone()))

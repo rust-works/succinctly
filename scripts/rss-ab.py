@@ -53,8 +53,7 @@ ROWS = [
   ("strs-2m bind each embed",   "strs-2m.json",    "jq", "[.[] as $s | {k: $s}] | length", ["-c"]),
   ("strs-2m bind each kept",    "strs-2m.json",    "jq", "[.[] as $s | $s]", ["-c"]),
   ("ints-2m bind each kept",    "ints-2m.json",    "jq", "[.[] as $n | $n]", ["-c"]),
-  ("strs-2m reduce concat",     "strs-2m.json",    "jq", "reduce .[] as $s (\"\"; . + $s) | length", ["-c"]),
-  ("strs-200k bind root path",  "strs-200k.json",  "jq", "[.[] as $s | {k: $s} | .k | path($s)] | length", ["-c"]),
+  ("strs-2m bind each placed",  "strs-2m.json",    "jq", "[.[] as $s | {k: $s} | .k] | length", ["-c"]),
   ("users-10mb.yaml identity",  "users-10mb.yaml", "yq", ".",            ["-o", "json", "-I0"]),
   ("users-10mb.yaml dom write", "users-10mb.yaml", "yq", ".users[0].name = \"x\"", []),
 ]

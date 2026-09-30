@@ -115001,6 +115001,38 @@ mod share_audit_2999 {
         );
     }
 
+    /// #3191: promotion is gated on the program reading a variable in path
+    /// position at all (`AnchorScope`), since nothing else can ask a
+    /// scalar's identity -- so a bound string placed in the output of a
+    /// program that never does stays inline: no `Rc` box per element.
+    #[test]
+    #[cfg(feature = "std")]
+    fn a_bind_nothing_asks_about_stays_inline_3191() {
+        fn embedded(filter: &str) -> Vec<bool> {
+            let json = br#"["a","b","c"]"#;
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap();
+            let QueryResult::Owned(OwnedValue::Array(items)) =
+                eval::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+            else {
+                unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every filter below builds an array (#3191)"
+            };
+            items
+                .iter()
+                .map(|item| match item {
+                    OwnedValue::Object(map) => match map.get("k") {
+                        Some(OwnedValue::String(s)) => s.is_shared(),
+                        _ => unreachable!(), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- each element is built as {k: <string>} (#3191)"
+                    },
+                    _ => unreachable!(), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- each element is built as {k: <string>} (#3191)"
+                })
+                .collect()
+        }
+        assert_eq!(embedded("[.[] as $s | {k: $s}]"), [false; 3]);
+        // The promoted half -- the same bind in a program that reads `$s`
+        // in path position -- is `test_scalar_bind_keeps_node_identity_3191`.
+    }
+
     #[test]
     fn eager_single_path_write_copies_nothing() {
         assert_forced(&ints(1000), ".[0] = 0", &[]);
