@@ -944,6 +944,18 @@ scalar-root-bool	true	. as $x | {k:.} | .k | path($x)
 scalar-root-null	null	. as $x | {k:.} | .k | path($x)
 scalar-root-bool-literal-copy	true	. as $x | true | path($x)
 scalar-nested-embed-yq-untouched-number	5	. as $x | [.] | path(.[0] | $x)
+bound-comma-length-root	{"a":{"b":1}}	[., .] as $a | $a | length
+bound-comma-length-elems	{"a":{"b":1},"c":[1,2]}	[.a, .c] as $a | $a | length
+bound-comma-length-piped	{"a":{"b":1}}	[., .] as $a | $a | length | . + 1
+bound-comma-shared-node-embed	{"a":{"b":1}}	[.a, .a] as $a | try ($a[0] as $y | $a[1] | path($y)) catch "refuse"
+bound-comma-shared-root-embed	{"a":{"b":1}}	[., .] as $a | try ($a[0] as $y | $a[1] | path($y)) catch "refuse"
+bound-comma-shared-relocated	{"a":{"b":1}}	[.a, .a] as $a | try (($a | .[1]) as $y | [$a[0]] | .[0] | path($y)) catch "refuse"
+bound-comma-equal-siblings-refuse	{"x":{"b":1},"y":{"b":1}}	[.x, .y] as $a | try ($a[0] as $y | $a[1] | path($y)) catch "refuse"
+bound-comma-equal-siblings-relocated-refuse	{"x":{"b":1},"y":{"b":1}}	[.x, .y] as $a | try (($a | .[1]) as $y | [$a[0]] | .[0] | path($y)) catch "refuse"
+bound-comma-path-element-refuses	{"a":{"b":1}}	[.a, .a] as $a | path($a[0])
+bound-comma-del-element-refuses	{"a":{"b":1}}	[.a, .a] as $a | del($a[0])
+bound-comma-write-element-refuses	{"a":{"b":1}}	[., .] as $a | ($a[1] | .a) = 9
+bound-comma-nested-node-refuse-only	{"a":{"b":1}}	[., .a] as $a | $a[1] as $y | $a[0] | .a | path($y)
 CASES_EOF
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
@@ -1002,6 +1014,7 @@ scalar-number-keeps-setpath-empty:#3191 -- a bound scalar has storage identity s
 scalar-number-keeps-ltrimstr-passthrough:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
 scalar-constant-pool-number-def:#3191 -- jq's constant pool loads one `jv` for a def's literal across calls; here each evaluation of a literal is a fresh value and only a bind promotes one, so the two calls are two storages (the two-literal twin refuses in both)
 scalar-constant-pool-string-def:same as scalar-constant-pool-number-def, for a string literal
+bound-comma-nested-node-refuse-only:#3477 -- a comma sequence shares a node only when it names that node twice; `.a` inside a `.` element is a descendant of another element, and the materialized copy of `.` has already built its own `.a`, so jq's shared jv is not shared here (the exact-node memo is deliberate: descendant sharing is the embed table's job and needs a bind to register)
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then

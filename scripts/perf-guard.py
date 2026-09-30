@@ -345,8 +345,15 @@ DEFAULT_THRESHOLD = 5.0
 # bridged document they resolve over (-25.9% / -25.2% / -25.2% / -17.9% on
 # x86_64 against the PR's own merge-base, outputs byte-identical). Remove
 # all four once `main` carries #3069 and the rows read ~0% again.
+#
+# `users_path_walk` (#3477) carries an override of the same one-off kind:
+# `[path(.users[] | .age)] | length` now has `length` answered from the owned
+# tree (`eval_owned_length`) instead of serializing and reindexing it first
+# (-31.7% ARM64-Linux / -28.5% x86_64 against the PR's own merge-base). Remove
+# it once `main` carries #3477 and the row reads ~0% again.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
+    "users_path_walk": 40.0,
     "users_del_select": 30.0,
     "users_del_bound_select": 30.0,
     "users_update_select": 30.0,

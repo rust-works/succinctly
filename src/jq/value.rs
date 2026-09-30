@@ -4340,6 +4340,8 @@ impl OwnedValue {
     /// it is `self`'s own storage rather than a rebuild -- see the
     /// crate-private `bridge_provenance` module.
     pub fn reindexed<S: EvalSemantics>(&self) -> Result<ReindexedDoc, EvalError> {
+        #[cfg(test)]
+        reindex_count::bump();
         Ok(ReindexedDoc::new(
             self.to_json_for_reindex::<S>()?,
             S::REINDEX_BRIDGE_KEEPS_IDENTITY.then_some(self),
@@ -4355,6 +4357,8 @@ impl OwnedValue {
     pub fn reindexed_without_provenance<S: EvalSemantics>(
         &self,
     ) -> Result<ReindexedDoc, EvalError> {
+        #[cfg(test)]
+        reindex_count::bump();
         Ok(ReindexedDoc::new(self.to_json_for_reindex::<S>()?, None))
     }
 
@@ -4365,7 +4369,29 @@ impl OwnedValue {
     /// handing back the source sound (`reindex_bridge_is_identity`) was
     /// never shown to hold for it.
     pub fn input_bridge_doc(&self) -> ReindexedDoc {
+        #[cfg(test)]
+        reindex_count::bump();
         ReindexedDoc::new(self.to_json_input_bridge(), None)
+    }
+}
+
+/// How many times an [`OwnedValue`] was serialized and indexed on this thread
+/// ([`OwnedValue::reindexed`] and its two siblings), so a test can assert that
+/// a route answered without the round trip (#3477). `cfg(test)` only: the shipped build carries no counter.
+#[cfg(test)]
+pub(crate) mod reindex_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
     }
 }
 
