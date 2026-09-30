@@ -78641,6 +78641,851 @@ fn test_recurse_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_RECURSE_3293)
 }
 
+/// #3293 slice 5: a `?//` retry inside a *path-mode* computed index supersedes
+/// what `resolve_index_expr_sink` stashed for the abandoned alternative --
+/// its `target_escape` and the consumer's stop -- whichever way the retry
+/// ends. Covers `path`, the write family (`del`, `=`, `|=`, `+=`, `//=`,
+/// `pick`), the wrappers that reach the same sink (`try`, `label`, `def`,
+/// comma, `//`, `first`/`limit`, `reduce`, `recurse`), each way the retry can
+/// end (answers, produces nothing, raises, fails to destructure), and a
+/// consumer's stop on an answering first alternative whose retry then
+/// raises or yields an unusable key -- the retry's own error must outrank the
+/// satisfied `first`. Controls: `?` still prunes, the same error with no
+/// `?//` still raises, an untracked target still refuses the retry's key
+/// (`path(1 | .[K])`), and a `halt_error` is not retried. Every value
+/// captured from jq 1.7.1 over `{"a":{"a":1}}`.
+const RETRY_ROWS_PATH_INDEX_3293: &[RetryRow3293] = &[
+    (
+        r#"path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])), 9]"#,
+        "[[\"a\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])), 9]"#,
+        "[[\"a\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)]), 9]"#,
+        "[[\"a\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)])"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)])), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)])), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)])"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#"[first(path(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)])), 9]"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#"[limit(1; path(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)])), 9]"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#"[path(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)]), 9]"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)])"#,
+        "[\"a\"]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)])), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)])), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)]), 9]"#,
+        "[[\"a\"],9]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else ["x"] end)])"#,
+        "[\"a\"]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else ["x"] end)])), 9]"#,
+        "",
+        "AA",
+        "Cannot index object with array",
+        5,
+    ),
+    (
+        r#"[limit(1; path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else ["x"] end)])), 9]"#,
+        "",
+        "AA",
+        "Cannot index object with array",
+        5,
+    ),
+    (
+        r#"[path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else ["x"] end)]), 9]"#,
+        "[[\"a\"],9]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type == "array" then halt_error else . end)])"#,
+        "",
+        "A",
+        r#"["a"]"#,
+        5,
+    ),
+    (
+        r#"path(.a | .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])"#,
+        "[\"a\",\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(.a | .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])), 9]"#,
+        "[[\"a\",\"a\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.a | .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)])"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(.a | .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)])), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.a | .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(path(.a | .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] | .a)"#,
+        "[\"a\",\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] | .a)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"del(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])"#,
+        "{}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(del(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])), 9]"#,
+        "[{},9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)])"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(del(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)])), 9]"#,
+        "[{\"a\":{\"a\":1}},9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(del(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"del(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)])"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#"[first(del(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)])), 9]"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] = 5"#,
+        "{\"a\":5}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)] = 5"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] = 5"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] |= 5"#,
+        "{\"a\":5}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)] |= 5"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] |= 5"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)] |= 5"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#".a[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] |= 5"#,
+        "{\"a\":{\"a\":5}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".a[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] |= 5"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] //= 1"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)] //= 1"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] += 1"#,
+        "",
+        "AA",
+        r#"object ({"a":1}) and number (1) cannot be added"#,
+        5,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)] += 1"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] += 1"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"pick(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"pick(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)])"#,
+        "null\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"pick(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"pick(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)])"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    (
+        r#"path(try .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] catch .)"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(try .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)] catch .)"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(try .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] catch .)"#,
+        "",
+        "AA",
+        r#"Invalid path expression with result "E2""#,
+        5,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)], .a)"#,
+        "[\"a\"]\n[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)], .a)"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] // .a)"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] // .a)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(label $out | .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(def f: .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)]; f)"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(def f: .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)]; f)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(first(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)]))"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(first(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)]))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(first(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)]))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(limit(1; .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)]))"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(limit(1; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)]))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(limit(1; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)]))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)]?)"#,
+        "",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)]?)"#,
+        "",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"path(1 | .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])"#,
+        "",
+        "AA",
+        r#"Invalid path expression near attempt to access element "a" of 1"#,
+        5,
+    ),
+    (
+        r#"path(1 | .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(reduce 1 as $x (.; .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)]))"#,
+        "",
+        "AA",
+        r#"Invalid path expression with result {"a":1}"#,
+        5,
+    ),
+    (
+        r#"path(reduce 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)]))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(recurse(if type == "object" then .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] else empty end))]"#,
+        "[[],[\"a\"],[\"a\",\"a\"]]\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(recurse(if type == "object" then .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] else empty end))]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(.[["a"]])"#,
+        "",
+        "",
+        "Cannot index object with array",
+        5,
+    ),
+    (
+        r#"del(.[["a"]])"#,
+        "",
+        "",
+        "Cannot index object with array",
+        5,
+    ),
+    (
+        r#".[["a"]] |= 5"#,
+        "",
+        "",
+        "Cannot index object with array",
+        5,
+    ),
+    (
+        r#"path(.[("a", ["a"])])"#,
+        "[\"a\"]\n",
+        "",
+        "Cannot index object with array",
+        5,
+    ),
+    (
+        r#"[path(.[("a", ["a"])])]"#,
+        "",
+        "",
+        "Cannot index object with array",
+        5,
+    ),
+    (r#"path(.[["a"]]?)"#, "", "", "", 0),
+];
+
+#[test]
+fn test_path_index_retry_supersedes_stashed_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(Some(r#"{"a":{"a":1}}"#), "", RETRY_ROWS_PATH_INDEX_3293)
+}
+
+/// #3293 slice 5: the same retry through `eval_generic`'s path-context walk
+/// (`path_context_step_computed_index`), which `key` and `path` after a
+/// computed index reach. Those are succinctly's, so each row's answer is
+/// jq 1.7.1's for the `path()` spelling in the comment above it. Cursor route
+/// only: over an owned input `key` takes the owned-identity walk instead,
+/// which still keeps the abandoned alternative's key (a slice 9 site,
+/// recorded on #3293). `first(.[K] | key)` rows whose retry fails after a
+/// satisfied first alternative are left out: the walk collects every
+/// position before `first` can stop it, so the `?//` is never asked to
+/// retry (the #2180 "materialized before the consumer" family, with #3470's
+/// `first(.[S:] | key)`).
+const RETRY_ROWS_PATH_CONTEXT_INDEX_3293: &[RetryRow3293] = &[
+    // jq 1.7.1: `path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)]) | last`
+    (
+        r#".[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] | key"#,
+        "\"a\"\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[first(path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)]) | last), 9]`
+    (
+        r#"[first(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] | key), 9]"#,
+        "[\"a\",9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[limit(1; path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)]) | last), 9]`
+    (
+        r#"[limit(1; .[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] | key), 9]"#,
+        "[\"a\",9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)]) | last`
+    (
+        r#".[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)] | key"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[first(path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)]) | last), 9]`
+    (
+        r#"[first(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)] | key), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[limit(1; path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)]) | last), 9]`
+    (
+        r#"[limit(1; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)] | key), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)]) | last`
+    (
+        r#".[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] | key"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // jq 1.7.1: `[first(path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)]) | last), 9]`
+    (
+        r#"[first(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] | key), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // jq 1.7.1: `[limit(1; path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)]) | last), 9]`
+    (
+        r#"[limit(1; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] | key), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // jq 1.7.1: `path(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)]) | last`
+    (
+        r#".[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)] | key"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    // jq 1.7.1: `[first(path(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)]) | last), 9]`
+    (
+        r#"[first(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)] | key), 9]"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    // jq 1.7.1: `[limit(1; path(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)]) | last), 9]`
+    (
+        r#"[limit(1; .[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)] | key), 9]"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    // jq 1.7.1: `path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)]) | last`
+    (
+        r#".[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)] | key"#,
+        "\"a\"\n",
+        "A",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `path(.a[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)]) | last`
+    (
+        r#".a[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] | key"#,
+        "\"a\"\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `path(.a[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)]) | last`
+    (
+        r#".a[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] | key"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // jq 1.7.1: `[path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])]`
+    (
+        r#"[.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] | path]"#,
+        "[[\"a\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[first([path(.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)])]), 9]`
+    (
+        r#"[first([.[([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)] | path]), 9]"#,
+        "[[[\"a\"]],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)])]`
+    (
+        r#"[.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)] | path]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[first([path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)])]), 9]`
+    (
+        r#"[first([.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q // empty)] | path]), 9]"#,
+        "[[],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `[path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])]`
+    (
+        r#"[.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] | path]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // jq 1.7.1: `[first([path(.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)])]), 9]`
+    (
+        r#"[first([.[([["a"]] as [$q] ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)] | path]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // jq 1.7.1: `[path(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)])]`
+    (
+        r#"[.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)] | path]"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+    // jq 1.7.1: `[first([path(.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)])]), 9]`
+    (
+        r#"[first([.[([["a"]] as [$q] ?// {$z} | ("A"|stderr) | $q)] | path]), 9]"#,
+        "",
+        "A",
+        r#"Cannot index array with string "z""#,
+        5,
+    ),
+];
+
+#[test]
+fn test_path_context_index_retry_supersedes_stashed_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        Some(r#"{"a":{"a":1}}"#),
+        "",
+        RETRY_ROWS_PATH_CONTEXT_INDEX_3293,
+    )
+}
+
 /// #3293 review: `first`/`limit`/`nth` reset the wrapping sink's stop per
 /// invocation, so after a `?//` retry inside them they report their own
 /// completion rather than a stale `Stopped`. The #1519 rows pin that an
@@ -79055,6 +79900,7 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("[10,20,30] | ", RETRY_ROWS_PATH_BIND_SOURCE_3293),
         ("[10,20,30] | ", RETRY_ROWS_PATH_FOLD_3293),
         ("[10,20,30] | ", RETRY_ROWS_RECURSE_3293),
+        (r#"{"a":{"a":1}} | "#, RETRY_ROWS_PATH_INDEX_3293),
     ] {
         assert_retry_rows_3293(None, prefix, rows)?;
     }
@@ -79151,6 +79997,44 @@ fn test_path_slice_retry_stash_leaves_yq_mode_unchanged_3293() -> Result<()> {
             assert!(output.status.success(), "`{filter}`: stderr={stderr:?}");
             assert!(stderr.is_empty(), "`{filter}`: stderr={stderr:?}");
         }
+    }
+    Ok(())
+}
+
+/// #3293 slice 5, yq mode: the path-mode computed-index resolver is shared
+/// with `succinctly yq`'s `del`, `=`, `|=` and `+=`, which have no `?//`, so
+/// the retry stamps must leave its output alone. Every row captured from yq
+/// v4.53.3 over `a: 1 / b: true / k: a`.
+#[test]
+fn test_path_index_retry_stash_leaves_yq_mode_unchanged_3293() -> Result<()> {
+    let input = "a: 1\nb: true\nk: a\n";
+    for (filter, expected) in [
+        ("del(.[.k])", r#"{"b":true,"k":"a"}"#),
+        (".[.k] = 5", r#"{"a":5,"b":true,"k":"a"}"#),
+        (".[.k] |= 5", r#"{"a":5,"b":true,"k":"a"}"#),
+        (".[.k] += 1", r#"{"a":2,"b":true,"k":"a"}"#),
+        (".[(.k)] |= . + 1", r#"{"a":2,"b":true,"k":"a"}"#),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            expected,
+            "#3293 (yq): `{filter}`: stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     Ok(())
 }
