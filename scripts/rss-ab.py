@@ -2,7 +2,8 @@
 """Interleaved wall/peak-RSS A/B for up to three succinctly binaries (base, head, holdout).
 
 Per docs/guides/benchmarking.md: binaries alternate within each repetition, a non-zero exit
-stops the row, output identity is gated before any number is read, and min-of-N is reported.
+or an unreadable RSS skips the row, a row whose outputs differ prints no numbers, and min-of-N
+is reported.
 RSS via /usr/bin/time (-l on macOS, -v on Linux). `scripts/ab-cli.py` times wall-clock only;
 this one exists for changes whose cost is peak memory -- a value-layout change first of all.
 
@@ -84,20 +85,27 @@ def main():
         path = os.path.join(a.corpus, f)
         if not os.path.exists(path): print(f"{label}: missing {f}"); continue
         walls = {n: [] for n,_ in bins}; rsss = {n: [] for n,_ in bins}; outs = {}
+        failed = None
         for rep in range(a.reps):
             order = bins if rep % 2 == 0 else list(reversed(bins))
             for n, b in order:
                 w, r, out, rc = run(b, tool, extra, q, path)
-                if rc != 0: print(f"{label}: {n} exit {rc}"); break
+                # A failing run, or one whose peak RSS could not be read, ends
+                # the row: min-of-N over unequal samples is not a comparison.
+                if rc != 0: failed = f"{n} exit {rc}"; break
+                if r < 0: failed = f"{n}: no RSS in /usr/bin/time output"; break
                 walls[n].append(w); rsss[n].append(r); outs.setdefault(n, out)
-        if len(outs) < len(bins): continue
+            if failed: break
+        if failed: print(f"{label}: SKIPPED ({failed})", flush=True); continue
         ident = all(outs[n] == outs["base"] for n,_ in bins)
+        if not ident:
+            print(f"{label}: SKIPPED (OUTPUT DIFFERS -- no timing is believed)", flush=True)
+            continue
         bw = min(walls["base"]); br = min(rsss["base"])
         def d(x, y): return f"{(x - y) / y * 100:+.1f}%"
         hw = d(min(walls["head"]), bw); hr = d(min(rsss["head"]), br)
         ow = d(min(walls["holdout"]), bw) if a.holdout else "-"
         orr = d(min(rsss["holdout"]), br) if a.holdout else "-"
-        flag = "" if ident else "  OUTPUT DIFFERS"
-        print(f"{label} | {bw*1000:.1f} | {hw} | {ow} | {br/1e6:.1f} | {hr} | {orr}{flag}", flush=True)
+        print(f"{label} | {bw*1000:.1f} | {hw} | {ow} | {br/1e6:.1f} | {hr} | {orr}", flush=True)
 
 main()

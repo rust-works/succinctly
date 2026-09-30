@@ -2718,8 +2718,11 @@ macro_rules! note_scalar_copy {
 /// site, moves it behind an `Rc`; every clone after that is a pointer bump
 /// and [`ptr_eq`](Self::ptr_eq) reports the identity. A string nothing
 /// binds stays inline and costs exactly what it did before -- no header,
-/// no extra allocation. Option D refcounted *every* string and paid +8% to
-/// +50% peak RSS for it (ADR-0024's "Option D result").
+/// no extra allocation -- and so does one bound in a program that reads no
+/// variable in path position, where nothing could ask its identity (the
+/// bind site checks that once per program). Option D refcounted *every*
+/// string and paid +8% to +50% peak RSS for it (ADR-0024's "Option D
+/// result").
 ///
 /// `Owned(String) | Shared(Rc<String>)` is 24 bytes, the size of the bare
 /// `String` it replaces: the tag lives in `String`'s capacity niche, so
@@ -2897,10 +2900,12 @@ impl DerefMut for SharableString {
             let s = core::mem::take(alloc::rc::Rc::make_mut(rc));
             self.0 = SharableStringInner::Owned(s);
         }
-        match &mut self.0 {
-            SharableStringInner::Owned(s) => s,
-            SharableStringInner::Shared(rc) => alloc::rc::Rc::make_mut(rc),
-        }
+        // Inline by construction now: the block above leaves no `Shared`
+        // behind, so no `&mut` into shared storage is ever handed out.
+        let SharableStringInner::Owned(s) = &mut self.0 else {
+            unreachable!("un-shared just above") // omni-dev: coverage tolerate-line reason="unreachable by construction -- the block above replaces every `Shared` with `Owned` before this line (#3191)"
+        };
+        s
     }
 }
 
@@ -3722,9 +3727,12 @@ impl OwnedValue {
     /// which is pointer equality there (#2889; strings and literals #3191).
     ///
     /// A string or number literal has storage to compare only once a bind
-    /// has promoted it ([`SharableString::promote`]); an inline one answers
-    /// `false`, which is exact rather than conservative: nothing but a bind
-    /// can be asked about, and a bind promotes. `false` too for `null`,
+    /// has promoted it (`SharableString::promote`); an inline one answers
+    /// `false`. That is conservative, not exact: a bind in a program that
+    /// reads no variable in path position declines to promote
+    /// (`embed_table_push`'s `AnchorScope` gate), so a bound scalar can be
+    /// inline -- safe only because the resolver certifying a marker in path
+    /// position is this identity's one reader. `false` too for `null`,
     /// `bool`, a computed `Int`/`Float`, and a mismatched pairing: jq's
     /// identity for those is by value, a rule its callers here
     /// (`marker_identical`'s null/bool carve-out, `owned_value_eq`) apply
@@ -5553,24 +5561,6 @@ impl<T: Into<Self>> From<Vec<T>> for OwnedValue {
 mod tests {
     use super::*;
 
-    /// #3000: the whole point of [`ObjectMap`] is that `OwnedValue` stops
-    /// paying `IndexMap`'s 72 inline bytes on *every* value. Pinned so a
-    /// future variant that reintroduces a wide payload can't silently undo
-    /// it -- every `Vec<OwnedValue>` element, every map entry and every
-    /// bare `Null` costs this.
-    ///
-    /// 32 is `NumberLiteral(NumberRepr, Box<str>)` -- 16 + 16 -- with the
-    /// discriminant packed into `NumberRepr`'s own niche; holding the object
-    /// map behind a pointer is what demotes `Object` from widest arm to 8
-    /// bytes. #2999 put `Array` behind a pointer as well (24 -> 8), which
-    /// changes nothing here -- `NumberLiteral` was already the widest arm --
-    /// and is asserted so the shape stays documented. 32 holds in every build
-    /// -- under the `unshared-containers` holdout the array's `Vec` is inline
-    /// again (24 bytes, still under `NumberLiteral`'s 32) -- so this pin has
-    /// no feature exemption; only the one-pointer assertion on `ArrayVec` is
-    /// the shipped shape's.
-    /// Same 64-bit gate as the crate's other exact-size pins (`EvalError`,
-    /// `Expr`): 32-bit targets shrink the pointer-sized fields.
     /// The promote-on-bind wrappers (#3191) cost nothing in layout: a
     /// `SharableString` is exactly a `String` (the `Owned | Shared` tag
     /// rides `String`'s capacity niche) and a `SharableLiteral` exactly a
@@ -5735,6 +5725,25 @@ mod tests {
         assert!(!l.is_shared());
     }
 
+    /// #3000: the whole point of [`ObjectMap`] is that `OwnedValue` stops
+    /// paying `IndexMap`'s 72 inline bytes on *every* value. Pinned so a
+    /// future variant that reintroduces a wide payload can't silently undo
+    /// it -- every `Vec<OwnedValue>` element, every map entry and every
+    /// bare `Null` costs this.
+    ///
+    /// 32 is `NumberLiteral(NumberRepr, SharableLiteral)` -- 16 + 16 (the
+    /// spelling is a `Box<str>`'s size, #3191) -- with the
+    /// discriminant packed into `NumberRepr`'s own niche; holding the object
+    /// map behind a pointer is what demotes `Object` from widest arm to 8
+    /// bytes. #2999 put `Array` behind a pointer as well (24 -> 8), which
+    /// changes nothing here -- `NumberLiteral` was already the widest arm --
+    /// and is asserted so the shape stays documented. 32 holds in every build
+    /// -- under the `unshared-containers` holdout the array's `Vec` is inline
+    /// again (24 bytes, still under `NumberLiteral`'s 32) -- so this pin has
+    /// no feature exemption; only the one-pointer assertion on `ArrayVec` is
+    /// the shipped shape's.
+    /// Same 64-bit gate as the crate's other exact-size pins (`EvalError`,
+    /// `Expr`): 32-bit targets shrink the pointer-sized fields.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn owned_value_is_32_bytes_because_its_containers_are_one_pointer_3000() {

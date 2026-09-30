@@ -3146,11 +3146,12 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // sized` allocates a fresh `jv` for every slice, full-range
                 // included, so a bound string loses its identity through one
                 // (`. as $x | .[0:] | path($x)` refuses). Only observable
-                // while a jq-mode bind is in scope -- that is where a
-                // promoted handle can reach here (#3191) -- so the rebuild is
-                // paid there alone.
-                let may_hand_back =
-                    S::TAG != EvalTag::Jq || !super::eval_generic::embed_table_active();
+                // while a jq-mode bind is in scope in a program that can ask
+                // a scalar's identity -- the only place a promoted handle can
+                // reach here (#3191) -- so the rebuild is paid there alone.
+                let may_hand_back = S::TAG != EvalTag::Jq
+                    || !super::eval_generic::embed_table_active()
+                    || !super::eval_generic::scalar_identity_readable();
 
                 // Fast path: identity slice [:] returns original string without character counting
                 if may_hand_back && start.is_none() && end.is_none() {
@@ -32553,7 +32554,7 @@ fn number_key_for(v: &OwnedValue) -> Option<NumberKey> {
     match v {
         OwnedValue::Float(f) => Some(NumberKey::Float(*f)),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => {
-            Some(NumberKey::Literal(*f, text.clone().into()))
+            Some(NumberKey::Literal(*f, Box::<str>::from(&**text)))
         }
         // `Int`, `NumberLiteral(Int, _)`, `Null` (slice's open-bound case):
         // nothing to preserve.
@@ -48511,9 +48512,13 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
             eval_owned_navigation::<S>(expr, input, optional)
         }
-        Expr::Builtin(Builtin::ToString) => Some(Ok(Some(OwnedValue::String(
-            owned_to_string::<S>(input).into(),
-        )))),
+        // A string is handed back as it is, the same handle, as
+        // `tostring_owned` does on the other routes (#3191) -- borrowed
+        // here, so only a string is cloned, never a container to render.
+        Expr::Builtin(Builtin::ToString) => Some(Ok(Some(match input {
+            OwnedValue::String(_) => input.clone(),
+            _ => OwnedValue::String(owned_to_string::<S>(input).into()),
+        }))),
         // #2086: `. + <literal>` (the common string/number-accumulator
         // shape a `reduce`/`foreach`/`until`/`while` UPDATE body takes,
         // `$x` already folded into a `Literal` by `substitute_vars` before

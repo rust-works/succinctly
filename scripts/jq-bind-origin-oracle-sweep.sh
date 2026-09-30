@@ -851,6 +851,10 @@ scalar-string-keeps-if	"abc"	. as $x | if . then . else . end | path($x)
 scalar-string-keeps-select	"abc"	. as $x | select(true) | path($x)
 scalar-string-keeps-getpath-empty	"abc"	. as $x | getpath([]) | path($x)
 scalar-string-keeps-setpath-empty	"abc"	. as $x | setpath([]; .) | path($x)
+scalar-string-keeps-strings-filter	"abc"	. as $x | strings | path($x)
+scalar-number-keeps-numbers-filter	1.50	. as $x | numbers | path($x)
+scalar-string-keeps-walk	"abc"	. as $x | walk(.) | path($x)
+scalar-string-keeps-reduce-rebind	"abc"	. as $x | reduce . as $y (null; $y) | path($x)
 scalar-string-keeps-limit	"abc"	. as $x | limit(1; .) | path($x)
 scalar-string-keeps-first-f	"abc"	. as $x | first(.) | path($x)
 scalar-string-keeps-recurse	"abc"	. as $x | recurse | path($x)
@@ -987,6 +991,10 @@ scalar-string-keeps-sub-nomatch:#3191 -- a bound scalar has storage identity sin
 scalar-string-keeps-gsub-nomatch:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
 scalar-string-keeps-flatten-one:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
 scalar-string-keeps-setpath-empty:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-strings-filter:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-number-keeps-numbers-filter:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-walk:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
+scalar-string-keeps-reduce-rebind:#3191 -- a fold rebinding the value as its own accumulator (`reduce . as $y (null; $y)`) runs its UPDATE through the owned re-index bridge (the #2889 owned-embed-fold-if-identity mechanism), which hands path() a fresh copy
 scalar-string-keeps-destructure-alt:#3191 -- only a plain `as $x` bind promotes a scalar; a destructuring bind (`as [$a] ?// $a`) materializes its variable fresh, so `$a` is a copy of the node `$x` holds rather than its storage
 scalar-number-keeps-abs:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
 scalar-number-keeps-max-by-one:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy

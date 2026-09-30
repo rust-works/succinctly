@@ -6220,7 +6220,7 @@ pub(crate) fn embed_table_push<S: EvalSemantics>(
     // `with_anchor_scope`) never promotes one: `[.[] as $s | {k: $s}]` would
     // otherwise keep an `Rc` box per element in its output for an identity
     // nothing can ask about. Declining costs at most the pre-#3191 refusal.
-    let scalar_identity_readable = anchor_scope::get() != AnchorScope::Off;
+    let scalar_identity_readable = scalar_identity_readable();
     match value {
         OwnedValue::Array(_) | OwnedValue::Object(_) => {}
         OwnedValue::String(s) if scalar_identity_readable => s.promote(),
@@ -6490,6 +6490,16 @@ pub(crate) fn embed_anchor_for(
 /// tracking the positions an anchor is read against.
 pub(crate) fn embed_anchors_active() -> bool {
     embed_table::anchored()
+}
+
+/// Whether the program being evaluated can read a scalar's identity at all
+/// (#3191): only a resolver certifying a marker in path position does, so a
+/// program [`with_anchor_scope`] found reading no variable there
+/// (`AnchorScope::Off`) never promotes a bound scalar. One definition for
+/// the bind site that promotes and the fast paths that must not hand a
+/// promoted handle through where jq allocates.
+pub(crate) fn scalar_identity_readable() -> bool {
+    anchor_scope::get() != AnchorScope::Off
 }
 
 /// Whether any `as` binding's value is currently registered in the embed
@@ -25302,15 +25312,19 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // (#2902, same reasoning as `to_owned_at_depth`'s own arm).
             if let Some(f) = value.bridge_computed_float() {
                 GenericResult::Owned(OwnedValue::Float(f))
-            } else if value.number_literal().is_some() {
-                // The document's own number, through the embed table like
-                // any materialization: a bound number literal comes back as
-                // the binding's handle, as jq's `f_tonumber` hands back its
-                // input `jv` (#3191).
+            } else if S::TAG == EvalTag::Jq && value.number_literal().is_some() {
+                // jq mode: the document's own number, through the embed
+                // table like any materialization, so a bound number literal
+                // comes back as the binding's handle, as jq's `f_tonumber`
+                // hands back its input `jv` (#3191). jq mode only: in yq
+                // mode materializing the node reads its YAML tag, and
+                // `!!str 1.5 | tonumber` must stay the number 1.5.
                 GenericResult::Owned(owned_or_suppress!(
                     to_owned_with_cursor::<_, S>(&value, cursor),
                     optional
                 ))
+            } else if let Some(literal) = value.number_literal() {
+                GenericResult::Owned(OwnedValue::from_number_literal::<S>(&literal))
             } else if let Some(i) = value.as_i64() {
                 GenericResult::Owned(OwnedValue::Int(i))
             } else if let Some(f) = document_number_f64_generic::<S, V>(&value) {
