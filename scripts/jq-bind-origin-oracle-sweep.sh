@@ -573,6 +573,11 @@ owned-scalar-bind-input-reduce	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | 
 owned-scalar-bind-input-nested-ancestor	{"a":{"b":{"c":1}}} {"a":{"b":{"c":1}}}	input | .a as $y | .a.b.c as $z | path(.a.b.c | $z)
 owned-scalar-bind-constructed	null	{a:{b:1}} | .a.b as $z | path(.a.b | $z)
 owned-scalar-bind-constructed-assign	null	{a:{b:1}} | .a.b as $z | (.a.b | $z) = 9
+owned-scalar-bind-input-negative-index	{"a":[1,2]} {"a":[1,2]}	input | .a[-1] as $z | path(.a[-1] | $z)
+owned-scalar-bind-input-negative-to-slot	{"a":[1,2]} {"a":[1,2]}	input | .a[-1] as $z | path(.a[1] | $z)
+owned-scalar-bind-input-negative-other	{"a":[1,2]} {"a":[1,2]}	input | .a[-1] as $z | path(.a[0] | $z)
+owned-scalar-bind-constructed-sibling	null	{a:{b:1,c:1}} | .a.b as $z | path(.a.c | $z)
+owned-scalar-bind-constructed-double	null	{a:{b:(1+1),c:2}} | .a.b as $z | path(.a.c | $z)
 owned-scalar-bind-input-sibling	{"a":{"b":1},"c":1} {"a":{"b":1},"c":1}	input | .a.b as $z | path(.c | $z)
 owned-scalar-bind-input-sibling-sub-root	{"a":{"b":1,"c":1}} {"a":{"b":1,"c":1}}	input | .a.b as $z | .a | path(.c | $z)
 owned-scalar-bind-input-other-parent-write	{"a":{"b":1},"x":{"b":1}} {"a":{"b":1},"x":{"b":1}}	input | .a.b as $z | .x | (.b | $z) = 5

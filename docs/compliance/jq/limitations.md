@@ -1762,7 +1762,8 @@ is the revert that established what the other one costs.
    `[.a] | …`, whose body leaves the pipe and rebuilds `.a`), and a bind that reaches `eval.rs`'s
    own `each_as`/`eval_as` -- which still mint no node for a scalar, a `StandardJson` scalar
    keeping only its text and offset. The four repros of #3482 all took the identity pipe, not
-   those sites; no shape found reaches them with a scalar bound and a path-position read. A member a later duplicate key shadows (`at_offset(5) as $x |
+   those sites; no shape found reaches them with a scalar bound and a path-position read.
+   A member a later duplicate key shadows (`at_offset(5) as $x |
    del(.a | $x)` on `{"a":1,"a":1}`, a succinctly extension binding the member jq's parser
    discards) gets no anchor step and refuses; `.a` is the last member. The routes that re-enter the eager evaluator with an *owned*
    accumulator (`reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)`, a `catch` handler) were

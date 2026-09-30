@@ -11864,6 +11864,12 @@ fn bind_origin_of_identity<V: DocumentValue>(id: &OwnedIdentity<V>, navigated: b
 /// value *stands*, which is what `path`/`key` want in yq but is no proof
 /// the value is the node there. A variable is excluded too: its own chain
 /// may end in such a stage, and `.a as $x | $x` carries no more than that.
+///
+/// This list must stay a subset of what [`owned_identity_nav_supported`]
+/// steps with [`OwnedIdentity::child`] -- a stage added here that kept the
+/// parent's identity instead would make the chain's last entry name the
+/// wrong node. `test_navigated_scalar_bind_on_owned_root_*_3482` pin the
+/// behaviour end to end.
 fn is_plain_navigation(source: &Expr) -> bool {
     fn steps(e: &Expr) -> Option<bool> {
         match strip_parens(e) {
@@ -42846,14 +42852,6 @@ mod tests {
         assert!(embed_at_or_within::<YqSemantics, _>(&empty).0.is_none());
     }
 
-    /// #3134: a scalar binding's anchor is pushed *pending* on its parent,
-    /// filled by the first materialization of that parent with the value it
-    /// built and the one step down to the bound node, and reused from then
-    /// on; the embed witness (`RootWitness::of_owned`'s source) never reads
-    /// it. A node below an already-bound ancestor anchors on that ancestor at
-    /// once, with every step. A member a later duplicate key shadows gets no
-    /// step, and so can never certify.
-    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
     /// #3482: only plain navigation steps make a bind's chain a proof of the
     /// node; anything that computes, constructs or reads a variable does not.
     #[test]
@@ -42891,6 +42889,14 @@ mod tests {
         }
     }
 
+    /// #3134: a scalar binding's anchor is pushed *pending* on its parent,
+    /// filled by the first materialization of that parent with the value it
+    /// built and the one step down to the bound node, and reused from then
+    /// on; the embed witness (`RootWitness::of_owned`'s source) never reads
+    /// it. A node below an already-bound ancestor anchors on that ancestor at
+    /// once, with every step. A member a later duplicate key shadows gets no
+    /// step, and so can never certify.
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
     #[test]
     fn embed_anchor_pending_fill_and_steps_3134() {
         let doc = br#"{"a":{"b":1,"c":2},"x":[5,6],"d":1,"d":2}"#;

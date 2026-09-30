@@ -33764,9 +33764,18 @@ fn anchored_identical(marker: &Tracked, frame: &Frame) -> bool {
         // needs no entry and lives exactly as long as the marker does.
         Some(BindOrigin::Owned {
             chain, navigated, ..
-        }) if *navigated => chain
-            .last()
-            .map(|(parent, step)| ((**parent).clone(), vec![step.clone()])),
+        }) if *navigated => chain.last().map(|(parent, step)| {
+            // The pipe records a negative index as spelled (`.a[-1]` steps
+            // `Int(-1)`), where the resolver's component resolves to the
+            // slot (`Int(len - 1)`) and a document anchor records the slot.
+            let step = match (&**parent, step) {
+                (OwnedValue::Array(items), OwnedValue::Int(i)) if *i < 0 => i
+                    .checked_add(i64::try_from(items.len()).unwrap_or(i64::MAX))
+                    .map_or_else(|| step.clone(), OwnedValue::Int),
+                _ => step.clone(),
+            };
+            ((**parent).clone(), vec![step])
+        }),
         Some(BindOrigin::Owned { .. }) => None,
         None => None,
     };
@@ -47205,10 +47214,13 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
     // invocation's own root, so record it for as long as the invocation runs.
     // #3464: [`same_frame_position`] navigates the same root to compare two
     // spellings of one position, so a container root is recorded whenever the
-    // frame has a position at all, not only while an anchor is in scope.
+    // frame has a position at all. Otherwise `may_certify_by_anchor` is the
+    // same gate `Frame::enter` used, so an invocation with no marker an anchor
+    // could certify -- yq mode, a program with no owned-chain bind -- records
+    // nothing.
     let _root = (frame.at.is_some()
-        && (super::eval_generic::embed_anchors_active()
-            || matches!(input, OwnedValue::Array(_) | OwnedValue::Object(_))))
+        && (matches!(input, OwnedValue::Array(_) | OwnedValue::Object(_))
+            || may_certify_by_anchor(expr)))
     .then(|| invocation_roots::push(frame.invocation, input.clone()));
     let flow = resolve_node_sink::<S>(
         expr,
@@ -110621,6 +110633,24 @@ mod tests {
             &["a", "b"],
             &root
         ));
+        // A negative index is recorded as spelled and certifies at its slot.
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        let holder = OwnedValue::object_from([("a".to_string(), array.clone())]);
+        let mut negative = marker(true, vec![(Rc::new(array), OwnedValue::Int(-1))]);
+        negative.value = OwnedValue::Int(2);
+        let index_at = |slot: i64| {
+            let frame = Frame::at(
+                NEXT_INVOCATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u64,
+                PathPrefix::extend(
+                    &PathPrefix::extend(&PathPrefix::root(), Expr::Field("a".to_string())),
+                    Expr::index(slot),
+                ),
+            );
+            let _root = invocation_roots::push(frame.invocation, holder.clone());
+            anchored_identical(&negative, &frame)
+        };
+        assert!(index_at(1) && index_at(-1), "the slot, either spelling");
+        assert!(!index_at(0));
         // Miss: no chain at all.
         assert!(!certifies(&marker(true, Vec::new()), &["a", "b"], &root));
         // Miss: no invocation root recorded.

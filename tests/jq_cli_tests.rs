@@ -69546,6 +69546,31 @@ fn test_navigated_scalar_bind_on_owned_root_answers_3482() -> Result<()> {
             r"{a:{b:1}} | .a.b as $z | (.a.b | $z) = 9",
             r#"{"a":{"b":9}}"#,
         ),
+        // A negative index is recorded as spelled and resolved as the slot.
+        (
+            r#"{"a":[1,2]}"#,
+            &["-n"][..],
+            r"input | .a[-1] as $z | path(.a[-1] | $z)",
+            r#"["a",-1]"#,
+        ),
+        (
+            r#"{"a":[1,2]}"#,
+            &["-n"][..],
+            r"input | .a[-1] as $z | path(.a[1] | $z)",
+            r#"["a",1]"#,
+        ),
+        (
+            r#"{"a":[1,2]}"#,
+            &["-n"][..],
+            r"input | .a[-1] as $z | (.a[-1] | $z) = 9",
+            r#"{"a":[1,9]}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"{a:{b:(1+1),c:2}} | .a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
     ] {
         let mut args = vec!["-c"];
         args.extend_from_slice(flags);
@@ -69645,6 +69670,11 @@ fn test_navigated_scalar_bind_on_owned_root_controls_refuse_3482() -> Result<()>
             r#"{"a":[1,1,1]}"#,
             r"input | (.a | max_by(.)) as $z | [path(.a[0] | $z)]",
         ),
+        (r#"{"a":[1,2]}"#, r"input | .a[-1] as $z | path(.a[0] | $z)"),
+        // A constructed root: an equal sibling, and an equal computed double.
+        (r"null", r"{a:{b:1,c:1}} | .a.b as $z | path(.a.c | $z)"),
+        (r"null", r"{a:{b:1,c:1}} | .a.b as $z | (.a.c | $z) = 5"),
+        (r"null", r"{a:{b:(1+1),c:2}} | .a.b as $z | path(.a.c | $z)"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
         assert_eq!(
@@ -69672,6 +69702,20 @@ fn test_owned_root_scalar_anchor_is_jq_mode_only_3482() -> Result<()> {
                 .arg("yq")
                 .arg("--jq-extensions")
                 .arg(".a.b as $z | (.a.b | $z) = 9");
+            command
+        },
+        Some(b"a:\n  b: 1\n"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8(output.stdout)?, "a:\n  b: 1\n");
+    // The owned-rooted route the jq-mode clause reads: same no-op.
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .arg("yq")
+                .arg("--jq-extensions")
+                .arg("tojson | fromjson | .a.b as $z | (.a.b | $z) = 9");
             command
         },
         Some(b"a:\n  b: 1\n"),
