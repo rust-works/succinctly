@@ -27189,13 +27189,15 @@ fn owned_identity_resolve_component<S: EvalSemantics, V: DocumentValue>(
 }
 
 /// [`owned_identity_computed_step`]'s target, resolved on the first key that
-/// arrives: `Ok(None)` when it produced nothing.
-type ResolvedComputedTarget<V> = Option<Result<Option<(OwnedValue, OwnedIdentity<V>)>, EvalError>>;
+/// arrives (`Ok(None)` when it produced nothing), with the shared parent every
+/// component's child identity hangs off -- built once, not per key.
+type ResolvedComputedTarget<V> =
+    Option<Result<Option<(OwnedValue, OwnedIdentity<V>, Rc<OwnedValue>)>, EvalError>>;
 
 /// [`ResolvedComputedTarget`] for a slice, with whether the slice is tracked
 /// ([`owned_identity_slice_is_tracked`]).
 type ResolvedComputedSliceTarget<V> =
-    Option<Result<Option<(OwnedValue, OwnedIdentity<V>, bool)>, EvalError>>;
+    Option<Result<Option<(OwnedValue, OwnedIdentity<V>, Rc<OwnedValue>, bool)>, EvalError>>;
 
 /// `.[K]` / `.[S:T]` / `E[K]` / `E[S:T]` over an owned value, naming the
 /// component each output takes (#2471).
@@ -27262,49 +27264,52 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
             let walk_error = StashedEscape::new();
             let key_direct_retry = crate::jq::eval::direct_pattern_retry(&key_expr);
             let mut resolved: ResolvedComputedTarget<V> = None;
-            let keys_flow = eval_each_owned::<S>(
-                &key_expr,
-                value,
-                optional,
-                Reentry::Against(id.root_witness()),
-                &mut |k| {
-                    // A re-invocation after a stop is a `?//` retry inside
-                    // the key; it supersedes whatever the retried-past call
-                    // decided.
-                    walk_error.begin();
-                    let _scope = was_read_only.then(yq_read_only_context::enter);
-                    let operand = resolved.get_or_insert_with(|| {
-                        owned_identity_operand::<S, V>(target, value, id, optional)
-                    });
-                    let (target_value, target_id) = match operand {
-                        Ok(Some(found)) => found,
-                        Ok(None) => return Demand::Continue,
-                        Err(e) => return walk_error.stop(Control::Error(e.clone())),
-                    };
-                    let (values, control) = owned_identity_values::<S>(
-                        &wrap(Expr::IndexExpr {
-                            target: target.clone(),
-                            key: Box::new(Expr::tracked_value(k.clone())),
-                        }),
-                        value,
-                        optional,
-                        &id.root_witness(),
-                    );
-                    // The owned evaluator yields at most one value per key;
-                    // none means the indexing raised or was suppressed.
-                    if !values.is_empty() {
-                        let parent = Rc::new(target_value.clone());
+            let keys_flow =
+                eval_each_owned::<S>(
+                    &key_expr,
+                    value,
+                    optional,
+                    Reentry::Against(id.root_witness()),
+                    &mut |k| {
+                        // A re-invocation after a stop is a `?//` retry inside
+                        // the key; it supersedes whatever the retried-past call
+                        // decided.
+                        walk_error.begin();
+                        let _scope = was_read_only.then(yq_read_only_context::enter);
+                        let operand =
+                            resolved.get_or_insert_with(|| {
+                                Ok(owned_identity_operand::<S, V>(target, value, id, optional)?
+                                    .map(|(target_value, target_id)| {
+                                        let parent = Rc::new(target_value.clone());
+                                        (target_value, target_id, parent)
+                                    }))
+                            });
+                        let (target_value, target_id, parent) = match operand {
+                            Ok(Some(found)) => found,
+                            Ok(None) => return Demand::Continue,
+                            Err(e) => return walk_error.stop(Control::Error(e.clone())),
+                        };
+                        let (values, control) = owned_identity_values::<S>(
+                            &wrap(Expr::IndexExpr {
+                                target: target.clone(),
+                                key: Box::new(Expr::tracked_value(k.clone())),
+                            }),
+                            value,
+                            optional,
+                            &id.root_witness(),
+                        );
+                        // The owned evaluator yields at most one value per key;
+                        // none means the indexing raised or was suppressed.
                         for v in values {
                             let component = owned_index_component::<S>(target_value, k.clone());
-                            out.push((v, target_id.child(&parent, component)));
+                            out.push((v, target_id.child(parent, component)));
                         }
-                    }
-                    match control {
-                        Some(control) => walk_error.stop(control),
-                        None => Demand::Continue,
-                    }
-                },
-            );
+                        match control {
+                            Some(control) => walk_error.stop(control),
+                            None => Demand::Continue,
+                        }
+                    },
+                );
             // #2495: every pair the keys before an escape reached is already
             // in `out`, so the escape reaches the caller alongside them.
             if let Some(control) = walk_error.take(&keys_flow, key_direct_retry) {
@@ -27385,10 +27390,11 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
                                             &target_id,
                                             &target_value,
                                         );
-                                        (target_value, target_id, tracked)
+                                        let parent = Rc::new(target_value.clone());
+                                        (target_value, target_id, parent, tracked)
                                     }))
                             });
-                        let (target_value, target_id, tracked) = match operand {
+                        let (_, target_id, parent, tracked) = match operand {
                             Ok(Some(found)) => found,
                             Ok(None) => return Demand::Continue,
                             Err(err) => return walk_error.stop(Control::Error(err.clone())),
@@ -27408,10 +27414,9 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
                             &id.root_witness(),
                         );
                         if *tracked {
-                            let parent = Rc::new(target_value.clone());
                             let component = literal_component_from_values(s.clone(), e.clone());
                             for v in values {
-                                out.push((v, target_id.child(&parent, component.clone())));
+                                out.push((v, target_id.child(parent, component.clone())));
                             }
                         } else {
                             out.extend(values.into_iter().map(|v| (v, target_id.clone())));
@@ -27595,8 +27600,13 @@ fn owned_identity_drive_each<S: EvalSemantics>(
 ) -> Flow {
     let stashed = StashedVerdict::<Flow>::new();
     let direct_retry = crate::jq::eval::direct_pattern_retry(expr);
+    // The consumer is the operand's own remaining work, not a downstream of
+    // `expr`, so it runs under the read-only state that was ambient before
+    // `expr` was pulled -- see `path_context_step_computed_index`.
+    let was_read_only = yq_read_only_context::active();
     let flow = eval_each_owned::<S>(expr, value, optional, Reentry::Against(*root), &mut |v| {
         stashed.begin();
+        let _scope = was_read_only.then(yq_read_only_context::enter);
         match each(v) {
             Flow::Exhausted => Demand::Continue,
             other => stashed.stop_with_downstream(other),

@@ -79961,14 +79961,18 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         (r#"{"a":{"a":1}} | "#, RETRY_ROWS_PATH_CONTEXT_INDEX_3293),
         (r#"{"a":[1,2]} | "#, RETRY_ROWS_OWNED_IDENTITY_3293),
     ] {
-        // #3512: an owned-input `[... | key]` collector prints the array it
+        // #3512: an owned-input `[... | key]` (or `| path`) collector prints the array it
         // had collected after the error its body raises, with or without a
         // `?//`; the collector rows that expect that error are not this
         // audit's.
         let rows: Vec<RetryRow3293> = rows
             .iter()
             .copied()
-            .filter(|&(filter, _, _, _, exit)| !(exit == 5 && filter.starts_with('[')))
+            .filter(|&(filter, _, _, _, exit)| {
+                !(exit == 5
+                    && filter.starts_with('[')
+                    && (filter.contains("| key") || filter.contains("| path]")))
+            })
             .collect();
         assert_retry_rows_3293(None, prefix, &rows)?;
     }
