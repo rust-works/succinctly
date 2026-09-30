@@ -27188,6 +27188,15 @@ fn owned_identity_resolve_component<S: EvalSemantics, V: DocumentValue>(
     )
 }
 
+/// [`owned_identity_computed_step`]'s target, resolved on the first key that
+/// arrives: `Ok(None)` when it produced nothing.
+type ResolvedComputedTarget<V> = Option<Result<Option<(OwnedValue, OwnedIdentity<V>)>, EvalError>>;
+
+/// [`ResolvedComputedTarget`] for a slice, with whether the slice is tracked
+/// ([`owned_identity_slice_is_tracked`]).
+type ResolvedComputedSliceTarget<V> =
+    Option<Result<Option<(OwnedValue, OwnedIdentity<V>, bool)>, EvalError>>;
+
 /// `.[K]` / `.[S:T]` / `E[K]` / `E[S:T]` over an owned value, naming the
 /// component each output takes (#2471).
 ///
@@ -27226,78 +27235,85 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
         Expr::IndexExpr { target, key } => {
             let key_expr =
                 owned_identity_resolve_component::<S, V>(key, id).map_err(Control::Error)?;
-            let (keys, keys_control) =
-                owned_identity_values::<S>(&key_expr, value, optional, &id.root_witness());
-            // #2495: re-running `key_expr` a second time to compute
-            // `values` (the pre-fix shape of this arm) doubles any side
-            // effect it has of its own -- `halt_error`/`debug`/`stderr`
-            // inside a computed bracket would fire twice for one logical
-            // evaluation. `owned_value_to_expr_literal` lets the *already*
-            // -computed `keys` stand in for a second run wherever every one
-            // of them round-trips through a `Literal` cleanly (every
-            // ordinary key does); only a key with no faithful `Literal` --
-            // an array or object, which can never index anything anyway --
-            // falls back to the original expression, where a second run is
-            // harmless (indexing errors, plain values, have no visible
-            // side effect to double). And when the key stream itself
-            // escaped (`keys_control` is `Some`), there is nothing left to
-            // index -- jq's own key-outer/target-inner model means the
-            // value stream never runs past where the key stream stopped --
-            // so `values` is skipped outright rather than re-evaluating
-            // `key_expr` a second time just to hit the same escape again.
-            let (values, values_control) = if keys_control.is_some() || keys.is_empty() {
-                (Vec::new(), None)
-            } else if let Some(literals) = keys
-                .iter()
-                .map(owned_value_to_expr_literal)
-                .collect::<Option<Vec<_>>>()
-            {
-                let value_key_expr = if let [only] = literals.as_slice() {
-                    Expr::Literal(only.clone())
-                } else {
-                    Expr::Comma(literals.into_iter().map(Expr::Literal).collect())
-                };
-                owned_identity_values::<S>(
-                    &wrap(Expr::IndexExpr {
-                        target: target.clone(),
-                        key: Box::new(value_key_expr),
-                    }),
-                    value,
-                    optional,
-                    &id.root_witness(),
-                )
-            } else {
-                owned_identity_values::<S>(
-                    &wrap(Expr::IndexExpr {
-                        target: target.clone(),
-                        key: Box::new(key_expr),
-                    }),
-                    value,
-                    optional,
-                    &id.root_witness(),
-                )
-            };
-            let control = combine_owned_identity_controls(keys_control, values_control);
-            let Some((target_value, target_id)) =
-                owned_identity_operand::<S, V>(target, value, id, optional)
-                    .map_err(Control::Error)?
-            else {
-                return control.map_or(Ok(()), Err);
-            };
-            let parent = Rc::new(target_value.clone());
-            // Zipped, like the sibling `Expr::Iterate` arm: the owned
-            // evaluator yields exactly one value per key, and a mismatch
-            // means the indexing raised or was suppressed, in which case the
-            // surplus components are unused. #2495: `out` gets every pair
-            // that zipped successfully *before* `control` is checked, so a
-            // key/value stream's own escape (a `halt` inside the key, a
-            // later key's indexing error) reaches the caller alongside
-            // whatever already zipped, not instead of it.
-            for (v, k) in values.into_iter().zip(keys) {
-                let component = owned_index_component::<S>(&target_value, k);
-                out.push((v, target_id.child(&parent, component)));
+            // #3293: the key stream and the value it indexes are one drive,
+            // not two lists zipped afterwards. jq compiles `E[K]` as
+            // `K as $k | E | .[$k]`, and a `?//` inside `K` retries when the
+            // indexing *downstream* of it raises, so the components that
+            // count are the ones whose index went through. Evaluating `K`
+            // once on its own and `E[K]` again on the side paired the
+            // abandoned alternative's key with the retried alternative's
+            // value (`.[([["a"]] as [$q] ?// [[$q]] | $q)] | key` on
+            // `{"a":5}` named `["a"]` for the value at `"a"`) and ran the
+            // key's side effects twice; it also raised the abandoned
+            // alternative's error after the retry had answered. Driving the
+            // key generator with the indexing inside its sink puts that error
+            // where the retry can see it, exactly as
+            // `path_context_step_computed_index` does on the cursor route.
+            //
+            // #2495: the value each key indexes is computed from the key the
+            // generator *yielded* ([`Expr::tracked_value`]), never by running
+            // `key_expr` a second time, so a side-effecting key
+            // (`halt_error`, `debug`) fires once per logical evaluation.
+            //
+            // `target` is resolved lazily, on the first key that arrives: jq
+            // evaluates `K` before `E`, and a key stream that yields nothing
+            // never touches the target at all.
+            let was_read_only = yq_read_only_context::active();
+            let walk_error = StashedEscape::new();
+            let key_direct_retry = crate::jq::eval::direct_pattern_retry(&key_expr);
+            let mut resolved: ResolvedComputedTarget<V> = None;
+            let keys_flow = eval_each_owned::<S>(
+                &key_expr,
+                value,
+                optional,
+                Reentry::Against(id.root_witness()),
+                &mut |k| {
+                    // A re-invocation after a stop is a `?//` retry inside
+                    // the key; it supersedes whatever the retried-past call
+                    // decided.
+                    walk_error.begin();
+                    let _scope = was_read_only.then(yq_read_only_context::enter);
+                    let operand = resolved.get_or_insert_with(|| {
+                        owned_identity_operand::<S, V>(target, value, id, optional)
+                    });
+                    let (target_value, target_id) = match operand {
+                        Ok(Some(found)) => found,
+                        Ok(None) => return Demand::Continue,
+                        Err(e) => return walk_error.stop(Control::Error(e.clone())),
+                    };
+                    let (values, control) = owned_identity_values::<S>(
+                        &wrap(Expr::IndexExpr {
+                            target: target.clone(),
+                            key: Box::new(Expr::tracked_value(k.clone())),
+                        }),
+                        value,
+                        optional,
+                        &id.root_witness(),
+                    );
+                    // The owned evaluator yields at most one value per key;
+                    // none means the indexing raised or was suppressed.
+                    if !values.is_empty() {
+                        let parent = Rc::new(target_value.clone());
+                        for v in values {
+                            let component = owned_index_component::<S>(target_value, k.clone());
+                            out.push((v, target_id.child(&parent, component)));
+                        }
+                    }
+                    match control {
+                        Some(control) => walk_error.stop(control),
+                        None => Demand::Continue,
+                    }
+                },
+            );
+            // #2495: every pair the keys before an escape reached is already
+            // in `out`, so the escape reaches the caller alongside them.
+            if let Some(control) = walk_error.take(&keys_flow, key_direct_retry) {
+                return Err(control);
             }
-            control.map_or(Ok(()), Err)
+            if let Flow::Escaped(control) = keys_flow {
+                return Err(control);
+            }
+            Ok(())
         }
         Expr::SliceExpr { target, start, end } => {
             let start_expr = match start {
@@ -27312,56 +27328,117 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
                 }
                 None => None,
             };
-            let (values, values_control) = owned_identity_values::<S>(
-                &wrap(Expr::SliceExpr {
-                    target: target.clone(),
-                    start: start_expr.clone().map(Box::new),
-                    end: end_expr.clone().map(Box::new),
-                }),
-                value,
-                optional,
-                &id.root_witness(),
-            );
-            let Some((target_value, target_id)) =
-                owned_identity_operand::<S, V>(target, value, id, optional)
-                    .map_err(Control::Error)?
-            else {
-                return values_control.map_or(Ok(()), Err);
-            };
-            // #2834: same rule as the literal-bound `Expr::Slice` arm in
-            // `owned_identity_step` -- see `owned_identity_slice_is_tracked`'s
-            // own doc comment. A dynamic-bound slice (`.[$s:$e]`) off a
-            // detached, non-null value used to fabricate a component here
-            // exactly like the literal-bound arm once did.
-            if !owned_identity_slice_is_tracked::<S, V>(&target_id, &target_value) {
-                out.extend(values.into_iter().map(|v| (v, target_id.clone())));
-                return values_control.map_or(Ok(()), Err);
-            }
-            let bound = |e: &Option<Expr>| -> (Vec<OwnedValue>, Option<Control>) {
-                match e {
-                    Some(e) => owned_identity_values::<S>(e, value, optional, &id.root_witness()),
-                    None => (vec![OwnedValue::Null], None),
+            // #3293: the bounds and the slice they take are one drive, for
+            // the reason [`Expr::IndexExpr`]'s arm above gives. `S` is the
+            // outer generator, `T` the middle and the target the inner, jq's
+            // own desugaring (`[1,2,3] | .[(0,1):(2,3)]` is
+            // `[1,2] [1,2,3] [2] [2,3]` against jq 1.7.1); `T` is re-run per
+            // `S`, and the slice runs inside `T`'s sink, so a `?//` in
+            // either bound sees the slice's failure. Mirrors
+            // `path_context_step_computed_slice` on the cursor route. A
+            // bound that is not written is `null`, which the slice takes as
+            // "unbounded", and stays an absent bound in the expression.
+            let was_read_only = yq_read_only_context::active();
+            let walk_error = StashedEscape::new();
+            let start_direct_retry = start_expr
+                .as_ref()
+                .is_some_and(crate::jq::eval::direct_pattern_retry);
+            let end_direct_retry = end_expr
+                .as_ref()
+                .is_some_and(crate::jq::eval::direct_pattern_retry);
+            // The target and whether its slice is tracked, resolved on the
+            // first bound pair that arrives.
+            let mut resolved: ResolvedComputedSliceTarget<V> = None;
+            let drive_bound =
+                |bound: &Option<Expr>, sink: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
+                    match bound {
+                        Some(e) => eval_each_owned::<S>(
+                            e,
+                            value,
+                            optional,
+                            Reentry::Against(id.root_witness()),
+                            sink,
+                        ),
+                        None => match sink(OwnedValue::Null) {
+                            Demand::Continue => Flow::Exhausted,
+                            Demand::Stop => Flow::Stopped { pending: None },
+                        },
+                    }
+                };
+            let starts_flow = drive_bound(&start_expr, &mut |s| {
+                walk_error.begin();
+                let _scope = was_read_only.then(yq_read_only_context::enter);
+                let ends_flow =
+                    drive_bound(&end_expr, &mut |e| {
+                        walk_error.begin();
+                        let _scope = was_read_only.then(yq_read_only_context::enter);
+                        let operand =
+                            resolved.get_or_insert_with(|| {
+                                Ok(owned_identity_operand::<S, V>(target, value, id, optional)?
+                                    .map(|(target_value, target_id)| {
+                                        // #2834: see
+                                        // `owned_identity_slice_is_tracked`. A
+                                        // dynamic-bound slice off a detached,
+                                        // non-null value must not fabricate a
+                                        // component.
+                                        let tracked = owned_identity_slice_is_tracked::<S, V>(
+                                            &target_id,
+                                            &target_value,
+                                        );
+                                        (target_value, target_id, tracked)
+                                    }))
+                            });
+                        let (target_value, target_id, tracked) = match operand {
+                            Ok(Some(found)) => found,
+                            Ok(None) => return Demand::Continue,
+                            Err(err) => return walk_error.stop(Control::Error(err.clone())),
+                        };
+                        let (values, control) = owned_identity_values::<S>(
+                            &wrap(Expr::SliceExpr {
+                                target: target.clone(),
+                                start: start_expr
+                                    .as_ref()
+                                    .map(|_| Box::new(Expr::tracked_value(s.clone()))),
+                                end: end_expr
+                                    .as_ref()
+                                    .map(|_| Box::new(Expr::tracked_value(e.clone()))),
+                            }),
+                            value,
+                            optional,
+                            &id.root_witness(),
+                        );
+                        if *tracked {
+                            let parent = Rc::new(target_value.clone());
+                            let component = literal_component_from_values(s.clone(), e.clone());
+                            for v in values {
+                                out.push((v, target_id.child(&parent, component.clone())));
+                            }
+                        } else {
+                            out.extend(values.into_iter().map(|v| (v, target_id.clone())));
+                        }
+                        match control {
+                            Some(control) => walk_error.stop(control),
+                            None => Demand::Continue,
+                        }
+                    });
+                // A retry inside `T` that yielded nothing, or raised, never
+                // re-invoked its sink to reset what that stashed.
+                walk_error.settle(&ends_flow, end_direct_retry);
+                if walk_error.is_set() {
+                    return Demand::Stop;
                 }
-            };
-            let (starts, starts_control) = bound(&start_expr);
-            let (ends, ends_control) = bound(&end_expr);
-            let parent = Rc::new(target_value.clone());
-            // `S` outer, `T` middle, `E` inner -- jq's own desugaring, which
-            // is also the order the value evaluator emits in (confirmed
-            // live: `[1,2,3] | .[(0,1):(2,3)]` is `[1,2] [1,2,3] [2] [2,3]`
-            // against jq 1.7.1).
-            let components = starts.iter().flat_map(|s| {
-                ends.iter()
-                    .map(|e| literal_component_from_values(s.clone(), e.clone()))
+                match ends_flow {
+                    Flow::Escaped(control) => walk_error.stop(control),
+                    Flow::Exhausted | Flow::Stopped { .. } => Demand::Continue,
+                }
             });
-            for (v, component) in values.into_iter().zip(components) {
-                out.push((v, target_id.child(&parent, component)));
+            if let Some(control) = walk_error.take(&starts_flow, start_direct_retry) {
+                return Err(control);
             }
-            let control = combine_owned_identity_controls(
-                combine_owned_identity_controls(values_control, starts_control),
-                ends_control,
-            );
-            control.map_or(Ok(()), Err)
+            if let Flow::Escaped(control) = starts_flow {
+                return Err(control);
+            }
+            Ok(())
         }
         // #2549: closed syntactically -- the only caller routes here from an
         // `Expr::IndexExpr { .. } | Expr::SliceExpr { .. }` arm, the two shapes
@@ -27491,6 +27568,43 @@ fn owned_identity_values<S: EvalSemantics>(
     }
 }
 
+/// Drive `expr` over `value` one output at a time, running `each` on every
+/// output, and answer the [`Flow`] the owned identity pipe should carry on
+/// with (#3293).
+///
+/// The eager form -- collect `expr`'s outputs with [`owned_identity_values`],
+/// then loop -- runs `each` after `expr` has finished, so a failure raised
+/// *downstream* of an output can never reach a `?//` inside `expr`: jq
+/// retries the next alternative when the body raises, and `if
+/// ([1] as $q ?// $b | $q) then error("E") else .a end` is `.a` in jq 1.7.1
+/// where the collected form raised the abandoned alternative's `E`. Here the
+/// body runs inside `expr`'s own sink, so its verdict is stashed behind a
+/// `Demand::Stop` (a [`StashedVerdict`], reset at the top of every call) and
+/// a retry that produces nothing or raises supersedes it.
+///
+/// An `each` answering anything but [`Flow::Exhausted`] ends the drive and is
+/// returned as is, exactly as the eager loop's `other => return other` did;
+/// otherwise the drive's own escape (a stream that raised after some outputs)
+/// is returned after every output before it has run.
+fn owned_identity_drive_each<S: EvalSemantics>(
+    expr: &Expr,
+    value: &OwnedValue,
+    optional: bool,
+    root: &RootWitness,
+    each: &mut dyn FnMut(OwnedValue) -> Flow,
+) -> Flow {
+    let stashed = StashedVerdict::<Flow>::new();
+    let direct_retry = crate::jq::eval::direct_pattern_retry(expr);
+    let flow = eval_each_owned::<S>(expr, value, optional, Reentry::Against(*root), &mut |v| {
+        stashed.begin();
+        match each(v) {
+            Flow::Exhausted => Demand::Continue,
+            other => stashed.stop_with_downstream(other),
+        }
+    });
+    stashed.take(&flow, direct_retry).unwrap_or(flow)
+}
+
 /// Combines two navigation steps' optional escapes into the one the
 /// pipeline should report, per [`prefer_pending_control`]'s Halt >
 /// Error/Break > nothing ranking (#2495) -- used wherever a computed step
@@ -27501,25 +27615,6 @@ fn combine_owned_identity_controls(a: Option<Control>, b: Option<Control>) -> Op
     match b {
         Some(c) => prefer_pending_control(a, c),
         None => a,
-    }
-}
-
-/// `v` as an `Expr::Literal`, or `None` for a value `Literal` cannot spell
-/// (`Array`/`Object`) -- used by [`owned_identity_computed_step`]'s
-/// `IndexExpr` arm (#2495) to stand an already-computed key back in for a
-/// second evaluation of its source expression, so a side-effecting key
-/// (`halt_error`, `debug`) fires once rather than once per use.
-fn owned_value_to_expr_literal(v: &OwnedValue) -> Option<Literal> {
-    match v {
-        OwnedValue::Null => Some(Literal::Null),
-        OwnedValue::Bool(b) => Some(Literal::Bool(*b)),
-        OwnedValue::Int(i) => Some(Literal::Int(*i)),
-        OwnedValue::Float(f) => Some(Literal::Float(*f)),
-        OwnedValue::String(s) => Some(Literal::String(s.to_string())),
-        OwnedValue::NumberLiteral(repr, text) => {
-            Some(Literal::NumberLiteral(*repr, text.to_string()))
-        }
-        OwnedValue::Array(_) | OwnedValue::Object(_) => None,
     }
 }
 
@@ -29075,29 +29170,32 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                     Ok(e) => e,
                     Err(e) => return Flow::Escaped(Control::Error(e)),
                 };
-            let (conds, control) =
-                owned_identity_values::<S>(&resolved, &value, optional, &id.root_witness());
-            for c in conds {
-                let branch = if c.is_truthy() {
-                    then_branch
-                } else {
-                    else_branch
-                };
-                match eval_owned_identity_spliced::<S, V>(
-                    branch,
-                    rest,
-                    Cow::Borrowed(&value),
-                    id.clone(),
-                    optional,
-                    tail.reborrow(),
-                ) {
-                    Flow::Exhausted => {}
-                    other => return other,
-                }
-            }
-            match control.or_else(|| escaped.into_inner()) {
-                Some(control) => Flow::Escaped(control),
-                None => Flow::Exhausted,
+            // #3293: the branch runs inside the condition's own sink, so a
+            // `?//` in the condition sees a failure raised after it.
+            let flow = owned_identity_drive_each::<S>(
+                &resolved,
+                &value,
+                optional,
+                &id.root_witness(),
+                &mut |c| {
+                    let branch = if c.is_truthy() {
+                        then_branch
+                    } else {
+                        else_branch
+                    };
+                    eval_owned_identity_spliced::<S, V>(
+                        branch,
+                        rest,
+                        Cow::Borrowed(&value),
+                        id.clone(),
+                        optional,
+                        tail.reborrow(),
+                    )
+                },
+            );
+            match flow {
+                Flow::Exhausted => escaped.into_inner().map_or(Flow::Exhausted, Flow::Escaped),
+                other => other,
             }
         }
         Expr::Comma(branches) => {
@@ -29136,30 +29234,32 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                     Ok(e) => e,
                     Err(e) => return Flow::Escaped(Control::Error(e)),
                 };
-            let (counts, control) =
-                owned_identity_values::<S>(&resolved, &value, optional, &id.root_witness());
-            for n_value in counts {
-                let take = match classify_limit_n(n_value) {
-                    Ok(LimitN::Unlimited) => None,
-                    Ok(LimitN::Take(n)) => Some(n),
-                    Err(e) => return Flow::Escaped(Control::Error(e)),
-                };
-                match eval_owned_identity_bounded::<S, V>(
-                    expr,
-                    take,
-                    rest,
-                    Cow::Borrowed(&value),
-                    id.clone(),
-                    optional,
-                    &mut tail,
-                ) {
-                    Flow::Exhausted => {}
-                    other => return other,
-                }
-            }
-            match control.or_else(|| escaped.into_inner()) {
-                Some(control) => Flow::Escaped(control),
-                None => Flow::Exhausted,
+            // #3293: as for `if`, the count's consumer runs inside its sink.
+            let flow = owned_identity_drive_each::<S>(
+                &resolved,
+                &value,
+                optional,
+                &id.root_witness(),
+                &mut |n_value| {
+                    let take = match classify_limit_n(n_value) {
+                        Ok(LimitN::Unlimited) => None,
+                        Ok(LimitN::Take(n)) => Some(n),
+                        Err(e) => return Flow::Escaped(Control::Error(e)),
+                    };
+                    eval_owned_identity_bounded::<S, V>(
+                        expr,
+                        take,
+                        rest,
+                        Cow::Borrowed(&value),
+                        id.clone(),
+                        optional,
+                        &mut tail,
+                    )
+                },
+            );
+            match flow {
+                Flow::Exhausted => escaped.into_inner().map_or(Flow::Exhausted, Flow::Escaped),
+                other => other,
             }
         }
         Expr::FirstExpr(inner) => eval_owned_identity_bounded::<S, V>(
