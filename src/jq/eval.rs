@@ -65229,8 +65229,10 @@ fn cursor_child<C: DocumentCursor>(cur: &C, key: &PatternKey<'_>) -> Option<C> {
 }
 
 /// One variable bound by a destructuring pattern, with the document node it
-/// was read from when the walk could follow it there (#3466).
-pub(crate) type NodeBinding = (String, OwnedValue, Option<BindOrigin>);
+/// was read from when the walk could follow it there (#3466): its
+/// `(node_id, document_token)`, which is all a [`BindOrigin::Node`] holds and a
+/// good deal smaller than one.
+pub(crate) type NodeBinding = (String, OwnedValue, Option<(usize, usize)>);
 
 /// Value mode that also follows the document (#3466): the register is the
 /// cursor of the node the walk stands on, stepped in lockstep with the
@@ -65259,7 +65261,7 @@ impl<C: DocumentCursor> PatternMode for CursorPatternMode<C> {
         (
             name.to_string(),
             value.clone(),
-            reg.as_ref().map(super::eval_generic::bind_origin_of_cursor),
+            reg.as_ref().map(|c| (c.node_id(), c.document_token())),
         )
     }
 
@@ -65730,9 +65732,13 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
     for (name, value, origin) in bindings {
         current = match origin {
             None => substitute_var(&current, name, value),
-            Some(node) => {
+            Some((node, document)) => {
+                let origin = BindOrigin::Node {
+                    node: *node,
+                    document: *document,
+                };
                 let mut bound = value.clone();
-                register(origin.as_ref(), &mut bound);
+                register(Some(&origin), &mut bound);
                 substitute_bound_var_at(
                     &Expr::Literal(Literal::Null),
                     &current,
@@ -65740,7 +65746,7 @@ pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
                     &bound,
                     None,
                     None,
-                    Some(node.clone()),
+                    Some(origin),
                     S::TAG == EvalTag::Jq,
                     S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY,
                 )
