@@ -12077,7 +12077,7 @@ fn each_label_generic<S: EvalSemantics, V: DocumentValue>(
 type BoundValue = (OwnedValue, Option<BindOrigin>);
 
 /// The origin of a value bound from a document node (#2072).
-fn bind_origin_of_cursor<C: DocumentCursor>(c: &C) -> BindOrigin {
+pub(crate) fn bind_origin_of_cursor<C: DocumentCursor>(c: &C) -> BindOrigin {
     BindOrigin::Node {
         node: c.node_id(),
         document: c.document_token(),
@@ -12138,7 +12138,10 @@ fn is_plain_navigation(source: &Expr) -> bool {
 /// positions are per-document integers, so an id from one document is
 /// usually in range in another and `same_node` cannot tell them apart
 /// (`node_id_reindex_tests`, `src/jq/document.rs`).
-fn bind_origin_cursor<C: DocumentCursor>(origin: &Option<BindOrigin>, anchor: &C) -> Option<C> {
+pub(crate) fn bind_origin_cursor<C: DocumentCursor>(
+    origin: &Option<BindOrigin>,
+    anchor: &C,
+) -> Option<C> {
     match origin {
         Some(BindOrigin::Node { node, document }) if *document == anchor.document_token() => {
             anchor.at_node_id(*node)
@@ -12235,11 +12238,10 @@ fn bound_var_identity<S: EvalSemantics, V: DocumentValue>(
 /// [`Demand::Stop`]: `[first((1 as $x ?// $y | 1) as $v | $v)]` is `[1,1]` in
 /// jq 1.7.1, was `[1]` (captured live, input `1`; see `eval::each_as`'s own
 /// doc comment for the fuller rationale, identical here). The origin variant
-/// (rather than plain [`fanout_arg_each_generic`], which
-/// [`each_as_pattern_generic`] below uses) is needed here and not there:
-/// only a bare `$var` bind has a single node worth tracking, and that node
-/// (#2072) still reaches [`substitute_bound_var_from`] unchanged by this
-/// widening. Each bound value's `body` is still pushed through
+/// is how a bare `$var` bind learns its single node (#2072), which still
+/// reaches [`substitute_bound_var_from`] unchanged by this widening;
+/// [`each_as_pattern_generic`] below uses it too since #3466, to seed its
+/// pattern walk. Each bound value's `body` is still pushed through
 /// [`eval_each_generic`] rather than materialized, unchanged from #1596.
 /// The parser reserves this bare-`$var` node for `Expr::As`;
 /// [`each_as_pattern_generic`] below is its
@@ -12302,19 +12304,34 @@ fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     let all_var_names = pattern_alternatives_var_names(patterns);
+    // #3466: whether this bind follows the document at all.
+    let tracked = crate::jq::eval::destructure_identity_tracked::<S>(patterns);
 
-    fanout_arg_each_generic::<S, V, _>(expr, value.clone(), optional, cursor, |bound_val| {
-        each_pattern_alternatives_generic::<S, V>(
-            patterns,
-            &all_var_names,
-            body,
-            &bound_val,
-            &value,
-            optional,
-            cursor,
-            sink,
-        )
-    })
+    fanout_arg_each_generic_with_origin::<S, V, _>(
+        expr,
+        value.clone(),
+        optional,
+        cursor,
+        |bound_val, origin| {
+            // A source that names no node of this document (an owned value,
+            // a constructed one, another document) binds by value alone.
+            let source = cursor
+                .as_ref()
+                .filter(|_| tracked)
+                .and_then(|anchor| bind_origin_cursor(&origin, anchor));
+            each_pattern_alternatives_generic::<S, V>(
+                patterns,
+                &all_var_names,
+                body,
+                &bound_val,
+                source,
+                &value,
+                optional,
+                cursor,
+                sink,
+            )
+        },
+    )
 }
 
 /// Sink-based twin of `eval::each_pattern_alternatives` (#1596): same
@@ -12356,6 +12373,7 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
     all_var_names: &[String],
     body: &Expr,
     bound_val: &OwnedValue,
+    source: Option<V::Cursor>,
     value: &V,
     optional: bool,
     cursor: Option<V::Cursor>,
@@ -12379,17 +12397,33 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
             Return(Flow),
         }
         let mut outcome: Option<BodyOutcome> = None;
-        let walk =
-            each_pattern_binding_set::<S>(pattern, bound_val, invert_dedup, &mut |bindings| {
-                let null_value = OwnedValue::Null;
-                let substituted_body = substitute_vars(
+        let walk = crate::jq::eval::each_pattern_binding_set_at::<S, V::Cursor>(
+            pattern,
+            bound_val,
+            source,
+            invert_dedup,
+            &mut |bindings| {
+                // #3466: each variable that names a node holds its value for
+                // the body's whole extent, exactly as `each_as_generic`'s
+                // does -- the embed table, and where the storage clause
+                // cannot certify it, its anchor. The guards drop with this
+                // binding set, so nothing outlives an alternative.
+                #[allow(clippy::collection_is_never_read)]
+                // held for their `Drop`, which pops the table
+                let mut embedded = Vec::new();
+                let substituted_body = crate::jq::eval::substitute_destructured_bindings::<S>(
                     body,
-                    as_var_refs(bindings).chain(
-                        all_var_names
-                            .iter()
-                            .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
-                            .map(|name| (name.as_str(), &null_value)),
-                    ),
+                    bindings,
+                    all_var_names,
+                    |origin, bound| {
+                        embedded.extend(embed_table_push::<S>(origin, bound));
+                        embedded.extend(embed_anchor_push::<S, _>(
+                            origin,
+                            bound,
+                            cursor.as_ref(),
+                            body,
+                        ));
+                    },
                 );
 
                 let mut lazy_fault: Option<Control> = None;
@@ -12440,7 +12474,8 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
                         Demand::Stop
                     }
                 }
-            });
+            },
+        );
         match outcome {
             Some(BodyOutcome::Retry) => continue,
             Some(BodyOutcome::Return(flow)) => return flow,

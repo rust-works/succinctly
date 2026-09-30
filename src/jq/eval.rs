@@ -6711,6 +6711,12 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// escape that used to be `bound_control` is now covered by
 /// [`fanout_arg_each`]'s own rule that the argument's trailing control fires
 /// only after every bound value's `body` has already run.
+///
+/// #3466: the fan-out now also reports the document node each bound value
+/// came from, so the pattern walk can follow it (see [`CursorPatternMode`]) and
+/// each variable is registered like [`each_as`]'s. Only for a program that can
+/// read a variable's identity ([`destructure_identity_tracked`]); otherwise
+/// every origin is `None` and the bind is by value, as it was.
 fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     patterns: &[Pattern],
@@ -6720,13 +6726,24 @@ fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let all_var_names = pattern_alternatives_var_names(patterns);
+    // #3466: the ambient node's cursor, when this bind follows the document
+    // at all; a source's own node is re-resolved against it.
+    let anchor = destructure_identity_tracked::<S>(patterns)
+        .then(|| standard_json_node_cursor(&value))
+        .flatten();
 
-    fanout_arg_each::<W, S, _>(expr, value.clone(), optional, |bound_val| {
+    fanout_arg_each_with_origin::<W, S, _>(expr, value.clone(), optional, |bound_val, origin| {
+        // A source that names no node of this document (an owned value, a
+        // constructed one, another document) binds by value alone.
+        let source = anchor
+            .as_ref()
+            .and_then(|anchor| super::eval_generic::bind_origin_cursor(&origin, anchor));
         each_pattern_alternatives::<W, S>(
             patterns,
             &all_var_names,
             body,
             &bound_val,
+            source,
             &value,
             optional,
             sink,
@@ -6753,11 +6770,13 @@ fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// [`is_retryable_stop`]. This function used to propagate it immediately,
 /// which is what made `isempty(1 as $x ?// $y | 5)` answer `false` once where
 /// jq answers it twice.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `each_pattern_alternatives_generic`'s own shape; every param is threaded straight through
 fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     patterns: &[Pattern],
     all_var_names: &[String],
     body: &Expr,
     bound_val: &OwnedValue,
+    source: Option<JsonCursor<'a, W>>,
     value: &StandardJson<'a, W>,
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
@@ -6790,17 +6809,26 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Return(Flow),
         }
         let mut outcome: Option<BodyOutcome> = None;
-        let walk =
-            each_pattern_binding_set::<S>(pattern, bound_val, invert_dedup, &mut |bindings| {
-                let null_value = OwnedValue::Null;
-                let substituted_body = substitute_vars(
+        let walk = each_pattern_binding_set_at::<S, JsonCursor<'a, W>>(
+            pattern,
+            bound_val,
+            source,
+            invert_dedup,
+            &mut |bindings| {
+                // #3466: each variable that names a node holds its value for
+                // the body's whole extent, exactly as `each_as`'s does, and
+                // so is registered in the embed table; the guards drop with
+                // this binding set, so nothing outlives an alternative.
+                #[allow(clippy::collection_is_never_read)]
+                // held for their `Drop`, which pops the table
+                let mut embedded = Vec::new();
+                let substituted_body = substitute_destructured_bindings::<S>(
                     body,
-                    as_var_refs(bindings).chain(
-                        all_var_names
-                            .iter()
-                            .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
-                            .map(|name| (name.as_str(), &null_value)),
-                    ),
+                    bindings,
+                    all_var_names,
+                    |origin, bound| {
+                        embedded.extend(super::eval_generic::embed_table_push::<S>(origin, bound));
+                    },
                 );
 
                 // #2180 WP3 review: cleared per attempt, so what the retry
@@ -6840,7 +6868,8 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         Demand::Stop
                     }
                 }
-            });
+            },
+        );
         match outcome {
             Some(BodyOutcome::Retry) => continue,
             Some(BodyOutcome::Return(flow)) => return flow,
@@ -7452,16 +7481,18 @@ where
     fanout_arg_each_inner::<W, S, _, false>(arg_expr, value, optional, |owned, _| body(owned))
 }
 
-/// [`fanout_arg_each`]'s twin for [`each_as`] alone (#2889 Stage B): the
-/// same demand-forwarding fan-out, with `body` also told the document node
+/// [`fanout_arg_each`]'s twin for [`each_as`] and [`each_as_pattern`] (#2889
+/// Stage B, #3466): the same demand-forwarding fan-out, with `body` also told
+/// the document node
 /// each bound value came from, read off the [`Item`] *before* it is
 /// materialized ([`item_bind_origin`]) because the conversion is what loses
 /// the cursor.
 ///
 /// The exact shape `eval_generic::fanout_arg_each_generic_with_origin`
-/// already has, and split off for the same reason: only a bare `$var` bind
-/// has a single node worth naming, so [`each_as_pattern`] keeps fanning out
-/// through plain [`fanout_arg_each`]. Every rule of [`fanout_arg_each_inner`]
+/// already has, and split off for the same reason: a body that has no use for
+/// the node ([`fanout_arg_each`]'s callers) should not pay to name it.
+/// [`each_as_pattern`] uses it too since #3466, to seed its pattern walk with
+/// the source's cursor. Every rule of [`fanout_arg_each_inner`]
 /// carries over verbatim -- `body` runs against argument value N before N+1
 /// is evaluated, a `body` escape stops the pull there, the argument's own
 /// trailing control fires only after everything `body` already produced, and
@@ -64866,6 +64897,7 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         all_var_names,
         body,
         bound_val,
+        None,
         value,
         optional,
         &mut |item| {
@@ -65060,6 +65092,18 @@ trait PatternMode {
     /// [`Reentry::at_register`].
     fn key_input_tracked(&self, reg: &Self::Reg, first: bool) -> bool;
 
+    /// The state the walk continues from after `walked`, the register the
+    /// sub-pattern of one entry ended in, where `container` is the register
+    /// the container's own entries step from. Path mode carries the moved
+    /// register on (jq's path register is *not* restored, which is exactly
+    /// what its `path_intact` check reads); a mode that follows the document
+    /// steps every entry from the container's own node and restores it
+    /// (#3466).
+    fn rejoin(&self, container: &Self::Reg, walked: Self::Reg) -> Self::Reg {
+        let _ = container;
+        walked
+    }
+
     /// The name a binding carries, for the duplicate-name rule.
     fn name(binding: &Self::Binding) -> &str;
 }
@@ -65087,6 +65131,139 @@ impl PatternMode for ValuePatternMode {
 
     fn key_input_tracked(&self, _reg: &(), _first: bool) -> bool {
         false
+    }
+
+    fn name(binding: &Self::Binding) -> &str {
+        &binding.0
+    }
+}
+
+/// The most pattern entries a walk follows on the document (#3466): each
+/// step scans its container's members, so a pattern wide enough to make
+/// that quadratic (#2872's 20k-entry pattern) resolves by value alone.
+const MAX_TRACKED_PATTERN_ENTRIES: usize = 64;
+
+/// Whether a destructuring bind follows the document node each variable
+/// sits at (#3466): jq mode only, only for a program that can read a
+/// variable's identity ([`scalar_identity_readable`], #3191's gate), and
+/// only for a pattern narrow enough to walk cheaply. Anything else binds by
+/// value exactly as before.
+///
+/// [`scalar_identity_readable`]: super::eval_generic::scalar_identity_readable
+pub(crate) fn destructure_identity_tracked<S: EvalSemantics>(patterns: &[Pattern]) -> bool {
+    fn entries(pattern: &Pattern) -> usize {
+        match pattern {
+            Pattern::Var(_) => 0,
+            Pattern::Object(es) => es.len() + es.iter().map(|e| entries(&e.pattern)).sum::<usize>(),
+            Pattern::Array(ps) => ps.len() + ps.iter().map(entries).sum::<usize>(),
+        }
+    }
+    S::TAG == EvalTag::Jq
+        && super::eval_generic::scalar_identity_readable()
+        && patterns.iter().map(entries).sum::<usize>() <= MAX_TRACKED_PATTERN_ENTRIES
+}
+
+/// The member of `cur`'s object named `name`, as the owned value keeps it:
+/// the **last** one when a key repeats. `None` when `cur` is no object, has
+/// no such member, or holds a member whose key has no display string -- the
+/// caller then binds by value, which is the refusal it always was.
+fn object_member_cursor<C: DocumentCursor>(cur: &C, name: &str) -> Option<C> {
+    let value = cur.value();
+    let mut fields = super::document::DocumentValue::as_object(&value)?;
+    let mut found = None;
+    while let Some((field, rest)) = fields.uncons() {
+        if key_display_string(&field.key)? == name {
+            found = Some(field.value_cursor);
+        }
+        fields = rest;
+    }
+    found
+}
+
+/// The element of `cur`'s array at `index`, a negative one counted from the
+/// end. `None` when `cur` is no array or `index` is out of range.
+fn array_element_cursor<C: DocumentCursor>(cur: &C, index: i64) -> Option<C> {
+    let value = cur.value();
+    let elements = super::document::DocumentValue::as_array(&value)?;
+    let target = if index < 0 {
+        let mut len = 0i64;
+        let mut e = elements;
+        while let Some((_, rest)) = e.uncons_cursor() {
+            len += 1;
+            e = rest;
+        }
+        len.checked_add(index).filter(|t| *t >= 0)?
+    } else {
+        index
+    };
+    let mut at = 0i64;
+    let mut e = elements;
+    while let Some((elem, rest)) = e.uncons_cursor() {
+        if at == target {
+            return Some(elem);
+        }
+        at += 1;
+        e = rest;
+    }
+    None
+}
+
+/// One pattern step taken on the document: the node [`PatternKey::child`]
+/// reads its owned value from. Only the keys whose owned answer the cursor
+/// provably agrees with are followed -- a literal or string key, a
+/// non-negative position, an integer computed key. A float, a slice
+/// descriptor or anything else gives `None` (#3466).
+fn cursor_child<C: DocumentCursor>(cur: &C, key: &PatternKey<'_>) -> Option<C> {
+    match key {
+        PatternKey::Field(name) => object_member_cursor(cur, name),
+        PatternKey::Position(i) => array_element_cursor(cur, *i),
+        PatternKey::Computed(OwnedValue::String(s)) => object_member_cursor(cur, s.as_ref()),
+        PatternKey::Computed(OwnedValue::Int(i)) => array_element_cursor(cur, *i),
+        PatternKey::Computed(_) => None,
+    }
+}
+
+/// One variable bound by a destructuring pattern, with the document node it
+/// was read from when the walk could follow it there (#3466).
+pub(crate) type NodeBinding = (String, OwnedValue, Option<BindOrigin>);
+
+/// Value mode that also follows the document (#3466): the register is the
+/// cursor of the node the walk stands on, stepped in lockstep with the
+/// owned value, and a binding records the node it stands at. `None` once
+/// the cursor cannot follow a step, which is every later binding's refusal
+/// and never a wrong answer -- a binding names a node only where the walk
+/// *proved* it, so [`embed_table_push`] can never certify a stranger.
+struct CursorPatternMode<C>(PhantomData<C>);
+
+impl<C: DocumentCursor> PatternMode for CursorPatternMode<C> {
+    type Reg = Option<C>;
+    type Binding = NodeBinding;
+
+    fn step<S: EvalSemantics>(
+        &self,
+        key: &PatternKey<'_>,
+        input: &OwnedValue,
+        reg: &Option<C>,
+        _first: bool,
+    ) -> Result<(OwnedValue, Option<C>), EvalError> {
+        let child = key.child::<S>(input)?;
+        Ok((child, reg.as_ref().and_then(|c| cursor_child(c, key))))
+    }
+
+    fn bind(&self, name: &str, value: &OwnedValue, reg: &Option<C>) -> Self::Binding {
+        (
+            name.to_string(),
+            value.clone(),
+            reg.as_ref().map(super::eval_generic::bind_origin_of_cursor),
+        )
+    }
+
+    fn key_input_tracked(&self, _reg: &Option<C>, _first: bool) -> bool {
+        false
+    }
+
+    fn rejoin(&self, container: &Option<C>, _walked: Option<C>) -> Option<C> {
+        *container
     }
 
     fn name(binding: &Self::Binding) -> &str {
@@ -65182,6 +65359,7 @@ fn walk_pattern_once<M: PatternMode, S: EvalSemantics>(
             Ok(reg)
         }
         Pattern::Object(entries) => {
+            let base = reg.clone();
             let mut reg = reg;
             for (i, entry) in entries.iter().enumerate() {
                 let ObjectKey::Literal(key) = &entry.key else {
@@ -65197,16 +65375,19 @@ fn walk_pattern_once<M: PatternMode, S: EvalSemantics>(
                 if let Some(bind) = &entry.bind {
                     out.push(mode.bind(bind, &child, &moved));
                 }
-                reg = walk_pattern_once::<M, S>(mode, &entry.pattern, &child, moved, out)?;
+                let walked = walk_pattern_once::<M, S>(mode, &entry.pattern, &child, moved, out)?;
+                reg = mode.rejoin(&base, walked);
             }
             Ok(reg)
         }
         Pattern::Array(elements) => {
+            let base = reg.clone();
             let mut reg = reg;
             for (i, element) in elements.iter().enumerate().rev() {
                 let key = PatternKey::Position(i as i64);
                 let (child, moved) = mode.step::<S>(&key, input, &reg, i + 1 == elements.len())?;
-                reg = walk_pattern_once::<M, S>(mode, element, &child, moved, out)?;
+                let walked = walk_pattern_once::<M, S>(mode, element, &child, moved, out)?;
+                reg = mode.rejoin(&base, walked);
             }
             Ok(reg)
         }
@@ -65228,6 +65409,7 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
     sink: PatternMatchSink<'_, M>,
 ) -> Flow {
     let mark = out.len();
+    let base = reg.clone();
     let mut reg = reg;
     let mut first = first;
     let mut idx = 0;
@@ -65249,7 +65431,7 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
             out.push(mode.bind(bind, &child, &moved));
         }
         reg = match walk_pattern_once::<M, S>(mode, &entry.pattern, &child, moved, out) {
-            Ok(reg) => reg,
+            Ok(walked) => mode.rejoin(&base, walked),
             Err(e) => {
                 out.truncate(mark);
                 return Flow::Escaped(Control::Error(e));
@@ -65276,10 +65458,17 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
         if let Some(bind) = &entry.bind {
             out.push(mode.bind(bind, &child, &moved));
         }
-        let flow =
-            walk_pattern_each::<M, S>(mode, &entry.pattern, &child, moved, out, &mut |reg, out| {
+        let flow = walk_pattern_each::<M, S>(
+            mode,
+            &entry.pattern,
+            &child,
+            moved,
+            out,
+            &mut |walked, out| {
+                let reg = mode.rejoin(&base, walked);
                 walk_object_entries::<M, S>(mode, rest, false, input, reg, out, sink)
-            });
+            },
+        );
         out.truncate(inner_mark);
         flow
     };
@@ -65336,6 +65525,7 @@ fn walk_array_elements<M: PatternMode, S: EvalSemantics>(
     sink: PatternMatchSink<'_, M>,
 ) -> Flow {
     let mark = out.len();
+    let base = reg.clone();
     let mut reg = reg;
     let mut first = first;
     let mut end = elements.len();
@@ -65349,7 +65539,7 @@ fn walk_array_elements<M: PatternMode, S: EvalSemantics>(
             }
         };
         reg = match walk_pattern_once::<M, S>(mode, &elements[end - 1], &child, moved, out) {
-            Ok(reg) => reg,
+            Ok(walked) => mode.rejoin(&base, walked),
             Err(e) => {
                 out.truncate(mark);
                 return Flow::Escaped(Control::Error(e));
@@ -65371,7 +65561,8 @@ fn walk_array_elements<M: PatternMode, S: EvalSemantics>(
             return Flow::Escaped(Control::Error(e));
         }
     };
-    let flow = walk_pattern_each::<M, S>(mode, element, &child, moved, out, &mut |reg, out| {
+    let flow = walk_pattern_each::<M, S>(mode, element, &child, moved, out, &mut |walked, out| {
+        let reg = mode.rejoin(&base, walked);
         walk_array_elements::<M, S>(mode, rest, false, input, reg, out, sink)
     });
     out.truncate(mark);
@@ -65474,6 +65665,90 @@ pub(crate) fn each_pattern_binding_set<S: EvalSemantics>(
             }
         },
     )
+}
+
+/// A consumer of one binding set that also carries each variable's document
+/// node: the bound `(name, value, origin)` triples in visit order,
+/// deduplicated.
+pub(crate) type NodeBindingSetSink<'s> = &'s mut dyn FnMut(&[NodeBinding]) -> Demand;
+
+/// [`each_pattern_binding_set`] that follows `source`, the cursor of the node
+/// `value` was read from, down the pattern (#3466), so a variable's
+/// [`BindOrigin`] names the document node it sits at. With no `source` every
+/// origin is `None` and this is [`each_pattern_binding_set`] plus one empty
+/// option per binding.
+pub(crate) fn each_pattern_binding_set_at<S: EvalSemantics, C: DocumentCursor>(
+    pattern: &Pattern,
+    value: &OwnedValue,
+    source: Option<C>,
+    invert: bool,
+    sink: NodeBindingSetSink<'_>,
+) -> Flow {
+    let mode = CursorPatternMode::<C>(PhantomData);
+    let mut out: Vec<NodeBinding> = Vec::new();
+    walk_pattern_each::<CursorPatternMode<C>, S>(
+        &mode,
+        pattern,
+        value,
+        source,
+        &mut out,
+        &mut |_, out| {
+            let demand = match dedup_pattern_match::<CursorPatternMode<C>>(out, invert) {
+                Some(deduped) => sink(&deduped),
+                None => sink(out),
+            };
+            match demand {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            }
+        },
+    )
+}
+
+/// `body` with every variable of one binding set substituted (#3466): a
+/// binding that names a document node goes through the marker route -- first
+/// telling `register` (the caller's embed-table and anchor push, whose guards
+/// it keeps alive for the body's extent) -- and every other binding, and
+/// every name of `all_var_names` the alternative left unbound (`null`), is
+/// substituted by value exactly as before.
+///
+/// The marker route is [`substitute_bound_var_at`] with no
+/// identity-passthrough: a destructured variable is a *child* of the source
+/// expression, so `. as {a:$v}` must never be read as `. as $v`.
+pub(crate) fn substitute_destructured_bindings<S: EvalSemantics>(
+    body: &Expr,
+    bindings: &[NodeBinding],
+    all_var_names: &[String],
+    mut register: impl FnMut(Option<&BindOrigin>, &mut OwnedValue),
+) -> Expr {
+    let mut current = body.clone();
+    for (name, value, origin) in bindings {
+        current = match origin {
+            None => substitute_var(&current, name, value),
+            Some(node) => {
+                let mut bound = value.clone();
+                register(origin.as_ref(), &mut bound);
+                substitute_bound_var_at(
+                    &Expr::Literal(Literal::Null),
+                    &current,
+                    name,
+                    &bound,
+                    None,
+                    None,
+                    Some(node.clone()),
+                    S::TAG == EvalTag::Jq,
+                    S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY,
+                )
+            }
+        };
+    }
+    let null_value = OwnedValue::Null;
+    for name in all_var_names {
+        if !bindings.iter().any(|(n, _, _)| n == name) {
+            current = substitute_var(&current, name, &null_value);
+        }
+    }
+    current
 }
 
 /// Drop every item after the first for each repeated `name`, keeping
@@ -76140,6 +76415,100 @@ mod tests {
             .iter()
             .map(OwnedValue::to_json)
             .collect()
+    }
+
+    /// #3466: `cursor_child` names exactly the node `PatternKey::child`
+    /// reads its owned value from, and nothing it cannot prove.
+    #[test]
+    fn test_cursor_child_names_the_owned_child_3466() {
+        let json = br#"{"a":1,"a":2,"l":[10,20,30],"s":"x"}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let text = |c: Option<JsonCursor<'_, Vec<u64>>>| {
+            c.map(|c| {
+                to_owned::<JqSemantics, Vec<u64>>(&c.value())
+                    .unwrap()
+                    .to_json()
+            })
+        };
+        let int = OwnedValue::Int;
+        // A repeated key resolves to the last member, as the owned value's.
+        assert_eq!(
+            text(cursor_child(&root, &PatternKey::Field("a"))).as_deref(),
+            Some("2")
+        );
+        assert!(cursor_child(&root, &PatternKey::Field("zz")).is_none());
+        assert!(cursor_child(&root, &PatternKey::Position(0)).is_none());
+        let list = cursor_child(&root, &PatternKey::Field("l")).unwrap();
+        assert_eq!(
+            text(cursor_child(&list, &PatternKey::Position(1))).as_deref(),
+            Some("20")
+        );
+        // A computed key: a negative position counts from the end, an
+        // out-of-range one, a float and a string on an array name nothing.
+        assert_eq!(
+            text(cursor_child(&list, &PatternKey::Computed(&int(-1)))).as_deref(),
+            Some("30")
+        );
+        for key in [
+            int(-4),
+            int(3),
+            OwnedValue::Float(1.0),
+            OwnedValue::string("x"),
+        ] {
+            assert!(
+                cursor_child(&list, &PatternKey::Computed(&key)).is_none(),
+                "{key:?}"
+            );
+        }
+        let computed = OwnedValue::string("l");
+        assert!(cursor_child(&root, &PatternKey::Computed(&computed)).is_some());
+        // A scalar has no children.
+        let scalar = cursor_child(&root, &PatternKey::Field("s")).unwrap();
+        assert!(cursor_child(&scalar, &PatternKey::Field("a")).is_none());
+        assert!(cursor_child(&scalar, &PatternKey::Position(0)).is_none());
+    }
+
+    /// #3466: the borrowed evaluator's own destructuring bind
+    /// (`each_as_pattern`, reached through a demand-forwarding consumer)
+    /// follows the source's document node like `eval_generic`'s does. A
+    /// `path()` query is routed to the generic evaluator before it gets
+    /// here, so what this pins is that the origin plumbing -- the cursor
+    /// walk, the embed-table guards, the marker substitution -- changes no
+    /// answer: every row, `?//` retry and computed key included, reads the
+    /// same values it did when the bind had no node.
+    #[test]
+    fn test_destructuring_bind_borrowed_evaluator_answers_unchanged_3466() {
+        let doc = br#"{"a":{"b":1,"c":0},"d":[3,{"e":4}]}"#;
+        for (filter, want) in [
+            (
+                "first(. as {a:{b:$z}} | [$z, .a.b, .a])",
+                vec![r#"[1,1,{"b":1,"c":0}]"#],
+            ),
+            (
+                "first(.a as {b:$z,c:$y} | {k:$z,m:$y})",
+                vec![r#"{"k":1,"m":0}"#],
+            ),
+            (
+                "first(. as {d:[$x,{e:$e}]} | [$x,$e,.d])",
+                vec![r#"[3,4,[3,{"e":4}]]"#],
+            ),
+            (
+                "first(. as [$x] ?// {a:{b:$z}} | [$x,$z])",
+                vec!["[null,1]"],
+            ),
+            (r#"first(. as {("a"):{("b"):$z}} | $z)"#, vec!["1"]),
+            ("first(. as {a:$v} | {k:.a} | .k == $v)", vec!["true"]),
+            // jq 1.7.1: `[first(...)]` is `[null,1]` -- a satisfied consumer
+            // is an escaping `break`, so the next alternative still runs
+            // (#1519).
+            (
+                "first(. as {nope:{b:$z}} ?// {a:{b:$z}} | $z)",
+                vec!["null", "1"],
+            ),
+        ] {
+            assert_eq!(outputs(doc, filter), want, "{filter}");
+        }
     }
 
     /// Like `outputs`, but evaluates with `YqSemantics` -- for exercising
