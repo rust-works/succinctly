@@ -30608,7 +30608,7 @@ fn fresh_run_pos<'a>(pos: Option<&UpdatePos<'a>>, fresh: &[Expr]) -> Option<Upda
     let mut components = vec_with_capacity(fresh.len());
     for step in fresh {
         match unwrap_path_component(step).0 {
-            Expr::Field(name) => components.push(OwnedValue::String(name.clone().into())),
+            Expr::Field(name) => components.push(OwnedValue::String(name.clone().into())), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
             Expr::Index { idx, .. } if *idx >= 0 => components.push(OwnedValue::Int(*idx)),
             _ => return None,
         }
@@ -54257,7 +54257,7 @@ fn get_value_at_path(value: &OwnedValue, path: &[OwnedValue]) -> Option<OwnedVal
         (OwnedValue::Object(desc), OwnedValue::String(s)) => {
             let bounds = SliceBounds::from_descriptor(desc).ok()?;
             let range = bounds.resolve(s.chars().count());
-            let sliced = OwnedValue::String(slice::slice_str(s, range).into());
+            let sliced = OwnedValue::String(slice::slice_str(s, range).into()); // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
             get_value_at_path(&sliced, &path[1..])
         }
         (OwnedValue::Object(desc), OwnedValue::Object(map)) => {
@@ -115160,6 +115160,22 @@ mod touched_edge_cases_2999 {
             jq_json(b"[1,[2]]", r#"getpath([{"start":1,"end":2}, 0])"#),
             "[2]"
         );
+    }
+
+    /// The resolver's per-component step looks through a `?` wrapper: `.b?`
+    /// takes `.b`'s own step. Since #3191 promotes a bound scalar, the CLI
+    /// rows that used to reach this arm are answered by identity before the
+    /// anchor is consulted, so the arm is pinned directly.
+    #[test]
+    fn anchor_component_step_looks_through_an_optional_component() {
+        let doc = OwnedValue::object_from([("b".to_string(), OwnedValue::Int(1))]);
+        let field = Expr::Optional(Box::new(Expr::Field("b".to_string())));
+        let (child, step) = anchor_component_step(&doc, &field).unwrap();
+        assert_eq!(child, &OwnedValue::Int(1));
+        assert_eq!(step, OwnedValue::string("b"));
+        // A missing key still declines, `?` or not.
+        let missing = Expr::Optional(Box::new(Expr::Field("z".to_string())));
+        assert!(anchor_component_step(&doc, &missing).is_none());
     }
 
     #[test]

@@ -25319,10 +25319,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // hands back its input `jv` (#3191). jq mode only: in yq
                 // mode materializing the node reads its YAML tag, and
                 // `!!str 1.5 | tonumber` must stay the number 1.5.
-                GenericResult::Owned(owned_or_suppress!(
-                    to_owned_with_cursor::<_, S>(&value, cursor),
-                    optional
-                ))
+                let owned = to_owned_with_cursor::<_, S>(&value, cursor);
+                GenericResult::Owned(owned_or_suppress!(owned, optional)) // omni-dev: coverage tolerate-line reason="unreachable: to_owned_with_cursor of a document number literal cannot fail, so the macro's error arms never run (#3191)"
             } else if let Some(literal) = value.number_literal() {
                 GenericResult::Owned(OwnedValue::from_number_literal::<S>(&literal))
             } else if let Some(i) = value.as_i64() {
@@ -27719,7 +27717,7 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
                         crate::jq::eval::compare_values::<S>(item, output)
                             == core::cmp::Ordering::Equal
                     })
-                    .map(|(k, _)| OwnedValue::String(k.clone().into())),
+                    .map(|(k, _)| OwnedValue::String(k.clone().into())), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
                 _ => None,
             };
             component.map(|component| id.child(&parent, component))
@@ -28087,7 +28085,7 @@ fn map_family_members(
                 .map(|(i, (k, v))| match family {
                     MapFamily::WithEntries => {
                         let key = typed_keys.map_or_else(
-                            || OwnedValue::String(k.clone().into()),
+                            || OwnedValue::String(k.clone().into()), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
                             |keys| keys[i].clone(),
                         );
                         (OwnedValue::Int(i as i64), map_family_entry(key, v.clone()))

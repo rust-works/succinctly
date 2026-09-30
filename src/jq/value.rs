@@ -5660,6 +5660,57 @@ mod tests {
         assert!(held.is_shared());
     }
 
+    /// `SharableString` stands in for `String` wherever one was, so its
+    /// conversions, comparisons and borrows must all agree with `String`'s
+    /// -- promoted or not (#3191).
+    #[test]
+    fn sharable_string_stands_in_for_string_3191() {
+        use core::borrow::Borrow;
+
+        assert_eq!(SharableString::new(), "");
+        assert_eq!(SharableString::default(), SharableString::from(""));
+
+        let a = SharableString::from("a");
+        let b = SharableString::from("b");
+        assert_eq!(a.partial_cmp(&b), Some(core::cmp::Ordering::Less));
+        assert_eq!(b.partial_cmp(&a), Some(core::cmp::Ordering::Greater));
+        assert_eq!(a.partial_cmp(&a.clone()), Some(core::cmp::Ordering::Equal));
+
+        let as_ref: &str = a.as_ref();
+        assert_eq!(as_ref, "a");
+        let borrowed: &str = Borrow::<str>::borrow(&a);
+        assert_eq!(borrowed, "a");
+
+        let owned = String::from("x");
+        assert_eq!(SharableString::from(&owned), "x");
+        assert_eq!(SharableString::from(Cow::Borrowed("y")), "y");
+        assert_eq!(SharableString::from(Cow::<str>::Owned("z".into())), "z");
+        assert_eq!(SharableString::from(Box::<str>::from("w")), "w");
+        assert_eq!(SharableString::from('c'), "c");
+
+        assert_eq!("a", a);
+        assert_ne!("a", b);
+        assert_eq!(*"a", a);
+        assert_ne!(*"a", b);
+        assert_eq!(a, *"a");
+        assert_eq!(a, "a");
+        let same = String::from("a");
+        assert_eq!(a, same);
+    }
+
+    /// The number-spelling twin borrows as a `str` like the `Box<str>` it
+    /// replaced (#3191).
+    #[test]
+    fn sharable_literal_borrows_as_str_3191() {
+        use core::borrow::Borrow;
+
+        let l = SharableLiteral::from("1.0");
+        let as_ref: &str = l.as_ref();
+        assert_eq!(as_ref, "1.0");
+        let borrowed: &str = Borrow::<str>::borrow(&l);
+        assert_eq!(borrowed, "1.0");
+    }
+
     /// The number-spelling twin: inline until promoted, one storage for
     /// every clone after, and `into_boxed` copies only while shared.
     #[test]

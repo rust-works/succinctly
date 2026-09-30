@@ -654,7 +654,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::NumberLiteral(literal) => {
                 OwnedValue::from_number_literal_boxed::<JqSemantics>(literal)
             }
-            JqValue::String(s) => OwnedValue::String(s.into()),
+            JqValue::String(s) => OwnedValue::String(s.into()), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
             JqValue::Array(arr) => OwnedValue::Array(
                 arr.into_iter()
                     .map(|v| v.into_owned_at_depth(depth + 1))
