@@ -18,9 +18,14 @@
 //! No timing assertion: correctness only. See `benches/jq_recurse_depth_bench.rs`
 //! for the depth-scaling *timing* benchmark this issue also adds.
 //!
+//! These call `eval_full`, not `eval`: since #3457 the public `eval` is the generic
+//! evaluator, whose path walkers stop at nesting depth 256, so it would not reach
+//! the code #626 touches. The public entry's own depth behaviour is pinned in
+//! `tests/jq_library_eval_nesting_depth_tests.rs`.
+//!
 //! Run with: cargo test --test jq_recurse_depth_tests
 
-use succinctly::jq::{eval, parse, JqSemantics, OwnedValue, QueryResult};
+use succinctly::jq::{eval_full, parse, JqSemantics, OwnedValue, QueryResult};
 use succinctly::json::JsonIndex;
 
 /// Deep enough to exercise many recursion frames; see module doc for why this
@@ -41,7 +46,7 @@ fn expected_paths(depth: usize) -> Vec<String> {
         .collect()
 }
 
-/// Run `filter` against `json` through the library's full evaluator and
+/// Run `filter` against `json` through eval.rs's own evaluator (`eval_full`) and
 /// render each output path with `OwnedValue::to_json`, matching the
 /// `expected_paths` string shape above.
 fn run_paths(json: &str, filter: &str) -> Vec<String> {
@@ -49,7 +54,7 @@ fn run_paths(json: &str, filter: &str) -> Vec<String> {
     let index = JsonIndex::build(bytes);
     let cursor = index.root(bytes);
     let expr = parse(filter).expect("parse failed");
-    let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+    let result: QueryResult<Vec<u64>> = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
     assert!(
         !result.is_error(),
         "`{filter}` errored on the depth-{DEPTH} document: {result:?}"

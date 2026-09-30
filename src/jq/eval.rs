@@ -1856,6 +1856,40 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
         )
     }
 
+    /// [`Self::collect_owned`] without the loss: a value that cannot be
+    /// decoded is an `Err`, not a `null` (#3457).
+    ///
+    /// A cursor result is undecoded by design (that is what keeps `.`
+    /// cheap), and [`eval`] hands the generic evaluator's cursors through as
+    /// they are, so `getpath(["b"])` on `{"a":1,"b":tru}` is a
+    /// [`QueryResult::OneCursor`] naming a value nothing can read. Mirrors
+    /// [`crate::jq::eval_generic::GenericResult::collect_owned`], which
+    /// already reports it (#1247).
+    ///
+    /// Named `_checked`, not `try_`, because what it checks is decoding: only
+    /// a *decode failure* is an `Err`. A query error, `break` or `halt`
+    /// is not: `None`/`Error`/`Break`/`Halt` collect to an empty `Vec` and a
+    /// `Partial` to its prefix, as in the lossy form and in the generic
+    /// evaluator. Check for [`QueryResult::Error`] (or [`Self::is_error`])
+    /// first if a query error must not read as "no results".
+    pub fn collect_owned_checked<S: EvalSemantics>(self) -> Result<Vec<OwnedValue>, EvalError> {
+        Ok(match self {
+            QueryResult::One(v) => vec![super::eval_generic::to_owned::<S, _>(&v)?],
+            QueryResult::OneCursor(c) => vec![super::eval_generic::to_owned::<S, _>(&c.value())?],
+            QueryResult::Many(vs) => vs
+                .iter()
+                .map(super::eval_generic::to_owned::<S, _>)
+                .collect::<Result<_, _>>()?,
+            QueryResult::None
+            | QueryResult::Error(_)
+            | QueryResult::Break(_)
+            | QueryResult::Halt(_) => Vec::new(),
+            QueryResult::Owned(o) => vec![o],
+            QueryResult::ManyOwned(os) => os,
+            QueryResult::Partial(vs, _control) => vs,
+        })
+    }
+
     /// Collect all output values into a `Vec<OwnedValue>`.
     ///
     /// Mirrors [`crate::jq::eval_generic::GenericResult::collect_owned`]:
@@ -1864,6 +1898,10 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
     /// outputs are no longer discarded. This gives the full evaluator the
     /// same materialization surface as the generic (CLI) path, which is what
     /// evaluator-parity tests rely on.
+    ///
+    /// **Lossy:** a cursor whose value cannot be decoded (a malformed number,
+    /// an unquoted keyword) becomes `null` rather than an error. Use
+    /// [`Self::collect_owned_checked`] when that distinction matters (#3457).
     pub fn collect_owned<S: EvalSemantics>(self) -> Vec<OwnedValue> {
         match self {
             QueryResult::One(v) => vec![to_owned_lossy::<S, _>(&v)],
@@ -23911,7 +23949,7 @@ fn yq_negative_index_error_for_len(
 /// this read-only helper's contract. `del()`/`delpaths()`'s own gap #2268
 /// also found is fixed via [`yq_negative_index_error_for_len`] above, not
 /// this function -- see that one's own doc comment for why.
-fn yq_negative_index_error<S: EvalSemantics>(
+pub(crate) fn yq_negative_index_error<S: EvalSemantics>(
     target: &OwnedValue,
     key: &OwnedValue,
 ) -> Option<EvalError> {
@@ -26319,26 +26357,67 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 ///
 /// # Relation to the CLI
 ///
-/// `succinctly jq` does not evaluate through this function; it uses the
-/// generic evaluator's cursor entries
-/// ([`eval_with_cursor_using`](super::eval_generic::eval_with_cursor_using)
-/// and its streaming twin). `succinctly yq`'s DOM route does call it. This
-/// function hands a query that needs path context (`key`, `parent`, ...) to
-/// that cursor entry and evaluates everything else itself, so the two can
-/// answer differently, on well-formed input too: cursor-metadata builtins
-/// such as `line` answer from fixed defaults here.
+/// This is the same evaluator `succinctly jq`/`succinctly yq` use: it hands
+/// every query to the generic evaluator's cursor entry
+/// ([`eval_with_cursor_using`](super::eval_generic::eval_with_cursor_using))
+/// and reshapes the answer into a [`QueryResult`] (#3457). So a value the
+/// index cannot read (a malformed number such as `1.2.3`, or a keyword such
+/// as `tru`), which jq rejects at parse time, is only validated where
+/// something reads it: `[.] | length` on it answers `1`, and `path(.a)` on
+/// `{"a":1,"b":tru}` answers `["a"]`, as they do in the CLI (#3266).
+/// Cursor-metadata builtins such as `line` answer from the real document.
 ///
-/// On a value the index cannot read (a malformed number such as `1.2.3`, or
-/// a keyword such as `tru`), which jq rejects at parse time, this entry
-/// raises where the cursor entry answers (#3266). It collects its results
-/// into owned values, and its `path`/`paths`/`leaf_paths`/`getpath` walk an
-/// owned copy of their input, and building that copy decodes the value:
-/// `[.] | length` on it, or `path(.a)` on `{"a":1,"b":tru}`, raises here
-/// and answers in the CLI. `eval_with_cursor_using` gives the CLI's
-/// answers, but its path walkers panic on a document nested deeper than 256
-/// levels, where this entry answers (#3429); the CLI catches that panic. The
-/// split is recorded in `docs/compliance/jq/limitations.md`; converging the
-/// two is #3457.
+/// # Result variants
+///
+/// Which [`QueryResult`] variant carries an answer depends on the filter's
+/// form, not just on the value, and these are the guarantees:
+///
+/// - the bare filter `.` is [`QueryResult::OneCursor`] (the input, undecoded,
+///   with its position);
+/// - any other filter that yields one value the document holds is
+///   [`QueryResult::One`], *including one that yields the input itself*
+///   (`. | .`, `first(.)`), which is the value but no longer a cursor;
+/// - a value the filter computes (`.a + 1`, a missing field's `null`) is
+///   [`QueryResult::Owned`]/[`QueryResult::ManyOwned`], and an empty
+///   iteration is [`QueryResult::None`].
+///
+/// A caller that needs a cursor's position should ask for `.` and navigate
+/// from the cursor itself, and one that matches on variants should accept
+/// the owned ones too. Before #3457 a missing field's `null` was
+/// `One(Null)` and an empty iteration `Many([])`; those are now `Owned(Null)`
+/// and `None`.
+///
+/// # Results and decode failures
+///
+/// A cursor result ([`QueryResult::OneCursor`], and the values inside
+/// [`QueryResult::One`]/[`QueryResult::Many`]) is *not* decoded here, so the
+/// value it names may still be unreadable. [`QueryResult::collect_owned_checked`]
+/// reports that as an `Err`; [`QueryResult::collect_owned`] is the lossy form
+/// and turns it into `null`. Use the former wherever a wrong answer is worse
+/// than an error.
+///
+/// # Nesting depth
+///
+/// A document nested 256 levels or deeper makes the queries that walk it
+/// (`paths`, `path(..)`, ...) return `nesting depth exceeds limit of 256` as
+/// a [`QueryResult::Error`]. The error is tagged as a decode failure, so a
+/// `try` in the filter does not swallow it, and it is a return value, not an
+/// unwinding panic. The evaluator this entry used before #3457 answered these
+/// up to 384 levels; raising the ceiling is #3429. Every depth guard the
+/// evaluator itself reaches reports the error this way. As a backstop, with
+/// the `std` feature a panic of the 256-level guard from anywhere else (the
+/// public `JqValue::materialize` still panics there by contract) is caught
+/// and returned the same way, though the default panic hook still prints its
+/// one-line message to stderr first; without `std` there is no unwinding to
+/// catch and it propagates.
+///
+/// # Other entry points
+///
+/// [`eval_lenient`] follows this entry. [`eval_owned_with_file_index`]
+/// evaluates an already-decoded [`OwnedValue`], which has no unreadable value
+/// to split on, and keeps its own route; so does `succinctly yq`'s DOM route,
+/// through the hidden `eval_reindexed`, for the same reason and because the
+/// generic evaluator costs it measurably more per `-R` line.
 ///
 /// # Examples
 ///
@@ -26357,31 +26436,126 @@ pub fn eval<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
 ) -> QueryResult<'a, W> {
-    // Spine 2416, phase 3: a query that reads path context anywhere is
-    // evaluated by the generic evaluator, where `key`/`parent`/`path` are
-    // cursor properties and object construction, `select`, `if` and the
-    // bounded consumers thread the cursor natively. This evaluator's own
-    // `eval_pipe` would divert such a pipe to the deleted eager path-context evaluator
-    // -- the eager, materializing path-context evaluator that spine is
-    // retiring -- so the library entry point no longer enters it at all
-    // for these shapes. The generic evaluator still bridges back into this
-    // file for the shapes only the eager evaluator can answer (owned-domain
+    // #3457: one evaluator for the library and the CLI, with no per-query
+    // routing decision. The generic evaluator still bridges back into this
+    // file for the shapes only this evaluator can answer (owned-domain
     // navigation, absent nodes, constructs it has no native arm for), and
     // does so through [`eval_full`], never through here, so the two cannot
-    // recurse into each other.
-    if needs_path_context(expr) {
-        return generic_to_query_result::<_, S>(
-            super::eval_generic::eval_with_cursor_using::<S, _>(expr, cursor),
-        );
+    // recurse into each other. #3432 tried routing only the path builtins
+    // and, by scanning the whole `Expr` (dead `def`s included), changed
+    // unrelated queries' answers, native stack use and cost; an
+    // unconditional route has no scan to get wrong.
+    //
+    // `.` needs no evaluation at all: it is the unchanged input as a cursor,
+    // which is also what the generic evaluator answers, so it skips the
+    // dispatch and the unwind guard.
+    if matches!(expr, Expr::Identity) {
+        return QueryResult::OneCursor(cursor);
     }
-    eval_full::<W, S>(expr, cursor)
+    //
+    // One shape adaptation keeps the documented result contract (README, the
+    // `jq` module docs): a single navigated value is the borrowed `One` view
+    // (`.age` is `One(Number)`), and only `.` is a `OneCursor`. The generic
+    // evaluator hands back a cursor for both. The value is the same either
+    // way; which variant carries it is what callers match on.
+    contain_depth_panic(move || {
+        match generic_to_query_result::<_, S>(super::eval_generic::eval_with_cursor_using::<S, _>(
+            expr, cursor,
+        )) {
+            QueryResult::OneCursor(c) => QueryResult::One(c.value()),
+            other => other,
+        }
+    })
+}
+
+/// [`eval`] for a document that was decoded first and then re-indexed: the
+/// hybrid `eval` was before #3457 (a query that reads path context goes to
+/// the generic evaluator, everything else to [`eval_full`]).
+///
+/// `succinctly yq`'s DOM route -- `-R` lines, `--inplace`, `--slurp`, writes,
+/// `--arg` -- evaluates an [`OwnedValue`] it has already decoded, re-indexed
+/// into a throwaway document (`OwnedValue::reindexed_without_provenance`).
+/// Two things make [`eval`] the wrong entry for it:
+///
+/// - The split #3457 closes (a value the index cannot read is validated where
+///   it is wrapped rather than where it is read) cannot arise: nothing in a
+///   re-indexed decoded value is unreadable. Cursor-metadata builtins would
+///   answer from the *synthetic* document's positions, which are not the
+///   user's file's (`.c | line` is `0` here, and `1` through [`eval`]).
+/// - The generic evaluator answers a builtin it has no native arm for
+///   (`test`, `+`, ...) by serializing the value and indexing it again per
+///   call. On the tiny documents `-R` produces one call per line, and
+///   measured on an M4 Pro (interleaved, 9 reps, `users` 1 MB and 10 MB as
+///   lines) that cost `select(test("age"))` +21% and +37% wall, `. + "x"` +4%
+///   to +9%, against this route, which reaches `eval_full` with no bridge.
+///
+/// Not a supported entry point; a library caller wants [`eval`].
+#[doc(hidden)]
+pub fn eval_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    cursor: JsonCursor<'a, W>,
+) -> QueryResult<'a, W> {
+    contain_depth_panic(move || {
+        if needs_path_context(expr) {
+            return generic_to_query_result::<_, S>(super::eval_generic::eval_with_cursor_using::<
+                S,
+                _,
+            >(expr, cursor));
+        }
+        eval_full::<W, S>(expr, cursor)
+    })
+}
+
+/// Run `f`, turning the generic evaluator's document-nesting panic
+/// ([`assert_nesting_depth`](super::eval_generic::assert_nesting_depth), 256)
+/// into a `decode_failure`-tagged [`QueryResult::Error`] (#3457).
+///
+/// The CLI wraps every query in `catch_unwind` for this (#1793); a library
+/// caller of [`eval`] has no such net and must never see a raw unwind from
+/// an over-deep document (#2627). No guard the evaluator reaches panics any
+/// more (the path walkers, `to_owned_with_comments`,
+/// `owned_from_standard_json_at_depth` and `owned_identity_recurse_step` all
+/// return the same tagged error directly), so this is a backstop for a
+/// 256-level panic from outside it, such as `JqValue::materialize`.
+///
+/// Only that one exact message is caught
+/// ([`nesting_depth_panic_message`](super::eval_generic::nesting_depth_panic_message));
+/// any other panic, including `assert_value_tree_depth`'s 384 guard, keeps
+/// unwinding. The tag makes the error un-swallowable by a `try`/`catch`,
+/// matching what the panic did. Every scope the evaluator installs
+/// (`file_origin`, node origin, the input queue, `with_stack_budget`) is an
+/// RAII guard, so an unwind restores it; the
+/// `eval_depth_panic_leaves_no_scope_behind_3457` test pins that.
+///
+/// Without `std` there is no unwinding to catch, so this is the identity
+/// there, exactly as before.
+#[cfg(any(feature = "std", test))]
+fn contain_depth_panic<'a, W>(f: impl FnOnce() -> QueryResult<'a, W>) -> QueryResult<'a, W> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => match super::eval_generic::nesting_depth_panic_message(&*payload) {
+            Some(message) => QueryResult::Error(EvalError::decode_failure(message)),
+            None => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+#[cfg(not(any(feature = "std", test)))]
+#[inline(always)]
+fn contain_depth_panic<'a, W>(f: impl FnOnce() -> QueryResult<'a, W>) -> QueryResult<'a, W> {
+    f()
 }
 
 /// This evaluator alone, with no generic-evaluator routing: the entry the
 /// generic evaluator's bridges use (`eval_generic::eval_on_owned`,
-/// `bridge_to_full_evaluator`), and what [`eval`] itself falls through to
-/// for a query with no path context.
-pub(crate) fn eval_full<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+/// `bridge_to_full_evaluator`).
+///
+/// `#[doc(hidden)] pub` (#3457) only so `tests/jq_evaluator_parity_tests.rs`
+/// can keep comparing *this* evaluator against the generic one: [`eval`] is
+/// the generic evaluator, so a parity harness that called it would compare
+/// that evaluator with itself. Not a supported entry point.
+#[doc(hidden)]
+pub fn eval_full<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
 ) -> QueryResult<'a, W> {
@@ -26425,18 +26599,42 @@ fn generic_to_query_result<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate a jq expression, returning only successfully matched values.
 /// Errors and None results are filtered out.
+///
+/// Follows [`eval`] (#3457), whose generic evaluator answers a computed value
+/// (a missing field's `null`, `1 == 1`, `.a + 1`) as an owned value rather
+/// than a borrowed one. A `Vec<StandardJson>` can only carry the two of those
+/// with no text to borrow, `null` and booleans, so an owned result made only
+/// of those is returned (`.missing` still yields `null`). An owned result that
+/// holds any other value (a number, string, array or object built by the
+/// filter) is dropped *whole*, as every owned result always was: returning
+/// only its `null`/boolean members would hand back a shorter list that reads
+/// as the complete answer (`.[] | if . > 1 then "big" else null end` would
+/// yield `[null]`). Use [`eval`] and match on [`QueryResult`] to see every
+/// result.
 pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
 ) -> Vec<StandardJson<'a, W>> {
+    fn borrowed<'v, V: Clone + AsRef<[u64]>>(v: &OwnedValue) -> Option<StandardJson<'v, V>> {
+        match v {
+            OwnedValue::Null => Some(StandardJson::Null),
+            OwnedValue::Bool(b) => Some(StandardJson::Bool(*b)),
+            _ => None,
+        }
+    }
     match eval::<W, S>(expr, cursor) {
         QueryResult::One(v) => vec![v],
         QueryResult::OneCursor(c) => vec![c.value()],
         QueryResult::Many(vs) => vs,
         QueryResult::None => Vec::new(),
         QueryResult::Error(_) => Vec::new(),
-        QueryResult::Owned(_) => Vec::new(), // Owned values not returned as StandardJson
-        QueryResult::ManyOwned(_) => Vec::new(),
+        QueryResult::Owned(v) => borrowed(&v).into_iter().collect(),
+        // All or nothing: a partial list would pass for the whole answer.
+        QueryResult::ManyOwned(vs) => vs
+            .iter()
+            .map(borrowed)
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default(),
         QueryResult::Break(_) => Vec::new(), // Break without matching label
         QueryResult::Halt(_) => Vec::new(),  // Halt: not representable as borrowed StandardJson
         QueryResult::Partial(..) => Vec::new(), // Same: not representable as borrowed StandardJson
@@ -67393,7 +67591,7 @@ mod tests {
         // evaluates the real array length.
         let mut resolved = parse("def length(x): x; length").unwrap();
         resolve_func_calls_all(&mut resolved);
-        match eval::<Vec<u64>, JqSemantics>(&resolved, index.root(json)) {
+        match eval_full::<Vec<u64>, JqSemantics>(&resolved, index.root(json)) {
             QueryResult::Owned(OwnedValue::Int(3)) => {}
             other => panic!("expected Owned(Int(3)), got {other:?}"),
         }
@@ -67402,7 +67600,7 @@ mod tests {
         // node's `builtin_fallback` is still `Some`, so this must name the
         // actual cause instead of reporting a bare arity/name mismatch.
         let unresolved = parse("def length(x): x; length").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&unresolved, index.root(json)) {
+        match eval_full::<Vec<u64>, JqSemantics>(&unresolved, index.root(json)) {
             QueryResult::Error(e) => {
                 assert!(
                     e.message.contains("resolve_func_calls"),
@@ -67431,7 +67629,7 @@ mod tests {
         let expr =
             parse_with_mode_and_extensions("def until(x): x; until(true; .)", ParserMode::Yq, true)
                 .unwrap();
-        match eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)) {
+        match eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(json)) {
             QueryResult::Error(e) => {
                 assert!(
                     e.message.contains("resolve_func_calls"),
@@ -68391,7 +68589,7 @@ mod tests {
             let json = b"null";
             let index = JsonIndex::build(json);
             with_stack_budget(0, || {
-                match eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
                     QueryResult::Error(e) => e,
                     other => panic!("{filter}: expected a refusal, got {other:?}"),
                 }
@@ -68445,7 +68643,7 @@ mod tests {
         ] {
             let expr = parse(filter).expect("parses");
             let refuse = || match with_stack_budget(0, || {
-                eval::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+                eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json))
             }) {
                 QueryResult::Error(e) => assert!(
                     e.message.ends_with("exceeded maximum recursion depth"),
@@ -68459,7 +68657,7 @@ mod tests {
             // Warm the node's bound-body cache with the stack unregistered...
             assert!(
                 !matches!(
-                    eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)),
+                    eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json)),
                     QueryResult::Error(_)
                 ),
                 "{filter}: answers with the stack unregistered"
@@ -68478,7 +68676,7 @@ mod tests {
             let expr = parse(filter).expect("parses");
             let refused = || {
                 matches!(
-                    with_stack_budget(0, || eval::<Vec<u64>, YqSemantics>(
+                    with_stack_budget(0, || eval_full::<Vec<u64>, YqSemantics>(
                         &expr,
                         index.root(json)
                     )),
@@ -68488,7 +68686,7 @@ mod tests {
             assert!(refused(), "{filter}: cold");
             assert!(
                 !matches!(
-                    eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)),
+                    eval_full::<Vec<u64>, YqSemantics>(&expr, index.root(json)),
                     QueryResult::Error(_)
                 ),
                 "{filter}: answers with the stack unregistered"
@@ -68501,7 +68699,7 @@ mod tests {
             &Expr::shared(Expr::Identity),
         );
         assert!(matches!(
-            with_stack_budget(0, || eval::<Vec<u64>, YqSemantics>(&read, index.root(json))),
+            with_stack_budget(0, || eval_full::<Vec<u64>, YqSemantics>(&read, index.root(json))),
             QueryResult::Error(e) if e.message == "exceeded maximum recursion depth"
         ));
 
@@ -68525,14 +68723,85 @@ mod tests {
                 "g",
                 &Expr::shared(Expr::Identity),
             );
-            let result =
-                with_stack_budget(0, || eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)));
+            let result = with_stack_budget(0, || {
+                eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+            });
             match result {
                 QueryResult::Error(e) => {
                     assert_eq!(e.message, "exceeded maximum recursion depth", "{filter}");
                 }
                 other => panic!("{filter}: expected a refusal, got {other:?}"),
             }
+        }
+    }
+
+    /// #3457: `eval_pipe` applied to a stage that yields several borrowed
+    /// values, each of which the rest of the pipe answers with several more
+    /// (`.a[] | .[]`), keeps them borrowed and in order. `eval()` used to reach
+    /// this fold on every such pipe; it now routes through the generic
+    /// evaluator, so `eval_full` is what drives this file's own.
+    #[test]
+    fn eval_pipe_keeps_many_borrowed_values_of_many_in_order_3457() {
+        let json = br#"{"a":[[1,2],[3]]}"#;
+        let index = JsonIndex::build(json);
+        for (filter, want) in [
+            (".a[] | .[]", vec!["1", "2", "3"]),
+            (".a[] | .[0], .[0]", vec!["1", "1", "3", "3"]),
+        ] {
+            let expr = parse(filter).expect("parses");
+            let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+                .collect_owned::<JqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>();
+            assert_eq!(got, want, "{filter}");
+        }
+    }
+
+    /// ADR-0025 (#3262), through the library entry (#3457): `eval()` runs the
+    /// generic cursor evaluator, whose own `DefCall` arms -- its owned-identity
+    /// route among them -- take the same floor as `eval_full`'s. The test
+    /// above drives `eval_full` (this file's evaluator) only, so it no longer
+    /// reaches those arms once `eval()` stopped being an alias of it.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_library_entry_checks_the_native_stack_floor_3457() {
+        let json = br#"{"a":{"b":1}}"#;
+        let index = JsonIndex::build(json);
+        for filter in [
+            "def f: .a; f | key",
+            "def f(g): g; f(.a) | key",
+            "def f: .a; [f | parent]",
+            "def f: .; f | .a",
+            "def f: .a; [path(f)]",
+            "def f(g): g; f(.a) |= 2",
+            "def f: .a; first(f)",
+            "def f: .; .a | to_entries | f | key",
+            "def f: .; .a | to_entries | f | parent",
+        ] {
+            let expr = parse(filter).expect("parses");
+            let refuse = || match with_stack_budget(0, || {
+                eval::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+            }) {
+                QueryResult::Error(e) => assert!(
+                    e.message.ends_with("exceeded maximum recursion depth"),
+                    "{filter}: {}",
+                    e.message
+                ),
+                other => panic!("{filter}: expected a refusal, got {other:?}"),
+            };
+            // Cold: the call is refused while its body is bound.
+            refuse();
+            // Warm the node's bound-body cache with the stack unregistered...
+            assert!(
+                !matches!(
+                    eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)),
+                    QueryResult::Error(_)
+                ),
+                "{filter}: answers with the stack unregistered"
+            );
+            // ...so the arm itself refuses the already-bound body.
+            refuse();
         }
     }
 
@@ -68552,7 +68821,7 @@ mod tests {
                         .expect("parses");
                     let json = b"null";
                     let index = JsonIndex::build(json);
-                    match eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
+                    match eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
                         QueryResult::Error(e) => e.message,
                         _ => String::new(),
                     }
@@ -69476,7 +69745,7 @@ mod tests {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let expr = parse(src).unwrap();
-            let (values, tag) = normalize(eval::<Vec<u64>, JqSemantics>(&expr, cursor));
+            let (values, tag) = normalize(eval_full::<Vec<u64>, JqSemantics>(&expr, cursor));
             assert_eq!(tag, "ok", "`{src}` did not evaluate cleanly");
             values
         }
@@ -69578,6 +69847,22 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse($expr).unwrap();
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                $pattern $(if $guard)? => $body,
+                other => panic!("unexpected result: {:?}", other),
+            }
+        }};
+    }
+
+    /// [`query!`] through the public [`eval`] entry instead of [`eval_full`]:
+    /// for the tests that pin how that entry routes a path-context query to
+    /// the generic evaluator (`key`, ...), which `eval_full` never does.
+    macro_rules! query_entry {
+        ($json:expr, $expr:expr, $pattern:pat $(if $guard:expr)? => $body:expr) => {{
+            let json_bytes: &[u8] = $json;
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr = parse($expr).unwrap();
             match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 $pattern $(if $guard)? => $body,
                 other => panic!("unexpected result: {:?}", other),
@@ -69634,7 +69919,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse_with_mode_and_extensions($expr, ParserMode::Yq, true).unwrap();
-            match eval::<Vec<u64>, YqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, YqSemantics>(&expr, cursor) {
                 $pattern $(if $guard)? => $body,
                 other => panic!("unexpected result: {:?}", other),
             }
@@ -71517,7 +71802,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse(filter).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Error(e) if e.is_decode_failure() => {
                     assert!(
                         e.message.contains("invalid UTF-8"),
@@ -73189,7 +73474,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse("truncate_stream(tostream)").unwrap();
-            if let QueryResult::Error(e) = eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            if let QueryResult::Error(e) = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 assert!(!e.is_decode_failure());
             }
         }
@@ -73852,7 +74137,7 @@ mod tests {
         // bytes rather than raising. The row is kept, asserting the new
         // answer, rather than deleted: the list's point is which builtins read
         // a value, and this is the one that stopped.
-        query!(
+        query_entry!(
             &b"[\"\xff\xfe\"]"[..],
             ".[] | key",
             QueryResult::Owned(OwnedValue::Int(0)) => {}
@@ -73867,7 +74152,7 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let expr = parse_with_mode_and_extensions(".[0:1]", ParserMode::Yq, true).unwrap();
-        match eval::<Vec<u64>, YqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, YqSemantics>(&expr, cursor) {
             QueryResult::Error(e) if e.is_decode_failure() => {}
             other => panic!("unexpected result: {other:?}"),
         }
@@ -74647,7 +74932,7 @@ mod tests {
             let index = JsonIndex::build(b"null");
             let cursor = index.root(b"null");
             let expr = parse(filter).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Partial(prefix, Control::Error(e)) => {
                     assert_eq!(
                         prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
@@ -74669,7 +74954,7 @@ mod tests {
             "IN([1] as [$x] ?// $x | if ($x|type)==\"number\" then $x else error(\"boom\") end)",
         )
         .unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Partial(prefix, Control::Error(e)) => {
                 assert_eq!(
                     prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
@@ -74964,7 +75249,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        eval::<Vec<u64>, JqSemantics>(&expr, cursor)
+        eval_full::<Vec<u64>, JqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -74980,7 +75265,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+        eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -76497,7 +76782,7 @@ mod tests {
         let index = JsonIndex::build(b"null");
         let cursor = index.root(b"null");
         assert_eq!(
-            eval::<Vec<u64>, JqSemantics>(&substituted, cursor)
+            eval_full::<Vec<u64>, JqSemantics>(&substituted, cursor)
                 .collect_owned::<JqSemantics>()
                 .iter()
                 .map(OwnedValue::to_json)
@@ -77833,7 +78118,7 @@ mod tests {
             // construct's own per-value operation, then escapes with the
             // generator's own control.
             let jq_expr = parse(filter).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&jq_expr, index.root(json)) {
+            match eval_full::<Vec<u64>, JqSemantics>(&jq_expr, index.root(json)) {
                 QueryResult::Partial(vs, Control::Error(e)) => {
                     assert_eq!(vs, jq_prefix, "{site}: jq prefix");
                     assert_eq!(e.message, "x", "{site}: jq escape");
@@ -77843,7 +78128,7 @@ mod tests {
 
             // yq mode discards it and escapes bare.
             let yq_expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, true).unwrap();
-            match eval::<Vec<u64>, YqSemantics>(&yq_expr, index.root(json)) {
+            match eval_full::<Vec<u64>, YqSemantics>(&yq_expr, index.root(json)) {
                 QueryResult::Error(e) => assert_eq!(e.message, "x", "{site}: yq escape"),
                 other => panic!("{site}: yq mode must discard the prefix, got {other:?}"),
             }
@@ -79985,7 +80270,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => {
                 assert_eq!(e.message, message, "filter: {filter} ({divergence})");
             }
@@ -79999,7 +80284,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Break(l) => assert_eq!(l, "out", "filter: {filter}"),
             other => panic!("{filter}: expected a bare Break, got {other:?}"),
         }
@@ -80429,7 +80714,7 @@ mod tests {
             let expr = parse(filter).unwrap();
             assert!(
                 matches!(
-                    eval::<Vec<u64>, JqSemantics>(&expr, cursor),
+                    eval_full::<Vec<u64>, JqSemantics>(&expr, cursor),
                     QueryResult::None
                 ),
                 "filter: {filter}"
@@ -82068,7 +82353,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("(.a[] | select((true,true))) |= . + 10").unwrap();
-        let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+        let out: Vec<String> = eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -89994,7 +90279,7 @@ mod tests {
             let expr = parse(filter).unwrap();
             format!(
                 "{:?}",
-                eval::<Vec<u64>, JqSemantics>(&expr, index.root(bytes))
+                eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(bytes))
             )
         };
         for (token, sibling) in [
@@ -90026,7 +90311,7 @@ mod tests {
         for (token, filter) in [("9e999e999", "isnan"), ("8e999e999", "isinfinite")] {
             let index = JsonIndex::build_reindex(token.as_bytes());
             let expr = parse(filter).unwrap();
-            let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(token.as_bytes()));
+            let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(token.as_bytes()));
             assert!(
                 matches!(result, QueryResult::Owned(OwnedValue::Bool(true))),
                 "{token} | {filter} as bridge text: {result:?}"
@@ -90466,7 +90751,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => Err(e.message),
             other => Ok(other
                 .collect_owned::<JqSemantics>()
@@ -93544,7 +93829,7 @@ mod tests {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let expr = parse(filter).expect("parse failed");
-            eval::<Vec<u64>, JqSemantics>(&expr, cursor).collect_owned::<JqSemantics>()
+            eval_full::<Vec<u64>, JqSemantics>(&expr, cursor).collect_owned::<JqSemantics>()
         }
         // OneCursor: identity passes a container through unchanged.
         assert_eq!(owned(br#"{"a":1}"#, ".").len(), 1);
@@ -95800,7 +96085,7 @@ mod tests {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let expr = parse(filter).unwrap();
-            let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+            let out: Vec<String> = eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
                 .collect_owned::<YqSemantics>()
                 .iter()
                 .map(OwnedValue::to_json)
@@ -95826,7 +96111,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("del(.a[].x[1:3])").unwrap();
-        let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+        let out: Vec<String> = eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -98304,7 +98589,7 @@ mod tests {
         // the key's line/column/comments), and `generic_to_query_result`
         // renders a batch of cursors as their borrowed values. Unchanged
         // keys.
-        query!(br#"{"a": 1, "b": 2, "c": 3}"#, ".[] | key",
+        query_entry!(br#"{"a": 1, "b": 2, "c": 3}"#, ".[] | key",
             QueryResult::Many(results) => {
                 assert_eq!(results.len(), 3);
                 // Check that all results are string keys
@@ -98348,19 +98633,20 @@ mod tests {
         // (spine 2416, phase 3), where `key` is a cursor property. The
         // `null` this used to pin was this evaluator's own answer, which is
         // no longer reachable from `eval`.
-        query!(br#"{"a": 1}"#, "key",
+        query_entry!(br#"{"a": 1}"#, "key",
             QueryResult::None => {}
         );
     }
 
     #[test]
     fn test_key_nested() {
-        // Test key on nested access. `OneCursor`, not `Owned`: see
-        // `test_key_object` above (#2763).
-        query!(br#"{"outer": {"inner": 42}}"#, ".outer | .[] | key",
-            QueryResult::OneCursor(c) => {
+        // Test key on nested access. A node the document holds (`One`), not
+        // `Owned`: see `test_key_object` above (#2763). `eval` presents the
+        // cursor the generic evaluator produced as its borrowed view.
+        query_entry!(br#"{"outer": {"inner": 42}}"#, ".outer | .[] | key",
+            QueryResult::One(v) => {
                 assert_eq!(
-                    crate::jq::eval_generic::to_owned_cursor::<JqSemantics, _>(&c).expect("decodes"),
+                    crate::jq::eval_generic::to_owned::<JqSemantics, _>(&v).expect("decodes"),
                     OwnedValue::String("inner".to_string())
                 );
             }
@@ -99676,7 +99962,7 @@ mod tests {
         let index = JsonIndex::build(b"[10,20]");
         let cursor = index.root(b"[10,20]");
         let expr = parse(".[] | key | tostring").unwrap();
-        let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+        let out: Vec<String> = eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -99936,7 +100222,7 @@ mod tests {
         let index = crate::json::JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(v) => {
                 assert_eq!(
                     v,
@@ -99957,7 +100243,7 @@ mod tests {
         let index = crate::json::JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(v) => {
                 assert_eq!(
                     v,
@@ -99977,7 +100263,7 @@ mod tests {
         let index = crate::json::JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(v) => {
                 assert_eq!(
                     v,
@@ -101057,7 +101343,7 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                         QueryResult::Owned(OwnedValue::Object(obj)) => {
                             assert_eq!(
                                 obj.get("name"),
@@ -101086,7 +101372,7 @@ mod tests {
             let cursor = index.root(json_bytes);
             let query = format!(r#"load("{path}")"#);
             let expr = parse(&query).unwrap();
-            let result = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+            let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
             let _ = fs::remove_file(path);
             match result {
                 QueryResult::Error(e) => assert!(e.is_decode_failure(), "{e:?}"),
@@ -101102,7 +101388,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(
                             obj.get("name"),
@@ -101123,7 +101409,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         let items = obj.get("items").unwrap();
                         match items {
@@ -101146,7 +101432,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse(r#"load("/tmp/nonexistent_file_12345.yaml")"#).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Error(err) => {
                     assert!(
                         err.message.contains("Failed to read file")
@@ -101164,7 +101450,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch null"#).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Owned(OwnedValue::Null) => {}
                 other => panic!("expected null, got: {other:?}"),
             }
@@ -101177,7 +101463,7 @@ mod tests {
             let cursor = index.root(json_bytes);
             let expr =
                 parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch "not found""#).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Owned(OwnedValue::String(s)) => {
                     assert_eq!(s, "not found");
                 }
@@ -101193,7 +101479,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#". + {{config: load("{path}")}}"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(
                             obj.get("name"),
@@ -101223,7 +101509,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Array(arr)) => {
                         assert_eq!(arr.len(), 2);
                         match &arr[0] {
@@ -101259,7 +101545,7 @@ mod tests {
                 let index = JsonIndex::build(json_bytes);
                 let cursor = index.root(json_bytes);
                 let expr = parse(r"load(.path)").unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(obj.get("loaded"), Some(&OwnedValue::Bool(true)));
                     }
@@ -101296,7 +101582,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(obj.get("a"), Some(&OwnedValue::Null));
                         assert_eq!(obj.get("b"), Some(&OwnedValue::Bool(true)));
@@ -101327,7 +101613,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Array(items)) => {
                         assert_eq!(items, vec![OwnedValue::String("5".to_string())]);
                     }
@@ -101350,7 +101636,7 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                         QueryResult::Owned(OwnedValue::Object(obj)) => {
                             assert_eq!(
                                 obj.get("quoted"),
@@ -101391,7 +101677,7 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                         QueryResult::Owned(OwnedValue::Object(obj)) => {
                             assert_eq!(obj.len(), 1);
                             assert_eq!(
@@ -101413,7 +101699,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
-                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(obj.get("a"), Some(&OwnedValue::String("hello".to_string())));
                         assert_eq!(obj.get("b"), Some(&OwnedValue::String("hello".to_string())));
@@ -101439,7 +101725,7 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                         QueryResult::Owned(OwnedValue::Object(obj)) => {
                             assert_eq!(obj.get("a"), Some(&OwnedValue::Int(5)));
                             assert_eq!(obj.get("b"), Some(&OwnedValue::Int(5)));
@@ -102194,7 +102480,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
-        let result = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+        let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
         let end = match &result {
             QueryResult::Error(e) => format!("error: {e}"),
             QueryResult::Break(label) => format!("break: {label}"),
@@ -103576,7 +103862,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("del(.[.a:1], .[.a:2])").unwrap();
-        let rendered: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+        let rendered: Vec<String> = eval_full::<Vec<u64>, YqSemantics>(&expr, cursor)
             .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
@@ -104623,7 +104909,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a = 5").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104643,7 +104929,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("(.a = 5)?").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104662,7 +104948,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a |= (.+1)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104682,7 +104968,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map(.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104700,7 +104986,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("to_entries").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104717,7 +105003,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("to_entries").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104737,7 +105023,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map_values(.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "object/One: {e:?}"),
             other => panic!("object/One: expected a decode-failure error, got: {other:?}"),
         }
@@ -104745,7 +105031,7 @@ mod tests {
         // Object arm, `Many` shape (`map_values` takes only the first
         // output, per jq semantics -- still must decode-check it).
         let expr = parse("map_values(.,.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "object/Many: {e:?}"),
             other => panic!("object/Many: expected a decode-failure error, got: {other:?}"),
         }
@@ -104755,14 +105041,14 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map_values(.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "array/One: {e:?}"),
             other => panic!("array/One: expected a decode-failure error, got: {other:?}"),
         }
 
         // Array arm, `Many` shape.
         let expr = parse("map_values(.,.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "array/Many: {e:?}"),
             other => panic!("array/Many: expected a decode-failure error, got: {other:?}"),
         }
@@ -104777,7 +105063,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map(.,.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104795,7 +105081,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("path(.a)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104817,7 +105103,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a = .b").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "One: {e:?}"),
             other => panic!("One: expected a decode-failure error, got: {other:?}"),
         }
@@ -104826,7 +105112,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a = (.b, .b)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "Many: {e:?}"),
             other => panic!("Many: expected a decode-failure error, got: {other:?}"),
         }
@@ -104842,7 +105128,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a = 5").unwrap();
-        match eval::<Vec<u64>, YqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, YqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104871,7 +105157,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a += .b").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104893,7 +105179,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("setpath([\"a\"]; 5)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "setpath: {e:?}"),
             other => panic!("setpath: expected a decode-failure error, got: {other:?}"),
         }
@@ -104901,7 +105187,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("del(.a)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "del: {e:?}"),
             other => panic!("del: expected a decode-failure error, got: {other:?}"),
         }
@@ -104909,7 +105195,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("delpaths([[\"a\"]])").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(e.is_decode_failure(), "delpaths: {e:?}"),
             other => panic!("delpaths: expected a decode-failure error, got: {other:?}"),
         }
@@ -104924,7 +105210,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("setpath([\"a\"]; 5)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), Some(&OwnedValue::Int(5)));
             }
@@ -104934,7 +105220,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("del(.a)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), None);
                 assert_eq!(m.get("b"), Some(&OwnedValue::Int(2)));
@@ -104945,7 +105231,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("delpaths([[\"a\"]])").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), None);
                 assert_eq!(m.get("b"), Some(&OwnedValue::Int(2)));
@@ -104970,7 +105256,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("path(.a | tonumber?)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -104993,7 +105279,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("delpaths([[\"a\"]])?").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.is_decode_failure(),
                 "expected a decode-failure error, got: {e:?}"
@@ -105024,7 +105310,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("sort").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Array(items)) => {
                 assert_eq!(items.len(), 1, "expected the field to survive: {items:?}");
                 match &items[0] {
@@ -105059,7 +105345,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("sort").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(_) => {}
             other => panic!(
                 "expected the structurally non-string key to raise instead of being silently dropped, got: {other:?}"
@@ -105079,7 +105365,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("sort").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
                 e.message.contains("ambiguous"),
                 "expected a colliding-key error, got: {e:?}"
@@ -105105,7 +105391,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("sort").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(_) => {}
             other => panic!(
                 "expected the trailing unpaired member to raise instead of being silently dropped, got: {other:?}"
@@ -105125,14 +105411,14 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map_values(.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), Some(&OwnedValue::Int(1)));
             }
             other => panic!("object/One: unexpected result: {other:?}"),
         }
         let expr = parse("map_values(.,.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), Some(&OwnedValue::Int(1)));
             }
@@ -105144,14 +105430,14 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("map_values(.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Array(vs)) => {
                 assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
             }
             other => panic!("array/One: unexpected result: {other:?}"),
         }
         let expr = parse("map_values(.,.)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Array(vs)) => {
                 assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
             }
@@ -105163,14 +105449,14 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a = .b").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.get("a"), Some(&OwnedValue::Int(2)));
             }
             other => panic!("assign/One: unexpected result: {other:?}"),
         }
         let expr = parse(".a = (.b, .b)").unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::ManyOwned(vs) => {
                 assert_eq!(vs.len(), 2);
                 for v in vs {
@@ -107591,7 +107877,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(&format!("[{filter}] | tojson")).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::String(s)) => Ok(s),
             QueryResult::Error(e) => Err(e),
             other => panic!("{filter}: unexpected result {other:?}"),
@@ -107963,7 +108249,7 @@ mod tests {
     fn owned_doc_2872(json: &[u8]) -> OwnedValue {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let mut outputs = eval::<Vec<u64>, JqSemantics>(&parse(".").unwrap(), cursor)
+        let mut outputs = eval_full::<Vec<u64>, JqSemantics>(&parse(".").unwrap(), cursor)
             .collect_owned::<JqSemantics>();
         outputs.pop().expect("identity yields the document")
     }
@@ -109175,7 +109461,7 @@ mod tests {
         let path_of = |var: Expr| {
             let cursor = index.root(doc);
             let expr = Expr::Builtin(Builtin::Path(Box::new(var)));
-            eval::<Vec<u64>, JqSemantics>(&expr, cursor)
+            eval_full::<Vec<u64>, JqSemantics>(&expr, cursor)
         };
         // A tracked root snapshot certifies against the root: `path(. as $x
         // | $x)` is `[]` in jq 1.7.1.
@@ -109207,7 +109493,7 @@ mod tests {
                 parse(".a").unwrap(),
                 Expr::Builtin(Builtin::Path(Box::new(var))),
             ]);
-            eval::<Vec<u64>, JqSemantics>(&expr, cursor)
+            eval_full::<Vec<u64>, JqSemantics>(&expr, cursor)
         };
         match at_a(constructed) {
             QueryResult::Error(e) => assert!(e.is_invalid_path_expression()),
@@ -110847,7 +111133,7 @@ mod tests {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let expr = parse(src).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Error(e) => assert!(
                     e.message.starts_with("Invalid path expression"),
                     "{src}: {}",
@@ -111126,7 +111412,7 @@ mod tests {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
             let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
-            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
             match want {
                 Ok(want) => {
                     let got: Vec<String> = got
@@ -111325,7 +111611,7 @@ mod tests {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
             let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
-            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
             match want {
                 Ok(want) => {
                     let got: Vec<String> = got
@@ -111551,7 +111837,7 @@ mod tests {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
             let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
-            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
             match want {
                 Ok(want) => {
                     let got: Vec<String> = got
@@ -111606,7 +111892,7 @@ mod tests {
             let json = doc.as_bytes();
             let index = JsonIndex::build(json);
             let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
-            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
             match want {
                 Ok(want) => {
                     let got: Vec<String> = got
@@ -111628,7 +111914,7 @@ mod tests {
         let json = br#"{"a":[1,2],"b":[3]}"#;
         let index = JsonIndex::build(json);
         let expr = parse(r"del((.,.) as [$z] ?// {a:$q} | $q)").unwrap();
-        let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+        let got = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
         let got: Vec<String> = got
             .collect_owned::<JqSemantics>()
             .iter()
@@ -112071,7 +112357,7 @@ mod tests {
         let refuses = |src: &str, want: &str| {
             let expr = parse(src).unwrap();
             let index = JsonIndex::build(doc);
-            match eval::<Vec<u64>, JqSemantics>(&expr, index.root(doc)) {
+            match eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(doc)) {
                 QueryResult::Error(e) => assert_eq!(e.message, want, "{src}"),
                 other => panic!("{src}: expected a refusal, got {other:?}"),
             }
@@ -112085,7 +112371,7 @@ mod tests {
         // orthogonal divergence in the refusal's wording, not its verdict
         // -- `resolve_leaf`'s catch-all names the whole fold's value where
         // jq names the destructuring step).
-        match eval::<Vec<u64>, JqSemantics>(
+        match eval_full::<Vec<u64>, JqSemantics>(
             &parse("path(reduce .b as {c:$x} (.; .b))").unwrap(),
             JsonIndex::build(doc).root(doc),
         ) {
@@ -112112,7 +112398,7 @@ mod tests {
         // though the source element is: `path(foreach (null) as {a:$x} (.;
         // .; $x))` on `{}` refuses (the coincidence needs the *register*'s
         // own value, not just the element's, to be null/bool).
-        match eval::<Vec<u64>, JqSemantics>(
+        match eval_full::<Vec<u64>, JqSemantics>(
             &parse("path(foreach (null) as {a:$x} (.; .; $x))").unwrap(),
             JsonIndex::build(br"{}").root(br"{}"),
         ) {
@@ -112150,7 +112436,7 @@ mod tests {
         // {b:{c:$x}} (.; $x))` raises "Invalid path expression with result
         // 5" in jq 1.7.1, even with a nested object pattern and a SOURCE
         // that is trivially the register (`.`).
-        match eval::<Vec<u64>, JqSemantics>(
+        match eval_full::<Vec<u64>, JqSemantics>(
             &parse("path(reduce . as {b:{c:$x}} (.; $x))").unwrap(),
             JsonIndex::build(doc).root(doc),
         ) {
@@ -114136,10 +114422,11 @@ mod tests {
     /// #3222: a value the index could not read -- a malformed nested number
     /// (`1.2.3`) or keyword (`tru`, #3035) -- raises an uncatchable decode
     /// failure on every route that reads it or asks its type, in *both*
-    /// evaluators: this one (`eval`, cursor-based) and the generic one
-    /// (`eval_using`). The CLI's routing picks one evaluator or the other
-    /// by query shape, so a CLI sweep alone cannot prove both are covered.
-    /// The generic one is entered through a cursor, as the CLI enters it.
+    /// evaluators: this one (`eval_full`, cursor-based) and the generic one
+    /// (`eval_with_cursor_using`, which `eval` has been since #3457). The
+    /// generic evaluator bridges into this one for some shapes, so a CLI
+    /// sweep alone cannot prove both are covered. The generic one is entered
+    /// through a cursor, as the CLI enters it.
     /// Before #3222 the type filters here dropped the value (`numbers`,
     /// `iterables`), the type tests answered `false`, and indexing it was a
     /// catchable `Cannot index error with ...`.
@@ -114213,7 +114500,7 @@ mod tests {
                 .expect("one element");
             for filter in READERS {
                 let expr = parse(filter).expect("filter parses");
-                let concrete = match eval::<Vec<u64>, JqSemantics>(&expr, element) {
+                let concrete = match eval_full::<Vec<u64>, JqSemantics>(&expr, element) {
                     QueryResult::Error(e) => e.is_decode_failure(),
                     _ => false, // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every READERS filter raises a decode failure on every malformed json in this sweep, so this fallback never fires (#3222)"
                 };
@@ -114223,7 +114510,8 @@ mod tests {
                     crate::jq::eval_generic::GenericResult::Error(e) => e.is_decode_failure(),
                     _ => false, // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- see the `concrete` match above, same sweep (#3222)"
                 };
-                for (evaluator, raised) in [("eval", concrete), ("eval_with_cursor_using", generic)]
+                for (evaluator, raised) in
+                    [("eval_full", concrete), ("eval_with_cursor_using", generic)]
                 {
                     if !raised {
                         // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a READERS filter fails to raise (#3222)"
@@ -114254,10 +114542,11 @@ mod tests {
             "empty",
             "1",
             // Filters that wrap or navigate the value without reading it
-            // (`[.] | length`, `path(.)`, ...) answer here in the generic
-            // evaluator but raise in `eval`, which materializes them; that
-            // split is pinned per evaluator by
-            // `eval_entry_validates_what_the_cursor_entry_navigates_3266`.
+            // (`[.] | length`, `path(.)`, ...) answer in the generic
+            // evaluator (and so in `eval`, which is that evaluator since
+            // #3457) but raise in `eval_full`, which materializes them; that
+            // split is pinned by
+            // `eval_entry_agrees_with_the_cursor_entry_on_unreadable_values_3266`.
         ];
         let good = b"[1]";
         let good_index = JsonIndex::build(good);
@@ -114271,13 +114560,13 @@ mod tests {
                 .expect("one element");
             for filter in NON_READERS {
                 let expr = parse(filter).expect("filter parses");
-                let concrete = normalize(eval::<Vec<u64>, JqSemantics>(&expr, element));
-                let expected = normalize(eval::<Vec<u64>, JqSemantics>(&expr, good_element));
-                if concrete != expected {
-                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a NON_READERS filter disagrees between the malformed and well-formed document (#3222)"
-                    disagreed.push(format!("eval `{filter}` on {json}: {concrete:?}"));
-                    // omni-dev: coverage end
-                }
+                let concrete = normalize(eval_full::<Vec<u64>, JqSemantics>(&expr, element));
+                let expected = normalize(eval_full::<Vec<u64>, JqSemantics>(&expr, good_element));
+                // The report is built every time and kept only on a disagreement,
+                // so the failure-recording path is one executed line, not a
+                // branch a passing suite never reaches.
+                let report = format!("eval `{filter}` on {json}: {concrete:?}");
+                disagreed.extend((concrete != expected).then_some(report));
                 let run_generic = |cursor| match crate::jq::eval_generic::eval_with_cursor_using::<
                     JqSemantics,
                     _,
@@ -114288,13 +114577,8 @@ mod tests {
                 };
                 let generic = run_generic(element);
                 let expected = run_generic(good_element);
-                if generic != expected {
-                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- see the `eval` failure-recording line above, same assertion (#3222)"
-                    disagreed.push(format!(
-                        "eval_with_cursor_using `{filter}` on {json}: {generic:?}"
-                    ));
-                    // omni-dev: coverage end
-                }
+                let report = format!("eval_with_cursor_using `{filter}` on {json}: {generic:?}");
+                disagreed.extend((generic != expected).then_some(report));
             }
         }
         assert!(
@@ -114303,30 +114587,24 @@ mod tests {
         );
     }
 
-    /// #3266: the three library entries give different answers on a value
-    /// the index cannot read (a malformed number `1.2.3`, a keyword `tru`)
-    /// under filters that never read it. `eval_with_cursor_using`, the
-    /// generic evaluator's cursor entry that `succinctly jq` evaluates
-    /// through, holds the input as a cursor and answers where a filter only
-    /// navigates past the value or wraps it in `[.]`. `eval` collects its
-    /// results into owned values, and its `path`/`paths`/`leaf_paths`/
-    /// `getpath` walk an owned copy of their input, so it decodes the value
-    /// -- even a sibling the navigation never visits (`path(.a)` with a
-    /// malformed `"b"`) -- unless the query needs path context (`key`), which
-    /// it hands to the cursor entry. `eval_using` is given a decoded value,
-    /// so it answers some of these and raises on others (even `not`). jq
-    /// rejects every document here at parse time, so no answer has a
+    /// #3266, converged by #3457: `eval` and `eval_with_cursor_using` give the
+    /// same answer on a value the index cannot read (a malformed number
+    /// `1.2.3`, a keyword `tru`), because `eval` *is* the cursor entry
+    /// reshaped into a `QueryResult`. Neither reads the value unless the
+    /// filter does: `[.] | length` and `path(.a)` on `{"a":1,"b":tru}` answer,
+    /// where `eval` used to raise (it collected into owned values and its
+    /// `path` builtins walked an owned copy). `eval_using` is given a decoded
+    /// value, so it answers some of these and raises on others (even `not`).
+    /// jq rejects every document here at parse time, so no answer has a
     /// reference.
     ///
-    /// Recorded as out of policy in `docs/compliance/jq/limitations.md`
-    /// ("The library `eval()` entry validates what the CLI's entry only
-    /// navigates"). Converging `eval` onto the cursor entry is #3457; the
-    /// collections that materialize in the cursor entry too (`[., 1]`,
-    /// `{a: .}`, `. as $x | [$x]`) are #3427. Each row pins every entry's
-    /// current answer, so a convergence has to flip a row on purpose rather
-    /// than pass silently.
+    /// Each row pins `eval_using`'s and the cursor entry's answer, and the
+    /// `eval` half is asserted equal to the cursor entry's for every row --
+    /// including the collections that materialize in the cursor entry too
+    /// (`[., 1]`, `{a: .}`, `. as $x | [$x]`, #3427), which raise in both, so
+    /// fixing #3427 has to flip a row on purpose.
     #[test]
-    fn eval_entry_validates_what_the_cursor_entry_navigates_3266() {
+    fn eval_entry_agrees_with_the_cursor_entry_on_unreadable_values_3266() {
         use crate::jq::eval_generic::{eval_using, eval_with_cursor_using, GenericResult};
 
         /// `None` = raises a decode failure; `Some(json)` = answers exactly
@@ -114334,64 +114612,59 @@ mod tests {
         type Outcome = Option<&'static str>;
         const OBJ: &str = r#"[{"a":1,"b":tru}]"#;
         // (document -- the filter runs on its first element, filter,
-        //  `eval`, `eval_using`, `eval_with_cursor_using`)
-        const ROWS: &[(&str, &str, Outcome, Outcome, Outcome)] = &[
-            ("[1.2.3]", "1", Some("1"), Some("1"), Some("1")),
-            ("[1.2.3]", "not", Some("false"), None, Some("false")),
-            ("[1.2.3]", "[.] | length", None, None, Some("1")),
-            ("[tru]", "[.] | length", None, None, Some("1")),
-            ("[1.2.3]", "[limit(1; .)] | length", None, None, Some("1")),
-            ("[tru]", "[limit(1; .)] | length", None, None, Some("1")),
-            ("[1.2.3]", "path(.)", None, None, Some("[]")),
-            ("[tru]", "path(.)", None, None, Some("[]")),
-            ("[1.2.3]", "[paths]", None, Some("[]"), Some("[]")),
-            ("[tru]", "[paths]", None, Some("[]"), Some("[]")),
-            ("[1.2.3]", "getpath([]) | not", None, None, Some("false")),
-            (OBJ, "path(.a)", None, None, Some(r#"["a"]"#)),
-            (OBJ, "[paths] | length", None, Some("2"), Some("2")),
+        //  `eval_using`, `eval_with_cursor_using` and therefore `eval`)
+        const ROWS: &[(&str, &str, Outcome, Outcome)] = &[
+            ("[1.2.3]", "1", Some("1"), Some("1")),
+            ("[1.2.3]", "not", None, Some("false")),
+            ("[1.2.3]", "[.] | length", None, Some("1")),
+            ("[tru]", "[.] | length", None, Some("1")),
+            ("[1.2.3]", "[limit(1; .)] | length", None, Some("1")),
+            ("[tru]", "[limit(1; .)] | length", None, Some("1")),
+            ("[1.2.3]", "path(.)", None, Some("[]")),
+            ("[tru]", "path(.)", None, Some("[]")),
+            ("[1.2.3]", "[paths]", Some("[]"), Some("[]")),
+            ("[tru]", "[paths]", Some("[]"), Some("[]")),
+            ("[1.2.3]", "getpath([]) | not", None, Some("false")),
+            (OBJ, "path(.a)", None, Some(r#"["a"]"#)),
+            (OBJ, "[paths] | length", Some("2"), Some("2")),
             (
                 OBJ,
                 "[leaf_paths]",
-                None,
                 Some(r#"[["a"],["b"]]"#),
                 Some(r#"[["a"],["b"]]"#),
             ),
-            (OBJ, r#"getpath(["a"])"#, None, None, Some("1")),
-            (OBJ, "[.[]] | length", None, Some("2"), Some("2")),
-            // `key` needs path context, so `eval` hands the whole query to
-            // the cursor entry and answers like it.
+            (OBJ, r#"getpath(["a"])"#, None, Some("1")),
+            (OBJ, "[.[]] | length", Some("2"), Some("2")),
             (
                 "[1.2.3]",
                 "select(key == 0) | [.] | length",
-                Some("1"),
                 None,
                 Some("1"),
             ),
-            (
-                OBJ,
-                "select(key == 0) | path(.a)",
-                Some(r#"["a"]"#),
-                None,
-                Some(r#"["a"]"#),
-            ),
+            (OBJ, "select(key == 0) | path(.a)", None, Some(r#"["a"]"#)),
             // #3427: these collections materialize in the cursor entry too.
-            ("[1.2.3]", "[., 1] | length", None, None, None),
-            ("[1.2.3]", "{a: .} | length", None, None, None),
-            ("[1.2.3]", ". as $x | [$x] | length", None, None, None),
+            ("[1.2.3]", "[., 1] | length", None, None),
+            ("[1.2.3]", "{a: .} | length", None, None),
+            ("[1.2.3]", ". as $x | [$x] | length", None, None),
         ];
         fn generic<V: crate::jq::document::DocumentValue>(r: GenericResult<V>) -> Outcome {
             match r {
                 GenericResult::Error(e) if e.is_decode_failure() => None,
-                other => match other.into_owned::<JqSemantics>() {
-                    Ok(Some(value)) => Some(value.to_json().leak()),
-                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- every ROWS filter either raises a decode failure or answers one value through the generic evaluator, so this fallback only reports a row that moved (#3266)"
-                    other => Some(format!("{other:?}").leak()),
-                    // omni-dev: coverage end
-                },
+                // Anything but one value is reported as its `Debug` rather than
+                // panicking, so a row that moved shows up in the assertion below.
+                other => {
+                    let owned = other.into_owned::<JqSemantics>();
+                    let answer = owned
+                        .as_ref()
+                        .ok()
+                        .and_then(Option::as_ref)
+                        .map(OwnedValue::to_json);
+                    Some(answer.unwrap_or_else(|| format!("{owned:?}")).leak())
+                }
             }
         }
         let mut moved = Vec::new();
-        for &(json, filter, want_eval, want_using, want_cursor) in ROWS {
+        for &(json, filter, want_using, want_cursor) in ROWS {
             let index = JsonIndex::build(json.as_bytes());
             let element = index
                 .root(json.as_bytes())
@@ -114400,27 +114673,22 @@ mod tests {
             let expr = parse(filter).expect("filter parses");
             let concrete: Outcome = match eval::<Vec<u64>, JqSemantics>(&expr, element) {
                 QueryResult::Error(e) if e.is_decode_failure() => None,
-                other => match normalize(other) {
-                    (values, tag) if values.len() == 1 && tag == "ok" => {
-                        Some(values[0].to_json().leak())
-                    }
-                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- every ROWS filter either raises a decode failure or answers one value through eval, so this fallback only reports a row that moved (#3266)"
-                    other => Some(format!("{other:?}").leak()),
-                    // omni-dev: coverage end
-                },
+                other => {
+                    let answer = normalize(other);
+                    let single =
+                        (answer.0.len() == 1 && answer.1 == "ok").then(|| answer.0[0].to_json());
+                    Some(single.unwrap_or_else(|| format!("{answer:?}")).leak())
+                }
             };
             let using = generic(eval_using::<JqSemantics, _>(&expr, element.value()));
             let cursor = generic(eval_with_cursor_using::<JqSemantics, _>(&expr, element));
             let got = (concrete, using, cursor);
-            let want = (want_eval, want_using, want_cursor);
-            if got != want {
-                // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a ROWS answer moves (#3266)"
-                moved.push(format!(
-                    "`{filter}` on {json}: (eval, eval_using, eval_with_cursor_using) = \
-                     {got:?}, pinned {want:?}"
-                ));
-                // omni-dev: coverage end
-            }
+            let want = (want_cursor, want_using, want_cursor);
+            let report = format!(
+                "`{filter}` on {json}: (eval, eval_using, eval_with_cursor_using) = \
+                 {got:?}, pinned {want:?}"
+            );
+            moved.extend((got != want).then_some(report));
         }
         assert!(moved.is_empty(), "a pinned answer moved: {moved:#?}");
     }
@@ -114462,7 +114730,7 @@ mod share_audit_2999 {
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
         let (ok, recorded) = share_stats::measure(|| {
-            let result = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+            let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
             let ok = !matches!(result, QueryResult::Error(_));
             drop(result);
             ok
@@ -114520,7 +114788,7 @@ mod share_audit_2999 {
         let cursor = index.root(&json);
         let expr = parse(".[(0,1)] = 0").unwrap();
         let ((), recorded) = share_stats::measure(|| {
-            drop(eval::<Vec<u64>, JqSemantics>(&expr, cursor));
+            drop(eval_full::<Vec<u64>, JqSemantics>(&expr, cursor));
         });
         assert!(!recorded.is_empty());
         for (site, _) in &recorded {
@@ -114586,7 +114854,7 @@ mod touched_edge_cases_2999 {
     fn one_json<S: EvalSemantics>(json: &[u8], expr: &Expr) -> String {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        match eval::<Vec<u64>, S>(expr, cursor) {
+        match eval_full::<Vec<u64>, S>(expr, cursor) {
             QueryResult::Owned(v) => v.to_json(),
             QueryResult::One(v) => to_owned::<S, _>(&v).unwrap().to_json(), // omni-dev: coverage tolerate-line reason="every pinned filter below yields an owned value; kept so a cursor answer still renders rather than panics (#2999)"
             other => panic!("unexpected result: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertions this helper serves (#2999)"
@@ -115307,5 +115575,486 @@ mod touched_edge_cases_2999 {
         // The outer nested def hides `a` only, so `b` is still visible: it is
         // rebuilt. Its inner `def b` hides the last visible key: cloned.
         assert_eq!(nested_defs_cached(&installed), vec![false, true]);
+    }
+
+    /// #3457: the `eval()` boundary turns the 256-level nesting panic into a
+    /// tagged error, and only that panic.
+    #[test]
+    fn contain_depth_panic_catches_only_the_nesting_guard_3457() {
+        let caught: QueryResult<'_, Vec<u64>> = contain_depth_panic(|| {
+            crate::jq::eval_generic::assert_nesting_depth(
+                crate::jq::eval_generic::MAX_NESTING_DEPTH,
+            );
+            QueryResult::None
+        });
+        // A decode failure (so it escapes try/catch) carrying the depth message.
+        let nesting_error = matches!(
+            &caught,
+            QueryResult::Error(e)
+                if e.is_decode_failure()
+                    && e.to_string() == "nesting depth exceeds limit of 256"
+        );
+        assert!(nesting_error, "expected the nesting error, got {caught:?}");
+
+        // The 384 guard shares the template but is a different failure class:
+        // it must keep unwinding.
+        let other = std::panic::catch_unwind(|| {
+            contain_depth_panic::<Vec<u64>>(|| {
+                crate::jq::assert_value_tree_depth(crate::jq::MAX_VALUE_TREE_DEPTH);
+                QueryResult::None
+            })
+        });
+        assert!(other.is_err(), "the 384 guard must not be contained");
+
+        // An unrelated panic keeps unwinding too.
+        let unrelated =
+            std::panic::catch_unwind(|| contain_depth_panic::<Vec<u64>>(|| panic!("unrelated")));
+        assert!(unrelated.is_err());
+    }
+
+    /// #3457: a contained depth panic leaves no evaluation scope installed --
+    /// the same thread answers the next query as a fresh one would.
+    #[test]
+    fn eval_depth_panic_leaves_no_scope_behind_3457() {
+        let json = br"[1]";
+        let index = JsonIndex::build(json);
+        let expr = parse("file_index").expect("parse");
+        let probe = || {
+            eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)).collect_owned::<JqSemantics>()
+        };
+        let fresh = probe();
+
+        let caught: QueryResult<'_, Vec<u64>> = contain_depth_panic(|| {
+            let _scope = enter_file_index_scope(7);
+            crate::jq::eval_generic::assert_nesting_depth(
+                crate::jq::eval_generic::MAX_NESTING_DEPTH,
+            );
+            QueryResult::None
+        });
+        assert!(caught.is_error());
+        assert_eq!(probe(), fresh, "the unwound scope must have been restored");
+    }
+
+    /// #3457: the must-not-change sweep for moving `eval()` onto the cursor
+    /// evaluator. Every row is a well-formed document and a filter, run through
+    /// the entry it used to reach (`eval_full`) and through the new `eval`, in
+    /// jq and yq mode; the two must give the same outputs (or the same error).
+    /// Where they do not, that is a bug in one evaluator or a documented
+    /// improvement -- [`MOVED`] pins those, each with its reason, so a row
+    /// moving is a decision rather than drift.
+    #[test]
+    fn eval_matches_the_previous_entry_on_well_formed_input_3457() {
+        /// (control kind, outputs, error message): everything a caller can see
+        /// of a result, with a decode failure kept distinct from a value.
+        fn observe<S: EvalSemantics>(
+            r: QueryResult<'_, Vec<u64>>,
+        ) -> (&'static str, String, String) {
+            // No sweep row breaks or halts, but one that starts to is reported
+            // as its own kind rather than folded into `values`. A table, not a
+            // `match`, so those never-taken kinds are not arms a passing suite
+            // leaves unexecuted.
+            let kind = [
+                (matches!(&r, QueryResult::Error(_)), "error"),
+                (matches!(&r, QueryResult::Break(_)), "break"),
+                (matches!(&r, QueryResult::Halt(_)), "halt"),
+                (matches!(&r, QueryResult::Partial(..)), "partial"),
+            ]
+            .into_iter()
+            .find_map(|(is_kind, name)| is_kind.then_some(name))
+            .unwrap_or("values");
+            let message = match &r {
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    e.message.clone()
+                }
+                _ => String::new(),
+            };
+            // Every sweep row is well-formed, so none fails to decode; one that
+            // did would be reported as a decode failure rather than a value.
+            let values = r
+                .collect_owned_checked::<S>()
+                .map(|vs| {
+                    vs.iter()
+                        .map(OwnedValue::to_json)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .map_err(|e| format!("decode failure: {}", e.message))
+                .unwrap_or_else(std::convert::identity);
+            (kind, values, message)
+        }
+        fn both<S: EvalSemantics>(
+            json: &str,
+            filter: &str,
+        ) -> (
+            (&'static str, String, String),
+            (&'static str, String, String),
+        ) {
+            let index = JsonIndex::build(json.as_bytes());
+            let expr = parse(filter).unwrap_or_else(|e| panic!("`{filter}` must parse: {e:?}"));
+            (
+                observe::<S>(eval_full::<Vec<u64>, S>(&expr, index.root(json.as_bytes()))),
+                observe::<S>(eval::<Vec<u64>, S>(&expr, index.root(json.as_bytes()))),
+            )
+        }
+
+        const DOC: &str = r#"{"a":[1,2,{"b":null}],"c":"x","d":{"e":[3,4]},"f":true,"g":1.5}"#;
+        const ARR: &str = "[3,1,2]";
+        const STR: &str = r#""héllo wörld""#;
+        const FILTERS: &[(&str, &[&str])] = &[
+            (
+                DOC,
+                &[
+                    ".a",
+                    ".a[]",
+                    ".a[2].b",
+                    ".d.e | add",
+                    "[.a[] | numbers]",
+                    "keys",
+                    "to_entries | map(.key)",
+                    "path(..)",
+                    "[paths]",
+                    "[leaf_paths]",
+                    "[paths(type == \"number\")]",
+                    r#"getpath(["d","e",1])"#,
+                    r#"getpath(["z"])"#,
+                    "[.. | numbers]",
+                    "map_values(type)",
+                    "with_entries(.value |= type)",
+                    "del(.a)",
+                    ".d.e[1] = 9",
+                    ".g += 1",
+                    "reduce .d.e[] as $x (0; . + $x)",
+                    "[foreach .d.e[] as $x (0; . + $x)]",
+                    "[limit(2; .a[])]",
+                    "first(.a[])",
+                    "[.a[] | select(. != null)]",
+                    ".c | ascii_upcase",
+                    ".c * 3",
+                    "tojson",
+                    "{(.c): .f}",
+                    "[.a[] | type]",
+                    "def f: .d.e[]; [f]",
+                    ". as {a: [$x]} | $x",
+                    ".a | length",
+                    "[.[] | type]",
+                    "[(.a, .d) | length]",
+                    r#"try error("x") catch ."#,
+                    "label $out | .a[] | if . == 2 then ., break $out else . end",
+                    "[limit(3; repeat(1))]",
+                    "[tostream] | length",
+                    "path(.a[1:])",
+                    ".a[-1]",
+                    ".a[1:] | length",
+                    "$__loc__",
+                    "path(.a[2].b)",
+                    "path(first(.a[]))",
+                    "[path(.a[] | select(. == 2))]",
+                    ".a | to_entries | length",
+                    "[.d.e[] | . * 2] | @csv",
+                    "walk(if type == \"number\" then . + 1 else . end)",
+                    "[splits(\"x\")]?",
+                    "to_entries[0]",
+                    "with_entries(select(.key == \"c\"))",
+                    ".a as [$p, $q] | [$p, $q]",
+                    "any(.a[]; . == 2)",
+                    "isvalid(.a[9])",
+                    "input_line_number",
+                    "getpath([\"a\",2,\"b\"])",
+                    "[.. | scalars]",
+                    "del(.a[0], .d)",
+                    "delpaths([[\"a\",0],[\"c\"]])",
+                    "setpath([\"c\"]; 1)",
+                    "to_entries | from_entries",
+                    "[range(3)] | map(. * 2)",
+                    "ltrimstr(\"x\")",
+                    "tostring",
+                    "@json",
+                    "@text",
+                    "[.a[]?]",
+                    ".a[]?",
+                    ".c[]?",
+                    ".c.d?",
+                    "(.a | first), (.a | last)",
+                    "[.a[] | tojson]",
+                    "map(.)?",
+                    "env | type",
+                ],
+            ),
+            (
+                ARR,
+                &[
+                    "sort",
+                    "min",
+                    "add",
+                    ".[1:]",
+                    "map(. * 2)",
+                    "to_entries",
+                    "reverse",
+                    "index(1)",
+                    "any",
+                    "all",
+                    "flatten",
+                    "[.[] | tostring] | join(\",\")",
+                    "@csv",
+                    "@sh",
+                    "sort_by(-.)",
+                    "group_by(. > 1)",
+                    "unique",
+                    "[.[] | . as $x | $x]",
+                    "path(.[1])",
+                    "[paths]",
+                    "getpath([1])",
+                    "del(.[0])",
+                    ".[1] = 9",
+                    "first",
+                    "last",
+                    "nth(1)",
+                    "length",
+                    "bsearch(2)",
+                    "combinations?",
+                    "tojson | fromjson",
+                    "limit(2; .[])",
+                    "[.[:2], .[2:]]",
+                    "min_by(-.)",
+                    "transpose?",
+                    "@json",
+                ],
+            ),
+            (
+                STR,
+                &[
+                    "length",
+                    "utf8bytelength",
+                    "explode | implode",
+                    "test(\"w\")",
+                    "ascii_downcase",
+                    "split(\" \")",
+                    "@uri",
+                    "@base64",
+                    "@base64 | @base64d",
+                    "ltrimstr(\"h\")",
+                    "[match(\"l+\"; \"g\") | .offset]",
+                    "sub(\"l\"; \"L\")",
+                    "gsub(\"l\"; \"L\")",
+                    "capture(\"(?<w>w\\\\S+)\")",
+                    "@html",
+                    "tojson",
+                    "ascii",
+                    ".[1:3]",
+                    "path(.)",
+                    "[paths]",
+                    "getpath([])",
+                    "try tonumber catch \"nan\"",
+                ],
+            ),
+        ];
+        // Duplicate keys: jq keeps the last, and so does the cursor evaluator.
+        const DUP: &str = r#"{"a":1,"a":2,"b":3}"#;
+        const DUP_FILTERS: &[&str] = &[
+            "to_entries | length",
+            "pick(.a)",
+            "keys",
+            "length",
+            ".a",
+            "[paths]",
+            "with_entries(.)",
+            "map_values(. + 1)",
+            "[.[]]",
+            "tojson",
+            "del(.a)",
+        ];
+        const YQ_FILTERS: &[(&str, &[&str])] = &[(
+            DOC,
+            &[
+                ".a[]",
+                ".a[-1]",
+                "del(.a)",
+                ".a[0] = 5",
+                "path(.d.e[0])",
+                "keys",
+                ".d | to_entries",
+                "[..] | length",
+                "[paths] | length",
+                ".a[(1*-5)]?",
+                ".a[(1*-5)]",
+                "([1,2]+[])[(1*-5)]",
+                "(.a, .d) | key",
+                ".a[] | key",
+                ".d.e | parent",
+                ".c | line",
+                ".. | select(tag == \"!!int\")",
+                ".a | length",
+                "with_entries(.value |= tag)",
+                "pick([\"c\"])",
+                "[.a[] | select(. == 2)]",
+            ],
+        )];
+
+        // Rows whose answer moved on purpose: (mode, doc, filter). Each is
+        // the cursor evaluator answering where eval.rs's own answer was the
+        // outlier, with the reason beside it.
+        const MOVED: &[(&str, &str, &str)] = &[
+            // `line` answered a fixed default here; the cursor evaluator reads
+            // the real position (the two evaluators' cursor-metadata stubs).
+            ("yq", DOC, ".c | line"),
+            // jq collapses a duplicate key (last wins), so `to_entries` has two
+            // entries (captured from jq 1.7.1); eval.rs's owned walk kept all
+            // three. The cursor evaluator, and so the CLI, always answered 2.
+            ("jq", DUP, "to_entries | length"),
+        ];
+
+        let mut differ = Vec::new();
+        let is_moved = |mode: &str, doc: &str, filter: &str| {
+            MOVED
+                .iter()
+                .any(|(m, d, f)| *m == mode && *d == doc && *f == filter)
+        };
+        let mut rows: Vec<(&str, &str, &str)> = Vec::new();
+        for (doc, filters) in FILTERS {
+            rows.extend(filters.iter().map(|f| ("jq", *doc, *f)));
+        }
+        rows.extend(DUP_FILTERS.iter().map(|f| ("jq", DUP, *f)));
+        for (doc, filters) in YQ_FILTERS {
+            rows.extend(filters.iter().map(|f| ("yq", *doc, *f)));
+        }
+        let checked = rows.len();
+        for (mode, doc, filter) in rows {
+            let (old, new) = if mode == "jq" {
+                both::<JqSemantics>(doc, filter)
+            } else {
+                both::<YqSemantics>(doc, filter)
+            };
+            let report = format!(
+                "{mode} `{filter}` on {doc}:\n    eval_full {old:?}\n    eval      {new:?}"
+            );
+            differ.extend((old != new && !is_moved(mode, doc, filter)).then_some(report));
+        }
+        assert!(checked >= 150, "the sweep shrank: {checked} rows");
+        let moved = differ.join("\n");
+        assert!(differ.is_empty(), "eval moved from eval_full:\n{moved}");
+    }
+
+    /// #3457: `eval_reindexed` is the hybrid `eval` was, for `succinctly yq`'s
+    /// DOM route. It reaches `eval_full` for a query with no path context (so
+    /// eval.rs's own answer, unreadable-value raise included, is unchanged) and
+    /// the generic evaluator for one that reads it, exactly as before.
+    #[test]
+    fn eval_reindexed_keeps_the_previous_hybrid_3457() {
+        let outcome = |json: &str, filter: &str| {
+            let index = JsonIndex::build(json.as_bytes());
+            let expr = parse(filter).expect("filter parses");
+            let element = index.root(json.as_bytes()).first_child().expect("element");
+            let run = |r: QueryResult<'_, Vec<u64>>| match r {
+                QueryResult::Error(e) => format!("error: {}", e.is_decode_failure()),
+                other => other
+                    .collect_owned::<JqSemantics>()
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            (
+                run(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, element)),
+                run(eval_full::<Vec<u64>, JqSemantics>(&expr, element)),
+                run(eval::<Vec<u64>, JqSemantics>(&expr, element)),
+            )
+        };
+        // No path context: `eval_reindexed` is `eval_full`, not `eval`.
+        let (reindexed, full, entry) = outcome("[1.2.3]", "[.] | length");
+        assert_eq!(
+            (reindexed.as_str(), full.as_str()),
+            ("error: true", "error: true")
+        );
+        assert_eq!(entry, "1");
+        let (reindexed, full, entry) = outcome(r#"[{"c":"x"}]"#, ".c | line");
+        // Cursor metadata: `eval_full`'s fixed default for the DOM route, whose
+        // document is a synthetic re-index, against the real position `eval` reads.
+        assert_eq!(
+            (reindexed.as_str(), full.as_str(), entry.as_str()),
+            ("0", "0", "1")
+        );
+        // Path context: the generic evaluator, as `eval` was routed before.
+        let (reindexed, _, entry) = outcome(r#"[{"a":1}]"#, "select(key == 0) | path(.a)");
+        assert_eq!(reindexed, r#"["a"]"#);
+        assert_eq!(reindexed, entry);
+    }
+
+    /// #3457: `collect_owned_checked` reports a cursor over an unreadable value as
+    /// an error where `collect_owned` (documented lossy) yields `null`, and
+    /// keeps a partial result's prefix.
+    #[test]
+    fn collect_owned_checked_reports_what_collect_owned_loses_3457() {
+        let run = |json: &str, filter: &str| {
+            let index = JsonIndex::build(json.as_bytes());
+            let expr = parse(filter).expect("filter parses");
+            let root = index.root(json.as_bytes());
+            let lossy = eval::<Vec<u64>, JqSemantics>(&expr, root)
+                .collect_owned::<JqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>();
+            let checked = eval::<Vec<u64>, JqSemantics>(&expr, root)
+                .collect_owned_checked::<JqSemantics>()
+                .map(|vs| vs.iter().map(OwnedValue::to_json).collect::<Vec<_>>());
+            (lossy, checked)
+        };
+        // `getpath(["b"])` is a cursor naming the malformed `tru`.
+        let (lossy, checked) = run(r#"{"a":1,"b":tru}"#, r#"getpath(["b"])"#);
+        assert_eq!(lossy, ["null"]);
+        assert!(checked
+            .expect_err("must not become null")
+            .is_decode_failure());
+        // A navigated value that reads fine, one and many, is the same both ways.
+        let (lossy, checked) = run(r#"{"a":1,"b":2}"#, ".a");
+        assert_eq!(
+            (lossy, checked),
+            (vec!["1".to_string()], Ok(vec!["1".to_string()]))
+        );
+        let (lossy, checked) = run(r#"{"a":1,"b":2}"#, ".[]");
+        assert_eq!(checked, Ok(vec!["1".to_string(), "2".to_string()]));
+        assert_eq!(lossy, ["1", "2"]);
+        // Identity is a `OneCursor`; the unreadable element is `null` in the
+        // lossy form and an error in the checked one.
+        let (lossy, checked) = run("[1.2.3]", ".");
+        assert_eq!(lossy, ["[null]"]);
+        assert!(checked
+            .expect_err("must not become null")
+            .is_decode_failure());
+        // Owned results and a partial result's prefix.
+        assert_eq!(
+            run("[]", "1, 2").1,
+            Ok(vec!["1".to_string(), "2".to_string()])
+        );
+        assert_eq!(run("[]", r#"1, error("x")"#).1, Ok(vec!["1".to_string()]));
+        assert_eq!(run("[]", "empty").1, Ok(vec![]));
+        assert_eq!(run("[]", r#"error("x")"#).1, Ok(vec![]));
+    }
+
+    /// #3457: `eval_lenient` keeps an owned result made only of `null`/booleans
+    /// (so `.missing` still yields `null`) and drops any owned result holding
+    /// another value whole, rather than returning a truncated list.
+    #[test]
+    fn eval_lenient_keeps_owned_null_and_bool_3457() {
+        let run = |json: &str, filter: &str| {
+            let index = JsonIndex::build(json.as_bytes());
+            let expr = parse(filter).expect("filter parses");
+            eval_lenient::<Vec<u64>, JqSemantics>(&expr, index.root(json.as_bytes()))
+                .iter()
+                .map(|v| to_owned_lossy::<JqSemantics, _>(v).to_json())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(r#"{"a":1}"#, ".missing"), ["null"]);
+        assert_eq!(run("[1]", ". == [1]"), ["true"]);
+        assert_eq!(run("[1]", "1 + 1"), Vec::<String>::new());
+        assert_eq!(run("[1]", r#""a" + "b""#), Vec::<String>::new());
+        assert_eq!(run("[1]", "(true, false, null)"), ["true", "false", "null"]);
+        // Not `["true", "false", "null"]`: the `5` cannot be carried, and a
+        // list without it would read as the whole answer.
+        assert_eq!(run("[1]", "(true, 5, false, null)"), Vec::<String>::new());
+        assert_eq!(
+            run("[1,2,3]", r#".[] | if . > 1 then "big" else null end"#),
+            Vec::<String>::new()
+        );
+        assert_eq!(run("[1]", "empty"), Vec::<String>::new());
     }
 }

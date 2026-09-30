@@ -75,11 +75,11 @@ use super::eval::{
     streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
     try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
-    Reentry, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
-    WHILE_UNTIL_MAX_STEPS,
+    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, RangeNum, Reentry, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict,
+    YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -208,13 +208,67 @@ pub fn assert_nesting_depth(depth: usize) {
 /// `validate_json_delimiters`, reached before any user filter runs) that
 /// already threads a `Result` and has no such concern.
 pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
+    check_depth_with(depth, EvalError::new)
+}
+
+/// The one [`MAX_NESTING_DEPTH`] comparison and message behind
+/// [`check_nesting_depth`] and [`guard_nesting_depth`], which differ only in
+/// how the error is tagged (`make`).
+#[inline]
+fn check_depth_with(depth: usize, make: fn(String) -> EvalError) -> Result<(), EvalError> {
     if depth < MAX_NESTING_DEPTH {
         Ok(())
     } else {
-        Err(EvalError::new(
-            super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
-        ))
+        Err(make(super::value::nesting_depth_exceeded_message(
+            MAX_NESTING_DEPTH,
+        )))
     }
+}
+
+/// The message of a caught nesting-depth panic, or `None` for any other.
+///
+/// `Some` iff `payload` (a caught panic's payload) is exactly
+/// [`assert_nesting_depth`]'s [`MAX_NESTING_DEPTH`] message, so a caller can
+/// `resume_unwind` anything unrelated rather than treating an unexpected
+/// panic as this known one (#1793, moved here from the CLI by #3457 so the
+/// library entry and the binary share one definition).
+///
+/// An *exact* match against `assert_depth`'s message template
+/// (`src/jq/value.rs`), not a substring check:
+/// [`assert_value_tree_depth`](super::value::assert_value_tree_depth)
+/// (`MAX_VALUE_TREE_DEPTH`, 384) shares that template and differs only in
+/// the number, and that guard is a different failure class (filter-driven
+/// value growth rather than document nesting). `reduce range(400) as $i
+/// (null; [.])` panics through the 384 guard and must not be reported as
+/// this one.
+///
+/// `assert!`'s formatted message panics with a `String` payload, checked
+/// first since it is the only shape this guard produces; the `&str` check
+/// is defence in depth against an unformatted `panic!("literal")`.
+pub fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<String> {
+    let text = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())?;
+    (text == super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH))
+        .then(|| text.to_string())
+}
+
+/// The path walkers' depth guard (#3457): [`assert_nesting_depth`]'s
+/// ceiling, reported as a `decode_failure`-tagged `Err` instead of a panic.
+///
+/// The walkers (`collect_paths_generic`, `path_walk_generic` and the
+/// `path_*step*` family) already return a `Result`, so -- like
+/// [`to_owned`] after #2627 -- only the signalling needed to change, not
+/// the signatures. The tag keeps the property the panic was chosen for: a
+/// stack-safety guard must not be swallowed by a `try`/`catch` in the
+/// running filter (see [`check_nesting_depth`], whose plain error would be).
+/// It also means a library caller of `jq::eval` gets a `QueryResult::Error`
+/// on a deep document rather than an unwinding panic, and the CLI needs no
+/// `catch_unwind` to report it.
+#[inline]
+pub(crate) fn guard_nesting_depth(depth: usize) -> Result<(), EvalError> {
+    check_depth_with(depth, EvalError::decode_failure)
 }
 
 /// A document number's double under `S`'s number model, for the
@@ -1766,7 +1820,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
     under_alias: bool,
     head_foot_read: HeadFootRead,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
-    assert_nesting_depth(depth);
+    guard_nesting_depth(depth)?;
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
     // getter: the write path re-emits this verbatim after one space.
     let own_comment = cursor.and_then(DocumentCursor::line_comment_raw);
@@ -2878,7 +2932,7 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
     use crate::json::light::StandardJson;
-    assert_nesting_depth(depth);
+    guard_nesting_depth(depth)?;
     Ok(match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
@@ -5227,8 +5281,8 @@ pub fn eval<V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
 /// read (a malformed number such as `1.2.3`, or a keyword such as `tru`) it
 /// answers some filters that never read the value (`1`, `[paths]`) and
 /// raises on others (`not`, `[.] | length`), where
-/// [`eval_with_cursor_using`], the entry the CLI uses, answers all of them
-/// (#3266).
+/// [`eval_with_cursor_using`], the entry the CLI uses (and, since #3457,
+/// [`crate::jq::eval`](fn@crate::jq::eval)), answers all of them (#3266).
 ///
 /// Arithmetic that falls back to the full evaluator (division, modulo, overflow)
 /// follows `S`, so yq keeps yq numeric behavior instead of jq's.
@@ -6520,15 +6574,16 @@ pub fn eval_with_cursor<C: DocumentCursor>(expr: &Expr, cursor: C) -> GenericRes
 /// modulo/division/overflow behavior is preserved on the cursor path.
 ///
 /// `succinctly jq` evaluates through this entry and its streaming twin,
-/// [`eval_each_with_cursor_using`]. It holds the input as a cursor, so a
-/// value the index cannot read (a malformed number such as `1.2.3`, or a
-/// keyword such as `tru`) does not raise under a filter that navigates past
-/// it (`path(.a)`) or wraps it in `[.]`, where [`eval_using`] and
-/// [`crate::jq::eval`](fn@crate::jq::eval) can (#3266). Other collections
-/// (`[., 1]`, `{a: .}`, `. as $x | [$x]`) materialize the value here too, and
-/// raise (#3427). Unlike `crate::jq::eval`, its `path`/`paths`/`leaf_paths`/
-/// `getpath` walkers panic on a document nested deeper than 256 levels
-/// (#3429); the CLI catches that panic.
+/// [`eval_each_with_cursor_using`], and so does the library entry
+/// [`crate::jq::eval`](fn@crate::jq::eval) since #3457 (it reshapes the answer
+/// into a `QueryResult`). The input is held as a cursor, so a value the index
+/// cannot read (a malformed number such as `1.2.3`, or a keyword such as
+/// `tru`) does not raise under a filter that navigates past it (`path(.a)`) or
+/// wraps it in `[.]`, where [`eval_using`], which is handed a decoded value,
+/// can (#3266). Other collections (`[., 1]`, `{a: .}`, `. as $x | [$x]`)
+/// materialize the value here too, and raise (#3427). A document nested deeper
+/// than 256 levels makes the `path`/`paths`/`leaf_paths`/`getpath` walkers
+/// return a decode-failure-tagged error (#3429 tracks the ceiling).
 ///
 /// Same `takes_input_queue_bridge` condition as [`eval_using`] (#1504),
 /// cursor-metadata carve-out included; see its doc comment for why the
@@ -11009,34 +11064,45 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
 /// `recurse(.[]?)`, so a node whose members cannot be listed ends its own
 /// branch silently -- except for the decode failure `?` never catches
 /// (#1620), which escapes.
+///
+/// Iterative (#3457): a pre-order walk over an explicit work stack, not a
+/// native recursion per level. The library `eval` now reaches this arm and
+/// has no evaluation thread of its own to size, so a recursion here overflowed
+/// the caller's stack on a document a few thousand levels deep (2,500 on a 2
+/// MB test thread) -- an abort, where the previous entry raised a catchable
+/// depth error. Children are pushed in reverse so they pop in document order,
+/// and each node's members are listed only once it has been delivered, as
+/// before, so the order of outputs and errors is unchanged.
 fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: V::Cursor,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    if matches!(sink.push(GenericItem::OneCursor(cursor)), Demand::Stop) {
-        return Flow::Stopped { pending: None };
-    }
-    let mut children: Vec<(Rc<PathTrail>, PathNode<V>)> = Vec::new();
-    let stepped = path_step_generic::<S, V, _>(
-        &Expr::Iterate,
-        &PathNode::At(cursor),
-        &PathTrail::root(),
-        S::COLLAPSE_DUPLICATE_KEYS,
-        &mut children,
-    );
-    match stepped {
-        Ok(()) => {}
-        Err(e) if e.is_uncatchable_at_value_position() => return Flow::Escaped(Control::Error(e)),
-        // `.[]?`: a scalar, or a malformed container, ends the branch.
-        Err(_) => {}
-    }
-    for (_, child) in children {
-        let PathNode::At(c) = child else {
-            unreachable!("a step from a live node reaches live children")
-        };
-        match each_recurse_cursor_generic::<S, V>(c, sink) {
-            Flow::Exhausted => {}
-            other => return other,
+    let mut pending: Vec<V::Cursor> = vec![cursor];
+    while let Some(cursor) = pending.pop() {
+        if matches!(sink.push(GenericItem::OneCursor(cursor)), Demand::Stop) {
+            return Flow::Stopped { pending: None };
+        }
+        let mut children: Vec<(Rc<PathTrail>, PathNode<V>)> = Vec::new();
+        let stepped = path_step_generic::<S, V, _>(
+            &Expr::Iterate,
+            &PathNode::At(cursor),
+            &PathTrail::root(),
+            S::COLLAPSE_DUPLICATE_KEYS,
+            &mut children,
+        );
+        match stepped {
+            Ok(()) => {}
+            Err(e) if e.is_uncatchable_at_value_position() => {
+                return Flow::Escaped(Control::Error(e))
+            }
+            // `.[]?`: a scalar, or a malformed container, ends the branch.
+            Err(_) => {}
+        }
+        for (_, child) in children.into_iter().rev() {
+            let PathNode::At(c) = child else {
+                unreachable!("a step from a live node reaches live children")
+            };
+            pending.push(c);
         }
     }
     Flow::Exhausted
@@ -16225,6 +16291,28 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// [`index_owned_by_key`] with yq's negative-index rule applied first (#3457):
+/// a negative index still negative once resolved against the array's length
+/// raises in real yq, unconditionally -- `?` does not suppress it (#2254).
+///
+/// `index_one_owned` has no notion of that rule (see
+/// `eval::yq_negative_index_error` for why it is not threaded into it), so a
+/// caller indexing an *owned* target checks it ahead. `eval.rs`'s own
+/// `KeyTargets::Owned` loop did; this evaluator's two did not, so
+/// `([1,2]+[])[(1*-5)]` answered `null` here where yq and `eval.rs` raise. It
+/// surfaced when the library entry moved onto this evaluator (#3457), and the
+/// CLI's cursor route, which had the same gap, is fixed with it.
+fn index_owned_checked<S: EvalSemantics>(
+    target: &OwnedValue,
+    key: &OwnedValue,
+    optional: bool,
+) -> Result<Option<OwnedValue>, EvalError> {
+    if let Some(e) = yq_negative_index_error::<S>(target, key) {
+        return Err(e);
+    }
+    index_owned_by_key::<S>(target, key, optional)
+}
+
 /// Evaluate `E[K]` — indexing by a computed key.
 ///
 /// The counterpart of `eval::eval_index_expr`; see that function for why the
@@ -16503,7 +16591,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                         }
                     },
                     accumulator: owned,
-                    fold: |t| index_owned_by_key::<S>(t, k, optional),
+                    fold: |t| index_owned_checked::<S>(t, k, optional),
                 }
             }
             GenericResult::One(v) => KeyTargets::Native(vec![v]),
@@ -16656,7 +16744,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     escape_generic!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                 }
                 for t in &ts {
-                    match index_owned_by_key::<S>(t, k, optional) {
+                    match index_owned_checked::<S>(t, k, optional) {
                         Ok(Some(v)) => owned.push(v),
                         Ok(None) => {}
                         // Same reasoning as the `Native` arm above: a later
@@ -17491,7 +17579,7 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
     paths: &mut Vec<OwnedValue>,
     leaves_only: bool,
 ) -> Result<(), EvalError> {
-    assert_nesting_depth(current_path.len());
+    guard_nesting_depth(current_path.len())?;
     if let Some(fields) = value.as_object() {
         let checked = effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS)?;
         if checked.is_empty() {
@@ -18370,7 +18458,8 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
     path: &Rc<PathTrail>,
     out: &mut Vec<OwnedValue>,
 ) -> Result<(), EvalError> {
-    // Panics past `MAX_NESTING_DEPTH` levels (code review on #2058), the
+    // Errors past `MAX_NESTING_DEPTH` levels (code review on #2058; a
+    // `decode_failure`-tagged `Err` rather than a panic since #3457), the
     // same guard `collect_paths_generic` already carries for its own
     // recursive path-array walk in this file. `PathTrail` has no depth cap
     // of its own -- a static chain (`path(.a.a.a...)`) recurses this
@@ -18381,7 +18470,7 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
     // (confirmed live) once this PR's fix made `path()` fast enough to
     // reach that depth in practice -- pre-fix, the O(d^2) cost made the
     // same input time out long before ever getting there.
-    assert_nesting_depth(path.depth());
+    guard_nesting_depth(path.depth())?;
     match expr {
         Expr::Identity => {
             out.push(OwnedValue::Array(path.to_vec().into()));
@@ -18463,7 +18552,7 @@ fn path_walk_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     // See `path_walk_generic`'s own doc comment -- this function recurses
     // into itself once per pipe stage without ever passing back through
     // that entry check, so it needs its own (#2058 code review).
-    assert_nesting_depth(path.depth());
+    guard_nesting_depth(path.depth())?;
     let Some((first, rest)) = exprs.split_first() else {
         out.push(OwnedValue::Array(path.to_vec().into())); // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
         return Ok(());
@@ -18495,7 +18584,7 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     node: &PathNode<V>,
     path: &T,
 ) -> Result<Option<(T, PathNode<V>)>, EvalError> {
-    assert_nesting_depth(path.recursion_depth());
+    guard_nesting_depth(path.recursion_depth())?;
     let next = match node {
         PathNode::Absent => PathNode::Absent,
         PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"), // omni-dev: coverage tolerate-line reason="unreachable: both step dispatchers route owned nodes to path_step_owned before calling this cursor helper (#3022)"
@@ -18542,7 +18631,7 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     node: &PathNode<V>,
     path: &T,
 ) -> Result<Option<(T, PathNode<V>)>, EvalError> {
-    assert_nesting_depth(path.recursion_depth());
+    guard_nesting_depth(path.recursion_depth())?;
     let mut component = index_component_value(idx, key);
     let next = match node {
         PathNode::Absent => PathNode::Absent,
@@ -18599,7 +18688,7 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
     collapse_duplicate_keys: bool,
     emit: &mut dyn FnMut(T, PathNode<V>) -> Demand,
 ) -> Result<Demand, EvalError> {
-    assert_nesting_depth(path.recursion_depth());
+    guard_nesting_depth(path.recursion_depth())?;
     match node {
         // #2346: real yq's `.[]` over any non-container -- including a
         // missing/null node here -- is a silent no-op (confirmed live
@@ -18767,7 +18856,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     out: &mut Vec<(T, PathNode<V>)>,
 ) -> Result<(), EvalError> {
     // See `path_walk_generic`'s own doc comment (#2058 code review).
-    assert_nesting_depth(path.recursion_depth());
+    guard_nesting_depth(path.recursion_depth())?;
     // spine 2416 (walk residue): a step from an owned value descends the
     // value itself, with the components the owned identity pipe would name.
     // Only the path-context walk produces such a node (`path()`'s own walk
@@ -18979,7 +19068,7 @@ fn path_step_pipe_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     // See `path_walk_generic`'s own doc comment -- like `path_walk_pipe_
     // generic`, this recurses into itself once per pipe stage (#2058 code
     // review).
-    assert_nesting_depth(path.recursion_depth());
+    guard_nesting_depth(path.recursion_depth())?;
     let Some((first, rest)) = exprs.split_first() else {
         out.push((path.clone(), node.clone()));
         return Ok(());
@@ -20453,7 +20542,7 @@ fn path_context_step_recurse<S: EvalSemantics, V: DocumentValue>(
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
-    assert_nesting_depth(pos.trail.recursion_depth());
+    guard_nesting_depth(pos.trail.recursion_depth())?;
     out.push(pos.clone());
     let mut children = Vec::new();
     path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;
@@ -26835,8 +26924,7 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             out,
         ),
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
-            owned_identity_recurse_step::<S, V>(value, id, out);
-            Ok(())
+            owned_identity_recurse_step::<S, V>(value, id, out).map_err(Control::Error)
         }
         // #2771: a literal has no position of its own. Reached only from
         // `owned_identity_operand` (its top-level `strip_parens` short-circuit
@@ -26868,8 +26956,8 @@ fn owned_identity_recurse_step<S: EvalSemantics, V: DocumentValue>(
     value: &OwnedValue,
     id: &OwnedIdentity<V>,
     out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
-) {
-    assert_nesting_depth(id.ancestors.len());
+) -> Result<(), EvalError> {
+    guard_nesting_depth(id.ancestors.len())?;
     out.push((value.clone(), id.clone()));
     let (children, _suppressed) = owned_nav_children::<S>(&Expr::Iterate, value, true);
     let parent = Rc::new(value.clone());
@@ -26878,8 +26966,9 @@ fn owned_identity_recurse_step<S: EvalSemantics, V: DocumentValue>(
             Some(component) => id.child(&parent, component),
             None => id.clone(),
         };
-        owned_identity_recurse_step::<S, V>(&child, &child_id, out);
+        owned_identity_recurse_step::<S, V>(&child, &child_id, out)?;
     }
+    Ok(())
 }
 
 /// This stage's own `key`/`path`/`file_index` reads, rewritten to the
@@ -37795,9 +37884,10 @@ mod tests {
     /// #1017: `owned_from_standard_json` is a third, independent copy of the
     /// cursor-to-`OwnedValue` conversion `to_owned`/`to_owned_cursor` are
     /// already guarded above (#998) -- same limit, same construction, its
-    /// own guard.
+    /// own guard. Reports the limit as a decode-failure-tagged error rather
+    /// than panicking since #3457, like the other two.
     #[test]
-    fn owned_from_standard_json_panics_past_nesting_depth_limit_1017() {
+    fn owned_from_standard_json_errors_past_nesting_depth_limit_1017() {
         let json = linear_nest(255);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
@@ -37807,13 +37897,11 @@ mod tests {
         let json = linear_nest(256);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
-        let value = cursor.value();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            owned_from_standard_json::<JqSemantics, _>(&value)
-        }));
+        let err = owned_from_standard_json::<JqSemantics, _>(&cursor.value())
+            .expect_err("owned_from_standard_json should error at depth 256");
         assert!(
-            result.is_err(),
-            "owned_from_standard_json should panic at depth 256"
+            err.is_decode_failure(),
+            "expected decode failure, got: {err:?}"
         );
     }
 

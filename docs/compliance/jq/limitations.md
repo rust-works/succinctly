@@ -1678,9 +1678,9 @@ is the revert that established what the other one costs.
    [#3136](https://github.com/rust-works/succinctly/issues/3136), which ORs in the same
    null/bool value-identity carve-out `register_identical` already makes, gated the same way
    by the existing node-identity check. The library entry point `succinctly::jq::eval`
-   takes the eager evaluator for a program `needs_path_context` does not route (a `path(f)`
-   with an argument, a write), so through it these rows keep refusing as before; the CLI's
-   route is the generic evaluator, where they answer.
+   took the eager evaluator for a program `needs_path_context` did not route (a `path(f)`
+   with an argument, a write), so through it these rows kept refusing; since #3457 it is the
+   generic evaluator too, where they answer.
 
    [#2649](https://github.com/rust-works/succinctly/issues/2649) closed the last shape in this
    family with no resolver arm at all: a **destructuring bind**. jq compiles
@@ -2852,9 +2852,12 @@ separately as #1629 -- `last` is no longer one of these, see below). Bare `keys_
 streaming truncation used to be a third; since #3265 its record is buffered and a partial array
 no longer reaches stdout.
 
-**Partly covered: `succinctly::jq::eval`'s own separate evaluator.** `src/jq/eval.rs` defines
-a second, independent `pub fn eval` — the function `succinctly::jq::eval` actually re-exports,
-and the one used in `src/jq/mod.rs`'s own module-doc example — with its own separate
+**Partly covered: `eval.rs`'s own separate evaluator.** (Since #3457 `succinctly::jq::eval`
+hands every query to the generic evaluator; what follows describes `src/jq/eval.rs`'s
+second, independent evaluator, which the generic one still bridges into and which the
+evaluator-parity tests reach through `eval_full`.) `src/jq/eval.rs` defines
+a second, independent evaluator — what `succinctly::jq::eval` re-exported before #3457 —
+with its own separate
 `to_owned`/`to_owned_lossy`/`effective_len`/`effective_fields` family (#1989 renamed the
 checked conversion to the short `to_owned` and the lossy one to `to_owned_lossy`, so that a
 bare `to_owned` at a new call site is the checked default; the names below are the current
@@ -2936,9 +2939,10 @@ ones). Two different checks are in play, and their coverage differs:
   `effective_fields_checked` (the value-carrying sibling of the same shared walk family), which
   gives both #1677 protection alongside #1194/#1642's.
 
-A library caller who follows the documented `eval()` example and evaluates straight off a
-fresh cursor gets #1677 protection only from `keys`/`keys_unsorted`/`to_entries`; every other
-builtin in this file, checked or not on the decode-failure/#1194 axis, still misses it.
+Before #3457 a library caller who followed the documented `eval()` example and evaluated
+straight off a fresh cursor got #1677 protection only from `keys`/`keys_unsorted`/`to_entries`;
+every other builtin in this file, checked or not on the decode-failure/#1194 axis, missed it.
+`eval()` is the generic evaluator now, so it gets the CLI's protection.
 
 **`keys_unsorted`'s positional fast paths split three ways.** `.[0]`/`first`/`.[n]` (a
 positive index) stay *deliberately* unchecked -- they are the arms built to answer in O(1)
@@ -4753,7 +4757,11 @@ stack the CLI reserves for evaluation (`EVAL_STACK_SIZE`, `src/bin/succinctly/ma
 and the CLI registers that stack for ADR-0025's floor. A library caller invoking
 `succinctly::jq::eval` directly gets neither guarantee on its own: the same recursion that
 errors cleanly under the CLI can abort the process with a native stack overflow on an
-ordinary (e.g. default 8 MB) thread. Wrapping the evaluation in
+ordinary (e.g. default 8 MB) thread. Since #3457 `succinctly::jq::eval` is the generic
+evaluator, whose recursion uses a little more native stack per level: on an 8 MB thread in a
+release build `def f(n): if n == 0 then 0 else f(n-1) + 1 end` answers up to about 450 levels
+through `eval` and about 550 through the evaluator it replaced (both abort past that).
+Wrapping the evaluation in
 `succinctly::jq::with_stack_budget(bytes_available, || ...)` arms the floor for that thread,
 so a recursion too deep for it refuses instead; running recursive `def`s at any real depth
 still needs a thread reserved at a comparable size.
@@ -8021,76 +8029,120 @@ Pinned by `test_bridge_token_spellings_read_like_their_siblings_3034` and
 `test_bridge_token_spelling_in_a_real_document_is_not_a_token_3034` (`src/jq/eval.rs`), and
 `bridge_tokens_decode_only_under_the_bridge_index_3034` (`src/json/light.rs`).
 
-A library caller of `succinctly::jq::eval` sees more filters raise on such a value than the CLI
-does. See the next entry.
+The library entry `succinctly::jq::eval` answers such a value as the CLI does since #3457. See the
+next entry.
 
-### The library `eval()` entry validates what the CLI's entry only navigates (#3266, #3427) — out of policy
+### An unreadable value is validated where something reads it, not where it is wrapped (#3266, #3427, #3457) — collections out of policy
 
+jq 1.7.1 rejects every document below at parse time (exit 5), so no row has a reference answer.
 `succinctly jq` evaluates through the generic evaluator's cursor entries
 (`eval_generic::eval_with_cursor_using` and its streaming twin), which hold the input as a
-cursor. The library entry `succinctly::jq::eval` (`src/jq/eval.rs`, also called by
-`succinctly yq`'s DOM route) hands a query that needs path context (`key`, `parent`, ...) to
-that cursor entry and evaluates everything else itself. It collects its results into owned
-values, and its `path`/`paths`/`leaf_paths`/`getpath` walk an owned copy of their input.
-Building an owned copy decodes every value in it. So on a value the index cannot read (the
-malformed number above, or a keyword such as `tru`), filters that only navigate past it or
-wrap it answer in the CLI and raise through `jq::eval`. A third entry,
-`eval_generic::eval_using`, takes a decoded value instead of a cursor and answers some of
-them. jq 1.7.1 rejects every document below at parse time (exit 5), so no row has a
-reference answer.
+cursor: a filter that only navigates past a value the index cannot read (a malformed number such
+as `1.2.3`, or a keyword such as `tru`), or wraps it in `[.]`, answers, and a filter that reads it
+raises. **The library entry `succinctly::jq::eval` is the same evaluator** (#3457; it was a
+second one that decoded the whole value it walked, so `path(.a)` on `{"a":1,"b":tru}` raised
+because of the sibling it never visits). A third entry, `eval_generic::eval_using`, takes a
+value that is already decoded rather than a cursor, so it answers some of these and raises on
+others.
 
-| filter, on the first element of                         | CLI / cursor entry | `jq::eval` | `eval_using`    |
-|---------------------------------------------------------|--------------------|------------|-----------------|
-| `1` on `[1.2.3]`                                        | `1`                | `1`        | `1`             |
-| `not` on `[1.2.3]`                                      | `false`            | `false`    | raises          |
-| `[.] \| length`, `[limit(1; .)] \| length` on `[1.2.3]` | `1`                | raises     | raises          |
-| `path(.)` on `[1.2.3]`                                  | `[]`               | raises     | raises          |
-| `[paths]` on `[1.2.3]`                                  | `[]`               | raises     | `[]`            |
-| `getpath([]) \| not` on `[1.2.3]`                       | `false`            | raises     | raises          |
-| `path(.a)` on `[{"a":1,"b":tru}]`                       | `["a"]`            | raises     | raises          |
-| `getpath(["a"])` (same)                                 | `1`                | raises     | raises          |
-| `[paths] \| length`, `[.[]] \| length` (same)           | `2`, `2`           | raises     | `2`, `2`        |
-| `[leaf_paths]` (same)                                   | `[["a"],["b"]]`    | raises     | `[["a"],["b"]]` |
-| `select(key == 0) \| path(.a)` (same)                   | `["a"]`            | `["a"]`    | raises          |
-| `[., 1] \| length`, `{a: .} \| length` on `[1.2.3]`     | raises             | raises     | raises          |
-| `. as $x \| [$x] \| length` on `[1.2.3]`                | raises             | raises     | raises          |
+| filter, on the first element of                         | `jq::eval` = CLI / cursor entry | `eval_using`    |
+|---------------------------------------------------------|---------------------------------|-----------------|
+| `1` on `[1.2.3]`                                        | `1`                             | `1`             |
+| `not` on `[1.2.3]`                                      | `false`                         | raises          |
+| `[.] \| length`, `[limit(1; .)] \| length` on `[1.2.3]` | `1`                             | raises          |
+| `path(.)` on `[1.2.3]`                                  | `[]`                            | raises          |
+| `[paths]` on `[1.2.3]`                                  | `[]`                            | `[]`            |
+| `getpath([]) \| not` on `[1.2.3]`                       | `false`                         | raises          |
+| `path(.a)` on `[{"a":1,"b":tru}]`                       | `["a"]`                         | raises          |
+| `getpath(["a"])` (same)                                 | `1`                             | raises          |
+| `[paths] \| length`, `[.[]] \| length` (same)           | `2`, `2`                        | `2`, `2`        |
+| `[leaf_paths]` (same)                                   | `[["a"],["b"]]`                 | `[["a"],["b"]]` |
+| `select(key == 0) \| path(.a)` (same)                   | `["a"]`                         | raises          |
+| `[., 1] \| length`, `{a: .} \| length` on `[1.2.3]`     | raises                          | raises          |
+| `. as $x \| [$x] \| length` on `[1.2.3]`                | raises                          | raises          |
 
-Every one of these is a split by spelling or by entry point, which ADR-0018's #2103 amendment
-exists to remove, so the entry is **out of policy**:
+**Still out of policy: the collection split inside the cursor evaluator.** `[.]`,
+`[limit(1; .)]` and `[.[]]` keep their elements as cursors, but `[., 1]`, `{a: .}` and
+`. as $x | [$x]` materialize them, so `[.] | length` answers where `[., 1] | length` raises.
+Which collections keep cursors follows which constructs have a cursor-forwarding arm, not a rule
+a user can see, and ADR-0018's #2103 amendment exists to remove exactly that kind of split.
+[#3427](https://github.com/rust-works/succinctly/issues/3427) tracks it, in the CLI and the
+library alike now. Neither direction is a quick fix: materializing every collection would decode
+every element of `[.[]]` over a large document and break `LazySeq` streaming, and keeping
+cursors in every collection needs a mixed lazy/owned array. The CLI also materializes the whole
+input for a filter that uses `input`, `inputs` or `input_line_number`, and under `-s`, so
+`.[0] | path(.a), input_line_number` and `-s '.[0][0] | path(.a)'` exit 5 where
+`.[0] | path(.a)` answers.
 
-- **Between entries.** The path-family rows break the amendment's #2168 instance ("`path`/
-  `getpath` validate only the nodes they navigate") for `jq::eval`: `path(.a)` raises because
-  of the sibling `"b"`, which it never visits. Mentioning `key` anywhere in the query moves it
-  onto the cursor entry and the answer back (`select(key == 0) | path(.a)`). Converging
-  `jq::eval` onto the cursor entry is
-  [#3457](https://github.com/rust-works/succinctly/issues/3457).
-  [#3432](https://github.com/rust-works/succinctly/pull/3432) tried extending `jq::eval`'s
-  existing path-context reroute to every query that mentions a path builtin, and was not
-  merged. The generic path walkers panic on a document nested deeper than 256 levels, which
-  `jq::eval` does not catch (#3429). The scan also matched a `def` that is never called and
-  changed unrelated answers, and a cursor result turned a decode failure into `null`. Those
-  costs are larger than a split that only moves answers on documents jq rejects outright,
-  so the fix is a complete, deliberate move with those problems designed out.
-- **Within the CLI.** `[.]`, `[limit(1; .)]` and `[.[]]` keep their elements as cursors, but
-  `[., 1]`, `{a: .}` and `. as $x | [$x]` materialize them, so `[.] | length` answers where
-  `[., 1] | length` raises. Which collections keep cursors follows which constructs have a
-  cursor-forwarding arm, not a rule a user can see.
-  [#3427](https://github.com/rust-works/succinctly/issues/3427) tracks it. Neither direction
-  is a quick fix: materializing every collection would decode every element of `[.[]]` over
-  a large document and break `LazySeq` streaming, and keeping cursors in every collection
-  needs a mixed lazy/owned array in both evaluators. The CLI also materializes the whole
-  input for a filter that uses `input`, `inputs` or `input_line_number`, and under `-s`, so
-  `.[0] | path(.a), input_line_number` and `-s '.[0][0] | path(.a)'` exit 5 where
-  `.[0] | path(.a)` answers.
+**What changed for a library caller of `jq::eval` (#3457).** The library now gives the CLI's
+answers, which differ from the evaluator it used before in these ways. Each is either an
+unreadable-value row above, a place the previous evaluator was the outlier, or a documented
+narrowing:
 
-A library caller who wants the CLI's answers can call `eval_with_cursor_using`, but it
-differs from `jq::eval` on well-formed input as well: its path walkers panic past nesting
-depth 256 where `jq::eval` answers (#3429; the CLI catches the panic), and cursor-metadata
-builtins such as `line` answer from the real position where `jq::eval` gives fixed
-defaults. The three entry points' rustdoc says which one the CLI uses and how each differs.
-Pinned per entry by `eval_entry_validates_what_the_cursor_entry_navigates_3266`
-(`src/jq/eval.rs`), so a convergence has to change a row on purpose, and in the CLI by
-`test_unreadable_value_collection_split_3266` (`tests/jq_cli_tests.rs`).
+- **Nesting depth.** `paths`, `leaf_paths`, `path(..)`, `getpath` and the other path builtins
+  now stop at nesting depth 256 (the generic walkers' ceiling, chosen for native-stack safety)
+  where the previous evaluator answered up to 384. Past it they return
+  `nesting depth exceeds limit of 256` as a `QueryResult::Error`, tagged as a decode failure so
+  a `try` in the filter does not swallow it, and never as an unwinding panic: the walkers report
+  it as an error, as do the comment-preserving and standard-JSON materializers and the owned
+  `..` walk, and `eval()` contains a 256-level panic from anywhere else, such as the public
+  `JqValue::materialize` (with the `std` feature; without it there is no unwinding to
+  catch). Raising the ceiling is
+  [#3429](https://github.com/rust-works/succinctly/issues/3429). Pinned by
+  `test_public_eval_path_family_over_depth_is_a_clean_error_3457`
+  (`tests/jq_library_eval_nesting_depth_tests.rs`).
+- **Result shape.** A single navigated value is still `QueryResult::One` and `.` is still
+  `OneCursor`, but a computed `null` is `Owned(Null)` where it was `One(Null)` and an empty
+  iteration is `None` where it was `Many([])`. The values are the same.
+  `QueryResult::collect_owned` turns a cursor over an unreadable value into `null` (as it
+  always did for `.`); `QueryResult::collect_owned_checked` reports it as an `Err`, and is what to
+  use where a wrong answer is worse than an error.
+- **`eval_lenient`** follows `eval`. It now also returns an owned `null` or boolean (so
+  `.missing` still yields `null`); an owned result holding any other value is dropped whole, as
+  before, never returned as a shorter list (`.[] | if . > 1 then "big" else null end` on
+  `[1,2,3]` is empty, not `[null]`).
+- **Cursor-metadata builtins** (`line`, `column`, `at_offset`, `at_position`, `document_index`,
+  `anchor`, `style`, `line_comment`) answer from the real document; the previous evaluator
+  answered fixed defaults and rejected `at_offset`/`at_position`.
+- **Duplicate keys** collapse as jq's do (`{"a":1,"a":2,"b":3} | to_entries | length` is `2`,
+  captured from jq 1.7.1; the previous evaluator said `3`), and `pick(.a)` keeps the last one.
+- **Bind-origin tracking.** `path(.a as $y | .a | $y)`-shaped paths that the previous evaluator
+  refused (`Invalid path expression`) now answer, as jq does; the CLI already did.
+- **An unreadable value that is only carried.** `mktime`/`strftime` on an array whose tail holds
+  an unreadable element the builtin never reads (#1820) raise here, as they do in the CLI; the
+  previous evaluator answered.
+- **yq mode.** `([1,2]+[])[(1*-5)]` raises `index [-5] out of range, array size is 2`, as real
+  yq does (the generic evaluator's owned-target computed index skipped yq's negative-index
+  rule and answered `null`; fixed for the CLI too, #3457). `1, .a[(1*-5)]` returns the error
+  without the `1` it produced first, which `succinctly yq` already discarded (#2392).
+- **Wording.** A decode failure reads as the cursor evaluator words it (`Invalid JSON text: ...`,
+  `malformed value in document`) rather than the previous evaluator's (`invalid numeric literal`).
+
+`succinctly yq`'s DOM route (`-R` lines, `--inplace`, `--slurp`, writes, `--arg`) does **not**
+use the converged entry: it evaluates a value it has already decoded and re-indexed, so the
+split above cannot arise there, and it calls the hidden `jq::eval_reindexed`, which is the
+hybrid `eval` was before #3457. That keeps its output and its speed as they were. Through the
+converged `eval` the same route measured slower (M4 Pro, interleaved, 9 reps, the `users`
+document as 1 MB and 10 MB of `-R` lines: `select(test("age"))` +21% and +37% wall, `. + "x"`
++4% to +9%, the rest within the harness's +-1% noise floor), because the generic evaluator
+answers a builtin it has no native arm for by serializing and re-indexing the value on every
+call, and `-R` makes one call per line. It would also read cursor metadata from the synthetic
+re-indexed document (`.c | line`: `1` through `eval`, the fixed default `0` through
+`eval_reindexed`). Moving that route is a separate decision, gated on that bridge cost.
+
+`jq::eval_owned_with_file_index` evaluates an already-decoded value, which has no unreadable
+value to split on, and keeps its own route. `eval.rs`'s owned evaluator (`eval_full`) is still
+the generic evaluator's bridge target and is what the evaluator-parity tests compare against.
+[#3432](https://github.com/rust-works/succinctly/pull/3432) tried routing only the path builtins
+and was not merged: it scanned the whole `Expr` (dead `def`s included), changed unrelated
+queries' answers and native stack use, and cost 29-89% per call. #3457 removes the decision
+instead of refining it.
+
+Pinned per entry by `eval_entry_agrees_with_the_cursor_entry_on_unreadable_values_3266`
+(`src/jq/eval.rs`), against the previous evaluator on well-formed input by
+`eval_matches_the_previous_entry_on_well_formed_input_3457` (each moved row named there with its
+reason), and in the CLI by `test_unreadable_value_collection_split_3266`
+(`tests/jq_cli_tests.rs`).
 
 ### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads real jq's synthetic `null`, not the ambient input — no carve-out; recorded as a still-open policy question (#534, #2163)
 

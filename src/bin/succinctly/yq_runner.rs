@@ -1751,7 +1751,11 @@ fn evaluate_input(
     // Build index and evaluate
     let cursor = doc.root();
 
-    let result = jq::eval::<Vec<u64>, YqSemantics>(expr, cursor);
+    // `eval_reindexed`, not `eval` (#3457): this value was decoded and
+    // re-indexed above, so the unreadable-value split `eval` closes cannot
+    // arise, and the per-call cost of `eval`'s generic evaluator on a tiny
+    // document is what `-R` pays once per line. See `jq::eval_reindexed`.
+    let result = jq::eval_reindexed::<Vec<u64>, YqSemantics>(expr, cursor);
     Ok(query_result_to_owned_values(result, sink))
 }
 
@@ -3391,7 +3395,7 @@ fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<Owned
         .reindexed_without_provenance::<jq::JqSemantics>()
         .ok()?;
     let cursor = doc.root();
-    match jq::eval::<Vec<u64>, YqSemantics>(expr, cursor) {
+    match jq::eval_reindexed::<Vec<u64>, YqSemantics>(expr, cursor) {
         QueryResult::One(v) => generic_to_owned::<YqSemantics, _>(&v).ok().map(|v| vec![v]),
         QueryResult::OneCursor(c) => generic_to_owned::<YqSemantics, _>(&c.value())
             .ok()

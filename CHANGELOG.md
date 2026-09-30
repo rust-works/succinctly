@@ -29,6 +29,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `eval_with_cursor`/`eval_with_cursor_using` return `GenericResult::LazySeq`
   for these shapes, as they already did for `[.]`.
 
+- **jq: the library `succinctly::jq::eval` is the CLI's evaluator** (#3457, #3266).
+  **Breaking for library callers** that match on `QueryResult` variants or
+  depend on the 384-level path-walker ceiling; details below.
+  It used to be a second evaluator that decoded the whole value it walked, so on
+  a value the index cannot read (`1.2.3`, `tru`) `path(.a)` on
+  `{"a":1,"b":tru}` and `[.] | length` raised through the library and answered
+  in the CLI. `eval` now hands every query to the generic evaluator's cursor
+  entry and reshapes the answer into a `QueryResult`; there is no per-query
+  routing decision. Path builtins on a document nested 256 levels or deeper
+  return a `QueryResult::Error` (decode-failure-tagged, never a panic; they used
+  to answer up to 384 levels, raising it is #3429). New
+  `QueryResult::collect_owned_checked` reports an undecodable cursor as an error
+  where `collect_owned` (documented lossy) returns `null`; `eval_lenient`
+  follows `eval` and keeps an owned result made only of `null`/booleans (any
+  owned result holding another value is dropped whole). Cursor-metadata builtins
+  answer from the real document, duplicate keys collapse as in jq, a computed
+  `null` is `QueryResult::Owned(Null)` where it was `One(Null)` and an empty
+  iteration is `None` where it was `Many([])` (a caller matching those exact
+  variants needs to accept the new ones), and a yq
+  owned-target computed index now raises on a negative out-of-range index as yq
+  does (`([1,2]+[])[(1*-5)]`, also in the CLI). `succinctly yq`'s own DOM route
+  keeps the previous evaluator (it evaluates an already-decoded value, and the
+  generic evaluator measured +21% to +37% on `-R` regex queries). The list of
+  what changed for library callers is in `docs/compliance/jq/limitations.md`.
+  The generic evaluator's `..`/`recurse` walk over a document is now iterative
+  rather than one native frame per level, so the library entry (which has no
+  large evaluation thread) answers it at any depth instead of overflowing the
+  caller's stack at a few thousand levels; the CLI is unaffected.
+
 - **jq: installing a program or module of many top-level `def`s is linear,
   not `O(defs x program)`** (#3307). Each `def` was installed over everything
   below it and every copy was kept, so 3000 one-literal defs peaked at 1 GB

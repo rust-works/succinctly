@@ -50,7 +50,7 @@
 //! not list the containment rows, because #358 fixed them before that manifest
 //! arrived.
 
-use succinctly::jq::{eval, eval_generic, parse, JqSemantics, OwnedValue, QueryResult};
+use succinctly::jq::{eval_full, eval_generic, parse, JqSemantics, OwnedValue, QueryResult};
 use succinctly::json::JsonIndex;
 
 /// What jq does with a case: either it prints values, or it raises a message.
@@ -67,7 +67,7 @@ fn full_outcome(json: &[u8], filter: &str) -> Result<Vec<String>, String> {
     let index = JsonIndex::build(json);
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
-    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
         QueryResult::Error(e) => Err(e.message),
         other => Ok(other
             .collect_owned::<JqSemantics>()
@@ -275,7 +275,8 @@ fn optional_suppresses_the_error() {
         let json: &[u8] = br"1";
         let index = JsonIndex::build(json);
 
-        let full: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+        let full: QueryResult<Vec<u64>> =
+            eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json));
         assert!(
             !full.is_error(),
             "full evaluator: optional {filter} should be suppressed"

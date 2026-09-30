@@ -1,7 +1,8 @@
 //! Computed keys in index brackets (#360), pinned on *both* evaluators.
 //!
 //! `.[K]` for a non-constant `K` is implemented twice — once in the full
-//! evaluator (`src/jq/eval.rs`, the library `jq::eval` entry point) and once in
+//! evaluator (`src/jq/eval.rs`, reached through `eval_full`; the library `jq::eval`
+//! is the generic evaluator since #3457) and once in
 //! the generic evaluator (`src/jq/eval_generic.rs`, which the `jq`/`yq` CLIs
 //! use). The two share no code on this path, so every case here runs through
 //! both and asserts they agree; see `jq_evaluator_parity_tests.rs` for why that
@@ -16,7 +17,7 @@
 //! handful that deliberately differ say so at the case.
 
 use succinctly::jq::eval_generic;
-use succinctly::jq::{eval, parse, JqSemantics, OwnedValue, QueryResult};
+use succinctly::jq::{eval_full, parse, JqSemantics, OwnedValue, QueryResult};
 use succinctly::json::JsonIndex;
 
 /// What an evaluator did: a stream of JSON-rendered outputs, or the error it
@@ -43,7 +44,7 @@ fn full(json: &[u8], filter: &str) -> Outcome {
     let index = JsonIndex::build(json);
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
-    let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+    let result: QueryResult<Vec<u64>> = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
     match result {
         QueryResult::Error(e) => Outcome::Error(e.message),
         other => Outcome::Values(
