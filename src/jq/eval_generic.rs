@@ -3759,13 +3759,16 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
 ///
 /// `[(., .) | .data]` reached `Expr::Pipe`, whose head `Expr::Comma` answers
 /// one owned tree per item, and `.data` then ran against each through a
-/// reindex: 293 MB on an 8.4 MB document where `(., .) | .data | length`
-/// took 26 MB. A pipe applies `rest` to each output of its head in order, so
-/// the pipe is the same outputs in the same order as the `,` of one pipe per
-/// branch -- which is [`comma_array_generic`]'s own body shape, so it keeps
+/// reindex: 262 MB on an 8.4 MB document where `(., .) | .data | length`
+/// took 20 MB (release, Apple M5 Max). A pipe applies `rest` to each output
+/// of its head in order, so the pipe is the same outputs in the same order as
+/// the `,` of one pipe per branch -- which is [`comma_array_generic`]'s own body shape, so it keeps
 /// each `.data` as its node and answers the same cursor sequence
 /// `[.data, .data]` does. The tail is run per branch by
-/// [`comma_array_generic`] itself, so nothing is rebuilt per evaluation.
+/// [`comma_array_generic`] itself, so the route does not clone
+/// `branch | rest` per evaluation. (`fold_pipe_stages` still copies the
+/// remaining stages when a middle stage answers several cursors, as it does
+/// for the same pipe anywhere else.)
 ///
 /// The regrouping is sound because every stage is
 /// [`path_expr_is_cursor_navigable`]: no side effect for it to reorder, the
@@ -39153,23 +39156,19 @@ mod tests {
             "[(., .) | .[]]",
             "[((., .)) | .a]",
             "[(., .) | .a | .]",
-            "[(.a, .b) | .[]?]",
+            "[(., .) | .[]? | .]",
         ] {
-            let want = if query == "[(.a, .b) | .[]?]" {
-                // Every item a scalar (`1`, `2`): a small array is cheaper.
-                "owned"
-            } else {
-                "prevalidated"
-            };
             assert_eq!(
                 comma_array_route::<JqSemantics>(query, doc),
-                want,
+                "prevalidated",
                 "{query}"
             );
         }
         for query in [
             // Every item a scalar: a small array is cheaper than a sequence.
             "[(., .) | .m]",
+            // Every item a scalar (`1`, `2`), so a small array is cheaper.
+            "[(.a, .b) | .[]?]",
             // A navigation miss is a computed `null`.
             "[(., .) | .missing]",
             // A computed stage is not pure navigation.

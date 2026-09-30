@@ -12,11 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **jq: `[(., .) | .data]` no longer builds each comma item as an owned tree**
   (#3476). #3473's cursor route covered a `,` sitting directly inside `[...]`;
   the same body behind a pipe (`[(., .) | .data]`) still built one owned tree
-  per comma item and reindexed it for `.data`, peaking at 293 MB on an 8.4 MB
-  document where the bare stream `(., .) | .data | length` needs 26 MB (jq
+  per comma item and reindexed it for `.data`, peaking at 262 MB on an 8.4 MB
+  document where the bare stream `(., .) | .data | length` needs 20 MB (jq
   1.7.1: 128 MB). In jq mode a pipe of navigation whose head is a `,` is now
   collected as the `,` of one pipe per branch, so it takes #3317's route:
-  36 MB, and 26 MB with `| length` (debug build, Apple M5 Max). Output is
+  27 MB, and 20 MB with `| length` (release build, Apple M5 Max; 111 MB to
+  16 MB at 4 MB, 37 MB to 11 MB at 1 MB, and 5x faster at 10 MB). Output is
   unchanged. One error case moves: the array now reads only the nodes the
   pipe answers, as `[.b]` and `(., .) | .b` always did, so over a malformed
   sibling the answer never contains (`{"a":{"k":tru},"b":2}`) `[(., .) | .b]`
