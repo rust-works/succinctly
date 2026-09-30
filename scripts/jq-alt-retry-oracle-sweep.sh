@@ -343,6 +343,63 @@ for r_entry in "${R_ENTRIES[@]}"; do
   done
 done
 
+# #3293 slice 7 (path-mode conditions): the same "sink-side failure, then
+# clean retry" shape, with the `?//` in an `if`/`select` *condition* and the
+# failure raised downstream of it, in the branch (or after the `select`). Only
+# a retry past that failure matches jq. `__T__` stands for the condition; its
+# first alternative is truthy and its retry is falsy (or produces nothing,
+# raises, or fails to destructure), so the abandoned alternative's stashed
+# verdict must not outrank what the retry did. Own input, since the
+# constructs navigate `.a`. Entries are `LABEL::TAG::TEMPLATE`, like R_ENTRIES
+# (slice 7 closed every one, so none is tagged now).
+COND_INPUT='{"a":{"a":1}}'
+COND_STDIN_FILE="$(mktemp -t jq-alt-retry-sweep-cond-stdin)"
+printf '%s' "$COND_INPUT" > "$COND_STDIN_FILE"
+trap 'rm -f "$STDIN_FILE" "$RETRY_STDIN_FILE" "$COND_STDIN_FILE" /tmp/jq-alt-retry-sweep.err /tmp/succ-alt-retry-sweep.err' EXIT
+T_VARIANTS=(
+  '([1] as $q ?// $b | ("A"|stderr) | $q)'
+  '([1] as $q ?// $b | ("A"|stderr) | $q // empty)'
+  '([1] as $q ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)'
+  '(1 as $x ?// [$y] | ("A"|stderr) | $x)'
+  '([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)'
+)
+T_ENTRIES=(
+  'path-if::::path(if __T__ then error("E") else .a end)'
+  'path-if-comma::::path(if __T__ then (.a, error("E")) else .a end)'
+  'path-select::::path(.a | select(__T__) | error("E"))'
+  'del-if::::del(if __T__ then error("E") else .a end)'
+  'del-select::::del(.a | select(__T__) | error("E"))'
+  'update-if::::(if __T__ then error("E") else .a end) |= 5'
+  'assign-if::::(if __T__ then error("E") else .a end) = 5'
+  'pick-if::::pick(if __T__ then error("E") else .a end)'
+  # The failure is not downstream of the condition, but a consumer's `first`
+  # stop is: jq retries the `?//` on that break too, so a retry that raises
+  # must still outrank the stashed stop.
+  'path-if-else::::path(if __T__ then .a else error("E") end)'
+  'path-select-pass::::path(.a | select(__T__) | .a)'
+  # Control: `?` catches the failure before the condition sees it.
+  'path-if-optional::::path(if __T__ then error("E") else .a end)?'
+)
+T_CONSUMERS=(
+  '__W__'
+  '[first(__W__), 9]'
+  '[limit(1; __W__), 9]'
+  '[__W__, 9]'
+)
+for t_entry in "${T_ENTRIES[@]}"; do
+  t_rest="$t_entry"
+  t_label="${t_rest%%::*}"
+  t_rest="${t_rest#*::}"
+  t_tag="${t_rest%%::*}"
+  t_template="${t_rest#*::}"
+  for t in "${T_VARIANTS[@]}"; do
+    t_filled="${t_template//__T__/$t}"
+    for c in "${T_CONSUMERS[@]}"; do
+      run_case "$t_label" "${c//__W__/$t_filled}" "$t_tag" "$COND_STDIN_FILE"
+    done
+  done
+done
+
 printf '%s' "$divergence_log"
 echo "== $total cases vs $JQ: $unexpected unexpected, $((diverged - unexpected)) known, $((total - diverged)) matched =="
 if ((diverged > unexpected)); then

@@ -77079,6 +77079,361 @@ fn test_path_context_slice_bound_retry_supersedes_stashed_verdict_3293() -> Resu
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_PATH_CONTEXT_SLICE_3293)
 }
 
+/// #3293 slice 7: a `?//` retry inside an `if` or `select` condition
+/// supersedes the verdict the retried-past alternative left in the path-mode
+/// resolver's `resolve_cond_fork_stream`. The condition's first alternative
+/// is truthy and sends the branch (or the stage after `select`) into an
+/// error; the retry is falsy, produces nothing, raises, or fails to
+/// destructure. `first`/`limit` rows pin a consumer's own stop, which jq
+/// also retries past. Input `{"a":{"a":1}}`; every value captured from jq
+/// 1.7.1 with `-c`.
+const RETRY_ROWS_PATH_COND_3293: &[RetryRow3293] = &[
+    // `if`'s condition: the retry answers, produces nothing, raises, or fails to destructure
+    (
+        r#"[path(if ([1] as $q ?// $b | ("A"|stderr) | $q) then error("E") else .a end)]"#,
+        "[[\"a\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(if ([1] as $q ?// $b | ("A"|stderr) | $q // empty) then error("E") else .a end)"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(if ([1] as $q ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end) then error("E") else .a end)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(if (1 as $x ?// [$y] | ("A"|stderr) | $x) then error("E") else .a end)"#,
+        "",
+        "A",
+        "Cannot index number with number",
+        5,
+    ),
+    (
+        r#"path(if ([1] as $q ?// {$z} | ("A"|stderr) | $q) then error("E") else .a end)"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[path(if ([1] as $q ?// $b | ("A"|stderr) | $q) then (.a, error("E")) else .a end)]"#,
+        "[[\"a\"],[\"a\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(if ([1] as $q ?// $b | ("A"|stderr) | $q) then error("E") else .a end), 9]"#,
+        "[[\"a\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(if ([1] as $q ?// $b | ("A"|stderr) | $q) then error("E") else .a end)), 9]"#,
+        "[[\"a\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; path(if ([1] as $q ?// $b | ("A"|stderr) | $q) then error("E") else .a end)), 9]"#,
+        "[[\"a\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(if ([1] as $q ?// $b | ("A"|stderr) | $q) then .a else error("E") end)), 9]"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
+        r#"[first(path(if ([1] as $q ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end) then .a else error("E") end)), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(path(if (1 as $x ?// [$y] | ("A"|stderr) | $x) then .a else .a end)), 9]"#,
+        "",
+        "A",
+        "Cannot index number with number",
+        5,
+    ),
+    // `select`'s condition, which re-emits its input through the sink
+    (
+        r#"path(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q)) | error("E"))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q // empty)) | error("E"))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)) | error("E"))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(.a | select((1 as $x ?// [$y] | ("A"|stderr) | $x)) | error("E"))"#,
+        "",
+        "A",
+        "Cannot index number with number",
+        5,
+    ),
+    (
+        r#"path(.a | select(([1] as $q ?// {$z} | ("A"|stderr) | $q)) | error("E"))"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[first(path(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q)) | error("E"))), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; path(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q)) | error("E"))), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end)) | .a)), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(path(.a | select((1 as $x ?// [$y] | ("A"|stderr) | $x)) | .a)), 9]"#,
+        "",
+        "A",
+        "Cannot index number with number",
+        5,
+    ),
+    (
+        r#"[path(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q)) | .a), 9]"#,
+        "[[\"a\",\"a\"],9]\n",
+        "A",
+        "",
+        0,
+    ),
+    // the write direction: `del`, `=`, `|=` and `pick` resolve the same paths
+    (
+        r#"del(if ([1] as $q ?// $b | ("A"|stderr) | $q) then error("E") else .a end)"#,
+        "{}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(if ([1] as $q ?// $b | ("A"|stderr) | $q // empty) then error("E") else .a end)"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(if ([1] as $q ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end) then error("E") else .a end)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"(if ([1] as $q ?// $b | ("A"|stderr) | $q) then error("E") else .a end) |= 5"#,
+        "{\"a\":5}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(if ([1] as $q ?// $b | ("A"|stderr) | $q) then error("E") else .a end) = 5"#,
+        "{\"a\":5}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(if ([1] as $q ?// $b | ("A"|stderr) | $q // empty) then error("E") else .a end) = 5"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"pick(if ([1] as $q ?// $b | ("A"|stderr) | $q) then error("E") else .a end)"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q)) | error("E"))"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q // empty)) | error("E"))"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q)) | error("E")) |= 5"#,
+        "{\"a\":{\"a\":1}}\n",
+        "AA",
+        "",
+        0,
+    ),
+    // controls: a `?` catches the failure, no `?//` at all, and a halt is never retried
+    (
+        r#"[path(if ([1] as $q ?// $b | ("A"|stderr) | $q) then error("E") else .a end)?, 9]"#,
+        "[[\"a\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(if true then error("E") else .a end)"#,
+        "",
+        "",
+        "E",
+        5,
+    ),
+    (r#"path(.a | select(true) | error("E"))"#, "", "", "E", 5),
+    (
+        r#"path(if ([1] as $q ?// $b | ("A"|stderr) | $q | if . then halt_error else . end) then .a else .a end)"#,
+        "",
+        "A",
+        "[1]",
+        5,
+    ),
+    (
+        r#"path(.a | select(([1] as $q ?// $b | ("A"|stderr) | $q | if . then halt_error else . end)))"#,
+        "",
+        "A",
+        "[1]",
+        5,
+    ),
+];
+
+#[test]
+fn test_path_cond_retry_supersedes_stashed_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(Some(r#"{"a":{"a":1}}"#), "", RETRY_ROWS_PATH_COND_3293)
+}
+
+/// #3293 slice 7: the same retry through `eval_generic`'s path-context walk
+/// (`path_context_step_generic`'s `if`, `limit` and `skip` arms), which `key`
+/// after them reaches. `key` is succinctly's, so each row's answer is jq
+/// 1.7.1's for the `path()` spelling in the comment above it; jq 1.7.1 has no
+/// `skip`, so its row follows `limit`'s. Cursor route only: over an owned
+/// input `key` takes the owned-identity walk, which does not retry at all (a
+/// slice 9 site). Input `{"a":{"a":1}}`.
+const RETRY_ROWS_PATH_CONTEXT_COND_3293: &[RetryRow3293] = &[
+    // jq 1.7.1: `[path(if T then error("E") else .a end) | last]`
+    (
+        r#"[(if ([1] as $q ?// $b | ("A"|stderr) | $q) then error("E") else .a end) | key]"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: the same with `$q // empty`
+    (
+        r#"[(if ([1] as $q ?// $b | ("A"|stderr) | $q // empty) then error("E") else .a end) | key]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: the same, the retry raising `E2`
+    (
+        r#"[(if ([1] as $q ?// $b | ("A"|stderr) | $q | if . == null then error("E2") else . end) then error("E") else .a end) | key]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // jq 1.7.1: `[path(limit(K; error("E"))) | last]`, `K`'s retry answering `0`
+    (
+        r#"[limit(([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then 0 else $a end); error("E")) | key]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    // jq 1.7.1: `path(limit(K; error("E")))`, `K`'s retry raising `E2`
+    (
+        r#"[limit(([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then error("E2") else $a end); error("E")) | key]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // no jq 1.7.1 `skip`: follows `limit`'s rows above
+    (
+        r#"[skip(([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then 0 else $a end); .a, error("E")) | key]"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
+        r#"[skip(([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then error("E2") else $a end); .a, error("E")) | key]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    // control: no `?//`, the branch's error surfaces
+    (
+        r#"[(if true then error("E") else .a end) | key]"#,
+        "",
+        "",
+        "E",
+        5,
+    ),
+];
+
+#[test]
+fn test_path_context_cond_retry_supersedes_stashed_verdict_3293() -> Result<()> {
+    assert_retry_rows_3293(
+        Some(r#"{"a":{"a":1}}"#),
+        "",
+        RETRY_ROWS_PATH_CONTEXT_COND_3293,
+    )
+}
+
 /// #3293 review: `first`/`limit`/`nth` reset the wrapping sink's stop per
 /// invocation, so after a `?//` retry inside them they report their own
 /// completion rather than a stale `Stopped`. The #1519 rows pin that an
@@ -77487,6 +77842,7 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("{} | ", RETRY_ROWS_SKIP_COUNT_3293),
         ("[10,20,30] | ", RETRY_ROWS_SLICE_BOUND_3293),
         ("[10,20,30] | ", RETRY_ROWS_PATH_SLICE_BOUND_3293),
+        (r#"{"a":{"a":1}} | "#, RETRY_ROWS_PATH_COND_3293),
         ("{} | ", RETRY_ROWS_WRAPPER_STOP_3293),
         ("{} | ", RETRY_ROWS_FOLD_3293),
     ] {
@@ -77578,6 +77934,46 @@ fn test_path_slice_retry_stash_leaves_yq_mode_unchanged_3293() -> Result<()> {
             assert!(output.status.success(), "`{filter}`: stderr={stderr:?}");
             assert!(stderr.is_empty(), "`{filter}`: stderr={stderr:?}");
         }
+    }
+    Ok(())
+}
+
+/// #3293 slice 7, yq mode: `resolve_cond_fork_stream` is shared with
+/// `succinctly yq`'s `del`/`|=`, which has no `?//`, so the retry stamp must
+/// leave `select`'s output alone -- including #1613's rule that a
+/// multi-output condition applies the update once per element. Every row
+/// captured from yq v4.53.3 over `a: [1,2,3]`.
+#[test]
+fn test_path_cond_retry_stash_leaves_yq_mode_unchanged_3293() -> Result<()> {
+    for (filter, expected) in [
+        (
+            "(.a[] | select((true,true))) |= . + 10",
+            r#"{"a":[11,12,13]}"#,
+        ),
+        ("del(.a[] | select(. == 2))", r#"{"a":[1,3]}"#),
+        ("(.a[] | select(. > 1)) |= . + 10", r#"{"a":[1,12,13]}"#),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(b"a: [1,2,3]\n")?;
+                child.wait_with_output()
+            })?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            expected,
+            "#3293 (yq): `{filter}`: stderr={stderr:?}"
+        );
+        assert!(stderr.is_empty(), "`{filter}`: stderr={stderr:?}");
     }
     Ok(())
 }

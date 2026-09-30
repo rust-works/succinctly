@@ -34372,20 +34372,37 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
     trackable: bool,
     mut dispatch: impl FnMut(bool) -> ResolveFlow,
 ) -> ResolveFlow {
-    let mut dispatched: Option<ResolveFlow> = None;
+    // #3293: a [`StashedVerdict`]. A `?//` inside `cond` retries past the
+    // stop `dispatch` answered (#1519), and a retry that emits again drops
+    // the stale answer at the top of the sink; one that produces nothing or
+    // raises supersedes it at the exit below. `path(if ([1] as $q ?// $b |
+    // $q) then error("E") else .a end)` is `["a"]` in jq 1.7.1, not the
+    // abandoned alternative's `E`. A halt or a decode failure is kept.
+    let dispatched: StashedVerdict<ResolveFlow> = StashedVerdict::new();
     let flow = eval_each_owned::<S>(
         cond,
         value,
         false,
         Reentry::at_register(trackable),
-        &mut |c| match dispatch(c.is_truthy()) {
-            ResolveFlow::Exhausted => Demand::Continue,
-            other => {
-                dispatched = Some(other);
-                Demand::Stop
+        &mut |c| {
+            dispatched.begin();
+            match dispatch(c.is_truthy()) {
+                ResolveFlow::Exhausted => Demand::Continue,
+                other => {
+                    // The `?//` retry is the one producer that may push
+                    // again after this stop; keep it from re-running a halt
+                    // or a decode failure (`resolve_seq_stage`'s rule).
+                    if let ResolveFlow::Escaped(escape) = &other {
+                        mark_nonretryable_escape(&Control::from(escape.clone()));
+                    }
+                    dispatched.stash(other);
+                    Demand::Stop
+                }
             }
         },
     );
+    let direct_retry = direct_pattern_retry(cond);
+    let dispatched = dispatched.take_unless(|at| retry_superseded(&flow, at, direct_retry));
 
     resolve_stream_flow(flow, dispatched)
 }
@@ -102270,6 +102287,126 @@ mod tests {
             let filter = r#"[limit(1; if ([1] as $a ?// $b | $a) then 1 else error("E") end)]"#;
             let (got, got_end) = outputs_and_end(b"null", filter);
             assert_eq!((got.len(), got_end.as_str()), (0, "error: E"), "`{filter}`");
+        }
+    }
+
+    /// #3293 slice 7: `resolve_cond_fork_stream`, `if`'s and `select`'s
+    /// path-mode condition driver, is reached through the library `eval()`
+    /// as well, and its `no_std` build reads [`direct_pattern_retry`] instead
+    /// of the retry generation. A `?//` retry in the condition supersedes the
+    /// branch failure the sink stopped on when it answers, produces nothing,
+    /// or raises; a halt is never superseded. Captured from jq 1.7.1 with
+    /// `-c` over `{"a":{"a":1}}`.
+    #[test]
+    fn test_path_cond_retry_supersedes_stashed_verdict_3293() {
+        for (filter, values, end) in [
+            (
+                r#"[path(if ([1] as $q ?// $b | $q) then error("E") else .a end)]"#,
+                &[r#"[["a"]]"#][..],
+                "",
+            ),
+            (
+                r#"path(if ([1] as $q ?// $b | $q // empty) then error("E") else .a end)"#,
+                &[][..],
+                "",
+            ),
+            (
+                r#"path(if ([1] as $q ?// $b | $q | if . == null then error("E2") else . end) then error("E") else .a end)"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r#"path(if (1 as $x ?// [$y] | $x) then error("E") else .a end)"#,
+                &[][..],
+                "error: Cannot index number with number",
+            ),
+            (
+                r#"path(if ([1] as $q ?// $b | $q | if . then ("h"|halt_error(3)) else . end) then .a else .a end)"#,
+                &[][..],
+                "halt: 3",
+            ),
+        ] {
+            let (got, got_end) = outputs_and_end(br#"{"a":{"a":1}}"#, filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(
+                (got.as_slice(), got_end.as_str()),
+                (values, end),
+                "`{filter}`"
+            );
+        }
+        // `select(cond)` is a pipe stage whose own `?//` check
+        // (`resolve_seq_stage`) reads `direct_pattern_retry` of the stage,
+        // which does not see through `select`, so `no_std` keeps the previous
+        // answer there (recorded in `limitations.md`).
+        #[cfg(feature = "std")]
+        for (filter, values, end) in [
+            (
+                r#"path(.a | select([1] as $q ?// $b | $q) | error("E"))"#,
+                &[][..],
+                "",
+            ),
+            (
+                r#"path(.a | select([1] as $q ?// $b | $q | if . == null then error("E2") else . end) | error("E"))"#,
+                &[][..],
+                "error: E2",
+            ),
+        ] {
+            let (got, got_end) = outputs_and_end(br#"{"a":{"a":1}}"#, filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(
+                (got.as_slice(), got_end.as_str()),
+                (values, end),
+                "`{filter}`"
+            );
+        }
+    }
+
+    /// #3293 slice 7: the cursor route's `key` walk (`path_context_step_generic`'s
+    /// `if`, `limit` and `skip` arms) reads `direct_pattern_retry` of the
+    /// generator it drives, so its `no_std` half runs here too. `key` is
+    /// succinctly's, so each row's answer is jq 1.7.1's for the `path()`
+    /// spelling; jq has no `skip`, so its rows follow `limit`'s.
+    #[test]
+    fn test_path_context_cond_retry_supersedes_stashed_verdict_3293() {
+        for (filter, values, end) in [
+            (
+                r#"[(if ([1] as $q ?// $b | $q) then error("E") else .a end) | key]"#,
+                &[r#"["a"]"#][..],
+                "",
+            ),
+            (
+                r#"[(if ([1] as $q ?// $b | $q // empty) then error("E") else .a end) | key]"#,
+                &["[]"][..],
+                "",
+            ),
+            (
+                r#"[(if ([1] as $q ?// $b | $q | if . == null then error("E2") else . end) then error("E") else .a end) | key]"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r#"[limit(([1] as [$a] ?// $b | if $a == null then 0 else $a end); error("E")) | key]"#,
+                &["[]"][..],
+                "",
+            ),
+            (
+                r#"[limit(([1] as [$a] ?// $b | if $a == null then error("E2") else $a end); error("E")) | key]"#,
+                &[][..],
+                "error: E2",
+            ),
+            (
+                r#"[skip(([1] as [$a] ?// $b | if $a == null then error("E2") else $a end); .a, error("E")) | key]"#,
+                &[][..],
+                "error: E2",
+            ),
+        ] {
+            let (got, got_end) = outputs_and_end(br#"{"a":{"a":1}}"#, filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(
+                (got.as_slice(), got_end.as_str()),
+                (values, end),
+                "`{filter}`"
+            );
         }
     }
 
