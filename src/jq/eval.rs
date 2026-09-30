@@ -110570,7 +110570,7 @@ mod tests {
     /// it was not (`max`, `+`, `[...]` place a computed value at a position
     /// without that value being the node there).
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))] // `invocation_roots` records nothing without `std`, so every anchor refuses
     fn anchored_identical_reads_an_owned_chain_3482() {
         let inner = OwnedValue::object_from([("b".to_string(), OwnedValue::string("x"))]);
         let root = OwnedValue::object_from([("a".to_string(), inner.clone())]);
