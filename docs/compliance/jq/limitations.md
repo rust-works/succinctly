@@ -1533,7 +1533,9 @@ is the revert that established what the other one costs.
      `test_default_route_empty_container_embed_keeps_identity_3180`), and this route since
      its second: a list opened on an empty container keeps the container's own cursor,
      tagged in the top bit of its BP position so `JsonFields`/`JsonElements` stay one
-     cursor wide, and `whole_container_cursor` answers it. The bridge provenance lookup
+     cursor wide, and `whole_container_cursor` answers it (on 64-bit targets only: a
+     narrower target cannot spare the bit, so there the route refuses an empty container,
+     as before #3180). The bridge provenance lookup
      (#3069) asks the same list for its document, so a second construct-and-navigate hop
      over an empty container answers on both routes too. Pinned in
      `test_input_route_empty_container_keeps_embed_identity_3180`
