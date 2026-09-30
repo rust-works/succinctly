@@ -1741,12 +1741,28 @@ is the revert that established what the other one costs.
    `limit`, in a `def` or a `reduce`, through `{k:.a}`/`[.a]` — and an equal value at a sibling,
    another element, the same step under another parent or past a write refuses as jq does. Pinned
    in `test_navigated_bind_anchor_rows_answer_3134`/`test_navigated_bind_anchor_controls_refuse_3134`
-   and the sweep's `navigated-bind-anchor-*` rows. Four shapes stay refuse-only, each because jq
+   and the sweep's `navigated-bind-anchor-*` rows. Two shapes stay refuse-only, each because jq
    keeps the scalar `jv` somewhere a document position cannot follow: through a copy-on-write of
-   its parent (`.a.c = 1 | path(.a.b | $z)`, `.a.b |= .`), into a new container (`[.a.b] |
-   path(.[0] | $z)`, `to_entries`), or on an owned-rooted document (`tojson | fromjson`, `-n
-   'input | …'`), whose `eval.rs` bind sites mint no node for a scalar at all. Only a real scalar
-   identity could close them. A member a later duplicate key shadows (`at_offset(5) as $x |
+   its parent (`.a.c = 1 | path(.a.b | $z)`, `.a.b |= .`) and into a new container (`[.a.b] |
+   path(.[0] | $z)`, `to_entries`). Only a real scalar identity could close them.
+   **On an owned-rooted document** (`-n 'input | …'`, a `tojson | fromjson` root, a constructed
+   `{a:{b:1}} | …`) the same rows answer since
+   [#3482](https://github.com/rust-works/succinctly/issues/3482), by a different mechanism:
+   those binds run in the owned identity pipe, not in a bind site with a live cursor, and the pipe
+   already records for every value it binds the container it descended from and the component it
+   took (`BindOrigin::Owned`'s chain, `OwnedIdentity::child`). `marker_identical`'s anchor clause
+   reads that last pair where a document bind reads the embed table: the register's container must
+   share storage with the recorded parent and stand exactly that step below it. The chain alone
+   is not a proof, because the pipe's position rules also place a value it *computed* where the
+   input stood (`(.a.b + "")`, `.a.b | [.]`, `max`, which puts the first of two equal elements
+   where jq returns the last), so only a bind source of plain steps (`.a.b`, `.a[0]`, `.a[]`,
+   `is_plain_navigation`; `BindOrigin::Owned::navigated`) is trusted. What still refuses there,
+   where jq answers: a source with any other stage (`.a.b?`, `getpath`, `..`, a slice, `.a |
+   first`, `.[expr]`), an embed of the parent into a new container (`{k:.a} | path(.k.b | $z)`,
+   `[.a] | …`, whose body leaves the pipe and rebuilds `.a`), and a bind that reaches `eval.rs`'s
+   own `each_as`/`eval_as` -- which still mint no node for a scalar, a `StandardJson` scalar
+   keeping only its text and offset. The four repros of #3482 all took the identity pipe, not
+   those sites; no shape found reaches them with a scalar bound and a path-position read. A member a later duplicate key shadows (`at_offset(5) as $x |
    del(.a | $x)` on `{"a":1,"a":1}`, a succinctly extension binding the member jq's parser
    discards) gets no anchor step and refuses; `.a` is the last member. The routes that re-enter the eager evaluator with an *owned*
    accumulator (`reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)`, a `catch` handler) were

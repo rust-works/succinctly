@@ -33641,11 +33641,22 @@ fn may_bind_navigated(expr: &Expr) -> bool {
 /// half of [`Frame::enter`]'s gate on `at` -- the anchor clause of
 /// [`marker_identical`] reads the frame's position, so it needs one.
 fn may_certify_by_anchor(expr: &Expr) -> bool {
-    super::eval_generic::embed_anchors_active()
-        && any_subexpr(
-            expr,
-            &mut |e| matches!(e, Expr::TrackedVar(marker) if matches!(marker.node, Some(BindOrigin::Node { .. }))),
-        )
+    let by_node = super::eval_generic::embed_anchors_active();
+    // #3482: a marker bound inside the owned identity pipe carries its own
+    // parent (`BindOrigin::Owned`'s chain), so it needs no table entry -- only
+    // a program that can read one in path position is worth the walk.
+    let by_chain = super::eval_generic::scalar_identity_readable();
+    (by_node || by_chain)
+        && any_subexpr(expr, &mut |e| match e {
+            Expr::TrackedVar(marker) => match &marker.node {
+                Some(BindOrigin::Node { .. }) => by_node,
+                Some(BindOrigin::Owned {
+                    chain, navigated, ..
+                }) => by_chain && *navigated && !chain.is_empty(),
+                None => false,
+            },
+            _ => false,
+        })
 }
 
 /// The root each live resolver invocation started from, by
@@ -33654,11 +33665,14 @@ fn may_certify_by_anchor(expr: &Expr) -> bool {
 /// [`same_frame_position`] (#3464) navigates to fold two spellings of one
 /// position together. Pushed by `resolve_terminal_sink` while an anchor is
 /// in scope or the frame has a position over a container root, and popped
-/// when that invocation ends, however it ends.
+/// when that invocation ends, however it ends. An anchor is either an
+/// embed-table entry (a document bind, #3134) or the chain an owned-identity
+/// bind carries on its own marker (#3482); the latter only exists below a
+/// container root, so the container-root clause covers it.
 ///
 /// `std` only, the same `thread_local!`-with-RAII-guard shape and the same
-/// degradation as `eval_generic`'s `embed_table`, which is the only source of
-/// anchors: without `std` there are none, so nothing is ever looked up.
+/// degradation as `eval_generic`'s `embed_table`: without `std` no root is
+/// recorded, so nothing is ever looked up and every anchor refuses.
 #[cfg(feature = "std")]
 mod invocation_roots {
     use super::OwnedValue;
@@ -33736,13 +33750,27 @@ mod invocation_roots {
 /// could not prove (`at` is `None`), refuses: the clause can only ever
 /// under-accept.
 fn anchored_identical(marker: &Tracked, frame: &Frame) -> bool {
-    let Some(BindOrigin::Node { node, document }) = &marker.node else {
-        return false;
-    };
     let Some(at) = frame.at.as_ref() else {
         return false;
     };
-    let Some((held, steps)) = super::eval_generic::embed_anchor_for(*node, *document) else {
+    let anchor = match &marker.node {
+        Some(BindOrigin::Node { node, document }) => {
+            super::eval_generic::embed_anchor_for(*node, *document)
+        }
+        // #3482: a bind made inside the owned identity pipe records the
+        // container it descended from and the component it took
+        // (`OwnedIdentity::child`), which is the anchor a document bind
+        // registers in the embed table -- held by the marker itself, so it
+        // needs no entry and lives exactly as long as the marker does.
+        Some(BindOrigin::Owned {
+            chain, navigated, ..
+        }) if *navigated => chain
+            .last()
+            .map(|(parent, step)| ((**parent).clone(), vec![step.clone()])),
+        Some(BindOrigin::Owned { .. }) => None,
+        None => None,
+    };
+    let Some((held, steps)) = anchor else {
         return false;
     };
     let path = at.to_vec();
@@ -110381,6 +110409,7 @@ mod tests {
                 key_node: false,
                 exact,
                 root: 11,
+                navigated: false,
             }),
         };
         let root = RootWitness::Node {
@@ -110521,6 +110550,84 @@ mod tests {
             }
             other => panic!("expected the comma back, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `rewrite_markers` rebuilds the same node kind it was given (#3037)"
         }
+    }
+
+    /// #3482: a marker bound inside the owned identity pipe is certified by
+    /// its own chain -- the container it descended from and the component it
+    /// took -- when the bind source was plain navigation, and by nothing when
+    /// it was not (`max`, `+`, `[...]` place a computed value at a position
+    /// without that value being the node there).
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn anchored_identical_reads_an_owned_chain_3482() {
+        let inner = OwnedValue::object_from([("b".to_string(), OwnedValue::string("x"))]);
+        let root = OwnedValue::object_from([("a".to_string(), inner.clone())]);
+        let marker = |navigated: bool, chain: Vec<(Rc<OwnedValue>, OwnedValue)>| Tracked {
+            value: OwnedValue::string("x"),
+            origin: Origin::Untracked,
+            node: Some(BindOrigin::Owned {
+                base: None,
+                chain,
+                key_node: false,
+                exact: false,
+                root: 1,
+                navigated,
+            }),
+        };
+        let chain = vec![(Rc::new(inner.clone()), OwnedValue::string("b"))];
+        let frame_at = |components: &[&str]| {
+            let mut at = PathPrefix::root();
+            for c in components {
+                at = PathPrefix::extend(&at, Expr::Field((*c).to_string()));
+            }
+            Frame::at(
+                NEXT_INVOCATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u64,
+                at,
+            )
+        };
+        let certifies = |m: &Tracked, components: &[&str], root: &OwnedValue| {
+            let frame = frame_at(components);
+            let _root = invocation_roots::push(frame.invocation, root.clone());
+            anchored_identical(m, &frame)
+        };
+
+        // Hit: the register's container is the very one the bind came out of.
+        assert!(certifies(&marker(true, chain.clone()), &["a", "b"], &root));
+        // Miss: the same step under another parent.
+        let other = OwnedValue::object_from([(
+            "x".to_string(),
+            OwnedValue::object_from([("b".to_string(), OwnedValue::string("x"))]),
+        )]);
+        assert!(!certifies(
+            &marker(true, chain.clone()),
+            &["x", "b"],
+            &other
+        ));
+        // Miss: another step in the right parent.
+        assert!(!certifies(&marker(true, chain.clone()), &["a", "c"], &root));
+        // Miss: an equal-valued rebuild of the parent is another node.
+        let rebuilt = OwnedValue::object_from([(
+            "a".to_string(),
+            OwnedValue::object_from([("b".to_string(), OwnedValue::string("x"))]),
+        )]);
+        assert!(!certifies(
+            &marker(true, chain.clone()),
+            &["a", "b"],
+            &rebuilt
+        ));
+        // Miss: not plain navigation, so the chain proves nothing.
+        assert!(!certifies(
+            &marker(false, chain.clone()),
+            &["a", "b"],
+            &root
+        ));
+        // Miss: no chain at all.
+        assert!(!certifies(&marker(true, Vec::new()), &["a", "b"], &root));
+        // Miss: no invocation root recorded.
+        assert!(!anchored_identical(
+            &marker(true, chain),
+            &frame_at(&["a", "b"])
+        ));
     }
 
     /// #3177: `marker_identical` certifies by storage identity -- jq's
@@ -110905,6 +111012,7 @@ mod tests {
             key_node: false,
             exact: false,
             root,
+            navigated: false,
         };
         let marker = |origin: Origin, node: Option<BindOrigin>| {
             Expr::TrackedVar(Rc::new(Tracked {
@@ -110946,6 +111054,7 @@ mod tests {
                 key_node: false,
                 exact: true,
                 root: 5,
+                navigated: false,
             }),
         });
         assert!(!marker_is_root(

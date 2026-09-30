@@ -156,6 +156,17 @@
 # route; `wrapped-*` pin the `first(...)`/`[...]` spellings, which reach the
 # same door through the eager re-entries.
 #
+# The `owned-scalar-bind-*` rows are #3482: a navigated *scalar* bind on an
+# owned-rooted document (`input | .a.b as $z`, a constructed root, the
+# `tojson | fromjson` twin `navigated-bind-anchor-owned-root`). The owned
+# identity pipe records the container a bind came out of and the component it
+# took, and the anchor clause certifies a register that stands that step
+# below a container sharing that storage. The `-sibling`/`-other-*`/`-moved-
+# root`/`-written-node` rows are the same controls #3134 pins for a document
+# bind, and `-computed-*`/`-max-first-equal` pin that a value the pipe
+# *computed* at a position, or an extremum rule that places the first of two
+# equal elements where jq returns the last, is no proof of the node there.
+#
 # Usage:
 #   cargo build --release --features cli
 #   ./scripts/jq-bind-origin-oracle-sweep.sh                 # TSV + summary; exit 1 on fabricate/mismatch/new refuse-only
@@ -547,6 +558,32 @@ navigated-bind-anchor-rebuilt-parent	{"a":{"b":1,"c":0}}	.a.b as $z | .a.c = 1 |
 navigated-bind-anchor-new-parent	{"a":{"b":1}}	.a.b as $z | [.a.b] | path(.[0] | $z)
 navigated-bind-anchor-relocated	{"a":{"b":1}}	.a.b as $z | .a | to_entries | path(.[0].value | $z)
 navigated-bind-anchor-owned-root	{"a":{"b":1}}	tojson | fromjson | .a.b as $z | path(.a.b | $z)
+owned-scalar-bind-input-path	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | path(.a.b | $z)
+owned-scalar-bind-input-string	{"a":{"b":"s"}} {"a":{"b":"s"}}	input | .a.b as $z | path(.a | .b | $z)
+owned-scalar-bind-input-float	{"a":{"b":1.5}} {"a":{"b":1.5}}	input | .a.b as $z | path(.a.b | $z)
+owned-scalar-bind-input-index	{"a":[1,1]} {"a":[1,1]}	input | .a[1] as $z | path(.a[1] | $z)
+owned-scalar-bind-input-sub-root	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | .a | path(.b | $z)
+owned-scalar-bind-input-assign	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | (.a.b | $z) = 9
+owned-scalar-bind-input-update	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | (.a | .b | $z) |= 9
+owned-scalar-bind-input-compound	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | (.a.b | $z) += 5
+owned-scalar-bind-input-del	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | del(.a.b | $z)
+owned-scalar-bind-input-try	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | try path(.a.b | $z) catch "c"
+owned-scalar-bind-input-def	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | def f: path(.a.b | $z); f
+owned-scalar-bind-input-reduce	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | reduce (1) as $i (.; (.a.b | $z) = 9)
+owned-scalar-bind-input-nested-ancestor	{"a":{"b":{"c":1}}} {"a":{"b":{"c":1}}}	input | .a as $y | .a.b.c as $z | path(.a.b.c | $z)
+owned-scalar-bind-constructed	null	{a:{b:1}} | .a.b as $z | path(.a.b | $z)
+owned-scalar-bind-constructed-assign	null	{a:{b:1}} | .a.b as $z | (.a.b | $z) = 9
+owned-scalar-bind-input-sibling	{"a":{"b":1},"c":1} {"a":{"b":1},"c":1}	input | .a.b as $z | path(.c | $z)
+owned-scalar-bind-input-sibling-sub-root	{"a":{"b":1,"c":1}} {"a":{"b":1,"c":1}}	input | .a.b as $z | .a | path(.c | $z)
+owned-scalar-bind-input-other-parent-write	{"a":{"b":1},"x":{"b":1}} {"a":{"b":1},"x":{"b":1}}	input | .a.b as $z | .x | (.b | $z) = 5
+owned-scalar-bind-input-other-parent-del	{"a":{"b":1},"x":{"b":1}} {"a":{"b":1},"x":{"b":1}}	input | .a.b as $z | del(.x.b | $z)
+owned-scalar-bind-input-other-index	{"a":[1,1]} {"a":[1,1]}	input | .a[1] as $z | path(.a[0] | $z)
+owned-scalar-bind-input-iterate-equal	{"a":[1,1]} {"a":[1,1]}	input | .a[1] as $z | [path(.a[] | $z)]
+owned-scalar-bind-input-moved-root	{"a":{"b":1},"x":{"a":{"b":1}}} {"a":{"b":1},"x":{"a":{"b":1}}}	input | .a.b as $z | .x | path(.a.b | $z)
+owned-scalar-bind-input-written-node	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $z | .a.b = 1 | path(.a.b | $z)
+owned-scalar-bind-input-computed-string	{"a":{"b":"x"}} {"a":{"b":"x"}}	input | (.a.b + "") as $z | path(.a.b | $z)
+owned-scalar-bind-input-computed-array	{"a":{"b":[1]}} {"a":{"b":[1]}}	input | (.a.b | [.[0]]) as $z | path(.a.b | $z)
+owned-scalar-bind-input-max-first-equal	{"a":[1,1,1]} {"a":[1,1,1]}	input | (.a | max) as $z | [path(.a[0] | $z)]
 navigated-bind-input-root	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | path($y)
 owned-root-input-assign	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | ($y.b) = 9
 owned-root-input-del	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | del($y.b)
@@ -989,7 +1026,6 @@ destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nest
 carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
 in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
-navigated-bind-anchor-owned-root:#3134 -- eval.rs's own bind sites mint no node for a scalar (a scalar StandardJson keeps no cursor), so no anchor is pushed on an owned-rooted document
 owned-embed-refuse-path-nested-del-fractional:#3188 -- the write door will not re-spell a fractional index: del(.[-0.5]) deletes element 0 here and nothing in jq (#3302), so the static spelling would be a wrong answer
 owned-embed-refuse-path-nested-del-slice:#3188 -- a slice component has no static spelling the evaluator indexes by (.[{"start":0,"end":1}], #3300), so the write door declines
 owned-embed-fold-update-rebuilt-by-nonwrite:#3181 review -- a witnessed step runs its UPDATE through the owned re-index bridge, so even an UPDATE returning `.` hands the next step a rebuilt copy (the owned-embed-fold-if-identity mechanism)
