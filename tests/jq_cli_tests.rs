@@ -66561,28 +66561,20 @@ fn test_owned_embed_navigated_inside_path_argument_3177() -> Result<()> {
 /// `first`, `label`, `?`, as an `as`/`reduce` source or a binary operand,
 /// and behind `with_entries`/`add`/a no-op `|=`) answer since #3069's
 /// bridge provenance: see `test_bridge_provenance_keeps_path_identity_3069`.
+/// The nested-ancestor row (`. as $x | .a as $y | [.] | path(.[0].a |
+/// $y)`) answers since #3134's anchor: see
+/// `test_navigated_bind_anchor_rows_answer_3134`.
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
-    for (input, filter, why) in [
-        (
-            r#"{"a":{"b":1}}"#,
-            r". as $x | .a as $y | [.] | path(.[0].a | $y)",
-            "reuse is depth-0 only (#2889): `$y` is a separate materialization \
-             of `.a`, not the `.a` inside `$x`'s storage (jq `[0,\"a\"]`)",
-        ),
-        (
-            "1",
-            r". as $x | [.] | path(.[0] | $x)",
-            "a scalar is not Rc-backed, so there is no storage to share (jq `[0]`)",
-        ),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(
-            code, 5,
-            "#3177 residual: `{filter}` ({why}): stdout={stdout:?} stderr={stderr:?}"
-        );
-    }
+    // A scalar is not `Rc`-backed, so there is no storage to share, and a
+    // scalar *root* has no parent to anchor on either (#3134) -- jq `[0]`.
+    let filter = r". as $x | [.] | path(.[0] | $x)";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("1"))?;
+    assert_eq!(
+        code, 5,
+        "#3177 residual: `{filter}`: stdout={stdout:?} stderr={stderr:?}"
+    );
     Ok(())
 }
 
@@ -68811,6 +68803,224 @@ fn test_navigated_bind_positional_and_owned_root_rows_answer_3069() -> Result<()
     Ok(())
 }
 
+/// #3134: a navigated bind the storage clause cannot certify -- a scalar,
+/// which is not `Rc`-backed, or a node below an already-bound ancestor,
+/// whose materialization is the ancestor's, not its own -- is certified by
+/// its *anchor*: the container it sits in shares storage with the one the
+/// embed table holds, and the register stands the recorded steps below it.
+/// That travels wherever a container's identity does, so the wrapped,
+/// `def` and `reduce` routes answer too. Every expected output captured
+/// live against jq 1.7.1.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_navigated_bind_anchor_rows_answer_3134() -> Result<()> {
+    let ab = r#"{"a":{"b":1}}"#;
+    for (input, filter, expected) in [
+        (ab, r".a.b as $z | path(.a.b | $z)", r#"["a","b"]"#),
+        (ab, r".a.b as $z | path(.a | .b | $z)", r#"["a","b"]"#),
+        (ab, r#".a.b as $z | path(.a | .["b"] | $z)"#, r#"["a","b"]"#),
+        (
+            r#"{"a":{"b":"s"}}"#,
+            r".a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1.5}}"#,
+            r".a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (ab, r".a.b as $z | .a | path(.b | $z)", r#"["b"]"#),
+        (ab, r".a.b as $z | .a | path(.b? | $z)", r#"["b"]"#),
+        (
+            ab,
+            r#".a.b as $z | .a | path(getpath(["b"]) | $z)"#,
+            r#"["b"]"#,
+        ),
+        (
+            ab,
+            r#".a.b as $z | .a | path(.. | select(type=="number") | $z)"#,
+            r#"["b"]"#,
+        ),
+        (ab, r".a | .b as $z | path(.b | $z)", r#"["b"]"#),
+        (
+            ab,
+            r".a.b as $z | path(.a.b | . as $q | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            ab,
+            r".a.b as $z | .a.b as $w | path(.a.b | $z, $w)",
+            r#"["a","b"] ["a","b"]"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            r".a[0] as $z | path(.a[0] | $z)",
+            r#"["a",0]"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            r".a[0] as $z | .a | path(.[-2] | $z)",
+            "[-2]",
+        ),
+        (r#"{"a":1,"a":2}"#, r".a as $z | path(.a | $z)", r#"["a"]"#),
+        (ab, r".a.b as $z | (.a.b | $z) = 9", r#"{"a":{"b":9}}"#),
+        (ab, r".a.b as $z | (.a | .b | $z) |= 9", r#"{"a":{"b":9}}"#),
+        (ab, r".a.b as $z | (.a.b | $z) += 5", r#"{"a":{"b":6}}"#),
+        (ab, r".a.b as $z | del(.a.b | $z)", r#"{"a":{}}"#),
+        (ab, r".a.b as $z | .a | (.b | $z) = 9", r#"{"b":9}"#),
+        (
+            r#"{"a":[1,1]}"#,
+            r".a[1] as $z | (.a[1] | $z) = 5",
+            r#"{"a":[1,5]}"#,
+        ),
+        // Wrapped, `def` and `reduce`: the anchor rides the parent's `Rc`.
+        (
+            ab,
+            r#".a.b as $z | try path(.a.b | $z) catch "c""#,
+            r#"["a","b"]"#,
+        ),
+        (ab, r".a.b as $z | [path(.a.b | $z)]", r#"[["a","b"]]"#),
+        (
+            ab,
+            r".a.b as $z | limit(1; path(.a.b | $z))",
+            r#"["a","b"]"#,
+        ),
+        (ab, r".a.b as $z | path(.a.b | $z) | length", "2"),
+        (
+            ab,
+            r".a.b as $z | def f: path(.a.b | $z); f",
+            r#"["a","b"]"#,
+        ),
+        (
+            ab,
+            r".a.b as $z | reduce (1) as $i (.; (.a.b | $z) = 9)",
+            r#"{"a":{"b":9}}"#,
+        ),
+        // An embed of the parent keeps it: `{k:.a}`/`[.a]` hold `.a`'s `Rc`.
+        (
+            ab,
+            r".a.b as $z | {k: .a} | path(.k.b | $z)",
+            r#"["k","b"]"#,
+        ),
+        (ab, r".a.b as $z | [.a] | path(.[0].b | $z)", r#"[0,"b"]"#),
+        // Below a bound ancestor, scalar and container alike.
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a as $y | .a.b as $z | .a | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a as $y | .a.b as $z | (.a | .b | $z) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a as $y | .a.b.c as $z | path(.a.b.c | $z)",
+            r#"["a","b","c"]"#,
+        ),
+        (
+            ab,
+            r". as $x | .a as $y | [.] | path(.[0].a | $y)",
+            r#"[0,"a"]"#,
+        ),
+        (
+            r#"{"a":[[1],[1]]}"#,
+            r".a[1] as $y | .a[1][0] as $z | path(.a[1][0] | $z)",
+            r#"["a",1,0]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        let stdout = stdout.lines().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "#3134: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3134's controls: jq refuses every one of these, because the register
+/// is an equal value at another node -- a sibling, another element, a moved
+/// root, the same step under another parent, or a node a write replaced --
+/// and an anchor must never certify one (the write-through direction).
+/// Captured live against jq 1.7.1.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_navigated_bind_anchor_controls_refuse_3134() -> Result<()> {
+    for (input, filter) in [
+        (r#"{"a":{"b":1},"c":1}"#, r".a.b as $z | path(.c | $z)"),
+        (r#"{"a":{"b":1,"c":1}}"#, r".a.b as $z | .a | path(.c | $z)"),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r".a.b as $z | .x | path(.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r".a.b as $z | path(.x.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r".a.b as $z | .x | (.b | $z) = 5",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r".a.b as $z | del(.x.b | $z)",
+        ),
+        (r#"{"a":[1,1]}"#, r".a[1] as $z | path(.a[0] | $z)"),
+        (r#"{"a":[1,1]}"#, r".a[1] as $z | .a | path(.[-2] | $z)"),
+        (r#"{"a":[1,1]}"#, r".a[1] as $z | [path(.a[] | $z)]"),
+        (r#"{"a":[1,1]}"#, r".a[0] as $z | [path(.a[] | $z)]"),
+        (
+            r#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+            r".a.b as $z | .x | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+            r".a.b as $z | def f: path(.a.b | $z); .x | f",
+        ),
+        (
+            r#"{"a":{"a":{"b":1},"b":1}}"#,
+            r".a.b as $z | .a | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":{"a":{"b":1},"b":1}}"#,
+            r".a.a.b as $z | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":[[1],[1]]}"#,
+            r".a[1][0] as $z | path(.a[0][0] | $z)",
+        ),
+        (
+            r#"{"a":[[1],[1]]}"#,
+            r".a[1] as $y | .a[1][0] as $z | path(.a[0][0] | $z)",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a.b = 1 | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a.b |= (. as $w | 1) | path(.a.b | $z)",
+        ),
+        (r#"{"a":{"b":1}}"#, r".a.b as $z | .a | path(.. | $z)"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3134: `{filter}` on {input} must stay refused, as jq refuses it: \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3134: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3179: an embed of a bound node reached through a container built from
 /// one of its *ancestors*. The materializer now takes the binding's own
 /// value for a nested container, not only at its depth 0, so `{k:.}`'s copy
@@ -69132,6 +69342,246 @@ fn test_navigated_bind_on_owned_root_yq_mode_unchanged_3135() -> Result<()> {
         "#3135 yq: stderr={:?}",
         String::from_utf8_lossy(&output.stderr)
     );
+    Ok(())
+}
+
+/// What #3069 left refusing, answered since #3134: a navigated bind whose
+/// node is *below* the resolver's root and which storage identity cannot
+/// certify -- a scalar (no `Rc`), or a node another bind's `Rc` already
+/// stands for (`.a as $y | .a.b as $z | .a | ...`). The cursor-side
+/// `path()` arms and write funnels now stamp such a marker with its
+/// position below the root for the one resolver invocation they enter.
+/// Every row captured live from `/usr/bin/jq` 1.7.1; every one exited 5
+/// on `main` before.
+#[test]
+fn test_navigated_bind_positional_scalar_and_nested_rows_answer_3134() -> Result<()> {
+    for (input, filter, expected) in [
+        // `path()`: scalars of every allocated kind, at every depth.
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | path(.a | .b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":"s"}}"#,
+            r".a.b as $z | path(.a | .b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1.5}}"#,
+            r".a.b as $z | path(.a | .b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#".a.b as $z | path(.a | .["b"] | $z)"#,
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#".a.b as $z | .a | path(getpath(["b"]) | $z)"#,
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#".a.b as $z | .a | path(.. | select(type=="number") | $z)"#,
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            r".a[0] as $z | .a | path(.[0] | $z)",
+            "[0]",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a | .b as $z | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a | .b as $w | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"(.a.b, .a.b) as $z | path(.a.b | $z)",
+            "[\"a\",\"b\"]\n[\"a\",\"b\"]",
+        ),
+        (r#"{"a":1,"a":2}"#, r".a as $z | path(.a | $z)", r#"["a"]"#),
+        // Under the wrappers the generic evaluator drives with a cursor.
+        (
+            r#"{"a":{"b":1}}"#,
+            r#".a.b as $z | try path(.a.b | $z) catch "c""#,
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | [path(.a.b | $z)]",
+            r#"[["a","b"]]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | limit(1; path(.a.b | $z))",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | def f: path(.a.b | $z); f",
+            r#"["a","b"]"#,
+        ),
+        // Writes.
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | (.a.b | $z) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | (.a | .b | $z) |= 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | (.a.b | $z) += 5",
+            r#"{"a":{"b":6}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | del(.a | .b | $z)",
+            r#"{"a":{}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a | (.b | $z) = 9",
+            r#"{"b":9}"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            r".a[1] as $z | (.a[1] | $z) = 5",
+            r#"{"a":[1,5]}"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            r".a[1] as $z | (.a[1] | $z) += 5",
+            r#"{"a":[1,6]}"#,
+        ),
+        // A node an ancestor bind's `Rc` stands for.
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a as $y | .a.b as $z | .a | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a as $y | .a.b as $z | path(.a | .b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a as $y | .a.b as $z | (.a | .b | $z) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3134's controls: jq 1.7.1 refuses every row (captured live), because
+/// the value the resolver stands on is equal to the bound one but is a
+/// different `jv` -- an equal-valued sibling, an iterated element, the
+/// same path under a moved root, or a node written since the bind. A
+/// position minted for the bind's own node must never certify any of them.
+#[test]
+fn test_navigated_bind_positional_controls_refuse_3134() -> Result<()> {
+    for (input, filter) in [
+        (r#"{"a":{"b":1},"c":1}"#, r".a.b as $z | path(.c | $z)"),
+        (r#"{"a":{"b":1,"c":1}}"#, r".a.b as $z | .a | path(.c | $z)"),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r".a.b as $z | .x | path(.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r".a.b as $z | .x | (.b | $z) = 9",
+        ),
+        (r#"{"a":{"b":1},"c":1}"#, r".a.b as $z | (.c | $z) = 9"),
+        (r#"{"a":[1,1]}"#, r".a[1] as $z | [path(.a[] | $z)]"),
+        (r#"{"a":[1,1]}"#, r".a[1] as $z | (.a[] | $z) = 5"),
+        (
+            r#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+            r".a as $y | .x | path(.a | $y)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+            r".a as $y | def f: path(.a | $y); .x | f",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a.b = 1 | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a.b as $z | .a.b |= (. as $w | 1) | path(.a.b | $z)",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}` on {input}: stdout={stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with result"),
+            "`{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3134 review: `at_offset` (a succinctly extension) can bind the *first*
+/// of two duplicate keys, a member jq's parser discards and that `.a` never
+/// reaches -- `.a` is the last member, in jq and in the owned tree the
+/// resolver walks. A position for the shadowed member would certify `.a`
+/// by value on `{"a":1,"a":1}` and let `del` delete through it, so it gets
+/// none and refuses; the last member, which `.a` is, answers.
+#[test]
+fn test_navigated_bind_positional_shadowed_duplicate_key_refuses_3134() -> Result<()> {
+    let input = r#"{"a":1,"a":1}"#;
+    for filter in [
+        r"at_offset(5) as $x | path(.a | $x)",
+        r"at_offset(5) as $x | del(.a | $x)",
+        r"at_offset(5) as $x | (.a | $x) = 9",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with result"),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    for (filter, expected) in [
+        (r"at_offset(11) as $x | path(.a | $x)", r#"["a"]"#),
+        (r"at_offset(11) as $x | del(.a | $x)", "{}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
     Ok(())
 }
 

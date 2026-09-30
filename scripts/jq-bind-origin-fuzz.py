@@ -69,6 +69,14 @@ computed value and then discards the array, so an inner refusal cannot be
 recovered by the terminal path check. The family also includes arrays jq
 accepts and the still-deferred optional-navigation cases from #2764.
 
+#3134 adds the POSITIONAL family: a navigated bind made outside any
+resolver (`.a.b as $y`, an `Untracked` marker) and then used *below* the
+resolver's root, `path(NAV | $y)`/`(NAV | $y) = v`, possibly after moving
+the root first. Such a marker certifies by its anchor, the storage of the
+container it sits in; the trap is an equal-valued scalar at a sibling,
+under a moved root, or reached by iteration, which must keep refusing.
+Off by default (`--positional-bind-p`) so existing seeds keep their stream.
+
 Usage:
     cargo build --release --features cli
     ./scripts/jq-bind-origin-fuzz.py [--bin PATH] [--jq PATH] [-n N] [--seed S] [--show K]
@@ -465,6 +473,33 @@ def value_bind_program(rng, d):
     body = f"{src} as $y | {nav} | {use}"
     return rng.choice(ROUTES) % body
 
+# #3134: see the module docstring. Sources and targets reach scalars,
+# containers and array elements at several depths; `doc()` copies `.a` into
+# `.c`, `.x.a` and `.arr[]` often, so equal-valued siblings are common.
+POSITIONAL_SOURCES = [".a", ".c", ".x.a", ".x.c", ".a.b?", ".c.b?", ".x.a.b?", ".arr[0]?",
+                      ".arr[1]?", ".arr[2]?", ".a[0]?", ".d", ".x"]
+POSITIONAL_PREFIXES = ["", "", "", ".x | ", ".a | ", ".arr | ", ".x as $w | ", ".a as $w | "]
+POSITIONAL_TARGETS = [".a", ".c", ".x.a", ".x.c", ".a.b?", ".c.b?", ".b?", ".[0]?", ".[1]?",
+                      ".[-1]?", ".arr[1]?", ".[]?", "..", "getpath([\"a\"])", ".d", ".x | .a",
+                      "select(true) | .a", ".a | .b?"]
+POSITIONAL_WRAPS = [
+    "path(%s | $y)", "[path(%s | $y)]", "(%s | $y) = 9", "(%s | $y) |= 5", "(%s | $y) += 1",
+    "(%s | $y) //= 7", "del(%s | $y)", "try path(%s | $y) catch \"c\"", "limit(1; path(%s | $y))",
+    "def f: path(%s | $y); f", "path(%s | $y | .b?)", "(%s | $y.b?) = 9", "first(path(%s | $y))",
+    "reduce (1) as $i (.; path(%s | $y))", "path(%s | select(. == $y))",
+]
+
+def positional_bind_program(rng):
+    src = rng.choice(POSITIONAL_SOURCES)
+    # Half the time aim the target at the bind's own node, spelled the way
+    # the prefix leaves it; otherwise any target, sibling traps included.
+    prefix = rng.choice(POSITIONAL_PREFIXES)
+    if rng.random() < 0.5 and not prefix.strip().startswith("."):
+        target = src
+    else:
+        target = rng.choice(POSITIONAL_TARGETS)
+    return f"{src} as $y | {prefix}" + rng.choice(POSITIONAL_WRAPS) % target
+
 def route_program(rng, d):
     v = "$x"
     prefix = rng.choice(["", "", ".x | "])
@@ -575,6 +610,10 @@ def main():
                          "container built from it, then del/assignment through a target navigating "
                          "to it. Off by default so existing seeds keep their stream; run at 1.0 to "
                          "weight the sweep onto the owned write door")
+    ap.add_argument("--positional-bind-p", type=float, default=0.0,
+                    help="probability a program is a positional-bind program (#3134): a navigated "
+                         "bind used below the resolver's root. Off by default so existing seeds "
+                         "keep their stream; run at 1.0 to weight the sweep onto the mint")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     pin = open("tests/data/jq-golden/JQ_VERSION").read().strip()
@@ -591,7 +630,11 @@ def main():
                            ("TRACKED_ARRAY_WRAPPERS", TRACKED_ARRAY_WRAPPERS),
                            ("VALUE_BIND_SOURCES", VALUE_BIND_SOURCES), ("VALUE_BIND_USES", VALUE_BIND_USES),
                            ("EMBED_WRITE_CONSTRUCTS", [c for c, _ in EMBED_WRITE_CONSTRUCTS]),
-                           ("EMBED_WRITE_WRAPS", EMBED_WRITE_WRAPS)]:
+                           ("EMBED_WRITE_WRAPS", EMBED_WRITE_WRAPS),
+                           ("POSITIONAL_SOURCES", POSITIONAL_SOURCES),
+                           ("POSITIONAL_PREFIXES", POSITIONAL_PREFIXES),
+                           ("POSITIONAL_TARGETS", POSITIONAL_TARGETS),
+                           ("POSITIONAL_WRAPS", POSITIONAL_WRAPS)]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
@@ -610,7 +653,9 @@ def main():
         dv = doc(rng)
         d = json.dumps(dv)
         r = rng.random()
-        if a.embed_write_p and rng.random() < a.embed_write_p:
+        if a.positional_bind_p and rng.random() < a.positional_bind_p:
+            f = positional_bind_program(rng)
+        elif a.embed_write_p and rng.random() < a.embed_write_p:
             f = embed_write_program(rng)
         elif r < TRACKED_ARRAY_P:
             f = tracked_array_program(rng)

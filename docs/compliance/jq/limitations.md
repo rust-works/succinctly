@@ -1585,7 +1585,29 @@ is the revert that established what the other one costs.
    owned-rooted document: `-n 'input | ...'`, a `tojson | fromjson` root) answer since #3179
    and #3069: the resolver stands on `$y`'s own storage at `.a`, so #3177's storage clause
    certifies it without a document-absolute bind path. Pinned in
-   `test_navigated_bind_positional_and_owned_root_rows_answer_3069`. The routes that re-enter the eager evaluator with an *owned*
+   `test_navigated_bind_positional_and_owned_root_rows_answer_3069`. What that storage clause
+   could not reach, a **scalar** (not `Rc`-backed: `.a.b as $z | path(.a.b | $z)`, jq
+   `["a","b"]`) and a node **below an already-bound ancestor** (`.a as $y | .a.b as $z | .a |
+   path(.b | $z)`, where `.a` is `$y`'s `Rc` and its `.b` is `$y`'s materialization, never `$z`'s),
+   answers since [#3134](https://github.com/rust-works/succinctly/issues/3134) by the binding's
+   *anchor*: `each_as_generic` registers the container the node sits in (its parent, pending until
+   the parent's first materialization fills it; or the bound ancestor, at once) with the steps
+   down to the node, and `marker_identical`'s anchor clause certifies a register whose container
+   at the anchor shares that storage and which sits exactly those steps below it. Sharing storage
+   makes the container the document's own unmodified node, whose child at a step is the one `jv`
+   jq's parser made there, so the clause is jq's `jv_identical` on parsed input; it rides the
+   parent's `Rc`, so it answers everywhere a container's identity does — under `try`/`[…]`/
+   `limit`, in a `def` or a `reduce`, through `{k:.a}`/`[.a]` — and an equal value at a sibling,
+   another element, the same step under another parent or past a write refuses as jq does. Pinned
+   in `test_navigated_bind_anchor_rows_answer_3134`/`test_navigated_bind_anchor_controls_refuse_3134`
+   and the sweep's `navigated-bind-anchor-*` rows. Four shapes stay refuse-only, each because jq
+   keeps the scalar `jv` somewhere a document position cannot follow: through a copy-on-write of
+   its parent (`.a.c = 1 | path(.a.b | $z)`, `.a.b |= .`), into a new container (`[.a.b] |
+   path(.[0] | $z)`, `to_entries`), or on an owned-rooted document (`tojson | fromjson`, `-n
+   'input | …'`), whose `eval.rs` bind sites mint no node for a scalar at all. Only a real scalar
+   identity could close them. A member a later duplicate key shadows (`at_offset(5) as $x |
+   del(.a | $x)` on `{"a":1,"a":1}`, a succinctly extension binding the member jq's parser
+   discards) gets no anchor step and refuses; `.a` is the last member. The routes that re-enter the eager evaluator with an *owned*
    accumulator (`reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)`, a `catch` handler) were
    listed here too — `eval.rs`'s own `eval_as` carries no node for a navigated bind, so no
    witness could promote it — until #3177's storage clause certified the marker by the `Rc`
