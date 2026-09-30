@@ -1017,8 +1017,6 @@ scalar-root-embed-write-string:same as owned-embed-refuse-scalar-string-root
 scalar-root-float-literal:same as owned-embed-refuse-scalar-string-root
 scalar-nested-embed-yq-untouched-number:same as owned-embed-refuse-scalar-string-root
 navigated-bind-positional-relocated-scalar:#3466 -- to_entries moves the scalar jv into a new container; a scalar has no identity to follow it
-navigated-bind-positional-write-first:the write door resolves only effect-free navigation targets (owned_write_door's gate, #3188); first(.) keeps the bridge's resolver, which has no position; path() of the same target answers
-navigated-bind-positional-write-limit:same as navigated-bind-positional-write-first
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then
