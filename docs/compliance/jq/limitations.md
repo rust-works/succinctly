@@ -648,11 +648,12 @@ and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` 
   closing slice.
 - **`paths(f)` evaluates `f` once per path, with no retry**: `[paths(if ([1] as $q ?// $b |
   $q) then error("E") else true end)]` is `[["a"],["a","a"]]` in jq 1.7.1 and `E` here after a
-  single attempt. A different site from the resolver above (a slice 9 row on #3293).
-- **`limit`/`skip` type-check their count eagerly**: `[limit(([1] as $q ?// $b | $q); 1,2,3)]`
-  is `[1,2,3]` in jq 1.7.1 (an array compares greater than `0`) and "limit requires
-  non-negative integer" here, after a single attempt -- the #2180 "arguments are evaluated
-  before the retry" family, not a stale slot. jq 1.7.1 has no `skip`, so its rows follow
+  single attempt (#3366, a second shape of its root-probe divergence).
+- **`limit` raises its own error for a non-number count, at the count** (#3486): `path(limit(([1]
+  as $q ?// $b | $q); .a))` is `["a"]` in jq 1.7.1 -- its `$n - 1` fails downstream of the count,
+  so the `?//` retries to a `null` (unlimited) count -- and "limit requires non-negative
+  integer" after a single attempt here. Without a `?//` both raise, with different wording. The
+  cursor route's value-mode `limit` already retries. jq 1.7.1 has no `skip`, so its rows follow
   `limit`'s.
 
 ## Where succinctly errors and jq does not
