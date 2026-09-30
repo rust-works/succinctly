@@ -114459,11 +114459,11 @@ mod tests {
                 let expr = parse(filter).expect("filter parses");
                 let concrete = normalize(eval_full::<Vec<u64>, JqSemantics>(&expr, element));
                 let expected = normalize(eval_full::<Vec<u64>, JqSemantics>(&expr, good_element));
-                if concrete != expected {
-                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a NON_READERS filter disagrees between the malformed and well-formed document (#3222)"
-                    disagreed.push(format!("eval `{filter}` on {json}: {concrete:?}"));
-                    // omni-dev: coverage end
-                }
+                // The report is built every time and kept only on a disagreement,
+                // so the failure-recording path is one executed line, not a
+                // branch a passing suite never reaches.
+                let report = format!("eval `{filter}` on {json}: {concrete:?}");
+                disagreed.extend((concrete != expected).then_some(report));
                 let run_generic = |cursor| match crate::jq::eval_generic::eval_with_cursor_using::<
                     JqSemantics,
                     _,
@@ -114474,13 +114474,8 @@ mod tests {
                 };
                 let generic = run_generic(element);
                 let expected = run_generic(good_element);
-                if generic != expected {
-                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- see the `eval` failure-recording line above, same assertion (#3222)"
-                    disagreed.push(format!(
-                        "eval_with_cursor_using `{filter}` on {json}: {generic:?}"
-                    ));
-                    // omni-dev: coverage end
-                }
+                let report = format!("eval_with_cursor_using `{filter}` on {json}: {generic:?}");
+                disagreed.extend((generic != expected).then_some(report));
             }
         }
         assert!(
@@ -114552,12 +114547,17 @@ mod tests {
         fn generic<V: crate::jq::document::DocumentValue>(r: GenericResult<V>) -> Outcome {
             match r {
                 GenericResult::Error(e) if e.is_decode_failure() => None,
-                other => match other.into_owned::<JqSemantics>() {
-                    Ok(Some(value)) => Some(value.to_json().leak()),
-                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- every ROWS filter either raises a decode failure or answers one value through the generic evaluator, so this fallback only reports a row that moved (#3266)"
-                    other => Some(format!("{other:?}").leak()),
-                    // omni-dev: coverage end
-                },
+                // Anything but one value is reported as its `Debug` rather than
+                // panicking, so a row that moved shows up in the assertion below.
+                other => {
+                    let owned = other.into_owned::<JqSemantics>();
+                    let answer = owned
+                        .as_ref()
+                        .ok()
+                        .and_then(Option::as_ref)
+                        .map(OwnedValue::to_json);
+                    Some(answer.unwrap_or_else(|| format!("{owned:?}")).leak())
+                }
             }
         }
         let mut moved = Vec::new();
@@ -114570,27 +114570,22 @@ mod tests {
             let expr = parse(filter).expect("filter parses");
             let concrete: Outcome = match eval::<Vec<u64>, JqSemantics>(&expr, element) {
                 QueryResult::Error(e) if e.is_decode_failure() => None,
-                other => match normalize(other) {
-                    (values, tag) if values.len() == 1 && tag == "ok" => {
-                        Some(values[0].to_json().leak())
-                    }
-                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- every ROWS filter either raises a decode failure or answers one value through eval, so this fallback only reports a row that moved (#3266)"
-                    other => Some(format!("{other:?}").leak()),
-                    // omni-dev: coverage end
-                },
+                other => {
+                    let answer = normalize(other);
+                    let single =
+                        (answer.0.len() == 1 && answer.1 == "ok").then(|| answer.0[0].to_json());
+                    Some(single.unwrap_or_else(|| format!("{answer:?}")).leak())
+                }
             };
             let using = generic(eval_using::<JqSemantics, _>(&expr, element.value()));
             let cursor = generic(eval_with_cursor_using::<JqSemantics, _>(&expr, element));
             let got = (concrete, using, cursor);
             let want = (want_cursor, want_using, want_cursor);
-            if got != want {
-                // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a ROWS answer moves (#3266)"
-                moved.push(format!(
-                    "`{filter}` on {json}: (eval, eval_using, eval_with_cursor_using) = \
-                     {got:?}, pinned {want:?}"
-                ));
-                // omni-dev: coverage end
-            }
+            let report = format!(
+                "`{filter}` on {json}: (eval, eval_using, eval_with_cursor_using) = \
+                 {got:?}, pinned {want:?}"
+            );
+            moved.extend((got != want).then_some(report));
         }
         assert!(moved.is_empty(), "a pinned answer moved: {moved:#?}");
     }
@@ -115489,13 +115484,14 @@ mod touched_edge_cases_2999 {
             );
             QueryResult::None
         });
-        match caught {
-            QueryResult::Error(e) => {
-                assert!(e.is_decode_failure(), "must escape try/catch: {e:?}");
-                assert_eq!(e.to_string(), "nesting depth exceeds limit of 256");
-            }
-            other => panic!("expected the nesting error, got {other:?}"), // omni-dev: coverage tolerate-line reason="test-only assertion-failure arm"
-        }
+        // A decode failure (so it escapes try/catch) carrying the depth message.
+        let nesting_error = matches!(
+            &caught,
+            QueryResult::Error(e)
+                if e.is_decode_failure()
+                    && e.to_string() == "nesting depth exceeds limit of 256"
+        );
+        assert!(nesting_error, "expected the nesting error, got {caught:?}");
 
         // The 384 guard shares the template but is a different failure class:
         // it must keep unwinding.
@@ -115550,27 +115546,37 @@ mod touched_edge_cases_2999 {
         fn observe<S: EvalSemantics>(
             r: QueryResult<'_, Vec<u64>>,
         ) -> (&'static str, String, String) {
-            let kind = match &r {
-                QueryResult::Error(_) => "error",
-                QueryResult::Break(_) => "break", // omni-dev: coverage tolerate-line reason="no sweep row breaks or halts: kept so a row that starts to is reported as a different kind, not folded into `values` (#3457)"
-                QueryResult::Halt(_) => "halt", // omni-dev: coverage tolerate-line reason="see the arm above (#3457)"
-                QueryResult::Partial(..) => "partial",
-                _ => "values",
-            };
+            // No sweep row breaks or halts, but one that starts to is reported
+            // as its own kind rather than folded into `values`. A table, not a
+            // `match`, so those never-taken kinds are not arms a passing suite
+            // leaves unexecuted.
+            let kind = [
+                (matches!(&r, QueryResult::Error(_)), "error"),
+                (matches!(&r, QueryResult::Break(_)), "break"),
+                (matches!(&r, QueryResult::Halt(_)), "halt"),
+                (matches!(&r, QueryResult::Partial(..)), "partial"),
+            ]
+            .into_iter()
+            .find_map(|(is_kind, name)| is_kind.then_some(name))
+            .unwrap_or("values");
             let message = match &r {
                 QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
                     e.message.clone()
                 }
                 _ => String::new(),
             };
-            let values = match r.try_collect_owned::<S>() {
-                Ok(vs) => vs
-                    .iter()
-                    .map(OwnedValue::to_json)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                Err(e) => format!("decode failure: {}", e.message), // omni-dev: coverage tolerate-line reason="every sweep row is well-formed, so no cursor fails to decode; kept so one that does is reported as a decode failure rather than a value (#3457)"
-            };
+            // Every sweep row is well-formed, so none fails to decode; one that
+            // did would be reported as a decode failure rather than a value.
+            let values = r
+                .try_collect_owned::<S>()
+                .map(|vs| {
+                    vs.iter()
+                        .map(OwnedValue::to_json)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .map_err(|e| format!("decode failure: {}", e.message))
+                .unwrap_or_else(std::convert::identity);
             (kind, values, message)
         }
         fn both<S: EvalSemantics>(
@@ -115815,22 +115821,14 @@ mod touched_edge_cases_2999 {
             } else {
                 both::<YqSemantics>(doc, filter)
             };
-            if old != new && !is_moved(mode, doc, filter) {
-                // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a row moves off eval_full without being listed in MOVED (#3457)"
-                differ.push(format!(
-                    "{mode} `{filter}` on {doc}:\n    eval_full {old:?}\n    eval      {new:?}"
-                ));
-                // omni-dev: coverage end
-            }
+            let report = format!(
+                "{mode} `{filter}` on {doc}:\n    eval_full {old:?}\n    eval      {new:?}"
+            );
+            differ.extend((old != new && !is_moved(mode, doc, filter)).then_some(report));
         }
         assert!(checked >= 150, "the sweep shrank: {checked} rows");
-        // omni-dev: coverage tolerate reason="the assertion's failure message: only evaluated when a row moved (#3457)"
-        assert!(
-            differ.is_empty(),
-            "eval moved from eval_full:\n{}",
-            differ.join("\n")
-        );
-        // omni-dev: coverage end
+        let moved = differ.join("\n");
+        assert!(differ.is_empty(), "eval moved from eval_full:\n{moved}");
     }
 
     /// #3457: `eval_reindexed` is the hybrid `eval` was, for `succinctly yq`'s
