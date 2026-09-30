@@ -8791,9 +8791,9 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
 /// what both accept. Called from the two owned re-entries that reach the
 /// bridge, [`eval_each_owned`] and `eval_generic::eval_on_owned`.
 pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
-    match expr {
-        Expr::Paren(inner) => eval_owned_length(inner, input),
-        Expr::Pipe(stages) => match stages.as_slice() {
+    match unwrap_paren(expr) {
+        // `. | length` is `length`: an identity stage yields its input once.
+        Expr::Pipe(stages) => match skip_identity_stages(stages) {
             [only] => eval_owned_length(only, input),
             _ => None,
         },
@@ -75970,17 +75970,8 @@ mod tests {
         ]));
         let mut answered = 0;
         for value in &values {
-            for src in ["length", "(length)", ". | length"] {
+            for src in ["length", "(length)", ". | length", "(. | (length))"] {
                 let expr = parse(src).unwrap();
-                let expr = match &expr {
-                    // `. | length` is a two-stage pipe: only the one-stage
-                    // spellings are this helper's to answer.
-                    Expr::Pipe(stages) if stages.len() > 1 => {
-                        assert!(eval_owned_length(&expr, value).is_none(), "{src}");
-                        continue;
-                    }
-                    _ => expr,
-                };
                 let is_container = matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_));
                 let Some(fast) = eval_owned_length(&expr, value) else {
                     assert!(!is_container, "{src:?} on {value:?} declined a container");
@@ -76002,7 +75993,15 @@ mod tests {
                 assert_eq!(fast, yq, "yq mode: {src:?} on {value:?}");
             }
         }
-        assert!(answered > 10, "the matrix must reach the container arms");
+        assert!(answered > 20, "the matrix must reach the container arms");
+        // A stage that computes something is not this helper's to answer.
+        for src in ["length | . + 1", ".a | length", "length, length", "keys"] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_length(&expr, &OwnedValue::array_from(vec![])).is_none(),
+                "{src}"
+            );
+        }
     }
 
     #[test]

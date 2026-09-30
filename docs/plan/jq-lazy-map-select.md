@@ -659,8 +659,9 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
       the document where jq holds one `jv`. `to_owned_all_cursors_shared` remembers a
       container by node id (never by value: `[.x, .y]` with equal values stays two builds)
       and is used only by the validated `,` producer, the one source that can name a node
-      twice. Sharing one storage also turns three rows the bind-origin sweep had as
-      refuse-only into agreements (`[., .] as $a | $a[0] as $y | $a[1] | path($y)`).
+      twice. Sharing one storage also makes jq's own answer reachable for a node named twice:
+      three of the new bind-origin sweep rows refuse where jq answers `[]` on `main` and
+      agree now (`[., .] as $a | $a[0] as $y | $a[1] | path($y)`).
     - **Measured** (release, Apple M5 Max, the box under heavy load, so RSS only): `[.] as
       $a | $a | length` 168 → 112 MB, `[., .] as $a | $a | length` 294 → 112 MB (1 MB:
       26 → 20 and 39 → 20 MB; 30 MB: 457 → 315 and 842 → 318 MB). The residual is the owned

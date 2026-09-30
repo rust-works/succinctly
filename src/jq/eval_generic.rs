@@ -769,26 +769,41 @@ pub fn to_owned_all_cursors<'a, S: EvalSemantics, C: DocumentCursor + 'a>(
 /// once is built once and shared (#3477).
 ///
 /// `[., .] as $a` held two whole copies of the document where jq holds one
-/// `jv` twice. Sharing is keyed by node id, never by value, so two distinct
-/// nodes that happen to be equal stay separate. Only containers are
-/// remembered: a scalar is cheaper to rebuild than to look up, and a
-/// container is where the copy costs anything. Every cursor here comes from
-/// one document, so an id names one node.
+/// `jv` twice. Sharing is keyed by (document, node), never by value, so two
+/// distinct nodes that happen to be equal stay separate, and a node id from
+/// one document can never stand in for another's. A first pass finds the
+/// repeated nodes from their ids alone; a sequence that names each node once
+/// (the common case) takes the plain path with no map, and only a repeated
+/// container is remembered while building. A scalar is cheaper to rebuild
+/// than to look up.
 fn to_owned_all_cursors_shared<S: EvalSemantics, C: DocumentCursor>(
     cursors: &[C],
 ) -> Result<Vec<OwnedValue>, EvalError> {
-    let mut built: alloc::collections::BTreeMap<usize, OwnedValue> =
+    let mut keys: Vec<(usize, usize)> = vec_with_capacity(cursors.len());
+    keys.extend(cursors.iter().map(|c| (c.document_token(), c.node_id())));
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    let repeated: alloc::collections::BTreeSet<(usize, usize)> = sorted
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0])
+        .collect();
+    drop(sorted);
+    if repeated.is_empty() {
+        return to_owned_all_cursors::<S, _>(cursors);
+    }
+    let mut built: alloc::collections::BTreeMap<(usize, usize), OwnedValue> =
         alloc::collections::BTreeMap::new();
     let mut out = vec_with_capacity(cursors.len());
-    for cursor in cursors {
-        let id = cursor.node_id();
-        if let Some(shared) = built.get(&id) {
+    for (cursor, key) in cursors.iter().zip(keys) {
+        if let Some(shared) = built.get(&key) {
             out.push(shared.clone());
             continue;
         }
         let value = to_owned_cursor::<S, _>(cursor)?;
-        if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
-            built.insert(id, value.clone());
+        if repeated.contains(&key) && matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_))
+        {
+            built.insert(key, value.clone());
         }
         out.push(value);
     }
@@ -2432,6 +2447,9 @@ enum LazySource<V: DocumentValue> {
         /// `JqSemantics` when it was collected (#3317's `,` producer), so
         /// the jq printer need not walk it a second time -- see
         /// [`LazySeq::is_prevalidated`]. `false` for every other producer.
+        /// It also marks the one source that may name a node twice
+        /// (`[., .]`), so materializing it shares a repeated container
+        /// (#3477).
         /// Kept on this variant rather than on `LazySeq` so the struct's
         /// pinned size (`test_lazyseq_size_is_pinned_1973`) does not grow.
         validated: bool,
@@ -39360,10 +39378,27 @@ mod tests {
             assert_eq!(out, [want], "{query}");
             assert_eq!(reindexes, 0, "{query} reindexed");
         }
+        // yq's bridge is a different entry point; it must not reindex either.
+        let before = crate::jq::value::reindex_count::get();
+        let (out, control) =
+            drive_each_sink::<YqSemantics>(doc.as_bytes(), "[.] as $a | $a | length");
+        assert!(control.is_none(), "{control:?}");
+        assert_eq!(
+            out.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+            ["1"]
+        );
+        assert_eq!(
+            crate::jq::value::reindex_count::get(),
+            before,
+            "yq reindexed"
+        );
     }
 
     /// #3477: a comma sequence that names a container node twice builds it
     /// once when it is materialized, and shares by node, never by value.
+    // Storage identity is what `unshared-containers` removes: a clone there
+    // deep-copies, so the pins below would read `false` for the wrong reason.
+    #[cfg(not(feature = "unshared-containers"))]
     #[test]
     fn test_comma_sequence_materialization_shares_a_repeated_node_3477() {
         let doc = r#"{"a":{"x":1},"b":{"x":1},"c":[1,2]}"#;
