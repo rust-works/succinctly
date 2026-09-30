@@ -625,9 +625,23 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     - 30 MB: `[., .]` 618 → 166 MB.
     - Controls (`.`, `[.]`, `[.[]]`, per-record `[.name, .age]`) are neutral.
     - Accepted cost: a consumer that materializes the array pays the validation walk on top
-      of the build. `validate_cursor` allocates each key into its collision map, so on small
-      objects it costs nearly what building does: `[., .] | tojson` +25%,
+      of the build. `validate_cursor` allocated each key into its collision map, so on small
+      objects it cost nearly what building does: `[., .] | tojson` +25%,
       `[., .] as $a | …` +40%, `.data | map([., .])` +60%.
+    - **Cheaper validation** ([#3478](https://github.com/rust-works/succinctly/issues/3478),
+      Option 1): the check-only walk no longer builds what it drops. It keeps no key map
+      until an undecodable key appears (`LazyKeyLedger`: a collision needs a fallback
+      spelling on one side, so a well-formed object never needs one; the first fallback key
+      seeds it from the members before it), and it decodes each scalar through the same
+      chain the build uses (`scalar_to_owned`) without allocating the string or converting
+      the number literal. The walk itself is unchanged (`validate_cursor_agrees_with_to_owned_cursor_3156`,
+      the fallback-key matrix, and a differential run over random damaged documents pin it).
+      **Measured** (Apple M5 Max, interleaved, min of 9, 1/4/10 MB, output identical, peak RSS
+      unchanged or lower): `[., .] | length` −37%/−39%/−42%, `[., .] | tojson | length`
+      −8%/−9%/−10%, `[., .] as $a | $a | length` −11%/−14%/−14%, `.data | map([., .]) | length`
+      −17%/−19%/−21%; controls (`.`, `[.]`, `. | tojson`, `[.data[]]`) within ±2%. What is
+      left of the +25-60% is the duplicate walk itself, which only a consumer that skips it
+      (validate-on-materialize, #3478's Option 4) can remove.
     - Residual: an all-scalar body over many nodes holds its cursor list while the values
       are built, so `[.[0], .[]] | length` over 300k strings peaks at 74 MB instead of
       64 MB, with neutral time.

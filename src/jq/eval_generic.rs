@@ -49,6 +49,7 @@ use super::document::{
     key_display_string_kind, key_hash, key_is_malformed, resolve_display_key, tail_gap_ok,
     trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
     DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
+    LazyKeyLedger,
 };
 use super::error::EvalEscape;
 use super::eval::{
@@ -622,8 +623,25 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         // #2358: same reasoning as the object arm's own check above.
         tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
         Ok(OwnedValue::array_from(items))
-    // Then check scalars in order of specificity
-    } else if value.is_null() {
+    } else {
+        scalar_to_owned::<S, V>(value, true)
+    }
+}
+
+/// The scalar half of [`to_owned_at_depth`]: `value` is known not to be a
+/// container. `keep` is whether the caller wants the value or only whether it
+/// decodes -- `false` answers the same `Ok`/`Err` through the same accessors
+/// in the same order, but hands back a bare `Null` where the value would have
+/// cost an allocation (a string) or a number-literal conversion, which is all
+/// [`validate_cursor`]'s walk would do with it before dropping it (#3478).
+/// One chain, so the two can never disagree about which scalars raise.
+#[inline(always)]
+fn scalar_to_owned<S: EvalSemantics, V: DocumentValue>(
+    value: &V,
+    keep: bool,
+) -> Result<OwnedValue, EvalError> {
+    // Check scalars in order of specificity.
+    if value.is_null() {
         Ok(OwnedValue::Null)
     } else if let Some(b) = value.as_bool() {
         Ok(OwnedValue::Bool(b))
@@ -635,7 +653,11 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         // threshold; see `DocumentValue::bridge_computed_float`.
         Ok(OwnedValue::Float(f))
     } else if let Some(literal) = value.number_literal() {
-        Ok(OwnedValue::from_number_literal::<S>(&literal))
+        Ok(if keep {
+            OwnedValue::from_number_literal::<S>(&literal)
+        } else {
+            OwnedValue::Null
+        })
     } else if let Some(i) = value.as_i64() {
         Ok(OwnedValue::Int(i))
     } else if let Some(f) = document_number_f64_generic::<S, V>(value) {
@@ -647,9 +669,17 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         // jq still reads that span's decimal through its 17-digit rounding
         // (#2936), which is why the double comes from the mode-aware
         // accessor rather than the plain `as_f64()`.
-        Ok(document_float_to_owned::<S, V>(value, f))
+        Ok(if keep {
+            document_float_to_owned::<S, V>(value, f)
+        } else {
+            OwnedValue::Null
+        })
     } else if let Some(s) = value.as_str() {
-        Ok(OwnedValue::String(s.into_owned().into()))
+        Ok(if keep {
+            OwnedValue::String(s.into_owned().into())
+        } else {
+            OwnedValue::Null
+        })
     } else if let Some(reason) = value.string_decode_error() {
         // The case this function used to swallow. `as_str` above answered
         // `None`, but the value *is* a string token -- its bytes just don't
@@ -915,12 +945,14 @@ fn nesting_depth_check(depth: usize) -> Result<(), EvalError> {
 ///
 /// The same walk, not a re-derivation of it: `to_owned_cursor_at_depth` is
 /// generic over what it assembles, and this instantiates it with
-/// `CheckOnly`, which keeps containers as `()` (an `IndexMap<String, ()>`
-/// for the key-collision rules, a zero-sized `Vec`) and drops each scalar as
-/// soon as it has decoded. So the answer is `to_owned_cursor`'s `Ok`/`Err`,
-/// by construction -- the property #2066's first, hand-written check lacked
-/// -- while memory stays at the depth of the walk rather than the size of the
-/// value. Unlike `to_owned_cursor` it never hands back an embedded binding's
+/// `CheckOnly`, which keeps containers as `()` (a zero-sized `Vec`, and no key
+/// map until an undecodable key needs the #1642 collision rules --
+/// [`LazyKeyLedger`], #3478) and decodes each scalar through the same chain
+/// without building it (`scalar_to_owned`). So the answer is
+/// `to_owned_cursor`'s `Ok`/`Err`, by construction -- the property #2066's
+/// first, hand-written check lacked -- while memory stays at the depth of the
+/// walk rather than the size of the value, and a well-formed document
+/// allocates nothing per key or per scalar. Unlike `to_owned_cursor` it never hands back an embedded binding's
 /// value: there is nothing to hand back, and walking is what decides.
 pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Result<(), EvalError> {
     let result = to_owned_cursor_at_depth::<S, _, CheckOnly>(
@@ -940,6 +972,10 @@ pub fn validate_cursor<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Resul
 /// walk -- every check, in the same order -- is the same for both.
 trait CursorWalkOutput {
     type Out;
+    /// Whether the walk keeps the members it reads. `false` lets the object
+    /// arm skip the per-key `String` and the per-object collision map, which
+    /// are all a walk that builds nothing would spend them on (#3478).
+    const KEEPS_MEMBERS: bool;
     fn object(map: IndexMap<String, Self::Out>) -> Self::Out;
     fn array(items: Vec<Self::Out>) -> Self::Out;
     fn scalar(value: OwnedValue) -> Self::Out;
@@ -961,6 +997,7 @@ struct BuildOwned;
 
 impl CursorWalkOutput for BuildOwned {
     type Out = OwnedValue;
+    const KEEPS_MEMBERS: bool = true;
     fn object(map: IndexMap<String, OwnedValue>) -> OwnedValue {
         OwnedValue::Object(map.into())
     }
@@ -987,6 +1024,7 @@ struct CheckOnly;
 
 impl CursorWalkOutput for CheckOnly {
     type Out = ();
+    const KEEPS_MEMBERS: bool = false;
     fn object(_: IndexMap<String, ()>) {}
     fn array(_: Vec<()>) {}
     fn scalar(_: OwnedValue) {}
@@ -1013,6 +1051,11 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut guard = DisplayKeyGuard::default();
+        // #3478: the collision bookkeeping of a walk that keeps no members
+        // (`CheckOnly`), lazy until an undecodable key appears; `map` and
+        // `guard` are the `BuildOwned` walk's.
+        let mut ledger = LazyKeyLedger::default();
+        let mut consumed = 0usize;
         let mut f = fields;
         let mut is_first = true;
         // #2243: the last real field's own cursor, retained past the loop so
@@ -1033,7 +1076,12 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             // conversions were copies of each other, and a fix that moved
             // only one would leave the cursor and value domains disagreeing
             // about whether a document is valid.
-            let key = field.checked_key(&f, &map, &mut guard, is_first)?;
+            let key = if B::KEEPS_MEMBERS {
+                field.checked_key(&f, &map, &mut guard, is_first)?
+            } else {
+                field.checked_key_lazy(&f, || value.as_object(), consumed, &mut ledger)?;
+                String::new()
+            };
             let child = match embed_shared_nested::<_, B>(&field.value_cursor, depth + 1, nested) {
                 Some(child) => child,
                 None => to_owned_cursor_at_depth::<S, _, B>(
@@ -1055,10 +1103,13 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                     watched.push((node, OwnedValue::String(key.clone().into())));
                 }
             }
-            map.insert(key, child);
+            if B::KEEPS_MEMBERS {
+                map.insert(key, child);
+            }
             last_field = Some(field.value_cursor);
             f = rest;
             is_first = false;
+            consumed += 1;
         }
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
@@ -1135,9 +1186,15 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
                 // takes precedence: a tag-forced type is a stronger,
                 // narrower signal than the document's own source format.
                 if cursor.canonicalize_numbers() {
-                    value
-                        .number_literal()
-                        .map(|literal| OwnedValue::from_number_literal_plain(&literal))
+                    value.number_literal().map(|literal| {
+                        // Infallible either way, so a walk that keeps
+                        // nothing (#3478) skips the conversion.
+                        if B::KEEPS_MEMBERS {
+                            OwnedValue::from_number_literal_plain(&literal)
+                        } else {
+                            OwnedValue::Null
+                        }
+                    })
                 } else {
                     None
                 }
@@ -1147,8 +1204,19 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             // being in scope -- `value` is already proven scalar by this
             // point (the caller's own container arms above return before
             // reaching this `else`), so `to_owned_at_depth`'s `cursor`
-            // parameter is never consulted on this path.
-            None => to_owned_at_depth::<S, _>(&value, None, depth).map(B::scalar),
+            // parameter is never consulted on this path. Its depth check
+            // still runs, since `check_depth` above is the caller's own
+            // contract and may be laxer; `scalar_to_owned` is what follows
+            // it there, and a walk that keeps nothing (#3478) asks it not to
+            // build what it would drop.
+            None => {
+                if depth >= MAX_NESTING_DEPTH {
+                    return Err(EvalError::decode_failure(
+                        super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
+                    ));
+                }
+                scalar_to_owned::<S, _>(&value, B::KEEPS_MEMBERS).map(B::scalar)
+            }
         }
     }
 }
@@ -39428,6 +39496,16 @@ mod tests {
             r#"["\ud800"]"#,
             r#"[{"a":{"b":[tru]}}]"#,
             "[1, 2, 3",
+            // #3478: scalars the check-only walk decodes without building.
+            "[1e999, -0, 0.1e-999, 123456789012345678901234567890, -1.5E+3]",
+            r#"["é\u00e9", "\ud83d\ude00", "", "a\nb"]"#,
+            r#"["\ud83d"]"#,
+            r#"["ok", "\udc00x"]"#,
+            r#"{"a":[true,false,null,"s",1,2.5]}"#,
+            "[nul]",
+            "[01]",
+            "[.5]",
+            "[+1]",
         ]
         .iter()
         .map(|d| (*d).to_string())
@@ -39442,6 +39520,214 @@ mod tests {
                 .map_err(|e| e.message);
             let checked = validate_cursor::<JqSemantics, _>(&cursor).map_err(|e| e.message);
             assert_eq!(checked, built, "validate_cursor disagrees on {doc}");
+        }
+    }
+
+    /// #3478: `validate_cursor` keeps no key map until an undecodable key
+    /// appears, then seeds it from the members before that key. The answer
+    /// must stay `to_owned_cursor`'s over every place a fallback key can sit
+    /// against clean keys and against errors, in both arrival orders.
+    #[test]
+    fn validate_cursor_lazy_key_ledger_agrees_with_to_owned_cursor_3478() {
+        // `(doc, collides)`: whether the eager build raises the #1642
+        // collision, so a vacuous `Ok == Ok` cannot pass for a case meant to
+        // raise.
+        let mut docs: Vec<(String, bool)> = [
+            // Two fallback keys with one spelling.
+            (r#"{"\ud800":1,"\ud800":2}"#, true),
+            // A fallback key alone, first, last, and among clean keys.
+            (r#"{"\ud800":1}"#, false),
+            (r#"{"\ud800":1,"a":2}"#, false),
+            (r#"{"a":1,"\ud800":2}"#, false),
+            (r#"{"a":1,"\ud800":2,"b":3}"#, false),
+            // Ordinary repeats still overwrite; a fallback after them is fine.
+            (r#"{"a":1,"b":2,"a":3,"\ud800":4}"#, false),
+            (r#"{"a":1,"\u0061":2}"#, false),
+            // The collision comes after the seed and a clean key in between.
+            (r#"{"a":1,"\ud800":2,"b":3,"\ud800":4}"#, true),
+            (r#"{"\ud800":1,"a":2,"b":3,"\ud800":4}"#, true),
+            // A fallback spelling meeting a clean key spelled the same, in
+            // each order.
+            (r#"{"\\ud800":1,"\ud800":2}"#, true),
+            (r#"{"\ud800":1,"\\ud800":2}"#, true),
+            // Nested, and inside an array.
+            (r#"{"x":{"a":1,"\ud800":2,"\ud800":3}}"#, true),
+            (r#"[{"a":1},{"\ud800":2,"\ud800":3}]"#, true),
+            // Error order: a value's failure at an earlier field beats a
+            // collision at a later one, and a malformed key after the seed
+            // still raises as malformed.
+            (r#"{"\ud800":1,"x":xyz123,"\ud800":2}"#, false),
+            (r#"{"\ud800":1,123:2}"#, false),
+            (r#"{"a":1,"\ud800":2 "b":3}"#, false),
+            (r#"{"\ud800":1,"\ud800":2,}"#, true),
+        ]
+        .iter()
+        .map(|(d, c)| ((*d).to_string(), *c))
+        .collect();
+        // Many clean keys before the fallback: the seeding walk covers them.
+        let many: String = (0..64).map(|i| format!(r#""k{i}":{i},"#)).collect();
+        docs.push((format!(r#"{{{many}"\ud800":1,"k7":9,"\ud800":2}}"#), true));
+        docs.push((format!(r#"{{{many}"k3":1,"\ud800":2}}"#), false));
+        // A clean key that only the seeded prefix knows collides with a late
+        // fallback spelled like it.
+        docs.push((format!(r#"{{"\\ud800":0,{many}"\ud800":2}}"#), true));
+        for (doc, collides) in &docs {
+            let index = JsonIndex::build(doc.as_bytes());
+            let cursor = index.root(doc.as_bytes());
+            let built = to_owned_cursor::<JqSemantics, _>(&cursor)
+                .map(|_| ())
+                .map_err(|e| e.message);
+            let checked = validate_cursor::<JqSemantics, _>(&cursor).map_err(|e| e.message);
+            assert_eq!(checked, built, "validate_cursor disagrees on {doc}");
+            if *collides {
+                let message = built.expect_err(doc);
+                assert!(message.contains("ambiguous"), "{doc}: {message}");
+            }
+        }
+    }
+
+    /// #3478: a differential run, since a hand-picked matrix is biased toward
+    /// the cases its author thought of. Random documents over a key alphabet
+    /// with undecodable spellings, clean duplicates and a fallback spelled
+    /// like a clean key, then damaged at random byte positions: the check-only
+    /// walk must answer as the building walk does, message included.
+    #[test]
+    fn validate_cursor_agrees_with_to_owned_cursor_on_random_documents_3478() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % n as u64) as usize
+            }
+        }
+        const KEYS: &[&str] = &[
+            r#""a""#,
+            r#""b""#,
+            r#""a""#,
+            r#""\ud800""#,
+            r#""\\ud800""#,
+            r#""\udc00""#,
+            r#""k""#,
+        ];
+        const SCALARS: &[&str] = &[
+            "1",
+            "2.5",
+            "-0",
+            "1e999",
+            "null",
+            "true",
+            "false",
+            r#""s""#,
+            r#""\q""#,
+            r#""\ud800""#,
+            r#""é""#,
+        ];
+        fn gen(rng: &mut Rng, depth: usize, out: &mut String) {
+            match if depth > 3 { 0 } else { rng.next(3) } {
+                0 => out.push_str(SCALARS[rng.next(SCALARS.len())]),
+                1 => {
+                    out.push('{');
+                    for i in 0..rng.next(6) {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(KEYS[rng.next(KEYS.len())]);
+                        out.push(':');
+                        gen(rng, depth + 1, out);
+                    }
+                    out.push('}');
+                }
+                _ => {
+                    out.push('[');
+                    for i in 0..rng.next(4) {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        gen(rng, depth + 1, out);
+                    }
+                    out.push(']');
+                }
+            }
+        }
+        const DAMAGE: &[&str] = &[",", ":", "x", "{", "}", "[", "]", "\"", "\\", " "];
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut errs, mut collisions) = (0usize, 0usize);
+        for _ in 0..4000 {
+            let mut doc = String::new();
+            gen(&mut rng, 0, &mut doc);
+            for _ in 0..rng.next(3) {
+                // Byte positions on char boundaries only, so it stays a `str`.
+                let at = (0..=doc.len())
+                    .filter(|i| doc.is_char_boundary(*i))
+                    .nth(rng.next(doc.chars().count() + 1))
+                    .unwrap_or(0);
+                if rng.next(2) == 0 {
+                    doc.insert_str(at, DAMAGE[rng.next(DAMAGE.len())]);
+                } else if at < doc.len() {
+                    doc.remove(at);
+                }
+            }
+            let index = JsonIndex::build(doc.as_bytes());
+            let cursor = index.root(doc.as_bytes());
+            // An unterminated string (`["s]]`) panics in the JSON string
+            // accessor whichever walk reaches it (the CLI catches that and
+            // reports invalid JSON), so a panic is an outcome the two walks
+            // must share too, not a document to skip.
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                to_owned_cursor::<JqSemantics, _>(&cursor)
+                    .map(|_| ())
+                    .map_err(|e| e.message)
+            }));
+            let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                validate_cursor::<JqSemantics, _>(&cursor).map_err(|e| e.message)
+            }));
+            assert_eq!(
+                checked.is_err(),
+                built.is_err(),
+                "one walk panics and the other does not on {doc}"
+            );
+            let (Ok(built), Ok(checked)) = (built, checked) else {
+                continue;
+            };
+            assert_eq!(checked, built, "validate_cursor disagrees on {doc}");
+            errs += usize::from(built.is_err());
+            collisions += usize::from(built.as_ref().is_err_and(|m| m.contains("ambiguous")));
+        }
+        // The run must reach both outcomes and the collision path, or it
+        // proved nothing.
+        assert!(errs > 200, "too few failing documents: {errs}");
+        assert!(collisions > 20, "too few collisions: {collisions}");
+    }
+
+    /// #3478: the same, over YAML, whose complex keys are flagged as
+    /// fallbacks too (#2519) and so meet the ledger's seeding path.
+    #[test]
+    fn validate_cursor_lazy_key_ledger_agrees_over_yaml_3478() {
+        use crate::yaml::YamlIndex;
+
+        for (doc, collides) in [
+            ("? [1]\n: v1\n? [2]\n: v2\n", true),
+            ("a: 1\n? [1]\n: v1\nb: 2\n", false),
+            ("a: 1\nb: 2\n? [1]\n: v1\n? [2]\n: v2\n", true),
+            ("x:\n  ? [1]\n  : v1\n  ? [2]\n  : v2\n", true),
+            ("a: 1\na: 2\n", false),
+            // A clean key spelled like the complex key's `""` fallback: the
+            // collision is only visible through the seeded prefix.
+            ("\"\": 1\n? [1]\n: v1\n", true),
+            ("? [1]\n: v1\n\"\": 1\n", true),
+        ] {
+            let index = YamlIndex::build(doc.as_bytes()).unwrap();
+            let cursor = index.root(doc.as_bytes());
+            // The document wrapper's first child is the mapping itself.
+            let cursor = cursor.first_child().expect("a document with content");
+            let built = to_owned_cursor::<YqSemantics, _>(&cursor)
+                .map(|_| ())
+                .map_err(|e| e.message);
+            let checked = validate_cursor::<YqSemantics, _>(&cursor).map_err(|e| e.message);
+            assert_eq!(checked, built, "validate_cursor disagrees on {doc:?}");
+            assert_eq!(built.is_err(), collides, "{doc:?}: {built:?}");
         }
     }
 
