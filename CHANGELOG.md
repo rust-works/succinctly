@@ -425,8 +425,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an input. A 7,128-shape differential sweep against jq 1.7.1 went from 1,615
   divergences to none. yq mode is unchanged. A right side with several outputs
   decodes the input twice, not once; a single-output `.users[0].name = "x"` on
-  a 7 MB document is 37% faster and peaks 32% lower on an Apple M5 Max, and the
-  other assignment shapes measured are within noise (x86_64 not measured).
+  a 7 MB document is 32-38% faster and peaks 23-32% lower on an Apple M4 Pro
+  and a Ryzen 9 7950X. `|=` over many targets reads its first output through
+  the demand-driven route, which costs 1-4% on the 7950X and nothing
+  measurable on the M4 Pro; the other shapes measured are within noise.
 
 - **Deep recursion refuses instead of overflowing the stack, whatever its
   shape** (#3262, #3294, ADR-0025). The recursion guard counted the structure

@@ -4480,14 +4480,27 @@ output takes the input document by move, the second decodes it once more, and la
 clone that copy (two decodes however many outputs, not one per output); the streaming
 route's per-output spine copy is charged once per output rather than once per extra output
 (`.[(0,1)] = (1,2)` copies the spine twice, where it copied once). A single-output right side
-takes the input by move, as before, and `.users[0].id = range(N)` scales linearly in N. Measured on a 7 MB generated `users` document (release,
-interleaved, 15 repetitions, outputs identical, Apple M5 Max under other sessions' load; a
-control run of the same binary against itself spans -2.5% to +1.7% on minimum and -9.5% to
-+10.3% on median): `.users[0].name = "x"` and `.users[0].name //= "y"` fall 319 -> 198 ms and
-365 -> 230 ms (-37%) and peak RSS 117 -> 80 MB (-32%); `.users[].score |= . + 1`, `+= 1`,
-`.users[(0,1)].score = 0`, `.users[0].id = (1,2)` and `(.users[] | select(.age > 30)).score
-|= . + 1` move -1.8% to +2.8% on minimum (medians inside the control's band) and by at most
-2.4 MB on peak RSS. x86_64 is not measured.
+takes the input by move, as before, and `.users[0].id = range(N)` scales linearly in N.
+
+Measured on a 7 MB generated `users` document (release, interleaved, 15 repetitions, outputs
+identical, minimum wall time; a control run of the same binary against itself stays within
+-1.5%..+2.2% on both boxes below):
+
+| filter                                            | M4 Pro           | Ryzen 9 7950X    |
+|---------------------------------------------------|------------------|------------------|
+| `.users[0].name = "x"`                            | -37.6%           | -32.0%           |
+| `.users[0].name //= "y"`                          | -35.8%           | -32.8%           |
+| `.users[0].name = "x"`, peak RSS                  | 115.6 -> 79.6 MB | 113.9 -> 87.8 MB |
+| `.users[].score \|= . + 1`                        | +1.1%            | +1.1%..+2.2%     |
+| `(.users[] \| select(.age > 30)).score \|= . + 1` | -1.3%            | +3.6%..+4.4%     |
+| `.users[].score += 1`                             | -1.2%            | -2.8%..-2.4%     |
+| `.users[0].id = (1,2)`, `.users[(0,1)].score = 0` | +0.2%, +1.1%     | -1.1%, +0.1%     |
+
+Peak RSS is within 0.5 MB of the baseline on every other row on both boxes. The 7950X's two
+`|=` rows are the price of `|=` reading its first output through the demand-driven route
+(a stopping sink over `eval_each_owned`) instead of collecting and dropping the tail; they
+reproduced on a 31-repetition rerun (+3.6% and +1.7%, control within +-1.4%) and the M4 Pro
+does not show them. The same run on an Apple M5 Max under load agreed with the M4 Pro.
 
 ## Reading a path is indexing
 
