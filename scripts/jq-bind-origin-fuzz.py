@@ -86,12 +86,25 @@ import argparse, json, random, subprocess, sys, copy
 
 LEAVES = [1, 1, 2, "s", "s", None, True, False, {"b": 1}, {"b": 1}, [1], [{"b": 1}]]
 
-def doc(rng):
+def doc(rng, empty_p=0.0):
     a = rng.choice(LEAVES)
     d = {"a": copy.deepcopy(a), "c": copy.deepcopy(a) if rng.random() < 0.7 else rng.choice(LEAVES),
          "d": rng.choice(LEAVES), "x": {"a": copy.deepcopy(a), "c": rng.choice(LEAVES)}}
     if rng.random() < 0.3:
         d["arr"] = [copy.deepcopy(a), copy.deepcopy(a), rng.choice(LEAVES)]
+    if empty_p:
+        # #3180: LEAVES holds no empty container, and a bind of one names its
+        # node through a path of its own (`JsonFields`/`JsonElements` keep the
+        # container cursor for it), so the stock document never reaches it.
+        # Off by default so existing seeds keep their stream; the empties are
+        # equal-valued siblings, the shape where a wrong node is a wrong write.
+        if rng.random() < empty_p:
+            e = rng.choice([{}, []])
+            for holder, key in ((d, "a"), (d, "c"), (d["x"], "a")):
+                if rng.random() < 0.7:
+                    holder[key] = copy.deepcopy(e)
+            if "arr" in d and rng.random() < 0.7:
+                d["arr"][rng.randrange(3)] = copy.deepcopy(e)
     return d
 
 # Binding sources: (source, needs_prev) where `$p` is the previous binding.
@@ -614,6 +627,10 @@ def main():
                     help="probability a program is a positional-bind program (#3134): a navigated "
                          "bind used below the resolver's root. Off by default so existing seeds "
                          "keep their stream; run at 1.0 to weight the sweep onto the mint")
+    ap.add_argument("--empty-p", type=float, default=0.0,
+                    help="probability a document holds equal-valued empty `{}`/`[]` siblings "
+                         "(#3180). The stock leaves have none, so the empty-container bind is "
+                         "unreachable by default -- run at 1.0 to weight the sweep onto it")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     pin = open("tests/data/jq-golden/JQ_VERSION").read().strip()
@@ -650,7 +667,7 @@ def main():
     counts = {k: 0 for k in kinds}
     examples = {k: [] for k in kinds}
     for _ in range(a.n):
-        dv = doc(rng)
+        dv = doc(rng, a.empty_p)
         d = json.dumps(dv)
         r = rng.random()
         if a.positional_bind_p and rng.random() < a.positional_bind_p:

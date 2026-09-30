@@ -1516,25 +1516,29 @@ is the revert that established what the other one costs.
    navigated-bind twins (`input | .a as $y | {k:.a} | .k | path($y)` and the `($y.b) = 9`
    write) — pinned in
    `test_owned_embed_keeps_node_identity_on_the_input_bridge_2889`. Three residuals were
-   left, all specific to this route; two are closed since. What still refuses on it, bare
-   or collected into an array, where jq and the generic route answer, is pinned in
-   `test_input_bridge_embed_residuals_refuse_cleanly_2889`: the empty container below and a
-   scalar root (`input | . as $x | [.] | .[0] | path($x)` on `1`, which never enters the
-   embed table on this route). A *second* construct-and-navigate hop after the embed
+   left, all specific to this route; all three are closed since. What still refuses on it,
+   bare or collected into an array, where jq and the generic route answer, is pinned in
+   `test_input_bridge_embed_residuals_refuse_cleanly_2889`: a scalar root
+   (`input | . as $x | [.] | .[0] | path($x)` on `1`, which never enters the embed table on
+   this route). A *second* construct-and-navigate hop after the embed
    (`input | . as $x | {k:.} | .k | {j:.} | .j | path($x)`), whose first hop's re-entry
    bridged `{j:.}` into a document the table knew nothing of, answers since #3069: the
    bridge hands `$x`'s storage back out.
-   - An **empty container** (`input | . as $x | {k:.} | .k | path($x)` on `{}` or `[]`)
-     binds no node at all: `whole_container_cursor` has no retained child cursor to hop
-     `parent()` from, so the table never gets an entry. jq answers `[]`; the generic
-     evaluator, handed a real cursor rather than one recovered after the fact, answers it
-     since #3180's first stage (its embed gate had asked `is_container()`, which the JSON
-     cursor answers as "has children", `false` for an empty `{}`/`[]`; it now does the
-     exact node lookup for a childless cursor too, pinned in
-     `test_default_route_empty_container_embed_keeps_identity_3180`) — the routes disagree
-     here in the safe direction.
-     Closing it means keeping the container cursor on `JsonFields`/`JsonElements`, which are
-     `Copy` and on the hot iteration path, so it waits on a two-architecture measurement
+   - *Closed.* An **empty container** (`input | . as $x | {k:.} | .k | path($x)` on `{}` or
+     `[]`, and a nested `.a as $x` over `{"a":{}}`) bound no node at all:
+     `whole_container_cursor` had no retained child cursor to hop `parent()` from, so the
+     table never got an entry. The generic evaluator answers it since #3180's first stage
+     (its embed gate had asked `is_container()`, which the JSON cursor answers as "has
+     children", `false` for an empty `{}`/`[]`; pinned in
+     `test_default_route_empty_container_embed_keeps_identity_3180`), and this route since
+     its second: a list opened on an empty container keeps the container's own cursor,
+     tagged in the top bit of its BP position so `JsonFields`/`JsonElements` stay one
+     cursor wide, and `whole_container_cursor` answers it (on 64-bit targets only: a
+     narrower target cannot spare the bit, so there the route refuses an empty container,
+     as before #3180). The bridge provenance lookup
+     (#3069) asks the same list for its document, so a second construct-and-navigate hop
+     over an empty container answers on both routes too. Pinned in
+     `test_input_route_empty_container_keeps_embed_identity_3180`
      ([#3180](https://github.com/rust-works/succinctly/issues/3180)).
    - *Closed.* A further re-entry between the embed and the read: collecting the pipe into
      an array (`[input | . as $x | {k:.} | .k | path($x)]`, `[inputs | ...]`) answers since

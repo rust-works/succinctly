@@ -1247,10 +1247,73 @@ pub enum StandardJson<'a, W = Vec<u64>> {
 /// `JsonFields` holds a cursor pointing to the current key (or None if empty).
 /// Each `uncons` returns the (key, value) pair and a new `JsonFields` pointing
 /// to the next key (or empty if no more fields).
-#[derive(Debug)]
 pub struct JsonFields<'a, W = Vec<u64>> {
-    /// Cursor pointing to the current field key, or None if exhausted
-    key_cursor: Option<JsonCursor<'a, W>>,
+    /// The current field key's cursor, or `None` once exhausted -- **or**,
+    /// for an object that was empty from the start, that object's own
+    /// cursor with [`EMPTY_CONTAINER_TAG`] set in its `bp_pos` (#3180).
+    ///
+    /// Never read directly: navigation goes through
+    /// [`current`](Self::current), which sees a tagged slot as `None`, and
+    /// only [`whole_container_cursor`](Self::whole_container_cursor) asks for
+    /// the tagged container, through [`empty_container`](Self::empty_container).
+    slot: Option<JsonCursor<'a, W>>,
+}
+
+/// The `bp_pos` bit a [`JsonFields`]/[`JsonElements`] slot sets to mean "this
+/// list is an *empty* container, and the cursor is the container's own"
+/// (#3180).
+///
+/// A list keeps a *child* cursor, so an empty `{}`/`[]` used to keep nothing
+/// at all, and `jq::eval`'s bind sites could not name its node. Holding the
+/// container cursor next to the slot would grow both `Copy` types by a word
+/// on the hottest JSON iteration path; the top bit of a BP position is free
+/// instead (a BP vector that long does not fit in the address space on a
+/// 64-bit target), so the tag costs no bytes.
+///
+/// On a target narrower than 64 bits the bit is *not* free -- a real child's
+/// position can reach it on a multi-GiB input, and [`slot_current`] would
+/// then read that child as the end of its list and silently truncate the
+/// iteration. There the tag is `0`, [`TAGGING`] is off, and an empty
+/// container is stored as plain `None`: an under-report (its bind names no
+/// node, exactly as before #3180), never a wrong answer.
+const EMPTY_CONTAINER_TAG: usize = if TAGGING { 1 << (usize::BITS - 1) } else { 0 };
+
+/// Whether [`EMPTY_CONTAINER_TAG`] may be used: only where the top bit of a
+/// BP position cannot belong to a real node.
+const TAGGING: bool = usize::BITS >= 64;
+
+// Without tagging the tag must be inert: `slot_current` masks with it.
+const _: () = assert!(TAGGING || EMPTY_CONTAINER_TAG == 0);
+
+/// The slot a freshly opened container's list starts from: its first child,
+/// or the container itself tagged with [`EMPTY_CONTAINER_TAG`] when it has
+/// none. The one place a tag is written; `uncons` builds `rest` from
+/// `next_sibling()`, so an *exhausted* list is plain `None` and never names
+/// the container a suffix of it came from.
+#[inline]
+fn container_slot<W: AsRef<[u64]>>(container: JsonCursor<'_, W>) -> Option<JsonCursor<'_, W>> {
+    container.first_child().or_else(|| {
+        TAGGING.then_some(JsonCursor {
+            bp_pos: container.bp_pos | EMPTY_CONTAINER_TAG,
+            ..container
+        })
+    })
+}
+
+/// A slot's navigable cursor: `None` for a tagged empty container.
+#[inline(always)]
+fn slot_current<W>(slot: Option<JsonCursor<'_, W>>) -> Option<JsonCursor<'_, W>> {
+    slot.filter(|c| c.bp_pos & EMPTY_CONTAINER_TAG == 0)
+}
+
+/// A slot's tagged empty container, untagged; `None` for any other slot.
+#[inline]
+fn slot_empty_container<W>(slot: Option<JsonCursor<'_, W>>) -> Option<JsonCursor<'_, W>> {
+    slot.filter(|c| c.bp_pos & EMPTY_CONTAINER_TAG != 0)
+        .map(|c| JsonCursor {
+            bp_pos: c.bp_pos & !EMPTY_CONTAINER_TAG,
+            ..c
+        })
 }
 
 // Manual Clone/Copy impl since JsonCursor is Copy
@@ -1262,26 +1325,58 @@ impl<W> Clone for JsonFields<'_, W> {
 
 impl<W> Copy for JsonFields<'_, W> {}
 
+/// Prints the decoded slot, so the empty-container tag never shows up as a
+/// huge `bp_pos` in `{:?}` output (#3180). A list that is not an untouched
+/// empty container prints exactly the one field it always did.
+impl<W: core::fmt::Debug> core::fmt::Debug for JsonFields<'_, W> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut shown = f.debug_struct("JsonFields");
+        shown.field("key_cursor", &self.current());
+        if self.empty_container().is_some() {
+            shown.field("empty_container", &true);
+        }
+        shown.finish()
+    }
+}
+
+impl<'a, W> JsonFields<'a, W> {
+    /// The current key's cursor; `None` when exhausted or empty (#3180).
+    #[inline(always)]
+    fn current(&self) -> Option<JsonCursor<'a, W>> {
+        slot_current(self.slot)
+    }
+
+    /// The object's own cursor, when the list is an object that was empty
+    /// from the start (#3180).
+    #[inline]
+    fn empty_container(&self) -> Option<JsonCursor<'a, W>> {
+        slot_empty_container(self.slot)
+    }
+}
+
 impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// Create a new JsonFields from an object cursor.
     fn from_object_cursor(object_cursor: JsonCursor<'a, W>) -> Self {
         Self {
-            key_cursor: object_cursor.first_child(),
+            slot: container_slot(object_cursor),
         }
     }
 
     /// Check if there are no more fields.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.key_cursor.is_none()
+        self.current().is_none()
     }
 
-    /// The document text the retained child cursor reads, or `None` for an
-    /// empty list -- no BP work, unlike [`whole_container_cursor`](Self::whole_container_cursor),
+    /// The document text the retained cursor reads, or `None` for an
+    /// exhausted list -- no BP work, unlike [`whole_container_cursor`](Self::whole_container_cursor),
     /// so a caller that only needs to know *which* document a list belongs
-    /// to can ask before paying for the hop (#3069).
+    /// to can ask before paying for the hop (#3069). A list that was empty
+    /// from the start keeps its container's cursor (#3180), so it answers
+    /// that container's document, as `whole_container_cursor` answers its
+    /// node.
     pub(crate) fn document_text(&self) -> Option<&'a [u8]> {
-        self.key_cursor.map(|c| c.text)
+        self.slot.map(|c| c.text)
     }
 
     /// The cursor of the object this field list belongs to, but **only**
@@ -1298,17 +1393,21 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// whole object for it would claim a node identity the value does not
     /// have.
     ///
-    /// `None` for an empty object (nothing retained to hop from) and for any
-    /// advanced list. Both are under-reports: a caller that needs a node
-    /// identity simply does without one, which costs an acceptance, never a
-    /// wrong answer.
+    /// An object that was empty from the start retains no child to hop from;
+    /// its list keeps the object's own cursor tagged instead (#3180), and
+    /// that is what this answers for it. `None` for any advanced list -- an
+    /// under-report: a caller that needs a node identity simply does without
+    /// one, which costs an acceptance, never a wrong answer.
     ///
     /// `pub(crate)`: this exists for `jq::eval`'s bind sites, which have no
     /// cursor of their own to consult, and is not a shape for this type's
     /// public iteration API to grow.
     #[inline]
     pub(crate) fn whole_container_cursor(&self) -> Option<JsonCursor<'a, W>> {
-        let child = self.key_cursor?;
+        if let Some(container) = self.empty_container() {
+            return Some(container);
+        }
+        let child = self.current()?;
         let container = child.parent()?;
         (container.first_child()?.bp_pos == child.bp_pos).then_some(container)
     }
@@ -1336,7 +1435,7 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// [`ends_unpaired`](Self::ends_unpaired) where only the answer matters.
     #[inline]
     pub fn unpaired_tail(&self) -> Option<JsonCursor<'a, W>> {
-        let key_cursor = self.key_cursor?;
+        let key_cursor = self.current()?;
         match key_cursor.next_sibling() {
             Some(_) => None,
             None => Some(key_cursor),
@@ -1361,14 +1460,14 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// [`ends_unpaired`](Self::ends_unpaired); see #1194 for why the
     /// distinction is not folded into this return type.
     pub fn uncons(&self) -> Option<(JsonField<'a, W>, Self)> {
-        let key_cursor = self.key_cursor?;
+        let key_cursor = self.current()?;
 
         // Next sibling of key is the value
         let value_cursor = key_cursor.next_sibling()?;
 
         // The rest starts at the value's next sibling (the next key, if any)
         let rest = JsonFields {
-            key_cursor: value_cursor.next_sibling(),
+            slot: value_cursor.next_sibling(),
         };
 
         let field = JsonField {
@@ -1673,10 +1772,11 @@ impl<'a, W: AsRef<[u64]>> JsonField<'a, W> {
 /// `JsonElements` holds a cursor pointing to the current element (or None if empty).
 /// Each `uncons` returns the element value and a new `JsonElements` pointing
 /// to the next element (or empty if no more elements).
-#[derive(Debug)]
 pub struct JsonElements<'a, W = Vec<u64>> {
-    /// Cursor pointing to the current element, or None if exhausted
-    element_cursor: Option<JsonCursor<'a, W>>,
+    /// The current element's cursor, or `None` once exhausted -- or a tagged
+    /// empty array's own cursor. Same encoding and same reading rules as
+    /// [`JsonFields`]'s slot (#3180).
+    slot: Option<JsonCursor<'a, W>>,
 }
 
 // Manual Clone/Copy impl since JsonCursor is Copy
@@ -1688,32 +1788,62 @@ impl<W> Clone for JsonElements<'_, W> {
 
 impl<W> Copy for JsonElements<'_, W> {}
 
+/// See [`JsonFields`]'s `Debug` (#3180).
+impl<W: core::fmt::Debug> core::fmt::Debug for JsonElements<'_, W> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut shown = f.debug_struct("JsonElements");
+        shown.field("element_cursor", &self.current());
+        if self.empty_container().is_some() {
+            shown.field("empty_container", &true);
+        }
+        shown.finish()
+    }
+}
+
+impl<'a, W> JsonElements<'a, W> {
+    /// See [`JsonFields::current`].
+    #[inline(always)]
+    fn current(&self) -> Option<JsonCursor<'a, W>> {
+        slot_current(self.slot)
+    }
+
+    /// See [`JsonFields::empty_container`].
+    #[inline]
+    fn empty_container(&self) -> Option<JsonCursor<'a, W>> {
+        slot_empty_container(self.slot)
+    }
+}
+
 impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     /// Create a new JsonElements from an array cursor.
     fn from_array_cursor(array_cursor: JsonCursor<'a, W>) -> Self {
         Self {
-            element_cursor: array_cursor.first_child(),
+            slot: container_slot(array_cursor),
         }
     }
 
     /// Check if there are no more elements.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.element_cursor.is_none()
+        self.current().is_none()
     }
 
     /// See [`JsonFields::document_text`].
     pub(crate) fn document_text(&self) -> Option<&'a [u8]> {
-        self.element_cursor.map(|c| c.text)
+        self.slot.map(|c| c.text)
     }
 
     /// The cursor of the array this element list belongs to, but **only**
     /// while the list still stands at that array's first element (#2889) --
     /// [`JsonFields::whole_container_cursor`]'s twin, with the same
-    /// first-child rule, the same reasons for it, and the same `pub(crate)`.
+    /// first-child rule, the same reasons for it, the same answer for an
+    /// array empty from the start (#3180), and the same `pub(crate)`.
     #[inline]
     pub(crate) fn whole_container_cursor(&self) -> Option<JsonCursor<'a, W>> {
-        let child = self.element_cursor?;
+        if let Some(container) = self.empty_container() {
+            return Some(container);
+        }
+        let child = self.current()?;
         let container = child.parent()?;
         (container.first_child()?.bp_pos == child.bp_pos).then_some(container)
     }
@@ -1722,10 +1852,10 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     ///
     /// Returns `None` if there are no more elements.
     pub fn uncons(&self) -> Option<(StandardJson<'a, W>, Self)> {
-        let element_cursor = self.element_cursor?;
+        let element_cursor = self.current()?;
 
         let rest = JsonElements {
-            element_cursor: element_cursor.next_sibling(),
+            slot: element_cursor.next_sibling(),
         };
 
         let value = element_cursor.value();
@@ -1737,10 +1867,10 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     /// This is like `uncons` but returns the cursor instead of the value.
     /// Useful for lazy evaluation where you want to defer calling `value()`.
     pub fn uncons_cursor(&self) -> Option<(JsonCursor<'a, W>, Self)> {
-        let element_cursor = self.element_cursor?;
+        let element_cursor = self.current()?;
 
         let rest = JsonElements {
-            element_cursor: element_cursor.next_sibling(),
+            slot: element_cursor.next_sibling(),
         };
 
         Some((element_cursor, rest))
@@ -1772,7 +1902,7 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     /// This is faster than `get()` which does O(n) IB selects.
     #[inline]
     pub fn get_fast(&self, index: usize) -> Option<StandardJson<'a, W>> {
-        let mut cursor = self.element_cursor?;
+        let mut cursor = self.current()?;
 
         // Navigate to the target element using only BP operations
         for _ in 0..index {
@@ -4228,7 +4358,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
     /// -- there is no cursor to read a document from, and inventing a position
     /// would be worse than saying less.
     fn malformed_member_error(&self) -> EvalError {
-        match self.key_cursor {
+        match self.current() {
             Some(cursor) => EvalError::malformed_json_text(cursor.text()),
             // #2286: decode_failure, not new -- same always-uncatchable tag
             // the cursor-present arm gets via malformed_json_text, so this
@@ -4270,7 +4400,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
     /// [`JsonFields::malformed_member_error`]'s own reasoning (#1194) for
     /// the array delimiter class (#1677).
     fn malformed_element_error(&self) -> EvalError {
-        match self.element_cursor {
+        match self.current() {
             Some(cursor) => EvalError::malformed_json_text(cursor.text()),
             // #2286: same fallback fix as JsonFields::malformed_member_error
             // above.
@@ -9555,5 +9685,132 @@ mod tests {
             other.root(same_bytes).document_token(),
             "two live indices over equal bytes are still two documents"
         );
+    }
+
+    /// #3180: a list opened on an *empty* container names that container
+    /// through `whole_container_cursor` -- the tagged slot -- while every
+    /// navigation reader still sees an empty list. A list that is merely
+    /// *exhausted* or partly consumed names nothing: it is a suffix, not the
+    /// container.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn whole_container_cursor_names_an_empty_container_3180() {
+        fn fields(v: StandardJson<'_>) -> JsonFields<'_> {
+            match v {
+                StandardJson::Object(f) => f,
+                _ => panic!("not an object"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every caller passes an object (#3180)"
+            }
+        }
+        fn elements(v: StandardJson<'_>) -> JsonElements<'_> {
+            match v {
+                StandardJson::Array(e) => e,
+                _ => panic!("not an array"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every caller passes an array (#3180)"
+            }
+        }
+
+        // Empty roots.
+        let json: &[u8] = b"{}";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let f = fields(root.value());
+        assert_eq!(
+            f.whole_container_cursor().map(|c| c.bp_position()),
+            Some(root.bp_position())
+        );
+        assert!(f.is_empty());
+        assert!(f.uncons().is_none());
+        assert!(!f.ends_unpaired());
+        assert!(f.unpaired_tail().is_none());
+        assert!(matches!(f.find("a"), Ok(None)));
+        assert_eq!(f.find_cursor("a").map(|c| c.is_some()), Ok(false));
+        assert_eq!(f.count(), 0);
+        assert_eq!(f.document_text(), Some(json));
+
+        let json: &[u8] = b"[]";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let e = elements(root.value());
+        assert_eq!(
+            e.whole_container_cursor().map(|c| c.bp_position()),
+            Some(root.bp_position())
+        );
+        assert!(e.is_empty());
+        assert!(e.uncons().is_none());
+        assert!(e.uncons_cursor().is_none());
+        assert!(e.get(0).is_none());
+        assert!(e.get_fast(0).is_none());
+        assert_eq!(e.count(), 0);
+        assert_eq!(e.document_text(), Some(json));
+
+        // Nested empty containers: the node named is the child's, not the root's.
+        let json: &[u8] = br#"{"a":{},"b":[]}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let top = fields(root.value());
+        let a = top.find_cursor("a").unwrap().unwrap();
+        let b = top.find_cursor("b").unwrap().unwrap();
+        assert_ne!(a.bp_position(), root.bp_position());
+        let fa = fields(a.value());
+        assert_eq!(
+            fa.whole_container_cursor().map(|c| c.bp_position()),
+            Some(a.bp_position())
+        );
+        assert!(fa.is_empty());
+        let eb = elements(b.value());
+        assert_eq!(
+            eb.whole_container_cursor().map(|c| c.bp_position()),
+            Some(b.bp_position())
+        );
+        assert!(eb.is_empty());
+        // The non-empty root still answers through the first-child hop.
+        assert_eq!(
+            top.whole_container_cursor().map(|c| c.bp_position()),
+            Some(root.bp_position())
+        );
+
+        // Exhausted and partly consumed lists are suffixes: no node.
+        let json: &[u8] = br#"{"a":1}"#;
+        let index = JsonIndex::build(json);
+        let (_, rest) = fields(index.root(json).value()).uncons().unwrap();
+        assert!(rest.is_empty());
+        assert!(rest.whole_container_cursor().is_none());
+        assert!(rest.document_text().is_none());
+        let json: &[u8] = b"[1,2]";
+        let index = JsonIndex::build(json);
+        let (_, rest) = elements(index.root(json).value()).uncons().unwrap();
+        assert!(!rest.is_empty());
+        assert!(rest.whole_container_cursor().is_none());
+        let (_, rest) = rest.uncons().unwrap();
+        assert!(rest.is_empty());
+        assert!(rest.whole_container_cursor().is_none());
+    }
+
+    /// #3180: the empty-container tag never shows in `{:?}` output -- the
+    /// derived impl would have printed the tagged `bp_pos` as a huge number.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn empty_container_debug_hides_the_tag_3180() {
+        let tag = EMPTY_CONTAINER_TAG.to_string();
+        for json in [&b"{}"[..], b"[]", b"{\"a\":1}", b"[1]"] {
+            let index = JsonIndex::build(json);
+            let shown = format!("{:?}", index.root(json).value());
+            assert!(!shown.contains(&tag), "{shown}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- panic-message format argument (#3180)"
+            let empty = json.len() == 2;
+            assert_eq!(shown.contains("empty_container"), empty, "{shown}");
+        }
+    }
+
+    /// #3180: the tag lives in `bp_pos`'s top bit precisely so the list
+    /// types do not grow -- they are `Copy` and on the hottest JSON
+    /// iteration path.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn list_types_stay_one_cursor_wide_3180() {
+        use core::mem::size_of;
+        assert_eq!(size_of::<JsonCursor<'_>>(), 32);
+        assert_eq!(size_of::<Option<JsonCursor<'_>>>(), 32);
+        assert_eq!(size_of::<JsonFields<'_>>(), 32);
+        assert_eq!(size_of::<JsonElements<'_>>(), 32);
+        assert_eq!(size_of::<StandardJson<'_>>(), 40);
     }
 }
