@@ -5223,6 +5223,13 @@ pub fn eval<V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
 
 /// Evaluate an expression against a document value with explicit semantics.
 ///
+/// This entry takes a value, not a cursor, so on a value the index cannot
+/// read (a malformed number such as `1.2.3`, or a keyword such as `tru`) it
+/// answers some filters that never read the value (`1`, `[paths]`) and
+/// raises on others (`not`, `[.] | length`), where
+/// [`eval_with_cursor_using`], the entry the CLI uses, answers all of them
+/// (#3266).
+///
 /// Arithmetic that falls back to the full evaluator (division, modulo, overflow)
 /// follows `S`, so yq keeps yq numeric behavior instead of jq's.
 ///
@@ -6511,6 +6518,17 @@ pub fn eval_with_cursor<C: DocumentCursor>(expr: &Expr, cursor: C) -> GenericRes
 ///
 /// Like [`eval_with_cursor`] but arithmetic follows `S` (jq vs yq), so yq's
 /// modulo/division/overflow behavior is preserved on the cursor path.
+///
+/// `succinctly jq` evaluates through this entry and its streaming twin,
+/// [`eval_each_with_cursor_using`]. It holds the input as a cursor, so a
+/// value the index cannot read (a malformed number such as `1.2.3`, or a
+/// keyword such as `tru`) does not raise under a filter that navigates past
+/// it (`path(.a)`) or wraps it in `[.]`, where [`eval_using`] and
+/// [`crate::jq::eval`](fn@crate::jq::eval) can (#3266). Other collections
+/// (`[., 1]`, `{a: .}`, `. as $x | [$x]`) materialize the value here too, and
+/// raise (#3427). Unlike `crate::jq::eval`, its `path`/`paths`/`leaf_paths`/
+/// `getpath` walkers panic on a document nested deeper than 256 levels
+/// (#3429); the CLI catches that panic.
 ///
 /// Same `takes_input_queue_bridge` condition as [`eval_using`] (#1504),
 /// cursor-metadata carve-out included; see its doc comment for why the
