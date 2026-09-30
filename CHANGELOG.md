@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[., .] as $a | $a | length`. `length` over an owned array or object is now
   answered from the tree, and a comma sequence that names a container node
   twice (`[., .]`) builds it once and shares it, as jq's own `jv` does. Both
-  forms now peak at 112 MB, which is the owned tree the binding holds (release
+  forms now peak at 114 MB, which is the owned tree the binding holds (release
   build, Apple M5 Max; 26 MB to 20 MB at 1 MB, 842 MB to 318 MB at 30 MB for
   `[., .]`). Output is unchanged. Every other consumer of a bound array
   (`.[]`, `first`, `has`, `keys`, `map`, `tojson`) still indexes the whole tree.

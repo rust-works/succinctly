@@ -663,7 +663,7 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
       three of the new bind-origin sweep rows refuse where jq answers `[]` on `main` and
       agree now (`[., .] as $a | $a[0] as $y | $a[1] | path($y)`).
     - **Measured** (release, Apple M5 Max, the box under heavy load, so RSS only): `[.] as
-      $a | $a | length` 168 → 112 MB, `[., .] as $a | $a | length` 294 → 112 MB (1 MB:
+      $a | $a | length` 168 → 114 MB, `[., .] as $a | $a | length` 294 → 114 MB (1 MB:
       26 → 20 and 39 → 20 MB; 30 MB: 457 → 315 and 842 → 318 MB). The residual is the owned
       tree the binding holds.
     - **Not done.** Every other consumer of a bound array (`.[]`, `first`, `has`, `keys`,
