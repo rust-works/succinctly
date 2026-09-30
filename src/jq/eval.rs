@@ -33791,10 +33791,8 @@ fn anchor_component_step<'v>(
             OwnedValue::String(name.clone().into()),
         )),
         (OwnedValue::Array(items), Expr::Index { idx, .. }) => {
-            let len = i64::try_from(items.len()).ok()?;
-            let slot = if *idx < 0 { len + *idx } else { *idx };
-            let item = items.get(usize::try_from(slot).ok()?)?;
-            Some((item, OwnedValue::Int(slot)))
+            let slot = array_slot(items.len(), *idx)?;
+            Some((&items[slot], OwnedValue::Int(i64::try_from(slot).ok()?)))
         }
         _ => None,
     }
@@ -33822,30 +33820,49 @@ fn anchor_component_step<'v>(
 /// [`Frame::names`] certifies, toward jq. With no root recorded (`no_std`, a
 /// scalar root) or a step the walk cannot take, a differing pair refuses.
 fn same_frame_position(invocation: u64, lhs: &Rc<PathPrefix>, rhs: &Rc<PathPrefix>) -> bool {
-    if lhs == rhs {
+    if Rc::ptr_eq(lhs, rhs) {
         return true;
     }
     if lhs.depth() != rhs.depth() {
         return false;
     }
-    let strip_optional = |component: &Expr| {
-        let mut component = component;
-        while let Expr::Optional(inner) = component {
-            component = inner;
+    // One allocation-free pass from the leaf answers every comparison that
+    // needs no container: a hard mismatch refuses at once, and a pair of
+    // chains that agree throughout is done.
+    let mut needs_root = false;
+    let (mut left, mut right) = (&**lhs, &**rhs);
+    while let (
+        PathPrefix::Node {
+            parent: left_parent,
+            component: left_component,
+            ..
+        },
+        PathPrefix::Node {
+            parent: right_parent,
+            component: right_component,
+            ..
+        },
+    ) = (left, right)
+    {
+        match relate_components(left_component, right_component) {
+            ComponentRelation::Differ => return false,
+            ComponentRelation::NeedsRoot => needs_root = true,
+            ComponentRelation::Agree => {}
         }
-        component.clone()
-    };
-    let lhs: Vec<Expr> = lhs.to_vec().iter().map(strip_optional).collect();
-    let rhs: Vec<Expr> = rhs.to_vec().iter().map(strip_optional).collect();
-    if lhs.iter().zip(&rhs).all(|(l, r)| components_agree(l, r)) {
+        (left, right) = (left_parent, right_parent);
+    }
+    if !needs_root {
         return true;
     }
     let Some(root) = invocation_roots::get(invocation) else {
         return false;
     };
-    let mut current = Some(&root);
-    for (l, r) in lhs.iter().zip(&rhs) {
-        current = match folded_component_step(current, l, r) {
+    let mut node = Some(FoldNode::Value(&root));
+    for (left, right) in components_from_root(lhs)
+        .into_iter()
+        .zip(components_from_root(rhs))
+    {
+        node = match folded_component_step(node, left, right) {
             FoldedStep::Differs => return false,
             FoldedStep::At(next) => Some(next),
             FoldedStep::Unknown => None,
@@ -33854,46 +33871,118 @@ fn same_frame_position(invocation: u64, lhs: &Rc<PathPrefix>, rhs: &Rc<PathPrefi
     true
 }
 
-/// Whether two components (with any `?` already stripped) agree without a
-/// container to read: equal, or two indexes with the same navigation index
-/// whatever spelling each reports itself by.
-fn components_agree(lhs: &Expr, rhs: &Expr) -> bool {
-    match (lhs, rhs) {
-        (Expr::Index { idx: left, .. }, Expr::Index { idx: right, .. }) => left == right,
-        _ => lhs == rhs,
+/// `component` without any `?` wrappers: the frame only moves on the inner
+/// step's success.
+fn strip_optional(component: &Expr) -> &Expr {
+    let mut component = component;
+    while let Expr::Optional(inner) = component {
+        component = inner;
+    }
+    component
+}
+
+/// `chain`'s components, root first, borrowed.
+fn components_from_root(chain: &PathPrefix) -> Vec<&Expr> {
+    let mut components = vec_with_capacity(chain.depth());
+    let mut chain = chain;
+    while let PathPrefix::Node {
+        parent, component, ..
+    } = chain
+    {
+        components.push(strip_optional(component));
+        chain = parent;
+    }
+    components.reverse();
+    components
+}
+
+/// What two components need from [`same_frame_position`] before they can be
+/// called one step.
+enum ComponentRelation {
+    /// The same step, whatever spelling each carries: equal, or two indexes
+    /// with one navigation index (the spelling an index reports itself by is
+    /// its `key`, which navigation never reads).
+    Agree,
+    /// Two indexes or two slices that differ as written; only the container
+    /// they apply to can say whether they name one child.
+    NeedsRoot,
+    /// Different steps, whatever the container.
+    Differ,
+}
+
+fn relate_components(lhs: &Expr, rhs: &Expr) -> ComponentRelation {
+    match (strip_optional(lhs), strip_optional(rhs)) {
+        (Expr::Index { idx: left, .. }, Expr::Index { idx: right, .. }) => {
+            if left == right {
+                ComponentRelation::Agree
+            } else {
+                ComponentRelation::NeedsRoot
+            }
+        }
+        (left @ Expr::Slice { .. }, right @ Expr::Slice { .. }) => {
+            if left == right {
+                ComponentRelation::Agree
+            } else {
+                ComponentRelation::NeedsRoot
+            }
+        }
+        (left, right) if left == right => ComponentRelation::Agree,
+        _ => ComponentRelation::Differ,
+    }
+}
+
+/// Where [`same_frame_position`]'s walk stands: on a value, or on the
+/// elements of a slice of an array -- a view, so a slice costs no copy.
+#[derive(Clone, Copy)]
+enum FoldNode<'v> {
+    Value(&'v OwnedValue),
+    Items(&'v [OwnedValue]),
+}
+
+impl<'v> FoldNode<'v> {
+    /// The elements, when this is an array or a slice of one.
+    fn items(self) -> Option<&'v [OwnedValue]> {
+        match self {
+            Self::Value(OwnedValue::Array(items)) => Some(items),
+            Self::Items(items) => Some(items),
+            Self::Value(_) => None,
+        }
     }
 }
 
 /// Where [`same_frame_position`]'s walk stands after one lockstep step.
 enum FoldedStep<'v> {
-    /// The two components do not name one child of the current value.
+    /// The two components do not name one child of the current node.
     Differs,
     /// They do, and this is it.
-    At(&'v OwnedValue),
-    /// They agree, but the walk has no value to stand on (a slice, or a step
-    /// it cannot take), so later steps need structural agreement.
+    At(FoldNode<'v>),
+    /// They agree, but the walk has no node to stand on (a step it cannot
+    /// take), so later steps need structural agreement.
     Unknown,
 }
 
-/// One lockstep step of [`same_frame_position`]'s walk from `current`.
-fn folded_component_step<'v>(
-    current: Option<&'v OwnedValue>,
-    lhs: &Expr,
-    rhs: &Expr,
-) -> FoldedStep<'v> {
+/// One lockstep step of [`same_frame_position`]'s walk from `node`. `lhs` and
+/// `rhs` have had their `?` wrappers stripped.
+fn folded_component_step<'v>(node: Option<FoldNode<'v>>, lhs: &Expr, rhs: &Expr) -> FoldedStep<'v> {
+    let items = node.and_then(FoldNode::items);
     match (lhs, rhs) {
-        (Expr::Index { idx: left, .. }, Expr::Index { idx: right, .. }) if left != right => {
-            let Some(OwnedValue::Array(items)) = current else {
-                return FoldedStep::Differs;
+        (Expr::Index { idx: left, .. }, Expr::Index { idx: right, .. }) => {
+            let Some(items) = items else {
+                return if left == right {
+                    FoldedStep::Unknown
+                } else {
+                    FoldedStep::Differs
+                };
             };
-            let Ok(len) = i64::try_from(items.len()) else {
-                return FoldedStep::Differs;
-            };
-            let slot = |idx: i64| usize::try_from(if idx < 0 { len + idx } else { idx }).ok();
-            match (slot(*left), slot(*right)) {
+            match (
+                array_slot(items.len(), *left),
+                array_slot(items.len(), *right),
+            ) {
                 (Some(left), Some(right)) if left == right => {
-                    items.get(left).map_or(FoldedStep::Differs, FoldedStep::At)
+                    FoldedStep::At(FoldNode::Value(&items[left]))
                 }
+                // The same out-of-range index is the same (null) step.
+                _ if left == right => FoldedStep::Unknown,
                 _ => FoldedStep::Differs,
             }
         }
@@ -33908,23 +33997,42 @@ fn folded_component_step<'v>(
                 end: right_end,
                 ..
             },
-        ) if lhs != rhs => {
-            let Some(OwnedValue::Array(items)) = current else {
-                return FoldedStep::Differs;
+        ) => {
+            let Some(items) = items else {
+                return if lhs == rhs {
+                    FoldedStep::Unknown
+                } else {
+                    FoldedStep::Differs
+                };
             };
             let left = SliceBounds::from_literals(*left_start, *left_end).resolve(items.len());
             let right = SliceBounds::from_literals(*right_start, *right_end).resolve(items.len());
-            if left == right && !left.is_empty() {
-                FoldedStep::Unknown
+            // An empty range is not a node the walk can vouch for (`[] |
+            // .[0:0]` is a fresh array in jq); two slices spelled alike
+            // still agree, as they always did.
+            if left == right && (!left.is_empty() || lhs == rhs) {
+                FoldedStep::At(FoldNode::Items(&items[left]))
             } else {
                 FoldedStep::Differs
             }
         }
-        _ if components_agree(lhs, rhs) => current
-            .and_then(|value| anchor_component_step(value, lhs))
-            .map_or(FoldedStep::Unknown, |(next, _)| FoldedStep::At(next)),
+        _ if lhs == rhs => match node {
+            Some(FoldNode::Value(value)) => anchor_component_step(value, lhs)
+                .map_or(FoldedStep::Unknown, |(next, _)| {
+                    FoldedStep::At(FoldNode::Value(next))
+                }),
+            _ => FoldedStep::Unknown,
+        },
         _ => FoldedStep::Differs,
     }
+}
+
+/// The slot `idx` names in an array of `len` elements, a negative index
+/// counted from the end; `None` out of range.
+fn array_slot(len: usize, idx: i64) -> Option<usize> {
+    let len = i64::try_from(len).ok()?;
+    let slot = usize::try_from(if idx < 0 { len + idx } else { idx }).ok()?;
+    (slot < len as usize).then_some(slot)
 }
 
 /// A branch's provenance mark (#1466, generalised by #2042): whether its
@@ -115887,6 +115995,54 @@ mod touched_edge_cases_2999 {
             invocation,
             vec![field("s"), slice(Some(-1), None)],
             vec![field("s"), slice(Some(1), None)]
+        ));
+        // Below a slice the walk stands on the array's own elements.
+        let nested = OwnedValue::object_from([(
+            "z".to_string(),
+            OwnedValue::array_from(vec![items(2), items(2)]),
+        )]);
+        let nested_invocation = invocation - 1;
+        let _nested_guard = invocation_roots::push(nested_invocation, nested);
+        assert!(same(
+            nested_invocation,
+            vec![
+                field("z"),
+                slice(Some(0), Some(1)),
+                index(0, None),
+                index(1, None)
+            ],
+            vec![
+                field("z"),
+                slice(Some(-2), Some(-1)),
+                index(0, None),
+                index(-1, None)
+            ],
+        ));
+        assert!(!same(
+            nested_invocation,
+            vec![
+                field("z"),
+                slice(Some(0), Some(1)),
+                index(0, None),
+                index(1, None)
+            ],
+            vec![
+                field("z"),
+                slice(Some(-2), Some(-1)),
+                index(0, None),
+                index(0, None)
+            ],
+        ));
+        // The same out-of-range index is one (null) step, not a mismatch.
+        assert!(same(
+            invocation,
+            vec![field("x"), index(7, None), index(-1, None)],
+            vec![field("x"), index(7, None), index(-1, None)],
+        ));
+        assert!(same(
+            invocation,
+            vec![field("x"), index(7, None), field("k"), index(-1, None)],
+            vec![field("x"), index(7, None), field("k"), index(-1, None)],
         ));
         // A slice is never folded onto its container (#3494).
         assert!(!same(

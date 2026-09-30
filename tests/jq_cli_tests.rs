@@ -81652,6 +81652,36 @@ fn test_resolver_frame_position_is_spelling_insensitive_3464() -> Result<()> {
             "",
             0,
         ),
+        // A fractional bound keeps its spelling in the path and names the range it rounds to.
+        (
+            r#"{"y":[1,2,3]}"#,
+            r"path(.y[0:2] as $y | .y[0:1.5] | $y)",
+            "[\"y\",{\"start\":0,\"end\":1.5}]\n",
+            "",
+            0,
+        ),
+        // Below a slice, the elements are the array's own, however each side spells them.
+        (
+            r#"{"z":[[1,1],[1,1]]}"#,
+            r"path(.z[0:1][0][1] as $y | .z[-2:-1][0][-1] | $y)",
+            "[\"z\",{\"start\":-2,\"end\":-1},0,-1]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"z":[[1,1],[1,1]]}"#,
+            r"path(.z[1:][0] as $y | .z | .[-1:][-1] | $y)",
+            "[\"z\",{\"start\":-1,\"end\":null},-1]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"z":[[1,1],[1,1]]}"#,
+            r"del(.z[0:1][0][1] as $y | .z[-2:-1][0][-1] | $y)",
+            "{\"z\":[[1],[1,1]]}\n",
+            "",
+            0,
+        ),
         // The write entry points take the same positions.
         (
             doc,
@@ -81689,6 +81719,22 @@ fn test_resolver_frame_position_spelling_controls_refuse_3464() -> Result<()> {
         (doc, r"path(.x[1] as $y | .x[0] | $y)", "", refused, 5),
         (doc, r"path(.a.b as $y | .a | .c? | $y)", "", refused, 5),
         (doc, r"del(.x[1] as $y | .x[-2] | $y)", "", refused, 5),
+        // A fractional end that rounds to a wider range is another slice.
+        (
+            r#"{"y":[1,2,3]}"#,
+            r"path(.y[0:1] as $y | .y[0:1.5] | $y)",
+            "",
+            refused,
+            5,
+        ),
+        // Below a slice, a different element is still a different node.
+        (
+            r#"{"z":[[1,1],[1,1]]}"#,
+            r"path(.z[0:1][0][1] as $y | .z[-2:-1][0][0] | $y)",
+            "",
+            refused,
+            5,
+        ),
         // An empty slice range, and a different range, are not the same slice.
         (doc, r"path(.x[5:] as $y | .x[6:] | $y)", "", refused, 5),
         (doc, r"path(.x[1:] as $y | .x[0:] | $y)", "", refused, 5),
