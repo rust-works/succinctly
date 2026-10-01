@@ -428,8 +428,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write through them. They raised `Invalid path expression with result 1`, and on a
   `null` input `path(first)` answered `[]` and `first = 9` wrote `9` where jq
   writes `[9]`. `[] | last = 9` raises `Out of bounds negative array index` as in
-  jq. `first(f)`, `last(f)` and `.[0]` already worked, and `succinctly yq` is
-  unchanged: real yq has no bare `first` or `last`.
+  jq. `first(f)`, `last(f)` and `.[0]` already worked. `succinctly yq` is
+  unchanged: real yq's `first` is a different, root-only operator (`first = 9`
+  works at the head of an expression, `.a | first` is an error, `last` is a
+  lexer error), which is tracked in #3551. Bare `nth(n)` is the same gap and is
+  tracked in #3550.
 
 - **jq: `getpath` reads an array segment on an array as jq's subarray search**
   (#2429, part of #3506). `[10,20] | getpath([[0],[1]])` is `[]` and
