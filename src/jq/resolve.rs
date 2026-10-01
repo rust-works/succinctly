@@ -1836,11 +1836,12 @@ fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
     }
 }
 
-/// Recurse into `expr` under `scope`, restoring `scope` before returning so a
-/// sibling never sees a binding introduced by its neighbour. Appends every
-/// unresolvable call to `errors` rather than stopping at the first, matching
-/// how real jq's own compiler keeps going to report every compile error in
-/// one pass (#2037).
+/// Recurse into `expr` under `cx`'s scopes, restoring every scope in `cx` to
+/// what it was on entry before returning so a sibling never sees a binding
+/// introduced by its neighbour. Appends every unresolvable call, variable and
+/// label to `cx.errors` rather than stopping at the first, matching how real
+/// jq's own compiler keeps going to report every compile error in one pass
+/// (#2037). `reachable` is the set of `def` bodies a call can reach (#2740).
 fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
     match expr {
         // #1371: neither variant can occur here. This pass runs once, on the
@@ -1877,10 +1878,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
                 let original = Rc::clone(inner);
                 let target = Rc::make_mut(inner).expr_mut();
                 let rebased = rebase_reachable(&original, target, reachable);
-                check(
-                    target,
-                    cx, &rebased
-                );
+                check(target, cx, &rebased);
             } else {
                 check(Rc::make_mut(inner).expr_mut(), cx, reachable);
             }
@@ -2522,10 +2520,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             *builtin = map_builtin_subexprs(builtin, &mut |sub| {
                 let mut copy = sub.clone();
                 let rebased = rebase_reachable(sub, &copy, reachable);
-                check(
-                    &mut copy,
-                    cx, &rebased
-                );
+                check(&mut copy, cx, &rebased);
                 copy
             });
         }
