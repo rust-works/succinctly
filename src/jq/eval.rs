@@ -33104,7 +33104,26 @@ impl Frame {
 
     /// The same frame carrying `register` as the live register's value
     /// (#3133), or none.
+    ///
+    /// **Exclusivity (#3456 D2).** The frame this returns -- the one a
+    /// stage's readers consult (`stage_frame`, a nested pipe's seed, a
+    /// `catch` handler's entry) -- never carries a live register *and*
+    /// records it lost: loss is set only when the carried register is
+    /// `None`, and only trackability clears it. That holds for every
+    /// `with_register` call the jq suite and the path-register sweep reach.
+    /// It does **not** hold for the *handoff* frame `place_step` builds with
+    /// [`Frame::with_register_loss`] for the next stage, nor for that frame
+    /// after [`Frame::extend`]: both still carry the register the stage was
+    /// *entered* with, and the next stage replaces it through
+    /// `with_register` before any reader looks. So the assertion lives here
+    /// and nowhere upstream of it; an assertion on those two failed 8 jq
+    /// tests (`test_path_catch_handler_*_843`, `_3133`, `_2978`, `_1297`)
+    /// without any reader being affected.
     fn with_register(&self, register: Option<&OwnedValue>) -> Self {
+        debug_assert!(
+            register.is_none() || !self.register_loss.is_lost(),
+            "a frame carrying a live register must not also record it lost",
+        );
         Self {
             invocation: self.invocation,
             at: self.at.clone(),
