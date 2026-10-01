@@ -3868,6 +3868,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // `write_output_jq_value`'s own comment on that branch).
     let can_json_fast_path = can_use_m2_streaming(&expr)
         && m2_json_fallback_safe(&expr)
+        && !m2_has_stderr_effect(&expr)
         && !output_config.raw_output
         && !output_config.join_output
         && !output_config.raw_output0
@@ -6977,7 +6978,9 @@ fn write_result_newline<W: core::fmt::Write>(w: &mut W) -> core::fmt::Result {
 /// `evaluate_m2_fast_path`'s own doc comment for why this matters: that
 /// function falls back to the general path on any detected malformation,
 /// which is only safe when a *later* result's failure can't follow
-/// already-written earlier ones.
+/// already-written earlier ones. "Safe" here means no *stdout* written
+/// before the failure; a program that also writes stderr as it runs is
+/// excluded separately by [`m2_has_stderr_effect`] (#3470).
 ///
 /// `Expr::Iterate` (`.[]`) and `Builtin::Select` are the two exclusions --
 /// the base whitelist's own only multi-result-capable shapes (a fanning
@@ -7042,6 +7045,30 @@ fn m2_json_fallback_safe(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::KeysUnsorted) => false,
         _ => false,
     }
+}
+
+/// Whether `expr` contains a builtin whose effect lands on stderr as it runs:
+/// `stderr`, `debug`, `debug(msg)` (#3470).
+///
+/// [`evaluate_m2_fast_path`] falls back to the general path on *any* detected
+/// error, and re-evaluates the whole document there. [`m2_json_fallback_safe`]
+/// only guarantees that nothing reached stdout before the failure; it says
+/// nothing about stderr, so a shape it admits (`first(.[("x"|stderr)])`,
+/// `sort_by(("x"|stderr) | error("e"))`, `map(.[("x"|debug)])`) would run its
+/// side effect once on the fast path and again on the fallback. jq runs it
+/// once. Such programs are rare, so they take the general path outright rather
+/// than teaching the fast path to tell a malformed document from a genuine
+/// evaluation error.
+///
+/// `halt_error` is not listed: a halt returns from the fast path before the
+/// fallback check, so it never runs twice.
+fn m2_has_stderr_effect(expr: &Expr) -> bool {
+    succinctly::jq::walk::any_subexpr(expr, &mut |node| {
+        matches!(
+            node,
+            Expr::Builtin(Builtin::Stderr | Builtin::Debug | Builtin::DebugMsg(_))
+        )
+    })
 }
 
 /// Evaluate one JSON document through the M2 fast path (#1576): stream
@@ -9412,6 +9439,34 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3470: which programs `m2_has_stderr_effect` keeps off the M2 fast
+    /// path. It must see an effect buried in a computed key, a slice bound or
+    /// a `*_by` filter, and must leave every ordinary shape alone.
+    #[test]
+    fn m2_has_stderr_effect_finds_nested_effects_only_3470() {
+        let has = |filter: &str| m2_has_stderr_effect(&jq::parse(filter).unwrap());
+        for filter in [
+            r#"first(.[("x"|stderr)])"#,
+            r#"first(.[("x"|stderr):])"#,
+            r#"first(.[("x"|debug)])"#,
+            r#"first(.[("x"|debug("m"))])"#,
+            r#"sort_by(("x"|stderr) | error("e"))"#,
+            r#"map(.[("x"|stderr)])"#,
+        ] {
+            assert!(has(filter), "{filter}");
+        }
+        for filter in [
+            "first(.[0])",
+            "map(.)",
+            "sort_by(.a)",
+            ".a.b",
+            r#"first(.[("x")])"#,
+            "min_by(.a)",
+        ] {
+            assert!(!has(filter), "{filter}");
+        }
+    }
 
     /// #3412: `resolve_positional_args` on clap's own captures, without the
     /// CLI. `argv` is parsed exactly as `succinctly jq` parses it, so each
