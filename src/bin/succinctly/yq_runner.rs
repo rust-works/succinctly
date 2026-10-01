@@ -3887,7 +3887,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             // above) needs the exact same rule and was missing it.
             to_owned_with_comments::<_, YqSemantics>(&c.value(), Some(c))
         } else {
-            generic_to_owned_cursor::<YqSemantics, _>(c).map(&no_comments)
+            generic_to_owned_cursor::<YqSemantics, _>(c).map(no_comments)
         }
     };
 
