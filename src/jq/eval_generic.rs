@@ -1391,9 +1391,11 @@ fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &
 /// `bp_pos` to look a tag up with, only the cursor does), so a caller that
 /// holds a cursor and branches on nullness should come through here, with the
 /// same tag lookup [`tagged_type_name`] does for `type` and every
-/// type-mismatch error name. Only `getpath`'s cursor walk does so far; the
-/// other cursor-holding `is_null()` tests (`length`, `has`, field and index
-/// access, `path_step_*`, ...) still read the text and are tracked separately.
+/// type-mismatch error name. `getpath`'s cursor walk (#2639) and, through
+/// [`cursor_is_null`], `length`, `has`, field and index access, `first`/`last`,
+/// `values`, yq's `map` no-op and the `path_step_*` walkers (#3533) come
+/// through here; a node reached with no cursor (an owned value) has no tag to
+/// consult and keeps the text test.
 /// A tag [`crate::yaml::resolve_tagged`] does not model (`!!map`, `!!seq`, a
 /// custom `!foo`) falls back to the untagged test.
 fn tagged_is_null<V: DocumentValue>(value: &V, cursor: &V::Cursor) -> bool {
@@ -1407,6 +1409,21 @@ fn tagged_is_null<V: DocumentValue>(value: &V, cursor: &V::Cursor) -> bool {
             || value.is_null(),
             |resolved| resolved == crate::yaml::ResolvedScalar::Null,
         )
+}
+
+/// [`tagged_is_null`] for a caller whose cursor may be absent (#3533).
+///
+/// Only a node that carries an explicit tag can differ from its text, so the
+/// tag is asked for first and the text test stands for every other node. That
+/// order is what keeps this cheap where it is called on every scalar a query
+/// reaches: on a document with no explicit tag at all the lookup is one
+/// empty-map check (`YamlIndex::has_explicit_tags`), so an untagged document
+/// pays one branch over the plain `is_null()` it replaces.
+fn cursor_is_null<V: DocumentValue>(value: &V, cursor: Option<&V::Cursor>) -> bool {
+    match cursor {
+        Some(c) if c.explicit_tag().is_some() => tagged_is_null(value, c),
+        _ => value.is_null(),
+    }
 }
 
 /// The **untagged** YAML type tag (`!!str`, `!!int`, `!!map`, ...) for a
@@ -9505,7 +9522,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     // `find_cursor`'s own doc comment.
                     Err(err) => GenericResult::Error(err),
                 }
-            } else if value.is_null() {
+            } else if cursor_is_null(&value, cursor.as_ref()) {
                 // jq returns null for field access on null
                 if absent_is_empty {
                     GenericResult::None
@@ -9575,7 +9592,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     // null since there is no error for `?` to suppress. See #307.
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
-            } else if value.is_null() {
+            } else if cursor_is_null(&value, cursor.as_ref()) {
                 // jq returns null for index on null, as the `Expr::Field` arm
                 // above already does for `.foo`. Without this, `null | .[0]`
                 // errored while `null | .[$n]` — the same query, and the same
@@ -18737,7 +18754,7 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
     key_owned: OwnedValue,
     optional: bool,
 ) -> GenericResult<V> {
-    if value.is_null() {
+    if cursor_is_null(value, cursor.as_ref()) {
         return GenericResult::Owned(OwnedValue::Bool(false));
     }
     match (&key_owned, value.as_object(), value.as_array()) {
@@ -19573,7 +19590,7 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
         PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"), // omni-dev: coverage tolerate-line reason="unreachable: both step dispatchers route owned nodes to path_step_owned before calling this cursor helper (#3022)"
         PathNode::At(c) => {
             let v = c.value();
-            if v.is_null() {
+            if cursor_is_null(&v, Some(c)) {
                 PathNode::Absent
             } else if let Some(fields) = v.as_object() {
                 // #2594: a zero-field malformed tail is invisible to
@@ -19621,7 +19638,7 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
         PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"), // omni-dev: coverage tolerate-line reason="unreachable: both step dispatchers route owned nodes to path_step_owned before calling this cursor helper (#3022)"
         PathNode::At(c) => {
             let v = c.value();
-            if v.is_null() {
+            if cursor_is_null(&v, Some(c)) {
                 PathNode::Absent
             } else if let Some(elements) = v.as_array() {
                 empty_elements_tail_gap_ok(&elements, Some(c))?;
@@ -25053,7 +25070,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     None => LazySource::Values(fields),
                 };
                 GenericResult::LazySeq(Box::new(LazySeq::new(source).push_map(f, S::TAG)))
-            } else if S::TAG == EvalTag::Yq && value.is_null() {
+            } else if S::TAG == EvalTag::Yq && cursor_is_null(&value, cursor.as_ref()) {
                 // #1907: real yq no-ops a scalar target for `map` entirely
                 // -- `f` never even runs (confirmed live, v4.53.3: `5 |
                 // map(error("boom"))` succeeds silently, `5`) -- unlike
@@ -25250,7 +25267,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
 
         Builtin::Length => {
-            if value.is_null() {
+            if cursor_is_null(&value, cursor.as_ref()) {
                 GenericResult::Owned(OwnedValue::Int(0))
             } else if let Some(s) = value.as_str() {
                 GenericResult::Owned(OwnedValue::Int(s.chars().count() as i64))
@@ -25405,7 +25422,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::Values => {
             // jq: values == select(. != null)
-            if value.is_null() {
+            if cursor_is_null(&value, cursor.as_ref()) {
                 GenericResult::None
             } else {
                 cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
@@ -25725,7 +25742,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
-            } else if value.is_null() {
+            } else if cursor_is_null(&value, cursor.as_ref()) {
                 GenericResult::Owned(OwnedValue::Null)
             } else if optional {
                 GenericResult::None
@@ -25759,7 +25776,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
-            } else if value.is_null() {
+            } else if cursor_is_null(&value, cursor.as_ref()) {
                 GenericResult::Owned(OwnedValue::Null)
             } else if optional {
                 GenericResult::None
