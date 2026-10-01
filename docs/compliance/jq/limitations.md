@@ -545,14 +545,6 @@ front of gaps that were already there behind a parenthesis:
   write is dropped; `and`/`or`/unary minus in front of a destructuring `as` reach
   [#3289](https://github.com/rust-works/succinctly/issues/3289). Both spellings behaved
   the same way behind parentheses on `main`.
-- **An assignment's right-hand side is collected eagerly**
-  ([#3448](https://github.com/rust-works/succinctly/issues/3448)), so under an early-exit
-  consumer (`first`, `limit`, `nth`, `any`, `isempty`) the *later* outputs of the right-hand
-  side (`input`, `debug`, `stderr`) run where jq is lazy. `[first(.a = (1, input)), input]`
-  already did on `main`; `.a = 1 as $x | ($x, input)` used to mis-parse as `(.a = 1) as $x |
-  ...` and now reaches it too. Under full consumption that spelling is a fix. Distinct from
-  #2267's open note (an assignment's *target* path). `-T as $x | B` itself is lazy in every
-  demand-driven consumer.
 - **`//` against assignment** (the remaining divergence in
   [the language reference](../../reference/jq-language.md#operator-precedence)) now also
   shows inside a binding body on the right of an assignment: `.a = 1 as $x | .a // 1 %= 2`.
@@ -4463,19 +4455,52 @@ between two faithful options. The eager route was not faithful here: it fires si
 effects jq never fires and raises a different error. The same structural sharing
 (#2999) that would retire `=`'s second document retires this one.
 
-**Still open, tracked on #2267.** jq re-resolves an assignment's path once per
-right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer generator),
-so `echo '{}' | jq -c '(.|stderr)[("a","b")] = (1,2)'` fires the target four times where
-this fires it twice. It cannot be fixed while `collect_rhs_outputs` is eager --
-re-resolving per output then fires the target for outputs a downstream consumer never
-pulls, which is *worse*: it was implemented, measured at 87 regressions against 69 fixes
-on a 5,000-shape sweep, and backed out. `first((.|debug("E"))["a"] = (1,2))` fires `E`
-twice under it where jq fires it once, and with `input` in the path it changes stdout;
-`first((.|stderr)["a"] = (1,2))` is pinned as a holdout so a re-attempt fails loudly. The
-streaming write above is deliberately gated to a *single* RHS output for the same reason —
-one output means one output document, so none of that class is reachable from it. The
-`op=`/`//=` family shares both the rule and the gap (`(.|stderr)[(0,1)] += (1,"x")` fires
-twice where jq fires three times, pinned as a #2974 holdout).
+**Closed by #3448: the right side is the outer generator.** jq re-resolves an assignment's
+path once per right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer
+generator), and its right side is lazy, so a consumer that stops early never runs the later
+outputs. Both halves now hold in jq mode. `=`, `op=` and `//=` pull one right-hand output at a
+time, resolve the target against the untouched input, write, hand that document on, and answer
+the consumer's stop back into the right side: `echo '{}' | jq -c '(.|stderr)[("a","b")] =
+(1,2)'` fires the target four times, and `first((.|debug("E"))["a"] = (1,2))` fires it once, in
+both. `|=` reads only the first output of its update, as jq's `_modify` does, so
+`[1] | .[0] |= (1, input)` no longer reads an input. This is what #2267's second step could
+not have while the right side was collected eagerly (it fired the target for outputs a
+downstream `first` never pulled: 87 regressions against 69 fixes on a 5,000-shape sweep);
+with a lazy right side it is a per-output re-resolution and nothing more. The same 7,128-shape
+differential sweep (`scripts/jq-assign-rhs-oracle-sweep.py`: path x operator x right side x
+consumer, `input`/`debug`/`stderr` observable) that the eager route failed 1,615 times against jq 1.7.1
+now has no divergence in stdout, `debug` trace or exit code.
+
+yq keeps the eager route: real yq applies only the *last* output of a multi-output right side,
+once, to every path, and resolves and vivifies its targets before the right side runs (#2481),
+so it needs the whole right side and has no `input`/`debug`/`stderr` to be lazy about.
+
+Costs: a right side that is pulled lazily cannot know an output is the last, so the first
+output takes the input document by move, the second decodes it once more, and later outputs
+clone that copy (two decodes however many outputs, not one per output); the streaming
+route's per-output spine copy is charged once per output rather than once per extra output
+(`.[(0,1)] = (1,2)` copies the spine twice, where it copied once). A single-output right side
+takes the input by move, as before, and `.users[0].id = range(N)` scales linearly in N.
+
+Measured on a 7 MB generated `users` document (release, interleaved, 15 repetitions, outputs
+identical, minimum wall time; a control run of the same binary against itself stays within
+-1.5%..+2.2% on both boxes below):
+
+| filter                                            | M4 Pro           | Ryzen 9 7950X    |
+|---------------------------------------------------|------------------|------------------|
+| `.users[0].name = "x"`                            | -37.6%           | -32.0%           |
+| `.users[0].name //= "y"`                          | -35.8%           | -32.8%           |
+| `.users[0].name = "x"`, peak RSS                  | 115.6 -> 79.6 MB | 113.9 -> 87.8 MB |
+| `.users[].score \|= . + 1`                        | +1.1%            | +1.1%..+2.2%     |
+| `(.users[] \| select(.age > 30)).score \|= . + 1` | -1.3%            | +3.6%..+4.4%     |
+| `.users[].score += 1`                             | -1.2%            | -2.8%..-2.4%     |
+| `.users[0].id = (1,2)`, `.users[(0,1)].score = 0` | +0.2%, +1.1%     | -1.1%, +0.1%     |
+
+Peak RSS is within 0.5 MB of the baseline on every other row on both boxes. The 7950X's two
+`|=` rows are the price of `|=` reading its first output through the demand-driven route
+(a stopping sink over `eval_each_owned`) instead of collecting and dropping the tail; they
+reproduced on a 31-repetition rerun (+3.6% and +1.7%, control within +-1.4%) and the M4 Pro
+does not show them. The same run on an Apple M5 Max under load agreed with the M4 Pro.
 
 ## Reading a path is indexing
 
