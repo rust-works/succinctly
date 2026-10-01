@@ -38792,6 +38792,38 @@ const IDENTITY_PASS_ROWS_2416: &[(&str, &str)] = &[
     (".a.b | [key] | .[0] | parent | path", "[\"a\",\"b\"]"),
 ];
 
+/// #2574 in yq mode: `.users[0] | parent | length` answers from the cursor,
+/// not from an `OwnedValue` of the whole document (a9c56ccb: 1533 ms / 449 MiB
+/// on a 20 MB file vs 111 ms / 62 MiB now; the eager evaluator that built the
+/// tree is gone since e4449b1f4, #2559). The second user's `id` is an
+/// undecodable escape, so a materializing consumer (`map(.id)`, the control)
+/// errors while counting children never decodes it; every row must answer what
+/// `.users | length` answers. Mirrors `test_parent_then_length_stays_on_cursor_2574`
+/// in `jq_cli_tests.rs`.
+#[test]
+fn test_parent_then_length_stays_on_cursor_2574() -> Result<()> {
+    let doc = "users:\n  - id: 0\n  - id: \"\\ud800\"\n";
+    let args = ["-o=json", "-I0"];
+    let (out, err, code) = run_yq_stdin_with_stderr(".users | length", doc, &args)?;
+    assert_eq!((code, out.trim_end()), (0, "2"), "baseline: {err}");
+    for (filter, want) in [
+        (".users[0] | parent | length", "2"),
+        (".users[0] | parent | parent | length", "1"),
+        (".users[0] | parent | keys", "[0,1]"),
+    ] {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
+        assert_eq!(code, 0, "`{filter}`: {out:?} {err}");
+        assert_eq!(out.trim_end(), want, "`{filter}`");
+    }
+    let (out, err, code) = run_yq_stdin_with_stderr(".users[0] | parent | map(.id)", doc, &args)?;
+    assert_ne!(code, 0, "control must fail to decode: {out:?}");
+    assert!(
+        err.contains("invalid escape sequence"),
+        "control stderr: {err}"
+    );
+    Ok(())
+}
+
 /// Spine 2416 gate reason 3 (#2473) in yq mode: a `reduce`/`foreach` whose
 /// source or INIT reads path context, and the `range`/`repeat`/`while`/`until`
 /// family that stays extension-only.
