@@ -422,6 +422,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **yq: a `<<` merge no longer silently drops a complex mapping key** (#3467). Merge
+  resolution overrode by key spelling, and a complex key (`? [1]`) is spelled `""`, so a
+  merged-in complex key and a local one (or a genuine `"": z`, or two merge sources)
+  collapsed into one entry: `.b.z = 1` on `a: &a {? [1]: x}` / `b: {<<: *a, ? [2]: y}`
+  wrote `b` without the merged `[1]: x` and exited 0, and so did a write elsewhere in the
+  document (`.a.k = 1`). The merged mapping now keeps both entries, so `.b | length` is `2`,
+  and every route that builds a map raises `object key "" is ambiguous`, as for plain
+  colliding complex keys. Ordinary keys and a genuine `""` key still override by name, and
+  so does what is the same key: a sequence key of equal content (a merged-in `? [1]` and a
+  local `? [1]`, `? []` twice, two sources that both define it), an alias key against
+  another use of the same anchor, and the same source mapping reached more than once. A
+  mapping used as a key (or nested in a sequence key) is compared by node only, so two
+  equal ones in different nodes used to resolve to the local one and now refuse. The
+  comparison renders at most 64 nodes, so an alias fan-out in a key cannot make a merge
+  expensive. `-i` was already refused for a complex key (#3463) and still leaves the file
+  untouched. How yq's `keys`, `length` and `has` treat a merge key is a separate gap
+  (#3556).
+
 - **jq: bare `first` and `last` are path steps** (#3545). jq defines `first` as
   `.[0]` and `last` as `.[-1]`, so `[1,2] | path(first)` is `[0]`, and
   `(.a | first) = 9`, `(.a | last) |= .+1`, `del(.a | first)` and `pick(.a | last)`

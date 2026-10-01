@@ -2369,10 +2369,56 @@ a duplicate-capable object exists ([#1344](https://github.com/rust-works/succinc
 `from_entries` sees an ordinary repeated key and no fallback flag survives to catch it. `-i`
 refuses these (its `validate_yaml_display_keys` pre-walk stays for exactly this case). And the
 `load()` builtin's own YAML-mapping conversion is tracked separately in
-[#1753](https://github.com/rust-works/succinctly/issues/1753). Merge keys (`<<`) collapse a
-merged-in complex key with a local one by their shared `""` spelling inside merge resolution
-itself, before any map is built, so even `.b.z = 1` drops an entry
-([#3467](https://github.com/rust-works/succinctly/issues/3467)).
+[#1753](https://github.com/rust-works/succinctly/issues/1753).
+
+**Merge keys (`<<`) keep a merged-in complex key beside a local one
+([#3467](https://github.com/rust-works/succinctly/issues/3467)).** Merge resolution overrides
+by key spelling, and a complex key is spelled `""`, so a merged-in `? [1]` and a local `? [2]`
+(or a genuine `"": z`, or two merge sources) used to collapse into one entry before any map was
+built, and even `.b.z = 1` dropped the merged one. A fallback spelling is never a duplicate
+there now, so the merged mapping keeps both and behaves like the plain collision above: the
+streaming routes show both under `""`, and every materializing route (including a write
+elsewhere in the document, `.a.k = 1`, which materializes `b` too) raises the same
+`object key "" is ambiguous` error. Ordinary keys and a genuine `""` key still override by
+name.
+
+What is the *same key* still overrides, byte for byte as before. A key is looked up by identity,
+not by its shared `""` spelling:
+
+- a sequence key is compared by content, after scalar type resolution (so `[0x1]` and `[1]`, or
+  `[True]` and `[true]`, are one key, while `[1]` and `[1.0]` or `["1"]` are two), so a merged-in
+  `? [1]` and a local `? [1]` are one key (the local one wins), and so are two sources that both
+  define it, `? []` against `? []`, a nested or block-style sequence, and an alias used as a key
+  (`*k : v`) against another use of the same anchor, or an alias naming a scalar (`*n : v` with
+  `n: &n 5`) against another naming an equal one. This applies only when the key is a sequence
+  of scalars, nested sequences and aliases to those, every scalar decodes, and it is small:
+  more than 64 rendered nodes or 16 levels stops the comparison (an alias hop is free, only the
+  node it names counts), which also keeps an alias fan-out (`l1: &l1 [*l0, ... x12]`,
+  `l2: &l2 [*l1, ... x12]`, ...) from expanding to 12^n nodes. That cap is a cliff by design:
+  an equal key written twice is one key within it and two entries past it;
+- anything else is the same key only if it is the same node, or the node an alias key names,
+  which covers a source mapping reached more than once (`<<: [*a, *a]`) and two uses of one
+  anchor naming a mapping (`*m : v`).
+
+Keys that merely look alike therefore stay two entries, and the materializing routes refuse
+them instead of keeping one: `[1]` against `["1"]` (a number and a string), `[]` against `[1]`,
+two different anchors, and two different sequences. So do two cases that used to collapse into
+one entry and did not need to be: **two equal mappings used as keys in different nodes**
+(`? {p: 1}` merged-in and local), and a mapping nested in a sequence key (`? [{p: 1}]`). A
+mapping used as a key, at any depth, is compared by node only, because its cursor yields no
+fields, so there is nothing reliable to tell two of them apart by. The same holds for the other
+fallback-spelled keys (an undecodable string). That is the refusing side of
+[ADR-0018](../../adrs/adr-0018.md)'s rule 4.
+
+For reference, real yq's own expansion of a merge (`explode(.) | .b`, v4.53.3) collapses every
+merged-in complex key against any local one, even distinct ones: `[1]` merged in and `[2]`
+local leaves the local entry alone, because yq matches keys by their text and a complex key has
+none. A yq *write* never expands a merge (it keeps `<<: *a` as written), so it loses nothing;
+succinctly's writes materialize the expansion, which is why this entry exists. succinctly keeps
+both entries on the streaming routes and refuses on the materializing ones, rather than copy
+yq's expansion into the user's file. How yq's key-list builtins treat a merge key at all
+(`keys`, `length`, `has`) is a separate gap, tracked in
+[#3556](https://github.com/rust-works/succinctly/issues/3556).
 
 **`-i` refuses a file holding a complex key
 ([#3463](https://github.com/rust-works/succinctly/issues/3463)).** Every `-i` route wrote a

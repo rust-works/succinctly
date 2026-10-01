@@ -3130,6 +3130,324 @@ fn test_yq_inplace_refuses_colliding_complex_keys_2519() -> Result<()> {
     Ok(())
 }
 
+/// #3467: a `<<` merge resolved by spelling, and a complex key (`? [1]`) is
+/// spelled `""` (#222), so a merged-in complex key and a local one -- or a
+/// genuine `"": z` -- shared a name and the later silently replaced the earlier
+/// *inside the merged mapping*, before any display-keyed map existed for #2519's
+/// collision guard to see. `.b.z = 1` wrote `b: {'': y, z: 1}` and the merged
+/// `[1]: x` entry was gone, exit 0. A fallback spelling is never a duplicate
+/// (#1385), so the mapping now keeps both entries: a stream of it shows both,
+/// and every materializing route raises #2519's error instead of dropping one.
+/// What *is* the same key still overrides (`FallbackKey` in `light.rs`): a
+/// sequence key of equal content, and the same source reached twice. A mapping
+/// used as a key is compared by node only, so two equal ones in different nodes
+/// refuse rather than collapse.
+const MERGED_VS_LOCAL_COMPLEX: &str = "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  ? [2]\n  : y\n";
+const TWO_MERGE_SOURCES_COMPLEX: &str =
+    "a: &a\n  ? [1]\n  : x\nc: &c\n  ? [2]\n  : w\nb:\n  <<: [*a, *c]\n";
+const MERGED_COMPLEX_VS_GENUINE_EMPTY: &str = "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  \"\": z\n";
+// Two keys that are the same key, and so still override: a merged-in `? [1]`
+// and a local `? [1]` (the local one wins, as it always did).
+const MERGED_VS_LOCAL_IDENTICAL_COMPLEX: &str =
+    "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  ? [1]\n  : y\n";
+// The same source mapping listed three times: one key, reached three times.
+const SAME_SOURCE_REPEATED_COMPLEX: &str = "a: &a\n  ? [1]\n  : x\nb:\n  <<: [*a, *a, *a]\n";
+// Two different source mappings that each define the same complex key.
+const TWO_SOURCES_SHARING_A_COMPLEX_KEY: &str =
+    "a: &a\n  ? [1]\n  : x\nc: &c\n  ? [1]\n  : w\nb:\n  <<: [*a, *c]\n";
+const MERGED_NUMBER_VS_STRING_KEY: &str =
+    "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  ? [\"1\"]\n  : y\n";
+const MERGED_DIFFERENT_MAPPING_KEYS: &str =
+    "a: &a\n  ? {p: 1}\n  : x\nb:\n  <<: *a\n  ? {p: 2}\n  : y\n";
+const MERGED_EQUAL_MAPPING_KEYS: &str =
+    "a: &a\n  ? {p: 1}\n  : x\nb:\n  <<: *a\n  ? {p: 1}\n  : y\n";
+// An alias used as a key is the key it names: two uses of one anchor are one
+// key, two different anchors are two.
+const SAME_ALIAS_KEY_MERGED_AND_LOCAL: &str =
+    "k: &k [1]\na: &a\n  *k : x\nb:\n  <<: *a\n  *k : y\n";
+const DIFFERENT_ALIAS_KEYS_MERGED_AND_LOCAL: &str =
+    "k: &k [1]\nj: &j [2]\na: &a\n  *k : x\nb:\n  <<: *a\n  *j : y\n";
+// An empty sequence is a real `[]`, so two of them are one key and `[]` against
+// `[1]` is two.
+const EMPTY_SEQUENCE_KEY_MERGED_AND_LOCAL: &str =
+    "a: &a\n  ? []\n  : x\nb:\n  <<: *a\n  ? []\n  : y\n";
+const EMPTY_SEQUENCE_VS_ONE_KEY: &str = "a: &a\n  ? []\n  : x\nb:\n  <<: *a\n  ? [1]\n  : y\n";
+// Sequences nested in a key, and a block-style key: equal ones are one key,
+// different ones are two.
+const NESTED_SEQUENCE_KEY_MERGED_AND_LOCAL: &str =
+    "a: &a\n  ? [1, [2, 3]]\n  : x\nb:\n  <<: *a\n  ? [1, [2, 3]]\n  : y\n";
+const DIFFERENT_NESTED_SEQUENCE_KEYS: &str =
+    "a: &a\n  ? [1, [2, 3]]\n  : x\nb:\n  <<: *a\n  ? [1, [2, 4]]\n  : y\n";
+const BLOCK_SEQUENCE_KEY_MERGED_AND_LOCAL: &str =
+    "a: &a\n  ? - 1\n    - 2\n  : x\nb:\n  <<: *a\n  ? - 1\n    - 2\n  : y\n";
+// A mapping nested in a sequence key is compared by node too, so the same
+// mapping is treated alike at the root and one level down.
+const EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY: &str =
+    "a: &a\n  ? [{p: 1}]\n  : x\nb:\n  <<: *a\n  ? [{p: 1}]\n  : y\n";
+// An alias naming a mapping, used as a key: two uses of one anchor are one key
+// (the key's own node differs per use, so identity follows the target), two
+// anchors with equal content are two.
+const SAME_ALIAS_TO_MAPPING_KEY: &str = "m: &m {p: 1}\na: &a\n  *m : x\nb:\n  <<: *a\n  *m : y\n";
+const DIFFERENT_ALIAS_TO_MAPPING_KEYS: &str =
+    "m: &m {p: 1}\nn: &n {p: 2}\na: &a\n  *m : x\nb:\n  <<: *a\n  *n : y\n";
+// The anchored definition of a key against an alias use of it is one key, and
+// so are two aliases naming equal scalars.
+const ANCHORED_MAPPING_KEY_AND_ITS_ALIAS: &str =
+    "a: &a\n  ? &m {p: 1}\n  : x\nb:\n  <<: *a\n  *m : y\n";
+const ANCHORED_SEQUENCE_KEY_AND_ITS_ALIAS: &str =
+    "a: &a\n  ? &m [1]\n  : x\nb:\n  <<: *a\n  *m : y\n";
+const TWO_ALIASES_NAMING_EQUAL_SCALARS: &str =
+    "n: &n 5\nm: &m 5\na: &a\n  *n : x\nb:\n  <<: *a\n  *m : y\n";
+
+#[test]
+fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()> {
+    let rows: &[(&str, &str, &str)] = &[
+        (MERGED_VS_LOCAL_COMPLEX, ".b | length", "2\n"),
+        (MERGED_VS_LOCAL_COMPLEX, ".b | keys", "- ''\n- ''\n"),
+        (
+            MERGED_VS_LOCAL_COMPLEX,
+            ".b | to_entries",
+            "- key: ''\n  value: x\n- key: ''\n  value: y\n",
+        ),
+        (TWO_MERGE_SOURCES_COMPLEX, ".b | length", "2\n"),
+        (TWO_MERGE_SOURCES_COMPLEX, ".b | keys", "- ''\n- ''\n"),
+        (MERGED_COMPLEX_VS_GENUINE_EMPTY, ".b | length", "2\n"),
+        // Keys that only *look* alike stay two entries: `[1]` against `["1"]`
+        // (a number and a string), two different mapping keys, and two equal
+        // ones in different nodes (compared by node, never by content).
+        (MERGED_NUMBER_VS_STRING_KEY, ".b | length", "2\n"),
+        (MERGED_DIFFERENT_MAPPING_KEYS, ".b | length", "2\n"),
+        (MERGED_EQUAL_MAPPING_KEYS, ".b | length", "2\n"),
+        (DIFFERENT_ALIAS_KEYS_MERGED_AND_LOCAL, ".b | length", "2\n"),
+        (EMPTY_SEQUENCE_VS_ONE_KEY, ".b | length", "2\n"),
+        (DIFFERENT_NESTED_SEQUENCE_KEYS, ".b | length", "2\n"),
+        (EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY, ".b | length", "2\n"),
+        (DIFFERENT_ALIAS_TO_MAPPING_KEYS, ".b | length", "2\n"),
+        // Looking up the genuine `""` key finds it, never a complex key that
+        // shares its spelling.
+        (MERGED_COMPLEX_VS_GENUINE_EMPTY, ".b | .[\"\"]", "z\n"),
+        // The identity route echoes the source, merge key and all.
+        (
+            MERGED_VS_LOCAL_COMPLEX,
+            ".",
+            "a: &a\n  \"\": x\nb:\n  !!merge <<: *a\n  \"\": y\n",
+        ),
+    ];
+    for &(yaml, filter, expected) in rows {
+        let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
+        assert_eq!(code, 0, "{filter:?} on {yaml:?}, stderr: {stderr}");
+        assert_eq!(output, expected, "{filter:?} on {yaml:?}");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_yq_merge_keys_raise_instead_of_dropping_a_complex_key_3467() -> Result<()> {
+    let rows: &[(&str, &str)] = &[
+        (MERGED_VS_LOCAL_COMPLEX, ".b.z = 1"),
+        // Not even a write elsewhere in the document: the DOM route
+        // materializes `b` too, and used to lose its merged entry.
+        (MERGED_VS_LOCAL_COMPLEX, ".a.k = 1"),
+        (MERGED_VS_LOCAL_COMPLEX, ".b | tojson"),
+        (MERGED_VS_LOCAL_COMPLEX, ".b | [.]"),
+        (MERGED_VS_LOCAL_COMPLEX, ".b | map_values(.)"),
+        (TWO_MERGE_SOURCES_COMPLEX, ".b.z = 1"),
+        (MERGED_COMPLEX_VS_GENUINE_EMPTY, ".b.z = 1"),
+        (MERGED_NUMBER_VS_STRING_KEY, ".b.z = 1"),
+        (MERGED_DIFFERENT_MAPPING_KEYS, ".b.z = 1"),
+        (MERGED_EQUAL_MAPPING_KEYS, ".b.z = 1"),
+        (DIFFERENT_ALIAS_KEYS_MERGED_AND_LOCAL, ".b.z = 1"),
+        (EMPTY_SEQUENCE_VS_ONE_KEY, ".b.z = 1"),
+        (DIFFERENT_NESTED_SEQUENCE_KEYS, ".b.z = 1"),
+        (EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY, ".b.z = 1"),
+        (DIFFERENT_ALIAS_TO_MAPPING_KEYS, ".b.z = 1"),
+    ];
+    for &(yaml, filter) in rows {
+        let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
+        assert_eq!(
+            code, 1,
+            "{filter:?} on {yaml:?} should raise, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("is ambiguous: a complex or undecodable key's display form"),
+            "{filter:?} on {yaml:?}: expected the collision error, got: {stderr}"
+        );
+        assert_eq!(
+            output, "",
+            "{filter:?} on {yaml:?}: nothing may reach stdout"
+        );
+    }
+
+    // `-i` leaves the file byte-identical (it refuses a complex key outright
+    // since #3463, and the pre-walk now also sees the merged collision).
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{MERGED_VS_LOCAL_COMPLEX}")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-i", ".b.z = 1"])
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success(), "-i should raise");
+    assert_eq!(
+        std::fs::read_to_string(input_file.path())?,
+        MERGED_VS_LOCAL_COMPLEX,
+        "-i must leave the file untouched"
+    );
+
+    Ok(())
+}
+
+/// #3467's must-not-change rows: the fix is the fallback-spelling gate in
+/// `upsert_field`, so ordinary keys still override by name (a local `p`
+/// replaces the merged-in one), and a *genuine* `""` key is not a fallback and
+/// still overrides a merged-in `""`. So does everything that is the *same key*
+/// despite the shared `""` spelling: a sequence key of equal content (an empty
+/// one included), an alias key against another use of its anchor, the same
+/// source reached three times, and two sources defining the same key. Each of
+/// those used to resolve to one entry and still does, byte for byte (checked
+/// against a build of `main` without the fix).
+#[test]
+fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> Result<()> {
+    const ORDINARY: &str = "a: &a\n  p: 1\n  q: 3\nb:\n  <<: *a\n  p: 2\n  r: 4\n";
+    const GENUINE_EMPTY: &str = "a: &a\n  \"\": 1\nb:\n  <<: *a\n  \"\": 2\n";
+    let rows: &[(&str, &str, &str)] = &[
+        (MERGED_VS_LOCAL_IDENTICAL_COMPLEX, ".b | length", "1\n"),
+        (
+            MERGED_VS_LOCAL_IDENTICAL_COMPLEX,
+            ".b | to_entries",
+            "- key: ''\n  value: y\n",
+        ),
+        (
+            MERGED_VS_LOCAL_IDENTICAL_COMPLEX,
+            ".b.z = 1",
+            "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
+        (SAME_SOURCE_REPEATED_COMPLEX, ".b | length", "1\n"),
+        (
+            SAME_SOURCE_REPEATED_COMPLEX,
+            ".b.z = 1",
+            "a: &a\n  '': x\nb:\n  '': x\n  z: 1\n",
+        ),
+        (SAME_ALIAS_KEY_MERGED_AND_LOCAL, ".b | length", "1\n"),
+        (
+            SAME_ALIAS_KEY_MERGED_AND_LOCAL,
+            ".b.z = 1",
+            "k: &k [1]\na: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
+        (EMPTY_SEQUENCE_KEY_MERGED_AND_LOCAL, ".b | length", "1\n"),
+        (
+            EMPTY_SEQUENCE_KEY_MERGED_AND_LOCAL,
+            ".b.z = 1",
+            "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
+        (ANCHORED_MAPPING_KEY_AND_ITS_ALIAS, ".b | length", "1\n"),
+        (ANCHORED_SEQUENCE_KEY_AND_ITS_ALIAS, ".b | length", "1\n"),
+        (TWO_ALIASES_NAMING_EQUAL_SCALARS, ".b | length", "1\n"),
+        (SAME_ALIAS_TO_MAPPING_KEY, ".b | length", "1\n"),
+        (
+            SAME_ALIAS_TO_MAPPING_KEY,
+            ".b.z = 1",
+            "m: &m {p: 1}\na: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
+        (NESTED_SEQUENCE_KEY_MERGED_AND_LOCAL, ".b | length", "1\n"),
+        (
+            NESTED_SEQUENCE_KEY_MERGED_AND_LOCAL,
+            ".b.z = 1",
+            "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
+        (BLOCK_SEQUENCE_KEY_MERGED_AND_LOCAL, ".b | length", "1\n"),
+        (
+            BLOCK_SEQUENCE_KEY_MERGED_AND_LOCAL,
+            ".b.z = 1",
+            "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
+        (TWO_SOURCES_SHARING_A_COMPLEX_KEY, ".b | length", "1\n"),
+        (
+            TWO_SOURCES_SHARING_A_COMPLEX_KEY,
+            ".b.z = 1",
+            "a: &a\n  '': x\nc: &c\n  '': w\nb:\n  '': x\n  z: 1\n",
+        ),
+        (ORDINARY, ".b | length", "3\n"),
+        (ORDINARY, ".b | keys", "- p\n- q\n- r\n"),
+        (ORDINARY, ".b.p", "2\n"),
+        (GENUINE_EMPTY, ".b | length", "1\n"),
+        (GENUINE_EMPTY, ".b | to_entries", "- key: ''\n  value: 2\n"),
+        (
+            GENUINE_EMPTY,
+            ".b.z = 1",
+            "a: &a\n  '': 1\nb:\n  '': 2\n  z: 1\n",
+        ),
+    ];
+    for &(yaml, filter, expected) in rows {
+        let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
+        assert_eq!(code, 0, "{filter:?} on {yaml:?}, stderr: {stderr}");
+        assert_eq!(output, expected, "{filter:?} on {yaml:?}");
+    }
+
+    Ok(())
+}
+
+/// #3467: the render that compares two complex keys by content is capped at 64
+/// nodes, and a key over the cap is compared by node instead. The cap is a cliff
+/// by design (an equal key written twice collapses within it and stays two
+/// entries past it), so pin both sides deterministically: `[*l0]` is about a
+/// dozen nodes and `[*l1]` well over a hundred. The wall-clock test below checks
+/// the cap really bounds the work; this one checks where it falls.
+#[test]
+fn test_yq_merge_key_content_comparison_stops_at_the_node_cap_3467() -> Result<()> {
+    let key_twice = |level: usize| -> String {
+        let items = ["x"; 12].join(", ");
+        let mut yaml = format!("l0: &l0 [{items}]\n");
+        for l in 1..=level {
+            let refs = vec![format!("*l{}", l - 1); 12].join(", ");
+            yaml.push_str(&format!("l{l}: &l{l} [{refs}]\n"));
+        }
+        yaml.push_str(&format!(
+            "src: &s\n  ? [*l{level}]\n  : v\nb:\n  <<: *s\n  ? [*l{level}]\n  : w\n"
+        ));
+        yaml
+    };
+    for (level, expected) in [(0, "1\n"), (1, "2\n")] {
+        let (output, stderr, code) =
+            run_yq_stdin_with_stderr(".b | length", &key_twice(level), &[])?;
+        assert_eq!(code, 0, "level {level}, stderr: {stderr}");
+        assert_eq!(output, expected, "level {level}");
+    }
+
+    Ok(())
+}
+
+/// #3467: comparing a complex key by content renders it, and an alias used as
+/// an element names its whole target again, so a few anchored sequences each
+/// listing the last twelve times expand to 12^n nodes from a few hundred bytes.
+/// An unbounded render made `.b` on this 500-byte document take about a minute
+/// in a debug build (and seconds in release), growing 12-fold per level. The
+/// render is capped, so the key falls back to node identity and the mapping
+/// resolves in milliseconds, keeping both entries.
+#[test]
+fn test_yq_merge_key_alias_fanout_in_a_complex_key_is_bounded_3467() -> Result<()> {
+    let items = ["x"; 12].join(", ");
+    let mut yaml = format!("l0: &l0 [{items}]\n");
+    for level in 1..=6 {
+        let refs = vec![format!("*l{}", level - 1); 12].join(", ");
+        yaml.push_str(&format!("l{level}: &l{level} [{refs}]\n"));
+    }
+    yaml.push_str("src: &s\n  ? [*l6]\n  : v\nb:\n  <<: *s\n  k: 1\n");
+
+    let started = std::time::Instant::now();
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".b | length", &yaml, &[])?;
+    let elapsed = started.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(output, "2\n");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "the alias fan-out was rendered unbounded: took {elapsed:?}"
+    );
+
+    Ok(())
+}
+
 /// Runs a yq filter over `yaml` with `extra_args` and asserts it raises with
 /// a stderr containing `expect_stderr` -- shared by
 /// [`test_select_and_write_agree_on_corruption_1803`]'s comparison arms so
