@@ -3130,6 +3130,133 @@ fn test_yq_inplace_refuses_colliding_complex_keys_2519() -> Result<()> {
     Ok(())
 }
 
+/// #3467: a `<<` merge resolved by spelling, and a complex key (`? [1]`) is
+/// spelled `""` (#222), so a merged-in complex key and a local one -- or a
+/// genuine `"": z` -- shared a name and the later silently replaced the earlier
+/// *inside the merged mapping*, before any display-keyed map existed for #2519's
+/// collision guard to see. `.b.z = 1` wrote `b: {'': y, z: 1}` and the merged
+/// `[1]: x` entry was gone, exit 0. A fallback spelling is never a duplicate
+/// (#1385), so the mapping now keeps both entries: a stream of it shows both,
+/// and every materializing route raises #2519's error instead of dropping one.
+const MERGED_VS_LOCAL_COMPLEX: &str = "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  ? [2]\n  : y\n";
+const TWO_MERGE_SOURCES_COMPLEX: &str =
+    "a: &a\n  ? [1]\n  : x\nc: &c\n  ? [2]\n  : w\nb:\n  <<: [*a, *c]\n";
+const MERGED_COMPLEX_VS_GENUINE_EMPTY: &str = "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  \"\": z\n";
+// Two *identical* complex keys, merged-in and local: the local one used to win.
+// Key identity here is the spelling and a complex key has none, so both stay
+// and the materializing routes refuse -- the safe side, recorded in
+// limitations.md.
+const MERGED_VS_LOCAL_IDENTICAL_COMPLEX: &str =
+    "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  ? [1]\n  : y\n";
+
+#[test]
+fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()> {
+    let rows: &[(&str, &str, &str)] = &[
+        (MERGED_VS_LOCAL_COMPLEX, ".b | length", "2\n"),
+        (MERGED_VS_LOCAL_COMPLEX, ".b | keys", "- ''\n- ''\n"),
+        (
+            MERGED_VS_LOCAL_COMPLEX,
+            ".b | to_entries",
+            "- key: ''\n  value: x\n- key: ''\n  value: y\n",
+        ),
+        (TWO_MERGE_SOURCES_COMPLEX, ".b | length", "2\n"),
+        (TWO_MERGE_SOURCES_COMPLEX, ".b | keys", "- ''\n- ''\n"),
+        (MERGED_COMPLEX_VS_GENUINE_EMPTY, ".b | length", "2\n"),
+        (MERGED_VS_LOCAL_IDENTICAL_COMPLEX, ".b | length", "2\n"),
+        // The identity route echoes the source, merge key and all.
+        (
+            MERGED_VS_LOCAL_COMPLEX,
+            ".",
+            "a: &a\n  \"\": x\nb:\n  !!merge <<: *a\n  \"\": y\n",
+        ),
+    ];
+    for &(yaml, filter, expected) in rows {
+        let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
+        assert_eq!(code, 0, "{filter:?} on {yaml:?}, stderr: {stderr}");
+        assert_eq!(output, expected, "{filter:?} on {yaml:?}");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_yq_merge_keys_raise_instead_of_dropping_a_complex_key_3467() -> Result<()> {
+    let rows: &[(&str, &str)] = &[
+        (MERGED_VS_LOCAL_COMPLEX, ".b.z = 1"),
+        // Not even a write elsewhere in the document: the DOM route
+        // materializes `b` too, and used to lose its merged entry.
+        (MERGED_VS_LOCAL_COMPLEX, ".a.k = 1"),
+        (MERGED_VS_LOCAL_COMPLEX, ".b | tojson"),
+        (MERGED_VS_LOCAL_COMPLEX, ".b | [.]"),
+        (MERGED_VS_LOCAL_COMPLEX, ".b | map_values(.)"),
+        (TWO_MERGE_SOURCES_COMPLEX, ".b.z = 1"),
+        (MERGED_COMPLEX_VS_GENUINE_EMPTY, ".b.z = 1"),
+        (MERGED_VS_LOCAL_IDENTICAL_COMPLEX, ".b.z = 1"),
+    ];
+    for &(yaml, filter) in rows {
+        let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
+        assert_eq!(
+            code, 1,
+            "{filter:?} on {yaml:?} should raise, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("is ambiguous: a complex or undecodable key's display form"),
+            "{filter:?} on {yaml:?}: expected the collision error, got: {stderr}"
+        );
+        assert_eq!(
+            output, "",
+            "{filter:?} on {yaml:?}: nothing may reach stdout"
+        );
+    }
+
+    // `-i` leaves the file byte-identical (it refuses a complex key outright
+    // since #3463, and the pre-walk now also sees the merged collision).
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{MERGED_VS_LOCAL_COMPLEX}")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-i", ".b.z = 1"])
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success(), "-i should raise");
+    assert_eq!(
+        std::fs::read_to_string(input_file.path())?,
+        MERGED_VS_LOCAL_COMPLEX,
+        "-i must leave the file untouched"
+    );
+
+    Ok(())
+}
+
+/// #3467's must-not-change rows: the fix is the fallback-spelling gate in
+/// `upsert_field`, so ordinary keys still override by name (a local `p`
+/// replaces the merged-in one), and a *genuine* `""` key is not a fallback and
+/// still overrides a merged-in `""`.
+#[test]
+fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> Result<()> {
+    const ORDINARY: &str = "a: &a\n  p: 1\n  q: 3\nb:\n  <<: *a\n  p: 2\n  r: 4\n";
+    const GENUINE_EMPTY: &str = "a: &a\n  \"\": 1\nb:\n  <<: *a\n  \"\": 2\n";
+    let rows: &[(&str, &str, &str)] = &[
+        (ORDINARY, ".b | length", "3\n"),
+        (ORDINARY, ".b | keys", "- p\n- q\n- r\n"),
+        (ORDINARY, ".b.p", "2\n"),
+        (GENUINE_EMPTY, ".b | length", "1\n"),
+        (GENUINE_EMPTY, ".b | to_entries", "- key: ''\n  value: 2\n"),
+        (
+            GENUINE_EMPTY,
+            ".b.z = 1",
+            "a: &a\n  '': 1\nb:\n  '': 2\n  z: 1\n",
+        ),
+    ];
+    for &(yaml, filter, expected) in rows {
+        let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
+        assert_eq!(code, 0, "{filter:?} on {yaml:?}, stderr: {stderr}");
+        assert_eq!(output, expected, "{filter:?} on {yaml:?}");
+    }
+
+    Ok(())
+}
+
 /// Runs a yq filter over `yaml` with `extra_args` and asserts it raises with
 /// a stderr containing `expect_stderr` -- shared by
 /// [`test_select_and_write_agree_on_corruption_1803`]'s comparison arms so

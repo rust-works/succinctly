@@ -5402,7 +5402,23 @@ fn upsert_field<'a, W: AsRef<[u64]>>(
     value: YamlCursor<'a, W>,
     key_value: &YamlValue<'a, W>,
 ) {
-    let name = key_value.key_string().into_owned();
+    let (name, is_fallback) = key_value.key_string_kind();
+    // #3467: a fallback spelling is never a duplicate (#1385). A complex key
+    // (`? [1]`) is spelled `""` (#222), so two of them -- or one and a genuine
+    // `"": z` -- shared a name here and the later one silently replaced the
+    // earlier, dropping a merged-in entry from the mapping before any
+    // display-keyed map existed for #2519's collision guard to see. Both
+    // entries stay: a stream of the mapping shows both, and a materializer
+    // raises "object key \"\" is ambiguous" instead of losing one. The
+    // fallback key claims no `positions` slot, so nothing later overrides it
+    // either. (Two *identical* complex keys, a merged-in `? [1]` and a local
+    // one, now also stay distinct rather than the local one winning, because
+    // key identity here is the spelling and a complex key has none.)
+    if is_fallback {
+        entries.push((key, value));
+        return;
+    }
+    let name = name.into_owned();
     match positions.get(&name) {
         Some(&pos) => entries[pos] = (key, value),
         None => {
