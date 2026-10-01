@@ -84397,3 +84397,43 @@ fn test_key_after_slice_yq_mode_unchanged_3469() -> Result<()> {
     );
     Ok(())
 }
+
+/// #3470: a top-level program the M2 fast path admits ran its stderr side
+/// effect twice when it then errored, because the fast path re-evaluates the
+/// whole document on the general path after any failure. jq 1.7.1 runs it once;
+/// every expected stderr below is its output.
+#[test]
+fn test_m2_fallback_does_not_rerun_stderr_effects_3470() -> Result<()> {
+    for (filter, expected) in [
+        (
+            r#"first(.[("x"|stderr)])"#,
+            "xjq: error (at <stdin>:1): Cannot index array with string \"x\"\n",
+        ),
+        (
+            r#"first(.[("x"|debug)])"#,
+            "[\"DEBUG:\",\"x\"]\njq: error (at <stdin>:1): Cannot index array with string \"x\"\n",
+        ),
+        (
+            r#"first(.[1:("x"|stderr)])"#,
+            "xjq: error (at <stdin>:1): Array/string slice indices must be integers\n",
+        ),
+        (
+            r#"sort_by(("x"|stderr) | error("e"))"#,
+            "xjq: error (at <stdin>:1): e\n",
+        ),
+        (
+            r#"min_by(("x"|stderr) | error("e"))"#,
+            "xjq: error (at <stdin>:1): e\n",
+        ),
+        (
+            r#"map(.[("x"|stderr)])"#,
+            "xjq: error (at <stdin>:1): Cannot index number with string \"x\"\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[10,20,30]\n"))?;
+        assert_eq!(code, 5, "`{filter}`: stdout {stdout:?} stderr {stderr:?}");
+        assert!(stdout.is_empty(), "`{filter}`: {stdout:?}");
+        assert_eq!(stderr, expected, "#3470: `{filter}`");
+    }
+    Ok(())
+}
