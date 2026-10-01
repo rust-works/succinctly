@@ -749,19 +749,21 @@ mod tests {
     /// the bits.
     #[test]
     fn negative_zero_is_a_float_only_in_yaml_documents_3445() {
-        match resolve_plain_sourced("-0", false) {
-            Float(f) => assert!(f == 0.0 && f.is_sign_negative(), "{f:?}"),
-            other => panic!("`-0` resolved as {other:?}"),
-        }
+        let negative_zero = resolve_plain_sourced("-0", false);
+        assert!(
+            matches!(negative_zero, Float(f) if f == 0.0 && f.is_sign_negative()),
+            "{negative_zero:?}"
+        );
         // JSON-sourced, and every other zero spelling, stay integers.
         assert_eq!(resolve_plain_sourced("-0", true), Int(0));
         for zero in ["0", "+0", "-00"] {
             assert_eq!(resolve_plain_sourced(zero, false), Int(0), "{zero}");
         }
-        match resolve_plain_sourced("-0.0", false) {
-            Float(f) => assert!(f.is_sign_negative()),
-            other => panic!("`-0.0` resolved as {other:?}"),
-        }
+        let negative_float = resolve_plain_sourced("-0.0", false);
+        assert!(
+            matches!(negative_float, Float(f) if f.is_sign_negative()),
+            "{negative_float:?}"
+        );
     }
 
     #[test]
