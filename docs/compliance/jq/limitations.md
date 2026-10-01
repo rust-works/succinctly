@@ -673,11 +673,11 @@ follows too. What it leaves:
   mid-path, which refuses an array segment). `.[[2]]` itself, `indices`/`index`/`rindex` with an
   array needle, `path(.[[2]])`, `del(.[[2]])` and `.[[2]] = 5` have answers of their own and are
   still refused with "Cannot index array with array", with or without a `?//`.
-- **`getpath` on a `null` with a `null` or boolean segment is lenient** (#2429 follow-up): jq
-  raises `Cannot index null with null` / `with boolean` at the first such segment, where
-  succinctly reads `null` as `null` for them as it does for a string or number (an array
-  segment is refused, above). `null | try getpath([null,[1]]) catch .` therefore words its
-  error as "with array" where jq says "with null".
+- **`getpath` with an array segment is value-only** (#2429): in path and write position it
+  still raises "Cannot index array with array" where jq answers, since those routes share the
+  `.[[2]]` gap above. `path(getpath([[1]]))` on `[1,2]` is `[[1]]` in jq; `pick(getpath([[1]]))`
+  is `Cannot index null with array`; `getpath([[1]]) = 3` and `|=` are `Cannot update field at
+  array index of array`, and `del(getpath([[1]]))` is `Cannot delete array element of array`.
 
 ## Path-mode `if`/`select` conditions and a `?//` retry (#3293)
 

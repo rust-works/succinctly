@@ -20884,16 +20884,25 @@ pub(crate) fn getpath_walk_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     getpath_walk_owned_segments::<W, S>(root, path, optional)
 }
 
-/// The first array segment in `rest`, which a `getpath` that has reached a
-/// `null` must still refuse (jq mode). Every other segment reads `null` as
-/// `null`, but an array segment is a subarray search `null` has no answer to:
-/// `[1,2] | getpath([5,[1]])` raises `Cannot index null with array` (#2429).
-/// yq has no array key, so it never has one to refuse.
-pub(crate) fn getpath_null_array_key<S: EvalSemantics>(rest: &[OwnedValue]) -> Option<&OwnedValue> {
+/// The first segment in `rest` that a `getpath` standing on a `null` must
+/// refuse (jq mode). A string, number or object (slice) segment reads `null`
+/// as `null`, but a `null`, boolean or array segment is a key `null` cannot be
+/// indexed by: `[1,2] | getpath([5,[1]])` raises `Cannot index null with array`
+/// and `null | getpath([true])` raises `Cannot index null with boolean`
+/// (#2429). The first such segment names the error. yq has no such key, so it
+/// never has one to refuse.
+pub(crate) fn getpath_null_refused_key<S: EvalSemantics>(
+    rest: &[OwnedValue],
+) -> Option<&OwnedValue> {
     if S::TAG == EvalTag::Yq {
         return None;
     }
-    rest.iter().find(|s| matches!(s, OwnedValue::Array(_)))
+    rest.iter().find(|s| {
+        matches!(
+            s,
+            OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::Array(_)
+        )
+    })
 }
 
 /// [`getpath_walk_owned`]'s loop over an already-unwrapped path, so a walk
@@ -20915,9 +20924,9 @@ pub(crate) fn getpath_walk_owned_segments<'a, W: Clone + AsRef<[u64]>, S: EvalSe
     for (i, segment) in path.iter().enumerate() {
         match (current.as_ref(), segment) {
             // jq: null | getpath(["a"]) => null -- and so is every deeper
-            // segment, except an array one (#2429).
+            // segment, except a null, boolean or array one (#2429).
             (OwnedValue::Null, _) => {
-                return match getpath_null_array_key::<S>(&path[i..]) {
+                return match getpath_null_refused_key::<S>(&path[i..]) {
                     None => QueryResult::Owned(OwnedValue::Null),
                     Some(_) if optional => QueryResult::None,
                     Some(key) => QueryResult::Error(EvalError::cannot_index("null", key)),

@@ -20882,13 +20882,14 @@ fn position_arg_integer<V: DocumentValue>(result: &GenericResult<V>) -> Option<i
 }
 
 /// What `getpath` answers once its walk has reached a `null` with `rest` of
-/// the path still to go: `null`, unless `rest` holds an array segment (jq
-/// mode), which raises -- see [`crate::jq::eval::getpath_null_array_key`].
+/// the path still to go: `null`, unless `rest` holds a segment `null` cannot
+/// be indexed by (jq mode), which raises -- see
+/// [`crate::jq::eval::getpath_null_refused_key`].
 fn getpath_null_tail<S: EvalSemantics, V: DocumentValue>(
     rest: &[OwnedValue],
     optional: bool,
 ) -> GenericResult<V> {
-    match crate::jq::eval::getpath_null_array_key::<S>(rest) {
+    match crate::jq::eval::getpath_null_refused_key::<S>(rest) {
         None => GenericResult::Owned(OwnedValue::Null),
         Some(_) if optional => GenericResult::None,
         Some(key) => GenericResult::Error(EvalError::cannot_index("null", key)),
@@ -20951,9 +20952,8 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
         // absorbs the "key not found" and "index out of range" exits below
         // by walking on from a `null`.
         //
-        // The one exception is an array segment (jq mode): jq reads it as a
-        // subarray search, which `null` cannot answer (#2429).
-        let is_array_key = matches!(segment, OwnedValue::Array(_)) && S::TAG != EvalTag::Yq;
+        // The exceptions are a null, boolean or array segment (jq mode), which
+        // `null` cannot be indexed by (#2429).
         if v.is_null() {
             return getpath_null_tail::<S, V>(&segments[i..], optional);
         }
@@ -21110,7 +21110,7 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
             // node is materialized -- the container only, never the root --
             // and the owned table finishes the walk from this segment on.
             // Against anything but an array it is the type error below.
-            OwnedValue::Array(_) if is_array_key && v.as_array().is_some() => {
+            OwnedValue::Array(_) if S::TAG != EvalTag::Yq && v.as_array().is_some() => {
                 let owned = owned_or_suppress!(to_owned_cursor::<S, _>(&c), optional);
                 return query_result_to_generic::<V, S>(
                     crate::jq::eval::getpath_walk_owned_segments::<Vec<u64>, S>(

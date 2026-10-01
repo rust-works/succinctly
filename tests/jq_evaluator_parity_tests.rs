@@ -1244,6 +1244,46 @@ fn getpath_array_segment_agrees_across_evaluators_2429() {
             "try getpath([0,[1]]) catch .",
             "\"Cannot index number with array\"",
         ),
+        (
+            "null",
+            "try getpath([null]) catch .",
+            "\"Cannot index null with null\"",
+        ),
+        (
+            "null",
+            "try getpath([true]) catch .",
+            "\"Cannot index null with boolean\"",
+        ),
+        (
+            "null",
+            "try getpath([\"a\",null]) catch .",
+            "\"Cannot index null with null\"",
+        ),
+        (
+            "null",
+            "try getpath([null,[1]]) catch .",
+            "\"Cannot index null with null\"",
+        ),
+        ("null", "getpath([\"a\",{}])", "null"),
+        (
+            "{\"x\":1}",
+            "try getpath([\"b\",true]) catch .",
+            "\"Cannot index null with boolean\"",
+        ),
+        ("{\"x\":1}", "[getpath([\"b\",null])?]", "[]"),
+        (
+            "[1,2]",
+            "try getpath([5,null]) catch .",
+            "\"Cannot index null with null\"",
+        ),
+        ("[[]]", "getpath([0,[1]])", "[]"),
+        (
+            "[[],{}]",
+            "try getpath([1,[1]]) catch .",
+            "\"Cannot index object with array\"",
+        ),
+        ("[]", "getpath([[1]])", "[]"),
+        ("[]", "getpath([5,\"a\"])", "null"),
     ] {
         assert_eq!(
             as_strs(&full_outputs(json.as_bytes(), filter)),

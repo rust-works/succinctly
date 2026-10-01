@@ -417,8 +417,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with array` -- which made `[.. | (getpath([paths]))?]` drop the output at every
   array position. Against an object, string, number, or a `null` reached partway
   along the path (`[1,2] | getpath([5,[1]])`) it is still `Cannot index <type>
-  with array`, as in jq 1.7.1. `succinctly yq` is unchanged. The same key on
-  `.[K]`, `path()`, `indices`, and writes is still open under #3506.
+  with array`, as in jq 1.7.1; a `null` or boolean segment on a `null` now
+  raises too (`null | getpath([true])` was `null`). `succinctly yq` is
+  unchanged. The same key on `.[K]`, `indices`, in `path(getpath(...))` and in
+  writes is still open under #3506.
 
 - **jq: an assignment's right-hand side is lazy, and its target is re-resolved
   per right-hand output** (#3448). `=`, `+=`, `-=`, `*=`, `/=`, `%=` and `//=`

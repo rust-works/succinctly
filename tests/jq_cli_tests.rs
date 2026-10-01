@@ -67820,8 +67820,9 @@ fn test_object_index_key_yq_mode_unchanged_3300() -> Result<()> {
 /// `getpath` reads an array segment on an array as jq's subarray search
 /// (`jv_array_indexes`), so `[10,20] | getpath([[0],[1]])` is `[]` -- the
 /// output `[.. | (getpath([paths]))?]` was missing at `.d`. Against any other
-/// container (and against a `null` reached mid-path) it is still
-/// `Cannot index <type> with array`, which `?` suppresses. Every expectation
+/// container, and against a `null` reached mid-path, it is still
+/// `Cannot index <type> with array`, which `?` suppresses; a `null` or boolean
+/// segment on a `null` is refused the same way. Every expectation
 /// was captured from `/usr/bin/jq` 1.7.1.
 #[test]
 fn test_getpath_array_segment_is_a_subarray_search_2429() -> Result<()> {
@@ -67898,6 +67899,46 @@ fn test_getpath_array_segment_is_a_subarray_search_2429() -> Result<()> {
             "try getpath([0,[1]]) catch .",
             "\"Cannot index number with array\"",
         ),
+        (
+            "null",
+            "try getpath([null]) catch .",
+            "\"Cannot index null with null\"",
+        ),
+        (
+            "null",
+            "try getpath([true]) catch .",
+            "\"Cannot index null with boolean\"",
+        ),
+        (
+            "null",
+            "try getpath([\"a\",null]) catch .",
+            "\"Cannot index null with null\"",
+        ),
+        (
+            "null",
+            "try getpath([null,[1]]) catch .",
+            "\"Cannot index null with null\"",
+        ),
+        ("null", "getpath([\"a\",{}])", "null"),
+        (
+            "{\"x\":1}",
+            "try getpath([\"b\",true]) catch .",
+            "\"Cannot index null with boolean\"",
+        ),
+        ("{\"x\":1}", "[getpath([\"b\",null])?]", "[]"),
+        (
+            "[1,2]",
+            "try getpath([5,null]) catch .",
+            "\"Cannot index null with null\"",
+        ),
+        ("[[]]", "getpath([0,[1]])", "[]"),
+        (
+            "[[],{}]",
+            "try getpath([1,[1]]) catch .",
+            "\"Cannot index object with array\"",
+        ),
+        ("[]", "getpath([[1]])", "[]"),
+        ("[]", "getpath([5,\"a\"])", "null"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "#2429: `{filter}` on {input}: {stderr:?}");
