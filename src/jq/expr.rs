@@ -272,6 +272,13 @@ pub enum BindOrigin {
         /// *detached* root (an `input`, a literal) still names that root
         /// and no other -- `base` is `None` there and `exact` cannot help.
         root: u64,
+        /// The bind source is nothing but plain navigation steps
+        /// (`.a.b`, `.a[0]`, `.a[]`), so `chain`'s last entry is the bound
+        /// value's own container and the component it took to reach it
+        /// (#3482). Every other source -- `max`, `.a | length`, `[.b]` --
+        /// places a value the pipe *computed* at that position, which is
+        /// not the node there, and `chain` alone cannot tell the two apart.
+        navigated: bool,
     },
 }
 

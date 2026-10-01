@@ -69415,6 +69415,348 @@ fn test_bound_ancestor_anchor_names_the_step_without_decoding_siblings_3483() ->
     Ok(())
 }
 
+/// #3482: a navigated scalar bind on an *owned-rooted* document -- `-n
+/// 'input | ...'`, a `tojson | fromjson` root, a constructed literal -- is
+/// certified by the container it was navigated out of, exactly as #3134 does
+/// for a document node. These binds run in the owned identity pipe, which
+/// records the parent container and the component taken for every value it
+/// binds (`BindOrigin::Owned`'s chain); `marker_identical`'s anchor clause
+/// reads that pair where a document bind reads the embed table. Every
+/// expected output captured live against jq 1.7.1.
+#[cfg(not(feature = "unshared-containers"))]
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_navigated_scalar_bind_on_owned_root_answers_3482() -> Result<()> {
+    for (input, flags, filter, expected) in [
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | path(.a | .b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | (.a.b | $z) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | (.a | .b | $z) |= 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | (.a.b | $z) += 5",
+            r#"{"a":{"b":6}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | del(.a.b | $z)",
+            r#"{"a":{}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | .a | (.b | $z) = 9",
+            r#"{"b":9}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | .a | path(.b | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | .a | path(.b? | $z)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r#"input | .a.b as $z | try path(.a.b | $z) catch "c""#,
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | [path(.a.b | $z)]",
+            r#"[["a","b"]]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | limit(1; path(.a.b | $z))",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | def f: path(.a.b | $z); f",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | reduce (1) as $i (.; (.a.b | $z) = 9)",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"a":{"b":"s"}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1.5}}"#,
+            &["-n"][..],
+            r"input | .a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            &["-n"][..],
+            r"input | .a[0] as $z | path(.a[0] | $z)",
+            r#"["a",0]"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            &["-n"][..],
+            r"input | .a[1] as $z | (.a[1] | $z) = 5",
+            r#"{"a":[1,5]}"#,
+        ),
+        (
+            r#"{"a":[1,1]}"#,
+            &["-n"][..],
+            r"input | .a[0] as $z | .a | path(.[-2] | $z)",
+            r"[-2]",
+        ),
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            &["-n"][..],
+            r"input | .a as $y | .a.b.c as $z | path(.a.b.c | $z)",
+            r#"["a","b","c"]"#,
+        ),
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            &["-n"][..],
+            r"input | .a as $y | .a.b as $z | (.a | .b | $z) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &[][..],
+            r"tojson | fromjson | .a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &[][..],
+            r"tojson | fromjson | .a.b as $z | (.a.b | $z) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"{a:{b:1}} | .a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"{a:{b:1}} | .a.b as $z | (.a.b | $z) = 9",
+            r#"{"a":{"b":9}}"#,
+        ),
+        // A negative index is recorded as spelled and resolved as the slot.
+        (
+            r#"{"a":[1,2]}"#,
+            &["-n"][..],
+            r"input | .a[-1] as $z | path(.a[-1] | $z)",
+            r#"["a",-1]"#,
+        ),
+        (
+            r#"{"a":[1,2]}"#,
+            &["-n"][..],
+            r"input | .a[-1] as $z | path(.a[1] | $z)",
+            r#"["a",1]"#,
+        ),
+        (
+            r#"{"a":[1,2]}"#,
+            &["-n"][..],
+            r"input | .a[-1] as $z | (.a[-1] | $z) = 9",
+            r#"{"a":[1,9]}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            &["-n"][..],
+            r"{a:{b:(1+1),c:2}} | .a.b as $z | path(.a.b | $z)",
+            r#"["a","b"]"#,
+        ),
+    ] {
+        let mut args = vec!["-c"];
+        args.extend_from_slice(flags);
+        args.push(filter);
+        let (stdout, stderr, code) = run_jq_full(&args, Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3482: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3482's controls: jq refuses each of these, and the owned route must too.
+/// The first block is the register being an equal value at another node; the
+/// second is a bound value the pipe *computed* (`+`, `ascii_downcase`,
+/// `[...]`) or picked by a rule that disagrees with jq about which element
+/// (`max`), so the identity chain is no proof of the node there.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_navigated_scalar_bind_on_owned_root_controls_refuse_3482() -> Result<()> {
+    for (input, filter) in [
+        (
+            r#"{"a":{"b":1},"c":1}"#,
+            r"input | .a.b as $z | path(.c | $z)",
+        ),
+        (
+            r#"{"a":{"b":1,"c":1}}"#,
+            r"input | .a.b as $z | .a | path(.c | $z)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r"input | .a.b as $z | .x | path(.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r"input | .a.b as $z | path(.x.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r"input | .a.b as $z | .x | (.b | $z) = 5",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"b":1}}"#,
+            r"input | .a.b as $z | del(.x.b | $z)",
+        ),
+        (r#"{"a":[1,1]}"#, r"input | .a[1] as $z | path(.a[0] | $z)"),
+        (r#"{"a":[1,1]}"#, r"input | .a[1] as $z | [path(.a[] | $z)]"),
+        (r#"{"a":[1,1]}"#, r"input | .a[0] as $z | [path(.a[] | $z)]"),
+        (
+            r#"{"a":[1,1]}"#,
+            r"input | .a[1] as $z | .a | path(.[-2] | $z)",
+        ),
+        (
+            r#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+            r"input | .a.b as $z | .x | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"input | .a.b as $z | .a.b = 1 | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"input | .a.b as $z | .a.b |= (. as $w | 1) | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"input | .a.b as $z | .a | path(.. | $z)",
+        ),
+        // A value the pipe computed at the position is not the node there: the
+        // identity chain says where the bind *stands*, not what it is.
+        (
+            r#"{"a":{"b":"x"}}"#,
+            r#"input | (.a.b + "") as $z | path(.a.b | $z)"#,
+        ),
+        (
+            r#"{"a":{"b":"x"}}"#,
+            r"input | (.a.b | ascii_downcase) as $z | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":"x"}}"#,
+            r"input | (.a.b | tojson | fromjson) as $z | path(.a.b | $z)",
+        ),
+        (
+            r#"{"a":{"b":[1]}}"#,
+            r"input | (.a.b | [.[0]]) as $z | path(.a.b | $z)",
+        ),
+        // `max` returns the *last* of equal elements in jq, where the pipe's
+        // extremum rule places it at the first: a chain-only proof would
+        // certify element 0.
+        (
+            r#"{"a":[1,1,1]}"#,
+            r"input | (.a | max) as $z | [path(.a[0] | $z)]",
+        ),
+        (
+            r#"{"a":[1,1,1]}"#,
+            r"input | (.a | max_by(.)) as $z | [path(.a[0] | $z)]",
+        ),
+        (r#"{"a":[1,2]}"#, r"input | .a[-1] as $z | path(.a[0] | $z)"),
+        // A constructed root: an equal sibling, and an equal computed double.
+        (r"null", r"{a:{b:1,c:1}} | .a.b as $z | path(.a.c | $z)"),
+        (r"null", r"{a:{b:1,c:1}} | .a.b as $z | (.a.c | $z) = 5"),
+        (r"null", r"{a:{b:(1+1),c:2}} | .a.b as $z | path(.a.c | $z)"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3482: `{filter}` on {input} must stay refused, as jq refuses it: \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3482: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3482 is jq mode only (ADR-0018): real yq's assignment through a variable
+/// is a no-op that prints the document unchanged, and `succinctly yq` must
+/// keep doing exactly that rather than write through the anchor.
+#[test]
+fn test_owned_root_scalar_anchor_is_jq_mode_only_3482() -> Result<()> {
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .arg("yq")
+                .arg("--jq-extensions")
+                .arg(".a.b as $z | (.a.b | $z) = 9");
+            command
+        },
+        Some(b"a:\n  b: 1\n"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8(output.stdout)?, "a:\n  b: 1\n");
+    // The owned-rooted route the jq-mode clause reads: same no-op.
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .arg("yq")
+                .arg("--jq-extensions")
+                .arg("tojson | fromjson | .a.b as $z | (.a.b | $z) = 9");
+            command
+        },
+        Some(b"a:\n  b: 1\n"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8(output.stdout)?, "a:\n  b: 1\n");
+    Ok(())
+}
+
 /// #3179: an embed of a bound node reached through a container built from
 /// one of its *ancestors*. The materializer now takes the binding's own
 /// value for a nested container, not only at its depth 0, so `{k:.}`'s copy

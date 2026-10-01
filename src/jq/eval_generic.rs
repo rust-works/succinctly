@@ -12080,14 +12080,43 @@ fn bind_origin_of_cursor<C: DocumentCursor>(c: &C) -> BindOrigin {
 /// -- it has to reduce to the type-erased `(node_id, document_token)` pair
 /// [`identity_from_origin`] later re-resolves against whatever cursor type
 /// the caller anchors it to.
-fn bind_origin_of_identity<V: DocumentValue>(id: &OwnedIdentity<V>) -> BindOrigin {
+fn bind_origin_of_identity<V: DocumentValue>(id: &OwnedIdentity<V>, navigated: bool) -> BindOrigin {
     BindOrigin::Owned {
         base: id.base.map(|c| (c.node_id(), c.document_token())),
         chain: id.ancestors.clone(),
         key_node: id.key_node,
         exact: id.exact,
         root: id.root,
+        navigated,
     }
+}
+
+/// Whether `source` is nothing but plain navigation steps and navigates at
+/// least once (#3482): the only shape whose last chain entry
+/// ([`OwnedIdentity::child`]) is the bound value's own container and
+/// component. A stage that computes a value and keeps the input's position
+/// (`length`, `[...]`, `max`, `+`) leaves the chain describing where the
+/// value *stands*, which is what `path`/`key` want in yq but is no proof
+/// the value is the node there. A variable is excluded too: its own chain
+/// may end in such a stage, and `.a as $x | $x` carries no more than that.
+///
+/// This list must stay a subset of what [`owned_identity_nav_supported`]
+/// steps with [`OwnedIdentity::child`] -- a stage added here that kept the
+/// parent's identity instead would make the chain's last entry name the
+/// wrong node. `test_navigated_scalar_bind_on_owned_root_*_3482` pin the
+/// behaviour end to end.
+fn is_plain_navigation(source: &Expr) -> bool {
+    fn steps(e: &Expr) -> Option<bool> {
+        match strip_parens(e) {
+            Expr::Identity => Some(false),
+            Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => Some(true),
+            Expr::Pipe(stages) => stages
+                .iter()
+                .try_fold(false, |seen, stage| Some(seen | steps(stage)?)),
+            _ => None,
+        }
+    }
+    steps(source) == Some(true)
 }
 
 /// The live cursor a `BindOrigin::Node` names, if `anchor` belongs to the
@@ -12123,6 +12152,7 @@ fn identity_from_origin<V: DocumentValue>(
             key_node,
             exact,
             root,
+            ..
         } => Some(OwnedIdentity {
             base: None,
             ancestors: chain.clone(),
@@ -12136,6 +12166,7 @@ fn identity_from_origin<V: DocumentValue>(
             key_node,
             exact,
             root,
+            ..
         } => {
             let anchor = anchor?;
             if anchor.document_token() != *document {
@@ -28360,6 +28391,7 @@ fn owned_identity_bind_values<S: EvalSemantics, V: DocumentValue>(
 ) -> (Vec<BoundValue>, Option<Control>) {
     let stages = owned_identity_body_stages(bind);
     if owned_identity_pipe_supported(stages) {
+        let navigated = is_plain_navigation(bind);
         let mut pairs: Vec<BoundValue> = Vec::new();
         let flow = eval_owned_identity_stages::<S, V>(
             stages,
@@ -28367,7 +28399,10 @@ fn owned_identity_bind_values<S: EvalSemantics, V: DocumentValue>(
             id.clone(),
             optional,
             OwnedIdentityTail::Pairs(&mut |v, vid| {
-                pairs.push((v.into_owned(), Some(bind_origin_of_identity(&vid))));
+                pairs.push((
+                    v.into_owned(),
+                    Some(bind_origin_of_identity(&vid, navigated)),
+                ));
                 Flow::Exhausted
             }),
         );
@@ -43526,6 +43561,43 @@ mod tests {
         // yq mode never shares.
         assert!(embed_shared_for::<YqSemantics, _>(&empty).is_none());
         assert!(embed_at_or_within::<YqSemantics, _>(&empty).0.is_none());
+    }
+
+    /// #3482: only plain navigation steps make a bind's chain a proof of the
+    /// node; anything that computes, constructs or reads a variable does not.
+    #[test]
+    fn is_plain_navigation_admits_only_steps_3482() {
+        let yes = [
+            ".a",
+            ".a.b",
+            ".a[0]",
+            ".a[]",
+            ".a | .b",
+            "(.a | .b)",
+            ".a | .",
+        ];
+        let no = [
+            ".",
+            "$__loc__",
+            ".a + 1",
+            ".a | length",
+            "[.a]",
+            ".a | max",
+            ".a?",
+            ".a // 1",
+            ".a[1:]",
+            "..",
+            "getpath([\"a\"])",
+            ".a, .b",
+            "1",
+            ".[.a]",
+        ];
+        for f in yes {
+            assert!(is_plain_navigation(&crate::jq::parse(f).unwrap()), "{f}");
+        }
+        for f in no {
+            assert!(!is_plain_navigation(&crate::jq::parse(f).unwrap()), "{f}");
+        }
     }
 
     /// #3134: a scalar binding's anchor is pushed *pending* on its parent,
