@@ -827,8 +827,12 @@ struct JqCommand {
     filter: Option<String>,
 
     /// Input files (reads from stdin if none provided)
-    /// When using --args or --jsonargs, these become positional values instead.
-    #[arg(trailing_var_arg = true)]
+    /// Words after --args or --jsonargs are positional values, not files.
+    ///
+    /// Not `trailing_var_arg`: that made every word after the first file a
+    /// file, flags included, so `jq . data.json -c` and `jq . data.json
+    /// --args a` failed with "Could not open file -c". jq reads an option
+    /// wherever it appears (#3447).
     files: Vec<String>,
 
     // === Input Options ===
@@ -1380,6 +1384,134 @@ fn negative_filter_retry_candidates(args: &[String], err: &clap::error::Error) -
     positions
 }
 
+/// `jq`'s clap definition with its argument settings resolved: until clap
+/// builds a command, an argument's `num_args` is unset, which
+/// [`jq_option_arity`] would read as "takes no value".
+fn built_jq_command() -> clap::Command {
+    let mut cmd = <JqCommand as clap::CommandFactory>::command();
+    cmd.build();
+    cmd
+}
+
+/// How many words after `flag` the jq option `flag` consumes as its values
+/// (`--arg NAME VALUE` is 2, `-f FILE` is 1, `-c` is 0), read off clap's own
+/// definition so a new option cannot drift from this table. `flag` is one
+/// argv word: a `--long`, `--long=value`, or a short bundle (`-nc`, `-nf`).
+///
+/// A bundle ends at the first short that takes a value: when text follows it
+/// in the same word, that text is the value (`-fprog.jq`) and nothing more is
+/// consumed; when it is the last character, the next word(s) are. An unknown
+/// option consumes nothing, so clap reports it in its own words.
+fn jq_option_arity(cmd: &clap::Command, flag: &str) -> usize {
+    let takes = |arg: &clap::Arg| arg.get_num_args().map_or(0, |range| range.min_values());
+    if let Some(long) = flag.strip_prefix("--") {
+        if long.contains('=') {
+            return 0;
+        }
+        return cmd
+            .get_arguments()
+            .find(|arg| {
+                arg.get_long() == Some(long)
+                    || arg
+                        .get_all_aliases()
+                        .is_some_and(|aliases| aliases.contains(&long))
+            })
+            .map_or(0, takes);
+    }
+    let shorts: Vec<char> = flag.chars().skip(1).collect();
+    for (i, c) in shorts.iter().enumerate() {
+        let Some(arg) = cmd.get_arguments().find(|arg| {
+            arg.get_short() == Some(*c)
+                || arg
+                    .get_all_short_aliases()
+                    .is_some_and(|aliases| aliases.contains(c))
+        }) else {
+            return 0;
+        };
+        let n = takes(arg);
+        if n > 0 {
+            return if i + 1 < shorts.len() { 0 } else { n };
+        }
+    }
+    0
+}
+
+/// Move every option (and the values it takes) that follows the first
+/// `--args`/`--jsonargs` in `args` to just before it (#3447).
+///
+/// Those two flags are greedy in clap: they take every following word, so an
+/// option among them (`--args '$ARGS.positional' -c a`) arrived as a
+/// positional value, where jq reads it as the option it is. jq's own rule is
+/// that a word is an option when it is `-` followed by a letter or another
+/// `-` ([`looks_like_negative_filter`] is the complement), anywhere before a
+/// `--`; `-7` and a lone `-` stay positional. Options do not depend on where
+/// they sit, so hoisting them leaves their effect unchanged and leaves the
+/// greedy flags only words that really are positional. Values are kept with
+/// their option by arity ([`jq_option_arity`]), so `--args '$P' --arg x y a`
+/// does not leave `x` and `y` behind as positional words.
+///
+/// `start` is the index of the first jq argument (after the program name, or
+/// after the `jq` subcommand token). Nothing moves when no such flag appears
+/// before a `--`, so every other invocation passes through byte-for-byte.
+fn hoist_options_before_positional_flags(args: Vec<String>, start: usize) -> Vec<String> {
+    let is_mode_flag = |w: &str| w == "--args" || w == "--jsonargs";
+    let is_option = |w: &str| w.starts_with('-') && !looks_like_negative_filter(w);
+
+    // The overwhelming majority of invocations have no such flag: answer
+    // those from one scan of argv, before building clap's whole definition
+    // for the arity table (process startup is the entire runtime of a small
+    // query).
+    if !args.iter().skip(start).any(|w| is_mode_flag(w)) {
+        return args;
+    }
+    let cmd = &built_jq_command();
+
+    // The first mode flag, found by walking in option-arity steps so a flag
+    // spelled like one but given as an option's value (`--arg x --args`) is
+    // not mistaken for it.
+    let mut i = start;
+    let mut first_mode = None;
+    while i < args.len() {
+        let w = args[i].as_str();
+        if w == "--" {
+            break;
+        }
+        if is_mode_flag(w) {
+            first_mode = Some(i);
+            break;
+        }
+        i += 1 + if is_option(w) {
+            jq_option_arity(cmd, w)
+        } else {
+            0
+        };
+    }
+    let Some(first_mode) = first_mode else {
+        return args;
+    };
+
+    let mut head = args[..first_mode].to_vec();
+    let mut tail = Vec::new();
+    let mut i = first_mode;
+    while i < args.len() {
+        let w = args[i].as_str();
+        if w == "--" {
+            tail.extend_from_slice(&args[i..]);
+            break;
+        }
+        if is_mode_flag(w) || !is_option(w) {
+            tail.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        let end = (i + 1 + jq_option_arity(cmd, w)).min(args.len());
+        head.extend_from_slice(&args[i..end]);
+        i = end;
+    }
+    head.extend(tail);
+    head
+}
+
 /// Parses `args` as `P` (a jq-only [`clap::Parser`], see
 /// [`looks_like_negative_filter`]'s own doc comment for why `yq` needs no
 /// equivalent), retrying with `--` spliced in before each candidate
@@ -1430,9 +1562,11 @@ fn try_multicall() -> Result<Option<i32>> {
 
     match name {
         "sjq" | "jq" => {
-            let cmd: JqCommand = parse_allowing_negative_filter(
-                std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
-            );
+            let argv: Vec<String> = std::iter::once(name.to_string())
+                .chain(std::env::args().skip(1))
+                .collect();
+            let cmd: JqCommand =
+                parse_allowing_negative_filter(hoist_options_before_positional_flags(argv, 1));
             Ok(Some(jq_runner::run_jq(cmd)?))
         }
         "syq" | "yq" => {
@@ -1553,7 +1687,12 @@ fn exit_after_run(exit_code: i32) -> ! {
 /// `succinctly yq` needs no equivalent gate on `"yq"` -- see
 /// `looks_like_negative_filter`'s own doc comment for why.
 fn parse_cli_allowing_negative_filter() -> Cli {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // `succinctly jq ...`: the jq options after the `jq` token get the same
+    // hoist the `sjq` path applies (#3447).
+    if args.get(1).map(String::as_str) == Some("jq") {
+        args = hoist_options_before_positional_flags(args, 2);
+    }
     match Cli::try_parse_from(args.iter().cloned()) {
         Ok(cli) => cli,
         Err(e) => {
@@ -2885,6 +3024,134 @@ mod tests {
         assert!(
             msg.contains("jq not found") || msg.contains("binary not found"),
             "unexpected error: {msg}"
+        );
+    }
+}
+
+/// #3447: [`hoist_options_before_positional_flags`] on argv alone, without
+/// running a command.
+#[cfg(test)]
+mod hoist_options_3447 {
+    use super::*;
+
+    fn hoist(words: &[&str]) -> Vec<String> {
+        let argv = words.iter().map(|w| (*w).to_string()).collect();
+        hoist_options_before_positional_flags(argv, 1)
+    }
+
+    fn strs(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_string()).collect()
+    }
+
+    #[test]
+    fn options_after_the_flag_move_in_front_of_it() {
+        assert_eq!(
+            hoist(&["jq", "-n", "--args", "$P", "-c", "a"]),
+            strs(&["jq", "-n", "-c", "--args", "$P", "a"])
+        );
+        assert_eq!(
+            hoist(&["jq", "--jsonargs", "$P", "1", "--tab", "2"]),
+            strs(&["jq", "--tab", "--jsonargs", "$P", "1", "2"])
+        );
+        // The flag's own position, and the order of what moved, are kept.
+        assert_eq!(
+            hoist(&["jq", "--args", "-n", "-c", "$P"]),
+            strs(&["jq", "-n", "-c", "--args", "$P"])
+        );
+    }
+
+    #[test]
+    fn an_option_keeps_its_values_by_arity() {
+        assert_eq!(
+            hoist(&["jq", "--args", "$P", "--arg", "x", "y", "a"]),
+            strs(&["jq", "--arg", "x", "y", "--args", "$P", "a"])
+        );
+        assert_eq!(
+            hoist(&["jq", "--args", "$P", "--indent", "1", "a"]),
+            strs(&["jq", "--indent", "1", "--args", "$P", "a"])
+        );
+        assert_eq!(
+            hoist(&["jq", "-n", "--args", "-f", "prog.jq", "a", "b"]),
+            strs(&["jq", "-n", "-f", "prog.jq", "--args", "a", "b"])
+        );
+        // A bundle ending in a value-taking short takes the next word; one
+        // with the value attached, or a `--long=value`, takes nothing more.
+        assert_eq!(
+            hoist(&["jq", "--args", "$P", "-nf", "prog.jq", "a"]),
+            strs(&["jq", "-nf", "prog.jq", "--args", "$P", "a"])
+        );
+        assert_eq!(
+            hoist(&["jq", "--args", "$P", "--indent=1", "a"]),
+            strs(&["jq", "--indent=1", "--args", "$P", "a"])
+        );
+    }
+
+    #[test]
+    fn short_only_and_two_value_options_keep_their_operands() {
+        // `-L DIR` has no long spelling; `--slurpfile`/`--rawfile` take two.
+        assert_eq!(
+            hoist(&["jq", "--args", "$P", "-L", "lib", "a"]),
+            strs(&["jq", "-L", "lib", "--args", "$P", "a"])
+        );
+        assert_eq!(
+            hoist(&["jq", "--args", "$P", "--slurpfile", "x", "f.json", "a"]),
+            strs(&["jq", "--slurpfile", "x", "f.json", "--args", "$P", "a"])
+        );
+        assert_eq!(
+            hoist(&["jq", "--args", "$P", "--rawfile", "x", "f.txt", "a"]),
+            strs(&["jq", "--rawfile", "x", "f.txt", "--args", "$P", "a"])
+        );
+        // An option-shaped operand belongs to its option, not to the hoist.
+        assert_eq!(
+            hoist(&["jq", "--args", "$P", "--arg", "x", "-c", "a"]),
+            strs(&["jq", "--arg", "x", "-c", "--args", "$P", "a"])
+        );
+    }
+
+    #[test]
+    fn positional_words_and_a_double_dash_stay_put() {
+        // `-7`, a lone `-`, and a bare word are positional, not options.
+        assert_eq!(
+            hoist(&["jq", "-n", "--args", "$P", "-7", "-", "a"]),
+            strs(&["jq", "-n", "--args", "$P", "-7", "-", "a"])
+        );
+        // `--` ends option reading, so what follows is not hoisted.
+        assert_eq!(
+            hoist(&["jq", "-n", "--args", "$P", "--", "-c", "a"]),
+            strs(&["jq", "-n", "--args", "$P", "--", "-c", "a"])
+        );
+        // An unknown option still moves, so clap reports it in its own words.
+        assert_eq!(
+            hoist(&["jq", "--args", "$P", "-x"]),
+            strs(&["jq", "-x", "--args", "$P"])
+        );
+    }
+
+    #[test]
+    fn a_flag_spelled_like_a_mode_flag_as_an_options_value_is_not_one() {
+        // `--arg a --args` hands `--args` to `--arg` as its value, so there is
+        // no mode flag here and nothing moves.
+        let argv = ["jq", "-n", "--arg", "a", "--args", "$P", "b"];
+        assert_eq!(hoist(&argv[..5]), strs(&argv[..5]));
+    }
+
+    #[test]
+    fn argv_without_a_mode_flag_is_untouched() {
+        for argv in [
+            &["jq", ".", "data.json", "-c"][..],
+            &["jq", "-nc", "$ARGS", "--arg", "x", "y"][..],
+            &["jq"][..],
+        ] {
+            assert_eq!(hoist(argv), strs(argv));
+        }
+    }
+
+    #[test]
+    fn the_start_index_skips_the_subcommand_token() {
+        let argv = strs(&["succinctly", "jq", "-n", "--args", "$P", "-c", "a"]);
+        assert_eq!(
+            hoist_options_before_positional_flags(argv, 2),
+            strs(&["succinctly", "jq", "-n", "-c", "--args", "$P", "a"])
         );
     }
 }

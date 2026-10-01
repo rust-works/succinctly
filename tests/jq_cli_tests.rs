@@ -1465,8 +1465,13 @@ fn test_jq_number_spellings_every_input_path_2877() -> Result<()> {
                 run_jq_full(&["-nc", "--argjson", "x", value, "$x"], None)?;
             assert_eq!(code, 0, "--argjson {value}: stderr: {stderr:?}");
             assert_eq!(stdout.trim_end(), expected, "--argjson {value}");
-            let (stdout, stderr, code) =
-                run_jq_full(&["-nc", "$ARGS.positional", "--jsonargs", value], None)?;
+            // `--` first: jq reads `--jsonargs -nan` as the unknown option
+            // `-nan` (#3447), so a `-`-then-letter spelling is only a word
+            // after it.
+            let (stdout, stderr, code) = run_jq_full(
+                &["-nc", "$ARGS.positional", "--jsonargs", "--", value],
+                None,
+            )?;
             assert_eq!(code, 0, "--jsonargs {value}: stderr: {stderr:?}");
             assert_eq!(
                 stdout.trim_end(),
@@ -85330,5 +85335,59 @@ fn test_m2_fallback_does_not_rerun_stderr_effects_3470() -> Result<()> {
         assert!(stdout.is_empty(), "`{filter}`: {stdout:?}");
         assert_eq!(stderr, expected, "#3470: `{filter}`");
     }
+    Ok(())
+}
+
+/// #3447: jq reads an option-shaped word as an option wherever it appears, a
+/// `--` being the only thing that ends that, but `--args`/`--jsonargs` were
+/// greedy: every following word became a positional value, `-n` after
+/// `--args` became the program, and an input file given before `--args` was
+/// treated as an option's operand. Expected output is jq 1.7.1's.
+#[test]
+fn test_options_after_args_and_jsonargs_are_options_3447() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let prog = dir.path().join("prog.jq");
+    std::fs::write(&prog, "$ARGS.positional\n")?;
+    let data = dir.path().join("data.json");
+    std::fs::write(&data, "{\"a\":1}\n")?;
+    let (prog, data) = (prog.to_string_lossy(), data.to_string_lossy());
+    let p = "$ARGS.positional";
+
+    for (argv, expected) in [
+        (vec!["--args", "-n", p, "a"], "[\n  \"a\"\n]"),
+        (vec!["-nc", "--args", "-f", &prog, "a", "b"], r#"["a","b"]"#),
+        (vec!["-nc", "--args", p, "-c", "a"], r#"["a"]"#),
+        (vec!["-nc", p, "--args", "a", "b", "-c"], r#"["a","b"]"#),
+        (
+            vec!["-nc", "--jsonargs", p, "1", "--tab", "2"],
+            "[\n\t1,\n\t2\n]",
+        ),
+        (vec!["-nc", "--args", p, "--arg", "x", "y", "a"], r#"["a"]"#),
+        (
+            vec!["-nc", "--args", p, "--indent", "1", "a"],
+            "[\n \"a\"\n]",
+        ),
+        // Not options: a `-` followed by a non-letter, a lone `-`, and
+        // everything after `--`.
+        (
+            vec!["-nc", "--args", p, "-7", "-", "a"],
+            r#"["-7","-","a"]"#,
+        ),
+        (vec!["-nc", "--args", p, "--", "-c", "a"], r#"["-c","a"]"#),
+        // An input file before `--args` is still an input file, and a flag
+        // after a file is still a flag.
+        (vec!["-c", p, &data, "--args", "a"], r#"["a"]"#),
+        (vec![".", &data, "-c"], r#"{"a":1}"#),
+        (vec![".", "-c", &data], r#"{"a":1}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&argv, Some(""))?;
+        assert_eq!(code, 0, "{argv:?}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{argv:?}");
+    }
+
+    // An unknown option after `--args` is an error, as in jq, not a word.
+    let (stdout, _, code) = run_jq_full(&["-nc", "--args", p, "-x"], Some(""))?;
+    assert_eq!(code, 2, "stdout {stdout:?}");
+    assert!(stdout.is_empty(), "{stdout:?}");
     Ok(())
 }
