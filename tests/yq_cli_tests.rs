@@ -49843,6 +49843,19 @@ fn test_yq_negative_zero_document_and_literal_arithmetic_3445() -> Result<()> {
         assert_eq!(stdout, expected, "`yq -n '{filter}'`");
     }
 
+    // The DOM routes (`-P`, `--arg`) resolve the same scalar through their
+    // own conversion, and must agree with the streaming one.
+    for (filter, expected, args) in [
+        (".a - 0", "-0\n", vec!["-P"]),
+        (".a | tag", "!!float\n", vec!["-P"]),
+        (".a", "-0.0\n", vec!["-P", "-o=json"]),
+        ("[.a] | .[0] / -1", "0\n", vec!["--arg", "x", "1"]),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "a: -0\n", &args)?;
+        assert_eq!(code, 0, "`{filter}` {args:?}");
+        assert_eq!(stdout, expected, "`{filter}` {args:?}");
+    }
+
     // An explicit `!!int` tag still makes `-0` the integer zero (the
     // float resolution is the *plain* scalar's), and a JSON document's `-0`
     // is the integer zero too: yq's JSON decoder, unlike its YAML one, reads

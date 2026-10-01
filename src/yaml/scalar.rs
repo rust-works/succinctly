@@ -208,6 +208,13 @@ impl ResolvedScalar {
 
 /// Resolves a plain (unquoted) YAML scalar under the 1.2 core schema.
 ///
+/// This is the *JSON-sourced* reading: `-0` is the integer zero here, as in
+/// yq's JSON decoder. A scalar read from a YAML document goes through
+/// [`resolve_plain_sourced`] (usually via `YamlString::resolve_plain_scalar`),
+/// which resolves exactly `-0` as a float, as go-yaml does (#3445). Call this
+/// one directly only where the source is JSON or the question is about the
+/// text alone.
+///
 /// Dispatches on the first byte so that non-matching scalars (the common
 /// case in the transcode hot path) exit after at most a couple of byte
 /// comparisons; full-string comparisons and numeric parses only run inside
@@ -244,10 +251,12 @@ pub fn resolve_plain(s: &str) -> ResolvedScalar {
 #[must_use]
 #[inline(always)]
 pub fn resolve_plain_sourced(s: &str, json_sourced: bool) -> ResolvedScalar {
-    if !json_sourced && s == "-0" {
-        ResolvedScalar::Float(-0.0)
-    } else {
-        resolve_plain(s)
+    // Checked on the *result*: only a scalar that resolved to the integer zero
+    // can be a `-0`, so every other plain scalar pays one discriminant
+    // compare, not a string compare, on the streaming hot path.
+    match resolve_plain(s) {
+        ResolvedScalar::Int(0) if !json_sourced && s == "-0" => ResolvedScalar::Float(-0.0),
+        resolved => resolved,
     }
 }
 

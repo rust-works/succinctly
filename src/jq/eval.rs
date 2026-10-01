@@ -12066,9 +12066,10 @@ fn is_negative_zero_int_literal(value: &OwnedValue) -> bool {
 }
 
 /// [`OwnedValue::number_repr`], except that in jq mode a `-0` integer literal
-/// reads as `Float(-0.0)` rather than `Int(0)` (#3442). jq has no integer
-/// type, so `-0` stays negative zero through `+`, `-`, `*`, `/` and negation
-/// (`(-0) - 0` is `-0`, `(-0) / -1` is `0`).
+/// reads as `Float(-0.0)` rather than `Int(0)` (#3442), through
+/// [`division_number_repr`]. jq has no integer type, so `-0` stays negative
+/// zero through `+`, `-`, `*`, `/` and negation (`(-0) - 0` is `-0`,
+/// `(-0) / -1` is `0`).
 ///
 /// yq mode is left alone: real yq v4.53.3 reads a `-0` *expression literal*
 /// as integer zero for `+`, `-` and `*` (`(-0) - 0` is `0`), which
