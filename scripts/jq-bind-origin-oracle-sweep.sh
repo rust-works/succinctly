@@ -21,6 +21,10 @@
 #   refuse-only  jq answers, succinctly refuses   -- safe; each one must be
 #                listed in REFUSE_ONLY below with the reason, so a *new* one
 #                fails the sweep too
+#   stale-refuse-only
+#                a row listed in REFUSE_ONLY that now *agrees* -- the entry
+#                pins nothing, so a regression back to refusing would go
+#                unnoticed; fails the sweep until the entry is dropped
 #
 # The matrix is deliberately hand-written (each row was probed live before
 # it was added); `scripts/jq-bind-origin-fuzz.py` is the randomised
@@ -1058,7 +1062,6 @@ CASES_EOF
 # other side: a `(` before a `#` in a reason made bash read the `#` as a
 # comment inside the `$( )`, so the closing `)` vanished).
 read -r -d '' REFUSE_ONLY <<'REFUSE_EOF' || true
-def-body-in-path:a def inside path() resolves as an opaque leaf, before #2042 too
 source-rebuilt-container:the source navigates inside a construction, which jq's suspended tracking allows but the resolver refuses; falls back to a plain value
 select-wrapped-source:the witness grammar is pure navigation (is_pure_navigation); a select-wrapped source binds by value
 alternative-source:the witness grammar is pure navigation; a // source binds by value
@@ -1072,13 +1075,9 @@ destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nest
 carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
 in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
-owned-embed-refuse-path-nested-del-fractional:#3188 -- the write door will not re-spell a fractional index: del(.[-0.5]) deletes element 0 here and nothing in jq (#3302), so the static spelling would be a wrong answer
-owned-embed-refuse-path-nested-del-slice:#3188 -- a slice component has no static spelling the evaluator indexes by (.[{"start":0,"end":1}], #3300), so the write door declines
 owned-embed-fold-update-rebuilt-by-nonwrite:#3181 review -- a witnessed step runs its UPDATE through the owned re-index bridge, so even an UPDATE returning `.` hands the next step a rebuilt copy (the owned-embed-fold-if-identity mechanism)
 owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
-owned-embed-refuse-array-slice:#2889 -- a slice is not one of embed_peel_step's Field/Index/Iterate shapes, so it re-indexes before the read
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
-identity-try-if-nonraising:#2978 review -- a try body holding an if is not a passthrough (its condition may raise and bind the value of the handler); the gate is static, so an if whose condition happens not to raise pays a refusal. The raising twin (identity-trap-raising-try-*) is the write-side fabrication this prevents
 untracked-opaque-stage-lost-register:#3120 review -- an opaque stage (reduce, a def call, first) drops the carried register, so the walk has none and refuses without retrying; jq refuses the step too and retries onto the bare alternative, whose empty body then writes nothing. main echoed the document by the ambient-null coincidence the fix removes
 untracked-later-step-refusal-no-retry:#3120 review -- refusal_is_exact is decided per source, and a marker that is the register is value-equal to it, so a later-step refusal after a certified first step is treated as a guess and does not retry; jq retries onto $w. The trackable twin retries and agrees
 catch-payload-own-node-refuse-only:#3133 -- error(.) raises the register node itself and jq answers ["a"]; the payload equals the register by value but is not null/bool and carries no marker, so it cannot be told from a rebuilt copy (catch-rebuilt-payload-refuses) and the handler stays untracked
@@ -1112,7 +1111,7 @@ if [[ "${1:-}" == "--list-cases" ]]; then
   exit 0
 fi
 
-fab=0; mis=0; new_refuse=0; agree=0; refuse=0
+fab=0; mis=0; new_refuse=0; stale=0; agree=0; refuse=0
 printf 'id\tclass\tfilter\tsucc_exit\tsucc_out\toracle_exit\toracle_out\n'
 while IFS=$'\t' read -r id input filter; do
   [[ -z "$id" ]] && continue
@@ -1121,7 +1120,9 @@ while IFS=$'\t' read -r id input filter; do
   sout=$(printf '%s' "$input" | "$SUCCINCTLY" jq -c "$filter" 2>/dev/null) && sex=0 || sex=$?
   jout=${jout//$'\n'/ }; sout=${sout//$'\n'/ }
   if [[ "$jex" == "$sex" && "$jout" == "$sout" ]]; then
-    class=agree; agree=$((agree+1))
+    # An agreeing row must not still be listed as refuse-only: the entry
+    # would pin nothing (a stale one is dropped, not kept "just in case").
+    if grep -q "^$id:" <<<"$REFUSE_ONLY"; then class=stale-refuse-only; stale=$((stale+1)); else class=agree; agree=$((agree+1)); fi
   elif [[ "$jex" != 0 && "$sex" == 0 ]]; then
     class=fabricate; fab=$((fab+1))
   elif [[ "$jex" == 0 && "$sex" != 0 ]]; then
@@ -1134,5 +1135,5 @@ while IFS=$'\t' read -r id input filter; do
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$class" "$filter" "$sex" "$sout" "$jex" "$jout"
 done <<<"$CASES"
-printf '\n# agree=%d fabricate=%d mismatch=%d refuse-only=%d refuse-only-NEW=%d\n' "$agree" "$fab" "$mis" "$refuse" "$new_refuse" >&2
-if (( fab > 0 || mis > 0 || new_refuse > 0 )); then exit 1; fi
+printf '\n# agree=%d fabricate=%d mismatch=%d refuse-only=%d refuse-only-NEW=%d stale-refuse-only=%d\n' "$agree" "$fab" "$mis" "$refuse" "$new_refuse" "$stale" >&2
+if (( fab > 0 || mis > 0 || new_refuse > 0 || stale > 0 )); then exit 1; fi
