@@ -3172,6 +3172,18 @@ const DIFFERENT_ALIAS_KEYS_MERGED_AND_LOCAL: &str =
 const EMPTY_SEQUENCE_KEY_MERGED_AND_LOCAL: &str =
     "a: &a\n  ? []\n  : x\nb:\n  <<: *a\n  ? []\n  : y\n";
 const EMPTY_SEQUENCE_VS_ONE_KEY: &str = "a: &a\n  ? []\n  : x\nb:\n  <<: *a\n  ? [1]\n  : y\n";
+// Sequences nested in a key, and a block-style key: equal ones are one key,
+// different ones are two.
+const NESTED_SEQUENCE_KEY_MERGED_AND_LOCAL: &str =
+    "a: &a\n  ? [1, [2, 3]]\n  : x\nb:\n  <<: *a\n  ? [1, [2, 3]]\n  : y\n";
+const DIFFERENT_NESTED_SEQUENCE_KEYS: &str =
+    "a: &a\n  ? [1, [2, 3]]\n  : x\nb:\n  <<: *a\n  ? [1, [2, 4]]\n  : y\n";
+const BLOCK_SEQUENCE_KEY_MERGED_AND_LOCAL: &str =
+    "a: &a\n  ? - 1\n    - 2\n  : x\nb:\n  <<: *a\n  ? - 1\n    - 2\n  : y\n";
+// A mapping nested in a sequence key is compared by node too, so the same
+// mapping is treated alike at the root and one level down.
+const EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY: &str =
+    "a: &a\n  ? [{p: 1}]\n  : x\nb:\n  <<: *a\n  ? [{p: 1}]\n  : y\n";
 
 #[test]
 fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()> {
@@ -3194,6 +3206,11 @@ fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()
         (MERGED_EQUAL_MAPPING_KEYS, ".b | length", "2\n"),
         (DIFFERENT_ALIAS_KEYS_MERGED_AND_LOCAL, ".b | length", "2\n"),
         (EMPTY_SEQUENCE_VS_ONE_KEY, ".b | length", "2\n"),
+        (DIFFERENT_NESTED_SEQUENCE_KEYS, ".b | length", "2\n"),
+        (EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY, ".b | length", "2\n"),
+        // Looking up the genuine `""` key finds it, never a complex key that
+        // shares its spelling.
+        (MERGED_COMPLEX_VS_GENUINE_EMPTY, ".b | .[\"\"]", "z\n"),
         // The identity route echoes the source, merge key and all.
         (
             MERGED_VS_LOCAL_COMPLEX,
@@ -3227,6 +3244,8 @@ fn test_yq_merge_keys_raise_instead_of_dropping_a_complex_key_3467() -> Result<(
         (MERGED_EQUAL_MAPPING_KEYS, ".b.z = 1"),
         (DIFFERENT_ALIAS_KEYS_MERGED_AND_LOCAL, ".b.z = 1"),
         (EMPTY_SEQUENCE_VS_ONE_KEY, ".b.z = 1"),
+        (DIFFERENT_NESTED_SEQUENCE_KEYS, ".b.z = 1"),
+        (EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY, ".b.z = 1"),
     ];
     for &(yaml, filter) in rows {
         let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
@@ -3306,6 +3325,18 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
             ".b.z = 1",
             "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
         ),
+        (NESTED_SEQUENCE_KEY_MERGED_AND_LOCAL, ".b | length", "1\n"),
+        (
+            NESTED_SEQUENCE_KEY_MERGED_AND_LOCAL,
+            ".b.z = 1",
+            "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
+        (BLOCK_SEQUENCE_KEY_MERGED_AND_LOCAL, ".b | length", "1\n"),
+        (
+            BLOCK_SEQUENCE_KEY_MERGED_AND_LOCAL,
+            ".b.z = 1",
+            "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
         (TWO_SOURCES_SHARING_A_COMPLEX_KEY, ".b | length", "1\n"),
         (
             TWO_SOURCES_SHARING_A_COMPLEX_KEY,
@@ -3328,6 +3359,36 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
         assert_eq!(code, 0, "{filter:?} on {yaml:?}, stderr: {stderr}");
         assert_eq!(output, expected, "{filter:?} on {yaml:?}");
     }
+
+    Ok(())
+}
+
+/// #3467: comparing a complex key by content renders it, and an alias used as
+/// an element names its whole target again, so a few anchored sequences each
+/// listing the last twelve times expand to 12^n nodes from a few hundred bytes.
+/// An unbounded render made `.b` on this 500-byte document take about a minute
+/// in a debug build (and seconds in release), growing 12-fold per level. The
+/// render is capped, so the key falls back to node identity and the mapping
+/// resolves in milliseconds, keeping both entries.
+#[test]
+fn test_yq_merge_key_alias_fanout_in_a_complex_key_is_bounded_3467() -> Result<()> {
+    let items = ["x"; 12].join(", ");
+    let mut yaml = format!("l0: &l0 [{items}]\n");
+    for level in 1..=6 {
+        let refs = vec![format!("*l{}", level - 1); 12].join(", ");
+        yaml.push_str(&format!("l{level}: &l{level} [{refs}]\n"));
+    }
+    yaml.push_str("src: &s\n  ? [*l6]\n  : v\nb:\n  <<: *s\n  k: 1\n");
+
+    let started = std::time::Instant::now();
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".b | length", &yaml, &[])?;
+    let elapsed = started.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(output, "2\n");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "the alias fan-out was rendered unbounded: took {elapsed:?}"
+    );
 
     Ok(())
 }

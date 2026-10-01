@@ -5387,13 +5387,14 @@ struct KeyPositions {
 /// What makes two fallback-spelled keys the same key, since their spelling
 /// cannot.
 ///
-/// - `Content`: a complex key whose whole subtree is plain scalars and plain
-///   string keys, by its rendering (`[1]`). Nothing nested can collapse to
-///   `""`, so equal renderings are equal keys. A merged-in `? [1]` and a local
-///   `? [1]` are one key, and the local one wins as it always did.
-/// - `Node`: anything else (a mapping used as a key, a complex key holding a
-///   complex key, an undecodable string, a dangling alias) is the same key
-///   only if it is the *same node*: the index of its own BP node. That covers
+/// - `Content`: a sequence key made only of scalars, nested sequences and
+///   aliases to those, by its rendering (`[1]`; see [`complex_key_content`]).
+///   Nothing in it can collapse to `""`, so equal renderings are equal keys. A
+///   merged-in `? [1]` and a local `? [1]` are one key, and the local one wins
+///   as it always did.
+/// - `Node`: anything else (a mapping used as a key at any depth, a sequence
+///   too large to render, an undecodable string, a dangling alias) is the same
+///   key only if it is the *same node*: the index of its own BP node. That covers
 ///   the same source mapping reached twice (`<<: [*a, *a]`); two different
 ///   nodes that merely look alike stay two entries, and a materializer then
 ///   refuses them instead of silently keeping one.
@@ -5408,71 +5409,65 @@ enum FallbackKey {
 /// this far is not worth rendering.
 const COMPLEX_KEY_CONTENT_MAX_DEPTH: usize = 16;
 
+/// How many nodes [`complex_key_content`] renders before giving up. Depth bounds
+/// nesting, not work: an alias used as an element names its whole target again,
+/// so a few anchored sequences each listing the last twelve times
+/// (`l1: &l1 [*l0, ... x12]`, `l2: &l2 [*l1, ... x12]`, ...) expand to 12^n
+/// nodes from a few hundred bytes. A real complex key has a handful of nodes.
+const COMPLEX_KEY_CONTENT_MAX_NODES: usize = 64;
+
 /// A rendering of a complex key, when it is safe to compare keys by it.
 ///
-/// Safe means nothing in the subtree is itself spelled `""`: every scalar
-/// decodes, every nested mapping key is a plain string, and no alias dangles.
-/// Otherwise two different keys could render alike (`{[1]: a}` and `{[2]: a}`
-/// both as `{"":"a"}`), and equating them would be the silent drop this exists
-/// to prevent -- so the answer is `None` and the caller uses node identity.
+/// Safe means nothing in the key is itself spelled `""`: it is a sequence of
+/// scalars, nested sequences and aliases to those, every scalar decodes, no
+/// alias dangles, and it is small (see [`COMPLEX_KEY_CONTENT_MAX_NODES`]).
+/// Anything else answers `None` and the caller falls back to node identity,
+/// because two different keys that render alike would be equated -- the silent
+/// drop this exists to prevent.
 ///
-/// Rendered from the key's own value, never from its cursor: for a complex key
-/// the cursor is a wrapper that `write_json_to` renders as `{}` for every
-/// mapping, which would equate all mapping keys. For the same reason a mapping
-/// used as a key is never rendered: its wrapper yields no fields, so there is
-/// nothing to tell two of them apart by, and an *empty* mapping anywhere in a
-/// key is refused for the same reason (an empty sequence is a real `[]`).
+/// A **mapping** used as a key, at any depth, is never rendered. Its cursor is
+/// a wrapper whose own fields are empty (`write_json_to` renders every such
+/// wrapper as `{}`), so there is nothing reliable to tell two of them apart
+/// by, and one nested in a sequence key must not be compared by content when
+/// the same mapping at the root is not.
+///
+/// Rendered from the key's own value, not its cursor: for a sequence key the
+/// cursor is a wrapper that renders one level too deep (`[[1]]`), which is
+/// harmless because it is the same for every key.
 fn complex_key_content<W: AsRef<[u64]>>(key: &YamlCursor<'_, W>) -> Option<String> {
-    fn container<W: AsRef<[u64]>>(value: YamlValue<'_, W>, out: &mut String, depth: usize) -> bool {
-        if depth > COMPLEX_KEY_CONTENT_MAX_DEPTH {
-            return false;
-        }
-        match value {
-            YamlValue::Sequence(elements) => {
-                out.push('[');
-                let mut first = true;
-                let mut rest = elements;
-                while let Some((element, next)) = rest.uncons_resolved_cursor() {
-                    if !first {
-                        out.push(',');
-                    }
-                    first = false;
-                    if !node(element, out, depth + 1) {
-                        return false;
-                    }
-                    rest = next;
-                }
-                out.push(']');
-                true
+    fn sequence<W: AsRef<[u64]>>(
+        elements: YamlElements<'_, W>,
+        out: &mut String,
+        depth: usize,
+        budget: &mut usize,
+    ) -> bool {
+        out.push('[');
+        let mut first = true;
+        let mut rest = elements;
+        while let Some((element, next)) = rest.uncons_resolved_cursor() {
+            if !first {
+                out.push(',');
             }
-            YamlValue::Mapping(fields) => {
-                out.push('{');
-                let mut count = 0usize;
-                for field in fields {
-                    if count > 0 {
-                        out.push(',');
-                    }
-                    count += 1;
-                    let YamlValue::String(name) = field.key() else {
-                        return false;
-                    };
-                    let Ok(name) = name.as_str() else {
-                        return false;
-                    };
-                    write_json_string(out, &name);
-                    out.push(':');
-                    if !node(field.value_cursor(), out, depth + 1) {
-                        return false;
-                    }
-                }
-                out.push('}');
-                count > 0
+            first = false;
+            if !node(element, out, depth + 1, budget) {
+                return false;
             }
-            _ => false,
+            rest = next;
         }
+        out.push(']');
+        true
     }
 
-    fn node<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>, out: &mut String, depth: usize) -> bool {
+    fn node<W: AsRef<[u64]>>(
+        cursor: YamlCursor<'_, W>,
+        out: &mut String,
+        depth: usize,
+        budget: &mut usize,
+    ) -> bool {
+        if depth > COMPLEX_KEY_CONTENT_MAX_DEPTH || *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
         match cursor.value() {
             YamlValue::Null => {
                 out.push_str("null");
@@ -5485,28 +5480,28 @@ fn complex_key_content<W: AsRef<[u64]>>(key: &YamlCursor<'_, W>) -> Option<Strin
                 cursor.write_json_to(out);
                 true
             }
-            value @ (YamlValue::Sequence(_) | YamlValue::Mapping(_)) => {
-                container(value, out, depth)
-            }
+            YamlValue::Sequence(elements) => sequence(elements, out, depth, budget),
             YamlValue::Alias {
                 target: Some(target),
                 ..
-            } => node(target, out, depth + 1),
-            YamlValue::Alias { target: None, .. } | YamlValue::Error(_) => false,
+            } => node(target, out, depth + 1, budget),
+            YamlValue::Mapping(_) | YamlValue::Alias { target: None, .. } | YamlValue::Error(_) => {
+                false
+            }
         }
     }
 
     let mut rendered = String::new();
+    let mut budget = COMPLEX_KEY_CONTENT_MAX_NODES;
     let rendered_ok = match key.value() {
-        // A mapping used as a key: compared by node (see above).
-        YamlValue::Mapping(_) => false,
+        YamlValue::Sequence(elements) => sequence(elements, &mut rendered, 0, &mut budget),
         // An alias used as a key (`*k : v`) is the key it names, so two uses
         // of one anchor are one key.
         YamlValue::Alias {
             target: Some(target),
             ..
-        } => node(target, &mut rendered, 1),
-        value => container(value, &mut rendered, 0),
+        } => node(target, &mut rendered, 1, &mut budget),
+        _ => false,
     };
     rendered_ok.then_some(rendered)
 }
