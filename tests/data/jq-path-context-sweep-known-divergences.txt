@@ -93,7 +93,3 @@ yq/*/alt_r/plain/descend     yq_alt_empty_rhs  same, at `..`'s first output (the
 # family as #2388's `foreach` INIT-fork disagreement, and the shape the
 # promoted scratch sweep was originally written to hunt.
 jq/getpath/foreach/path/*   foreach_path   path(foreach getpath(..) as $x ...) raises where jq resolves the path — #2388
-
-# `.. | (getpath([<path producer>]))?` drops the `[]` output jq produces for
-# the root position; the `?` swallows it instead of letting it through.
-jq/*/getpath/opt/descend    optional_root  `?` over getpath at the root drops jq's own `[]` output — #2416 phase 0

@@ -3085,6 +3085,11 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Index { idx, .. } => index_array_by_position::<W, S>(value, *idx, optional),
 
+        // #3506: a resolved array key replayed as a component reads as the
+        // subarray search it named, and refuses any other target as the key
+        // did.
+        Expr::ArrayKey(key) => index_one::<W, S>(value, key, optional),
+
         Expr::IndexExpr { target, key } => eval_index_expr::<W, S>(target, key, value, optional),
 
         Expr::SliceExpr { target, start, end } => {
@@ -29874,6 +29879,9 @@ fn set_path<S: EvalSemantics>(
         Expr::SliceExpr { .. } => Err(EvalError::new(
             "internal error: unresolved computed slice in assignment path",
         )),
+        // #3506: jq's `setpath` finds a subarray-search key where it wanted an
+        // index, whatever the value or the rest of the path.
+        Expr::ArrayKey(_) => Err(EvalError::cannot_update_field_at_array_index_of_array()),
         _ => Err(EvalError::new(
             "cannot use expression as assignment target".to_string(),
         )),
@@ -29912,6 +29920,28 @@ fn is_atomic_path_component(expr: &Expr) -> bool {
         unwrap_path_component(expr).0,
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Slice { .. }
     )
+}
+
+/// Whether a path component's *last* step is a subarray-search key (#3506),
+/// looking through the `?` and `()` wrappers and the `Pipe` group a resolved
+/// `?` over several components leaves as one opaque element
+/// ([`is_atomic_path_component`]'s doc), skipping a trailing `.`.
+///
+/// jq's `delpaths` deletes a path's last component from its parent first, so
+/// a key that *ends* the path is refused as `Cannot delete array element of
+/// array`, where one earlier in it is the `setpath` that rewrites the parent
+/// (`Cannot update field at array index of array`). Every delete walker asks
+/// this one question, so the wording cannot drift between them.
+fn ends_in_array_key(component: &Expr) -> bool {
+    match unwrap_path_component(component).0 {
+        Expr::ArrayKey(_) => true,
+        Expr::Pipe(exprs) => exprs
+            .iter()
+            .rev()
+            .find(|e| !matches!(unwrap_path_component(e).0, Expr::Identity))
+            .is_some_and(ends_in_array_key),
+        _ => false,
+    }
 }
 
 /// #1428's stranded-write test, shared by `=`'s and `|=`'s chain walkers.
@@ -30357,6 +30387,9 @@ fn set_path_steps<S: EvalSemantics>(
         Expr::SliceExpr { .. } => Err(EvalError::new(
             "internal error: unresolved computed slice in path component",
         )),
+        // #3506: jq's `setpath` meets a subarray-search key where it wanted an
+        // index, however much path follows it -- see `set_path`'s own arm.
+        Expr::ArrayKey(_) => Err(EvalError::cannot_update_field_at_array_index_of_array()),
         _ => Err(EvalError::new("invalid path component")),
     }
 }
@@ -31824,6 +31857,25 @@ fn update_path_with_deletes<S: EvalSemantics>(
         Expr::SliceExpr { .. } => {
             Err(EvalError::new("internal error: unresolved computed slice in update path").into())
         }
+        // #3506: jq's `_modify` reads the subarray search, runs the filter on
+        // what it found, and only then meets the key where `setpath` wanted an
+        // index -- or, for a filter with no output, in the `delpaths`. So a
+        // filter that raises still raises its own error first, an inline `?`
+        // hides neither, and the wording follows whether anything was written.
+        Expr::ArrayKey(key) => {
+            let mut read = match index_one_owned::<S>(root, key, false)? {
+                Some(read) => read,
+                None => return Ok(false),
+            };
+            let wrote =
+                update_root_with_filter::<S>(&mut read, filter_expr, None, Reentry::REBUILT, None)?;
+            Err(if wrote {
+                EvalError::cannot_update_field_at_array_index_of_array()
+            } else {
+                EvalError::cannot_delete_element_of_array("array")
+            }
+            .into())
+        }
         _ => Err(EvalError::new("cannot use expression as update target").into()),
     }
 }
@@ -32265,6 +32317,32 @@ fn update_path_steps<S: EvalSemantics>(
             Expr::Identity => {
                 steps = rest;
                 continue;
+            }
+            // #3506: the rest of the chain runs against the subarray search's
+            // result, where jq's `_modify` reads it, so the filter sees the
+            // leaf it would have and a filter that raises raises first. The
+            // write then fails at the key whatever the filter produced: jq's
+            // `delpaths` for a multi-component path rewrites the parent with
+            // `setpath`, so even a filter with no output ends in the update
+            // wording, unlike the terminal key in `update_path_with_deletes`.
+            Expr::ArrayKey(key) => {
+                let mut read = match index_one_owned::<S>(root, key, false)? {
+                    Some(read) => read,
+                    None => return Ok(false),
+                };
+                update_path_steps::<S>(
+                    &mut read,
+                    rest,
+                    filter_expr,
+                    here,
+                    scalar_noop,
+                    None,
+                    None,
+                )?;
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.at.truncate(entry_depth);
+                }
+                return Err(EvalError::cannot_update_field_at_array_index_of_array().into());
             }
             _ => {
                 let result = update_path_with_deletes::<S>(
@@ -32884,6 +32962,15 @@ fn key_to_path_component<S: EvalSemantics>(
         // #3300: jq's slice descriptor, in path position.
         OwnedValue::Object(desc) if S::TAG != EvalTag::Yq => {
             descriptor_path_component::<S>(desc, container)
+        }
+        // #3506: jq's subarray search, in path position. The key is the
+        // component whole -- `path(.[[9]])` is `[[9]]` even where nothing
+        // matches -- and only an array target has one (`null | path(.[[1]])`
+        // keeps raising). yq has no such key.
+        OwnedValue::Array(_)
+            if S::TAG != EvalTag::Yq && matches!(container, OwnedValue::Array(_)) =>
+        {
+            Ok(Expr::ArrayKey(Box::new(key.clone())))
         }
         // Truncation toward zero, as in the value path.
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
@@ -37663,6 +37750,7 @@ fn navigation_element(component: &Expr) -> Option<OwnedValue> {
             *end,
             end_key.as_ref(),
         )),
+        Expr::ArrayKey(key) => Some((**key).clone()),
         Expr::Optional(inner) | Expr::Paren(inner) => navigation_element(inner),
         _ => None,
     }
@@ -54595,6 +54683,12 @@ fn walk_path<'v, S: EvalSemantics>(
             )?;
         }
 
+        // #3506: an array key, kept whole as the component; the step reads the
+        // subarray search's positions (`eval_single`'s `ArrayKey` arm).
+        Expr::ArrayKey(key) => {
+            step_into::<S>(expr, (**key).clone(), &value, current_path, out, optional)?;
+        }
+
         // The one step whose components come from the *value* rather than the
         // expression, so it reads them off the container directly. Anything
         // that is not a container still takes the evaluator's verdict, which
@@ -55603,6 +55697,12 @@ fn set_value_at_path(
             Ok(OwnedValue::Array(arr))
         }
         // null, booleans and arrays index nothing, in any container.
+        // #3506: jq's `setpath` finds a subarray-search key where it wanted an
+        // index, whatever follows it and whatever is written. Any other
+        // container refuses an array key as it always did.
+        OwnedValue::Array(_) if matches!(value, OwnedValue::Array(_)) => {
+            Err(EvalError::cannot_update_field_at_array_index_of_array())
+        }
         _ => Err(EvalError::cannot_index(value.type_name(), key)),
     }
 }
@@ -55909,6 +56009,14 @@ fn delete_paths_under<S: EvalSemantics>(
                     DeleteIndexResolution::PositiveOutOfRange(_) | DeleteIndexResolution::Skip => {}
                 }
                 Ok(OwnedValue::Array(arr))
+            }
+            // #3506: a subarray-search key with more path after it. jq's
+            // `delpaths` rewrites the parent with `setpath`, which is where
+            // it meets the key (a terminal one is `delete_keys`'s `Cannot
+            // delete array element of array`). yq has no such key and keeps
+            // refusing it below.
+            OwnedValue::Array(_) if !yq_mode => {
+                Err(EvalError::cannot_update_field_at_array_index_of_array())
             }
             // A non-number key names no element at all: jq's `Cannot index
             // array with <kind>`.
@@ -56553,6 +56661,12 @@ impl DeleteTrieBuilder {
                 );
                 return Err(EvalError::new("cannot use expression as delete target"));
             }
+            // #3506: only a key with more path after it reaches here -- a
+            // terminal one is refused before the walk, in `insert_branch` and
+            // `insert_expr`, with the delete wording.
+            Expr::ArrayKey(_) => {
+                return Err(EvalError::cannot_update_field_at_array_index_of_array())
+            }
             _ => return Err(EvalError::new("cannot use expression as delete target")),
         };
         if parent_was_leaf && parent != DELETE_TRIE_ROOT {
@@ -56695,6 +56809,14 @@ impl DeleteTrieBuilder {
     }
 
     fn insert_branch(&mut self, path: &Rc<PathPrefix>) -> Result<(), EvalError> {
+        // #3506: a subarray-search key that ends the path is what jq's
+        // `delpaths` cannot delete; one with more path after it is refused
+        // by `child_of` with the update wording.
+        if let PathPrefix::Node { component, .. } = &**path {
+            if ends_in_array_key(component) {
+                return Err(EvalError::cannot_delete_element_of_array("array"));
+            }
+        }
         let id = self.intern(path)?;
         self.trie.nodes[id as usize].terminal = true;
         Ok(())
@@ -56714,6 +56836,14 @@ impl DeleteTrieBuilder {
         let mut steps = core::mem::take(&mut self.scratch);
         steps.clear();
         flatten_delete_path(path, false, &mut steps);
+        // #3506: see `insert_branch`.
+        if steps
+            .last()
+            .is_some_and(|step| ends_in_array_key(&step.component))
+        {
+            self.scratch = steps;
+            return Err(EvalError::cannot_delete_element_of_array("array"));
+        }
         let mut id = DELETE_TRIE_ROOT;
         let mut failed = None;
         for step in &steps {
@@ -58199,6 +58329,8 @@ fn delete_at_path(
         Expr::SliceExpr { .. } => Err(EvalError::new(
             "internal error: unresolved computed slice in delete path",
         )),
+        // #3506: jq will not delete through a subarray-search key.
+        Expr::ArrayKey(_) => Err(EvalError::cannot_delete_element_of_array("array")),
         _ => Err(EvalError::new("cannot use expression as delete target")),
     }
 }
@@ -58752,6 +58884,21 @@ fn delete_path_steps(
             Expr::Identity => {
                 steps = rest;
                 continue;
+            }
+            // #3506: more path follows the key (a lone one is the terminal
+            // arm), and jq's `delpaths` rewrites the parent of the last
+            // component with `setpath`, so this is the update wording --
+            // `delete_at_path`'s own `ArrayKey` arm is the terminal one.
+            Expr::ArrayKey(_) => {
+                // ...unless the path *ends* in a subarray-search key too: the
+                // terminal key is deleted from its parent first, and that is
+                // where jq refuses (`del(.[[1]][[0]])`).
+                let ends_in_key = rest.last().is_some_and(ends_in_array_key);
+                return Err(if ends_in_key {
+                    EvalError::cannot_delete_element_of_array("array")
+                } else {
+                    EvalError::cannot_update_field_at_array_index_of_array()
+                });
             }
             _ => return delete_at_path(root, first, here, yq_mode, real_slot),
         }
@@ -107929,6 +108076,29 @@ mod tests {
     /// AST as literals, reachable from `.a += rhs_expr`/`.a //= rhs_expr`
     /// and `as`-pattern variable substitution with no adversarial document
     /// involved.
+    /// #3506: the delete walkers' one question -- does this component's last
+    /// step end in a subarray-search key -- looks through `?`, `()`, a
+    /// `Pipe` group and a trailing `.`, and answers no for everything else.
+    #[test]
+    fn ends_in_array_key_looks_through_wrappers_3506() {
+        let key = || Expr::ArrayKey(Box::new(OwnedValue::array()));
+        assert!(ends_in_array_key(&key()));
+        assert!(ends_in_array_key(&Expr::Optional(Box::new(key()))));
+        assert!(ends_in_array_key(&Expr::Paren(Box::new(key()))));
+        assert!(ends_in_array_key(&Expr::Pipe(vec![
+            Expr::Index { idx: 0, key: None },
+            key(),
+            Expr::Identity,
+        ])));
+        assert!(!ends_in_array_key(&Expr::Pipe(vec![
+            key(),
+            Expr::Index { idx: 0, key: None },
+        ])));
+        assert!(!ends_in_array_key(&Expr::Pipe(Vec::new())));
+        assert!(!ends_in_array_key(&Expr::Index { idx: 0, key: None }));
+        assert!(!ends_in_array_key(&Expr::Identity));
+    }
+
     #[test]
     fn owned_to_expr_panics_past_nesting_depth_limit_1025() {
         use crate::jq::value::MAX_VALUE_TREE_DEPTH;

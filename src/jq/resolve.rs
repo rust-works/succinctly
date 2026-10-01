@@ -912,6 +912,7 @@ fn build_call_graph(
         | Expr::Field(_)
         | Expr::Index { .. }
         | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
         | Expr::Iterate
         | Expr::Literal(_)
         | Expr::RecursiveDescent
@@ -1903,6 +1904,7 @@ fn check(
         | Expr::Field(_)
         | Expr::Index { .. }
         | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
         | Expr::Iterate
         | Expr::Literal(_)
         | Expr::RecursiveDescent

@@ -461,7 +461,7 @@ wrong answers, since the comma could not be written without parens.
 **Computed keys in brackets** (#360) accept any expression, but two jq behaviours are not reproduced:
 
 - **A slice bound that has to be evaluated is still a parse error.** Both bounds accept the same spellings — `.[1:3]`, `.[(1):3]`, `.[1:(3)]`, `.[1.0:3]` — but nothing dynamic: `.[$a:$b]` and `.[(1+1):]` are parse errors, where jq accepts them.
-- **An array-valued key searches only when read.** `[10,20,30] | .[[20]]` is jq's indices-of-subarray search and returns `[1]` here too (as do `indices`, `index`, `rindex` and `getpath([[20]])`, #3453, #2429); `path(.[[20]])` and writes through it still report `Cannot index array with array`, tracked in #3506.
+- **An array-valued key is jq's subarray search.** `[10,20,30] | .[[20]]` returns `[1]` (as do `indices`, `index`, `rindex` and `getpath([[20]])`, #3453, #2429); `path(.[[20]])` is `[[20]]` and every write through it raises `Cannot update field at array index of array`, as in jq (#3506). `succinctly yq` keeps refusing the key form, as real yq does.
 
 One further divergence is confined to path contexts. A NaN key reads as `null` in both (`[10,20,30] | .[nan]` → `null`), but has no path component here: `path(.[nan])` and `del(.[nan])` report `Cannot set array element at NaN index`, jq's own wording for the assignment case, where jq instead yields the path `[null]` that its own `setpath` rejects (and, for `del`, hangs).
 
