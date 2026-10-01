@@ -87,7 +87,7 @@ between copies:
 
 - **`resolve_node_eager`'s `Expr::TrackedVar` arm** — a `$var` reference in path position is
   certified against the frame the resolver is *currently* at.
-- **`resolve_seq_stage`'s carried register** (`reestablishes_register`/`carry_register`) — the
+- **`resolve_seq_stage`'s carried register** (`reestablishes_register` and the carry in `place_step`) — the
   plain-pipe register `#1573` already carries across navigation-free stages gains the frame
   its own position sits in, so `register_identical` can check a carried register the same way
   it checks a fresh `TrackedVar` reference.
