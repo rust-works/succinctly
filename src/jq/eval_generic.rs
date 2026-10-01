@@ -39567,6 +39567,24 @@ mod tests {
         ));
     }
 
+    /// #3453: an element the index could not read (`1.2.3`) is a decode
+    /// failure of the haystack, so `.[$array]` raises it and `?` -- which
+    /// suppresses only an indexing error, not a document fault -- does not
+    /// hide it.
+    #[test]
+    fn test_array_key_over_an_unreadable_element_raises_3453() {
+        let json: &[u8] = b"[1.2.3,2]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        for filter in [".[[2]]", ".[[2]]?"] {
+            let result = eval(&crate::jq::parse(filter).unwrap(), cursor.value());
+            assert!(
+                result.is_error(),
+                "`{filter}` over an unreadable element: {result:?}"
+            );
+        }
+    }
+
     /// `to_owned_key_shape`'s object branch (#626/#670/#903) is a shape-only
     /// fast path for a computed index/slice-bound candidate -- reached from
     /// `eval_index_expr`'s `keys` match when the key expression resolves to a
