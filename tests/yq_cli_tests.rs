@@ -24435,6 +24435,180 @@ fn test_getpath_tag_aware_null_leaves_containers_and_untagged_alone_2639() -> Re
     Ok(())
 }
 
+/// #3533: a node's nullness is its explicit tag's call before its text's, and
+/// `length`, field access, index access and `map` each tested the untagged
+/// text instead. `a: !!null foo` is null although its text is not, so
+/// `.a | length` is `0` and `.a | .b` is `null`; `a: !!str null` is a
+/// string although its text spells null, so `.a | length` is `4` and indexing
+/// it is the empty read yq gives a scalar. `type`, `tag`, `has` and `//` on a
+/// scalar already agreed, which is how this stayed hidden (#2639 fixed the one
+/// site `getpath` owns). Covered: literal field and index access, `length` and
+/// `map`; not covered, and still text-based, are computed-key and multi-key
+/// indexing (`.[$k]`, `.[0,1]`) and a container tagged `!!null`.
+///
+/// Every row is captured from yq v4.53.3 (`(document, filter, stdout, exit)`,
+/// `-o=json -I=0`) and spans both tag directions, the tagged forms that must not
+/// move (`!!int`, `!!str 5`, `!!bool`, `!!map`, a custom tag), untagged scalars,
+/// containers, an alias to a tagged node, and a tagged node one level down.
+const TAGGED_NULL_READ_ROWS_3533: &[(&str, &str, &str, i32)] = &[
+    ("a: !!null foo", ".a | length", "0\n", 0),
+    ("a: !!null foo", ".a | .b", "null\n", 0),
+    ("a: !!null foo", ".a | .[0]", "null\n", 0),
+    ("a: !!null foo", ".a | .b?", "null\n", 0),
+    ("a: !!null foo", ".a | .[0]?", "null\n", 0),
+    ("a: !!str null", ".a | length", "4\n", 0),
+    ("a: !!str null", ".a | .b", "", 0),
+    ("a: !!str null", ".a | .[0]", "", 0),
+    ("a: !!str null", ".a | .b?", "", 0),
+    ("a: !!str null", ".a | .[0]?", "", 0),
+    ("a: !!str ~", ".a | length", "1\n", 0),
+    ("a: !!str ~", ".a | .b", "", 0),
+    ("a: !!str ~", ".a | .[0]", "", 0),
+    ("a: !!str ~", ".a | .b?", "", 0),
+    ("a: !!str ~", ".a | .[0]?", "", 0),
+    ("a: !!null \"\"", ".a | length", "0\n", 0),
+    ("a: !!null \"\"", ".a | .b", "null\n", 0),
+    ("a: !!null \"\"", ".a | .[0]", "null\n", 0),
+    ("a: !!null \"\"", ".a | .b?", "null\n", 0),
+    ("a: !!null \"\"", ".a | .[0]?", "null\n", 0),
+    ("a: !!str \"\"", ".a | length", "0\n", 0),
+    ("a: !!str \"\"", ".a | .b", "", 0),
+    ("a: !!str \"\"", ".a | .[0]", "", 0),
+    ("a: !!str \"\"", ".a | .b?", "", 0),
+    ("a: !!str \"\"", ".a | .[0]?", "", 0),
+    ("a: !!null", ".a | length", "0\n", 0),
+    ("a: !!null", ".a | .b", "null\n", 0),
+    ("a: !!null", ".a | .[0]", "null\n", 0),
+    ("a: !!null", ".a | .b?", "null\n", 0),
+    ("a: !!null", ".a | .[0]?", "null\n", 0),
+    ("a: null", ".a | length", "0\n", 0),
+    ("a: null", ".a | .b", "null\n", 0),
+    ("a: null", ".a | .[0]", "null\n", 0),
+    ("a: null", ".a | .b?", "null\n", 0),
+    ("a: null", ".a | .[0]?", "null\n", 0),
+    ("a: ~", ".a | length", "0\n", 0),
+    ("a: ~", ".a | .b", "null\n", 0),
+    ("a: ~", ".a | .[0]", "null\n", 0),
+    ("a: ~", ".a | .b?", "null\n", 0),
+    ("a: ~", ".a | .[0]?", "null\n", 0),
+    ("a: foo", ".a | length", "3\n", 0),
+    ("a: foo", ".a | .b", "", 0),
+    ("a: foo", ".a | .[0]", "", 0),
+    ("a: foo", ".a | .b?", "", 0),
+    ("a: foo", ".a | .[0]?", "", 0),
+    ("a: \"null\"", ".a | length", "4\n", 0),
+    ("a: \"null\"", ".a | .b", "", 0),
+    ("a: \"null\"", ".a | .[0]", "", 0),
+    ("a: \"null\"", ".a | .b?", "", 0),
+    ("a: \"null\"", ".a | .[0]?", "", 0),
+    ("a: 5", ".a | length", "1\n", 0),
+    ("a: 5", ".a | .b", "", 0),
+    ("a: 5", ".a | .[0]", "", 0),
+    ("a: 5", ".a | .b?", "", 0),
+    ("a: 5", ".a | .[0]?", "", 0),
+    ("a: !!int 5", ".a | length", "1\n", 0),
+    ("a: !!int 5", ".a | .b", "", 0),
+    ("a: !!int 5", ".a | .[0]", "", 0),
+    ("a: !!int 5", ".a | .b?", "", 0),
+    ("a: !!int 5", ".a | .[0]?", "", 0),
+    ("a: !!str 5", ".a | length", "1\n", 0),
+    ("a: !!str 5", ".a | .b", "", 0),
+    ("a: !!str 5", ".a | .[0]", "", 0),
+    ("a: !!str 5", ".a | .b?", "", 0),
+    ("a: !!str 5", ".a | .[0]?", "", 0),
+    ("a: !!bool true", ".a | length", "4\n", 0),
+    ("a: !!bool true", ".a | .b", "", 0),
+    ("a: !!bool true", ".a | .[0]", "", 0),
+    ("a: !!bool true", ".a | .b?", "", 0),
+    ("a: !!bool true", ".a | .[0]?", "", 0),
+    ("a: !!map {b: 1}", ".a | length", "1\n", 0),
+    ("a: !!map {b: 1}", ".a | .b", "1\n", 0),
+    ("a: !!map {b: 1}", ".a | .[0]", "null\n", 0),
+    ("a: !!map {b: 1}", ".a | .b?", "1\n", 0),
+    ("a: !!map {b: 1}", ".a | .[0]?", "null\n", 0),
+    ("a: !custom foo", ".a | length", "3\n", 0),
+    ("a: !custom foo", ".a | .b", "", 0),
+    ("a: !custom foo", ".a | .[0]", "", 0),
+    ("a: !custom foo", ".a | .b?", "", 0),
+    ("a: !custom foo", ".a | .[0]?", "", 0),
+    ("a: [1, 2]", ".a | length", "2\n", 0),
+    ("a: [1, 2]", ".a | .b", "", 1),
+    ("a: [1, 2]", ".a | .[0]", "1\n", 0),
+    ("a: [1, 2]", ".a | .b?", "", 0),
+    ("a: [1, 2]", ".a | .[0]?", "1\n", 0),
+    ("a: {b: 1}", ".a | length", "1\n", 0),
+    ("a: {b: 1}", ".a | .b", "1\n", 0),
+    ("a: {b: 1}", ".a | .[0]", "null\n", 0),
+    ("a: {b: 1}", ".a | .b?", "1\n", 0),
+    ("a: {b: 1}", ".a | .[0]?", "null\n", 0),
+    ("x: &n !!null foo\ny: *n", ".y | length", "0\n", 0),
+    ("x: &n !!null foo\ny: *n", ".y | .b", "null\n", 0),
+    ("x: &n !!null foo\ny: *n", ".y | .[0]", "null\n", 0),
+    ("x: &n !!null foo\ny: *n", ".y | .b?", "null\n", 0),
+    ("x: &n !!null foo\ny: *n", ".y | .[0]?", "null\n", 0),
+    ("o:\n  a: !!null foo", ".o.a | length", "0\n", 0),
+    ("o:\n  a: !!null foo", ".o.a | .b", "null\n", 0),
+    ("o:\n  a: !!null foo", ".o.a | .[0]", "null\n", 0),
+    ("o:\n  a: !!null foo", ".o.a | .b?", "null\n", 0),
+    ("o:\n  a: !!null foo", ".o.a | .[0]?", "null\n", 0),
+];
+
+#[test]
+fn test_length_field_and_index_read_a_nodes_tag_before_its_text_3533() -> Result<()> {
+    for &(doc, filter, stdout, exit) in TAGGED_NULL_READ_ROWS_3533 {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (out.as_str(), code),
+            (stdout, exit),
+            "{doc:?} {filter}: stderr {err:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #3533: the jq-only builtins reach the same null tests, behind
+/// `--jq-extensions`, so there is no yq oracle and what is pinned is jq's own
+/// model (`null | first` is `null`, `"null" | first` is `Cannot index string
+/// with number`, `null | values` is empty, `"null" | values` is `"null"`),
+/// applied to the node's tag.
+#[test]
+fn test_first_last_and_values_read_a_nodes_tag_before_its_text_3533() -> Result<()> {
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+
+    for (doc, filter, want) in [
+        ("a: !!null foo\n", ".a | first", "null"),
+        ("a: !!null foo\n", ".a | last", "null"),
+        ("a: !!null foo\n", ".a | values", ""),
+        ("a: !!null foo\n", ".a | length", "0"),
+        ("a: !!str null\n", ".a | values", r#""null""#),
+        ("a: !!str null\n", ".a | length", "4"),
+        // Untagged scalars keep reading their text.
+        ("a: null\n", ".a | values", ""),
+        ("a: null\n", ".a | first", "null"),
+        ("a: \"null\"\n", ".a | values", r#""null""#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(code, 0, "{doc:?} {filter}: {out:?}");
+        assert_eq!(out.trim(), want, "{doc:?} {filter}");
+    }
+
+    for (doc, filter) in [
+        ("a: !!str null\n", ".a | first"),
+        ("a: !!str null\n", ".a | last"),
+        ("a: !!str ~\n", ".a | first"),
+    ] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
+        assert_eq!(code, 1, "{doc:?} {filter}: stderr {stderr:?}");
+        assert!(
+            stderr.contains("Cannot index string with number"),
+            "{doc:?} {filter}: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2168 coverage, yq mode: the two arms that only a value with **no cursor**
 /// reaches.
 ///

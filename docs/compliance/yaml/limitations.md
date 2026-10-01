@@ -349,7 +349,18 @@ one documented gap: the lazy, cursor-free half of the jq evaluator (`src/jq/eval
 `to_owned`, shared with JSON) is not tag-aware, so `succinctly yq '.a | type'` on a tagged
 scalar can still answer from untagged inference even though `succinctly yq '.'`'s JSON output
 for the same input is always correct. Tracked as
-[#747](https://github.com/rust-works/succinctly/issues/747).
+[#747](https://github.com/rust-works/succinctly/issues/747). The *cursor-holding* null tests are
+the exception ([#3533](https://github.com/rust-works/succinctly/issues/3533)): `length`, literal
+field and index access (`.a | .b`, `.a | .[0]`), yq's `map` no-op, `has`, `first`/`last`/`values`
+(behind `--jq-extensions`) and the path-step walkers consult an explicit `!!null`/`!!str` tag before
+the text, so `a: !!null foo` has `length` `0` and `a: !!str null` has `length` `4`, as in yq. A
+document with no explicit tag at all skips the lookup (`YamlIndex::has_explicit_tags`); one with
+a tag pays about 5% on a string-`length`-heavy query. What stays text-based, because it has no
+cursor or reaches the test before its container arms: computed-key and multi-key indexing
+(`.a | .[$k]`, `.a | .[0,1]`, which go through `index_one_generic` on collected values),
+a container tagged `!!null` (`a: !!null {b: 1}`, null in yq), and the owned conversion,
+so `succinctly yq '.a | map(.)'` on `a: !!str 5` answers `5` and on `a: !!str null` answers
+`null` where yq answers the string.
 
 ### How the gaps were closed (#664 → #224)
 

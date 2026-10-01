@@ -2911,6 +2911,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// `explicit_tag` was the one left out (#903 review).
     #[inline]
     pub fn explicit_tag(&self) -> Option<&str> {
+        // A document with no explicit tag anywhere has none at an alias's
+        // target either, so skip the `value()` decode this would otherwise
+        // pay just to learn whether the node is an alias (#3533: the null
+        // tests that now consult the tag run on every scalar they reach).
+        if !self.index.has_explicit_tags() {
+            return None;
+        }
         self.explicit_tag_at(Some(&self.value()))
     }
 

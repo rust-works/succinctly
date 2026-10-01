@@ -610,6 +610,18 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         self.tags.get(&bp_pos).map(alloc::string::String::as_str)
     }
 
+    /// Whether any node in the document carries an explicit tag.
+    ///
+    /// `false` is a proof that [`Self::get_tag`] answers `None` for every
+    /// position, which lets a caller skip the work of locating a tag (a fresh
+    /// value decode, for a cursor) on the overwhelmingly common untagged
+    /// document (#3533).
+    #[inline]
+    #[must_use]
+    pub fn has_explicit_tags(&self) -> bool {
+        !self.tags.is_empty()
+    }
+
     /// Get the raw trailing-comment byte range(s) for a BP position, if the
     /// node at that position has any same-line comment (issue #710).
     /// Usually zero or one entry; a mapping key can hold two (#1085) -- a
@@ -2569,5 +2581,30 @@ mod tests {
             Some("!!str"),
             "tags map must survive from_parts round trip"
         );
+    }
+
+    /// #3533: `has_explicit_tags` is the proof `YamlCursor::explicit_tag`'s
+    /// fast path rests on -- `false` must mean `get_tag` answers `None`
+    /// everywhere -- so it has to track a tag on any node, including a
+    /// nested one and one reached only through an alias.
+    #[test]
+    fn test_has_explicit_tags_tracks_whether_any_node_is_tagged_3533() {
+        for (yaml, tagged) in [
+            (&b"a: 1\nb: [x, y]\n"[..], false),
+            (&b"a: !!str 1\nb: [x, y]\n"[..], true),
+            (&b"o:\n  p:\n    - !!null foo\n"[..], true),
+            (&b"x: &n !!null foo\ny: *n\n"[..], true),
+            (&b"a: &x foo\nb: *x\n"[..], false),
+        ] {
+            let index = YamlIndex::build(yaml).expect("should parse");
+            assert_eq!(index.has_explicit_tags(), tagged, "{yaml:?}");
+            if !tagged {
+                // The invariant itself: no position answers a tag.
+                assert!(
+                    (0..=yaml.len()).all(|bp| index.get_tag(bp).is_none()),
+                    "{yaml:?}"
+                );
+            }
+        }
     }
 }
