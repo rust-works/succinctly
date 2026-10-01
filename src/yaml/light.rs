@@ -7412,7 +7412,9 @@ fn string_key_kind<'a>(s: &YamlString<'a>) -> (Cow<'a, str>, bool) {
 // (`select`, `==`, arithmetic, `is*`, `to_entries`, `reverse`/`shuffle`/
 // `pivot`, and other cursor-materializing paths) or
 // `crate::jq::eval_generic::tagged_type_name` (`type` and every
-// type-mismatch error message, none of which materialize a value at all).
+// type-mismatch error message, none of which materialize a value at all) or
+// `crate::jq::eval_generic::tagged_is_null` (`getpath`'s cursor walk, whose
+// per-segment null short-circuit would otherwise read the text, #2639).
 // So `echo 'a: !!str 1' | succinctly yq '.a | type'` now correctly says
 // `"string"`, matching `succinctly yq '.'`'s JSON output for the same input.
 // Two gaps remain, deliberately out of scope for #747/#903: `to_owned`
