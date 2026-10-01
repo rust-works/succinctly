@@ -29120,8 +29120,10 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let value = match item.into_owned::<S>() {
             Ok(value) => value,
             Err(e) if suppresses(&e, optional) => {
+                // omni-dev: coverage tolerate reason="unreachable: a materialization only ever raises a decode failure, which `suppresses` never swallows -- `debug_assert_materialization_error` (#2334) asserts exactly that; kept so the one classification rule is applied here as at every sibling `to_owned` site (#1953, #3448)"
                 swallowed = true;
                 return Demand::Stop;
+                // omni-dev: coverage end
             }
             Err(e) => return stop_with_escape(&mut parked, Control::Error(e)),
         };
@@ -29131,8 +29133,10 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let pristine = match pristine {
             Ok(pristine) => pristine,
             Err(e) if suppresses(&e, optional) => {
+                // omni-dev: coverage tolerate reason="unreachable: `assign_pristine` is `to_owned`, which only ever raises a decode failure (#2334's `debug_assert_materialization_error`), and `suppresses` never swallows one; kept so the one classification rule is applied here as at every sibling `to_owned` site (#1953, #3448)"
                 swallowed = true;
                 return Demand::Stop;
+                // omni-dev: coverage end
             }
             Err(e) => return stop_with_escape(&mut parked, Control::Error(e)),
         };
@@ -29267,7 +29271,7 @@ fn assign_one<S: EvalSemantics>(
                 let value = if i == last_path {
                     core::mem::replace(&mut value, OwnedValue::Null)
                 } else {
-                    value.clone()
+                    value.clone() // omni-dev: coverage tolerate-line reason="unreachable: the eager route runs only when the path resolves to at most one path -- `needs_path_prepass` false is one verbatim path, and true with `resolves_to_at_most_one_path` is at most one resolved path (#2976) -- so no path is ever followed by another; kept as the loop's own contract (#3448)"
                 };
                 set_path::<S>(&mut result, path, value, false, false)?;
             }
@@ -71197,6 +71201,32 @@ mod tests {
                     "expected a decode failure regardless of optional={optional}, got: {other:?}"
                 ),
             }
+        }
+    }
+
+    /// #3448's eager write route (`assign_one`, `streaming == false`): a bare
+    /// `.[]` fans out but is native-walkable, so it is one path the writer
+    /// itself expands -- never several resolved paths -- and every right-side
+    /// output is written into every element of its own fresh document.
+    #[test]
+    fn test_eval_assign_eager_iterate_writes_every_element_per_rhs_output_3448() {
+        let json_bytes: &[u8] = b"[1,2,3]";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let path_expr = parse(".[]").expect("parse");
+        // `each_assign` streams only when both predicates hold; a bare `.[]`
+        // fans out but is native-walkable, so it stays eager.
+        assert!(
+            !(needs_path_prepass(&path_expr) && assignment_path_needs_streaming(&path_expr)),
+            "this test is only meaningful on the eager route"
+        );
+        let value_expr = parse("9, 8").expect("parse");
+        match eval_assign::<Vec<u64>, JqSemantics>(&path_expr, &value_expr, cursor.value(), false) {
+            QueryResult::ManyOwned(docs) => {
+                let rendered: Vec<String> = docs.iter().map(OwnedValue::to_json).collect();
+                assert_eq!(rendered, ["[9,9,9]", "[8,8,8]"]);
+            }
+            other => panic!("expected one document per right-side output, got: {other:?}"),
         }
     }
 
