@@ -49808,6 +49808,7 @@ fn test_yq_negative_zero_document_and_literal_arithmetic_3445() -> Result<()> {
         (".a | tostring", "-0\n"),
         (".a == 0", "false\n"),
         (".a == -0", "true\n"),
+        (".a *= 1", "a: -0\n"),
         (".a", "-0\n"),
         ("[.a] | .[0] - 0", "-0\n"),
     ] {
@@ -49842,6 +49843,32 @@ fn test_yq_negative_zero_document_and_literal_arithmetic_3445() -> Result<()> {
         assert_eq!(stdout, expected, "`yq -n '{filter}'`");
     }
 
+    // An explicit `!!int` tag still makes `-0` the integer zero (the
+    // float resolution is the *plain* scalar's), and a JSON document's `-0`
+    // is the integer zero too: yq's JSON decoder, unlike its YAML one, reads
+    // it that way.
+    for (doc, filter, expected, args) in [
+        ("a: !!int -0\n", ".a - 0", "0\n", vec![]),
+        ("a: !!int -0\n", ".a | tag", "!!int\n", vec![]),
+        ("{\"a\": -0}", ".a - 0", "0\n", vec!["-p=json"]),
+        (
+            "{\"a\": -0}",
+            ".a | tag",
+            "\"!!int\"\n",
+            vec!["-p=json", "-o=json"],
+        ),
+        (
+            "{\"a\": -0, \"b\": [-0, 0]}",
+            ".",
+            "{\"a\":0,\"b\":[0,0]}\n",
+            vec!["-p=json", "-o=json", "-I=0"],
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(code, 0, "`{filter}` on {doc:?}");
+        assert_eq!(stdout, expected, "`{filter}` on {doc:?} {args:?}");
+    }
+
     // Must not change: every other zero spelling is still the value it was.
     for (doc, filter, expected) in [
         ("a: 0\n", ".a / -1", "-0\n"),
@@ -49850,6 +49877,7 @@ fn test_yq_negative_zero_document_and_literal_arithmetic_3445() -> Result<()> {
         ("a: +0\n", ".a | tag", "!!int\n"),
         ("a: -0.0\n", ".a - 0", "-0\n"),
         ("a: -0.0\n", ".a | tag", "!!float\n"),
+        ("a: -00\n", ".a - 0", "0\n"),
         ("a: -1\n", ".a / -1", "1\n"),
         ("a: '-0'\n", ".a | tag", "!!str\n"),
     ] {

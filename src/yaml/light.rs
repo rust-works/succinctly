@@ -26,7 +26,7 @@ use super::index::YamlIndex;
 use super::line_break::{is_line_break, line_break_len, line_break_len_before};
 use super::scalar::{
     could_be_null_or_bool, is_preservable_float_literal, preservable_float_literal_text,
-    resolve_plain, resolve_tagged, ResolvedScalar,
+    resolve_plain, resolve_plain_sourced, resolve_tagged, ResolvedScalar,
 };
 use super::{starts_inline_seq_entry, starts_seq_entry};
 use crate::util::simd::escape::find_json_escape;
@@ -429,6 +429,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     start: effective_text_pos,
                     end,
                     base_indent,
+                    json_sourced: self.index.canonicalize_numbers(),
                 })
             }
         }
@@ -3346,7 +3347,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // schema; quoted/block scalars are always strings.
                 if s.is_unquoted() {
                     if let Ok(str_val) = s.as_str() {
-                        return resolve_plain(&str_val).tag();
+                        return s.resolve_plain_scalar(&str_val).tag();
                     }
                 }
                 "!!str"
@@ -4191,7 +4192,7 @@ pub fn format_float_yq_yaml(f: f64) -> String {
 #[must_use]
 pub fn format_float_yq_yaml_nested(f: f64) -> String {
     let spelling = format_float_yq_yaml(f);
-    if super::scalar::needs_explicit_float_tag(&spelling) {
+    if super::scalar::needs_explicit_float_tag_in_yaml(&spelling) {
         format!("!!float {spelling}")
     } else {
         spelling
@@ -4843,7 +4844,14 @@ fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
     str_val: &str,
     canonicalize: bool,
 ) -> core::fmt::Result {
-    stream_resolved_scalar_as_json(out, resolve_plain(str_val), str_val, canonicalize)
+    // `canonicalize` is the index's JSON-sourced flag (#996), which is also
+    // what decides whether `-0` is a float (#3445).
+    stream_resolved_scalar_as_json(
+        out,
+        resolve_plain_sourced(str_val, canonicalize),
+        str_val,
+        canonicalize,
+    )
 }
 
 /// Stream an already-resolved scalar as JSON.
@@ -5711,6 +5719,13 @@ pub enum YamlString<'a> {
         end: usize,
         /// Base indentation level for detecting continuation lines
         base_indent: usize,
+        /// Set from `YamlIndex::canonicalize_numbers` at construction, as
+        /// [`YamlString::DoubleQuoted`]'s is: this text is JSON, which this
+        /// crate parses with the YAML grammar. It decides how a plain
+        /// scalar resolves where yq's two decoders differ -- `-0` is a float
+        /// in a YAML document and the integer zero in JSON (#3445); see
+        /// [`YamlString::resolve_plain_scalar`].
+        json_sourced: bool,
     },
     /// Block literal scalar (`|`): preserves newlines
     BlockLiteral {
@@ -5736,6 +5751,26 @@ impl<'a> YamlString<'a> {
     /// as YAML null, while quoted or block scalars should remain strings.
     pub fn is_unquoted(&self) -> bool {
         matches!(self, YamlString::Unquoted { .. })
+    }
+
+    /// Resolve this plain scalar's text (`str_val`, from [`Self::as_str`])
+    /// per the YAML 1.2 core schema, as yq's decoder for this scalar's source
+    /// would (#3445).
+    ///
+    /// [`resolve_plain`] alone reads `-0` as the integer zero, which is what
+    /// yq's JSON decoder does. Its YAML decoder (go-yaml) resolves exactly
+    /// `-0` as a float that keeps its sign, so a YAML document's `-0` goes
+    /// through [`resolve_plain_sourced`] with this scalar's own source flag.
+    #[inline]
+    pub fn resolve_plain_scalar(&self, str_val: &str) -> ResolvedScalar {
+        let json_sourced = matches!(
+            self,
+            YamlString::Unquoted {
+                json_sourced: true,
+                ..
+            }
+        );
+        resolve_plain_sourced(str_val, json_sourced)
     }
 
     /// Get the raw bytes of the string (including quotes if applicable).
@@ -5814,6 +5849,7 @@ impl<'a> YamlString<'a> {
                 start,
                 end,
                 base_indent,
+                ..
             } => {
                 let bytes = &text[*start..*end];
                 // Need folding if contains newlines (multiline plain scalar)
@@ -7481,7 +7517,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         match self {
             YamlValue::String(s) if s.is_unquoted() => {
                 let str_val = s.as_str().ok()?;
-                match resolve_plain(&str_val) {
+                match s.resolve_plain_scalar(&str_val) {
                     ResolvedScalar::Int(n) => Some(n),
                     _ => None,
                 }
@@ -7499,7 +7535,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             YamlValue::String(s) if s.is_unquoted() => {
                 let str_val = s.as_str().ok()?;
                 // Non-finite floats arise only from the `.inf`/`.nan` family
-                match resolve_plain(&str_val) {
+                match s.resolve_plain_scalar(&str_val) {
                     ResolvedScalar::Int(n) => Some(n as f64),
                     ResolvedScalar::Float(f) => Some(f),
                     _ => None,
@@ -7547,7 +7583,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         match self {
             YamlValue::String(s) if s.is_unquoted() => {
                 let str_val = s.as_str().ok()?;
-                match resolve_plain(&str_val) {
+                match s.resolve_plain_scalar(&str_val) {
                     ResolvedScalar::Float(_) if is_preservable_float_literal(&str_val) => {
                         Some(str_val)
                     }
@@ -7685,7 +7721,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                 // Determine effective type per the YAML 1.2 core schema
                 if s.is_unquoted() {
                     if let Ok(str_val) = s.as_str() {
-                        return resolve_plain(&str_val).type_name();
+                        return s.resolve_plain_scalar(&str_val).type_name();
                     }
                 }
                 "string"
@@ -15612,7 +15648,8 @@ mod tests {
         ] {
             let emitted = format_float_yq_yaml_nested(f);
             let scalar = emitted.strip_prefix("!!float ").map_or_else(
-                || super::super::scalar::resolve_plain(&emitted),
+                // Emitted into a YAML document, so read back as one (#3445).
+                || super::super::scalar::resolve_plain_sourced(&emitted, false),
                 |text| {
                     super::super::scalar::resolve_tagged(text, "!!float")
                         .expect("!!float is a core-schema tag")

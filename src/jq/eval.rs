@@ -12081,8 +12081,8 @@ fn is_negative_zero_int_literal(value: &OwnedValue) -> bool {
 /// `range`, which are correct as they stand and read the literal as `Int(0)`
 /// on purpose: jq's `%` casts to `intmax_t`, so `-0` must not reach it.
 fn signed_number_repr<S: EvalSemantics>(value: &OwnedValue) -> Option<NumberRepr> {
-    if S::TAG != EvalTag::Yq && is_negative_zero_int_literal(value) {
-        Some(NumberRepr::Float(-0.0))
+    if S::TAG != EvalTag::Yq {
+        division_number_repr(value)
     } else {
         value.number_repr()
     }
@@ -61788,7 +61788,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
     cursor: crate::yaml::YamlCursor<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
-    use crate::yaml::{resolve_plain, resolve_tagged, YamlValue};
+    use crate::yaml::{resolve_tagged, YamlValue};
 
     Ok(match cursor.value() {
         YamlValue::Null => OwnedValue::Null,
@@ -61814,7 +61814,7 @@ fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
             }
 
             // Resolve plain scalars per the YAML 1.2 core schema
-            resolve_plain(&str_value).to_owned_value(str_value)
+            s.resolve_plain_scalar(&str_value).to_owned_value(str_value)
         }
         YamlValue::Sequence(mut elements) => {
             let mut items = Vec::new();
@@ -79427,14 +79427,16 @@ mod tests {
 
     /// #3442: real yq v4.53.3 reads a `-0` expression literal as integer
     /// zero for `+`, `-` and `*` (all three rows below captured live), so the
-    /// jq-mode reader must not reach `YqSemantics`. yq's `/` on that literal
-    /// and a `-0` YAML document number keep the sign there; succinctly does
-    /// not match that yet (#3445), so neither is pinned here.
+    /// jq-mode reader must not reach `YqSemantics`. Its `/` on that literal
+    /// divides as a float and keeps the sign (#3445, which also pins a `-0`
+    /// YAML document number from the CLI).
     #[test]
     fn test_arithmetic_negative_zero_operand_yq_stays_zero_3442() {
         assert_eq!(outputs_yq(b"null", "(-0) - 0"), ["0"]);
         assert_eq!(outputs_yq(b"null", "(-0) + (-0)"), ["0"]);
         assert_eq!(outputs_yq(b"null", "(-0) * 1"), ["0"]);
+        assert_eq!(outputs_yq(b"null", "(-0) / 1"), ["-0"]);
+        assert_eq!(outputs_yq(b"null", "(-0) / -1"), ["0"]);
     }
 
     /// #3440: yq has no negative zero (Go's `int64` product is plain `0`),

@@ -234,6 +234,23 @@ pub fn resolve_plain(s: &str) -> ResolvedScalar {
     }
 }
 
+/// [`resolve_plain`] for a plain scalar whose source is known (#3445).
+///
+/// yq's YAML decoder (go-yaml) resolves exactly `-0` as a float that keeps its
+/// sign, where its JSON decoder reads `-0` as the integer zero `resolve_plain`
+/// returns. `json_sourced` is the index's own flag for JSON text, which this
+/// crate parses with the YAML grammar. Every other scalar, and `-00`/`0`/`+0`
+/// (integers in both), resolve exactly as `resolve_plain` does.
+#[must_use]
+#[inline(always)]
+pub fn resolve_plain_sourced(s: &str, json_sourced: bool) -> ResolvedScalar {
+    if !json_sourced && s == "-0" {
+        ResolvedScalar::Float(-0.0)
+    } else {
+        resolve_plain(s)
+    }
+}
+
 #[inline(always)]
 fn keyword(matched: bool, resolved: ResolvedScalar) -> ResolvedScalar {
     if matched {
@@ -267,9 +284,6 @@ fn resolve_signed(s: &str, bytes: &[u8]) -> ResolvedScalar {
             // fails the parse and resolves to `Str`.
             _ => parse_float(s),
         },
-        // go-yaml resolves exactly `-0` as a float (`-0` keeps its sign, #3445),
-        // where every other zero spelling (`0`, `+0`, `-00`) is an integer.
-        Some(b'0') if s == "-0" => ResolvedScalar::Float(-0.0),
         Some(b'0'..=b'9') => parse_int_or_float(s),
         // `+inf`, `-_1`, a bare sign, … — never numeric in the core schema.
         _ => ResolvedScalar::Str,
@@ -587,15 +601,23 @@ pub(super) fn preservable_float_literal_text(s: &str) -> Option<String> {
 ///
 /// Anchoring on `resolve_plain` also guarantees the emitter and the reader
 /// agree: whatever spelling this crate writes, this crate reads back at the
-/// same type. That costs one byte against real yq on exactly one value —
-/// yq resolves `-0` as `!!float` while `resolve_plain` calls it `!!int`, so
-/// a computed negative zero emits `!!float -0` here versus yq's bare `-0`.
-/// Tagging it is the type-safe side of that divergence, and fixing
-/// `resolve_plain`'s `-0` classification later makes both callers
-/// oracle-exact with no change to either.
+/// same type. `resolve_plain` is the *JSON-sourced* reading, where `-0` is
+/// the integer zero, which is what the second caller (a JSON round trip)
+/// needs; the YAML emitter asks [`needs_explicit_float_tag_in_yaml`] instead,
+/// because a YAML document's `-0` is a float (#3445).
 #[must_use]
 pub(crate) fn needs_explicit_float_tag(text: &str) -> bool {
     !matches!(resolve_plain(text), ResolvedScalar::Float(_))
+}
+
+/// [`needs_explicit_float_tag`] for text this crate is about to write into a
+/// YAML document (#3445): the question is what a YAML reader would make of
+/// it, and a YAML document's `-0` reads back as a float
+/// ([`resolve_plain_sourced`]), so a computed negative zero is emitted bare,
+/// as real yq does, rather than as `!!float -0`.
+#[must_use]
+pub(crate) fn needs_explicit_float_tag_in_yaml(text: &str) -> bool {
+    !matches!(resolve_plain_sourced(text, false), ResolvedScalar::Float(_))
 }
 
 /// Force-resolves a scalar's value under an explicit YAML tag.
@@ -706,24 +728,28 @@ mod tests {
         assert_resolves("42", Int(42));
         assert_resolves("+42", Int(42));
         assert_resolves("-7", Int(-7));
+        assert_resolves("-0", Int(0)); // YAML's float `-0` is `resolve_plain_sourced`'s (#3445)
         assert_resolves("052", Int(52)); // decimal with leading zero, not octal
         assert_resolves("9223372036854775807", Int(i64::MAX));
         assert_resolves("-9223372036854775808", Int(i64::MIN));
     }
 
     /// go-yaml resolves exactly `-0` as a float that keeps its sign (#3445);
-    /// every other zero spelling is an integer. `Float(0.0) == Float(-0.0)`,
-    /// so the sign is checked on the bits.
+    /// every other zero spelling is an integer, and JSON text's `-0` is the
+    /// integer zero. `Float(0.0) == Float(-0.0)`, so the sign is checked on
+    /// the bits.
     #[test]
-    fn negative_zero_is_a_float_and_other_zeros_are_ints_3445() {
-        match resolve_plain("-0") {
+    fn negative_zero_is_a_float_only_in_yaml_documents_3445() {
+        match resolve_plain_sourced("-0", false) {
             Float(f) => assert!(f == 0.0 && f.is_sign_negative(), "{f:?}"),
             other => panic!("`-0` resolved as {other:?}"),
         }
-        assert_resolves("0", Int(0));
-        assert_resolves("+0", Int(0));
-        assert_resolves("-00", Int(0));
-        match resolve_plain("-0.0") {
+        // JSON-sourced, and every other zero spelling, stay integers.
+        assert_eq!(resolve_plain_sourced("-0", true), Int(0));
+        for zero in ["0", "+0", "-00"] {
+            assert_eq!(resolve_plain_sourced(zero, false), Int(0), "{zero}");
+        }
+        match resolve_plain_sourced("-0.0", false) {
             Float(f) => assert!(f.is_sign_negative()),
             other => panic!("`-0.0` resolved as {other:?}"),
         }

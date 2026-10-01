@@ -33,8 +33,8 @@ use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    format_float_yq_yaml, format_float_yq_yaml_nested, resolve_plain, resolve_tagged,
-    stream_json_sequence, stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
+    format_float_yq_yaml, format_float_yq_yaml_nested, resolve_tagged, stream_json_sequence,
+    stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
 };
 
 use super::m2_gate::can_use_m2_streaming;
@@ -879,7 +879,8 @@ fn yaml_to_owned_value<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> Re
             }
 
             // Resolve plain scalars per the YAML 1.2 core schema
-            Ok(resolve_plain(&str_value).to_owned_value_for_json_bridge(str_value))
+            Ok(s.resolve_plain_scalar(&str_value)
+                .to_owned_value_for_json_bridge(str_value))
         }
         YamlValue::Mapping(fields) => {
             let mut map = IndexMap::new();
