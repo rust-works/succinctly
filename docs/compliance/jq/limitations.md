@@ -673,7 +673,9 @@ follows too. What it leaves:
   `getpath([[2]])` now answer it (including past a `null` reached mid-path, which refuses an
   array segment). `path(.[[2]])`, `del(.[[2]])` and `.[[2]] = 5` have answers of their own and
   are still refused with "Cannot index array with array", with or without a `?//`. `succinctly
-  yq` keeps refusing the key form, as real yq does.
+  yq` keeps refusing the key form, as real yq does; `indices`/`index`/`rindex` are a
+  `--jq-extensions` surface there (real yq has none) and follow jq's search, so under that flag
+  `indices([1])` searches while `.[[1]]` still raises.
 - **`getpath` with an array segment is value-only** (#2429): in path and write position it
   still raises "Cannot index array with array" where jq answers, since those routes share the
   `.[[2]]` gap above. `path(getpath([[1]]))` on `[1,2]` is `[[1]]` in jq; `pick(getpath([[1]]))`
@@ -8143,7 +8145,7 @@ is rebuilt (`map(.)`, `sort`, `[] + .`, `[.[]]`) is a new allocation in jq too a
 | `map(nan) \| . == .` on stdin `[1]`                     | `true` | `true`     |
 | `{a:[nan]} \| .a as $x \| .a \| path($x)`               | `[]`   | `[]`       |
 | `[nan,1] \| .[0:1] == .[0:1]`                           | `true` | `false`    |
-| `[nan] \| . as $a \| [$a] \| indices([$a])`             | `[0]`  | `[]`       |
+| `[nan] \| . as $a \| [$a] \| indices([$a])`             | `[0]`  | `[0]`      |
 
 The shortcut fires only where `==` is handed two handles on one storage, so the other half of
 #3069 is not splitting a value into two containers before `==` sees it:
@@ -8171,9 +8173,6 @@ Still different:
   does. An equal-bounds *partial* slice is a view onto the same storage in jq (pointer, offset
   and size all equal), so `.[0:1] == .[0:1]` is identical there; here each slice is a new
   array. Matching it would need a slice representation, which a NaN is the only way to observe.
-- **`indices`/`index`/`rindex` with an array argument** differ for a reason unrelated to
-  identity: an array pattern is a subsequence search in jq and a whole-element comparison here
-  ([#3453](https://github.com/rust-works/succinctly/issues/3453)).
 - **`no_std` builds.** The bridge registry is a thread-local, so without `std` every bridge
   read rebuilds, as before, and the bridged rows above answer `false` there.
 

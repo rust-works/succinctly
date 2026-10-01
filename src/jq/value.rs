@@ -5044,12 +5044,20 @@ pub(crate) fn subarray_positions<'a, S: EvalSemantics>(
     } else {
         0..hay.len() - needle.len() + 1
     };
-    windows.filter(move |&start| {
-        hay[start..start + needle.len()]
-            .iter()
-            .zip(needle)
-            .all(|(x, y)| owned_value_eq::<S>(x, y))
-    })
+    windows.filter(move |&start| window_matches::<S>(&hay[start..start + needle.len()], needle))
+}
+
+/// Whether `window` equals `needle` element for element, with `==`'s own
+/// element comparison. The one definition of a match for the search's every
+/// caller; `window` must be as long as `needle`.
+pub(crate) fn window_matches<S: EvalSemantics>(
+    window: &[OwnedValue],
+    needle: &[OwnedValue],
+) -> bool {
+    window
+        .iter()
+        .zip(needle)
+        .all(|(x, y)| owned_value_eq::<S>(x, y))
 }
 
 pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(

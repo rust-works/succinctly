@@ -410,7 +410,7 @@ use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
     infinite_float_preview_text, int_to_f64, jq_identical, jq_literal_int_to_f64, jq_numeric_cmp,
     numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, subarray_indices,
-    subarray_positions, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
+    subarray_positions, window_matches, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -2640,6 +2640,11 @@ fn scalar_fallback<'a, W: Clone + AsRef<[u64]>>(
 /// undecodable string candidate (a computed index/slice-bound key) must
 /// raise, not silently become `""` and get indexed/compared as though
 /// that were the real key.
+///
+/// **Not for an index key's array** (#3453): jq reads `.[$array]` on an array
+/// as a subarray search, which needs the key's contents, so index-key sites
+/// go through [`to_owned_index_key`] instead. The array arm below serves slice
+/// bounds and `yq_join`, where an array is only ever rejected on type.
 fn to_owned_key_shape<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
@@ -20445,18 +20450,28 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // #1755: an undecodable element must raise, not compare as "".
                 Err(e) => return suppress_or_raise(e, optional),
             }
+            // `index` stops at the first window that matches, as the scalar
+            // scan below does, instead of reading the rest of the array.
+            if matches!(occurrence, SearchOccurrence::First)
+                && !needle.is_empty()
+                && hay.len() >= needle.len()
+            {
+                let start = hay.len() - needle.len();
+                if window_matches::<S>(&hay[start..], needle) {
+                    return QueryResult::Owned(OwnedValue::Int(start as i64));
+                }
+            }
         }
-        let mut positions = subarray_positions::<S>(&hay, needle);
         return match occurrence {
             SearchOccurrence::All => QueryResult::Owned(subarray_indices::<S>(&hay, needle)),
-            SearchOccurrence::First => positions.next().map_or_else(
-                || QueryResult::Owned(OwnedValue::Null),
-                |i| QueryResult::Owned(OwnedValue::Int(i as i64)),
-            ),
-            SearchOccurrence::Last => positions.next_back().map_or_else(
-                || QueryResult::Owned(OwnedValue::Null),
-                |i| QueryResult::Owned(OwnedValue::Int(i as i64)),
-            ),
+            // Every window was tried as it arrived.
+            SearchOccurrence::First => QueryResult::Owned(OwnedValue::Null),
+            SearchOccurrence::Last => subarray_positions::<S>(&hay, needle)
+                .next_back()
+                .map_or_else(
+                    || QueryResult::Owned(OwnedValue::Null),
+                    |i| QueryResult::Owned(OwnedValue::Int(i as i64)),
+                ),
         };
     }
     match value {
