@@ -431,10 +431,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and every route that builds a map raises `object key "" is ambiguous`, as for plain
   colliding complex keys. Ordinary keys and a genuine `""` key still override by name, and
   so does what is the same key: a sequence key of equal content (a merged-in `? [1]` and a
-  local `? [1]`, or two sources that both define it) and the same source mapping reached
-  more than once. Two equal *mappings* used as keys in different nodes used to resolve to
-  the local one and now refuse. `-i` was already refused for a complex key (#3463) and
-  still leaves the file untouched. How yq's `keys`/`length`/`has` treat a merge key is a separate gap (#3556).
+  local `? [1]`, `? []` twice, two sources that both define it), an alias key against
+  another use of the same anchor, and the same source mapping reached more than once. Two
+  equal *mappings* used as keys in different nodes used to resolve to the local one and now
+  refuse. `-i` was already refused for a complex key (#3463) and still leaves the file
+  untouched. How yq's `keys`, `length` and `has` treat a merge key is a separate gap
+  (#3556).
 
 - **jq: bare `first` and `last` are path steps** (#3545). jq defines `first` as
   `.[0]` and `last` as `.[-1]`, so `[1,2] | path(first)` is `[0]`, and

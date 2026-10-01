@@ -2382,18 +2382,25 @@ elsewhere in the document, `.a.k = 1`, which materializes `b` too) raises the sa
 `object key "" is ambiguous` error. Ordinary keys and a genuine `""` key still override by
 name.
 
-What is the *same key* still overrides, byte for byte as before: a sequence key of equal content
-(a merged-in `? [1]` and a local `? [1]`, or two sources that both define it, compared by
-rendering, and only when nothing inside it is itself spelled `""`), and the same source mapping
-reached more than once (`<<: [*a, *a]`). Anything else is the same key only if it is the same
-node, so two keys that merely look alike stay two entries and the materializing routes refuse
-them rather than keep one: `[1]` against `["1"]` (a
-number and a string), two different mappings used as keys, and **two equal mappings used as
-keys in different nodes**. That last case used to resolve to the local one (YAML's override
-rule) and now refuses; a mapping key cannot be compared by content yet because its cursor does
-not expose its fields. That is the refusing side of
-[ADR-0018](../../adrs/adr-0018.md)'s rule 4. How yq's key-list builtins treat a merge key at
-all (`keys`, `length`, `has`) is a separate gap, tracked in
+What is the *same key* still overrides, byte for byte as before. A key is looked up by identity,
+not by its shared `""` spelling:
+
+- a sequence key is compared by content, so a merged-in `? [1]` and a local `? [1]` are one key
+  (the local one wins), and so are two sources that both define it, `? []` against `? []`, and
+  an alias used as a key (`*k : v`) against another use of the same anchor. This applies only
+  when nothing inside the key is itself spelled `""`;
+- anything else is the same key only if it is the same node, which covers a source mapping
+  reached more than once (`<<: [*a, *a]`).
+
+Keys that merely look alike therefore stay two entries, and the materializing routes refuse
+them instead of keeping one: `[1]` against `["1"]` (a number and a string), `[]` against `[1]`,
+two different anchors, and two different mappings used as keys. Two cases that used to
+collapse into one entry are refused for the same reason and are the only ones that did not
+need to be: **two equal mappings used as keys in different nodes** (`? {p: 1}` merged-in and
+local), and a key holding an empty mapping (`? [{}]`). A mapping used as a key cannot be
+compared by content yet, because its cursor yields no fields, so it is compared by node only.
+That is the refusing side of [ADR-0018](../../adrs/adr-0018.md)'s rule 4. How yq's key-list
+builtins treat a merge key at all (`keys`, `length`, `has`) is a separate gap, tracked in
 [#3556](https://github.com/rust-works/succinctly/issues/3556).
 
 **`-i` refuses a file holding a complex key

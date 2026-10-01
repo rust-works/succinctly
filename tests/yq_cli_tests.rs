@@ -3161,6 +3161,17 @@ const MERGED_DIFFERENT_MAPPING_KEYS: &str =
     "a: &a\n  ? {p: 1}\n  : x\nb:\n  <<: *a\n  ? {p: 2}\n  : y\n";
 const MERGED_EQUAL_MAPPING_KEYS: &str =
     "a: &a\n  ? {p: 1}\n  : x\nb:\n  <<: *a\n  ? {p: 1}\n  : y\n";
+// An alias used as a key is the key it names: two uses of one anchor are one
+// key, two different anchors are two.
+const SAME_ALIAS_KEY_MERGED_AND_LOCAL: &str =
+    "k: &k [1]\na: &a\n  *k : x\nb:\n  <<: *a\n  *k : y\n";
+const DIFFERENT_ALIAS_KEYS_MERGED_AND_LOCAL: &str =
+    "k: &k [1]\nj: &j [2]\na: &a\n  *k : x\nb:\n  <<: *a\n  *j : y\n";
+// An empty sequence is a real `[]`, so two of them are one key and `[]` against
+// `[1]` is two.
+const EMPTY_SEQUENCE_KEY_MERGED_AND_LOCAL: &str =
+    "a: &a\n  ? []\n  : x\nb:\n  <<: *a\n  ? []\n  : y\n";
+const EMPTY_SEQUENCE_VS_ONE_KEY: &str = "a: &a\n  ? []\n  : x\nb:\n  <<: *a\n  ? [1]\n  : y\n";
 
 #[test]
 fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()> {
@@ -3181,6 +3192,8 @@ fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()
         (MERGED_NUMBER_VS_STRING_KEY, ".b | length", "2\n"),
         (MERGED_DIFFERENT_MAPPING_KEYS, ".b | length", "2\n"),
         (MERGED_EQUAL_MAPPING_KEYS, ".b | length", "2\n"),
+        (DIFFERENT_ALIAS_KEYS_MERGED_AND_LOCAL, ".b | length", "2\n"),
+        (EMPTY_SEQUENCE_VS_ONE_KEY, ".b | length", "2\n"),
         // The identity route echoes the source, merge key and all.
         (
             MERGED_VS_LOCAL_COMPLEX,
@@ -3212,6 +3225,8 @@ fn test_yq_merge_keys_raise_instead_of_dropping_a_complex_key_3467() -> Result<(
         (MERGED_NUMBER_VS_STRING_KEY, ".b.z = 1"),
         (MERGED_DIFFERENT_MAPPING_KEYS, ".b.z = 1"),
         (MERGED_EQUAL_MAPPING_KEYS, ".b.z = 1"),
+        (DIFFERENT_ALIAS_KEYS_MERGED_AND_LOCAL, ".b.z = 1"),
+        (EMPTY_SEQUENCE_VS_ONE_KEY, ".b.z = 1"),
     ];
     for &(yaml, filter) in rows {
         let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
@@ -3252,7 +3267,8 @@ fn test_yq_merge_keys_raise_instead_of_dropping_a_complex_key_3467() -> Result<(
 /// `upsert_field`, so ordinary keys still override by name (a local `p`
 /// replaces the merged-in one), and a *genuine* `""` key is not a fallback and
 /// still overrides a merged-in `""`. So does everything that is the *same key*
-/// despite the shared `""` spelling: a sequence key of equal content, the same
+/// despite the shared `""` spelling: a sequence key of equal content (an empty
+/// one included), an alias key against another use of its anchor, the same
 /// source reached three times, and two sources defining the same key. Each of
 /// those used to resolve to one entry and still does, byte for byte (checked
 /// against a build of `main` without the fix).
@@ -3277,6 +3293,18 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
             SAME_SOURCE_REPEATED_COMPLEX,
             ".b.z = 1",
             "a: &a\n  '': x\nb:\n  '': x\n  z: 1\n",
+        ),
+        (SAME_ALIAS_KEY_MERGED_AND_LOCAL, ".b | length", "1\n"),
+        (
+            SAME_ALIAS_KEY_MERGED_AND_LOCAL,
+            ".b.z = 1",
+            "k: &k [1]\na: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
+        (EMPTY_SEQUENCE_KEY_MERGED_AND_LOCAL, ".b | length", "1\n"),
+        (
+            EMPTY_SEQUENCE_KEY_MERGED_AND_LOCAL,
+            ".b.z = 1",
+            "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
         ),
         (TWO_SOURCES_SHARING_A_COMPLEX_KEY, ".b | length", "1\n"),
         (

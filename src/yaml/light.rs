@@ -5118,10 +5118,10 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     ///
     /// YAML permits duplicate mapping keys; per YAML 1.2 and to match `yq`,
     /// the last matching entry wins (see issue #174). A `Merged` list is
-    /// deduplicated by key, so this loop is a no-op scan for it -- except that
-    /// fallback-spelled keys (a complex key is spelled `""`) are deduplicated
-    /// by identity, not spelling, so several can share the name `""` and the
-    /// last of them wins here (#3467).
+    /// deduplicated by key, so this loop is a no-op scan for it. (A
+    /// fallback-spelled key -- a complex key is spelled `""` -- is deduplicated
+    /// by identity, so several can share that spelling in the list, but only a
+    /// decoded string key is ever matched here, so they change nothing, #3467.)
     ///
     /// A name absent from this level falls back to recursing into any merge
     /// source's own nested `<<` (#1318) — see `merge_fallback`'s doc comment.
@@ -5411,40 +5411,43 @@ const COMPLEX_KEY_CONTENT_MAX_DEPTH: usize = 16;
 /// A rendering of a complex key, when it is safe to compare keys by it.
 ///
 /// Safe means nothing in the subtree is itself spelled `""`: every scalar
-/// decodes, every nested mapping key is a plain string, no alias dangles, and
-/// no container is empty. Otherwise two different keys could render alike
-/// (`{[1]: a}` and `{[2]: a}` both as `{"":"a"}`), and equating them would be
-/// the silent drop this exists to prevent -- so the answer is `None` and the
-/// caller uses node identity. An empty container is refused as well: a node
-/// that yields nothing to render is indistinguishable from a broken render.
+/// decodes, every nested mapping key is a plain string, and no alias dangles.
+/// Otherwise two different keys could render alike (`{[1]: a}` and `{[2]: a}`
+/// both as `{"":"a"}`), and equating them would be the silent drop this exists
+/// to prevent -- so the answer is `None` and the caller uses node identity.
 ///
 /// Rendered from the key's own value, never from its cursor: for a complex key
 /// the cursor is a wrapper that `write_json_to` renders as `{}` for every
-/// mapping, which would equate all mapping keys.
+/// mapping, which would equate all mapping keys. For the same reason a mapping
+/// used as a key is never rendered: its wrapper yields no fields, so there is
+/// nothing to tell two of them apart by, and an *empty* mapping anywhere in a
+/// key is refused for the same reason (an empty sequence is a real `[]`).
 fn complex_key_content<W: AsRef<[u64]>>(key: &YamlCursor<'_, W>) -> Option<String> {
     fn container<W: AsRef<[u64]>>(value: YamlValue<'_, W>, out: &mut String, depth: usize) -> bool {
         if depth > COMPLEX_KEY_CONTENT_MAX_DEPTH {
             return false;
         }
-        let mut count = 0usize;
         match value {
             YamlValue::Sequence(elements) => {
                 out.push('[');
+                let mut first = true;
                 let mut rest = elements;
                 while let Some((element, next)) = rest.uncons_resolved_cursor() {
-                    if count > 0 {
+                    if !first {
                         out.push(',');
                     }
-                    count += 1;
+                    first = false;
                     if !node(element, out, depth + 1) {
                         return false;
                     }
                     rest = next;
                 }
                 out.push(']');
+                true
             }
             YamlValue::Mapping(fields) => {
                 out.push('{');
+                let mut count = 0usize;
                 for field in fields {
                     if count > 0 {
                         out.push(',');
@@ -5463,10 +5466,10 @@ fn complex_key_content<W: AsRef<[u64]>>(key: &YamlCursor<'_, W>) -> Option<Strin
                     }
                 }
                 out.push('}');
+                count > 0
             }
-            _ => return false,
+            _ => false,
         }
-        count > 0
     }
 
     fn node<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>, out: &mut String, depth: usize) -> bool {
@@ -5494,7 +5497,18 @@ fn complex_key_content<W: AsRef<[u64]>>(key: &YamlCursor<'_, W>) -> Option<Strin
     }
 
     let mut rendered = String::new();
-    container(key.value(), &mut rendered, 0).then_some(rendered)
+    let rendered_ok = match key.value() {
+        // A mapping used as a key: compared by node (see above).
+        YamlValue::Mapping(_) => false,
+        // An alias used as a key (`*k : v`) is the key it names, so two uses
+        // of one anchor are one key.
+        YamlValue::Alias {
+            target: Some(target),
+            ..
+        } => node(target, &mut rendered, 1),
+        value => container(value, &mut rendered, 0),
+    };
+    rendered_ok.then_some(rendered)
 }
 
 /// Expand one `<<` field's merge sources into `entries`/`positions`.
