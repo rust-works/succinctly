@@ -33108,18 +33108,13 @@ impl Frame {
     /// **Exclusivity (#3456 D2).** The frame this returns -- the one a
     /// stage's readers consult (`stage_frame`, a nested pipe's seed, a
     /// `catch` handler's entry) -- never carries a live register *and*
-    /// records it lost: loss is set only when the carried register is
-    /// `None`, and only trackability clears it. That holds for every
-    /// `with_register` call the jq suite and the path-register sweep reach.
-    /// It does **not** hold for the *handoff* frame `place_step` builds with
-    /// [`Frame::with_register_loss`] for the next stage, nor for that frame
-    /// after [`Frame::extend`]: both still carry the register the stage was
-    /// *entered* with, and the next stage replaces it through
-    /// `with_register` (its `stage_frame`). So the assertion lives here and
-    /// nowhere upstream of it; an assertion on those two failed 8 jq tests
-    /// (`test_path_catch_handler_*_843`, `_3133`, `_2978`, `_1297`), none of
-    /// which showed a reader of the mixed frame -- tested, not proven by
-    /// construction.
+    /// records it lost. That is *not* true of the handoff frame `place_step`
+    /// builds with [`Frame::with_register_loss`] for the next stage (or that
+    /// frame after [`Frame::extend`]): it still carries the register the
+    /// stage was entered with, which the next stage replaces here. So this is
+    /// the one place the invariant is asserted; the evidence it holds is
+    /// tested, not proven by construction -- see
+    /// `docs/plan/jq-path-register-producer-contract.md` (D2).
     fn with_register(&self, register: Option<&OwnedValue>) -> Self {
         debug_assert!(
             register.is_none() || !self.register_loss.is_lost(),
@@ -111954,6 +111949,25 @@ mod tests {
         assert!(register_identical::<YqSemantics>(
             &empty, &at_slice, &fresh, &mark
         ));
+    }
+
+    /// `PathBranch` is moved and `Vec`-stored on every path-mode step, and
+    /// `BranchRegister` rides in it (#3456). `Option<Cow<OwnedValue>>` and
+    /// `BranchRegister { None, Unmoved(Cow) }` both fit `Cow`'s niche, so the
+    /// type change added nothing. The producer contract's lost states
+    /// (D1) must keep it that way: `LostAt` holds an `Rc`, not a second `Cow`,
+    /// which would put a second dataful variant on the niche and cost 8 bytes
+    /// (measured 120 against 112).
+    #[test]
+    #[cfg(all(target_pointer_width = "64", not(feature = "unshared-containers")))]
+    fn path_branch_size_is_pinned_3456() {
+        assert_eq!(
+            core::mem::size_of::<PathBranch<'static>>(),
+            112,
+            "size_of::<PathBranch>() moved -- every path-mode step moves one. \
+             See docs/plan/jq-path-register-producer-contract.md section 9 \
+             before re-pinning.",
+        );
     }
 
     /// #2889: `RootWitness::of_owned` reports the node an owned value still

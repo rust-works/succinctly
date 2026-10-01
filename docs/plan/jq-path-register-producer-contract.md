@@ -108,14 +108,16 @@ output; `place_step` is the **single** conversion point from branch-level loss t
 
 **An invariant the code implies, and what B1 found when it asserted it.** The claim was that
 `Frame::register.is_some()` and `register_loss.is_lost()` are mutually exclusive. It is
-**false as stated.** B1 put a `debug_assert!` on every `Frame` constructor that can combine the
-two and ran the jq suite: eight tests tripped it (`test_path_catch_handler_*_843`,
+**false as stated.** B1 first put a probe `debug_assert!` on every `Frame` constructor that can
+combine the two (`with_register`, `with_register_loss`, `extend`) and ran the jq suite: eight
+tests tripped it (`test_path_catch_handler_*_843`,
 `_3133`, `_2978`, `_1297`). The violating frames are the *handoff* frame `place_step` builds
 with `with_register_loss` for the next stage, and that frame after `extend`. Both still carry
 the register the stage was *entered* with while recording a new loss. The next stage replaces
 the register through `with_register` (its `stage_frame`), and neither the suite nor the sweep
-showed a reader of a mixed frame -- tested, not proven by construction. The `And`/`Or` arm's `frame.with_register(register)` was the candidate
-counterexample; it did not fire.
+showed a reader of a mixed frame -- tested, not proven by construction. The `And`/`Or` arm's
+`frame.with_register(register)` was the candidate counterexample; it did not fire, in the suite,
+in the sweep, or on hand-built `reduce`/`foreach`/`try` shapes under an and/or/negate operand.
 
 What does hold is narrower, and is what B1 asserts: **a frame built by `Frame::with_register`
 -- the one a stage's readers consult -- never carries a register while recording it lost.** It
