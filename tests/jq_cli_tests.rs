@@ -68661,6 +68661,132 @@ fn test_array_key_in_path_and_write_position_yq_mode_unchanged_3506() -> Result<
 }
 
 // ============================================================================
+// #3550: bare `nth(n)` is a path step
+// ============================================================================
+
+/// jq defines `nth($n)` as `.[$n]`, so in `path()` and under a write it extends
+/// the path by that component, as bare `first`/`last` do (#3545). `$n` is a value
+/// generator, so a comma fans out; a `null` input names the position
+/// (`null | path(nth(1))` is `[1]`, not `[]`). Every row was captured from
+/// `/usr/bin/jq` 1.7.1; the error rows compare the message.
+#[test]
+fn test_bare_nth_is_a_path_step_3550() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[1,2,3]", "path(nth(1))", "[1]"),
+        ("[1,2,3]", "nth(1) = 9", "[1,9,3]"),
+        ("[1,2,3]", "del(nth(1))", "[1,3]"),
+        ("{\"a\":[1,2,3]}", "path(.a|nth(1))", "[\"a\",1]"),
+        ("[1,2,3]", "path(nth(-1))", "[-1]"),
+        ("[1,2,3]", "[path(nth(0,2))]", "[[0],[2]]"),
+        ("{\"a\":1}", "path(nth(\"a\"))", "[\"a\"]"),
+        ("null", "path(nth(1))", "[1]"),
+        ("[1,2,3]", "nth(1)", "2"),
+        ("[1,2,3]", "nth(1) |= 7", "[1,7,3]"),
+        ("[1,2,3]", "nth(1) += 10", "[1,12,3]"),
+        ("[1,2,3]", "nth(5) = 9", "[1,2,3,null,null,9]"),
+        ("[1,2,3]", "path(nth(5))", "[5]"),
+        ("[1,2,3]", "path(nth(-5))", "[-5]"),
+        ("[1,2,3]", "nth(0,2) = 9", "[9,2,9]"),
+        ("[1,2,3]", "[nth(0,2)]", "[1,3]"),
+        ("[1,2,3]", "path(nth(1.5))", "[1.5]"),
+        (
+            "[1,2,3]",
+            "try path(nth(\"a\")) catch .",
+            "\"Cannot index array with string \\\"a\\\"\"",
+        ),
+        (
+            "{\"a\":1}",
+            "try path(nth(0)) catch .",
+            "\"Cannot index object with number\"",
+        ),
+        ("null", "nth(1) = 9", "[null,9]"),
+        ("null", "nth(\"a\") = 9", "{\"a\":9}"),
+        ("[[1,2],[3,4]]", "path(.[]|nth(1))", "[0,1]\n[1,1]"),
+        ("[[1,2],[3,4]]", ".[]|=nth(1)", "[2,4]"),
+        ("[[1,2],[3,4]]", "(.[]|nth(1)) = 0", "[[1,0],[3,0]]"),
+        ("[[1,2],[3,4]]", "del(.[]|nth(0))", "[[2],[4]]"),
+        ("[1,2,3]", "path(nth(empty))", ""),
+        ("[1,2,3]", "[path(nth(empty))]", "[]"),
+        (
+            "[1,2,3]",
+            "try path(nth(error(\"boom\"))) catch .",
+            "\"boom\"",
+        ),
+        ("[1,2,3]", "path(nth(1)?)", "[1]"),
+        ("[1,2,3]", "path(try nth(1))", "[1]"),
+        ("[1,2,3]", "[paths]|length", "3"),
+        ("[1,2,3]", "to_entries|map(.key)", "[0,1,2]"),
+        ("[1,2,3]", "pick(nth(1))", "[null,2]"),
+        ("[1,2,3]", "pick(nth(0,2))", "[1,null,3]"),
+        ("{\"a\":[1,2,3]}", "pick(.a|nth(1))", "{\"a\":[null,2]}"),
+        ("[1,2,3]", "path(first(nth(1)))", "[1]"),
+        ("[1,2,3]", "path(nth(1)|select(.))", "[1]"),
+        ("[1,2,3]", "path(nth(1)|.a?)", ""),
+        ("[1,2,3]", "nth(1) as $x | $x", "2"),
+        ("[1,2,3]", "path(.[nth(0)|.])", "[1]"),
+        ("[1,2,3]", "path(nth(.[0]))", "[1]"),
+        ("[1,2,3]", "[limit(2;path(nth(0,1,2)))]", "[[0],[1]]"),
+        (
+            "[1,2,3]",
+            "reduce path(nth(0,1)) as $p (.; setpath($p; 0))",
+            "[0,0,3]",
+        ),
+        ("[1,2,3]", "nth(1) |= empty", "[1,3]"),
+        ("[1,2,3]", "(nth(0), nth(1)) |= empty", "[3]"),
+        ("[[1,2],[3]]", "path(nth(0) | nth(1))", "[0,1]"),
+        ("[[1,2],[3]]", "nth(0) | nth(1) = 5", "[1,5]"),
+        ("[[1,2],[3]]", "(nth(0) | nth(1)) = 5", "[[1,5],[3]]"),
+        ("[[1,2],[3]]", "try path(nth(1) | nth(1)) catch .", "[1,1]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3550: `{filter}` on {input}: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "#3550: `{filter}` on {input}");
+    }
+    for (input, filter, message) in [
+        (
+            "[1,2,3]",
+            "nth(-5) = 9",
+            "Out of bounds negative array index",
+        ),
+        (
+            "[1,2,3]",
+            "path(nth(\"a\"))",
+            "Cannot index array with string \"a\"",
+        ),
+        (
+            "{\"a\":1}",
+            "path(nth(0))",
+            "Cannot index object with number",
+        ),
+        ("[1,2,3]", "path(nth(error(\"boom\")))", "boom"),
+        (
+            "[1,2,3]",
+            "paths(nth(0)==1)",
+            "Cannot index number with number",
+        ),
+        (
+            "[1,2,3]",
+            "with_entries(.)",
+            "Cannot use number (0) as object key",
+        ),
+        (
+            "[1,2,3]",
+            "path(nth(1) | nth(0))",
+            "Cannot index number with number",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "#3550: `{filter}` on {input}: {stdout:?}");
+        assert!(stdout.is_empty(), "#3550: `{filter}`: {stdout:?}");
+        assert!(
+            stderr.contains(message),
+            "#3550: `{filter}` on {input}: wanted {message:?}, got {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
 // #3279: a `try`-wrapped `if` as a bind source keeps the path register
 // ============================================================================
 

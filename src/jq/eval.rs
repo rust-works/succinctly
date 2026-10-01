@@ -36017,6 +36017,23 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             });
             resolve_node_sink::<S>(&component, value, trackable, snapshot, frame, keep, sink)
         }
+        // #3550: jq defines the one-argument `nth($n)` as `.[$n]`
+        // (`def nth($n): .[$n];`), so in a path it extends it by that
+        // component exactly as bare `first`/`last` do above. `$n` is a value
+        // generator, which is the `E[K]` shape: re-dispatching as an index of
+        // `.` by `n` reuses its key fan-out (`[path(nth(0,2))]` is `[[0],[2]]`),
+        // negative and out-of-range indices, a `null` input (`null |
+        // path(nth(1))` is `[1]`, where the eager fallback answered `[]`) and
+        // an object's string key. jq mode only, like `first`/`last`: yq's
+        // `nth` is a `--jq-extensions` builtin whose path semantics nothing has
+        // pinned.
+        Expr::Builtin(Builtin::Nth(n)) if S::TAG == EvalTag::Jq => {
+            let component = Expr::IndexExpr {
+                target: Box::new(Expr::Identity),
+                key: n.clone(),
+            };
+            resolve_node_sink::<S>(&component, value, trackable, snapshot, frame, keep, sink)
+        }
         // #3297: a `def` declared *inside* `path(...)` (`path(def f: .a; f)`)
         // has no arm here, so it fell to the eager fallback below, which
         // evaluates the whole `FuncDef` -- definition and `then` alike --
