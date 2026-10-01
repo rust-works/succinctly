@@ -2771,6 +2771,24 @@ from no position at all).
 cursor, not from a path, and no cursor reaches the filter. `.a | .b |= line` is `2` in real
 yq and `0` in succinctly — a separate, pre-existing gap, not one #2522 touches.
 
+The same gap shows on everything downstream of a write, and on `-R`, `--slurp` and `--arg`:
+those evaluate a value succinctly has re-indexed into throwaway text, whose positions are
+not the user's file's, so the cursor-metadata builtins answer their fixed defaults there
+(#3479). Against yq v4.53.3 on `a: 1` / `c: 2`:
+
+| query                        | yq | succinctly yq    |
+|------------------------------|----|------------------|
+| `.c \| line`                 | 2  | 2 (cursor route) |
+| `.c = 3 \| .c \| line`       | 2  | 0                |
+| `.c = 3 \| .a \| line`       | 1  | 0                |
+| `.c = 3 \| .c \| column`     | 4  | 0                |
+| `.c \|= . + 1 \| .c \| line` | 2  | 0                |
+| `.d = 3 \| .d \| line`       | 0  | 0                |
+
+`0` is deliberate rather than the position in the re-indexed text (`1` for all of them), which
+would look right and be wrong; `test_dom_route_cursor_metadata_is_positionless_3479` pins it.
+Carrying the original node's position through a write is a separate, larger change.
+
 ### An `and`/`or` operand's evaluation context -- resolved as precedence ([#2506](https://github.com/rust-works/succinctly/issues/2506)); a literal against an empty context remains a residual gap
 
 Captured under [#2473](https://github.com/rust-works/succinctly/issues/2473) as "real yq

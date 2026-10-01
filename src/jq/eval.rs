@@ -26802,9 +26802,12 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 ///
 /// [`eval_lenient`] follows this entry. [`eval_owned_with_file_index`]
 /// evaluates an already-decoded [`OwnedValue`], which has no unreadable value
-/// to split on, and keeps its own route; so does `succinctly yq`'s DOM route,
-/// through the hidden `eval_reindexed`, for the same reason and because the
-/// generic evaluator costs it measurably more per `-R` line.
+/// to split on, and keeps its own route. `succinctly yq`'s DOM route (`-R`
+/// lines, `--inplace`, `--slurp`, writes, `--arg`) is this entry too since
+/// #3479, through the hidden `eval_reindexed_document`: the same evaluator over
+/// a document it is told was re-indexed from a decoded value, so that a
+/// construct bridged to the owned evaluator reuses that index instead of
+/// building another per call.
 ///
 /// # Examples
 ///
@@ -26855,42 +26858,29 @@ pub fn eval<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     })
 }
 
-/// [`eval`] for a document that was decoded first and then re-indexed: the
-/// hybrid `eval` was before #3457 (a query that reads path context goes to
-/// the generic evaluator, everything else to [`eval_full`]).
+/// [`eval`] over a document `succinctly yq`'s DOM route re-indexed from a value
+/// it already holds (`OwnedValue::reindexed_without_provenance`): `-R` lines,
+/// `--inplace`, `--slurp`, writes, `--arg` (#3479).
 ///
-/// `succinctly yq`'s DOM route -- `-R` lines, `--inplace`, `--slurp`, writes,
-/// `--arg` -- evaluates an [`OwnedValue`] it has already decoded, re-indexed
-/// into a throwaway document (`OwnedValue::reindexed_without_provenance`).
-/// Two things make [`eval`] the wrong entry for it:
+/// The same evaluator and the same answers as [`eval`] on `doc.root()`; the
+/// only difference is that `doc` is registered for the call, so a construct
+/// the generic evaluator answers by crossing to this file's owned evaluator
+/// evaluates over `doc`'s existing text and index when it is handed the whole
+/// document, rather than writing the decoded value out and indexing it again.
+/// On the tiny documents `-R` produces, one per line, that rebuild was the
+/// route's whole extra cost over the evaluator it used before #3479.
 ///
-/// - The split #3457 closes (a value the index cannot read is validated where
-///   it is wrapped rather than where it is read) cannot arise: nothing in a
-///   re-indexed decoded value is unreadable. Cursor-metadata builtins would
-///   answer from the *synthetic* document's positions, which are not the
-///   user's file's (`.c | line` is `0` here, and `1` through [`eval`]).
-/// - The generic evaluator answers a builtin it has no native arm for
-///   (`test`, `+`, ...) by serializing the value and indexing it again per
-///   call. On the tiny documents `-R` produces one call per line, and
-///   measured on an M4 Pro (interleaved, 9 reps, `users` 1 MB and 10 MB as
-///   lines) that cost `select(test("age"))` +21% and +37% wall, `. + "x"` +4%
-///   to +9%, against this route, which reaches `eval_full` with no bridge.
+/// Cursor-metadata builtins answer their fixed defaults on such a document
+/// (`line` is `0`): its positions describe text the serializer wrote, not the
+/// user's file.
 ///
 /// Not a supported entry point; a library caller wants [`eval`].
 #[doc(hidden)]
-pub fn eval_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+pub fn eval_reindexed_document<'a, S: EvalSemantics>(
     expr: &Expr,
-    cursor: JsonCursor<'a, W>,
-) -> QueryResult<'a, W> {
-    contain_depth_panic(move || {
-        if needs_path_context(expr) {
-            return generic_to_query_result::<_, S>(super::eval_generic::eval_with_cursor_using::<
-                S,
-                _,
-            >(expr, cursor));
-        }
-        eval_full::<W, S>(expr, cursor)
-    })
+    doc: &'a alloc::rc::Rc<super::value::ReindexedDoc>,
+) -> QueryResult<'a, Vec<u64>> {
+    super::eval_generic::with_reindexed_document(doc, || eval::<Vec<u64>, S>(expr, doc.root()))
 }
 
 /// Run `f`, turning the generic evaluator's document-nesting panic
@@ -49335,7 +49325,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// through the round trip too), and this arm is speed-only.
 /// `owned_to_string` is the same function `builtin_tostring` calls
 /// directly, so it is unobservable except in speed for every value shape.
-fn eval_owned_fast_path<S: EvalSemantics>(
+pub(crate) fn eval_owned_fast_path<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
@@ -118459,6 +118449,13 @@ mod touched_edge_cases_2999 {
                 "with_entries(.value |= tag)",
                 "pick([\"c\"])",
                 "[.a[] | select(. == 2)]",
+                // A non-string scalar key stringifies in yq (#2508). Since
+                // #3479 moved the DOM route off eval.rs's evaluator, these
+                // rows are what run its eager object construction in yq mode.
+                "{(.a[0]): \"x\"}",
+                "{(.f): 1}",
+                "{(.a[2].b): 1}",
+                "{(.g): 1}",
             ],
         )];
 
@@ -118506,49 +118503,396 @@ mod touched_edge_cases_2999 {
         assert!(differ.is_empty(), "eval moved from eval_full:\n{moved}");
     }
 
-    /// #3457: `eval_reindexed` is the hybrid `eval` was, for `succinctly yq`'s
-    /// DOM route. It reaches `eval_full` for a query with no path context (so
-    /// eval.rs's own answer, unreadable-value raise included, is unchanged) and
-    /// the generic evaluator for one that reads it, exactly as before.
+    /// #3479: the DOM route evaluates a value it re-indexed into throwaway
+    /// text, so a cursor-metadata builtin has no position of the user's to
+    /// report. Whatever entry evaluates it must answer the fixed defaults
+    /// `eval_full` always has (`line` `0`, `at_offset` the "requires document
+    /// cursor context" error), never a position inside the synthetic text
+    /// (`.c | line` is `1` there, through plain `eval` on the same document).
+    /// Pinned against both entries the route can take, so neither drifts.
     #[test]
-    fn eval_reindexed_keeps_the_previous_hybrid_3457() {
-        let outcome = |json: &str, filter: &str| {
-            let index = JsonIndex::build(json.as_bytes());
+    fn reindexed_document_cursor_metadata_is_positionless_3479() {
+        let input = OwnedValue::object_from([
+            ("a".to_string(), OwnedValue::Int(1)),
+            ("c".to_string(), OwnedValue::Int(2)),
+        ]);
+        let doc = alloc::rc::Rc::new(
+            input
+                .reindexed_without_provenance::<JqSemantics>()
+                .expect("shallow"),
+        );
+        let run = |entry: &str, filter: &str| {
             let expr = parse(filter).expect("filter parses");
-            let element = index.root(json.as_bytes()).first_child().expect("element");
-            let run = |r: QueryResult<'_, Vec<u64>>| match r {
-                QueryResult::Error(e) => format!("error: {}", e.is_decode_failure()),
+            let root = doc.root();
+            let result = match entry {
+                "eval_reindexed_document" => eval_reindexed_document::<YqSemantics>(&expr, &doc),
+                _ => eval_full::<Vec<u64>, YqSemantics>(&expr, root),
+            };
+            match result {
+                QueryResult::Error(e) => format!("error: {e}"),
                 other => other
-                    .collect_owned::<JqSemantics>()
+                    .collect_owned::<YqSemantics>()
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            }
+        };
+        for (filter, expected) in [
+            (".c | line", "0"),
+            (".c | column", "0"),
+            (".a | line", "0"),
+            (".c | document_index", "0"),
+            (".c | anchor", r#""""#),
+            (".c | style", r#""""#),
+            (".c | line_comment", r#""""#),
+            (".c | head_comment", r#""""#),
+            (".c | foot_comment", r#""""#),
+            ("[.[] | line]", "[0,0]"),
+            ("to_entries | map(.value | column)", "[0,0]"),
+            (
+                "at_offset(1)",
+                "error: at_offset requires document cursor context",
+            ),
+            (
+                ".c | at_offset(0)",
+                "error: at_offset requires document cursor context",
+            ),
+            (
+                "at_position(1; 1)",
+                "error: at_position requires document cursor context",
+            ),
+        ] {
+            for entry in ["eval_reindexed_document", "eval_full"] {
+                assert_eq!(run(entry, filter), expected, "{entry}: {filter}");
+            }
+        }
+        // The same filters against a document the user supplied keep their
+        // real positions: only the bridge's own text is positionless.
+        let real = JsonIndex::build(br#"{"a":1,"c":2}"#);
+        let root = real.root(br#"{"a":1,"c":2}"#);
+        let line = eval::<Vec<u64>, YqSemantics>(&parse(".c | line").unwrap(), root);
+        assert_eq!(
+            line.collect_owned::<YqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>(),
+            ["1"]
+        );
+        let at = eval::<Vec<u64>, YqSemantics>(&parse("at_offset(5)").unwrap(), root);
+        assert_eq!(
+            at.collect_owned::<YqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>(),
+            ["1"]
+        );
+    }
+
+    /// #3479: a construct the generic evaluator bridges to the owned evaluator
+    /// evaluates over the DOM document's existing text and index when it is
+    /// handed the whole document, instead of writing the decoded value out and
+    /// indexing it again. `reindex_count` counts every serialize-and-index of an
+    /// `OwnedValue`: building the document is one, and the registered route adds
+    /// no second, where the unregistered `eval` over the same document adds one
+    /// per bridged call.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn registered_document_bridges_without_reindexing_3479() {
+        use crate::jq::value::reindex_count;
+        let line = OwnedValue::String(r#"{"id":7,"name":"User7"}"#.into());
+        let run = |filter: &str, registered: bool| {
+            let expr = parse(filter).expect("filter parses");
+            let before = reindex_count::get();
+            let doc = alloc::rc::Rc::new(
+                line.reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let result = if registered {
+                eval_reindexed_document::<YqSemantics>(&expr, &doc)
+            } else {
+                eval::<Vec<u64>, YqSemantics>(&expr, doc.root())
+            };
+            let answer = result
+                .collect_owned::<YqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (answer, reindex_count::get() - before)
+        };
+        for (filter, expected) in [
+            (r#"test("User")"#, "true"),
+            (
+                r#"select(test("User"))"#,
+                r#""{\"id\":7,\"name\":\"User7\"}""#,
+            ),
+            (r#". + "x""#, r#""{\"id\":7,\"name\":\"User7\"}x""#),
+            ("fromjson | .id", "7"),
+            (r#"fromjson | .name + "x""#, r#""User7x""#),
+            (r#"sub("User";"U")"#, r#""{\"id\":7,\"name\":\"U7\"}""#),
+        ] {
+            let (plain, plain_reindexes) = run(filter, false);
+            let (rooted, rooted_reindexes) = run(filter, true);
+            assert_eq!(plain, expected, "unregistered: {filter}");
+            assert_eq!(rooted, expected, "registered: {filter}");
+            // Building the document is the only serialization the registered
+            // route performs; the unregistered one adds one per bridged call
+            // (`. + "x"` is answered natively there, so it adds none).
+            if filter.contains(r#".name + "x""#) {
+                // An arithmetic stage that is not `. + <literal>` still
+                // writes its owned operand out; only the document is reused.
+                assert!(rooted_reindexes < plain_reindexes, "{filter}");
+            } else {
+                assert_eq!(rooted_reindexes, 1, "{filter}: registered");
+            }
+            assert!(plain_reindexes >= 1, "{filter}: unregistered");
+            if filter != r#". + "x""# {
+                assert!(
+                    plain_reindexes >= 2,
+                    "{filter}: the unregistered route bridges ({plain_reindexes})"
+                );
+            }
+        }
+        // A value the filter computed is not the document, so it still bridges.
+        assert!(run(r#"[.] | .[0] | test("User")"#, true).1 >= 1);
+    }
+
+    /// #3479: the fast path the registered bridge takes answers every outcome
+    /// the round trip would have, without writing the decoded value out again:
+    /// no output (in yq a scalar has no fields), an error, and an error `?`
+    /// leaves alone (a negative index past the front of an array raises in yq
+    /// whatever `?` says, #2254). The unregistered route is the oracle, and
+    /// `reindex_count` shows which one answered.
+    #[test]
+    fn registered_document_bridge_fast_path_outcomes_3479() {
+        use crate::jq::value::reindex_count;
+        let run = |line: &str, filter: &str, registered: bool| {
+            let expr = parse(filter).expect("filter parses");
+            let before = reindex_count::get();
+            let doc = alloc::rc::Rc::new(
+                OwnedValue::String(line.into())
+                    .reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let result = if registered {
+                eval_reindexed_document::<YqSemantics>(&expr, &doc)
+            } else {
+                eval::<Vec<u64>, YqSemantics>(&expr, doc.root())
+            };
+            let answer = match result {
+                QueryResult::Error(e) => format!("error: {e}"),
+                other => other
+                    .collect_owned::<YqSemantics>()
                     .iter()
                     .map(OwnedValue::to_json)
                     .collect::<Vec<_>>()
                     .join(" "),
             };
+            (answer, reindex_count::get() - before)
+        };
+        for (line, filter, expected, bridged) in [
+            ("7", "fromjson | .a", "", true),
             (
-                run(eval_reindexed::<Vec<u64>, JqSemantics>(&expr, element)),
-                run(eval_full::<Vec<u64>, JqSemantics>(&expr, element)),
-                run(eval::<Vec<u64>, JqSemantics>(&expr, element)),
+                "[1]",
+                "fromjson | .a",
+                r#"error: Cannot index array with string "a""#,
+                true,
+            ),
+            (
+                "[1]",
+                "fromjson | .[-5]?",
+                "error: index [-5] out of range, array size is 1",
+                false,
+            ),
+        ] {
+            let (plain, plain_reindexes) = run(line, filter, false);
+            let (rooted, rooted_reindexes) = run(line, filter, true);
+            assert_eq!(plain, expected, "unregistered: {filter} on {line}");
+            assert_eq!(rooted, expected, "registered: {filter} on {line}");
+            if bridged {
+                // Building the document is the registered route's only
+                // serialization; the unregistered one adds one for the stage
+                // after `fromjson`.
+                assert_eq!(rooted_reindexes, 1, "{filter} on {line}: registered");
+                assert!(plain_reindexes >= 2, "{filter} on {line}: unregistered");
+            }
+        }
+    }
+
+    /// #3479: `path(f)` at the root of a registered document. A `-R` line is a
+    /// string, which the document remembers, so the bridge reads it back
+    /// instead of decoding the text; any other root is decoded from its cursor.
+    /// The unregistered route is the oracle for both.
+    #[test]
+    fn registered_document_path_builtin_at_the_root_3479() {
+        for (root, filter, expected) in [
+            (
+                OwnedValue::String("abc".into()),
+                r#"path(select(. == "abc"))"#,
+                "[]",
+            ),
+            (
+                OwnedValue::object_from([
+                    ("a".to_string(), OwnedValue::Int(1)),
+                    ("b".to_string(), OwnedValue::Int(2)),
+                ]),
+                "path(.[] | select(. > 1))",
+                r#"["b"]"#,
+            ),
+        ] {
+            let expr = parse(filter).expect("filter parses");
+            let doc = alloc::rc::Rc::new(
+                root.reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let render = |result: QueryResult<'_>| match result {
+                QueryResult::Error(e) => format!("error: {e}"),
+                other => other
+                    .collect_owned::<YqSemantics>()
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            assert_eq!(
+                render(eval::<Vec<u64>, YqSemantics>(&expr, doc.root())),
+                expected,
+                "unregistered: {filter}"
+            );
+            assert_eq!(
+                render(eval_reindexed_document::<YqSemantics>(&expr, &doc)),
+                expected,
+                "registered: {filter}"
+            );
+        }
+    }
+
+    /// #3479: `path(f)` over a document holding a NaN literal (`nan` in JSON
+    /// input, `.nan` in YAML). A NaN literal is not an identity of the bridge
+    /// (`reindex_bridge_is_identity`), so the resolver cannot walk the tree it
+    /// decoded: the builtin crosses to the owned evaluator over a document
+    /// written from it, here with no registered document to reuse. jq 1.7.1
+    /// answers `["a"]` and `["b"]` for the same query on the same text.
+    #[test]
+    fn path_builtin_over_a_nan_literal_crosses_to_the_owned_evaluator_3479() {
+        let text: &[u8] = br#"{"a":nan,"b":2}"#;
+        let index = JsonIndex::build(text);
+        let expr = parse("path(.[] | select(. != 1))").expect("filter parses");
+        let show = |values: Vec<OwnedValue>| {
+            values
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(
+            show(
+                eval::<Vec<u64>, JqSemantics>(&expr, index.root(text))
+                    .collect_owned::<JqSemantics>()
+            ),
+            r#"["a"] ["b"]"#
+        );
+        assert_eq!(
+            show(
+                eval::<Vec<u64>, YqSemantics>(&expr, index.root(text))
+                    .collect_owned::<YqSemantics>()
+            ),
+            r#"["a"] ["b"]"#
+        );
+    }
+
+    /// #3479: two shapes whose coverage came from `succinctly yq`'s old DOM
+    /// route, which ran on eval.rs's own evaluator, and now has to be pinned
+    /// on the one it runs on.
+    ///
+    /// A `select` whose condition produces no output keeps nothing
+    /// (`push_generic_truthiness`' empty arm), in both modes. And a path
+    /// walked over an owned value -- what a write leaves behind -- that
+    /// iterates a scalar under `?` finds nothing to step into: an error the
+    /// `?` swallows in jq, an empty answer in yq (`walk_path`'s `Iterate` arm).
+    #[test]
+    fn empty_select_condition_and_scalar_iteration_after_a_write_3479() {
+        let text: &[u8] = br#"{"a":[1,2],"b":3}"#;
+        let index = JsonIndex::build(text);
+        let show = |values: Vec<OwnedValue>| {
+            values
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for (filter, expected) in [
+            ("select(empty)", ""),
+            ("[.a[] | select(empty)]", "[]"),
+            ("select(.a[] | select(. > 5))", ""),
+            (".x = 1 | [path(.b[]?)]", "[]"),
+        ] {
+            let expr = parse(filter).expect("filter parses");
+            assert_eq!(
+                show(
+                    eval::<Vec<u64>, JqSemantics>(&expr, index.root(text))
+                        .collect_owned::<JqSemantics>()
+                ),
+                expected,
+                "jq: {filter}"
+            );
+            assert_eq!(
+                show(
+                    eval::<Vec<u64>, YqSemantics>(&expr, index.root(text))
+                        .collect_owned::<YqSemantics>()
+                ),
+                expected,
+                "yq: {filter}"
+            );
+        }
+    }
+
+    /// #3479: the registration is a stack of dynamic extents. It ends with the
+    /// call, nests without hiding the outer document, and unwinds with a panic,
+    /// so a later evaluation never matches a stale document.
+    #[test]
+    fn reindexed_document_registration_is_scoped_3479() {
+        use crate::jq::eval_generic::with_reindexed_document;
+        let make = |text: &str| {
+            alloc::rc::Rc::new(
+                OwnedValue::String(text.into())
+                    .reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
             )
         };
-        // No path context: `eval_reindexed` is `eval_full`, not `eval`.
-        let (reindexed, full, entry) = outcome("[1.2.3]", "[.] | length");
-        assert_eq!(
-            (reindexed.as_str(), full.as_str()),
-            ("error: true", "error: true")
-        );
-        assert_eq!(entry, "1");
-        let (reindexed, full, entry) = outcome(r#"[{"c":"x"}]"#, ".c | line");
-        // Cursor metadata: `eval_full`'s fixed default for the DOM route, whose
-        // document is a synthetic re-index, against the real position `eval` reads.
-        assert_eq!(
-            (reindexed.as_str(), full.as_str(), entry.as_str()),
-            ("0", "0", "1")
-        );
-        // Path context: the generic evaluator, as `eval` was routed before.
-        let (reindexed, _, entry) = outcome(r#"[{"a":1}]"#, "select(key == 0) | path(.a)");
-        assert_eq!(reindexed, r#"["a"]"#);
-        assert_eq!(reindexed, entry);
+        let (outer, inner) = (make("outer"), make("inner"));
+        let witness =
+            |doc: &alloc::rc::Rc<crate::jq::ReindexedDoc>| RootWitness::of(Some(&doc.root()));
+        let found = |doc: &alloc::rc::Rc<crate::jq::ReindexedDoc>| {
+            crate::jq::eval_generic::registered_reindexed_root(&witness(doc)).is_some()
+        };
+        assert!(!found(&outer));
+        with_reindexed_document(&outer, || {
+            assert!(found(&outer) && !found(&inner));
+            with_reindexed_document(&inner, || assert!(found(&outer) && found(&inner)));
+            assert!(found(&outer) && !found(&inner));
+        });
+        assert!(!found(&outer) && !found(&inner));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_reindexed_document(&outer, || panic!("unwinds"));
+        }));
+        assert!(unwound.is_err());
+        assert!(!found(&outer), "a panic leaves no document registered");
+        // A cursor into any other document, and a child of the registered one,
+        // are not its root.
+        let plain = JsonIndex::build(b"[1]");
+        with_reindexed_document(&outer, || {
+            assert!(
+                crate::jq::eval_generic::registered_reindexed_root(&RootWitness::of(Some(
+                    &plain.root(b"[1]")
+                )))
+                .is_none()
+            );
+            assert!(
+                crate::jq::eval_generic::registered_reindexed_root(&RootWitness::Owned).is_none()
+            );
+        });
     }
 
     /// #3457: `collect_owned_checked` reports a cursor over an unreadable value as

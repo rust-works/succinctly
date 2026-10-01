@@ -8321,17 +8321,39 @@ narrowing:
 - **Wording.** A decode failure reads as the cursor evaluator words it (`Invalid JSON text: ...`,
   `malformed value in document`) rather than the previous evaluator's (`invalid numeric literal`).
 
-`succinctly yq`'s DOM route (`-R` lines, `--inplace`, `--slurp`, writes, `--arg`) does **not**
-use the converged entry: it evaluates a value it has already decoded and re-indexed, so the
-split above cannot arise there, and it calls the hidden `jq::eval_reindexed`, which is the
-hybrid `eval` was before #3457. That keeps its output and its speed as they were. Through the
-converged `eval` the same route measured slower (M4 Pro, interleaved, 9 reps, the `users`
-document as 1 MB and 10 MB of `-R` lines: `select(test("age"))` +21% and +37% wall, `. + "x"`
-+4% to +9%, the rest within the harness's +-1% noise floor), because the generic evaluator
-answers a builtin it has no native arm for by serializing and re-indexing the value on every
-call, and `-R` makes one call per line. It would also read cursor metadata from the synthetic
-re-indexed document (`.c | line`: `1` through `eval`, the fixed default `0` through
-`eval_reindexed`). Moving that route is a separate decision, gated on that bridge cost.
+`succinctly yq`'s DOM route (`-R` lines, `--inplace`, `--slurp`, writes, `--arg`) is on the
+converged evaluator too since [#3479](https://github.com/rust-works/succinctly/issues/3479); the
+hidden `jq::eval_reindexed` (the hybrid `eval` was before #3457) is gone. The route evaluates a
+value it has already decoded and re-indexed, so the split above cannot arise there. Through the
+plain `eval` it measured slower (7950X, interleaved, 9 reps, the `users` document as 1 MB and
+10 MB of `-R` lines: `select(test("age"))` +30%, `tojson` +41%, `sub` +32%, `fromjson | .id`
++129%), because the generic evaluator answers a builtin it has no native arm for by decoding the
+value, writing it out again and indexing it again on every call, and `-R` makes one call per
+line. Three changes close that; the first and third are scoped to the DOM route (no cursor on the
+`succinctly jq` route is ever registered), and the second is a plain speedup everywhere:
+
+- The route calls the hidden `jq::eval_reindexed_document`, which is `eval` plus a registration
+  of the document it was handed. A bridge whose value is that document's root evaluates over its
+  existing text and index instead of building another, and takes the string the document was
+  written from rather than unescaping it back out of its own text.
+- `OwnedValue::to_json_for_reindex` writes into one buffer instead of building a `String` per
+  node and joining them (identical bytes, pinned by `reindex_text_matches_the_nested_form_3479`).
+  Every reindex bridge in both modes pays this, so it also speeds the `succinctly jq` bridge.
+- While a document is registered, the stage after a bridge (`fromjson | .id`) answers the shapes
+  `eval_owned_fast_path` already answers against an owned tree without writing it out again.
+
+Result against the pre-#3479 route (7950X, same method; the control's own range on that run was
+-4.6%..+7.0%): every `-R` row within +6.0% (`. + "x"` +4.5% median), and the rows the generic
+evaluator answers natively faster, `[match("a";"g")] | length` -41%, `split(",")` -45%,
+`fromjson | to_entries | length` -67%, because the old route had no native arm for them.
+
+Cursor metadata on that route is **not** read from the document it evaluates: the text is
+throwaway serialization, so `line`, `column`, `document_index`, `anchor`, `style`, the comment
+builtins and `at_offset`/`at_position` treat such a cursor as no cursor at all
+(the document is registered with the evaluator for the call). `.c = 3 | .c | line` is `0`, as it was through `eval_reindexed`,
+never `1` (a position in the synthetic text), and `at_offset(0)` raises `at_offset requires
+document cursor context`. Real yq keeps the original node's position (`2`); recovering it after a
+write is the gap recorded in `docs/compliance/yq/limitations.md`.
 
 `jq::eval_owned_with_file_index` evaluates an already-decoded value, which has no unreadable
 value to split on, and keeps its own route. `eval.rs`'s owned evaluator (`eval_full`) is still

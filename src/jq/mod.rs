@@ -100,7 +100,7 @@ pub use eval::{
     FileIndexScope, JqSemantics, QueryResult, VisibleDef, YqSemantics,
 };
 #[doc(hidden)]
-pub use eval::{eval_full, eval_reindexed};
+pub use eval::{eval_full, eval_reindexed_document};
 // `input`/`inputs`/`input_line_number`'s CLI-facing seam (#723) -- only
 // exists under `eval.rs`'s own `#[cfg(feature = "std")]` gate (a `thread_local!`
 // backing store needs `std`, and there is no meaningful "remaining input

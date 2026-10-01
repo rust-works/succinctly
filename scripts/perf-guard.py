@@ -346,6 +346,14 @@ DEFAULT_THRESHOLD = 5.0
 # x86_64 against the PR's own merge-base, outputs byte-identical). Remove
 # all four once `main` carries #3069 and the rows read ~0% again.
 #
+# `users_yq_del_select` (#3479) carries an override of the same one-off kind:
+# `OwnedValue::to_json_for_reindex` writes one buffer instead of a `String`
+# per node joined together, and `succinctly yq`'s DOM route reuses its
+# document's index across a bridge, so the yq-mode write row stops paying for
+# the bridge's reserialization (-5.9% x86_64 / -7.4% ARM64-Linux against the
+# PR's own merge-base, outputs byte-identical). Remove it once `main` carries
+# #3479 and the row reads ~0% again.
+#
 # `users_path_walk` (#3477) carried an override of the same one-off kind:
 # `[path(.users[] | .age)] | length` had `length` answered from the owned
 # tree (`eval_owned_length`) instead of serializing and reindexing it first
@@ -358,6 +366,7 @@ QUERY_THRESHOLDS = {
     "users_del_bound_select": 30.0,
     "users_update_select": 30.0,
     "users_assign_scores": 30.0,
+    "users_yq_del_select": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant

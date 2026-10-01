@@ -1732,7 +1732,10 @@ fn evaluate_input(
     sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
-    let doc = match input.reindexed_without_provenance::<jq::JqSemantics>() {
+    let doc = match input
+        .reindexed_without_provenance::<jq::JqSemantics>()
+        .map(std::rc::Rc::new)
+    {
         Ok(doc) => doc,
         // #3261: report and yield nothing, exactly as `query_result_to_owned_values`'s
         // own `QueryResult::Error` arm does for a failure surfacing further downstream.
@@ -1748,14 +1751,12 @@ fn evaluate_input(
         } // omni-dev: coverage tolerate-line reason="unreachable: see the block comment above this arm"
     };
 
-    // Build index and evaluate
-    let cursor = doc.root();
-
-    // `eval_reindexed`, not `eval` (#3457): this value was decoded and
-    // re-indexed above, so the unreadable-value split `eval` closes cannot
-    // arise, and the per-call cost of `eval`'s generic evaluator on a tiny
-    // document is what `-R` pays once per line. See `jq::eval_reindexed`.
-    let result = jq::eval_reindexed::<Vec<u64>, YqSemantics>(expr, cursor);
+    // The converged evaluator (#3479), told which document it is evaluating:
+    // this value was decoded and re-indexed above, so a construct the generic
+    // evaluator hands to the owned one evaluates over that index rather than
+    // writing the value out and indexing it again, which `-R` would pay once
+    // per line. See `jq::eval_reindexed_document`.
+    let result = jq::eval_reindexed_document::<YqSemantics>(expr, &doc);
     Ok(query_result_to_owned_values(result, sink))
 }
 
@@ -3395,9 +3396,9 @@ fn owned_value_at_mut<'v>(
 fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<OwnedValue>> {
     let doc = input
         .reindexed_without_provenance::<jq::JqSemantics>()
-        .ok()?;
-    let cursor = doc.root();
-    match jq::eval_reindexed::<Vec<u64>, YqSemantics>(expr, cursor) {
+        .ok()
+        .map(std::rc::Rc::new)?;
+    match jq::eval_reindexed_document::<YqSemantics>(expr, &doc) {
         QueryResult::One(v) => generic_to_owned::<YqSemantics, _>(&v).ok().map(|v| vec![v]),
         QueryResult::OneCursor(c) => generic_to_owned::<YqSemantics, _>(&c.value())
             .ok()
