@@ -29277,7 +29277,7 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Whether the path can yield a second path -- the streaming write's gate,
     // unchanged (#2267, #2974, #2976).
     let streaming = needs_path_prepass(path_expr) && assignment_path_needs_streaming(path_expr);
-    let mut parked: Option<Control> = None;
+    let parked = StashedEscape::new();
     // `Error` under `optional` ends the fan-out quietly.
     let mut swallowed = false;
     // The input is materialised once per call, at most: the first output
@@ -29287,6 +29287,15 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut first_output = true;
     let mut decoded: Option<OwnedValue> = None;
     let flow = eval_each::<W, S>(value_expr, input.clone(), optional, &mut |item| {
+        // #3293: a re-invocation after a stop is a `?//` retry inside the
+        // right side, which supersedes whatever the retried-past output's
+        // write decided -- the stashed escape and the swallowed-stop flag
+        // both. `.a += ([[1]] as [$a] ?// [[$a]] | $a)` on `{"a":1}` fails
+        // the write for the first alternative's `[1]`, retries, and writes
+        // the second's `1`: the document is `{"a":2}` and the first
+        // alternative's "cannot be added" is not raised after it.
+        parked.begin();
+        swallowed = false;
         let value = match item.into_owned::<S>() {
             Ok(value) => value,
             Err(e) if suppresses(&e, optional) => {
@@ -29295,7 +29304,7 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return Demand::Stop;
                 // omni-dev: coverage end
             }
-            Err(e) => return stop_with_escape(&mut parked, Control::Error(e)),
+            Err(e) => return parked.stop(Control::Error(e)),
         };
         let pristine = assign_pristine::<S, W>(&input, &mut first_output, &mut decoded);
         // #1953: a non-decode-failure `to_owned` error respects `optional`;
@@ -29308,7 +29317,7 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return Demand::Stop;
                 // omni-dev: coverage end
             }
-            Err(e) => return stop_with_escape(&mut parked, Control::Error(e)),
+            Err(e) => return parked.stop(Control::Error(e)),
         };
         match assign_one::<S>(kind, path_expr, value, pristine, streaming) {
             Ok(doc) => sink(Item::Owned(doc)),
@@ -29318,10 +29327,10 @@ fn each_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 swallowed = true;
                 Demand::Stop
             }
-            Err(escape) => stop_with_escape(&mut parked, escape.into()),
+            Err(escape) => parked.stop(escape.into()),
         }
     });
-    match resume_from_escape(parked, flow) {
+    match parked.resume(flow, direct_pattern_retry(value_expr)) {
         Flow::Escaped(Control::Error(e)) if suppresses(&e, optional) => Flow::Exhausted,
         // A stop this function raised itself is not the consumer's.
         Flow::Stopped { .. } if swallowed => Flow::Exhausted,

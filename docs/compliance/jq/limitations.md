@@ -534,9 +534,11 @@ previous build refused too), and regresses 3 that matched jq before, all `?//` i
 assignment's right-hand side (below). What it turns up is the parse now being *right* in
 front of gaps that were already there behind a parenthesis:
 
-- **`?//` in an assignment's right-hand side never retries.** jq retries the next
-  alternative when the update's own write step fails; succinctly retries neither there
-  nor in `map`/`map_values` ([#3417](https://github.com/rust-works/succinctly/issues/3417)).
+- **`?//` in a `|=` right-hand side answers where jq raises.** `+=` and the other
+  compound forms retry the next alternative when the write the first alternative's value
+  feeds fails, as jq does ([#3417](https://github.com/rust-works/succinctly/issues/3417));
+  `|=` does not, and jq's own `|=` fails there with `Paths must be specified as an array`
+  once a `?//` retries inside it ([#3524](https://github.com/rust-works/succinctly/issues/3524)).
   `.a |= (-"s" as $x ?// [$x] | 0.5, 2)` is an error in jq and `{"a":-0.5,...}` here, and the
   parenthesised spelling already was before this change.
 - **Path position.** `L // . as P1 ?// P2 | PATH` under `path`/`del`/`|=` hits the

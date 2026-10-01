@@ -422,6 +422,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a `?//` in a compound assignment's right-hand side no longer raises the first
+  alternative's error after its retry succeeded** (#3417). With
+  `G = ([[1]] as [$a] ?// [[$a]] | $a)`, `{"a":1} | .a += G` fails the write for the first
+  alternative's `$a` (`[1]`), retries into the second (`1`) and writes `{"a":2}`, as jq does,
+  but the spent error was still raised after the document: exit 5 where jq exits 0. The same
+  held for `-=`, `*=`, `/=` and `%=`, inside `[...]`, `first`, `reduce` and `try`. The
+  assignment's driver kept that error in a slot nothing cleared on a retry; it now clears it
+  as every other `?//`-aware driver does (#3293). `|=` is a different divergence (#3524).
+
 - **yq: `length`, field access, index access and `map` read a node's explicit tag
   before its text** (#3533). `a: !!null foo` is null although its text is not, and
   `a: !!str null` is a string although its text spells null, but each of those

@@ -82238,6 +82238,151 @@ fn test_alternative_destructuring_retries_past_an_operator_failure_3410() -> Res
     Ok(())
 }
 
+/// A `?//` in the right-hand side of a compound assignment retries when the
+/// write the first alternative's value feeds fails (#3417). With
+/// `G = ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)` the first alternative
+/// binds `$a` to `[1]`, which `+=` refuses against a number, and jq retries
+/// into the second (`$a` = `1`) and writes that. Each row is captured from
+/// `/usr/bin/jq` 1.7.1: stdout (lines joined by a space), the number of
+/// attempts (`A`s on stderr), the error jq raises if any, and the exit code.
+/// The retry already produced the right document; what was left was the first
+/// alternative's spent error, raised after it (exit 5).
+#[test]
+fn test_alternative_destructuring_retries_past_a_compound_assignment_write_3417() -> Result<()> {
+    let rows: &[(&str, &str, &str, usize, &str, i32)] = &[
+        (r#"{"a":1}"#, ".a += @G@", r#"{"a":2}"#, 2, "", 0),
+        (r#"{"a":1}"#, ".a -= @G@", r#"{"a":0}"#, 2, "", 0),
+        (r#"{"a":6}"#, ".a *= @G@", r#"{"a":6}"#, 2, "", 0),
+        (r#"{"a":6}"#, ".a /= @G@", r#"{"a":6}"#, 2, "", 0),
+        (r#"{"a":7}"#, ".a %= @G@", r#"{"a":0}"#, 2, "", 0),
+        (r#"{"a":"ab"}"#, ".a *= @G@", r#"{"a":"ab"}"#, 2, "", 0),
+        (r#"{"a":1}"#, ".a += (1|@G@)", r#"{"a":2}"#, 2, "", 0),
+        ("[1]", ".[0] += @G@", "[2]", 2, "", 0),
+        (
+            r#"{"a":1,"b":2}"#,
+            "(.a,.b) += @G@",
+            r#"{"a":2,"b":3}"#,
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            ".[] += @G@",
+            r#"{"a":2,"b":3}"#,
+            2,
+            "",
+            0,
+        ),
+        (r#"{"a":1}"#, "[.a += @G@]", r#"[{"a":2}]"#, 2, "", 0),
+        (r#"{"a":1}"#, "[.a += @G@] | length", "1", 2, "", 0),
+        (r#"{"a":1}"#, "[.a += @G@ | .a]", "[2]", 2, "", 0),
+        (r#"{"a":1}"#, "(.a += @G@)?", r#"{"a":2}"#, 2, "", 0),
+        (
+            r#"{"a":1}"#,
+            r#"try (.a += @G@) catch "C""#,
+            r#"{"a":2}"#,
+            2,
+            "",
+            0,
+        ),
+        (r#"{"a":1}"#, "first(.a += @G@)", r#"{"a":2}"#, 2, "", 0),
+        // A consumer's stop after the retry still ends the fan-out: the `7`
+        // is never asked for.
+        (
+            r#"{"a":1}"#,
+            "[limit(1; (.a += @G@)?, 7)]",
+            r#"[{"a":2}]"#,
+            2,
+            "",
+            0,
+        ),
+        (r#"{"a":1}"#, "isempty(.a += @G@)", "false", 2, "", 0),
+        (
+            r#"{"a":1}"#,
+            "[.a += (@G@, 10)]",
+            r#"[{"a":2},{"a":11}]"#,
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            "[.a += (10, @G@)]",
+            r#"[{"a":11},{"a":2}]"#,
+            2,
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"reduce (1,2) as $i (.; .a += @G@)",
+            r#"{"a":3}"#,
+            4,
+            "",
+            0,
+        ),
+        // A retry that yields nothing ends the fan-out quietly.
+        (
+            r#"{"a":1}"#,
+            r#"[.a += ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a | if type == "array" then . else empty end)]"#,
+            "[]",
+            2,
+            "",
+            0,
+        ),
+        // The retry's own failure is the one raised, not the spent one.
+        (
+            r#"{"a":1}"#,
+            r#".a += ([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a | if . == 1 then error("E") else . end)"#,
+            "",
+            2,
+            "E",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#".a += ([[1]] as [$a] ?// $a | ("A"|stderr) | $a)"#,
+            "",
+            2,
+            "number (1) and array ([[1]]) cannot be added",
+            5,
+        ),
+        // Both alternatives fail the write under `?`: swallowed, nothing printed.
+        (
+            r#"{"a":1}"#,
+            r#"[(.a += ([[1]] as [$a] ?// [$a] | ("A"|stderr) | $a))?]"#,
+            "[]",
+            2,
+            "",
+            0,
+        ),
+    ];
+    let g = r#"([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)"#;
+    for (input, filter, stdout_expected, attempts, error, code_expected) in rows {
+        let filter = filter.replace("@G@", g);
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end().replace('\n', " ").as_str(), code),
+            (*stdout_expected, *code_expected),
+            "`{filter}`: stderr={stderr:?}"
+        );
+        let (retries, diagnostic) = stderr.split_once("jq: error").unwrap_or((&stderr, ""));
+        assert_eq!(
+            retries.matches('A').count(),
+            *attempts,
+            "`{filter}`: stderr={stderr:?}"
+        );
+        assert!(diagnostic.contains(error), "`{filter}`: stderr={stderr:?}");
+        assert_eq!(
+            diagnostic.is_empty(),
+            error.is_empty(),
+            "`{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3334 coverage follow-up: `comma_leaves` only splits a *top-level* comma
 /// bind source, so a comma nested one level down (under a `Pipe`, which
 /// `is_pure_navigation_node` also admits) still reaches the pre-#3334
