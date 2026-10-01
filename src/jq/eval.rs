@@ -35914,6 +35914,26 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         Expr::Paren(inner) => {
             resolve_node_sink::<S>(inner, value, trackable, snapshot, frame, keep, sink)
         }
+        // #3545: jq defines bare `first` as `.[0]` and bare `last` as `.[-1]`
+        // (`def first: .[0]; def last: .[-1];`), so in a path they extend it by
+        // that component and a write through them lands. Without an arm here
+        // both fell to the eager value fallback, which reports the element's
+        // *value* as an untracked result (`[1,2] | path(first)` refused, and
+        // `null | first = 9` wrote `9` where jq writes `[9]`). Re-dispatching
+        // as the index step reuses every `Index` rule -- null input, an empty
+        // array's `-1`, the near-access wording -- instead of restating them.
+        // jq mode only, because yq's `first` is not `.[0]`: it is a root-only
+        // operator (`first = 9` is `[9,2]` on `[1,2]`, `.a | first` is an
+        // error, and `last` is a lexer error, all yq v4.53.3), so yq mode
+        // keeps the old behaviour until #3551 settles what it should be.
+        Expr::Builtin(step @ (Builtin::First | Builtin::Last)) if S::TAG == EvalTag::Jq => {
+            let component = Expr::index(if matches!(step, Builtin::First) {
+                0
+            } else {
+                -1
+            });
+            resolve_node_sink::<S>(&component, value, trackable, snapshot, frame, keep, sink)
+        }
         // #3297: a `def` declared *inside* `path(...)` (`path(def f: .a; f)`)
         // has no arm here, so it fell to the eager fallback below, which
         // evaluates the whole `FuncDef` -- definition and `then` alike --
@@ -37772,6 +37792,11 @@ fn builtin_navigation<S: EvalSemantics>(
     value: &OwnedValue,
 ) -> Result<Option<BuiltinNavigation>, EvalEscape> {
     match builtin {
+        // Only yq mode reaches these two: in jq mode `resolve_node_sink`
+        // resolves a bare `first`/`last` as the `.[0]`/`.[-1]` step it is
+        // (#3545) before this check runs. Measured by making them assert
+        // `S::TAG != Jq` and running the lib and CLI suites plus the probe
+        // matrices: none tripped.
         Builtin::First => Ok(Some(BuiltinNavigation::Access(OwnedValue::Int(0)))),
         Builtin::Last => Ok(Some(BuiltinNavigation::Access(OwnedValue::Int(-1)))),
         Builtin::Add
