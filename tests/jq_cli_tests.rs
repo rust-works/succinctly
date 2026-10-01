@@ -81880,3 +81880,882 @@ fn test_resolver_frame_position_spelling_controls_refuse_3464() -> Result<()> {
         ),
     ])
 }
+
+/// #3471: a `?//` inside a computed slice's bound retries when a short-circuiting
+/// consumer (`first`, `limit`, `isempty`) stops on the slice's first output,
+/// as jq's `label`/`break` does -- `[first(.[(1 as $x ?// $y | 1):]), 9]` is
+/// `[[20,30],[20,30],9]`. The slice collected its result before the consumer
+/// saw it, so the bound generator never saw the stop (the computed index in the
+/// same position already matched jq). Rows cover a retry in `start`, in
+/// `end`, and in both, under each consumer, with a retry that answers, raises,
+/// produces nothing, fails to destructure, or is not needed at all, over an
+/// array; the bracketed shapes (`[first(...), 9]`) keep #3470's separate
+/// M2-fallback doubling out of the trace. Every value captured from jq 1.7.1.
+const RETRY_ROWS_SLICE_BOUND_CONSUMER_3471: &[RetryRow3293] = &[
+    (
+        "[first(.[(1 as $x ?// $y | 1):]), 9]",
+        "[[20,30],[20,30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(1; .[(1 as $x ?// $y | 1):]), 9]",
+        "[[20,30],[20,30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(2; .[(1 as $x ?// $y | 1):]), 9]",
+        "[[20,30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[isempty(.[(1 as $x ?// $y | 1):]), 9]",
+        "[false,false,9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[first(.[:(1 as $x ?// $y | 1)]), 9]",
+        "[[10],[10],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(1; .[:(1 as $x ?// $y | 1)]), 9]",
+        "[[10],[10],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(2; .[:(1 as $x ?// $y | 1)]), 9]",
+        "[[10],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[isempty(.[:(1 as $x ?// $y | 1)]), 9]",
+        "[false,false,9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[first(.[(1 as $x ?// $y | 1):3]), 9]",
+        "[[20,30],[20,30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(1; .[(1 as $x ?// $y | 1):3]), 9]",
+        "[[20,30],[20,30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(2; .[(1 as $x ?// $y | 1):3]), 9]",
+        "[[20,30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[isempty(.[(1 as $x ?// $y | 1):3]), 9]",
+        "[false,false,9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[first(.[0:(1 as $x ?// $y | 1)]), 9]",
+        "[[10],[10],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(1; .[0:(1 as $x ?// $y | 1)]), 9]",
+        "[[10],[10],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(2; .[0:(1 as $x ?// $y | 1)]), 9]",
+        "[[10],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[isempty(.[0:(1 as $x ?// $y | 1)]), 9]",
+        "[false,false,9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]), 9]"#,
+        "[[20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; .[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]), 9]"#,
+        "[[20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(2; .[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]), 9]"#,
+        "[[20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]), 9]"#,
+        "[false,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[:([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]), 9]"#,
+        "[[10],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; .[:([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]), 9]"#,
+        "[[10],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(2; .[:([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]), 9]"#,
+        "[[10],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[:([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]), 9]"#,
+        "[false,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[limit(1; .[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[limit(2; .[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):]), 9]"#,
+        "[[20,30],9]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[first(.[:([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[limit(1; .[:([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[limit(2; .[:([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "[[10],9]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[:([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[first(.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; .[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(2; .[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[isempty(.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(.[:([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; .[:([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(2; .[:([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[isempty(.[:([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; .[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(2; .[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty):]), 9]"#,
+        "[true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[:([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; .[:([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(2; .[:([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[:([[1]] as [$a] ?// $b | ("A"|stderr) | $a // empty)]), 9]"#,
+        "[true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a):]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[limit(1; .[([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a):]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[limit(2; .[([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a):]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[isempty(.[([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a):]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[first(.[:([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[limit(1; .[:([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[limit(2; .[:([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        r#"[isempty(.[:([[0]] as [$a] ?// {k: $b} | ("A"|stderr) | $a)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"k\"",
+        5,
+    ),
+    (
+        "[first(.[(1 as $x ?// $y | 1):(1 as $x ?// $y | 1)]), 9]",
+        "[[],[],[],[],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(2; .[(1 as $x ?// $y | 1):(1 as $x ?// $y | 1)]), 9]",
+        "[[],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[isempty(.[(1 as $x ?// $y | 1):(1 as $x ?// $y | 1)]), 9]",
+        "[false,false,false,false,9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[first(.[(0,1):(1 as $x ?// $y | 1)]), 9]",
+        "[[10],[10],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(2; .[(0,1):(1 as $x ?// $y | 1)]), 9]",
+        "[[10],[],[],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[isempty(.[(0,1):(1 as $x ?// $y | 1)]), 9]",
+        "[false,false,9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[first(.[(1 as $x ?// $y | 1):(2,3)]), 9]",
+        "[[20],[20],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[limit(2; .[(1 as $x ?// $y | 1):(2,3)]), 9]",
+        "[[20],[20,30],[20],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[isempty(.[(1 as $x ?// $y | 1):(2,3)]), 9]",
+        "[false,false,9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "",
+        "AAAAAA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[limit(2; .[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "[[],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "",
+        "AAAAAA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[first(.[(0,1):([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[limit(2; .[(0,1):([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "",
+        "AAA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[isempty(.[(0,1):([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[first(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):(2,3)]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[limit(2; .[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):(2,3)]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[isempty(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):(2,3)]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[first(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]), 9]"#,
+        "[[],9]\n",
+        "AAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(2; .[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]), 9]"#,
+        "[[],9]\n",
+        "AAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]), 9]"#,
+        "[false,9]\n",
+        "AAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[(0,1):([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]), 9]"#,
+        "[[10],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(2; .[(0,1):([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]), 9]"#,
+        "[[10],[],9]\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[(0,1):([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a)]), 9]"#,
+        "[false,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):(2,3)]), 9]"#,
+        "[[20],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(2; .[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):(2,3)]), 9]"#,
+        "[[20],[20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):(2,3)]), 9]"#,
+        "[false,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]), 9]"#,
+        "",
+        "AAAA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(2; .[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]), 9]"#,
+        "",
+        "AAAA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[isempty(.[([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end):([[1]] as [$a] ?// $b | ("A"|stderr) | $a | if . == null then error("E2") else . end)]), 9]"#,
+        "",
+        "AAAA",
+        "E2",
+        5,
+    ),
+    (
+        "[first(.[1:] | .[(1 as $x ?// $y | 1):]), 9]",
+        "[[30],[30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[1:] | .[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]), 9]"#,
+        "[[30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        "[first(.[(1 as $x ?// $y | 1):] | length), 9]",
+        "[2,2,9]\n",
+        "",
+        "",
+        0,
+    ),
+    ("[nth(1; .[(1 as $x ?// $y | 1):]), 9]", "[9]\n", "", "", 0),
+    (
+        r#"[first(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):] | length), 9]"#,
+        "[2,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[nth(1; .[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        "[first(.[(1 as $x ?// $y | 1):]?), 9]",
+        "[[20,30],[20,30],9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]?), 9]"#,
+        "[9]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):]?), 9]"#,
+        "[[20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+/// #3471: the same table over a string target, whose slice applies to codepoints.
+const RETRY_ROWS_SLICE_BOUND_CONSUMER_STRING_3471: &[RetryRow3293] = &[
+    (
+        "[first(.[(1 as $x ?// $y | 1):]), 9]",
+        "[\"bcd\",\"bcd\",9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[isempty(.[(1 as $x ?// $y | 1):]), 9]",
+        "[false,false,9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[first(.[:(1 as $x ?// $y | 1)]), 9]",
+        "[\"a\",\"a\",9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        "[isempty(.[:(1 as $x ?// $y | 1)]), 9]",
+        "[false,false,9]\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[isempty(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[first(.[:([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[isempty(.[:([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end)]), 9]"#,
+        "",
+        "AA",
+        "Array/string slice indices must be integers",
+        5,
+    ),
+    (
+        r#"[first(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]), 9]"#,
+        "[\"bcd\",9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[isempty(.[([[1]] as [$a] ?// [[$a]] | ("A"|stderr) | $a):]), 9]"#,
+        "[false,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+#[test]
+fn test_slice_bound_retry_reaches_consumer_stop_3471() -> Result<()> {
+    assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_SLICE_BOUND_CONSUMER_3471)?;
+    assert_retry_rows_3293(
+        Some(r#""abcd""#),
+        "",
+        RETRY_ROWS_SLICE_BOUND_CONSUMER_STRING_3471,
+    )
+}
+
+/// #3471, owned route: the tables above again with the target built under `-n`
+/// (`eval.rs`'s evaluator, which has its own `each_slice_expr`), and once more
+/// with an `input` builtin inside the bound, which forces that evaluator for an
+/// ordinary document read too. The `input` rows feed every pull the same `5`,
+/// so the rows' answers are unchanged.
+#[test]
+fn test_slice_bound_retry_reaches_consumer_stop_on_owned_route_3471() -> Result<()> {
+    assert_retry_rows_3293(None, "[10,20,30] | ", RETRY_ROWS_SLICE_BOUND_CONSUMER_3471)?;
+    assert_retry_rows_3293(
+        None,
+        r#""abcd" | "#,
+        RETRY_ROWS_SLICE_BOUND_CONSUMER_STRING_3471,
+    )?;
+    // jq 1.7.1: the bound is `input as $q | 1 as $x ?// $y | 1`, so each pull
+    // of the bound reads one `5` and yields `1`. `-n` keeps the leftover `5`s
+    // from being run through the filter as documents of their own.
+    for (filter, expected) in [
+        (
+            "input as $d | $d | [first(.[(input as $q | 1 as $x ?// $y | 1):]), 9]",
+            "[[20,30],[20,30],9]\n",
+        ),
+        (
+            "input as $d | $d | [limit(1; .[:(input as $q | 1 as $x ?// $y | 1)]), 9]",
+            "[[10],[10],9]\n",
+        ),
+        (
+            "input as $d | $d | [isempty(.[(input as $q | 1 as $x ?// $y | 1):]), 9]",
+            "[false,false,9]\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-nc", filter], Some("[10,20,30] 5 5 5 5"))?;
+        assert_eq!((out.as_str(), code), (expected, 0), "`{filter}`: {err:?}");
+    }
+    Ok(())
+}
+
+/// #3471 must-not-change: the bound streams and side-effect order of an
+/// uncontested slice, the Partial prefix before a bound's error, and a
+/// consumer that takes one output from a multi-valued start. jq 1.7.1.
+#[test]
+fn test_slice_bound_consumer_stop_leaves_uncontested_slices_alone_3471() -> Result<()> {
+    let arr = "[10,20,30]";
+    // stderr is the bound generators' interleaving: `0 0 2 2 3 1 2 2 3`.
+    let (out, err, code) = run_jq_full(
+        &["-c", "[.[(0|stderr,1|stderr):(2|stderr,3|stderr)]]"],
+        Some(arr),
+    )?;
+    assert_eq!(
+        (out.as_str(), err.as_str(), code),
+        ("[[10,20],[10,20,30],[20],[20,30]]\n", "002231223", 0)
+    );
+    let (out, _, code) = run_jq_full(&["-c", "[limit(1; .[(0,1):])]"], Some(arr))?;
+    assert_eq!((out.as_str(), code), ("[[10,20,30]]\n", 0));
+    // the slices before a later bound's error are delivered first
+    let (out, err, code) = run_jq_full(&["-c", r#".[0:(1,2,error("boom"))]"#], Some(arr))?;
+    assert_eq!((out.as_str(), code), ("[10]\n[10,20]\n", 5), "{err:?}");
+    assert!(err.contains("boom"), "{err:?}");
+    // a failing first bound raises before `debug` runs for the second
+    let (out, err, code) = run_jq_full(&["-c", r#".[("x",(1|debug)):]"#], Some("[1,2,3,4]"))?;
+    assert_eq!((out.as_str(), code), ("", 5), "{err:?}");
+    assert!(!err.contains("DEBUG"), "{err:?}");
+    assert!(
+        err.contains("Array/string slice indices must be integers"),
+        "{err:?}"
+    );
+    // a consumer that takes the first output of a multi-valued start
+    // drops the pair's later escape rather than raising it
+    let (out, err, code) = run_jq_full(
+        &["-c", r#"[first(.[(0,1):(2,error("late"))]), 9]"#],
+        Some(arr),
+    )?;
+    assert_eq!((out.as_str(), code), ("[[10,20],9]\n", 0), "{err:?}");
+    Ok(())
+}
+
+/// #3471: path mode is a separate resolver (#3293 slice 6) and does not take the
+/// value-mode retry: `path(first(.[B:]))` retries once and raises, and `del`
+/// over the same slice stays as it was. jq 1.7.1.
+#[test]
+fn test_slice_bound_consumer_stop_leaves_path_mode_alone_3471() -> Result<()> {
+    let arr = "[10,20,30]";
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#"[path(first(.[([1] as [$a] ?// $b | ("A"|stderr) | if $a == null then "x" else $a end):])), 9]"#,
+        ],
+        Some(arr),
+    )?;
+    assert_eq!((out.as_str(), code), ("", 5), "{err:?}");
+    assert!(err.starts_with("AA"), "{err:?}");
+    assert!(
+        err.contains("Array/string slice indices must be integers"),
+        "{err:?}"
+    );
+    let (out, err, code) = run_jq_full(
+        &["-c", "[del(first(.[(1 as $x ?// $y | 1):])), 9]"],
+        Some(arr),
+    )?;
+    assert_eq!((out.as_str(), code), ("[[10],9]\n", 0), "{err:?}");
+    Ok(())
+}
+
+/// #3471: a computed slice under a consumer now runs through the streaming
+/// worker (`eval_each` -> `each_slice_expr` -> bound sinks -> `slice_pair`), a
+/// deeper native stack than the eager `eval_single` arm it replaced. A
+/// recursion built through it must still finish at depth 1000 (jq 1.7.1:
+/// `[0,9]`) and refuse, rather than overflow the native stack, when the
+/// recursion is far past the evaluator's limit (ADR-0025).
+#[test]
+fn test_computed_slice_under_consumer_stays_within_the_stack_budget_3471() -> Result<()> {
+    let filter = |n: u32| {
+        format!(
+            "def r($n): if $n == 0 then 0 else (.[(r($n-1)):] | length) end; [first(r({n})), 9]"
+        )
+    };
+    let (out, err, code) = run_jq_full(&["-c", &filter(1000)], Some("[10,20,30]"))?;
+    assert_eq!((out.as_str(), code), ("[0,9]\n", 0), "{err:?}");
+    let (_, err, code) = run_jq_full(&["-c", &filter(100_000)], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "a refusal, not a signal: {err:?}");
+    assert!(err.contains("maximum recursion depth"), "{err:?}");
+    Ok(())
+}

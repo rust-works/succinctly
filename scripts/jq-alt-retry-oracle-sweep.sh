@@ -256,6 +256,16 @@ R_ENTRIES=(
   'del-bind-source::::del(__B__ as $y | .[$y:])'
   'update-bind-source::::(__B__ as $y | .[$y:]) |= ["x"]'
   'pick-bind-source::::pick(__B__ as $y | .[$y:])'
+  # -- #3471: CLOSED. The read-mode computed slice (`each_slice_expr` in
+  #    eval.rs, `each_slice_expr_generic` in eval_generic.rs) pushes each
+  #    `(s, e)` pair's slices to the consumer as they are produced, so a
+  #    `first`/`limit`/`isempty` stop reaches the bound's `?//`. --
+  'slice-start::::.[__B__:]'
+  'slice-end::::.[:__B__]'
+  'slice-both::::.[__B__:__B__]'
+  'slice-start-optional::::.[__B__:]?'
+  'slice-fanout-start::::.[(0,1):__B__]'
+  'slice-fanout-end::::.[__B__:(2,3)]'
 )
 # The path-mode computed index (slice 5) is the IX family below, over an object:
 # on this array input an array-valued first alternative is jq's `indices` search

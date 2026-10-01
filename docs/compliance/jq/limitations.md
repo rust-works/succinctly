@@ -640,10 +640,6 @@ raises in jq and now here). What it leaves:
   The same holds for `path(f)`'s consumer stop, whose operand is the whole path expression.
 - **A computed index** (`path(.[K])`, `del(.[K])`) kept its own bare slots in
   `resolve_index_expr_sink` at this slice; the next section closes it.
-- **Value mode never retries on a consumer's stop through a slice bound** (#3471):
-  `[first(.[([1] as [$a] ?// $b | if $a == null then "x" else $a end):]), 9]` is `[[20,30],9]`
-  here where jq retries and raises -- `eval_slice_expr` collects before the consumer sees an
-  output, the #2180 "materialized before the consumer" family.
 
 ## Path-mode computed index and a `?//` retry (#3293)
 
@@ -3978,19 +3974,13 @@ than once overall (see this doc's own no-longer-applicable earlier framing corre
 target length can vary per key/pair now, so a product including it is no longer even
 computable), so each also reserves incrementally per key/pair via `Vec::try_reserve`
 against `cannot_reserve_cross_product`'s identical error, regardless of the target's own
-length. The two functions differ on what's reserved *before* that incremental loop even
-starts: `eval_index_expr` reserves nothing upfront (purely incremental from an empty
-`Vec`), while `eval_slice_expr` reserves a `starts.len() * ends.len()` baseline first, via
-the same `try_reserve_product` helper this section already describes (both factors are
-already known non-empty by this point, so it never takes that helper's own zero-factor
-fast return) — both factors are still fully known before the loop, so this recovers a
-single allocation for the common one-output-per-pair case instead of paying
-amortized-doubling reallocation/copy costs on every slice query, and reuses
-`try_reserve_product`'s existing overflow/refusal handling and its existing unit test
-coverage for both, rather than adding a parallel, practically-untestable check of its own
-(a `starts * ends` pair count large enough to organically overflow this product would
-first exhaust memory building the `starts`/`ends` bound streams themselves, long before
-this reservation could ever run). The refusal guarantee this section describes is
+length. Neither reserves anything upfront: `eval_slice_expr`'s bounds are streamed one value at a
+time (#2546), so there is no `starts.len() * ends.len()` count to reserve against. Each
+`(s, e)` pair reserves its target count inside `slice_pair`/`slice_pair_generic`, and the
+collector that gathers the pairs' slices (#3471) reserves one element per slice it keeps, so
+the collector's own `Vec`, which spans every pair, is behind a refusal too.
+
+The refusal guarantee this section describes is
 unchanged by any of this — every push remains behind a fallible reservation, so the
 failure mode stays "clean refusal," never a panic — only the moment(s) a check runs and
 the factor(s) named in the error message
