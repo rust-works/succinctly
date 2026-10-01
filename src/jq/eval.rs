@@ -35914,6 +35914,34 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         Expr::Paren(inner) => {
             resolve_node_sink::<S>(inner, value, trackable, snapshot, frame, keep, sink)
         }
+        // #3545: jq defines bare `first` as `.[0]` and bare `last` as `.[-1]`
+        // (`def first: .[0]; def last: .[-1];`), so in a path they extend it by
+        // that component and a write through them lands. Without an arm here
+        // both fell to the eager value fallback, which reports the element's
+        // *value* as an untracked result (`[1,2] | path(first)` refused, and
+        // `null | first = 9` wrote `9` where jq writes `[9]`). Re-dispatching
+        // as the index step reuses every `Index` rule -- null input, an empty
+        // array's `-1`, the near-access wording -- instead of restating them.
+        // jq mode only: real yq has no bare `first`/`last` (its lexer rejects
+        // `last` and `first` parses as a call, confirmed against yq v4.53.3).
+        Expr::Builtin(Builtin::First) if S::TAG == EvalTag::Jq => resolve_node_sink::<S>(
+            &Expr::index(0),
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            sink,
+        ),
+        Expr::Builtin(Builtin::Last) if S::TAG == EvalTag::Jq => resolve_node_sink::<S>(
+            &Expr::index(-1),
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            sink,
+        ),
         // #3297: a `def` declared *inside* `path(...)` (`path(def f: .a; f)`)
         // has no arm here, so it fell to the eager fallback below, which
         // evaluates the whole `FuncDef` -- definition and `then` alike --
