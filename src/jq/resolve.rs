@@ -766,23 +766,69 @@ fn scan_scope<'a, E, T>(
     }
 }
 
-/// A lexical *variable* scope: the `$name`s (without the sigil) visible at a
-/// point in the tree — [`Scope`]'s sibling for #2734, tracked in the same
-/// walk rather than a separate pass (see [`check`]'s doc comment).
-///
-/// No arity component: unlike a function, a variable binding has no
-/// overload-by-arity concept, so plain name equality is enough.
-type VarScope = Vec<String>;
+/// One definition of the name stack both [`VarScope`] and [`LabelScope`] are
+/// (#3081). They stay two distinct types rather than aliases of one
+/// `Vec<String>`: `check` threads both through every recursive call, and with
+/// bare aliases a transposed pair of arguments type-checked, so a swap would
+/// have been a silent wrong-scope lookup instead of a compile error.
+macro_rules! name_scope {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Default)]
+        struct $name(Vec<String>);
 
-/// A lexical *label* scope (#2964): the `$label` names (without the sigil)
-/// visible at a point in the tree — [`VarScope`]'s sibling for `break`'s
-/// compile-time label-scope check, tracked in the same walk rather than a
-/// separate pass (see [`check`]'s doc comment).
-///
-/// No arity or value component, same as [`VarScope`] but for `label`
-/// bindings: only the name matters. Restored before returning so a sibling
-/// never sees a label introduced by its neighbour, exactly like `var_scope`.
-type LabelScope = Vec<String>;
+        impl $name {
+            fn push(&mut self, name: String) {
+                self.0.push(name);
+            }
+
+            fn pop(&mut self) {
+                self.0.pop();
+            }
+
+            /// The names, innermost last -- what a scope scan reads.
+            fn names(&self) -> &[String] {
+                &self.0
+            }
+        }
+    };
+}
+
+name_scope! {
+    /// A lexical *variable* scope: the `$name`s (without the sigil) visible at a
+    /// point in the tree — [`Scope`]'s sibling for #2734, tracked in the same
+    /// walk rather than a separate pass (see [`check`]'s doc comment).
+    ///
+    /// No arity component: unlike a function, a variable binding has no
+    /// overload-by-arity concept, so plain name equality is enough.
+    VarScope
+}
+
+impl VarScope {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
+    }
+
+    fn extend(&mut self, names: impl IntoIterator<Item = String>) {
+        self.0.extend(names);
+    }
+}
+
+name_scope! {
+    /// A lexical *label* scope (#2964): the `$label` names (without the sigil)
+    /// visible at a point in the tree — [`VarScope`]'s sibling for `break`'s
+    /// compile-time label-scope check, tracked in the same walk rather than a
+    /// separate pass (see [`check`]'s doc comment).
+    ///
+    /// No arity or value component, same as [`VarScope`] but for `label`
+    /// bindings: only the name matters. Restored before returning so a sibling
+    /// never sees a label introduced by its neighbour, exactly like `var_scope`.
+    LabelScope
+}
 
 /// [`Scope`]'s sibling for [`build_call_graph`] (#2740): each entry also
 /// carries the identity of the `def` it resolves to -- a parameter has none
@@ -1399,27 +1445,9 @@ pub fn resolve_all(expr: &mut Expr) -> Vec<ResolveError> {
     build_call_graph(expr, &mut reach_scope, None, &mut graph, &mut roots);
     let reachable = compute_reachable(&graph, &roots);
 
-    let mut scope = Scope::new();
-    let mut var_scope = VarScope::new();
-    let mut label_scope = LabelScope::new();
-    let mut errors = Vec::new();
-    // Bundles #2635's call-occurrence counter with #2964's break-occurrence
-    // counter -- how many `break $name` sites the walk has already visited
-    // per label name, so a diagnostic carries which *occurrence* of the name
-    // -- the same "which `$x` actually failed" question `var_scope` can't
-    // answer by itself, resolved here by counting as we go (see
-    // `UnresolvedLabel::occurrence`).
-    let mut occurrences = Occurrences::default();
-    check(
-        expr,
-        &mut scope,
-        &mut var_scope,
-        &mut label_scope,
-        &mut errors,
-        &reachable,
-        &mut occurrences,
-    );
-    errors
+    let mut cx = CheckCtx::default();
+    check(expr, &mut cx, &reachable);
+    cx.errors
 }
 
 /// Whether `(name, arity)` is one of the pinned jq's own builtins.
@@ -1451,6 +1479,32 @@ struct Occurrences {
 struct RunFrame {
     ordinals: BTreeMap<(String, usize), usize>,
     def: Option<(usize, ModuleDef)>,
+}
+
+/// The mutable state [`check`] threads through its whole walk (#3081): the
+/// three lexical scopes it pushes and pops, the diagnostics it appends, and the
+/// per-name occurrence counters those diagnostics carry. One `&mut CheckCtx`
+/// replaces what used to be five positional arguments at every one of the ~45
+/// recursive call sites, so the next tracked-scope concern is one more field
+/// here rather than another parameter on every call -- and [`VarScope`] and
+/// [`LabelScope`] being distinct types means a field cannot be read as the
+/// other one.
+///
+/// `reachable` stays a separate parameter: it is read-only and varies per call
+/// (`rebase_reachable`), where these fields live for the whole walk.
+#[derive(Default)]
+struct CheckCtx {
+    scope: Scope,
+    var_scope: VarScope,
+    label_scope: LabelScope,
+    errors: Vec<ResolveError>,
+    /// Bundles #2635's call-occurrence counter with #2964's break-occurrence
+    /// counter -- how many `break $name` sites the walk has already visited
+    /// per label name, so a diagnostic carries which *occurrence* of the name
+    /// -- the same "which `$x` actually failed" question `var_scope` can't
+    /// answer by itself, resolved here by counting as we go (see
+    /// `UnresolvedLabel::occurrence`).
+    occurrences: Occurrences,
 }
 
 impl Occurrences {
@@ -1510,7 +1564,7 @@ fn in_scope(scope: &Scope, name: &str, arity: usize) -> ScanResult<()> {
 }
 
 /// Whether `name` resolves against a plain name-stack scope (`VarScope` or
-/// `LabelScope`, both bare `Vec<String>`), innermost first, stopping at the
+/// `LabelScope`, both name stacks), innermost first, stopping at the
 /// same module-scope floor as [`in_scope`] (#2962) — the shared lookup body
 /// [`in_var_scope`] and [`in_label_scope`] both wrap, so a change to how
 /// name-stack lookups work has exactly one definition to update.
@@ -1521,13 +1575,13 @@ fn in_name_scope(scope: &[String], name: &str) -> ScanResult<()> {
 /// [`in_name_scope`] for `$name` against `var_scope`: a `$`-parameter of the
 /// def a dependency is spliced into is not the dependency's to see.
 fn in_var_scope(var_scope: &VarScope, name: &str) -> ScanResult<()> {
-    in_name_scope(var_scope, name)
+    in_name_scope(var_scope.names(), name)
 }
 
 /// [`in_name_scope`] for `$*label-name` against `label_scope` —
 /// [`in_var_scope`]'s sibling for labels (#2964).
 fn in_label_scope(label_scope: &LabelScope, name: &str) -> ScanResult<()> {
-    in_name_scope(label_scope, name)
+    in_name_scope(label_scope.names(), name)
 }
 
 /// The innermost module run enclosing this point in `label_scope`,
@@ -1542,7 +1596,7 @@ fn in_label_scope(label_scope: &LabelScope, name: &str) -> ScanResult<()> {
 /// the same [`scan_scope`] walk with a probe that never matches, so it
 /// always runs to the floor (or the top) instead of stopping early.
 fn enclosing_run(label_scope: &LabelScope) -> Option<u32> {
-    scan_scope(label_scope, String::as_str, |_| None::<()>, false)
+    scan_scope(label_scope.names(), String::as_str, |_| None::<()>, false)
         .run
         .map(|(id, _)| id)
 }
@@ -1554,17 +1608,13 @@ fn enclosing_run(label_scope: &LabelScope) -> Option<u32> {
 /// sequence, and having two copies invites them drifting apart silently
 /// (this file's own [`scan_scope`] doc comment warns about exactly that
 /// failure mode, citing #106).
-fn check_break(
-    name: &str,
-    label_scope: &LabelScope,
-    errors: &mut Vec<ResolveError>,
-    occurrences: &mut Occurrences,
-) {
+fn check_break(name: &str, cx: &mut CheckCtx) {
     // Both a bound and an unbound break consume a slot in this scope's
     // counter, mirroring the source's `collect_break_sites` table.
-    let origin = enclosing_run(label_scope);
-    let scope = occurrences.scope();
-    let n = occurrences
+    let origin = enclosing_run(&cx.label_scope);
+    let scope = cx.occurrences.scope();
+    let n = cx
+        .occurrences
         .breaks
         .entry((scope, name.to_string()))
         .or_insert(0);
@@ -1574,12 +1624,12 @@ fn check_break(
     // `label $x` only covers nodes nested inside its body, not siblings of
     // that body. `label_scope` is a stack pushed/popped by the `Label` arm,
     // so this check sees only genuinely enclosing labels.
-    if in_label_scope(label_scope, name).hit.is_none() {
-        errors.push(ResolveError::Break(UnresolvedLabel {
+    if in_label_scope(&cx.label_scope, name).hit.is_none() {
+        cx.errors.push(ResolveError::Break(UnresolvedLabel {
             name: name.to_string(),
             occurrence,
             origin,
-            module_def: occurrences.module_def(),
+            module_def: cx.occurrences.module_def(),
         }));
     }
 }
@@ -1612,52 +1662,20 @@ fn check_break(
 /// pre-existing gap being closed here was that one specific position
 /// (inside a pattern's computed key) silently escaped that same,
 /// already-established policy, not that yq mode gained a new one.
-fn check_pattern_keys(
-    pattern: &mut Pattern,
-    scope: &mut Scope,
-    var_scope: &mut VarScope,
-    label_scope: &mut LabelScope,
-    errors: &mut Vec<ResolveError>,
-    reachable: &BTreeSet<usize>,
-    occurrences: &mut Occurrences,
-) {
+fn check_pattern_keys(pattern: &mut Pattern, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
     match pattern {
         Pattern::Var(_) => {}
         Pattern::Object(entries) => {
             for entry in entries.iter_mut() {
                 if let ObjectKey::Expr(k) = &mut entry.key {
-                    check(
-                        k,
-                        scope,
-                        var_scope,
-                        label_scope,
-                        errors,
-                        reachable,
-                        occurrences,
-                    );
+                    check(k, cx, reachable);
                 }
-                check_pattern_keys(
-                    &mut entry.pattern,
-                    scope,
-                    var_scope,
-                    label_scope,
-                    errors,
-                    reachable,
-                    occurrences,
-                );
+                check_pattern_keys(&mut entry.pattern, cx, reachable);
             }
         }
         Pattern::Array(patterns) => {
             for p in patterns.iter_mut() {
-                check_pattern_keys(
-                    p,
-                    scope,
-                    var_scope,
-                    label_scope,
-                    errors,
-                    reachable,
-                    occurrences,
-                );
+                check_pattern_keys(p, cx, reachable);
             }
         }
     }
@@ -1672,23 +1690,11 @@ fn check_pattern_keys(
 /// already finding and closing five copies of exactly this shape.
 fn bind_patterns(
     patterns: &mut [Pattern],
-    scope: &mut Scope,
-    var_scope: &mut VarScope,
-    label_scope: &mut LabelScope,
-    errors: &mut Vec<ResolveError>,
+    cx: &mut CheckCtx,
     reachable: &BTreeSet<usize>,
-    occurrences: &mut Occurrences,
 ) -> Vec<String> {
     for pattern in patterns.iter_mut() {
-        check_pattern_keys(
-            pattern,
-            scope,
-            var_scope,
-            label_scope,
-            errors,
-            reachable,
-            occurrences,
-        );
+        check_pattern_keys(pattern, cx, reachable);
     }
     pattern_alternatives_var_names(patterns)
 }
@@ -1835,15 +1841,7 @@ fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
 /// unresolvable call to `errors` rather than stopping at the first, matching
 /// how real jq's own compiler keeps going to report every compile error in
 /// one pass (#2037).
-fn check(
-    expr: &mut Expr,
-    scope: &mut Scope,
-    var_scope: &mut VarScope,
-    label_scope: &mut LabelScope,
-    errors: &mut Vec<ResolveError>,
-    reachable: &BTreeSet<usize>,
-    occurrences: &mut Occurrences,
-) {
+fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
     match expr {
         // #1371: neither variant can occur here. This pass runs once, on the
         // freshly parsed program, before evaluation begins; both are built
@@ -1881,20 +1879,15 @@ fn check(
                 let rebased = rebase_reachable(&original, target, reachable);
                 check(
                     target,
-                    scope,
-                    var_scope,
-                    label_scope,
-                    errors,
-                    &rebased,
-                    occurrences,
+                    cx, &rebased
                 );
             } else {
-                check(Rc::make_mut(inner).expr_mut(), scope, var_scope, label_scope, errors, reachable, occurrences);
+                check(Rc::make_mut(inner).expr_mut(), cx, reachable);
             }
         }
         Expr::DefCall { args, .. } => {
             for arg in args.iter_mut() {
-                check(arg, scope, var_scope, label_scope, errors, reachable, occurrences);
+                check(arg, cx, reachable);
             }
         }
         // Leaves: nothing nested to descend into. Mirrors `walk::any_subexpr`'s
@@ -1929,7 +1922,7 @@ fn check(
         // scope (`var_scope` is truncated before `then`), so the body's
         // `$ENV` never sees the later `as` binding.
         Expr::Env => {
-            if in_var_scope(var_scope, "ENV").hit.is_some() {
+            if in_var_scope(&cx.var_scope, "ENV").hit.is_some() {
                 *expr = Expr::Var("ENV".to_string());
             }
         }
@@ -1957,7 +1950,7 @@ fn check(
         // counted too (#3085), so the index lines up with the CLI's
         // `BreakSite` table.
         Expr::Break(name) => {
-            check_break(name, label_scope, errors, occurrences);
+            check_break(name, cx);
         }
 
         // #2734: the leaf this whole pass exists to add. `$ENV`/`$__loc__`
@@ -1967,19 +1960,19 @@ fn check(
         // already resolved, never present on the freshly parsed tree this
         // pass runs on (same reasoning as the `Shared`/`DefCall` arm above).
         Expr::Var(name) => {
-            let count = occurrences
+            let count = cx.occurrences
                 .vars
-                .entry((occurrences.scope(), name.clone()))
+                .entry((cx.occurrences.scope(), name.clone()))
                 .or_insert(0);
             let occurrence = *count;
             *count += 1;
-            let found = in_var_scope(var_scope, name);
+            let found = in_var_scope(&cx.var_scope, name);
             if found.hit.is_none() {
-                errors.push(ResolveError::Var(UnboundVar {
+                cx.errors.push(ResolveError::Var(UnboundVar {
                     name: name.clone(),
                     origin: found.run.map(|(id, _)| id),
                     occurrence,
-                    module_def: occurrences.module_def(),
+                    module_def: cx.occurrences.module_def(),
                 }));
             }
         }
@@ -1990,7 +1983,7 @@ fn check(
         | Expr::Negate(inner)
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner)
-        | Expr::Repeat(inner) => check(inner, scope, var_scope, label_scope, errors, reachable, occurrences),
+        | Expr::Repeat(inner) => check(inner, cx, reachable),
 
         // #2840: real jq's `label $x | BODY` intercepts every escape that
         // isn't its own `{"__jq":N}` break sentinel and re-raises it
@@ -2007,10 +2000,10 @@ fn check(
         // #2687's `break $x` -> `error/0` desugaring's own
         // shadowable-or-untouched gate).
         Expr::Label { name, body } => {
-            label_scope.push(name.clone());
-            check(body, scope, var_scope, label_scope, errors, reachable, occurrences);
-            label_scope.pop();
-            if in_scope(scope, "error", 0).hit.is_some() {
+            cx.label_scope.push(name.clone());
+            check(body, cx, reachable);
+            cx.label_scope.pop();
+            if in_scope(&cx.scope, "error", 0).hit.is_some() {
                 let old_body = core::mem::replace(body.as_mut(), Expr::Identity);
                 **body = Expr::Try {
                     expr: Box::new(old_body),
@@ -2025,7 +2018,7 @@ fn check(
 
         Expr::Error(inner) => {
             if let Some(e) = inner.as_deref_mut() {
-                check(e, scope, var_scope, label_scope, errors, reachable, occurrences);
+                check(e, cx, reachable);
             }
         }
 
@@ -2082,17 +2075,17 @@ fn check(
             value: right,
             ..
         } => {
-            check(left, scope, var_scope, label_scope, errors, reachable, occurrences);
-            check(right, scope, var_scope, label_scope, errors, reachable, occurrences);
+            check(left, cx, reachable);
+            check(right, cx, reachable);
         }
 
         // #2734: binds `var` in `body` only, not `expr` -- `.foo as $x | ...`
         // evaluates `.foo` before `$x` exists.
         Expr::As { expr, var, body } => {
-            check(expr, scope, var_scope, label_scope, errors, reachable, occurrences);
-            var_scope.push(var.clone());
-            check(body, scope, var_scope, label_scope, errors, reachable, occurrences);
-            var_scope.pop();
+            check(expr, cx, reachable);
+            cx.var_scope.push(var.clone());
+            check(body, cx, reachable);
+            cx.var_scope.pop();
         }
 
         // #2734: `patterns` is every `?//`-alternative (usually just one);
@@ -2110,12 +2103,12 @@ fn check(
             patterns,
             body,
         } => {
-            check(expr, scope, var_scope, label_scope, errors, reachable, occurrences);
-            let outer = var_scope.len();
-            let bound = bind_patterns(patterns, scope, var_scope, label_scope, errors, reachable, occurrences);
-            var_scope.extend(bound);
-            check(body, scope, var_scope, label_scope, errors, reachable, occurrences);
-            var_scope.truncate(outer);
+            check(expr, cx, reachable);
+            let outer = cx.var_scope.len();
+            let bound = bind_patterns(patterns, cx, reachable);
+            cx.var_scope.extend(bound);
+            check(body, cx, reachable);
+            cx.var_scope.truncate(outer);
         }
 
         // The one arm that changes function scope. `body` sees the function
@@ -2136,20 +2129,20 @@ fn check(
             then,
             ..
         } => {
-            let outer = scope.len();
-            scope.push((name.clone(), params.len()));
-            let with_self = scope.len();
+            let outer = cx.scope.len();
+            cx.scope.push((name.clone(), params.len()));
+            let with_self = cx.scope.len();
 
             // A parameter binds its bare name at arity 0 only: `def f(g):
             // g(1)` is `g/1 is not defined` in jq, not a call to the outer
             // `g`. Pushed after the function's own name so a parameter
             // shadowing it wins. A `$`-style parameter also binds `$name`
             // in the same pass over `params`, one loop for both namespaces.
-            let var_outer = var_scope.len();
+            let var_outer = cx.var_scope.len();
             for p in params.iter() {
-                scope.push((p.name().to_string(), 0));
+                cx.scope.push((p.name().to_string(), 0));
                 if p.is_dollar() {
-                    var_scope.push(p.name().to_string());
+                    cx.var_scope.push(p.name().to_string());
                 }
             }
             // #2740: a `def` whose call never appears anywhere reachable is
@@ -2167,11 +2160,11 @@ fn check(
             // #3085: a module-level def of an open run is its own counting
             // scope, identified the way the CLI's `DefSite` table can find
             // it again (see `ModuleDef`).
-            let module_level = marker.is_none() && occurrences.at_module_level();
+            let module_level = marker.is_none() && cx.occurrences.at_module_level();
             if module_level {
-                let scope_id = occurrences.next_scope;
-                occurrences.next_scope += 1;
-                if let Some(run) = occurrences.runs.last_mut() {
+                let scope_id = cx.occurrences.next_scope;
+                cx.occurrences.next_scope += 1;
+                if let Some(run) = cx.occurrences.runs.last_mut() {
                     let written = written_def_name(name);
                     let seen = run
                         .ordinals
@@ -2190,24 +2183,24 @@ fn check(
                 }
             }
             if reachable.contains(&body_addr) {
-                check(body, scope, var_scope, label_scope, errors, reachable, occurrences);
+                check(body, cx, reachable);
             } else if !module_level {
                 // #3085: an unreferenced body is not diagnosed, but its
                 // sites are still in the source tables the occurrence
                 // indexes point into, so they are still counted. A
                 // module-level def needs no such walk: it is a counting
                 // scope of its own, so skipping it shifts nothing.
-                let kept = errors.len();
-                check(body, scope, var_scope, label_scope, errors, reachable, occurrences);
-                errors.truncate(kept);
+                let kept = cx.errors.len();
+                check(body, cx, reachable);
+                cx.errors.truncate(kept);
             }
             if module_level {
-                if let Some(run) = occurrences.runs.last_mut() {
+                if let Some(run) = cx.occurrences.runs.last_mut() {
                     run.def = None;
                 }
             }
-            var_scope.truncate(var_outer);
-            scope.truncate(with_self);
+            cx.var_scope.truncate(var_outer);
+            cx.scope.truncate(with_self);
 
             // A run marker floors variables as well as functions (#2962), so
             // it goes on the variable stack too -- for `then` only, since a
@@ -2220,35 +2213,35 @@ fn check(
             let is_marker = marker.is_some();
             let mut closed_run = None;
             if is_marker {
-                var_scope.push(name.clone());
-                label_scope.push(name.clone());
+                cx.var_scope.push(name.clone());
+                cx.label_scope.push(name.clone());
                 // #3085: a begin opens a fresh run frame, even when its file
                 // shares a run id with another import of the same module. An
                 // end closes it for `then`; on return the begin that opened
                 // it still owns it.
                 match &marker {
-                    Some(RunMarker::Begin { .. }) => occurrences.runs.push(RunFrame::default()),
-                    Some(RunMarker::End { .. }) => closed_run = occurrences.runs.pop(),
+                    Some(RunMarker::Begin { .. }) => cx.occurrences.runs.push(RunFrame::default()),
+                    Some(RunMarker::End { .. }) => closed_run = cx.occurrences.runs.pop(),
                     None => {} // omni-dev: coverage tolerate-line reason="unreachable by construction: this match is only entered when is_marker (marker.is_some()) is true, and RunMarker has only Begin/End variants -- the None arm exists solely for exhaustiveness against Option<RunMarker>'s type"
                 }
             }
-            check(then, scope, var_scope, label_scope, errors, reachable, occurrences);
-            var_scope.truncate(var_outer);
+            check(then, cx, reachable);
+            cx.var_scope.truncate(var_outer);
             if is_marker {
                 if matches!(marker, Some(RunMarker::Begin { .. })) {
-                    occurrences.runs.pop();
+                    cx.occurrences.runs.pop();
                 } else if let Some(run) = closed_run {
-                    occurrences.runs.push(run);
+                    cx.occurrences.runs.push(run);
                 }
-                label_scope.pop();
+                cx.label_scope.pop();
             }
-            scope.truncate(outer);
+            cx.scope.truncate(outer);
         }
 
         Expr::Try { expr, catch } => {
-            check(expr, scope, var_scope, label_scope, errors, reachable, occurrences);
+            check(expr, cx, reachable);
             if let Some(c) = catch.as_deref_mut() {
-                check(c, scope, var_scope, label_scope, errors, reachable, occurrences);
+                check(c, cx, reachable);
             }
         }
 
@@ -2257,21 +2250,21 @@ fn check(
             then_branch,
             else_branch,
         } => {
-            check(cond, scope, var_scope, label_scope, errors, reachable, occurrences);
-            check(then_branch, scope, var_scope, label_scope, errors, reachable, occurrences);
-            check(else_branch, scope, var_scope, label_scope, errors, reachable, occurrences);
+            check(cond, cx, reachable);
+            check(then_branch, cx, reachable);
+            check(else_branch, cx, reachable);
         }
 
         Expr::SliceExpr { target, start, end } => {
-            check(target, scope, var_scope, label_scope, errors, reachable, occurrences);
-            check_opt(start.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences);
-            check_opt(end.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences);
+            check(target, cx, reachable);
+            check_opt(start.as_deref_mut(), cx, reachable);
+            check_opt(end.as_deref_mut(), cx, reachable);
         }
 
         Expr::Range { from, to, step } => {
-            check(from, scope, var_scope, label_scope, errors, reachable, occurrences);
-            check_opt(to.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences);
-            check_opt(step.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences);
+            check(from, cx, reachable);
+            check_opt(to.as_deref_mut(), cx, reachable);
+            check_opt(step.as_deref_mut(), cx, reachable);
         }
 
         // #2734: `patterns`' vars are bound in `update` only, not `init` --
@@ -2302,13 +2295,13 @@ fn check(
             init,
             update,
         } => {
-            check(input, scope, var_scope, label_scope, errors, reachable, occurrences);
-            check(init, scope, var_scope, label_scope, errors, reachable, occurrences);
-            let outer = var_scope.len();
-            let bound = bind_patterns(patterns, scope, var_scope, label_scope, errors, reachable, occurrences);
-            var_scope.extend(bound);
-            check(update, scope, var_scope, label_scope, errors, reachable, occurrences);
-            var_scope.truncate(outer);
+            check(input, cx, reachable);
+            check(init, cx, reachable);
+            let outer = cx.var_scope.len();
+            let bound = bind_patterns(patterns, cx, reachable);
+            cx.var_scope.extend(bound);
+            check(update, cx, reachable);
+            cx.var_scope.truncate(outer);
         }
 
         // #2734: same rule as `Expr::Reduce` above -- `init` sees no bound
@@ -2322,19 +2315,19 @@ fn check(
             update,
             extract,
         } => {
-            check(input, scope, var_scope, label_scope, errors, reachable, occurrences);
-            check(init, scope, var_scope, label_scope, errors, reachable, occurrences);
-            let outer = var_scope.len();
-            let bound = bind_patterns(patterns, scope, var_scope, label_scope, errors, reachable, occurrences);
-            var_scope.extend(bound);
-            check(update, scope, var_scope, label_scope, errors, reachable, occurrences);
-            check_opt(extract.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences);
-            var_scope.truncate(outer);
+            check(input, cx, reachable);
+            check(init, cx, reachable);
+            let outer = cx.var_scope.len();
+            let bound = bind_patterns(patterns, cx, reachable);
+            cx.var_scope.extend(bound);
+            check(update, cx, reachable);
+            check_opt(extract.as_deref_mut(), cx, reachable);
+            cx.var_scope.truncate(outer);
         }
 
         Expr::Pipe(exprs) | Expr::Comma(exprs) => {
             for e in exprs.iter_mut() {
-                check(e, scope, var_scope, label_scope, errors, reachable, occurrences);
+                check(e, cx, reachable);
             }
         }
 
@@ -2386,7 +2379,7 @@ fn check(
             builtin_fallback,
         } => {
             let arity = call_arity(args, builtin_fallback.as_deref());
-            let scan = in_scope(scope, name, arity);
+            let scan = in_scope(&cx.scope, name, arity);
             // #2989: a def inside an `import`ed module calls its siblings by
             // the bare name it is written with, but the loader namespaced
             // them to `alias::name`. Retry the bare miss under the innermost
@@ -2397,7 +2390,7 @@ fn check(
             let aliased = match (&scan.hit, &scan.run) {
                 (None, Some((_, Some(alias)))) => {
                     let qualified = alloc::format!("{alias}::{name}");
-                    in_scope(scope, &qualified, arity).hit.map(|()| qualified)
+                    in_scope(&cx.scope, &qualified, arity).hit.map(|()| qualified)
                 }
                 _ => None,
             };
@@ -2422,7 +2415,7 @@ fn check(
                 // occurrences -- resolved or not -- came before it in the
                 // source; see `UnresolvedCall::occurrence_index`'s own doc
                 // comment).
-                next_call_occurrence(occurrences, name, arity);
+                next_call_occurrence(&mut cx.occurrences, name, arity);
                 // #2971: of `builtin_fallback_into_args`'s arms only the
                 // `Builtin` one clones -- the rest move their operands, which
                 // keeps every `def` body where `build_call_graph` found it.
@@ -2438,7 +2431,7 @@ fn check(
                     // `$*label-x is not defined`, rc=3 (confirmed live).
                     // Check BEFORE discarding.
                     if let Expr::Break(ref name) = *fallback {
-                        check_break(name, label_scope, errors, occurrences);
+                        check_break(name, cx);
                     }
                     *args = builtin_fallback_into_args(*fallback);
                     cloned_from.map(|from| {
@@ -2448,7 +2441,7 @@ fn check(
                 });
                 let reachable = rebased.as_ref().unwrap_or(reachable);
                 for a in args.iter_mut() {
-                    check(a, scope, var_scope, label_scope, errors, reachable, occurrences);
+                    check(a, cx, reachable);
                 }
             } else if let Some(fallback) = builtin_fallback.take() {
                 // Not shadowed after all -- restore the original parse in
@@ -2459,20 +2452,20 @@ fn check(
                 // recursive `check` call below counts it exactly once, in
                 // whichever arm the swapped-in `expr` actually matches.
                 *expr = *fallback;
-                check(expr, scope, var_scope, label_scope, errors, reachable, occurrences);
+                check(expr, cx, reachable);
             } else if is_jq_builtin(name, arity) {
-                next_call_occurrence(occurrences, name, arity); // omni-dev: coverage tolerate-line reason="unreachable in practice today: this arm needs builtin_fallback==None (the name was never a shadow candidate) yet is_jq_builtin==true (a real jq builtin at this arity) -- every implemented builtin's own dedicated parse already lowers that shape to Expr::Builtin before resolve.rs ever runs, and #3042/#3046 closed the once-real 'unimplemented builtin' gap this existed for (see JQ_BUILTIN_ROSTER's own doc comment)"
+                next_call_occurrence(&mut cx.occurrences, name, arity); // omni-dev: coverage tolerate-line reason="unreachable in practice today: this arm needs builtin_fallback==None (the name was never a shadow candidate) yet is_jq_builtin==true (a real jq builtin at this arity) -- every implemented builtin's own dedicated parse already lowers that shape to Expr::Builtin before resolve.rs ever runs, and #3042/#3046 closed the once-real 'unimplemented builtin' gap this existed for (see JQ_BUILTIN_ROSTER's own doc comment)"
                 for a in args.iter_mut() {
-                    check(a, scope, var_scope, label_scope, errors, reachable, occurrences); // omni-dev: coverage tolerate-line reason="unreachable with the current roster: every `JQ_BUILTIN_ROSTER` entry of arity >= 1 already has a dedicated parser form (a `matches_keyword` special case or a `Libm1`/`Libm2`/`Libm3::ALL` entry -- confirmed by cross-referencing the full roster against both), so it is parsed straight to `Expr::Builtin` and never reaches here as a bare `FuncCall`. This arm exists for a roster name with no dedicated parse yet and a nonzero arity -- there is none today, so the loop body is reached with an empty `args` on every pinned-suite run (355 hits on the arm's own condition, 0 in the loop) and would only start executing if such a name were added (#2964)"
+                    check(a, cx, reachable); // omni-dev: coverage tolerate-line reason="unreachable with the current roster: every `JQ_BUILTIN_ROSTER` entry of arity >= 1 already has a dedicated parser form (a `matches_keyword` special case or a `Libm1`/`Libm2`/`Libm3::ALL` entry -- confirmed by cross-referencing the full roster against both), so it is parsed straight to `Expr::Builtin` and never reaches here as a bare `FuncCall`. This arm exists for a roster name with no dedicated parse yet and a nonzero arity -- there is none today, so the loop body is reached with an empty `args` on every pinned-suite run (355 hits on the arm's own condition, 0 in the loop) and would only start executing if such a name were added (#2964)"
                 }
             } else {
-                let occurrence_index = next_call_occurrence(occurrences, name, arity);
-                errors.push(ResolveError::Call(UnresolvedCall {
+                let occurrence_index = next_call_occurrence(&mut cx.occurrences, name, arity);
+                cx.errors.push(ResolveError::Call(UnresolvedCall {
                     name: name.clone(),
                     arity,
                     origin,
                     occurrence_index,
-                    module_def: occurrences.module_def(),
+                    module_def: cx.occurrences.module_def(),
                 }));
             }
         }
@@ -2484,23 +2477,23 @@ fn check(
         // undefined here.
         Expr::NamespacedCall { args, .. } => {
             for a in args.iter_mut() {
-                check(a, scope, var_scope, label_scope, errors, reachable, occurrences);
+                check(a, cx, reachable);
             }
         }
 
         Expr::Object(entries) => {
             for entry in entries.iter_mut() {
                 if let ObjectKey::Expr(k) = &mut entry.key {
-                    check(k, scope, var_scope, label_scope, errors, reachable, occurrences);
+                    check(k, cx, reachable);
                 }
-                check(&mut entry.value, scope, var_scope, label_scope, errors, reachable, occurrences);
+                check(&mut entry.value, cx, reachable);
             }
         }
 
         Expr::StringInterpolation(parts) => {
             for part in parts.iter_mut() {
                 if let StringPart::Expr(e) = part {
-                    check(e, scope, var_scope, label_scope, errors, reachable, occurrences);
+                    check(e, cx, reachable);
                 }
             }
         }
@@ -2531,12 +2524,7 @@ fn check(
                 let rebased = rebase_reachable(sub, &copy, reachable);
                 check(
                     &mut copy,
-                    scope,
-                    var_scope,
-                    label_scope,
-                    errors,
-                    &rebased,
-                    occurrences,
+                    cx, &rebased
                 );
                 copy
             });
@@ -2633,25 +2621,9 @@ fn collect_def_body_addrs(expr: &Expr, addrs: &mut Vec<usize>) {
 }
 
 /// [`check`] over an optional sub-expression.
-fn check_opt(
-    expr: Option<&mut Expr>,
-    scope: &mut Scope,
-    var_scope: &mut VarScope,
-    label_scope: &mut LabelScope,
-    errors: &mut Vec<ResolveError>,
-    reachable: &BTreeSet<usize>,
-    occurrences: &mut Occurrences,
-) {
+fn check_opt(expr: Option<&mut Expr>, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
     if let Some(e) = expr {
-        check(
-            e,
-            scope,
-            var_scope,
-            label_scope,
-            errors,
-            reachable,
-            occurrences,
-        );
+        check(e, cx, reachable);
     }
 }
 
@@ -3164,22 +3136,10 @@ mod tests {
             builtin_fallback: None,
         };
 
-        let mut scope = Scope::new();
-        let mut var_scope = VarScope::new();
-        let mut label_scope = LabelScope::new();
-        let mut errors = Vec::new();
-        let mut occurrences = Occurrences::default();
-        check(
-            &mut Expr::shared(unresolved()),
-            &mut scope,
-            &mut var_scope,
-            &mut label_scope,
-            &mut errors,
-            &BTreeSet::new(),
-            &mut occurrences,
-        );
+        let mut cx = CheckCtx::default();
+        check(&mut Expr::shared(unresolved()), &mut cx, &BTreeSet::new());
         assert_eq!(
-            errors,
+            cx.errors,
             [ResolveError::Call(UnresolvedCall {
                 name: "nosuchfn".into(),
                 arity: 0,
@@ -3192,11 +3152,7 @@ mod tests {
             })]
         );
 
-        let mut scope = Scope::new();
-        let mut var_scope = VarScope::new();
-        let mut label_scope = LabelScope::new();
-        let mut errors = Vec::new();
-        let mut occurrences = Occurrences::default();
+        let mut cx = CheckCtx::default();
         check(
             &mut Expr::DefCall {
                 def: Rc::new(crate::jq::FuncDefData {
@@ -3208,15 +3164,11 @@ mod tests {
                 frames: 0,
                 bound: crate::jq::BoundBody::default(),
             },
-            &mut scope,
-            &mut var_scope,
-            &mut label_scope,
-            &mut errors,
+            &mut cx,
             &BTreeSet::new(),
-            &mut occurrences,
         );
         assert_eq!(
-            errors,
+            cx.errors,
             [ResolveError::Call(UnresolvedCall {
                 name: "nosuchfn".into(),
                 arity: 0,
