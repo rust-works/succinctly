@@ -153,7 +153,9 @@ pub enum Control {
 /// `eval_owned_expr` (used by dozens of builtins' argument evaluation, not
 /// just path context) now propagate a *bare* unmatched `Break` too (#575's
 /// precedent: a `_ctrl`-suffixed twin that preserves [`Control`] losslessly
-/// exists at the few call sites that need it). One shape is still open,
+/// exists at the few call sites that need it -- today `eval_owned_expr_ctrl_full`,
+/// and `eval_owned_expr_full` beneath it keeps a trailing `Control` beside the
+/// value rather than dropping it, #1559). One shape is still open,
 /// though: when the argument generator produces one or more values *before*
 /// breaking/erroring (`QueryResult::Partial`), `result_to_owned` still
 /// silently takes the first value and drops the trailing escape — tracked as

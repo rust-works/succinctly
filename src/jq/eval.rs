@@ -55199,8 +55199,9 @@ fn builtin_paths<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// root pre-check, `paths(node_filter)` on a scalar/null/empty container
 /// never runs `filter` at all -- and (#850) even on a non-empty root, an
 /// error/break on the root itself must abort before any non-root path is
-/// produced, not just be missed. **This pre-check stays eager and
-/// unconditional even for a demand-driven sink**: nothing has been pushed
+/// produced, not just be missed. **This pre-check stays unconditional
+/// even for a demand-driven sink** (it runs the filter to exhaustion, ahead of
+/// any consumer's stop): nothing has been pushed
 /// yet at this point, so it is a bare `Error`/`Break`/`Halt`, never a
 /// `Partial`, and jq itself always runs it before any consumer could stop
 /// — confirmed against jq 1.7.1: `[1] | path(paths(stderr))` writes `[1]`

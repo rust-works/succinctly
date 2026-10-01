@@ -68915,6 +68915,16 @@ fn test_paths_filter_root_probe_retries_an_alternative_3366() -> Result<()> {
             "[[\"a\",0],[\"a\",1]]",
         ),
         ("{\"a\":1}", "try paths(error(\"e\")) catch .", "\"e\""),
+        ("1", "[paths(error(\"x\"))?]", "[]"),
+        ("{}", "[paths(1, error(\"boom\"))?]", "[]"),
+        ("{\"a\":1}", "[paths(1, error(\"boom\"))?]", "[]"),
+        (
+            "{}",
+            "try ([paths(1, error(\"boom\"))]) catch .",
+            "\"boom\"",
+        ),
+        ("[1]", "[paths(true, empty)]", "[[0]]"),
+        ("1", "[paths(empty)]", "[]"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "#3366: `{filter}` on {input}: {stderr:?}");

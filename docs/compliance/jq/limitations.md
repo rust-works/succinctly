@@ -7272,7 +7272,7 @@ gap properly for 3 of the 4 sites**, without take-first's regression: the
 issue's own `/code-review`, after a finder disproved the "not known to be
 live-reachable" claim below) the `Expr::Object`/`Array`/`Literal` arm now
 route through `eval_owned_input` (which preserves `Many`/`ManyOwned`)
-instead of `eval_owned_expr_opt` (which collapsed to one value).
+instead of `eval_owned_expr_opt` (which collapsed to one value; removed with its last caller, #3366).
 `continue_rest_with_context`/`accumulate_path_context_step` -- the functions
 that actually fan a `Comma` branch's output back out into the enclosing
 computation -- already handled `ManyOwned` correctly; they just never used
