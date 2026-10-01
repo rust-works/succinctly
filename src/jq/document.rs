@@ -3835,16 +3835,20 @@ impl LazyKeyLedger {
             }
             self.seeded = true;
             let mut earlier = first();
-            for _ in 0..consumed {
-                let Some((member, rest)) = earlier.as_ref().and_then(F::uncons) else {
-                    break; // omni-dev: coverage tolerate-line reason="unreachable: `consumed` members were already read from this list, so it has that many"
-                };
+            let mut replayed = 0usize;
+            // The list holds this member and whatever follows it, so it never
+            // runs out before `consumed` members have been replayed.
+            while let Some((member, rest)) = earlier.as_ref().and_then(F::uncons) {
+                if replayed == consumed {
+                    break;
+                }
                 // Every earlier key was clean (else this would have seeded
                 // then), so none needs the guard.
                 if let Some((clean, _)) = member.key.display_key_kind() {
                     self.map.insert(clean.into_owned(), ());
                 }
                 earlier = Some(rest);
+                replayed += 1;
             }
         }
         if !self.guard.check(&self.map, &key, is_fallback) {

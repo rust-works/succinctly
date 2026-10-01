@@ -16301,8 +16301,8 @@ where
             if result.is_escape() {
                 if let Some(control) = push_generic_owned_values::<_, S>(result, &mut out) {
                     return stop_with_escape(&mut body_control, control);
-                }
-                return Demand::Stop;
+                } // omni-dev: coverage tolerate-line reason="unreachable: `is_escape()` is exactly `Error|Break|Halt|Partial`, and `push_generic_owned_values` answers `Some(control)` for every one of those four, so the `None` continuation cannot be reached (#2180)"
+                return Demand::Stop; // omni-dev: coverage tolerate-line reason="unreachable: see the `if let` above -- `push_generic_owned_values` never answers `None` for an `is_escape()` result (#2180)"
             }
             if out.is_empty() && pending_first.is_none() {
                 pending_first = Some(result);
@@ -39912,6 +39912,70 @@ mod tests {
         }
     }
 
+    /// #3478: a JSON document read through the YAML index
+    /// ([`mark_json_sourced`](crate::yaml::YamlIndex::mark_json_sourced), yq's
+    /// own JSON-input convention) canonicalizes its number literals, a
+    /// separate scalar route from the plain one. The check-only walk must
+    /// still answer what the building walk does there -- the same `Ok`, or
+    /// the same error -- over every number spelling and a scalar that does
+    /// not decode.
+    #[test]
+    fn validate_cursor_agrees_over_json_sourced_yaml_numbers_3478() {
+        use crate::yaml::YamlIndex;
+
+        for doc in [
+            "[1, 2.5, -0, 1e3, 1.5E-3, 123456789012345678901234567890]",
+            r#"{"a": [1.0, 2e999, {"b": 0.1}], "c": "s", "d": null, "e": true}"#,
+            "42",
+            "[[1.5], [[2.5]]]",
+            r#"["ok", "\ud800"]"#,
+        ] {
+            let mut index = YamlIndex::build(doc.as_bytes()).unwrap();
+            index.mark_json_sourced();
+            let cursor = index.root(doc.as_bytes());
+            let cursor = cursor.first_child().expect("a document with content");
+            assert!(
+                cursor.canonicalize_numbers(),
+                "{doc:?} must be JSON-sourced"
+            );
+            let built = to_owned_cursor::<YqSemantics, _>(&cursor)
+                .map(|_| ())
+                .map_err(|e| e.message);
+            let checked = validate_cursor::<YqSemantics, _>(&cursor).map_err(|e| e.message);
+            assert_eq!(checked, built, "validate_cursor disagrees on {doc:?}");
+        }
+    }
+
+    /// A scalar answers the nesting-depth failure itself when the caller's
+    /// `check_depth` is laxer than [`MAX_NESTING_DEPTH`]: the guard at the
+    /// walk's entry has already passed it, and the scalar arm re-checks
+    /// because that depth contract is the caller's to loosen (#3478 moved the
+    /// check into the scalar arm with the rest of the scalar decode).
+    #[test]
+    fn scalar_arm_enforces_nesting_depth_under_a_lax_check_3478() {
+        let depth = MAX_NESTING_DEPTH;
+        let doc = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let index = JsonIndex::build(doc.as_bytes());
+        let cursor = index.root(doc.as_bytes());
+
+        // The strict contract refuses a level earlier, at the scalar's own
+        // entry; the lax one lets the scalar arm see it.
+        let strict = to_owned_cursor::<JqSemantics, _>(&cursor).expect_err("too deep");
+        let lax = to_owned_cursor_with::<_, JqSemantics>(&cursor, |_| Ok(()), |_| None)
+            .expect_err("a scalar this deep must still be refused");
+        let expected = crate::jq::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH);
+        assert_eq!(strict.message, expected);
+        assert_eq!(lax.message, expected);
+        assert!(lax.is_decode_failure());
+
+        // One level shallower the same scalar is fine under both.
+        let doc = format!("{}1{}", "[".repeat(depth - 1), "]".repeat(depth - 1));
+        let index = JsonIndex::build(doc.as_bytes());
+        let cursor = index.root(doc.as_bytes());
+        assert!(to_owned_cursor::<JqSemantics, _>(&cursor).is_ok());
+        assert!(to_owned_cursor_with::<_, JqSemantics>(&cursor, |_| Ok(()), |_| None).is_ok());
+    }
+
     /// Whether `query` over `json` in jq mode answers a prevalidated cursor
     /// sequence (#3317), an owned array, or something else.
     fn comma_array_route<S: EvalSemantics>(query: &str, json: &str) -> &'static str {
@@ -40201,11 +40265,11 @@ mod tests {
             let built = to_owned_cursor::<JqSemantics, _>(&cursor).map_err(|e| e.message);
             let message = |control: Control| match control {
                 Control::Error(e) => e.message,
-                _ => panic!("only an error is expected on {doc}"),
+                _ => panic!("only an error is expected on {doc}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design: a panic message, formatted only if the walk's failure were not a plain Error (#3478)"
             };
             // `collect_owned` swallows a plain `Error`, so read it first.
             let got = match eval_with_cursor_using::<JqSemantics, _>(&expr, cursor) {
-                GenericResult::Error(e) => Err(e.message),
+                GenericResult::Error(e) => Err(e.message), // omni-dev: coverage tolerate-line reason="no document here answers a plain Error since #3478 (the walk is the consumer's); kept so a future eager walk reports its own message instead of falling to the arm below, which swallows it"
                 // #3478: the walk is the consumer's. Building the array
                 // (which walks as it builds) and pulling it (which walks
                 // before the first element) must each fail with the message
