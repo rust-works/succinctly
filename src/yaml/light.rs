@@ -5394,8 +5394,9 @@ struct KeyPositions {
 ///   as it always did.
 /// - `Node`: anything else (a mapping used as a key at any depth, a sequence
 ///   too large to render, an undecodable string, a dangling alias) is the same
-///   key only if it is the *same node*: the index of its own BP node. That covers
-///   the same source mapping reached twice (`<<: [*a, *a]`); two different
+///   key only if it is the *same node*: the index of its own BP node, or of the
+///   node an alias key names. That covers the same source mapping reached
+///   twice (`<<: [*a, *a]`) and two uses of one anchor as a key; two different
 ///   nodes that merely look alike stay two entries, and a materializer then
 ///   refuses them instead of silently keeping one.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -5557,7 +5558,15 @@ fn upsert_field<'a, W: AsRef<[u64]>>(
         let identity = if let Some(content) = complex_key_content(&key) {
             FallbackKey::Content(content)
         } else {
-            FallbackKey::Node(key.bp_pos)
+            // An alias used as a key names its target, so two uses of one
+            // anchor are one key, whichever node each use sits at.
+            FallbackKey::Node(match key_value {
+                YamlValue::Alias {
+                    target: Some(target),
+                    ..
+                } => target.bp_pos,
+                _ => key.bp_pos,
+            })
         };
         match positions.by_identity.get(&identity) {
             Some(&pos) => entries[pos] = (key, value),

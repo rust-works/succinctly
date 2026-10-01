@@ -433,8 +433,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so does what is the same key: a sequence key of equal content (a merged-in `? [1]` and a
   local `? [1]`, `? []` twice, two sources that both define it), an alias key against
   another use of the same anchor, and the same source mapping reached more than once. A
-  mapping used as a key (or nested in a sequence key) is compared by node only, so two equal
-  ones in different nodes used to resolve to the local one and now refuse. `-i` was already refused for a complex key (#3463) and still leaves the file
+  mapping used as a key (or nested in a sequence key) is compared by node only, so two
+  equal ones in different nodes used to resolve to the local one and now refuse. The
+  comparison renders at most 64 nodes, so an alias fan-out in a key cannot make a merge
+  expensive. `-i` was already refused for a complex key (#3463) and still leaves the file
   untouched. How yq's `keys`, `length` and `has` treat a merge key is a separate gap
   (#3556).
 

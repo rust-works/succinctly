@@ -2385,15 +2385,18 @@ name.
 What is the *same key* still overrides, byte for byte as before. A key is looked up by identity,
 not by its shared `""` spelling:
 
-- a sequence key is compared by content, so a merged-in `? [1]` and a local `? [1]` are one key
-  (the local one wins), and so are two sources that both define it, `? []` against `? []`, a
-  nested or block-style sequence, and an alias used as a key (`*k : v`) against another use of
-  the same anchor. This applies only when the key is a sequence of scalars, nested sequences and
-  aliases to those, every scalar decodes, and it is small: more than 64 nodes or 16 levels
-  stops the comparison, which also keeps an alias fan-out (`l1: &l1 [*l0, ... x12]`, `l2: &l2
-  [*l1, ... x12]`, ...) from expanding to 12^n nodes;
-- anything else is the same key only if it is the same node, which covers a source mapping
-  reached more than once (`<<: [*a, *a]`).
+- a sequence key is compared by content, after scalar type resolution (so `[0x1]` and `[1]`, or
+  `[True]` and `[true]`, are one key, as real yq's output also shows), so a merged-in `? [1]` and
+  a local `? [1]` are one key (the local one wins), and so are two sources that both define it,
+  `? []` against `? []`, a nested or block-style sequence, and an alias used as a key (`*k : v`)
+  against another use of the same anchor. This applies only when the key is a sequence of
+  scalars, nested sequences and aliases to those, every scalar decodes, and it is small: more
+  than 64 nodes or 16 levels stops the comparison, which also keeps an alias fan-out (`l1: &l1
+  [*l0, ... x12]`, `l2: &l2 [*l1, ... x12]`, ...) from expanding to 12^n nodes. That cap is a
+  cliff by design: an equal key written twice is one key within it and two entries past it;
+- anything else is the same key only if it is the same node, or the node an alias key names,
+  which covers a source mapping reached more than once (`<<: [*a, *a]`) and two uses of one
+  anchor naming a mapping (`*m : v`).
 
 Keys that merely look alike therefore stay two entries, and the materializing routes refuse
 them instead of keeping one: `[1]` against `["1"]` (a number and a string), `[]` against `[1]`,

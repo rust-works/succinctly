@@ -3184,6 +3184,12 @@ const BLOCK_SEQUENCE_KEY_MERGED_AND_LOCAL: &str =
 // mapping is treated alike at the root and one level down.
 const EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY: &str =
     "a: &a\n  ? [{p: 1}]\n  : x\nb:\n  <<: *a\n  ? [{p: 1}]\n  : y\n";
+// An alias naming a mapping, used as a key: two uses of one anchor are one key
+// (the key's own node differs per use, so identity follows the target), two
+// anchors with equal content are two.
+const SAME_ALIAS_TO_MAPPING_KEY: &str = "m: &m {p: 1}\na: &a\n  *m : x\nb:\n  <<: *a\n  *m : y\n";
+const DIFFERENT_ALIAS_TO_MAPPING_KEYS: &str =
+    "m: &m {p: 1}\nn: &n {p: 2}\na: &a\n  *m : x\nb:\n  <<: *a\n  *n : y\n";
 
 #[test]
 fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()> {
@@ -3208,6 +3214,7 @@ fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()
         (EMPTY_SEQUENCE_VS_ONE_KEY, ".b | length", "2\n"),
         (DIFFERENT_NESTED_SEQUENCE_KEYS, ".b | length", "2\n"),
         (EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY, ".b | length", "2\n"),
+        (DIFFERENT_ALIAS_TO_MAPPING_KEYS, ".b | length", "2\n"),
         // Looking up the genuine `""` key finds it, never a complex key that
         // shares its spelling.
         (MERGED_COMPLEX_VS_GENUINE_EMPTY, ".b | .[\"\"]", "z\n"),
@@ -3246,6 +3253,7 @@ fn test_yq_merge_keys_raise_instead_of_dropping_a_complex_key_3467() -> Result<(
         (EMPTY_SEQUENCE_VS_ONE_KEY, ".b.z = 1"),
         (DIFFERENT_NESTED_SEQUENCE_KEYS, ".b.z = 1"),
         (EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY, ".b.z = 1"),
+        (DIFFERENT_ALIAS_TO_MAPPING_KEYS, ".b.z = 1"),
     ];
     for &(yaml, filter) in rows {
         let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
@@ -3325,6 +3333,12 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
             ".b.z = 1",
             "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
         ),
+        (SAME_ALIAS_TO_MAPPING_KEY, ".b | length", "1\n"),
+        (
+            SAME_ALIAS_TO_MAPPING_KEY,
+            ".b.z = 1",
+            "m: &m {p: 1}\na: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
         (NESTED_SEQUENCE_KEY_MERGED_AND_LOCAL, ".b | length", "1\n"),
         (
             NESTED_SEQUENCE_KEY_MERGED_AND_LOCAL,
@@ -3358,6 +3372,36 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
         let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
         assert_eq!(code, 0, "{filter:?} on {yaml:?}, stderr: {stderr}");
         assert_eq!(output, expected, "{filter:?} on {yaml:?}");
+    }
+
+    Ok(())
+}
+
+/// #3467: the render that compares two complex keys by content is capped at 64
+/// nodes, and a key over the cap is compared by node instead. The cap is a cliff
+/// by design (an equal key written twice collapses within it and stays two
+/// entries past it), so pin both sides deterministically: `[*l0]` is about a
+/// dozen nodes and `[*l1]` well over a hundred. The wall-clock test below checks
+/// the cap really bounds the work; this one checks where it falls.
+#[test]
+fn test_yq_merge_key_content_comparison_stops_at_the_node_cap_3467() -> Result<()> {
+    let key_twice = |level: usize| -> String {
+        let items = ["x"; 12].join(", ");
+        let mut yaml = format!("l0: &l0 [{items}]\n");
+        for l in 1..=level {
+            let refs = vec![format!("*l{}", l - 1); 12].join(", ");
+            yaml.push_str(&format!("l{l}: &l{l} [{refs}]\n"));
+        }
+        yaml.push_str(&format!(
+            "src: &s\n  ? [*l{level}]\n  : v\nb:\n  <<: *s\n  ? [*l{level}]\n  : w\n"
+        ));
+        yaml
+    };
+    for (level, expected) in [(0, "1\n"), (1, "2\n")] {
+        let (output, stderr, code) =
+            run_yq_stdin_with_stderr(".b | length", &key_twice(level), &[])?;
+        assert_eq!(code, 0, "level {level}, stderr: {stderr}");
+        assert_eq!(output, expected, "level {level}");
     }
 
     Ok(())
