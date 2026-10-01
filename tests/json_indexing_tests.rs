@@ -290,7 +290,7 @@ mod standard_cursor {
         assert_eq!(semi.state, standard::State::InJson);
 
         // BP should be non-empty
-        assert!(!semi.bp.is_empty());
+        assert!(!semi.bp.is_empty(), "{:?}", semi.bp);
     }
 
     #[test]

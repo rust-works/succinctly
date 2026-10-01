@@ -230,7 +230,7 @@ mod tests {
         let writer = BitWriter::new();
         assert!(writer.is_empty());
         let words = writer.finish();
-        assert!(words.is_empty());
+        assert!(words.is_empty(), "{words:?}");
     }
 
     #[test]

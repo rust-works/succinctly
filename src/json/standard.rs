@@ -484,7 +484,7 @@ mod tests {
 
         // BP should be balanced (equal opens and closes)
         // Just verify we have some BP output
-        assert!(!semi.bp.is_empty());
+        assert!(!semi.bp.is_empty(), "{:?}", semi.bp);
     }
 
     #[test]

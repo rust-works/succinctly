@@ -652,7 +652,7 @@ mod tests {
         // The children iterator as designed doesn't make sense for simple cursor.
         //
         // Let's verify it returns nothing after skipping delimiters:
-        assert!(children.is_empty());
+        assert!(children.is_empty(), "{children:?}");
     }
 
     #[test]
@@ -666,7 +666,7 @@ mod tests {
         // struct positions: 2 (,), 4 (,)
         // After skipping delimiters, we get nothing.
         let children: Vec<_> = index.children(json, 0).unwrap().collect();
-        assert!(children.is_empty());
+        assert!(children.is_empty(), "{children:?}");
     }
 
     #[test]

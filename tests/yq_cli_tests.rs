@@ -28195,7 +28195,7 @@ fn test_yq_del_trie_untouched_by_2929() -> Result<()> {
     // row that actually exercises the `!yq_mode` gate (see doc comment).
     let (out, stderr, code) = run_yq_stdin_with_stderr("del(.[0], .[0][-5])", "[[1, 2]]\n", &[])?;
     assert_ne!(code, 0);
-    assert!(out.is_empty());
+    assert!(out.is_empty(), "{out:?}");
     assert!(
         stderr.contains("index [-5] out of range, array size is 2"),
         "unexpected stderr: {stderr}"

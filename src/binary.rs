@@ -157,7 +157,7 @@ mod tests {
     fn test_words_to_bytes_empty() {
         let words: &[u64] = &[];
         let bytes = words_to_bytes(words);
-        assert!(bytes.is_empty());
+        assert!(bytes.is_empty(), "{bytes:?}");
     }
 
     #[test]
@@ -187,7 +187,7 @@ mod tests {
     fn test_bytes_to_words_empty() {
         let bytes: &[u8] = &[];
         let words = bytes_to_words(bytes);
-        assert!(words.is_empty());
+        assert!(words.is_empty(), "{words:?}");
     }
 
     #[test]

@@ -345,6 +345,6 @@ mod tests {
     #[test]
     fn test_get_cpu_info() {
         let cpu = get_cpu_info();
-        assert!(!cpu.is_empty());
+        assert!(!cpu.is_empty(), "{cpu:?}");
     }
 }

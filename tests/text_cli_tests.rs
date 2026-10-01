@@ -208,7 +208,7 @@ fn validate_quiet_mode_suppresses_output() -> Result<()> {
 fn validate_no_color_has_no_ansi() -> Result<()> {
     let (_, stderr, code) = run_validate_stdin(&[0x80], &["--no-color"])?;
     assert_eq!(code, 1);
-    assert!(!stderr.is_empty());
+    assert!(!stderr.is_empty(), "{stderr:?}");
     assert!(
         !stderr.contains('\x1b'),
         "no-color output must not contain ANSI escapes: {stderr:?}"

@@ -339,7 +339,7 @@ mod tests {
 
         sync_node(&fake, &build, &n, true, false, Duration::from_secs(5)).unwrap();
 
-        assert!(fake.calls().is_empty());
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
         assert_eq!(build.call_count(), 0);
     }
 }

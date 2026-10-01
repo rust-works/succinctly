@@ -475,7 +475,7 @@ nodes:
         let fake = FakeExec::new();
         run(parsed, &fake).unwrap();
 
-        assert!(fake.calls().is_empty());
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
     }
 
     #[test]
