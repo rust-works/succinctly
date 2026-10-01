@@ -16445,6 +16445,29 @@ mod meta_assign_798 {
         Ok(())
     }
 
+    /// A negative index the target *computes* (`.a[1 - 3]`, `.a[(1*-1)]`) or
+    /// fans out to (`.a[-1,0]`) is named as written, `-2`/`-1`, by `path(TARGET)`
+    /// -- unlike the literal `.a[-1]` above, which the path walk resolves
+    /// itself -- so [`meta_path_from_value`] resolves it against the array's
+    /// length. Same answers as the pinned yq v4.53.3 (#3479: the literal form
+    /// stopped reaching that resolution when the DOM route moved onto the
+    /// converged evaluator, leaving these shapes the only ones that do).
+    #[test]
+    fn computed_negative_index_target_resolves_against_the_array_length() -> Result<()> {
+        let input = "a:\n  - 1\n  - 2\n";
+        for (filter, expected) in [
+            (".a[1 - 3] anchor = \"z\"", "a:\n  - &z 1\n  - 2\n"),
+            (".a[(1*-1)] anchor = \"z\"", "a:\n  - 1\n  - &z 2\n"),
+            (".a[-1,0] anchor = \"z\"", "a:\n  - &z 1\n  - &z 2\n"),
+            (".a[(1 - 3)] line_comment = \"q\"", "a:\n  - 1 # q\n  - 2\n"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "{filter}");
+            assert_eq!(out, expected, "{filter}");
+        }
+        Ok(())
+    }
+
     /// Every top-level key named after one of the seven metadata keywords
     /// must keep parsing as a field write: the whitespace after `.` is the
     /// discriminator (`. style = ...` is the root's style, `.style = ...` is

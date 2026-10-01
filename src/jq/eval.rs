@@ -118449,6 +118449,13 @@ mod touched_edge_cases_2999 {
                 "with_entries(.value |= tag)",
                 "pick([\"c\"])",
                 "[.a[] | select(. == 2)]",
+                // A non-string scalar key stringifies in yq (#2508). Since
+                // #3479 moved the DOM route off eval.rs's evaluator, these
+                // rows are what run its eager object construction in yq mode.
+                "{(.a[0]): \"x\"}",
+                "{(.f): 1}",
+                "{(.a[2].b): 1}",
+                "{(.g): 1}",
             ],
         )];
 
@@ -118649,6 +118656,196 @@ mod touched_edge_cases_2999 {
         }
         // A value the filter computed is not the document, so it still bridges.
         assert!(run(r#"[.] | .[0] | test("User")"#, true).1 >= 1);
+    }
+
+    /// #3479: the fast path the registered bridge takes answers every outcome
+    /// the round trip would have, without writing the decoded value out again:
+    /// no output (in yq a scalar has no fields), an error, and an error `?`
+    /// leaves alone (a negative index past the front of an array raises in yq
+    /// whatever `?` says, #2254). The unregistered route is the oracle, and
+    /// `reindex_count` shows which one answered.
+    #[test]
+    fn registered_document_bridge_fast_path_outcomes_3479() {
+        use crate::jq::value::reindex_count;
+        let run = |line: &str, filter: &str, registered: bool| {
+            let expr = parse(filter).expect("filter parses");
+            let before = reindex_count::get();
+            let doc = alloc::rc::Rc::new(
+                OwnedValue::String(line.into())
+                    .reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let result = if registered {
+                eval_reindexed_document::<YqSemantics>(&expr, &doc)
+            } else {
+                eval::<Vec<u64>, YqSemantics>(&expr, doc.root())
+            };
+            let answer = match result {
+                QueryResult::Error(e) => format!("error: {e}"),
+                other => other
+                    .collect_owned::<YqSemantics>()
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            (answer, reindex_count::get() - before)
+        };
+        for (line, filter, expected, bridged) in [
+            ("7", "fromjson | .a", "", true),
+            (
+                "[1]",
+                "fromjson | .a",
+                r#"error: Cannot index array with string "a""#,
+                true,
+            ),
+            (
+                "[1]",
+                "fromjson | .[-5]?",
+                "error: index [-5] out of range, array size is 1",
+                false,
+            ),
+        ] {
+            let (plain, plain_reindexes) = run(line, filter, false);
+            let (rooted, rooted_reindexes) = run(line, filter, true);
+            assert_eq!(plain, expected, "unregistered: {filter} on {line}");
+            assert_eq!(rooted, expected, "registered: {filter} on {line}");
+            if bridged {
+                // Building the document is the registered route's only
+                // serialization; the unregistered one adds one for the stage
+                // after `fromjson`.
+                assert_eq!(rooted_reindexes, 1, "{filter} on {line}: registered");
+                assert!(plain_reindexes >= 2, "{filter} on {line}: unregistered");
+            }
+        }
+    }
+
+    /// #3479: `path(f)` at the root of a registered document. A `-R` line is a
+    /// string, which the document remembers, so the bridge reads it back
+    /// instead of decoding the text; any other root is decoded from its cursor.
+    /// The unregistered route is the oracle for both.
+    #[test]
+    fn registered_document_path_builtin_at_the_root_3479() {
+        for (root, filter, expected) in [
+            (
+                OwnedValue::String("abc".into()),
+                r#"path(select(. == "abc"))"#,
+                "[]",
+            ),
+            (
+                OwnedValue::object_from([
+                    ("a".to_string(), OwnedValue::Int(1)),
+                    ("b".to_string(), OwnedValue::Int(2)),
+                ]),
+                "path(.[] | select(. > 1))",
+                r#"["b"]"#,
+            ),
+        ] {
+            let expr = parse(filter).expect("filter parses");
+            let doc = alloc::rc::Rc::new(
+                root.reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let render = |result: QueryResult<'_>| match result {
+                QueryResult::Error(e) => format!("error: {e}"),
+                other => other
+                    .collect_owned::<YqSemantics>()
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            assert_eq!(
+                render(eval::<Vec<u64>, YqSemantics>(&expr, doc.root())),
+                expected,
+                "unregistered: {filter}"
+            );
+            assert_eq!(
+                render(eval_reindexed_document::<YqSemantics>(&expr, &doc)),
+                expected,
+                "registered: {filter}"
+            );
+        }
+    }
+
+    /// #3479: `path(f)` over a document holding a NaN literal (`nan` in JSON
+    /// input, `.nan` in YAML). A NaN literal is not an identity of the bridge
+    /// (`reindex_bridge_is_identity`), so the resolver cannot walk the tree it
+    /// decoded: the builtin crosses to the owned evaluator over a document
+    /// written from it, here with no registered document to reuse. jq 1.7.1
+    /// answers `["a"]` and `["b"]` for the same query on the same text.
+    #[test]
+    fn path_builtin_over_a_nan_literal_crosses_to_the_owned_evaluator_3479() {
+        let text: &[u8] = br#"{"a":nan,"b":2}"#;
+        let index = JsonIndex::build(text);
+        let expr = parse("path(.[] | select(. != 1))").expect("filter parses");
+        let show = |values: Vec<OwnedValue>| {
+            values
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(
+            show(
+                eval::<Vec<u64>, JqSemantics>(&expr, index.root(text))
+                    .collect_owned::<JqSemantics>()
+            ),
+            r#"["a"] ["b"]"#
+        );
+        assert_eq!(
+            show(
+                eval::<Vec<u64>, YqSemantics>(&expr, index.root(text))
+                    .collect_owned::<YqSemantics>()
+            ),
+            r#"["a"] ["b"]"#
+        );
+    }
+
+    /// #3479: two shapes whose coverage came from `succinctly yq`'s old DOM
+    /// route, which ran on eval.rs's own evaluator, and now has to be pinned
+    /// on the one it runs on.
+    ///
+    /// A `select` whose condition produces no output keeps nothing
+    /// (`push_generic_truthiness`' empty arm), in both modes. And a path
+    /// walked over an owned value -- what a write leaves behind -- that
+    /// iterates a scalar under `?` finds nothing to step into: an error the
+    /// `?` swallows in jq, an empty answer in yq (`walk_path`'s `Iterate` arm).
+    #[test]
+    fn empty_select_condition_and_scalar_iteration_after_a_write_3479() {
+        let text: &[u8] = br#"{"a":[1,2],"b":3}"#;
+        let index = JsonIndex::build(text);
+        let show = |values: Vec<OwnedValue>| {
+            values
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for (filter, expected) in [
+            ("select(empty)", ""),
+            ("[.a[] | select(empty)]", "[]"),
+            ("select(.a[] | select(. > 5))", ""),
+            (".x = 1 | [path(.b[]?)]", "[]"),
+        ] {
+            let expr = parse(filter).expect("filter parses");
+            assert_eq!(
+                show(
+                    eval::<Vec<u64>, JqSemantics>(&expr, index.root(text))
+                        .collect_owned::<JqSemantics>()
+                ),
+                expected,
+                "jq: {filter}"
+            );
+            assert_eq!(
+                show(
+                    eval::<Vec<u64>, YqSemantics>(&expr, index.root(text))
+                        .collect_owned::<YqSemantics>()
+                ),
+                expected,
+                "yq: {filter}"
+            );
+        }
     }
 
     /// #3479: the registration is a stack of dynamic extents. It ends with the

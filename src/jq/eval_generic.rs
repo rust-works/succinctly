@@ -3338,10 +3338,14 @@ fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
     // streaming owned entries already run (`eval_each_owned`).
     if !S::REINDEX_BRIDGE_KEEPS_IDENTITY && dom_roots::active() && !embed_table_active() {
         if let Some(result) = crate::jq::eval::eval_owned_fast_path::<S>(expr, &owned, optional) {
+            // No `Err(_) if optional` arm, unlike the route above: the fast
+            // path applies `optional` itself, so an `Err` it still returns is
+            // one `?` must not swallow (a negative index past the front of an
+            // array raises in yq whatever `?` says, #2254), and
+            // `eval_owned_input`, its other eager caller, passes it on too.
             return match result {
                 Ok(Some(value)) => GenericResult::Owned(value),
                 Ok(None) => GenericResult::None,
-                Err(_) if optional => GenericResult::None,
                 Err(error) => GenericResult::Error(error),
             };
         }

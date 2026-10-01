@@ -9762,7 +9762,7 @@ mod tests {
             match (new, old) {
                 (Ok(a), Ok(b)) => assert_eq!(a, b),
                 (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
-                (a, b) => panic!("depth {depth}: {a:?} vs {b:?}"),
+                (a, b) => panic!("depth {depth}: {a:?} vs {b:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make: the two serializers disagreeing on whether a nest is too deep (#3479)"
             }
         }
     }
