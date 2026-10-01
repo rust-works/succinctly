@@ -321,8 +321,16 @@ Each step is safe to land on `main` by itself.
 
 1. Should `last(f)` be promoted to `Unmoved` in its own step after B2 (section 5)? Recommended:
    yes, with sweep rows, after B3.
-2. Is `BranchRegister` worth carrying `Cow` for the `Lost*` variants, or is `LostAt` enough with
-   an `Rc`? `Frame` already uses `Rc`. Decide with the `size_of` measurement in B1.
+2. ~~Is `BranchRegister` worth carrying `Cow` for the `Lost*` variants, or is `LostAt` enough
+   with an `Rc`?~~ **Answered by B1's measurement** (aarch64 macOS, release layout, throwaway
+   test, not committed): `size_of::<PathBranch>()` is **112 bytes before and after B1**
+   (`Option<Cow<OwnedValue>>` and `BranchRegister { None, Unmoved(Cow) }` both fit the `Cow`
+   niche). A mirror struct with the same fields measured **120** with
+   `{ None, Unmoved(Cow), LostAt(Cow), LostSomewhere }` and **112** with
+   `{ None, Unmoved(Cow), LostAt(Rc<OwnedValue>), LostSomewhere }`. B2 should use
+   `LostAt(Rc<OwnedValue>)`: it costs nothing in `PathBranch`'s size and matches
+   `RegisterLoss::LostAt`, so the branch-to-frame conversion in `place_step` moves the `Rc`
+   instead of cloning. (`Frame` is 40 bytes.) Confirm with the same probe on the real type in B2.
 3. The `Try` negative test in D4.3: where does a lost-frame refusal under `try` get caught
    today, if at all? B2 writes the test first; if it fails on `main`, that is a separate
    Severity-High issue, not folded into this one.
