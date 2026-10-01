@@ -41084,6 +41084,51 @@ mod tests {
             let (out, _) = outputs_and_reindexes(doc, query);
             assert_eq!(out, vec![want.to_string()], "{query}");
         }
+        // yq never enters this route: its answer is what it was.
+        assert_ne!(
+            comma_array_route::<YqSemantics>("[(., .), .]", doc),
+            "prevalidated"
+        );
+    }
+
+    /// #3500: a spliced array fails exactly as the flat spelling of the same
+    /// branches does -- the first failure in branch order, and nothing
+    /// printed -- whether the raise is a branch's own (`.c.x` on a string) or
+    /// an earlier pending node's undecodable string, and behind a piped tail.
+    #[test]
+    fn test_nested_comma_array_fails_like_the_flat_spelling_3500() {
+        let run = |doc: &str, query: &str| {
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), query);
+            (out, format!("{control:?}"))
+        };
+        for (doc, nested, flat) in [
+            (r#"{"a":1,"c":"s"}"#, "[(.c.x, .a), .a]", "[.c.x, .a, .a]"),
+            (
+                r#"{"a":1,"c":"s"}"#,
+                "[((.a, .c.x), .a), .c.y]",
+                "[.a, .c.x, .a, .c.y]",
+            ),
+            // An undecodable string in an earlier node wins over a later
+            // nested branch's own error.
+            (
+                r#"{"a":"\q","c":"s"}"#,
+                "[(.a, (.c.x, .a)), .a]",
+                "[.a, .c.x, .a, .a]",
+            ),
+            // Behind a piped tail.
+            (
+                r#"{"a":{"x":"s"},"b":{"x":1}}"#,
+                "[((.a, .b), .a) | .x.y]",
+                "[(.a | .x.y), (.b | .x.y), (.a | .x.y)]",
+            ),
+            // A malformed document.
+            (r#"{"a":1,"b":xyz}"#, "[(., .), .]", "[., ., .]"),
+        ] {
+            let (out, control) = run(doc, nested);
+            assert!(out.is_empty(), "{nested}: {out:?}");
+            assert!(control.contains("Error"), "{nested}: {control}");
+            assert_eq!(run(doc, flat), (out, control), "{nested} vs {flat}");
+        }
     }
 
     /// #3317: the `,` producer's sequence prints as its `Cursors` source,
