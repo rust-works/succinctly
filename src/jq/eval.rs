@@ -12072,9 +12072,9 @@ fn is_negative_zero_int_literal(value: &OwnedValue) -> bool {
 ///
 /// yq mode is left alone: real yq v4.53.3 reads a `-0` *expression literal*
 /// as integer zero for `+`, `-` and `*` (`(-0) - 0` is `0`), which
-/// `Int(0)` reproduces. Its `/` on that literal, and any `-0` read from a
-/// YAML *document*, stay float there and keep the sign; that is a separate,
-/// pre-existing divergence (#3445), not something this reader decides.
+/// `Int(0)` reproduces. Its `/` on that literal reads it as a float, which
+/// [`division_number_repr`] does; a `-0` read from a YAML *document* is
+/// already a float by the time it gets here (`resolve_plain`, #3445).
 ///
 /// This is a per-call-site reader rather than a change to `number_repr()`
 /// itself because that also feeds ordering (`arith_compare`), `%` and
@@ -12082,6 +12082,22 @@ fn is_negative_zero_int_literal(value: &OwnedValue) -> bool {
 /// on purpose: jq's `%` casts to `intmax_t`, so `-0` must not reach it.
 fn signed_number_repr<S: EvalSemantics>(value: &OwnedValue) -> Option<NumberRepr> {
     if S::TAG != EvalTag::Yq && is_negative_zero_int_literal(value) {
+        Some(NumberRepr::Float(-0.0))
+    } else {
+        value.number_repr()
+    }
+}
+
+/// [`OwnedValue::number_repr`], except that a `-0` integer literal reads as
+/// `Float(-0.0)` in *both* modes -- the reader `/` uses (#3445).
+///
+/// jq reads it that way for every operator ([`signed_number_repr`]). Real yq
+/// v4.53.3 reads a `-0` *expression literal* as integer zero for `+`, `-` and
+/// `*` (`(-0) - 0` is `0`, which `Int(0)` reproduces) but divides it as a
+/// float (`(-0) / 1` is `-0`, `(-0) / -1` is `0`, `1 / (-0)` is `-Inf`), so
+/// only division asks for the float.
+fn division_number_repr(value: &OwnedValue) -> Option<NumberRepr> {
+    if is_negative_zero_int_literal(value) {
         Some(NumberRepr::Float(-0.0))
     } else {
         value.number_repr()
@@ -12510,10 +12526,7 @@ fn arith_div<S: EvalSemantics>(
     // still cite a `NumberLiteral` operand's own source spelling, not the
     // canonically-reformatted value `into_plain_number()` would have left
     // behind.
-    match (
-        signed_number_repr::<S>(&left),
-        signed_number_repr::<S>(&right),
-    ) {
+    match (division_number_repr(&left), division_number_repr(&right)) {
         (Some(NumberRepr::Int(a)), Some(NumberRepr::Int(b))) => {
             if b == 0 {
                 if S::DIV_BY_ZERO_IS_INFINITY {

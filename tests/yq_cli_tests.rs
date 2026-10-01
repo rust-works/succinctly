@@ -49790,3 +49790,72 @@ fn test_yq_inplace_still_rewrites_scalar_keys_3463() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3445: a YAML document `-0` is a float in yq and keeps its sign through
+/// every operator; a `-0` *expression literal* is integer zero for `+`, `-`
+/// and `*` but divides as a float. Every expected value is yq v4.53.3's.
+#[test]
+fn test_yq_negative_zero_document_and_literal_arithmetic_3445() -> Result<()> {
+    // A document `a: -0`.
+    for (filter, expected) in [
+        (".a - 0", "-0\n"),
+        (".a * 1", "-0\n"),
+        (".a + .a", "-0\n"),
+        (".a / 1", "-0\n"),
+        (".a / -1", "0\n"),
+        (".a + 0", "0\n"),
+        (".a | tag", "!!float\n"),
+        (".a | tostring", "-0\n"),
+        (".a == 0", "false\n"),
+        (".a == -0", "true\n"),
+        (".a", "-0\n"),
+        ("[.a] | .[0] - 0", "-0\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "a: -0\n", &[])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, expected, "`{filter}` on `a: -0`");
+    }
+
+    // JSON output spells the float.
+    let (stdout, code) = run_yq_stdin(".a", "a: -0\n", &["-o=json"])?;
+    assert_eq!((stdout.as_str(), code), ("-0.0\n", 0));
+
+    // A bare `-0` document, and one in a sequence.
+    let (stdout, _) = run_yq_stdin(". - 0", "-0\n", &[])?;
+    assert_eq!(stdout, "-0\n");
+    let (stdout, _) = run_yq_stdin(".[] | . - 0", "- -0\n- 0\n- +0\n", &[])?;
+    assert_eq!(stdout, "-0\n0\n0\n");
+
+    // The `-0` expression literal (`yq -n`).
+    for (filter, expected) in [
+        ("(-0) / 1", "-0\n"),
+        ("(-0) / -1", "0\n"),
+        ("(-0) / 2", "-0\n"),
+        ("(-0) - 0", "0\n"),
+        ("(-0) + (-0)", "0\n"),
+        ("(-0) * 1", "0\n"),
+        ("0 / -1", "-0\n"),
+        ("(-0) | type", "!!int\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "", &["-n"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, expected, "`yq -n '{filter}'`");
+    }
+
+    // Must not change: every other zero spelling is still the value it was.
+    for (doc, filter, expected) in [
+        ("a: 0\n", ".a / -1", "-0\n"),
+        ("a: +0\n", ".a / -1", "-0\n"),
+        ("a: 0\n", ".a | tag", "!!int\n"),
+        ("a: +0\n", ".a | tag", "!!int\n"),
+        ("a: -0.0\n", ".a - 0", "-0\n"),
+        ("a: -0.0\n", ".a | tag", "!!float\n"),
+        ("a: -1\n", ".a / -1", "1\n"),
+        ("a: '-0'\n", ".a | tag", "!!str\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` on {doc:?}");
+        assert_eq!(stdout, expected, "`{filter}` on {doc:?}");
+    }
+    Ok(())
+}

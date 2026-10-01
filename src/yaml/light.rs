@@ -15593,14 +15593,12 @@ mod tests {
         assert_eq!(format_float_yq_yaml_nested(1e100), "1e+100");
         assert_eq!(format_float_yq_yaml_nested(1e-100), "1e-100");
 
-        // The one accepted divergence from the oracle: real yq leaves a
-        // computed negative zero bare (`-0`), because go-yaml resolves `-0`
-        // as `!!float`. `resolve_plain` calls it `!!int`, so tagging is what
-        // keeps *this* crate's emitter and reader in agreement -- the
-        // type-safe side of the disagreement. Fixing `resolve_plain`'s `-0`
-        // classification would make this byte-identical to yq with no change
-        // to `format_float_yq_yaml_nested` itself.
-        assert_eq!(format_float_yq_yaml_nested(-0.0), "!!float -0");
+        // A computed negative zero is left bare (`-0`), as real yq does:
+        // go-yaml resolves `-0` as `!!float`, and since #3445 so does
+        // `resolve_plain`, so no tag is needed to keep this crate's emitter
+        // and reader in agreement. (It was `!!float -0` while `resolve_plain`
+        // still read `-0` as an integer.)
+        assert_eq!(format_float_yq_yaml_nested(-0.0), "-0");
     }
 
     /// Whatever `format_float_yq_yaml_nested` emits must read back at the

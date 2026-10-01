@@ -267,6 +267,9 @@ fn resolve_signed(s: &str, bytes: &[u8]) -> ResolvedScalar {
             // fails the parse and resolves to `Str`.
             _ => parse_float(s),
         },
+        // go-yaml resolves exactly `-0` as a float (`-0` keeps its sign, #3445),
+        // where every other zero spelling (`0`, `+0`, `-00`) is an integer.
+        Some(b'0') if s == "-0" => ResolvedScalar::Float(-0.0),
         Some(b'0'..=b'9') => parse_int_or_float(s),
         // `+inf`, `-_1`, a bare sign, … — never numeric in the core schema.
         _ => ResolvedScalar::Str,
@@ -703,10 +706,27 @@ mod tests {
         assert_resolves("42", Int(42));
         assert_resolves("+42", Int(42));
         assert_resolves("-7", Int(-7));
-        assert_resolves("-0", Int(0));
         assert_resolves("052", Int(52)); // decimal with leading zero, not octal
         assert_resolves("9223372036854775807", Int(i64::MAX));
         assert_resolves("-9223372036854775808", Int(i64::MIN));
+    }
+
+    /// go-yaml resolves exactly `-0` as a float that keeps its sign (#3445);
+    /// every other zero spelling is an integer. `Float(0.0) == Float(-0.0)`,
+    /// so the sign is checked on the bits.
+    #[test]
+    fn negative_zero_is_a_float_and_other_zeros_are_ints_3445() {
+        match resolve_plain("-0") {
+            Float(f) => assert!(f == 0.0 && f.is_sign_negative(), "{f:?}"),
+            other => panic!("`-0` resolved as {other:?}"),
+        }
+        assert_resolves("0", Int(0));
+        assert_resolves("+0", Int(0));
+        assert_resolves("-00", Int(0));
+        match resolve_plain("-0.0") {
+            Float(f) => assert!(f.is_sign_negative()),
+            other => panic!("`-0.0` resolved as {other:?}"),
+        }
     }
 
     #[test]
