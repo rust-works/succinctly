@@ -41300,6 +41300,16 @@ mod tests {
         assert_eq!(split(".a | .b? | parent | key"), Some((4, 0)));
         assert_eq!(split(".[]? | .k | parent"), Some((3, 0)));
         assert_eq!(split(".[]? | .k | parent | key"), Some((4, 0)));
+        // #2574: `length` is neither navigational nor an emitting stage, so
+        // the whole pipe matches no shape and the top-level split declines
+        // it; the staged driver then evaluates `.a` as stage 1 and its
+        // cursor continues through `[parent, length]` as a nested pipe,
+        // whose split is the head-only shape below (`parent` alone, tail
+        // `length`). A fourth top-level shape was deliberately not added:
+        // the nested re-dispatch keeps the route on the cursor and the
+        // second ancestor climb it costs is inside noise.
+        assert_eq!(split(".a | parent | length"), None);
+        assert_eq!(split("parent | length"), Some((1, 1)));
     }
 
     /// What the M2 gate asks: cursors end to end, never a computed tail.

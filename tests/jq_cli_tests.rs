@@ -61317,6 +61317,45 @@ fn test_identity_pass_constructs_jq_2416() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #2574: a pipe that continues from `parent` into a non-navigational stage
+/// (`length`, `keys`) answers from the cursor, not from an `OwnedValue` of
+/// the whole document. At the head the issue was filed against (a9c56ccb)
+/// `.users[0] | parent | length` built the document root first (15x time and
+/// RSS on a 14 MB file); spine 2416's exit (e4449b1f4, #2559) deleted the
+/// eager evaluator that did it.
+///
+/// The discriminator needs no counter: the second user's `id` is an
+/// undecodable escape, so anything that materializes the array errors
+/// (`map(.id)` is the control, asserted below so the document cannot rot
+/// into a vacuous pass), while counting children on the cursor never decodes
+/// it. Each row must answer exactly what `.users | length` answers. Limit: a
+/// materialized subtree with no undecodable node is invisible, which is fine
+/// because this shape materializes the root or nothing.
+#[test]
+fn test_parent_then_length_stays_on_cursor_2574() -> anyhow::Result<()> {
+    let doc = r#"{"users":[{"id":0},{"id":"\ud800"}]}"#;
+    let (out, err, code) = run_jq_full(&["-c", ".users | length"], Some(doc))?;
+    assert_eq!((code, out.trim_end()), (0, "2"), "baseline: {err}");
+    for (filter, want) in [
+        (".users[0] | parent | length", "2"),
+        (".users[0] | parent | parent | length", "1"),
+        (".users[0] | parent | keys", "[0,1]"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?} {err}");
+        assert_eq!(out.trim_end(), want, "`{filter}`");
+    }
+    // The control: a materializing consumer of the same parent does decode
+    // the sibling, so the rows above passing is evidence of the cursor route.
+    let (out, err, code) = run_jq_full(&["-c", ".users[0] | parent | map(.id)"], Some(doc))?;
+    assert_ne!(code, 0, "control must fail to decode: {out:?}");
+    assert!(
+        err.contains("invalid unicode escape sequence"),
+        "control stderr: {err}"
+    );
+    Ok(())
+}
+
 /// Spine 2416's walk residue in jq mode. jq 1.7.1 has no `key`/`parent`/
 /// `path/0`, so every row is succinctly's own extension surface, pinned to
 /// the tree-structural model's answer (ADR-0021 decision 7; ADR-0018 rule 5)
