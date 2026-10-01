@@ -55029,7 +55029,7 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match parts.as_slice() {
             [OwnedValue::Array(path), leaf_value] => {
                 e = path.is_empty();
-                x = match set_value_at_path(x, path, leaf_value.clone()) {
+                x = match set_value_at_path::<S>(x, path, leaf_value.clone()) {
                     Ok(v) => v,
                     Err(err) => return QueryResult::Error(err),
                 };
@@ -55562,7 +55562,7 @@ fn extend_array_with_nulls_for_delete(
 /// indexed, so `1 | setpath(["a"]; 1)` is an error rather than `{"a":1}`
 /// (#359), and so does a container indexed with the wrong kind of key —
 /// `{} | setpath([0]; 1)`, `[] | setpath(["a"]; 1)`.
-fn set_value_at_path(
+fn set_value_at_path<S: EvalSemantics>(
     value: OwnedValue,
     path: &[OwnedValue],
     new_val: OwnedValue,
@@ -55580,9 +55580,9 @@ fn set_value_at_path(
                     // jq leaves an existing key where it was, and `IndexMap`
                     // would move it to the end after a `shift_remove`.
                     let old = core::mem::replace(slot, OwnedValue::Null);
-                    *slot = set_value_at_path(old, rest, new_val)?;
+                    *slot = set_value_at_path::<S>(old, rest, new_val)?;
                 } else {
-                    let val = set_value_at_path(OwnedValue::Null, rest, new_val)?;
+                    let val = set_value_at_path::<S>(OwnedValue::Null, rest, new_val)?;
                     entries.insert(name.to_string(), val);
                 }
                 Ok(OwnedValue::Object(entries))
@@ -55591,7 +55591,7 @@ fn set_value_at_path(
                 let mut entries = IndexMap::new();
                 entries.insert(
                     String::clone(name),
-                    set_value_at_path(OwnedValue::Null, rest, new_val)?,
+                    set_value_at_path::<S>(OwnedValue::Null, rest, new_val)?,
                 );
                 Ok(OwnedValue::Object(entries.into()))
             }
@@ -55608,7 +55608,7 @@ fn set_value_at_path(
                 pad_with_nulls(&mut arr, index)?;
             }
             let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
-            arr[index] = set_value_at_path(old, rest, new_val)?;
+            arr[index] = set_value_at_path::<S>(old, rest, new_val)?;
             Ok(OwnedValue::Array(arr))
         }
         // An object path element is jq's slice, `{"start":s,"end":e}` — what
@@ -55690,19 +55690,19 @@ fn set_value_at_path(
                 }
                 _ => (ArrayVec::new(), OwnedValue::Null, 0..0),
             };
-            let OwnedValue::Array(items) = set_value_at_path(sub, rest, new_val)? else {
+            let OwnedValue::Array(items) = set_value_at_path::<S>(sub, rest, new_val)? else {
                 return Err(EvalError::slice_assign_non_array());
             };
             arr.splice(range, items);
             Ok(OwnedValue::Array(arr))
         }
-        // null, booleans and arrays index nothing, in any container.
         // #3506: jq's `setpath` finds a subarray-search key where it wanted an
-        // index, whatever follows it and whatever is written. Any other
-        // container refuses an array key as it always did.
-        OwnedValue::Array(_) if matches!(value, OwnedValue::Array(_)) => {
+        // index, whatever follows it and whatever is written. yq has no such
+        // key, and every other container refuses it as it always did.
+        OwnedValue::Array(_) if S::TAG != EvalTag::Yq && matches!(value, OwnedValue::Array(_)) => {
             Err(EvalError::cannot_update_field_at_array_index_of_array())
         }
+        // null, booleans and arrays index nothing, in any container.
         _ => Err(EvalError::cannot_index(value.type_name(), key)),
     }
 }
@@ -55771,7 +55771,12 @@ fn propagate_anchor_writes(
                 if !get_value_at_path(post, alias).is_some_and(|v| v.identical(want)) {
                     continue;
                 }
-                if let Ok(updated) = set_value_at_path(post.clone(), alias, new.clone()) {
+                // The alias slots are named by string and index components
+                // only, so the mode `set_value_at_path` is told never decides
+                // anything here (#3506 added the one arm that reads it).
+                if let Ok(updated) =
+                    set_value_at_path::<JqSemantics>(post.clone(), alias, new.clone())
+                {
                     *post = updated;
                     expected[g][a] = Some(new.clone());
                     changed = true;
@@ -55866,7 +55871,7 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut path = path;
             alias_identity::redirect_concrete_path(&mut path, &owned);
             let pre = alias_identity::active().then(|| owned.clone());
-            match set_value_at_path(owned, &path, new_val) {
+            match set_value_at_path::<S>(owned, &path, new_val) {
                 Ok(mut result) => {
                     if let Some(pre) = &pre {
                         alias_identity::mirror_after_write(pre, &mut result);
@@ -56015,7 +56020,13 @@ fn delete_paths_under<S: EvalSemantics>(
             // it meets the key (a terminal one is `delete_keys`'s `Cannot
             // delete array element of array`). yq has no such key and keeps
             // refusing it below.
-            OwnedValue::Array(_) if !yq_mode => {
+            //
+            // Deleting the rest of the path from the search result comes
+            // first, so a deeper refusal wins (`delpaths([[[1],[0]]])` is
+            // `Cannot delete array element of array`), as in jq.
+            OwnedValue::Array(needle) if !yq_mode => {
+                let read = subarray_indices::<S>(&arr, needle);
+                delete_paths_sorted::<S>(read, paths, start)?;
                 Err(EvalError::cannot_update_field_at_array_index_of_array())
             }
             // A non-number key names no element at all: jq's `Cannot index
@@ -64506,7 +64517,7 @@ pub(crate) fn pick_pathexps_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
             _ => unreachable!("getpath on a path array produces one value or an error"),
         };
         let current = core::mem::replace(&mut output, OwnedValue::Null);
-        match set_value_at_path(current, &parts, selected) {
+        match set_value_at_path::<S>(current, &parts, selected) {
             Ok(value) => output = value,
             Err(error) => {
                 write_error = Some(error);
@@ -92624,7 +92635,7 @@ mod tests {
         .take(200_000)
         .collect();
 
-        let result = set_value_at_path(
+        let result = set_value_at_path::<JqSemantics>(
             OwnedValue::String("hello".into()),
             &path,
             OwnedValue::Int(5),
@@ -108071,11 +108082,6 @@ mod tests {
         v
     }
 
-    /// #1025: `owned_to_expr` had no depth guard -- splices a
-    /// compound-assignment RHS or pattern-substitution value back into the
-    /// AST as literals, reachable from `.a += rhs_expr`/`.a //= rhs_expr`
-    /// and `as`-pattern variable substitution with no adversarial document
-    /// involved.
     /// #3506: the delete walkers' one question -- does this component's last
     /// step end in a subarray-search key -- looks through `?`, `()`, a
     /// `Pipe` group and a trailing `.`, and answers no for everything else.
@@ -108099,6 +108105,11 @@ mod tests {
         assert!(!ends_in_array_key(&Expr::Identity));
     }
 
+    /// #1025: `owned_to_expr` had no depth guard -- splices a
+    /// compound-assignment RHS or pattern-substitution value back into the
+    /// AST as literals, reachable from `.a += rhs_expr`/`.a //= rhs_expr`
+    /// and `as`-pattern variable substitution with no adversarial document
+    /// involved.
     #[test]
     fn owned_to_expr_panics_past_nesting_depth_limit_1025() {
         use crate::jq::value::MAX_VALUE_TREE_DEPTH;

@@ -679,7 +679,10 @@ follows too. What it leaves:
   inline `?` hides none of the write errors, as in jq. `succinctly yq` keeps refusing the key
   form everywhere, as real yq does; `indices`/`index`/`rindex` are a `--jq-extensions` surface
   there (real yq has none) and follow jq's search, so under that flag `indices([1])` searches
-  while `.[[1]]` still raises. One neighbouring gap is not this key's: bare `first` and `last`
+  while `.[[1]]` still raises. When one `del()` names several paths that meet different array
+  key errors, jq deletes them in descending path order and reports the greatest path's, where
+  this reports the first collected (`[1,2] | del(.[[1]], .[[2]][0])` is the update wording in
+  jq and the delete wording here). One neighbouring gap is not this key's: bare `first` and `last`
   are not path steps, so `path(.[0] | first)` raises `Invalid path expression` here with a
   plain index too, where jq answers `[0,0]` (#3545).
 - **`getpath(K)` in a write is the same refusal** (#2429, #3506): `getpath([[1]]) = 3` and

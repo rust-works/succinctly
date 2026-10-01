@@ -68249,8 +68249,8 @@ fn test_array_key_in_path_and_write_position_3506() -> Result<()> {
         ("[1,2]", "[paths(..)]|length", "2"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(code, 0, "#3506:  on {input}: {stderr:?}");
-        assert_eq!(stdout.trim_end(), expected, "#3506:  on {input}");
+        assert_eq!(code, 0, "#3506: `{filter}` on {input}: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "#3506: `{filter}` on {input}");
     }
     for (input, filter, message) in [
         (
@@ -68455,13 +68455,78 @@ fn test_array_key_in_path_and_write_position_3506() -> Result<()> {
             ".[[1]]? |= 9",
             "Cannot update field at array index of array",
         ),
+        (
+            "[1,2]",
+            "delpaths([[[1],[0]]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[9],[0]]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[1],\"a\"]])",
+            "Cannot delete string element of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[1],0,\"x\"]])",
+            "Cannot delete fields from number",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[1],0,0]])",
+            "Cannot delete fields from number",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[1],0]])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[2],0]])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "[delpaths([[[1],5]])]",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[[1,2]]",
+            "delpaths([[0,[1],0]])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]][[0]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]]|.[0])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]][0][0])",
+            "Cannot index number with number",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]][0].a)",
+            "Cannot index number with string \"a\"",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(code, 5, "#3506:  on {input}: {stdout:?}");
-        assert!(stdout.is_empty(), "#3506: : {stdout:?}");
+        assert_eq!(code, 5, "#3506: `{filter}` on {input}: {stdout:?}");
+        assert!(stdout.is_empty(), "#3506: `{filter}`: {stdout:?}");
         assert!(
             stderr.contains(message),
-            "#3506:  on {input}: wanted {message:?}, got {stderr:?}"
+            "#3506: `{filter}` on {input}: wanted {message:?}, got {stderr:?}"
         );
     }
     Ok(())
@@ -68471,9 +68536,17 @@ fn test_array_key_in_path_and_write_position_3506() -> Result<()> {
 /// still refused with the same message everywhere it was.
 #[test]
 fn test_array_key_in_path_and_write_position_yq_mode_unchanged_3506() -> Result<()> {
-    for filter in [".a[[1]] = 5", "del(.a[[1]])", ".a[[1]] |= 5", "[.a[[1]]]"] {
+    // `setpath` is `--jq-extensions` surface there, and the array key is still
+    // refused through it (#3506 review).
+    for filter in [
+        ".a[[1]] = 5",
+        "del(.a[[1]])",
+        ".a[[1]] |= 5",
+        "[.a[[1]]]",
+        "setpath([\"a\",[1]]; 5)",
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .args(["yq", "-o", "json", "-I", "0", filter])
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -68487,9 +68560,12 @@ fn test_array_key_in_path_and_write_position_yq_mode_unchanged_3506() -> Result<
             })?;
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("Cannot index array with array"),
-            "#3506 (yq): : {output:?}"
+            "#3506 (yq): `{filter}`: {output:?}"
         );
-        assert!(output.stdout.is_empty(), "#3506 (yq): : {output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "#3506 (yq): `{filter}`: {output:?}"
+        );
     }
     Ok(())
 }
