@@ -50279,6 +50279,39 @@ fn test_bare_first_is_a_path_step_in_yq_3551() -> Result<()> {
     Ok(())
 }
 
+/// `del(first)` is `del(.[0])` as far as the presentation goes: the comments
+/// move with their items and the anchors stay on the right ones (#3551). The
+/// reconcile pass knew `.[0]` as a static path step but not bare `first`, so a
+/// delete through it fell back to positional lockstep, which put `# one` on the
+/// second item and swapped `&x` and `&y`. The comment rows were captured from
+/// Homebrew `yq` v4.53.3; the anchor rows equal `del(.[0])`'s (real yq keeps a
+/// dangling `*x` there, which succinctly deliberately never emits).
+#[test]
+fn test_del_first_keeps_comments_and_anchors_with_their_items_3551() -> Result<()> {
+    let commented = "# head\n- 1 # one\n- 2 # two\n- 3 # three\n";
+    let (out, code) = run_yq_stdin("del(first)", commented, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "# head\n- 2 # two\n- 3 # three\n");
+    let (index_form, _) = run_yq_stdin("del(.[0])", commented, &[])?;
+    assert_eq!(out, index_form, "#3551: `del(first)` vs `del(.[0])`");
+
+    let anchored = "- &x 1\n- &y 2\n- *x\n";
+    let (out, code) = run_yq_stdin("del(first)", anchored, &[])?;
+    assert_eq!(code, 0);
+    let (index_form, _) = run_yq_stdin("del(.[0])", anchored, &[])?;
+    assert_eq!(
+        out, index_form,
+        "#3551: anchors, `del(first)` vs `del(.[0])`"
+    );
+    assert!(out.starts_with("- &y 2\n"), "#3551: {out:?}");
+
+    // A write keeps the target's comment, as `.[0] = 9` does.
+    let (out, code) = run_yq_stdin("first = 9", commented, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "# head\n- 9 # one\n- 2 # two\n- 3 # three\n");
+    Ok(())
+}
+
 /// On a mapping real yq's `first` names the first *key*, and assigning through
 /// it renames that key (`first = 9` on `{a: 1}` is `{"9":1}`). There is no path
 /// component for a key rename here, so the write is refused loudly rather than

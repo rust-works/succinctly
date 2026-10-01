@@ -1438,9 +1438,16 @@ Two shapes still differ:
   delete through bare `first` on a mapping is refused (`bare first on a mapping names its first
   key; writing through it (renaming the key) is not supported`) rather than dropped. Reading
   `first` on a mapping is also still `Cannot index object with number`, where yq answers the key.
+  The refusal covers every path-resolving use of `first`, not only writes: in a mixed stream
+  (`(.[] | first) = 5` over `[[1,2],{a: 1}]`) the one mapping element aborts the whole
+  expression with nothing partially applied, where yq renames that key and writes the rest.
 - **A comma over `null` or an empty sequence**: `(first, .[1]) = 7` on `null` or `[]` is
   `[7,7]` in yq, because the sibling path creates the sequence `first` then lands on; here it is
   `[null,7]`.
+
+Under `--jq-extensions`, `path(first)` on an empty sequence or `null` yields no path (yq has no
+`path`), where `path(nth(0))` yields `[0]`: bare `first` follows yq's operator there, not jq's
+`.[0]`.
 
 Not changed here: real yq reads bare `first` only at the head of an expression (`.a | first` is
 `'|' expects 2 args but there is 1`), where `succinctly yq` applies it after a pipe as it does in
