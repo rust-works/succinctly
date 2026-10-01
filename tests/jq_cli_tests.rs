@@ -68664,6 +68664,19 @@ fn test_array_key_in_path_and_write_position_yq_mode_unchanged_3506() -> Result<
 // #3550: bare `nth(n)` is a path step
 // ============================================================================
 
+/// Rows the `-n` (literal input) leg of `test_bare_nth_is_a_path_step_3550`
+/// runs, jq 1.7.1's answers.
+const NTH_LITERAL_ROWS_3550: [(&str, &str, &str); 8] = [
+    ("[1,2,3]", "path(nth(1))", "[1]"),
+    ("[1,2,3]", "[path(nth(0,2))]", "[[0],[2]]"),
+    ("{\"a\":[1,2,3]}", "path(.a|nth(1))", "[\"a\",1]"),
+    ("null", "path(nth(1))", "[1]"),
+    ("[1,2,3]", "nth(1) = 9", "[1,9,3]"),
+    ("[1,2,3]", "nth(1) |= . + 10", "[1,12,3]"),
+    ("[1,2,3]", "del(nth(1))", "[1,3]"),
+    ("[[1,2],[3,4]]", "(.[]|nth(1)) = 0", "[[1,0],[3,0]]"),
+];
+
 /// jq defines `nth($n)` as `.[$n]`, so in `path()` and under a write it extends
 /// the path by that component, as bare `first`/`last` do (#3545). `$n` is a value
 /// generator, so a comma fans out; a `null` input names the position
@@ -68742,6 +68755,14 @@ fn test_bare_nth_is_a_path_step_3550() -> Result<()> {
         assert_eq!(code, 0, "#3550: `{filter}` on {input}: {stderr:?}");
         assert_eq!(stdout.trim_end(), expected, "#3550: `{filter}` on {input}");
     }
+    // The same rows on a literal input (`-n`), which takes the owned-value
+    // route rather than the document cursor.
+    for (input, filter, expected) in NTH_LITERAL_ROWS_3550 {
+        let program = format!("{input} | {filter}");
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &program], None)?;
+        assert_eq!(code, 0, "#3550 (-n): `{program}`: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "#3550 (-n): `{program}`");
+    }
     for (input, filter, message) in [
         (
             "[1,2,3]",
@@ -68781,6 +68802,56 @@ fn test_bare_nth_is_a_path_step_3550() -> Result<()> {
         assert!(
             stderr.contains(message),
             "#3550: `{filter}` on {input}: wanted {message:?}, got {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Real yq has no `nth` (its lexer rejects it), so under `--jq-extensions` it
+/// means what jq defines, `.[$n]`: every form below answers exactly what the
+/// spelled-out index does in yq mode (#3550). Before, the write forms were
+/// silent no-ops (exit 0) and `path(nth(1))` printed nothing.
+#[test]
+fn test_bare_nth_is_the_index_step_in_yq_extensions_3550() -> Result<()> {
+    for (nth_form, index_form) in [
+        ("nth(1)", ".[1]"),
+        ("nth(-1)", ".[-1]"),
+        ("nth(1) = 9", ".[1] = 9"),
+        ("nth(1) |= . + 10", ".[1] |= . + 10"),
+        ("nth(-1) |= . + 10", ".[-1] |= . + 10"),
+        ("nth(5) = 9", ".[5] = 9"),
+        ("del(nth(1))", "del(.[1])"),
+        ("[path(nth(0,2))]", "[path(.[0,2])]"),
+    ] {
+        let run = |filter: &str| -> Result<String> {
+            let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    child
+                        .stdin
+                        .take()
+                        .expect("piped")
+                        .write_all(b"- 1\n- 2\n- 3\n")?;
+                    child.wait_with_output()
+                })?;
+            assert!(
+                output.status.success(),
+                "#3550 (yq): `{filter}`: {output:?}"
+            );
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_string())
+        };
+        let got = run(nth_form)?;
+        assert!(!got.is_empty(), "#3550 (yq): `{nth_form}` printed nothing");
+        assert_eq!(
+            got,
+            run(index_form)?,
+            "#3550 (yq): `{nth_form}` vs `{index_form}`"
         );
     }
     Ok(())

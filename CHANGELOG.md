@@ -432,15 +432,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged: real yq's `first` is a different, root-only operator (`first = 9`
   works at the head of an expression, `.a | first` is an error, `last` is a
   lexer error), which is tracked in #3551. Bare `nth(n)` is the same gap and is
-  tracked in #3550.
+  fixed in the entry below (#3550).
 
 - **jq: bare `nth(n)` is a path step** (#3550). jq defines the one-argument `nth($n)` as
   `.[$n]`, so `[1,2,3] | path(nth(1))` is `[1]`, and `nth(1) = 9`, `nth(1) |= .+1`,
   `del(nth(1))` and `pick(nth(1))` write through it, as do a generator (`[path(nth(0,2))]` is
   `[[0],[2]]`), a negative index and an object's string key. They raised `Invalid path
   expression with result 2`, and on a `null` input `path(nth(1))` answered `[]` where jq
-  answers `[1]`. `nth(n; f)` and `.[n]` already worked. `succinctly yq` is unchanged: its
-  `nth` is a `--jq-extensions` builtin whose path semantics nothing has pinned.
+  answers `[1]`. `nth(n; f)` and `.[n]` already worked. `succinctly yq --jq-extensions` gets the
+  same, since real yq has no `nth` and the extension means what jq defines: `nth(1) = 9` was a
+  silent no-op (exit 0) and `path(nth(1))` printed nothing there.
 
 - **jq: `getpath` reads an array segment on an array as jq's subarray search**
   (#2429, part of #3506). `[10,20] | getpath([[0],[1]])` is `[]` and
