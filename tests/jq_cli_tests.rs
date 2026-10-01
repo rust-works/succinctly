@@ -83839,3 +83839,31 @@ fn test_destructuring_bind_wide_pattern_binds_by_value_3466() -> Result<()> {
     );
     Ok(())
 }
+
+/// #3466: the destructuring bind moved to `fanout_arg_each_generic_with_origin`,
+/// which left the decode-failure arm of `fanout_arg_each_generic` -- the
+/// count-argument fan-out of `limit`/`nth`/`skip` -- with no caller in the
+/// suite that reached it (the PR's own coverage comment: `eval_generic.rs`
+/// `Err(control) => return escape.stop(control)` went covered -> uncovered).
+/// A count argument that navigates to a corrupt string must raise the decode
+/// failure rather than be read as a count, for a scalar and an iterated `n`.
+#[test]
+fn test_count_argument_decode_failure_raises_limit_nth_skip_3466() -> Result<()> {
+    for (filter, input) in [
+        ("limit(.a; 1)", r#"{"a":"\q"}"#),
+        ("nth(.a; 1,2)", r#"{"a":"\q"}"#),
+        ("[skip(.a; 1,2)]", r#"{"a":"\q"}"#),
+        ("limit(.a[]; 1)", r#"{"a":["\q"]}"#),
+        ("nth(.a[]; 1)", r#"{"a":["\q"]}"#),
+        ("[skip(.a[]; 1,2)]", r#"{"a":["\q"]}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert!(stdout.is_empty(), "{filter}: {stdout:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
