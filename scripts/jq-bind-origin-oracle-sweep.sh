@@ -86,6 +86,16 @@
 # refuses). The sibling/rebuilt/ambiguous rows are carried as `agree` rows:
 # both binaries must exit 5.
 #
+# The `destructure-bind-node-*` rows are #3466: a variable bound by a
+# destructuring pattern in *value* position (`. as {a:{b:$z}} | path(.a.b |
+# $z)`) keeps the document node it was read from, exactly as a plain `as $x`
+# does, because the pattern walk follows the source's cursor in lockstep with
+# the owned value (`CursorPatternMode`, `src/jq/eval.rs`). Not to be confused
+# with the `destructure-*` rows above, where the pattern sits *inside*
+# `path()`. The sibling/rebuilt/other-variable rows are `agree` rows -- both
+# binaries must exit 5 -- and the one refuse-only row is a *constructed*
+# source, which has no node to follow.
+#
 # The `scalar-*` rows are #3182's oracle matrix for scalar node identity: a
 # string or number literal root/element bound by `as` and re-materialized by a
 # placement (`{k:.} | .k`, `[.] | .[0]`, `[.] | add`), and, captured live, every
@@ -101,8 +111,9 @@
 # #3191 a scalar gets storage identity only when a plain `as` bind promotes it
 # (`SharableString::promote`, at `embed_table_push`), which costs nothing for a
 # scalar nothing binds. The placements and passthroughs agree; what stays
-# refuse-only below (the safe direction) is the bridged-builtin class, a
-# destructuring bind, and jq's constant pool, each with its reason.
+# refuse-only below (the safe direction) is the bridged-builtin class and
+# jq's constant pool, each with its reason (a destructuring bind answers since
+# #3466 -- see the `destructure-bind-node-*` rows).
 #
 # The `owned-embed-*` rows are #2889 Phase 2: an *identity* bind (`. as $x`)
 # whose value is later re-materialized by an embedding stage jq keeps the
@@ -589,6 +600,36 @@ owned-scalar-bind-input-written-node	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as
 owned-scalar-bind-input-computed-string	{"a":{"b":"x"}} {"a":{"b":"x"}}	input | (.a.b + "") as $z | path(.a.b | $z)
 owned-scalar-bind-input-computed-array	{"a":{"b":[1]}} {"a":{"b":[1]}}	input | (.a.b | [.[0]]) as $z | path(.a.b | $z)
 owned-scalar-bind-input-max-first-equal	{"a":[1,1,1]} {"a":[1,1,1]}	input | (.a | max) as $z | [path(.a[0] | $z)]
+destructure-bind-node-scalar-object	{"a":{"b":1,"c":0}}	. as {a:{b:$z}} | path(.a.b | $z)
+destructure-bind-node-scalar-navigated-source	{"a":{"b":1,"c":0}}	.a as {b:$z} | path(.a.b | $z)
+destructure-bind-node-scalar-alt	{"a":{"b":1,"c":0}}	. as [$z] ?// {a:{b:$z}} | path(.a.b | $z)
+destructure-bind-node-scalar-alt-first	{"a":{"b":1,"c":0}}	. as {a:{b:$z}} ?// [$z] | path(.a.b | $z)
+destructure-bind-node-container	{"a":{"b":1,"c":0}}	. as {a:$v} | path(.a | $v)
+destructure-bind-node-container-relocated	{"a":{"b":1,"c":0}}	. as {a:$v} | {k:.a} | path(.k | $v)
+destructure-bind-node-container-nested-bind	{"a":{"b":1,"c":0}}	. as {$a:{b:$z}} | [path(.a.b | $z), path(.a | $a)]
+destructure-bind-node-shorthand	{"a":{"b":1,"c":0}}	. as {$a} | path(.a | $a)
+destructure-bind-node-computed-key	{"a":{"b":1,"c":0}}	. as {("a"):{("b"):$z}} | path(.a.b | $z)
+destructure-bind-node-multi-key	{"a":{"b":1,"c":2},"d":[3,{"e":4}]}	. as {a:{c:$c,b:$b},d:[$x,{e:$e}]} | [path(.a.c | $c), path(.a.b | $b), path(.d[0] | $x), path(.d[1].e | $e)]
+destructure-bind-node-array-first	[1,1]	. as [$a,$b] | path(.[0] | $a)
+destructure-bind-node-array-second	[1,1]	. as [$a,$b] | path(.[1] | $b)
+destructure-bind-node-array-nested	[[1,2],[3]]	. as [[$p,$q],[$r]] | [path(.[0][1] | $q), path(.[1][0] | $r)]
+destructure-bind-node-null-bool	{"a":{"b":null,"c":true}}	. as {a:{b:$n,c:$t}} | [path(.a.b | $n), path(.a.c | $t)]
+destructure-bind-node-del	{"a":{"b":1,"c":0}}	. as {a:{b:$z}} | del(.a.b | $z)
+destructure-bind-node-del-container	{"a":{"b":1,"c":0}}	. as {a:$v} | del(.a | $v)
+destructure-bind-node-assign	{"a":{"b":1,"c":0}}	. as {a:{b:$z}} | (.a.b | $z) = 7
+destructure-bind-node-update	{"a":{"b":1,"c":0}}	. as {a:{b:$z}} | (.a.b | $z) |= 7
+destructure-bind-node-compound	{"a":{"b":1,"c":0}}	. as {a:{b:$z}} | (.a.b | $z) += 5
+destructure-bind-node-new-container	{"a":{"b":1,"c":0}}	. as {a:{b:$z}} | [.a.b] | path(.[0] | $z)
+destructure-bind-node-sibling-equal-refuses	{"a":{"b":1,"c":1}}	. as {a:{b:$z}} | path(.a.c | $z)
+destructure-bind-node-sibling-equal-navigated-refuses	{"a":{"b":1,"c":1}}	.a as {b:$z} | path(.a.c | $z)
+destructure-bind-node-array-sibling-refuses	[1,1]	. as [$a,$b] | path(.[0] | $b)
+destructure-bind-node-array-other-var-refuses	[1,1]	. as [$a,$b] | path(.[1] | $a)
+destructure-bind-node-other-var-refuses	{"a":{"b":1,"c":2},"d":[3,{"e":4}]}	. as {a:{c:$c,b:$b}} | path(.a.b | $c)
+destructure-bind-node-rebuilt-parent-refuses	{"a":{"b":1,"c":0}}	. as {a:{b:$z}} | .a.c = 1 | path(.a.b | $z)
+destructure-bind-node-rewritten-node-refuses	{"a":{"b":1,"c":0}}	. as {a:{b:$z}} | .a.b |= 5 | path(.a.b | $z)
+destructure-bind-node-rebuilt-container-refuses	{"a":{"b":1,"c":0}}	. as {a:$v} | .a.b |= 5 | path(.a | $v)
+destructure-bind-node-computed-use-refuses	{"a":{"b":1,"c":0}}	. as {a:{b:$z}} | path(.a.b | $z | . + 0)
+destructure-bind-node-constructed-source-refuse-only	{"a":{"b":1,"c":0}}	[.a.b] as [$z] | path(.a.b | $z)
 navigated-bind-input-root	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | path($y)
 owned-root-input-assign	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | ($y.b) = 9
 owned-root-input-del	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | del($y.b)
@@ -1056,7 +1097,7 @@ scalar-string-keeps-strings-filter:#3191 -- a bound scalar has storage identity 
 scalar-number-keeps-numbers-filter:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
 scalar-string-keeps-walk:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
 scalar-string-keeps-reduce-rebind:#3191 -- a fold rebinding the value as its own accumulator (`reduce . as $y (null; $y)`) runs its UPDATE through the owned re-index bridge (the #2889 owned-embed-fold-if-identity mechanism), which hands path() a fresh copy
-scalar-string-keeps-destructure-alt:#3191 -- only a plain `as $x` bind promotes a scalar; a destructuring bind (`as [$a] ?// $a`) materializes its variable fresh, so `$a` is a copy of the node `$x` holds rather than its storage
+destructure-bind-node-constructed-source-refuse-only:#3466 -- an element of a freshly constructed source has no document node behind it, and #3191 declined to carry identity through construction (an Rc per element), so `[.a.b] as [$z] | path(.a.b | $z)` refuses where jq answers; a destructuring of a document node answers
 scalar-number-keeps-abs:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
 scalar-number-keeps-max-by-one:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy
 scalar-number-keeps-setpath-empty:#3191 -- a bound scalar has storage identity since #3191, but this builtin is bridged through the owned re-index round trip (the class #3178 closed only for sort/unique/reverse/to_entries/getpath), which hands path() a fresh copy

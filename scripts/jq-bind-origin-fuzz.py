@@ -77,6 +77,15 @@ container it sits in; the trap is an equal-valued scalar at a sibling,
 under a moved root, or reached by iteration, which must keep refusing.
 Off by default (`--positional-bind-p`) so existing seeds keep their stream.
 
+#3466 adds the DESTRUCTURE_BIND family: a *destructuring* bind made in value
+position (`. as {a:{b:$v}} | path(.a.b | $v)`), drawn from the same `PATTERNS`
+pool, then used the way POSITIONAL binds are -- below the resolver's root,
+after a write or rebuild, at an equal-valued sibling -- so the pattern walk's
+cursor (which names the node a variable came from) is the thing under test.
+The trap is a variable read at a node it does not sit at, which must keep
+refusing. Off by default (`--destructure-bind-p`) so existing seeds keep
+their stream.
+
 Usage:
     cargo build --release --features cli
     ./scripts/jq-bind-origin-fuzz.py [--bin PATH] [--jq PATH] [-n N] [--seed S] [--show K]
@@ -530,6 +539,33 @@ def positional_bind_program(rng):
         target = rng.choice(POSITIONAL_TARGETS)
     return f"{src} as $y | {prefix}" + rng.choice(POSITIONAL_WRAPS) % target
 
+# #3466: see the module docstring. The variable comes from a pattern in
+# value position, so what is checked is the node the walk followed for it.
+DESTRUCTURE_BIND_SOURCES = [".", ".", ".", ".x", ".a", ".c", ".arr", ".x | .", "(.a, .c)"]
+DESTRUCTURE_BIND_STAGES = [
+    ".a = 1", ".x.a = 1", ".c |= .", ".a.b? = 5", "(. + {})", "(tojson | fromjson)",
+    "del(.d)", "(.x.c |= .)", "first(.)", "select(true)",
+]
+DESTRUCTURE_BIND_ROUTE_P = 0.3
+
+def destructure_bind_program(rng):
+    src = rng.choice(DESTRUCTURE_BIND_SOURCES)
+    pat, use = rng.choice(PATTERNS)
+    v, w = "$dv", "$dw"
+    pat = pat.replace("V", v).replace("W", w)
+    use = use.replace("V", v).replace("W", w)
+    stage = "" if rng.random() < 0.7 else " | " + rng.choice(DESTRUCTURE_BIND_STAGES)
+    prefix = rng.choice(POSITIONAL_PREFIXES)
+    if rng.random() < 0.4 and not prefix.strip().startswith("."):
+        target = rng.choice(POSITIONAL_SOURCES)
+    else:
+        target = rng.choice(POSITIONAL_TARGETS)
+    wrap = rng.choice(POSITIONAL_WRAPS).replace("$y", use)
+    body = f"{src} as {pat}{stage} | {prefix}" + wrap % target
+    if rng.random() < DESTRUCTURE_BIND_ROUTE_P:
+        return rng.choice(ROUTES) % body, True
+    return body, False
+
 def route_program(rng, d):
     v = "$x"
     prefix = rng.choice(["", "", ".x | "])
@@ -644,6 +680,11 @@ def main():
                     help="probability a program is a positional-bind program (#3134): a navigated "
                          "bind used below the resolver's root. Off by default so existing seeds "
                          "keep their stream; run at 1.0 to weight the sweep onto the mint")
+    ap.add_argument("--destructure-bind-p", type=float, default=0.0,
+                    help="probability a program is a destructure-bind program (#3466): a "
+                         "destructuring bind in value position, its variable used below the "
+                         "resolver's root. Off by default so existing seeds keep their stream; "
+                         "run at 1.0 to weight the sweep onto the pattern walk's cursor")
     ap.add_argument("--empty-p", type=float, default=0.0,
                     help="probability a document holds equal-valued empty `{}`/`[]` siblings "
                          "(#3180). The stock leaves have none, so the empty-container bind is "
@@ -672,7 +713,9 @@ def main():
                            ("POSITIONAL_SOURCES", POSITIONAL_SOURCES),
                            ("POSITIONAL_PREFIXES", POSITIONAL_PREFIXES),
                            ("POSITIONAL_TARGETS", POSITIONAL_TARGETS),
-                           ("POSITIONAL_WRAPS", POSITIONAL_WRAPS)]:
+                           ("POSITIONAL_WRAPS", POSITIONAL_WRAPS),
+                           ("DESTRUCTURE_BIND_SOURCES", DESTRUCTURE_BIND_SOURCES),
+                           ("DESTRUCTURE_BIND_STAGES", DESTRUCTURE_BIND_STAGES)]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
@@ -699,6 +742,10 @@ def main():
             f = positional_bind_program(rng)
         elif a.embed_write_p and rng.random() < a.embed_write_p:
             f = embed_write_program(rng)
+        elif a.destructure_bind_p and rng.random() < a.destructure_bind_p:
+            f, twice = destructure_bind_program(rng)
+            if twice:
+                d = d + "\n" + d
         elif r < TRACKED_ARRAY_P:
             f = tracked_array_program(rng)
         elif r < TRACKED_ARRAY_P + (1.0 - TRACKED_ARRAY_P) * route_p:

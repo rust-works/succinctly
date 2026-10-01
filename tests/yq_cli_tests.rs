@@ -49387,3 +49387,22 @@ fn test_tonumber_on_a_tagged_number_ignores_the_tag_3191() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3466: a destructuring bind follows the source's document node in jq
+/// mode only (ADR-0018: the mode decides). `succinctly yq` reads the
+/// variable as it always did, and a `path()` that steps through it (behind
+/// `--jq-extensions`, since real yq's lexer rejects both the pattern and
+/// `path(f)`) still yields nothing rather than certifying a node.
+#[test]
+fn test_destructuring_bind_yq_mode_unchanged_3466() -> Result<()> {
+    let input = "a: {b: 1, c: 0}\n";
+    let (stdout, code) = run_yq_stdin(". as {a:{b:$z}} | $z", input, &[])?;
+    assert_eq!((stdout.as_str(), code), ("1\n", 0));
+    let (stdout, code) = run_yq_stdin(
+        ". as {a:{b:$z}} | [path(.a.b | $z)]",
+        input,
+        &["--jq-extensions", "-o", "json", "-I0"],
+    )?;
+    assert_eq!((stdout.as_str(), code), ("[]\n", 0));
+    Ok(())
+}

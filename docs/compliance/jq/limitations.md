@@ -1369,7 +1369,7 @@ is the revert that established what the other one costs.
    | Filter                                                                                                                                                                                              | Why still refused                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
    | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
    | `input \| . as $x \| [.] \| .[0] \| path($x)` on `1`                                                                                                                                                | a scalar read through `input` has no node: `eval.rs`'s bind sites mint none for a scalar (a scalar `StandardJson` keeps no cursor), so there is nothing for #3191's bind-time promotion to register. The plain-route twin (`. as $x \| [.] \| path(.[0] \| $x)` on `1`) answers since #3191; the sweep's `scalar-*` family is the full matrix                                                                                                                                                                                                                                           |
-   | `. as $x \| ltrimstr("z") \| path($x)` (and a no-match `sub`/`rtrimstr`, `abs`, `strings`, `numbers`, `walk(.)`, `setpath([]; .)`, `tostring \| tostring`, `reduce . as $y (null; $y)`) on a scalar | #3191 gives a bound string or number literal storage identity, but these builtins run through the owned re-index round trip, which hands `path()` a fresh copy -- the scalar twin of the bridged-builtin residual above. Two more stay refused for reasons of their own: a destructuring bind (`. as [$a] ?// $a`) materializes its variable fresh rather than through `embed_table_push`, and jq's constant pool (`def f: 5; f as $x \| f \| path($x)` is one `jv`) has no counterpart here, where each evaluation of a literal is a fresh value. The sweep's `scalar-*` rows pin each |
+   | `. as $x \| ltrimstr("z") \| path($x)` (and a no-match `sub`/`rtrimstr`, `abs`, `strings`, `numbers`, `walk(.)`, `setpath([]; .)`, `tostring \| tostring`, `reduce . as $y (null; $y)`) on a scalar | #3191 gives a bound string or number literal storage identity, but these builtins run through the owned re-index round trip, which hands `path()` a fresh copy -- the scalar twin of the bridged-builtin residual above. One more stays refused for a reason of its own: jq's constant pool (`def f: 5; f as $x \| f \| path($x)` is one `jv`) has no counterpart here, where each evaluation of a literal is a fresh value. The sweep's `scalar-*` rows pin each                                                                                                                       |
    | `. as $x \| .a as $y \| [.] \| path(.[0].a \| $y)`                                                                                                                                                  | `$x` is bound first, so `[.]` reuses `$x`'s own value, whose `.a` is `$x`'s materialization, not `$y`'s: sharing it needs an *ancestor* lookup when `$y` is bound, the mirror of #3179's nested reuse (jq `[0,"a"]`; the other bind order answers since #3179)                                                                                                                                                                                                                                                                                                                          |
    | `reduce (1) as $i (.; if true then . else 1 end) \| path($x)`                                                                                                                                       | the UPDATE is not one of the owned fast paths (`eval_owned_navigation`/`eval_owned_relocating_fold`), so the fold's own hoisted per-step reroot rebuilds the accumulator before `path($x)` reads it                                                                                                                                                                                                                                                                                                                                                                                     |
    | `reduce (.) as $x (.; path($x))`                                                                                                                                                                    | a fold's own loop variable is a literal, never a marker ([#3329](https://github.com/rust-works/succinctly/issues/3329)); the owned fold input ([#3328](https://github.com/rust-works/succinctly/issues/3328)) and `-n` owned-identity ([#3331](https://github.com/rust-works/succinctly/issues/3331)) rows that shared this cell answer since #3069                                                                                                                                                                                                                                     |
@@ -1398,7 +1398,7 @@ is the revert that established what the other one costs.
    for the node that went in. On a 2124-row stage-by-tail sweep (`. as $x | STAGE | TAIL` over
    60 stages and 12 `path()`/write tails), rows refused where jq answers went from 434 to 44,
    and no row answers where jq refuses. The 44 are the fold loop variable (#3329) and
-   destructuring binds (`as {a:$v}`, `?//`). Pinned in
+   destructuring binds (`as {a:$v}`, `?//`; those answer since #3466, below). Pinned in
    `test_bridge_provenance_keeps_path_identity_3069` and
    `test_bridge_provenance_never_certifies_a_rebuilt_copy_3069`.
 
@@ -1833,6 +1833,36 @@ is the revert that established what the other one costs.
    its pre-existing fall-through, yielding nothing at exit 0 rather than raising, because the
    generic evaluator's path bridge has no case for a `Pattern` other than a single bare `Var`.
    `test_as_pattern_arm_is_jq_mode_only_2649` pins that outcome as unaffected by this change.
+
+   **A destructured variable keeps its node in value position too
+   ([#3466](https://github.com/rust-works/succinctly/issues/3466)).** The arm above is the
+   pattern *inside* `path()`. A pattern bind that runs *before* it (`. as {a:{b:$z}} \|
+   path(.a.b \| $z)`, `.a as {b:$z} \| ...`, a `?//` chain, a computed key, an array
+   position) used to bind each variable from an owned copy, so no variable had a node and jq's
+   `["a","b"]` was refused with "Invalid path expression with result 1" -- for a container
+   (`. as {a:$v} \| path(.a \| $v)`) as much as a scalar. The pattern walk now also steps the
+   source's cursor in lockstep with the owned value (`CursorPatternMode`, `src/jq/eval.rs`; an
+   object member by key, the **last** one when a key repeats, an array element by position, a
+   negative one from the end), and each variable's `BindOrigin::Node` goes through the same
+   `embed_table_push`/`embed_anchor_push` a plain `as $x` does, so #3191's storage identity and
+   #3134's anchor certify it. Every step the cursor cannot prove -- a float or slice-descriptor
+   key, a missing key, a scalar, a member whose key has no display string -- drops the cursor
+   and binds by value, which is the refusal it always was, so identity is only ever minted for
+   the node the walk followed. It is gated exactly like #3191's promotion: jq mode only, a
+   program that reads a variable in path position (`AnchorScope != Off`), and a pattern of at
+   most 64 entries (each step scans its container's members). A destructured `$z` is a *child*
+   of its source, never the source, so an `. as {a:$v}` bind is not an identity passthrough.
+   Pinned by `test_destructuring_bind_keeps_node_identity_3466` (every row captured from jq
+   1.7.1), its must-refuse twin `test_destructuring_bind_controls_refuse_3466`, and the sweep's
+   `destructure-bind-node-*` rows. **Still refuse-only:** the source is a *constructed* value --
+   `[.a.b] as [$z] \| path(.a.b \| $z)` is `["a","b"]` in jq, whose array holds the very `jv`,
+   but an element of a freshly built array has no node here, and carrying identity through
+   construction is the per-element `Rc` #3191 declined. The routes that bind a pattern from an
+   *owned* value stay by-value too, so they refuse as they did: a `reduce`/`foreach` loop
+   pattern, a fold UPDATE (`reduce (1) as $i (.; . as {a:$v} \| path(.a \| $v))`, jq `["a"]`),
+   the owned-identity pipe (`-n 'input \| . as {a:$v} \| ...'`) and a pattern over a scalar the
+   borrowed evaluator reaches -- none has a cursor to follow. A pattern wider than 64 entries
+   binds by value as well. `succinctly yq` is unchanged.
 
    `?//` alternatives retry as they do in value mode, with one deliberate exception: the
    **artefact guard**. This resolver can raise refusals jq never raises — until

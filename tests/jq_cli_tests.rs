@@ -82259,6 +82259,140 @@ fn test_resolver_frame_position_is_spelling_insensitive_3464() -> Result<()> {
     ])
 }
 
+/// #3466: a variable bound by a destructuring pattern keeps the identity of
+/// the document node it was read from, so it is a valid path step wherever
+/// jq's `jv_identical` holds -- exactly as an `as $x` bind's does (#3191,
+/// #3134). Every row is captured from jq 1.7.1; the pattern walk follows the
+/// source's node in lockstep with the owned value (`CursorPatternMode`), for
+/// an object key, an array position, a computed key, a `?//` alternative and
+/// a nested pattern alike.
+#[test]
+fn test_destructuring_bind_keeps_node_identity_3466() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:{b:$z}} | path(.a.b | $z)",
+            "[\"a\",\"b\"]\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r".a as {b:$z} | path(.a.b | $z)",
+            "[\"a\",\"b\"]\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as [$z] ?// {a:{b:$z}} | path(.a.b | $z)",
+            "[\"a\",\"b\"]\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:$v} | path(.a | $v)",
+            "[\"a\"]\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:$v} | {k:.a} | path(.k | $v)",
+            "[\"k\"]\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:{b:$z}} | del(.a.b | $z)",
+            "{\"a\":{\"c\":0}}\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:{b:$z}} | (.a.b | $z) |= 7",
+            "{\"a\":{\"b\":7,\"c\":0}}\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:{b:$z}} | (.a.b | $z) = 7",
+            "{\"a\":{\"b\":7,\"c\":0}}\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:$v} | del(.a | $v)",
+            "{}\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r#". as {("a"):{("b"):$z}} | path(.a.b | $z)"#,
+            "[\"a\",\"b\"]\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {$a:{b:$z}} | [path(.a.b | $z), path(.a | $a)]",
+            "[[\"a\",\"b\"],[\"a\"]]\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:{b:$z}} | first(path(.a.b | $z))",
+            "[\"a\",\"b\"]\n",
+            r"",
+            0,
+        ),
+        (r"[1,1]", r". as [$a,$b] | path(.[1] | $b)", "[1]\n", r"", 0),
+        (r"[1,1]", r". as [$a,$b] | path(.[0] | $a)", "[0]\n", r"", 0),
+        (
+            r"[[1,2],[3]]",
+            r". as [[$p,$q],[$r]] | [path(.[0][1] | $q), path(.[1][0] | $r)]",
+            "[[0,1],[1,0]]\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":2},"d":[3,{"e":4}]}"#,
+            r". as {a:{c:$c,b:$b},d:[$x,{e:$e}]} | [path(.a.c | $c), path(.a.b | $b), path(.d[0] | $x), path(.d[1].e | $e)]",
+            "[[\"a\",\"c\"],[\"a\",\"b\"],[\"d\",0],[\"d\",1,\"e\"]]\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":null,"c":true}}"#,
+            r". as {a:{b:$n,c:$t}} | [path(.a.b | $n), path(.a.c | $t)]",
+            "[[\"a\",\"b\"],[\"a\",\"c\"]]\n",
+            r"",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r". as [$a] ?// $x | path(.[0] | $a)",
+            "[0]\n",
+            r"",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:{b:$z}} | [.a.b] | path(.[0] | $z)",
+            "[0]\n",
+            r"",
+            0,
+        ),
+    ])
+}
+
 /// #3464: the same rows' other-node twins must keep refusing -- folding
 /// spellings together may only ever name one node, never a neighbour of it
 /// with an equal value.
@@ -83548,5 +83682,192 @@ fn test_assign_rhs_is_lazy_on_the_generic_route_3448() -> Result<()> {
     let (out, err) = run(r#"[.[0] = (1, (2|debug("R")))]"#)?;
     assert_eq!(out, "[[1,\"b\"],[2,\"b\"]]\n[[1,\"2\"],[2,\"2\"]]\n");
     assert_eq!(err.matches("DEBUG").count(), 2, "stderr={err:?}");
+    Ok(())
+}
+
+/// #3466 controls: the walk mints identity only where the cursor proves the
+/// node, so an equal-valued sibling, another variable's node, a write that
+/// rebuilt the parent, and a computed use of `$z` still refuse, exactly as
+/// jq does (every row captured from jq 1.7.1).
+#[test]
+fn test_destructuring_bind_controls_refuse_3466() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"b":1,"c":1}}"#,
+            r". as {a:{b:$z}} | path(.a.c | $z)",
+            "",
+            r"Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":1}}"#,
+            r".a as {b:$z} | path(.a.c | $z)",
+            "",
+            r"Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:{b:$z}} | path(.a.c | $z)",
+            "",
+            r"Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r"[1,1]",
+            r". as [$a,$b] | path(.[0] | $b)",
+            "",
+            r"Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r"[1,1]",
+            r". as [$a,$b] | path(.[1] | $a)",
+            "",
+            r"Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:{b:$z}} | .a.b |= 5 | path(.a.b | $z)",
+            "",
+            r"Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:{b:$z}} | .a |= {b:1,c:0} | path(.a.b | $z)",
+            "",
+            r"Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:$v} | .a.b |= 5 | path(.a | $v)",
+            "",
+            r#"Invalid path expression with result {"b":1,"c":0}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":2},"d":[3,{"e":4}]}"#,
+            r". as {a:{c:$c,b:$b},d:[$x,{e:$e}]} | path(.a.b | $c)",
+            "",
+            r"Invalid path expression with result 2",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1,"c":0}}"#,
+            r". as {a:{b:$z}} | path(.a.b | $z | . + 0)",
+            "",
+            r"Invalid path expression with result 1",
+            5,
+        ),
+    ])
+}
+
+/// #3466 residual, **refuse-only**: an element of a freshly *constructed*
+/// source has no document node behind it, and #3191 declined to carry
+/// identity through construction (an `Rc` per element). jq answers
+/// `["a","b"]` here; succinctly refuses, and `limitations.md` lists it. This
+/// pins the refusal so a change to it is a decision, not an accident.
+#[test]
+fn test_destructuring_bind_constructed_source_stays_refuse_only_3466() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[.a.b] as [$z] | path(.a.b | $z)"],
+        Some(r#"{"a":{"b":1,"c":0}}"#),
+    )?;
+    assert_eq!(code, 5, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("Invalid path expression with result 1"),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #3466: a repeated key binds the last member (jq's own parse and ours agree
+/// on which value the variable holds), and a computed key steps by its
+/// evaluated value -- a literal `0`, a computed `-1`, an out-of-range one --
+/// end to end (rows captured from jq 1.7.1).
+#[test]
+fn test_destructuring_bind_duplicate_and_computed_keys_3466() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1,"a":2}"#,
+            ". as {a:$z} | path(.a | $z)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "[10,20,30]",
+            "0 as $k | . as {($k):$z} | path(.[0] | $z)",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (
+            "[10,20,30]",
+            "(0-1) as $k | . as {($k):$z} | path(.[-1] | $z)",
+            "[-1]\n",
+            "",
+            0,
+        ),
+        (
+            "[10,20,30]",
+            "(0-4) as $k | . as {($k):$z} | path(.[-3] | $z)",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+    ])
+}
+
+/// #3466: a pattern of more than 64 entries binds by value, so the per-step
+/// member scan cannot go quadratic on a very wide one. jq answers both
+/// widths; the 65-entry one is refuse-only here, and is the boundary this
+/// pins (`MAX_TRACKED_PATTERN_ENTRIES`).
+#[test]
+fn test_destructuring_bind_wide_pattern_binds_by_value_3466() -> Result<()> {
+    let pattern = |entries: usize| {
+        let rest: String = (1..entries).map(|i| format!(", $k{i}")).collect();
+        format!(". as {{a:$v{rest}}} | path(.a | $v)")
+    };
+    let input = r#"{"a":{"b":1}}"#;
+    let (stdout, _, code) = run_jq_full(&["-c", &pattern(64)], Some(input))?;
+    assert_eq!((stdout.as_str(), code), ("[\"a\"]\n", 0));
+    let (stdout, stderr, code) = run_jq_full(&["-c", &pattern(65)], Some(input))?;
+    assert_eq!(code, 5, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("Invalid path expression with result"),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #3466: the destructuring bind moved to `fanout_arg_each_generic_with_origin`,
+/// which left the decode-failure arm of `fanout_arg_each_generic` -- the
+/// count-argument fan-out of `limit`/`nth`/`skip` -- with no caller in the
+/// suite that reached it (the PR's own coverage comment: `eval_generic.rs`
+/// `Err(control) => return escape.stop(control)` went covered -> uncovered).
+/// A count argument that navigates to a corrupt string must raise the decode
+/// failure rather than be read as a count, for a scalar and an iterated `n`.
+#[test]
+fn test_count_argument_decode_failure_raises_limit_nth_skip_3466() -> Result<()> {
+    for (filter, input) in [
+        ("limit(.a; 1)", r#"{"a":"\q"}"#),
+        ("nth(.a; 1,2)", r#"{"a":"\q"}"#),
+        ("[skip(.a; 1,2)]", r#"{"a":"\q"}"#),
+        ("limit(.a[]; 1)", r#"{"a":["\q"]}"#),
+        ("nth(.a[]; 1)", r#"{"a":["\q"]}"#),
+        ("[skip(.a[]; 1,2)]", r#"{"a":["\q"]}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert!(stdout.is_empty(), "{filter}: {stdout:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "{filter}: {stderr:?}"
+        );
+    }
     Ok(())
 }
