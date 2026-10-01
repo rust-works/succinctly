@@ -151,6 +151,37 @@ deleted. `cannot_move_register` also stays in use by `FoldRegister::advance` and
 P7/P8 follow the same shape: `register_after`'s four-way decision becomes "read the branch's
 `BranchRegister`", and `computed_at_register` becomes a conversion from it.
 
+**As built in B2 -- two parts of the above could not be exact, and were not done.**
+
+- *The stage rule stays, once.* `stage_preserves_register` is a rule about the whole pipe
+  **stage**, and a leaf producer sees only its leaf. For a compound stage (`(.a // 1)`, an `if`
+  or a `try`/`catch` mixing a navigating and a by-value part) the stage verdict is stricter than
+  any leaf's, and a leaf-local verdict is the truer one: jq backtracks to the fork, so the
+  by-value leaf's register is unmoved. Captured against jq 1.7.1, `path(. as $x | (.a // 1) | $x)`
+  on `{"a":null}`, `path(. as $x | if true then 1 else first(.a) end | $x)` and `path(. as $x |
+  try 1 catch first(.a) | $x)` on `{"a":1}` are all `[]`, where `main` refuses. Lifting the
+  verdict to the leaf would therefore turn each refusal into jq's answer: correct, but a
+  promotion that needs its own rows, not part of making the producers truthful. So `place_step`
+  applies `cannot_move_register(element)` to the register entering the step, in exactly one
+  place, and takes the stricter of the producer's and the stage's answer
+  (`test_path_register_compound_stage_is_refused_as_a_whole_3456` pins the rows).
+  `StepRegisterFacts::stage_preserves_register` and `carry_register` are gone: `reestablishes_register`
+  reads a register the stage has already vouched for.
+- *A carried register has no leaf producer.* `getpath_preserves_register` is `false` whenever the
+  entry is trackable, so the per-branch getpath rule only ever concerns a register carried on an
+  untracked entry, which `untracked_at_register` never sees (it is called with `trackable ==
+  false` and records nothing). In yq mode the frame carries no register at all, yet the carry
+  still applies. The stage rule is that carry's transfer function, applied by `place_step`.
+
+The producers themselves are as D3 says. `leaf_register(expr, trackable, value)` is `None` /
+`Unmoved(entry)` (`cannot_move_register(expr)`) / `LostAt(entry)`, read once per leaf call and
+only while trackable. The drain arms (`last`, `isempty`, `INDEX`) are `LostAt(entry)` (D5). An
+unchecked `[E]` on a trackable entry is `LostSomewhere`, **not** `LostAt`: that is what `main`
+derives today (`untracked_at_register` was handed `trackable && checked`, so it recorded nothing),
+and `LostAt(entry)` would let `guess_refusal` clear a refusal of a `$x` frozen elsewhere and let a
+`try` catch it -- a promotion (rows pinned in
+`test_path_register_drain_producers_lose_the_register_uncatchably_3456`).
+
 ### D4. "Could it" versus "did it"
 
 `cannot_move_register` is a static *could it*. It is sound as a producer rule (cannot implies
@@ -266,11 +297,16 @@ Each step is safe to land on `main` by itself.
   `git grep from_option` is B2's list of producers that must state their own answer, after
   which the adapter is deleted. The D2 assertion landed first and is narrower than the plan
   assumed (section 3, D2).
-- **B2 -- move the rule (D3-D7).** Producers become truthful, `stage_preserves_register`
-  leaves C1, wrappers and `FoldRegister` consume the state, `register_after` collapses to
-  "read the branch". `and_or_negate_resolves_live` keeps its gate, so **no behaviour change on
-  `main`**; a flipped row means the lift was not the same predicate, which is a bug in the
-  lift: stop and diff.
+- **B2 -- producers state their own register (D3, D5; landed).** `BranchRegister` gains
+  `LostAt(Rc<OwnedValue>)` and `LostSomewhere`; `from_option` is deleted; P1, P2, P7, P8 and the
+  `resolve_seq_sink` seed state their own answer; `place_step` reads the branch, applies the
+  stage rule once (section 3, "As built"), and derives `Frame::register_loss` from the lost state
+  instead of re-cloning the entry register. **No behaviour change on `main`**; a flipped row means
+  the lift was not the same predicate, which is a bug in the lift: stop and diff. Not done in B2,
+  and why: `register_after` cannot collapse to "read the branch" while the compound/wrapper
+  producers (`if`, `try`, `//`, `def`, `first` ... under an untracked ambient) are not truthful
+  (it would accept where it answers `None` today); D6's pass-through and D7's `FoldRegister`
+  read of SOURCE's branch both need that too. They are **B2b**, ahead of B3.
 - **B3 -- close #3428.** With `LostAt(entry)` truthful on `first` / `last` / `any` / `nth` /
   `range` / `paths` / `try` / `//` / `if` / `def` operands, drop the
   `register_movement_tracked` precondition from `and_or_negate_resolves_live`. Expected: the
@@ -332,7 +368,8 @@ Each step is safe to land on `main` by itself.
    `{ None, Unmoved(Cow), LostAt(Rc<OwnedValue>), LostSomewhere }`. B2 should use
    `LostAt(Rc<OwnedValue>)`: it costs nothing in `PathBranch`'s size and matches
    `RegisterLoss::LostAt`, so the branch-to-frame conversion in `place_step` moves the `Rc`
-   instead of cloning. (`Frame` is 40 bytes.) Confirm with the same probe on the real type in B2.
+   instead of cloning. (`Frame` is 40 bytes.) **Confirmed in B2 on the real type:**
+   `path_branch_size_is_pinned_3456` still reads 112 bytes with all four variants.
 3. The `Try` negative test in D4.3: where does a lost-frame refusal under `try` get caught
    today, if at all? B2 writes the test first; if it fails on `main`, that is a separate
    Severity-High issue, not folded into this one.

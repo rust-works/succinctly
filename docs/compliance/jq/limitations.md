@@ -928,7 +928,7 @@ is the revert that established what the other one costs.
    `FoldRegister::resolve` supplies `self.value` there whenever `UPDATE`/`EXTRACT` is (under
    any wrapping `Paren`) an `Expr::Pipe` — the shape `$x.a`, `$x.a.b`, `$x[0]`, `5 \| $x.a`,
    ... all parse into. Once seeded, the *existing*, already-oracle-verified stage-to-stage
-   carrying (`reestablishes_register`/`carry_register`, both from #1573/#2041/#2044) takes
+   carrying (`reestablishes_register` and the carry in `resolve_seq_stage`, both from #1573/#2041/#2044) takes
    over unchanged — #2046 adds a new *source* for the carried register, not a new rule for
    recognising it. A bare `$var` with nothing chained after it needed none of this: it was
    already reestablishing directly through `FoldRegister::relocate`'s own `identical()` check.
@@ -955,7 +955,10 @@ is the revert that established what the other one costs.
    `path((.a and .b) \| empty)` on `{"a":1}` refuses near `"b"`, `path(.a and .b)` on
    `{"a":false}` is `["a"]` (so `del`/`=`/`|=` write there), `path(.a and 5)` on `{"a":0}`
    refuses, and a later `$var` re-establishes the register the operator left
-   (`path(.a as $y \| -.a \| $y)` is `["a"]`). Three residuals remain:
+   (`path(.a as $y \| -.a \| $y)` is `["a"]`). The register each branch reports is stated by
+   the leaf that produced it
+   ([#3456](https://github.com/rust-works/succinctly/issues/3456); the contract and its open
+   steps are in `docs/plan/jq-path-register-producer-contract.md`). Three residuals remain:
 
    - **An operand jq navigates inside but this resolver evaluates by value** (`first`, `last`,
      `any`, `nth(n)`, `range`, `paths`, a `try`, a `//`, an `if`, a `def`) keeps the eager
@@ -998,7 +1001,19 @@ is the revert that established what the other one costs.
    `//` also leaves jq's register where it was on inputs this predicate can't tell apart
    statically. Those still drop the register here. Before #3186 these refused, and under `try` the refusal was caught as if it
    were jq's own: `del(. as $v \| {k: .a} \| try ($v \| .[]?))` echoed the document where jq
-   deletes every key. An array is different: jq collects it without a subexp, so its contents
+   deletes every key. The register is also dropped **per stage, not per leaf**: a compound stage
+   that mixes a leaf that navigates with one that does not (`(.a // 1)`, an `if` or a
+   `try`/`catch` of that shape) loses it as a whole, so `path(. as $x \| (.a // 1) \| $x)` on
+   `{"a":null}` and `path(. as $x \| if true then 1 else first(.a) end \| $x)` on `{"a":1}`
+   refuse where jq answers `[]` (backtracking to the fork puts the register back for the
+   by-value leaf). Refuse-only, and pinned
+   (`test_path_register_compound_stage_is_refused_as_a_whole_3456`) so lifting the verdict to
+   the leaf is a deliberate change with rows of its own. The drain builtins are the same kind of
+   case: jq backtracks `last(f)`'s and `INDEX(s; f)`'s source, so `path(. as $x \| last(.l[]) \|
+   $x)` on `{"l":[1,2]}` is `[]` in jq, while here the register is lost at the drain and the
+   later `$x` is refused -- and, since #3267, uncatchably (`isempty(g)` moves it only when `g`
+   emits). Pinned by `test_path_register_drain_producers_lose_the_register_uncatchably_3456`.
+   An array is different: jq collects it without a subexp, so its contents
    are path-checked (`path(. as $x \| {k:.a} \| [.k] \| $x)` raises on the `.k`), and then
    backtracks the register to where the collect began. Since
    [#3263](https://github.com/rust-works/succinctly/issues/3263) an array carries the register
