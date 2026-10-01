@@ -68056,6 +68056,126 @@ fn test_getpath_array_segment_yq_mode_unchanged_2429() -> Result<()> {
 }
 
 // ============================================================================
+// #3453: an array key / array pattern on an array is jq's subarray search
+// ============================================================================
+
+/// `.[$array]`, `indices`, `index` and `rindex` over an array input search for
+/// the *subarray* (`jv_array_indexes`) rather than comparing each element with
+/// the whole pattern: overlapping matches all count, an empty or too-long
+/// needle is `[]` (`null` for `index`/`rindex`), and a scalar pattern is the
+/// one-element needle. A `null`, object or string input still refuses an array
+/// pattern. Every expectation was captured from `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_array_pattern_is_a_subarray_search_3453() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[1,2,1]", "indices([1])", "[0,2]"),
+        ("[1,2,1,2]", "indices([1,2])", "[0,2]"),
+        ("[1,2]", "index([2])", "1"),
+        ("[1,2,1]", "rindex([1])", "2"),
+        ("[[1],2]", "indices([1])", "[]"),
+        ("[[1],2]", "indices([[1]])", "[0]"),
+        ("[1,[1,2],1]", "indices([[1,2]])", "[1]"),
+        ("[1,[1,2],1]", "indices([1])", "[0,2]"),
+        ("[[1,2],1,2]", "index([1,2])", "1"),
+        ("[0,1,2,1,2]", "[index([1,2]), rindex([1,2])]", "[1,3]"),
+        ("[1,2,1]", ".[[1]]", "[0,2]"),
+        ("[0,1,2,1,2]", ".[[1,2]]", "[1,3]"),
+        ("[0,1,2,1,2]", ".[[1,2]]?", "[1,3]"),
+        ("[0,1,2,1,2]", "try .[[1,2]] catch .", "[1,3]"),
+        ("[1,2]", "[.[[1],[2]]]", "[[0],[1]]"),
+        ("[1,2]", "[indices([1],[2])]", "[[0],[1]]"),
+        // A key *navigated* out of the document is read in full, not shaped
+        // (#626's placeholder would have answered `[]`).
+        ("[1,2,3]", ".[.]", "[0]"),
+        ("{\"k\":[1,2],\"v\":[0,1,2,1,2]}", ".v[.k]", "[1,3]"),
+        (
+            "{\"k\":[1,2],\"v\":[0,1,2,1,2]}",
+            "[.v[.k, [2]]]",
+            "[[1,3],[2,4]]",
+        ),
+        ("{\"k\":[1,2],\"v\":{\"a\":1}}", "[.v[.k]?]", "[]"),
+        // Overlap, an empty needle, a needle past the end, a miss.
+        ("[1,1,1]", ".[[1,1]]", "[0,1]"),
+        ("[1,2,1,2,1]", ".[[1,2,1]]", "[0,2]"),
+        ("[1,1,1]", "[index([1,1]), rindex([1,1])]", "[0,1]"),
+        ("[1,2]", ".[[]]", "[]"),
+        ("[1,2]", "indices([])", "[]"),
+        ("[1,2]", "[index([]), rindex([])]", "[null,null]"),
+        ("[1,2]", "indices([1,2,3])", "[]"),
+        ("[1,2]", ".[[2,null]]", "[]"),
+        ("[1,2]", "[index([9]), rindex([9])]", "[null,null]"),
+        // Elements compare as `==` does.
+        ("[1,1.0]", ".[[1]]", "[0,1]"),
+        ("[null]", ".[[null]]", "[0]"),
+        ("[{\"a\":1},{\"a\":1}]", ".[[{\"a\":1}]]", "[0,1]"),
+        ("[1,2,1]", "indices(1)", "[0,2]"),
+        ("[1,2]", "index(null)", "null"),
+        ("[1,2]", "indices(null)", "[]"),
+        // A NaN that is the same value as itself matches (#3069).
+        ("null", "[nan] | . as $a | [$a] | indices([$a])", "[0]"),
+        // `null` input with a non-array pattern is untouched.
+        ("null", "indices(1)", "null"),
+        ("null", "index(1)", "null"),
+        ("null", "indices(\"a\")", "null"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3453: `{filter}` on {input}: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "#3453: `{filter}` on {input}");
+    }
+    // Every other input refuses an array pattern, and `?` suppresses it.
+    for (input, filter, message) in [
+        ("null", "indices([1])", "Cannot index null with array"),
+        ("null", "index([1])", "Cannot index null with array"),
+        ("null", "rindex([1])", "Cannot index null with array"),
+        ("null", ".[[1]]", "Cannot index null with array"),
+        (
+            "\"abc\"",
+            "indices([\"a\"])",
+            "Cannot index string with array",
+        ),
+        (
+            "{\"a\":1}",
+            "indices([1])",
+            "Cannot index object with array",
+        ),
+        ("{\"a\":1}", ".[[1]]", "Cannot index object with array"),
+        ("5", ".[[1]]", "Cannot index number with array"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "#3453: `{filter}` on {input}: {stdout:?}");
+        assert!(stdout.is_empty(), "#3453: `{filter}`: {stdout:?}");
+        assert!(stderr.contains(message), "#3453: `{filter}`: {stderr:?}");
+        let (stdout, _, code) = run_jq_full(&["-c", &format!("[{filter}?]")], Some(input))?;
+        assert_eq!(code, 0, "#3453: `[{filter}?]` on {input}");
+        assert_eq!(stdout.trim_end(), "[]", "#3453: `[{filter}?]` on {input}");
+    }
+    Ok(())
+}
+
+/// yq has no array key (real yq rejects `.[[1,2]]` with a `strconv.ParseInt`
+/// error), so `succinctly yq` keeps raising for the key form. `indices` is a
+/// jq extension in yq mode and follows jq's search.
+#[test]
+fn test_array_key_yq_mode_unchanged_3453() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-o", "json", "-I", "0", ".[[1]]"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().expect("piped").write_all(b"[1,2,1]")?;
+            child.wait_with_output()
+        })?;
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Cannot index array with array"),
+        "#3453 (yq): {output:?}"
+    );
+    assert!(output.stdout.is_empty(), "#3453 (yq): {output:?}");
+    Ok(())
+}
+
+// ============================================================================
 // #3279: a `try`-wrapped `if` as a bind source keeps the path register
 // ============================================================================
 

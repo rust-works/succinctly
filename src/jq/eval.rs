@@ -409,8 +409,8 @@ use super::expr::{
 use super::value::{
     assert_value_tree_depth, check_value_tree_depth, cmp_f64, document_number_f64,
     infinite_float_preview_text, int_to_f64, jq_identical, jq_literal_int_to_f64, jq_numeric_cmp,
-    numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, subarray_indices, ArrayVec,
-    NumberRepr, ObjectMap, OwnedValue,
+    numeric_repr_cmp, owned_value_eq, owned_value_eq_at_depth_generic, subarray_indices,
+    subarray_positions, window_matches, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -2640,6 +2640,11 @@ fn scalar_fallback<'a, W: Clone + AsRef<[u64]>>(
 /// undecodable string candidate (a computed index/slice-bound key) must
 /// raise, not silently become `""` and get indexed/compared as though
 /// that were the real key.
+///
+/// **Not for an index key's array** (#3453): jq reads `.[$array]` on an array
+/// as a subarray search, which needs the key's contents, so index-key sites
+/// go through [`to_owned_index_key`] instead. The array arm below serves slice
+/// bounds and `yq_join`, where an array is only ever rejected on type.
 fn to_owned_key_shape<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
@@ -2668,6 +2673,27 @@ fn to_owned_key_shape<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         StandardJson::Object(_) => Ok(OwnedValue::Object(IndexMap::new().into())),
         other => to_owned::<S, _>(other),
+    }
+}
+
+/// [`to_owned_key_shape`] for an *index* key (`.[$k]`), where an array key's
+/// contents matter in jq mode: on an array target it is jq's subarray search
+/// (`[1,2,3] | .[.]` is `[0]`, #3453), so the shape-only placeholder would
+/// silently answer `[]`. Every other key keeps its shape -- an object key's
+/// descriptor members, a scalar as itself -- and so does an array key in yq
+/// mode, which has no such search and only ever rejects it.
+///
+/// This gives back #626's saving for an array-valued navigated key, but the
+/// copy is bounded: a navigated key is a part of the document, so one visit
+/// copies at most the document, and `..` cannot nest deeper than the depth
+/// limit, so a walk that copies a subtree at every node copies a small
+/// multiple of the document in total.
+fn to_owned_index_key<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'_, W>,
+) -> Result<OwnedValue, EvalError> {
+    match value {
+        StandardJson::Array(_) if S::TAG != EvalTag::Yq => to_owned::<S, _>(value),
+        other => to_owned_key_shape::<_, S>(other),
     }
 }
 
@@ -8035,7 +8061,7 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // call above -- `.[k]?` suppresses only its own final index step,
             // never an error raised while computing `k`. Same exemption, same
             // reason, as `eval_index_expr`'s own `Item::Borrowed` arm.
-            Item::Borrowed(v) => match to_owned_key_shape::<_, S>(&v) {
+            Item::Borrowed(v) => match to_owned_index_key::<_, S>(&v) {
                 Ok(k) => k,
                 Err(e) => return escape.stop(Control::Error(e)),
             },
@@ -20352,7 +20378,11 @@ fn unsearchable_input<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     match value {
-        StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
+        // An *array* pattern reaches `.[$array]`, which `null` refuses
+        // (`null | indices([1])` is `Cannot index null with array`, #3453).
+        StandardJson::Null if !matches!(pattern, OwnedValue::Array(_)) => {
+            QueryResult::Owned(OwnedValue::Null)
+        }
         StandardJson::Object(_) if matches!(pattern, OwnedValue::String(_)) => {
             QueryResult::Owned(OwnedValue::Null)
         }
@@ -20408,6 +20438,42 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     occurrence: SearchOccurrence,
 ) -> QueryResult<'a, W> {
+    // jq's `indices($i)` over an array is `.[$i]` for an array `$i` and
+    // `.[[$i]]` otherwise, and `.[$array]` is a subarray search (`jv_array_
+    // indexes`). A scalar pattern is the one-element needle, which the
+    // element scan below answers identically without materializing the array.
+    if let (StandardJson::Array(elements), OwnedValue::Array(needle)) = (value, pattern) {
+        let mut hay = Vec::new();
+        for elem in *elements {
+            match to_owned::<S, _>(&elem) {
+                Ok(v) => hay.push(v),
+                // #1755: an undecodable element must raise, not compare as "".
+                Err(e) => return suppress_or_raise(e, optional),
+            }
+            // `index` stops at the first window that matches, as the scalar
+            // scan below does, instead of reading the rest of the array.
+            if matches!(occurrence, SearchOccurrence::First)
+                && !needle.is_empty()
+                && hay.len() >= needle.len()
+            {
+                let start = hay.len() - needle.len();
+                if window_matches::<S>(&hay[start..], needle) {
+                    return QueryResult::Owned(OwnedValue::Int(start as i64));
+                }
+            }
+        }
+        return match occurrence {
+            SearchOccurrence::All => QueryResult::Owned(subarray_indices::<S>(&hay, needle)),
+            // Every window was tried as it arrived.
+            SearchOccurrence::First => QueryResult::Owned(OwnedValue::Null),
+            SearchOccurrence::Last => subarray_positions::<S>(&hay, needle)
+                .next_back()
+                .map_or_else(
+                    || QueryResult::Owned(OwnedValue::Null),
+                    |i| QueryResult::Owned(OwnedValue::Int(i as i64)),
+                ),
+        };
+    }
     match value {
         StandardJson::String(s) => {
             // An object pattern is jq's slice. For `indices` that answers a
@@ -24173,6 +24239,15 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(e) => QueryResult::Error(e),
             }
         }
+        // #3453: an array key on an array is jq's subarray search,
+        // `[1,2,1] | .[[1]]` is `[0,2]`. Any other target keeps raising
+        // (`null | .[[1]]` is `Cannot index null with array`), and yq has no
+        // such key (real yq rejects it), so it keeps raising too.
+        OwnedValue::Array(_)
+            if S::TAG != EvalTag::Yq && matches!(target, StandardJson::Array(_)) =>
+        {
+            search_pattern::<W, S>(&target, key, optional, SearchOccurrence::All)
+        }
         // #2482 (yq mode): a computed key (`.s[$k]`) on a scalar target is
         // the same empty-not-error rule as the literal-field/literal-index
         // siblings above -- see `yq_field_index_on_scalar_is_empty`.
@@ -24298,6 +24373,11 @@ pub(crate) fn index_one_owned<S: EvalSemantics>(
         (OwnedValue::String(s), OwnedValue::Object(map)) => Ok(Some(
             map.get(s.as_str()).cloned().unwrap_or(OwnedValue::Null),
         )),
+        // #3453: an array key on an array is jq's subarray search -- see
+        // `index_one`'s own arm.
+        (OwnedValue::Array(needle), OwnedValue::Array(items)) if S::TAG != EvalTag::Yq => {
+            Ok(Some(subarray_indices::<S>(items, needle)))
+        }
         (OwnedValue::String(_), OwnedValue::Null) => Ok(Some(OwnedValue::Null)),
         (
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
@@ -24999,7 +25079,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // own final index step, never an error raised while
                 // computing `k` -- see the pre-#2138 arm this replaces for
                 // the jq 1.7.1 capture that settles it.
-                let k = match to_owned_key_shape::<_, S>(&v) {
+                let k = match to_owned_index_key::<_, S>(&v) {
                     Ok(k) => k,
                     Err(e) => escape_with_prefix!(Control::Error(e)),
                 };

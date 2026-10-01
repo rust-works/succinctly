@@ -5022,20 +5022,42 @@ pub(crate) fn subarray_indices<S: EvalSemantics>(
     hay: &[OwnedValue],
     needle: &[OwnedValue],
 ) -> OwnedValue {
-    let mut found = Vec::new();
-    if !needle.is_empty() && needle.len() <= hay.len() {
-        for start in 0..=hay.len() - needle.len() {
-            let window = &hay[start..start + needle.len()];
-            if window
-                .iter()
-                .zip(needle)
-                .all(|(x, y)| owned_value_eq::<S>(x, y))
-            {
-                found.push(OwnedValue::Int(start as i64));
-            }
-        }
-    }
-    OwnedValue::array_from(found)
+    OwnedValue::array_from(
+        subarray_positions::<S>(hay, needle)
+            .map(|start| OwnedValue::Int(start as i64))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The start positions [`subarray_indices`] reports, in order and lazily, so
+/// `index` can stop at the first and `rindex` can walk from the last (#3453).
+///
+/// Double-ended on purpose: `rindex([1,2])` over a long array is one backward
+/// scan to its first hit, not a forward pass over every window.
+pub(crate) fn subarray_positions<'a, S: EvalSemantics>(
+    hay: &'a [OwnedValue],
+    needle: &'a [OwnedValue],
+) -> impl DoubleEndedIterator<Item = usize> + 'a {
+    // An empty needle, or one running past the end, has no window to try.
+    let windows = if needle.is_empty() || needle.len() > hay.len() {
+        0..0
+    } else {
+        0..hay.len() - needle.len() + 1
+    };
+    windows.filter(move |&start| window_matches::<S>(&hay[start..start + needle.len()], needle))
+}
+
+/// Whether `window` equals `needle` element for element, with `==`'s own
+/// element comparison. The one definition of a match for the search's every
+/// caller; `window` must be as long as `needle`.
+pub(crate) fn window_matches<S: EvalSemantics>(
+    window: &[OwnedValue],
+    needle: &[OwnedValue],
+) -> bool {
+    window
+        .iter()
+        .zip(needle)
+        .all(|(x, y)| owned_value_eq::<S>(x, y))
 }
 
 pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
@@ -5737,6 +5759,29 @@ mod tests {
         assert_eq!(idx(&nested, &nested.clone()), "[0]");
         let nan = vec![OwnedValue::Float(f64::NAN)];
         assert_eq!(idx(&nan, &nan.clone()), "[]");
+    }
+
+    /// #3453: `index` and `rindex` read the first and last position, so the
+    /// positions come lazily and from either end.
+    #[test]
+    fn subarray_positions_run_from_both_ends_3453() {
+        let arr =
+            |v: &[i64]| -> Vec<OwnedValue> { v.iter().map(|n| OwnedValue::Int(*n)).collect() };
+        let hay = arr(&[1, 1, 1, 2]);
+        let needle = arr(&[1, 1]);
+        let mut it = subarray_positions::<JqSemantics>(&hay, &needle);
+        assert_eq!(it.next(), Some(0));
+        assert_eq!(it.next_back(), Some(1));
+        assert_eq!(it.next(), None);
+        // No window to try: an empty needle, or one longer than the haystack.
+        assert_eq!(subarray_positions::<JqSemantics>(&hay, &[]).next(), None);
+        let long = arr(&[1, 1, 1, 2, 3]);
+        assert_eq!(subarray_positions::<JqSemantics>(&hay, &long).next(), None);
+        // A needle exactly the haystack's length has the single window `0`.
+        assert_eq!(
+            subarray_positions::<JqSemantics>(&hay, &hay).collect::<Vec<_>>(),
+            [0]
+        );
     }
 
     /// The promote-on-bind wrappers (#3191) cost nothing in layout: a

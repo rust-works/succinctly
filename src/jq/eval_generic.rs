@@ -89,7 +89,7 @@ use super::expr::{
     NumberKey, ObjectEntry, ObjectKey, Pattern, StringPart,
 };
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
-use super::value::{owned_value_eq, NumberRepr, OwnedValue};
+use super::value::{owned_value_eq, subarray_indices, NumberRepr, OwnedValue};
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
 /// [`to_owned_with_comments`] (#998).
@@ -2215,6 +2215,33 @@ fn to_owned_key_shape_cursor<C: DocumentCursor, S: EvalSemantics>(
         descriptor_key_shape::<C::Value, S>(&fields)
     } else {
         to_owned_cursor::<S, _>(cursor)
+    }
+}
+
+/// [`to_owned_key_shape`] for an *index* key (`.[$k]`) -- see
+/// `eval::to_owned_index_key`: an array key is jq's subarray search in jq mode
+/// (#3453), so its contents are materialized; everything else, and every yq
+/// key, keeps its shape.
+fn to_owned_index_key<V: DocumentValue, S: EvalSemantics>(
+    value: &V,
+) -> Result<OwnedValue, EvalError> {
+    if value.is_array() && S::TAG != EvalTag::Yq {
+        to_owned::<S, _>(value)
+    } else {
+        to_owned_key_shape::<V, S>(value)
+    }
+}
+
+/// [`to_owned_index_key`] for a key reached through a cursor, so an explicit
+/// tag on the key expression itself is still honoured
+/// ([`to_owned_key_shape_cursor`]).
+fn to_owned_index_key_cursor<C: DocumentCursor, S: EvalSemantics>(
+    cursor: &C,
+) -> Result<OwnedValue, EvalError> {
+    if cursor.value().is_array() && S::TAG != EvalTag::Yq {
+        to_owned_cursor::<S, _>(cursor)
+    } else {
+        to_owned_key_shape_cursor::<C, S>(cursor)
     }
 }
 
@@ -13910,7 +13937,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                 // its own final index step, never an error raised while
                 // computing `k`. Same exemption, same reason, as
                 // `eval_index_expr_generic`'s own `One` arm.
-                let k = match to_owned_key_shape::<_, S>(&v) {
+                let k = match to_owned_index_key::<_, S>(&v) {
                     Ok(k) => k,
                     Err(e) => return escape.stop(Control::Error(e)),
                 };
@@ -13930,7 +13957,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
             }
             GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => {
                 // STYLE-0012: key generator -- see the `One` arm above.
-                let k = match to_owned_key_shape_cursor::<_, S>(&c) {
+                let k = match to_owned_index_key_cursor::<_, S>(&c) {
                     Ok(k) => k,
                     Err(e) => return escape.stop(Control::Error(e)),
                 };
@@ -17028,6 +17055,17 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
     if let Some(err) = unreadable_value_error(&target) {
         return GenericResult::Error(err);
     }
+    // #3453: an array key on an array is jq's subarray search -- see
+    // `eval.rs`'s `index_one` arm. Anything else, and yq, falls through.
+    if let (OwnedValue::Array(needle), Some(elements), true) =
+        (key, target.as_array(), S::TAG != EvalTag::Yq)
+    {
+        return match to_owned_all::<S, _>(elements.collect_values().iter()) {
+            Ok(hay) => GenericResult::Owned(subarray_indices::<S>(&hay, needle)),
+            Err(e) if suppresses(&e, optional) => GenericResult::None,
+            Err(e) => GenericResult::Error(e),
+        };
+    }
     match key {
         OwnedValue::String(s) => {
             // #2470: same rule as `Expr::Field`'s own arm -- a computed
@@ -17657,7 +17695,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 // only its own final index step, never an error raised
                 // while computing `k` -- see the pre-#2138 arm this
                 // replaces for the jq 1.7.1 capture that settles it.
-                let k = match to_owned_key_shape::<_, S>(&v) {
+                let k = match to_owned_index_key::<_, S>(&v) {
                     Ok(k) => k,
                     Err(e) => escape_generic!(Control::Error(e)),
                 };
@@ -17678,7 +17716,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             // that wiring.
             GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => {
                 // STYLE-0012: key generator -- see the `One` arm above.
-                let k = match to_owned_key_shape_cursor::<_, S>(&c) {
+                let k = match to_owned_index_key_cursor::<_, S>(&c) {
                     Ok(k) => k,
                     Err(e) => escape_generic!(Control::Error(e)),
                 };
@@ -39525,29 +39563,52 @@ mod tests {
         ));
     }
 
-    /// `to_owned_key_shape`'s array/object branches (#626/#670/#903) are a
-    /// shape-only fast path for a computed index/slice-bound candidate --
-    /// reached from `eval_index_expr`'s `keys` match when the key expression
-    /// resolves to a bare `GenericResult::One` (not `OneCursor`), which only
-    /// happens when the ambient cursor is `None`: `.[.]` at the top level,
-    /// evaluated through the cursor-less `eval()`, makes the key expression
-    /// (`.`, i.e. `Expr::Identity`) evaluate against a `None` cursor, giving
-    /// `GenericResult::One(document)`. An array/object document then hits
-    /// `to_owned_key_shape`'s array/object branch respectively; the
-    /// synthesized empty container is then rejected by `index_one_owned`
-    /// (neither branch there handles an array/object key), confirming the
-    /// fast path's synthesized shape reaches real indexing logic rather than
-    /// disappearing into an unused value.
+    /// #3453: an element the index could not read (`1.2.3`) is a decode
+    /// failure of the haystack, so `.[$array]` raises it and `?` -- which
+    /// suppresses only an indexing error, not a document fault -- does not
+    /// hide it.
     #[test]
-    fn test_computed_index_self_as_key_rejects_array_and_object_shapes_1247() {
+    fn test_array_key_over_an_unreadable_element_raises_3453() {
+        let json: &[u8] = b"[1.2.3,2]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        for filter in [".[[2]]", ".[[2]]?"] {
+            let result = eval(&crate::jq::parse(filter).unwrap(), cursor.value());
+            assert!(
+                result.is_error(),
+                "`{filter}` over an unreadable element: {result:?}"
+            );
+        }
+    }
+
+    /// `to_owned_key_shape`'s object branch (#626/#670/#903) is a shape-only
+    /// fast path for a computed index/slice-bound candidate -- reached from
+    /// `eval_index_expr`'s `keys` match when the key expression resolves to a
+    /// bare `GenericResult::One` (not `OneCursor`), which only happens when
+    /// the ambient cursor is `None`: `.[.]` at the top level, evaluated
+    /// through the cursor-less `eval()`, makes the key expression (`.`, i.e.
+    /// `Expr::Identity`) evaluate against a `None` cursor, giving
+    /// `GenericResult::One(document)`. An object document then hits
+    /// `to_owned_key_shape`'s object branch; the synthesized empty object is
+    /// then rejected by `index_one_owned`, confirming the fast path's
+    /// synthesized shape reaches real indexing logic rather than disappearing
+    /// into an unused value.
+    ///
+    /// An *array* key is not shaped any more (#3453): on an array it is jq's
+    /// subarray search, which reads the key's contents, so `[1,2,3] | .[.]`
+    /// is `[0]` (jq 1.7.1) rather than the `[]` the placeholder would answer.
+    #[test]
+    fn test_computed_index_self_as_key_rejects_object_shape_and_searches_array_1247() {
         let array_json: &[u8] = b"[1,2,3]";
         let index = JsonIndex::build(array_json);
         let cursor = index.root(array_json);
         let value = cursor.value();
         let result = eval(&crate::jq::parse(".[.]").unwrap(), value);
-        assert!(
-            result.is_error(),
-            "array self-index should be rejected, got {result:?}"
+        let outputs = result.collect_owned::<JqSemantics>().unwrap();
+        assert_eq!(
+            outputs.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+            ["[0]"],
+            "an array indexed by itself is the subarray search"
         );
 
         let object_json: &[u8] = b"{\"a\":1}";
