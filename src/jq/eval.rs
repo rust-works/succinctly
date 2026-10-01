@@ -34601,6 +34601,63 @@ impl PathTrail {
     }
 }
 
+/// What a [`PathBranch`] reports about jq's path *register* once its leaf has
+/// run (#3456) -- the one vocabulary producers write and consumers read, in
+/// place of the `Option<Cow<OwnedValue>>` it replaces. See
+/// `docs/plan/jq-path-register-producer-contract.md` (D1) for the target
+/// shape and the reasons for it.
+///
+/// Today it has the two states the `Option` had. [`BranchRegister::Unmoved`]
+/// holds the register the leaf *entered* with, which is jq's register
+/// afterwards only if the leaf did not move it; nothing here says whether it
+/// did, and the consumers still decide that (`stage_preserves_register`,
+/// `register_after`). The producer contract's lost states
+/// (`LostAt`/`LostSomewhere`, mirroring [`RegisterLoss`]) arrive with the
+/// first producer that can write them, rather than as unconstructed variants
+/// ahead of it.
+enum BranchRegister<'a> {
+    /// No live register is known here -- and today this does not say
+    /// whether none entered the leaf or one entered and was lost; loss rides
+    /// [`Frame::register_loss`] (D2).
+    None,
+    /// The register jq holds, still live at the branch's own path while the
+    /// branch's `value` has moved off it (#1573).
+    Unmoved(Cow<'a, OwnedValue>),
+}
+
+impl<'a> BranchRegister<'a> {
+    /// The pre-#3456 `Option` as a `BranchRegister`: `Some` is
+    /// [`Unmoved`](Self::Unmoved).
+    ///
+    /// The adapter every site that still produces an `Option` goes through,
+    /// so that `git grep from_option` is the list of producers the producer
+    /// contract's next step has to make truthful -- each must state
+    /// `Unmoved`, a lost state or `None` for itself, after which this is
+    /// deleted.
+    fn from_option(register: Option<Cow<'a, OwnedValue>>) -> Self {
+        register.map_or(Self::None, Self::Unmoved)
+    }
+
+    /// The register as the `Option` consumers read it: `Some` only for
+    /// [`Unmoved`](Self::Unmoved). Converting at the boundary keeps every
+    /// consumer body unchanged by the introduction of this type.
+    fn into_unmoved(self) -> Option<Cow<'a, OwnedValue>> {
+        match self {
+            Self::None => None,
+            Self::Unmoved(register) => Some(register),
+        }
+    }
+
+    /// Force the register to `Cow::Owned`, like [`PathBranch::into_owned_value`]
+    /// does the branch's value (#668).
+    fn into_owned(self) -> BranchRegister<'static> {
+        match self {
+            Self::None => BranchRegister::None,
+            Self::Unmoved(register) => BranchRegister::Unmoved(Cow::Owned(register.into_owned())),
+        }
+    }
+}
+
 /// One resolved branch: the static path components reaching it, and the value
 /// found there (needed to resolve any computed key further along the chain).
 ///
@@ -34684,13 +34741,14 @@ struct PathBranch<'a> {
     /// `Expr::TrackedVar` re-establish trackability against it, by exactly
     /// the rule [`register_identical`] already applies inside a fold.
     ///
-    /// `None` means "no live register known here", and is always the safe
-    /// answer — it can only cost a refusal, never invent a path. Only ever
-    /// set while `!trackable`: when `trackable` holds, the branch's own
+    /// [`BranchRegister::None`] means "no live register known here", and is
+    /// always the safe answer — it can only cost a refusal, never invent a
+    /// path (#3456: the type this field now has). Only ever set while
+    /// `!trackable`: when `trackable` holds, the branch's own
     /// value *is* the register at its own path, which is exactly what
     /// `trackable` means, so there is nothing separate to store —
     /// [`PathBranch::with_register`] asserts that.
-    register: Option<Cow<'a, OwnedValue>>,
+    register: BranchRegister<'a>,
 }
 
 impl<'a> PathBranch<'a> {
@@ -34720,7 +34778,7 @@ impl<'a> PathBranch<'a> {
             // A navigation step's own value is the register (or it is
             // untracked with no register knowledge to pass on) — either
             // way nothing extra to record here (#1573).
-            register: None,
+            register: BranchRegister::None,
         }
     }
 
@@ -34762,7 +34820,7 @@ impl<'a> PathBranch<'a> {
             // steps. `resolve_seq`'s own loop re-attaches it around the
             // call instead (see `carried_register` there), which keeps this
             // constructor's contract to its callers unchanged.
-            register: None,
+            register: BranchRegister::None,
         }
     }
 
@@ -34777,7 +34835,7 @@ impl<'a> PathBranch<'a> {
             value,
             trackable: false,
             snapshot: Snapshot::No,
-            register: None,
+            register: BranchRegister::None,
         }
     }
 
@@ -34790,7 +34848,7 @@ impl<'a> PathBranch<'a> {
             value,
             trackable: false,
             snapshot: Snapshot::Marked(origin),
-            register: None,
+            register: BranchRegister::None,
         }
     }
 
@@ -34810,7 +34868,7 @@ impl<'a> PathBranch<'a> {
             value,
             trackable: false,
             snapshot: Snapshot::At(origin),
-            register: None,
+            register: BranchRegister::None,
         }
     }
 
@@ -34866,9 +34924,9 @@ impl<'a> PathBranch<'a> {
     /// register while the register's value is still in scope), and every
     /// other site would have to pass `None`. `debug_assert`s the field's own
     /// invariant instead of silently tolerating a caller that ignores it.
-    fn with_register(mut self, register: Option<Cow<'a, OwnedValue>>) -> Self {
+    fn with_register(mut self, register: BranchRegister<'a>) -> Self {
         debug_assert!(
-            !(self.trackable && register.is_some()),
+            !(self.trackable && matches!(register, BranchRegister::Unmoved(_))),
             "a trackable branch's register is its own value at its own path; \
              storing a second one would let a reader answer from a stale copy",
         );
@@ -34886,7 +34944,7 @@ impl<'a> PathBranch<'a> {
             snapshot: self.snapshot,
             // Same reason as `value`: a borrowed register would cap this
             // branch at the borrow it is escaping (#1573/#668).
-            register: self.register.map(|r| Cow::Owned(r.into_owned())),
+            register: self.register.into_owned(),
         }
     }
 }
@@ -38411,7 +38469,9 @@ fn untracked_at_register<'a>(
     trackable: bool,
     value: &'a OwnedValue,
 ) -> PathBranch<'a> {
-    PathBranch::untracked(computed).with_register(trackable.then(|| Cow::Borrowed(value)))
+    PathBranch::untracked(computed).with_register(BranchRegister::from_option(
+        trackable.then(|| Cow::Borrowed(value)),
+    ))
 }
 
 /// Whether `and`/`or`/unary minus `expr` resolves its operands live in path
@@ -38509,6 +38569,7 @@ fn register_after<'a>(
     } else if cannot_move_register(expr) {
         branch
             .register
+            .into_unmoved()
             .or_else(|| frame.register().map(|reg| Cow::Owned(reg.clone())))
     } else if (ambient_trackable && register_movement_tracked(expr))
         || matches!(
@@ -38516,7 +38577,7 @@ fn register_after<'a>(
             Expr::Pipe(_) | Expr::And(..) | Expr::Or(..) | Expr::Negate(_)
         )
     {
-        branch.register
+        branch.register.into_unmoved()
     } else {
         None
     };
@@ -38542,7 +38603,7 @@ fn computed_at_register(
             PathBranch::new(path, Cow::Owned(computed), true)
         }
         register => PathBranch::passthrough(path, Cow::Owned(computed), false, Snapshot::No)
-            .with_register(register),
+            .with_register(BranchRegister::from_option(register)),
     }
 }
 
@@ -38599,7 +38660,7 @@ fn resolve_from_restored_input<'a, S: EvalSemantics>(
         return resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, &mut |r| {
             sink(
                 PathBranch::passthrough(Rc::clone(&path), r.value, false, Snapshot::No)
-                    .with_register(register.clone()),
+                    .with_register(BranchRegister::from_option(register.clone())),
             )
         });
     }
@@ -38619,7 +38680,7 @@ fn resolve_from_restored_input<'a, S: EvalSemantics>(
             PathBranch::new(path, Cow::Borrowed(value), true)
         }
         register => PathBranch::passthrough(path, Cow::Borrowed(value), false, Snapshot::No)
-            .with_register(register),
+            .with_register(BranchRegister::from_option(register)),
     };
     let lost_frame;
     let frame = if lost {
@@ -38823,7 +38884,7 @@ fn resolve_recursive_descent_sink<'a>(
             value: current.clone(),
             trackable: node_trackable,
             snapshot: node_snapshot,
-            register: None,
+            register: BranchRegister::None,
         }) == Demand::Stop
         {
             return ResolveFlow::Stopped;
@@ -41262,7 +41323,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                                     false,
                                     snapshot.clone(),
                                 )
-                                .with_register(Some(Cow::Owned(reg.clone()))),
+                                .with_register(BranchRegister::Unmoved(Cow::Owned(reg.clone()))),
                                 frame,
                                 keep,
                                 sink,
@@ -41290,7 +41351,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                                 false,
                                 Snapshot::No,
                             )
-                            .with_register(Some(Cow::Owned(reg.value)))
+                            .with_register(BranchRegister::Unmoved(Cow::Owned(reg.value)))
                         };
                         resolve_seq_from_seed::<S>(
                             core::slice::from_ref(&substituted),
@@ -43435,7 +43496,7 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
         }
         Some(register) => {
             PathBranch::passthrough(PathPrefix::root(), Cow::Owned(payload), false, Snapshot::No)
-                .with_register(Some(Cow::Owned(register.clone())))
+                .with_register(BranchRegister::Unmoved(Cow::Owned(register.clone())))
         }
         None => PathBranch::untracked(Cow::Owned(payload)),
     };
@@ -44471,7 +44532,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
                 let child = PathBranch {
                     path: PathPrefix::extend_many(&prefix, child.path.to_vec()),
                     value: child.value,
-                    register: None,
+                    register: BranchRegister::None,
                     trackable: node_trackable && child.trackable,
                     snapshot: child.snapshot,
                 };
@@ -44538,7 +44599,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
         PathBranch {
             path: Rc::clone(&node.path),
             value: node.value.clone(),
-            register: None,
+            register: BranchRegister::None,
             // Propagated rather than assumed `true`: in jq mode an
             // untracked seed enters this walk (#2764) and is delivered as
             // the passthrough it is, for a terminal to refuse "with result"
@@ -44691,7 +44752,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
                         next.push(PathBranch {
                             path,
                             value: child_value,
-                            register: None,
+                            register: BranchRegister::None,
                             trackable: node_trackable && child_trackable,
                             // `f`'s own mark, propagated (#1591). Unlike
                             // `trackable` this is not `&&`-ed with the
@@ -44728,7 +44789,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
                             next.push(PathBranch {
                                 path: Rc::clone(&path),
                                 value: child_value.clone(),
-                                register: None,
+                                register: BranchRegister::None,
                                 trackable: node_trackable && child_trackable,
                                 // Same propagation as the `None` arm above
                                 // (#1591); `cond` gates whether the child is
@@ -46419,7 +46480,11 @@ fn apply_static_tail_one<'a, S: EvalSemantics>(
         // *did* navigate, which by definition moves the register onto
         // what it reached — at which point `trackable` already carries
         // it and this field is not consulted (#1573).
-        register: register.filter(|_| tail.is_empty()),
+        register: if tail.is_empty() {
+            register
+        } else {
+            BranchRegister::None
+        },
     }))
 }
 
@@ -46685,14 +46750,16 @@ fn resolve_seq_sink<'a, S: EvalSemantics>(
         snapshot.clone(),
     )
     .with_register(if trackable {
-        None
+        BranchRegister::None
     } else {
         // #3133: a nested pipe (the `Pipe` arm passes `None`) inherits the
         // register the enclosing stage's frame carries, so `try ($w | .b)`
         // can re-establish `$w` exactly as the bare `$w | .b` stage does.
-        register
-            .map(Cow::Borrowed)
-            .or_else(|| frame.register().map(|reg| Cow::Owned(reg.clone())))
+        BranchRegister::from_option(
+            register
+                .map(Cow::Borrowed)
+                .or_else(|| frame.register().map(|reg| Cow::Owned(reg.clone()))),
+        )
     });
     resolve_seq_from_seed::<S>(exprs, seed, frame, keep, sink)
 }
@@ -46960,6 +47027,9 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // more.
         register: carried_register,
     } = branch;
+    // #3456: every consumer below reads the register as the `Option` it
+    // always was; `Unmoved` is exactly the old `Some`.
+    let carried_register = carried_register.into_unmoved();
 
     // Set when the recursion below reports anything other than
     // `Exhausted`, which is also when this stage's own producer is told to
@@ -47058,6 +47128,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             snapshot: step_snapshot,
             register: step_register,
         } = step;
+        let step_register = step_register.into_unmoved();
         let facts = StepRegisterFacts {
             navigated: components.depth() > 0,
             stage_preserves_register,
@@ -47144,7 +47215,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             RegisterLoss::Kept
         };
         let placed = PathBranch {
-            register,
+            register: BranchRegister::from_option(register),
             path,
             value: resulting,
             // Untracked is absorbing: nothing downstream can
