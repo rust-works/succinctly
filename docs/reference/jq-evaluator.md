@@ -59,6 +59,17 @@ results can be projected through the sink before array collection, so
 `[while(.i < N; .i += 1) | .i]` stores only projected integers. An array
 requesting all complete states still stores those states.
 
+A generator that emits a large computed container into a later pipe stage
+(`range([]; {}; [1]) | ...`, `while(...; . + [1]) | ...`) reaches the bridge once
+per output, and the bridge serializes and indexes the whole container each time:
+linear per output, quadratic over the run. A few stages therefore answer from the
+owned tree instead -- `length`, a leading `.field`/`.[n]`, and (#3439) `select(cond)`
+when `cond` is a comparison/boolean over `type`, `length` of an array or object and
+navigation -- and any other stage still pays the bridge. The producing loop is not
+the cost: `range/3`'s generic loop appends to its accumulator in place once its
+consumer lets go of each value; only a consumer that *keeps* every value forces a
+copy per step, in jq as well (`/usr/bin/jq` 1.7.1: 0.16 s at 10,000 steps, 0.71 s at 20,000).
+
 See [the #3025 spike](../plan/issue-3025-spike.md) for the 200,000-digit
 cost and the [implementation results](../plan/issue-3025-results.md).
 
