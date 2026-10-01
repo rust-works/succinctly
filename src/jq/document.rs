@@ -1951,8 +1951,10 @@ impl DisplayKeyGuard {
     /// should raise instead.
     ///
     pub fn check<T>(&mut self, map: &IndexMap<String, T>, key: &str, is_fallback: bool) -> bool {
-        let collides = map.contains_key(key)
-            && (is_fallback || self.fallback_keys.iter().any(|seen| seen.as_str() == key));
+        // The fallback test first: with no fallback key on either side (the
+        // ordinary case) it is false without hashing `key` at all (#3478).
+        let collides = (is_fallback || self.fallback_keys.iter().any(|seen| seen.as_str() == key))
+            && map.contains_key(key);
         if !collides && is_fallback {
             self.fallback_keys.push(String::from(key));
         }
@@ -3756,6 +3758,104 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
             return Err(fields.malformed_member_error());
         }
         Ok(key)
+    }
+
+    /// [`checked_key`](Self::checked_key) for a walk that keeps no members
+    /// (`validate_cursor`, #3478): the same rules, in the same order, but the
+    /// #1642 collision map is [`LazyKeyLedger`]'s, built only once an
+    /// undecodable key appears, so a well-formed object allocates nothing per
+    /// key.
+    ///
+    /// `fields` is the list at this member (for the malformed-member error),
+    /// `first` yields the object's own first list (asked for at most once,
+    /// and only when the ledger has to seed itself) and `consumed` is how many
+    /// members precede this one. STYLE-0013:
+    /// the delimiter half is [`delimiters_ok`](Self::delimiters_ok), not a
+    /// copy.
+    pub fn checked_key_lazy<F>(
+        &self,
+        fields: &F,
+        first: impl FnOnce() -> Option<F>,
+        consumed: usize,
+        ledger: &mut LazyKeyLedger,
+    ) -> Result<(), EvalError>
+    where
+        F: DocumentFields<Value = V, Cursor = C>,
+    {
+        ledger.admit(&self.key, first, consumed, fields)?;
+        if !self.delimiters_ok::<F>(consumed == 0) {
+            return Err(fields.malformed_member_error());
+        }
+        Ok(())
+    }
+}
+
+/// The #1642 key-collision bookkeeping of an object walk that keeps none of
+/// its members, built lazily (#3478; the same idea as #2061's
+/// `push_generic_document_validation_error`).
+///
+/// [`DisplayKeyGuard::check`] reports a collision only when the key is
+/// already present *and* a decode-failure fallback spelling is involved --
+/// this key's, or one it recorded earlier. So until the first fallback key,
+/// no collision is possible whatever the map holds, and the map's only effect
+/// is one `String` and one hash per key. A well-formed object therefore never
+/// builds it. When a fallback key does appear at position `k`, a later
+/// fallback can collide with an earlier *clean* key, so the first `k` keys
+/// are re-walked into the map then, and every key from there on is checked
+/// and recorded exactly as `resolve_display_key` would. The error order is
+/// the eager walk's: a collision is reported at the member that causes it,
+/// ahead of anything after it.
+#[derive(Default)]
+pub struct LazyKeyLedger {
+    map: IndexMap<String, ()>,
+    guard: DisplayKeyGuard,
+    seeded: bool,
+}
+
+impl LazyKeyLedger {
+    /// Check `key`, the `consumed`-th member of the object whose members
+    /// start at `first`, against the members before it.
+    ///
+    /// `display_key_kind`, not `key_display_string_kind`: the object this
+    /// mirrors is `to_owned_cursor`'s, whose map build also flags a YAML
+    /// complex key as a fallback (#2519).
+    fn admit<F: DocumentFields>(
+        &mut self,
+        key: &F::Value,
+        first: impl FnOnce() -> Option<F>,
+        consumed: usize,
+        fields: &F,
+    ) -> Result<(), EvalError> {
+        let Some((key, is_fallback)) = key.display_key_kind() else {
+            return Err(fields.malformed_member_error());
+        };
+        if !self.seeded {
+            if !is_fallback {
+                return Ok(());
+            }
+            self.seeded = true;
+            let mut earlier = first();
+            let mut replayed = 0usize;
+            // The list holds this member and whatever follows it, so it never
+            // runs out before `consumed` members have been replayed.
+            while let Some((member, rest)) = earlier.as_ref().and_then(F::uncons) {
+                if replayed == consumed {
+                    break;
+                }
+                // Every earlier key was clean (else this would have seeded
+                // then), so none needs the guard.
+                if let Some((clean, _)) = member.key.display_key_kind() {
+                    self.map.insert(clean.into_owned(), ());
+                }
+                earlier = Some(rest);
+                replayed += 1;
+            }
+        }
+        if !self.guard.check(&self.map, &key, is_fallback) {
+            return Err(EvalError::colliding_display_key(&key));
+        }
+        self.map.insert(key.into_owned(), ());
+        Ok(())
     }
 }
 

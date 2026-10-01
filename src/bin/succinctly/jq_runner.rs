@@ -7388,11 +7388,12 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // than by re-deriving its checks a second time -- which
         // `validate_cursor` keeps, since it is that same walk.
         //
-        // Skipped when `is_prevalidated()` (#3317): a jq-mode `[a, b, ...]`
-        // over document nodes already ran this exact walk, under these same
-        // `JqSemantics`, on every cursor before answering -- which is what
-        // keeps a malformed node failing the construction itself, ahead of
-        // any consumer -- so a second walk here would only repeat it (+50%
+        // Skipped when `is_prevalidated()` (#3317, #3478): a jq-mode `[a, b,
+        // ...]` over document nodes runs this exact walk, under these same
+        // `JqSemantics`, on every cursor before it hands out the first one
+        // (`LazySource::advance`, which `drain_atomic` below pulls through) --
+        // which is what keeps a malformed node failing the whole array ahead
+        // of anything else -- so a second walk here would only repeat it (+50%
         // time on `[., .]`).
         GenericResult::LazySeq(seq) => {
             let prevalidated = seq.is_prevalidated();
