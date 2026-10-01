@@ -372,12 +372,12 @@ pub enum Expr {
     /// [`Expr::Field`] and `.[0]` to [`Expr::Index`], so the hot `.foo.bar[0]`
     /// path and every existing `Field`/`Index` match site are untouched.
     ///
-    /// Two deliberate divergences from jq. An array-valued key errors with
-    /// `Cannot index array with array` rather than performing jq's
-    /// indices-of-subarray search (`[10,20,30] | .[[20]]` → `[1]`). And a
-    /// NaN key, which reads as null in both, has no path component here — jq's
-    /// `path(.[nan])` is `[null]`, a path its own `setpath` then rejects, so
-    /// this errors at the source instead.
+    /// An array-valued key on an array is jq's indices-of-subarray search
+    /// (`[10,20,30] | .[[20]]` → `[1]`) when *read* (#3453). In `path()` and
+    /// write position it is still refused with `Cannot index array with array`
+    /// where jq answers (#3506). A NaN key, which reads as null in both, has no
+    /// path component here — jq's `path(.[nan])` is `[null]`, a path its own
+    /// `setpath` then rejects, so this errors at the source instead.
     ///
     /// A float key is *not* on that list any more: it keeps its own
     /// spelling in `path()` output, via [`Expr::Index`]'s own `key` field

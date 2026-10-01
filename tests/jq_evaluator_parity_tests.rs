@@ -1294,6 +1294,59 @@ fn getpath_array_segment_agrees_across_evaluators_2429() {
     }
 }
 
+/// #3453: an array key / array pattern on an array is jq's subarray search in
+/// both evaluators -- the cursor walk, the generic bridge, and the owned-target
+/// path (`(.|tojson|fromjson)[[1]]` computes its target, so it indexes an owned
+/// value). Each expectation is jq-1.7.1's.
+#[test]
+fn array_key_is_a_subarray_search_across_evaluators_3453() {
+    for (json, filter, expected) in [
+        ("[1,2,1,2]", ".[[1]]", "[0,2]"),
+        ("[1,2,1,2]", ".[[1,2]]", "[0,2]"),
+        ("[1,2,1,2]", "(.|tojson|fromjson)[[1,2]]", "[0,2]"),
+        ("[1,2,1,2]", "[.[[1],[2]]]", "[[0,2],[1,3]]"),
+        // A key navigated out of the document is read in full, not shaped.
+        ("[1,2,3]", ".[.]", "[0]"),
+        ("{\"k\":[1,2],\"v\":[0,1,2,1,2]}", ".v[.k]", "[1,3]"),
+        ("[1,2,1,2]", "indices([1,2])", "[0,2]"),
+        ("[1,2,1,2]", "[index([1,2]), rindex([1,2])]", "[0,2]"),
+        ("[1,1,1]", ".[[1,1]]", "[0,1]"),
+        ("[1,2]", ".[[]]", "[]"),
+        ("[1,2]", ".[[2,null]]", "[]"),
+        ("{\"a\":[1,2,1]}", ".a[[1]]", "[0,2]"),
+        ("[1,[1,2],1]", "indices([[1,2]])", "[1]"),
+        ("[1,2]", "[.[[1]]?]", "[[0]]"),
+        (
+            "null",
+            "try .[[1]] catch .",
+            "\"Cannot index null with array\"",
+        ),
+        (
+            "null",
+            "try indices([1]) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        ("null", "indices(1)", "null"),
+        (
+            "{\"a\":1}",
+            "try .[[1]] catch .",
+            "\"Cannot index object with array\"",
+        ),
+        (
+            "\"abc\"",
+            "try .[[1]] catch .",
+            "\"Cannot index string with array\"",
+        ),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json.as_bytes(), filter)),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}` on `{json}`"
+        );
+        assert_parity(json.as_bytes(), filter);
+    }
+}
+
 #[test]
 fn test_object_construction_product_parity_354() {
     // Object construction is a generator: an entry whose key or value yields n
