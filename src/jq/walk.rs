@@ -1423,21 +1423,28 @@ pub fn uses_input_builtins(expr: &Expr) -> bool {
 /// Same expanded-program requirement as [`uses_input_builtins`] — a call
 /// reachable only through an imported module body still counts.
 pub fn uses_cursor_metadata_builtins(expr: &Expr) -> bool {
-    contains_builtin(expr, |b| {
-        matches!(
-            b,
-            Builtin::Line
-                | Builtin::Column
-                | Builtin::DocumentIndex
-                | Builtin::Anchor
-                | Builtin::Style
-                | Builtin::LineComment
-                | Builtin::HeadComment
-                | Builtin::FootComment
-                | Builtin::AtOffset(_)
-                | Builtin::AtPosition(_, _)
-        )
-    })
+    contains_builtin(expr, is_cursor_metadata_builtin)
+}
+
+/// Whether `builtin` reads a position, an anchor, a style or a comment off the
+/// cursor it is evaluated at -- the set [`uses_cursor_metadata_builtins`] looks
+/// for, and the set the generic evaluator hides a registered DOM document's
+/// cursor from (#3479), so a builtin added here is covered in both places.
+#[inline(always)]
+pub(crate) fn is_cursor_metadata_builtin(builtin: &Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Line
+            | Builtin::Column
+            | Builtin::DocumentIndex
+            | Builtin::Anchor
+            | Builtin::Style
+            | Builtin::LineComment
+            | Builtin::HeadComment
+            | Builtin::FootComment
+            | Builtin::AtOffset(_)
+            | Builtin::AtPosition(_, _)
+    )
 }
 
 /// Whether evaluating `expr` could consult the **ambient input value** (`.`)

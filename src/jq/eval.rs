@@ -118635,7 +118635,7 @@ mod touched_edge_cases_2999 {
             if filter.contains(r#".name + "x""#) {
                 // An arithmetic stage that is not `. + <literal>` still
                 // writes its owned operand out; only the document is reused.
-                assert!(rooted_reindexes <= plain_reindexes, "{filter}");
+                assert!(rooted_reindexes < plain_reindexes, "{filter}");
             } else {
                 assert_eq!(rooted_reindexes, 1, "{filter}: registered");
             }

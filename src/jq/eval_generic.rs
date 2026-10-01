@@ -24776,19 +24776,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     // `at_offset`/`at_position` to their "requires document cursor context"
     // error) instead of reporting offsets in text the user never wrote. Only
     // these builtins: `key`/`parent`/`path` still need the cursor to navigate.
-    let cursor = if matches!(
-        builtin,
-        Builtin::Line
-            | Builtin::Column
-            | Builtin::DocumentIndex
-            | Builtin::Anchor
-            | Builtin::Style
-            | Builtin::LineComment
-            | Builtin::HeadComment
-            | Builtin::FootComment
-            | Builtin::AtOffset(_)
-            | Builtin::AtPosition(..)
-    ) {
+    let cursor = if crate::jq::walk::is_cursor_metadata_builtin(builtin) {
         cursor.filter(|c| !dom_roots::owns_document(c.document_token()))
     } else {
         cursor
@@ -26085,8 +26073,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // is a different node). Demote any marker not proven to be
             // `cursor`'s own node before either resolution route below.
             let root = RootWitness::of(cursor.as_ref());
-            let owned_builtin_expr = Expr::Builtin(builtin.clone());
-            let rooted = reindexed_root_for::<S, _>(&owned_builtin_expr, cursor.as_ref());
+            let rooted = if S::REINDEX_BRIDGE_KEEPS_IDENTITY {
+                None
+            } else {
+                reindexed_root_for::<S, _>(&Expr::Builtin(builtin.clone()), cursor.as_ref())
+            };
             let owned = owned_or_suppress!(
                 match rooted
                     .as_deref()
@@ -26110,6 +26101,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     None => owned_vec_to_generic_result(values),
                 };
             }
+            let owned_builtin_expr = Expr::Builtin(builtin.clone());
             eval_on_owned_over::<S, _>(
                 &owned_builtin_expr,
                 owned,

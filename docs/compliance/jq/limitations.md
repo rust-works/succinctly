@@ -8329,7 +8329,8 @@ plain `eval` it measured slower (7950X, interleaved, 9 reps, the `users` documen
 10 MB of `-R` lines: `select(test("age"))` +30%, `tojson` +41%, `sub` +32%, `fromjson | .id`
 +129%), because the generic evaluator answers a builtin it has no native arm for by decoding the
 value, writing it out again and indexing it again on every call, and `-R` makes one call per
-line. Three changes close that, and none touches the `succinctly jq` cursor route:
+line. Three changes close that; the first and third are scoped to the DOM route (no cursor on the
+`succinctly jq` route is ever registered), and the second is a plain speedup everywhere:
 
 - The route calls the hidden `jq::eval_reindexed_document`, which is `eval` plus a registration
   of the document it was handed. A bridge whose value is that document's root evaluates over its
