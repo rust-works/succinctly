@@ -23955,20 +23955,16 @@ fn path_context_absent_identity<V: DocumentValue, S: EvalSemantics>(
 
 /// The `Expr` one resolved path component spells.
 ///
-/// A path component is a mapping key (a string) or a sequence index (an
-/// integer) -- [`cursor_key`] and `path_step_generic` are the only two
-/// things that build one, and neither produces anything else.
+/// A path component is a mapping key (a string), a sequence index (an
+/// integer), or -- for a slice step -- the `{"start":s,"end":e}` object jq
+/// spells a slice with (#3469). The first two are the common case and stay
+/// literals; the slice object has no literal syntax short of a constructor,
+/// so it rides a [`Expr::tracked_value`] snapshot as `parent`'s arms do.
 fn path_component_literal(component: &OwnedValue) -> Expr {
     match component {
         OwnedValue::String(s) => Expr::Literal(Literal::String(s.to_string())),
         OwnedValue::Int(i) => Expr::Literal(Literal::Int(*i)),
-        _ => {
-            debug_assert!(
-                false,
-                "a path component is a string key or an integer index"
-            );
-            Expr::Literal(Literal::Null)
-        }
+        other => Expr::tracked_value(other.clone()),
     }
 }
 

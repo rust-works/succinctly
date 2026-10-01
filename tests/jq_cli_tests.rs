@@ -84167,3 +84167,113 @@ fn test_count_argument_decode_failure_raises_limit_nth_skip_3466() -> Result<()>
     }
     Ok(())
 }
+
+/// #3469: `key` / the no-arg `path` after a slice step answered `null` (and
+/// panicked a debug build) whenever the stage was rewritten to constants --
+/// comma, `select`, `if`, `//` -- because the rewrite only knew how to spell a
+/// string or integer component, not the `{"start":s,"end":e}` a slice
+/// contributes. Expected values are jq 1.7.1's `path(.[a:b]) | last`.
+#[test]
+fn test_key_and_path_after_slice_survive_constant_rewrite_3469() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            "[10,20,30]",
+            "[.[1:2] | key, 9]",
+            r#"[{"start":1,"end":2},9]"#,
+        ),
+        (
+            "[10,20,30]",
+            "[.[1:] | key, 9]",
+            r#"[{"start":1,"end":null},9]"#,
+        ),
+        (
+            "[10,20,30]",
+            "[.[:2] | key, 9]",
+            r#"[{"start":null,"end":2},9]"#,
+        ),
+        (
+            "[10,20,30]",
+            "[.[-2:] | key, 9]",
+            r#"[{"start":-2,"end":null},9]"#,
+        ),
+        (
+            "[10,20,30]",
+            "[.[1:2] | select(true) | key]",
+            r#"[{"start":1,"end":2}]"#,
+        ),
+        (
+            "[10,20,30]",
+            "[.[1:2] | if true then key else 1 end]",
+            r#"[{"start":1,"end":2}]"#,
+        ),
+        // `null` is falsy, so the old `null` answer fell through to `9`.
+        (
+            "[10,20,30]",
+            "[.[1:2] | key // 9]",
+            r#"[{"start":1,"end":2}]"#,
+        ),
+        (
+            "[10,20,30]",
+            "[.[1:2] | path, 9]",
+            r#"[[{"start":1,"end":2}],9]"#,
+        ),
+        (
+            "[[1,2,3]]",
+            "[.[0][1:] | (path, key), 9]",
+            r#"[[0,{"start":1,"end":null}],{"start":1,"end":null},9]"#,
+        ),
+        // Nested slice: the last component is the inner slice.
+        (
+            "[10,20,30]",
+            "[.[1:3][0:1] | key, 9]",
+            r#"[{"start":0,"end":1},9]"#,
+        ),
+        (
+            "[10,20,30]",
+            "[.[1:3][0:1] | path, 9]",
+            r#"[[{"start":1,"end":3},{"start":0,"end":1}],9]"#,
+        ),
+        // Must not change: string and integer components, and the routes that
+        // already answered correctly.
+        ("{\"a\":1}", "[.a | key, 9]", r#"["a",9]"#),
+        ("[10,20,30]", "[.[1] | key, 9]", "[1,9]"),
+        ("[10,20,30]", ".[1:2] | key", r#"{"start":1,"end":2}"#),
+        (
+            "[10,20,30]",
+            "[.[1:2] | [key]]",
+            r#"[[{"start":1,"end":2}]]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "#3469: `{filter}`");
+    }
+    Ok(())
+}
+
+/// #3469: yq mode never reached the bug (real yq v4.53.3 answers `[9]` -- a
+/// slice has no key there), and must keep answering that.
+#[test]
+fn test_key_after_slice_yq_mode_unchanged_3469() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-o", "json", "-I", "0", "[.[1:2] | key, 9]"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child
+                .stdin
+                .take()
+                .expect("piped")
+                .write_all(b"[10,20,30]")?;
+            child.wait_with_output()
+        })?;
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim_end(),
+        "[9]",
+        "stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
