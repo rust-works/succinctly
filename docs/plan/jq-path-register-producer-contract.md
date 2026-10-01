@@ -106,14 +106,29 @@ output; `place_step` is the **single** conversion point from branch-level loss t
   those constructors would have to carry it, and one missed site silently makes a guessed
   refusal catchable again -- #3186 / #3267's refuse-only-under-try failure.
 
-**An invariant the code implies but does not assert, and that this note cannot yet prove:**
-`Frame::register.is_some()` and `register_loss.is_lost()` are mutually exclusive. The
-`And`/`Or` arm is a candidate counterexample: for a non-trackable `L`, `right_frame =
-frame.with_register(register)` copies the *outer* frame's `register_loss`, so an outer-lost
-frame can gain a `Some` register there. B1 adds the `debug_assert!` *first* and runs the full
-suite and the A1 sweep with it on. If it fires, the layering argument above needs restating
-(the two fields would still stay separate; what changes is which combinations a reader may
-assume). Collapsing the two frame fields into one enum is a follow-up, not this issue.
+**An invariant the code implies, and what B1 found when it asserted it.** The claim was that
+`Frame::register.is_some()` and `register_loss.is_lost()` are mutually exclusive. It is
+**false as stated.** B1 put a `debug_assert!` on every `Frame` constructor that can combine the
+two and ran the jq suite: eight tests tripped it (`test_path_catch_handler_*_843`,
+`_3133`, `_2978`, `_1297`). The violating frames are the *handoff* frame `place_step` builds
+with `with_register_loss` for the next stage, and that frame after `extend`. Both still carry
+the register the stage was *entered* with while recording a new loss. The next stage replaces
+the register through `with_register` (its `stage_frame`), and neither the suite nor the sweep
+showed a reader of a mixed frame -- tested, not proven by construction. The `And`/`Or` arm's `frame.with_register(register)` was the candidate
+counterexample; it did not fire.
+
+What does hold is narrower, and is what B1 asserts: **a frame built by `Frame::with_register`
+-- the one a stage's readers consult -- never carries a register while recording it lost.** It
+held across the jq suite and the full A1 sweep (94,887 rows, built with debug assertions, no
+panic and no flipped row). Two consequences for B2:
+
+- a reader should take the register from `stage_frame`, not from the handoff `frame`, whose
+  `register` is stale by design;
+- the layering argument stands (the two fields stay separate), but the handoff frame is a
+  place where `register` is stale by design, which is one more reason `place_step` is the
+  single conversion point.
+
+Collapsing the two frame fields into one enum remains a follow-up, not this issue.
 
 ### D3. The survival rule moves into the producer
 
@@ -241,11 +256,14 @@ Each step is safe to land on `main` by itself.
   `*_3456` row family per round-2 category in `tests/jq_cli_tests.rs`.
 - **#3494 (merged, PR #3509):** `Frame::certifies_value`.
 - **A2 (this note).**
-- **B1 -- type introduction, zero behaviour change.** `BranchRegister` replaces the `Option`.
-  P1, P7, P8 map `Some` to `Unmoved` (still the entry value, deliberately not yet truthful)
-  and `None` to `None`. Add the D2 `debug_assert!` and run the suite and A1 sweep with it
-  first. Record `size_of::<PathBranch>()` (no pin exists today; the `Cow` plus a tag may fit
-  a niche) and run the perf guard.
+- **B1 -- type introduction, zero behaviour change (#3456).** `BranchRegister { None,
+  Unmoved }` replaces the `Option`; only those two variants, because the lost states have no
+  producer until B2 and an unconstructed variant would need a `dead_code` allowance
+  (STYLE-0005). P1, P7, P8 and the stage placement map `Some` to `Unmoved` through
+  `BranchRegister::from_option` (still the entry value, deliberately not yet truthful), so
+  `git grep from_option` is B2's list of producers that must state their own answer, after
+  which the adapter is deleted. The D2 assertion landed first and is narrower than the plan
+  assumed (section 3, D2).
 - **B2 -- move the rule (D3-D7).** Producers become truthful, `stage_preserves_register`
   leaves C1, wrappers and `FoldRegister` consume the state, `register_after` collapses to
   "read the branch". `and_or_negate_resolves_live` keeps its gate, so **no behaviour change on
@@ -295,7 +313,8 @@ Each step is safe to land on `main` by itself.
 - **"No behaviour change" can hide a refactor that never reaches the changed code.** The
   sweep needs rows that reach P1, P7 and P8 on a trackable input under each wrapper; B1/B2 check
   that the sweep's grid does, rather than assuming it.
-- **The D2 invariant may be false** (section 3, D2). This is the first thing B1 tests.
+- **The D2 invariant was false as first stated** (section 3, D2); B1 narrowed it to reader frames and
+  it holds in the suite and sweep. B2 should not read a register from the handoff frame.
 - **B3 widens acceptance.** Its gate is the sweep, not reasoning.
 
 ## 9. Open questions for review

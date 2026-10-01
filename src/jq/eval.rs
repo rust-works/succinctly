@@ -33115,10 +33115,11 @@ impl Frame {
     /// [`Frame::with_register_loss`] for the next stage, nor for that frame
     /// after [`Frame::extend`]: both still carry the register the stage was
     /// *entered* with, and the next stage replaces it through
-    /// `with_register` before any reader looks. So the assertion lives here
-    /// and nowhere upstream of it; an assertion on those two failed 8 jq
-    /// tests (`test_path_catch_handler_*_843`, `_3133`, `_2978`, `_1297`)
-    /// without any reader being affected.
+    /// `with_register` (its `stage_frame`). So the assertion lives here and
+    /// nowhere upstream of it; an assertion on those two failed 8 jq tests
+    /// (`test_path_catch_handler_*_843`, `_3133`, `_2978`, `_1297`), none of
+    /// which showed a reader of the mixed frame -- tested, not proven by
+    /// construction.
     fn with_register(&self, register: Option<&OwnedValue>) -> Self {
         debug_assert!(
             register.is_none() || !self.register_loss.is_lost(),
