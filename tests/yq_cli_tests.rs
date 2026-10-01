@@ -3190,6 +3190,14 @@ const EQUAL_MAPPING_NESTED_IN_SEQUENCE_KEY: &str =
 const SAME_ALIAS_TO_MAPPING_KEY: &str = "m: &m {p: 1}\na: &a\n  *m : x\nb:\n  <<: *a\n  *m : y\n";
 const DIFFERENT_ALIAS_TO_MAPPING_KEYS: &str =
     "m: &m {p: 1}\nn: &n {p: 2}\na: &a\n  *m : x\nb:\n  <<: *a\n  *n : y\n";
+// The anchored definition of a key against an alias use of it is one key, and
+// so are two aliases naming equal scalars.
+const ANCHORED_MAPPING_KEY_AND_ITS_ALIAS: &str =
+    "a: &a\n  ? &m {p: 1}\n  : x\nb:\n  <<: *a\n  *m : y\n";
+const ANCHORED_SEQUENCE_KEY_AND_ITS_ALIAS: &str =
+    "a: &a\n  ? &m [1]\n  : x\nb:\n  <<: *a\n  *m : y\n";
+const TWO_ALIASES_NAMING_EQUAL_SCALARS: &str =
+    "n: &n 5\nm: &m 5\na: &a\n  *n : x\nb:\n  <<: *a\n  *m : y\n";
 
 #[test]
 fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()> {
@@ -3333,6 +3341,9 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
             ".b.z = 1",
             "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
         ),
+        (ANCHORED_MAPPING_KEY_AND_ITS_ALIAS, ".b | length", "1\n"),
+        (ANCHORED_SEQUENCE_KEY_AND_ITS_ALIAS, ".b | length", "1\n"),
+        (TWO_ALIASES_NAMING_EQUAL_SCALARS, ".b | length", "1\n"),
         (SAME_ALIAS_TO_MAPPING_KEY, ".b | length", "1\n"),
         (
             SAME_ALIAS_TO_MAPPING_KEY,

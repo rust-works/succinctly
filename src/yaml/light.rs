@@ -5388,10 +5388,12 @@ struct KeyPositions {
 /// cannot.
 ///
 /// - `Content`: a sequence key made only of scalars, nested sequences and
-///   aliases to those, by its rendering (`[1]`; see [`complex_key_content`]).
-///   Nothing in it can collapse to `""`, so equal renderings are equal keys. A
-///   merged-in `? [1]` and a local `? [1]` are one key, and the local one wins
-///   as it always did.
+///   aliases to those, or an alias naming a scalar or such a sequence, by its
+///   rendering (`[1]`, `5`; see [`complex_key_content`]). Renderings are JSON
+///   text, and a sequence's starts with `[` while a scalar's never does, so the
+///   two cannot be mistaken for each other. Nothing in a rendered key can
+///   collapse to `""`, so equal renderings are equal keys. A merged-in `? [1]`
+///   and a local `? [1]` are one key, and the local one wins as it always did.
 /// - `Node`: anything else (a mapping used as a key at any depth, a sequence
 ///   too large to render, an undecodable string, a dangling alias) is the same
 ///   key only if it is the *same node*: the index of its own BP node, or of the
@@ -5415,6 +5417,9 @@ const COMPLEX_KEY_CONTENT_MAX_DEPTH: usize = 16;
 /// so a few anchored sequences each listing the last twelve times
 /// (`l1: &l1 [*l0, ... x12]`, `l2: &l2 [*l1, ... x12]`, ...) expand to 12^n
 /// nodes from a few hundred bytes. A real complex key has a handful of nodes.
+/// Only a rendered node counts (a scalar, a `null`, a sequence); an alias hop is
+/// free, because the node it names is counted, so the same content costs the
+/// same whether it is written inline or through an alias.
 const COMPLEX_KEY_CONTENT_MAX_NODES: usize = 64;
 
 /// A rendering of a complex key, when it is safe to compare keys by it.
@@ -5465,23 +5470,30 @@ fn complex_key_content<W: AsRef<[u64]>>(key: &YamlCursor<'_, W>) -> Option<Strin
         depth: usize,
         budget: &mut usize,
     ) -> bool {
-        if depth > COMPLEX_KEY_CONTENT_MAX_DEPTH || *budget == 0 {
+        if depth > COMPLEX_KEY_CONTENT_MAX_DEPTH {
             return false;
         }
-        *budget -= 1;
+        // The node being rendered costs one; an alias hop costs nothing.
+        let mut spend = || {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            true
+        };
         match cursor.value() {
             YamlValue::Null => {
                 out.push_str("null");
-                true
+                spend()
             }
             YamlValue::String(s) => {
                 if s.as_str().is_err() {
                     return false;
                 }
                 cursor.write_json_to(out);
-                true
+                spend()
             }
-            YamlValue::Sequence(elements) => sequence(elements, out, depth, budget),
+            YamlValue::Sequence(elements) => spend() && sequence(elements, out, depth, budget),
             YamlValue::Alias {
                 target: Some(target),
                 ..
