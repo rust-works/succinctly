@@ -81845,6 +81845,63 @@ fn test_as_binding_neighbouring_shapes_still_match_jq_3397() -> Result<()> {
     assert_as_binding_rows_3397(AS_BINDING_GUARD_ROWS_3397)
 }
 
+/// #3443: in jq mode a leading unary minus binds *looser* than `/` and `%`
+/// (jq's `'-' Exp`), so `-1 / 0` is `-(1 / 0)` and `-1 % 1` is `-(1 % 1)`.
+/// The two parses agree on every value where the sign cancels, so the symptom
+/// was only a zero result's sign (`-0` against `0`) and the operand a
+/// divide/modulo error names (`number (1)`, not `number (-1)`). #3397's
+/// change to the same grammar (an operator after a negative literal is covered
+/// by the negation) closed it, and nothing pinned these rows.
+///
+/// The second half is the explicit spellings, which must keep their own
+/// answers: `(-1) % 1` is `0` and `((-1) / 0)` names `(-1)`. Every value is
+/// captured from jq 1.7.1 -- `(input, filter, stdout, exit)`.
+const UNARY_MINUS_DIVISION_ROWS_3443: &[(&str, &str, &str, i32)] = &[
+    (r"null", r"-1 % 1", "-0\n", 0),
+    (r"null", r"-2 % 2", "-0\n", 0),
+    (r"null", r"-1 % -1", "-0\n", 0),
+    (r"null", r"-1 / 0", "", 5),
+    (r"null", r"-1 % 0", "", 5),
+    (r"null", r"-6 / 3 / 0", "", 5),
+    (
+        r"null",
+        r"try (-1 / 0) catch .",
+        "\"number (1) and number (0) cannot be divided because the divisor is zero\"\n",
+        0,
+    ),
+    (
+        r"null",
+        r"try (-1 % 0) catch .",
+        "\"number (1) and number (0) cannot be divided (remainder) because the divisor is zero\"\n",
+        0,
+    ),
+    (
+        r"null",
+        r"try (-6 / 3 / 0) catch .",
+        "\"number (2) and number (0) cannot be divided because the divisor is zero\"\n",
+        0,
+    ),
+    // The explicit spellings keep their own answers.
+    (r"null", r"(-1) % 1", "0\n", 0),
+    (r"null", r"-(1 % 1)", "-0\n", 0),
+    (
+        r"null",
+        r"try ((-1) / 0) catch .",
+        "\"number (-1) and number (0) cannot be divided because the divisor is zero\"\n",
+        0,
+    ),
+    // `*` and `+` stay put: the sign is visible only through a generator.
+    (r"null", r"-1 * 0", "-0\n", 0),
+    (r"null", r"[-1 * (1, 0)]", "[-1,-0]\n", 0),
+    (r"null", r"[-5 % (5, 3)]", "[-0,-2]\n", 0),
+    (r"null", r"-1 + 2", "1\n", 0),
+];
+
+#[test]
+fn test_unary_minus_covers_division_and_remainder_chain_3443() -> Result<()> {
+    assert_as_binding_rows_3397(UNARY_MINUS_DIVISION_ROWS_3443)
+}
+
 /// #3397, yq mode: real yq binds the whole left expression before `as`
 /// (`2 * 1 as $x | $x + 10` is `12` in yq v4.53.3), so `succinctly yq`
 /// keeps doing so; only jq mode moved to jq's grammar.
