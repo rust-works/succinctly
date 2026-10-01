@@ -83082,8 +83082,10 @@ fn test_slice_bound_retry_reaches_consumer_stop_3471() -> Result<()> {
 /// #3471, owned route: the tables above again with the target built under `-n`
 /// (`eval.rs`'s evaluator, which has its own `each_slice_expr`), and once more
 /// with an `input` builtin inside the bound, which forces that evaluator for an
-/// ordinary document read too. The `input` rows feed every pull the same `5`,
-/// so the rows' answers are unchanged.
+/// ordinary document read too. In the `input` rows the first input is the
+/// document and each pull of the bound then consumes one queued `5`; the
+/// queue holds enough for the retry's second pull, so the rows' answers are
+/// unchanged.
 #[test]
 fn test_slice_bound_retry_reaches_consumer_stop_on_owned_route_3471() -> Result<()> {
     assert_retry_rows_3293(None, "[10,20,30] | ", RETRY_ROWS_SLICE_BOUND_CONSUMER_3471)?;
@@ -83093,8 +83095,10 @@ fn test_slice_bound_retry_reaches_consumer_stop_on_owned_route_3471() -> Result<
         RETRY_ROWS_SLICE_BOUND_CONSUMER_STRING_3471,
     )?;
     // jq 1.7.1: the bound is `input as $q | 1 as $x ?// $y | 1`, so each pull
-    // of the bound reads one `5` and yields `1`. `-n` keeps the leftover `5`s
-    // from being run through the filter as documents of their own.
+    // of the bound reads one `5` from the queue and yields `1`. The first
+    // input is taken as `$d`; the first attempt and the retry take two of the
+    // four `5`s. `-n` keeps the leftover `5`s from being run through the
+    // filter as documents of their own.
     for (filter, expected) in [
         (
             "input as $d | $d | [first(.[(input as $q | 1 as $x ?// $y | 1):]), 9]",
