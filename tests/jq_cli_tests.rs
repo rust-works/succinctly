@@ -59450,6 +59450,153 @@ fn test_path_register_long_and_chain_is_bounded_3456() -> Result<()> {
     Ok(())
 }
 
+/// #3456 (B2): the drain producers -- `last(f)`, `isempty(g)`, `INDEX(s; f)`
+/// and an `[E]` whose contents the resolver does not check -- compute a value
+/// without navigating to it, so they cannot say jq's register is where it
+/// entered. A later refusal of the frozen `$x` is therefore a guess, and a
+/// guessed refusal must be loud: caught by the `try` beside it, the write
+/// would be lost silently. Every row is exit 5 here and `{"k":1,"l":[1,2]}`
+/// (or the unchanged document) in jq 1.7.1, which keeps the register where it
+/// was for `last`/`INDEX`/`[E]` -- the promotion step's rows, not a fix here.
+#[test]
+fn test_path_register_drain_producers_lose_the_register_uncatchably_3456() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"k":1,"l":[1,2]}"#;
+    let access_a = r#"Invalid path expression near attempt to access element "a""#;
+    let access_k = r#"Invalid path expression near attempt to access element "k""#;
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"del(. as $x | last(.l[]) | try ($x | .a))",
+            "",
+            access_a,
+            5,
+        ),
+        (
+            doc,
+            r"del(. as $x | isempty(.l[]) | try ($x | .a))",
+            "",
+            access_a,
+            5,
+        ),
+        (
+            doc,
+            r"del(. as $x | INDEX(.l[]; .) | try ($x | .a))",
+            "",
+            access_a,
+            5,
+        ),
+        (
+            doc,
+            r"del(. as $x | [.l | sort] | try ($x | .a))",
+            "",
+            access_a,
+            5,
+        ),
+        // An unchecked `[E]` entered at `.l` records no position at all
+        // (`LostSomewhere`), so even a `$x` that cannot be inside `.l` stays a
+        // guess: jq's answer is the unchanged document. `LostAt(entry)` would
+        // give it, and is a promotion with rows of its own.
+        (
+            doc,
+            r"del(. as $x | .l | [. | sort] | try ($x | .k))",
+            "",
+            access_k,
+            5,
+        ),
+    ])
+}
+
+/// #3456 (B2): what the drain producers *do* know is where the register was
+/// when they ran -- `last`/`isempty`/`INDEX` record it (`LostAt`), so a `$x`
+/// frozen outside that node cannot be it and jq's own refusal stays
+/// catchable, exactly as jq 1.7.1 has it. A checked `[E]` keeps the register
+/// outright (#3263). All exit 0 and byte-identical to jq.
+#[test]
+fn test_path_register_drain_producers_keep_where_they_lost_it_3456() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"k":1,"l":[1,2]}"#;
+    let unchanged = "{\"a\":{\"b\":1},\"k\":1,\"l\":[1,2]}\n";
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"del(. as $x | .a | last(.b?) | try ($x | .k))",
+            unchanged,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | .a | isempty(.b?) | try ($x | .k))",
+            unchanged,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | .a | INDEX(.b?; .) | try ($x | .k))",
+            unchanged,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | .l | [.[]] | try ($x | .k))",
+            unchanged,
+            "",
+            0,
+        ),
+        // The checked array keeps the register, so `$x` re-establishes and
+        // the write happens.
+        (
+            doc,
+            r"del(. as $x | [.a] | try ($x | .a))",
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3456 (B2): the survival rule is decided per *stage*, not per leaf. A
+/// compound stage that mixes a leaf that navigates with one that does not
+/// loses the register as a whole, so these refuse where jq 1.7.1 answers `[]`
+/// (backtracking to the fork puts its register back for the by-value leaf).
+/// Pinned as today's behaviour: lifting the verdict to the leaf would turn
+/// each into jq's answer, which is a promotion with its own rows, and the
+/// producer migration must flip nothing. The `(empty, 1)` control matches jq.
+#[test]
+fn test_path_register_compound_stage_is_refused_as_a_whole_3456() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | (.a // 1) | $x)",
+            "",
+            r#"Invalid path expression with result {"a":null}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | if true then 1 else first(.a) end | $x)",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | try 1 catch first(.a) | $x)",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | (empty, 1) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #2760 seen from the side that does damage: `del()` and `|=` consume the
 /// same resolution, so the missing refusal was a **refused edit reported as
 /// a successful no-op** -- the document came back unchanged at exit 0 where
