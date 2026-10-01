@@ -68176,6 +68176,486 @@ fn test_array_key_yq_mode_unchanged_3453() -> Result<()> {
 }
 
 // ============================================================================
+// #3506: an array key on an array in path position and under a write
+// ============================================================================
+
+/// jq keeps an array key whole as the path component (`path(.[[9]])` is
+/// `[[9]]` even where nothing matches), reads through it as the subarray
+/// search, and refuses every write through it: `Cannot update field at array
+/// index of array` for a write, `Cannot delete array element of array` when
+/// the key ends the path being deleted, and the update wording again when a
+/// key earlier in the path is rewritten with `setpath`. The wording depends on
+/// *which* component is the key and what the filter does, so every row below
+/// was captured from `/usr/bin/jq` 1.7.1 rather than derived.
+#[test]
+fn test_array_key_in_path_and_write_position_3506() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[0,1,2,1,2]", "path(.[[2]])", "[[2]]"),
+        ("[0,1,2,1,2]", "[path(.[[1,2]])]", "[[[1,2]]]"),
+        ("[1,2]", "path(.[[1]]|.[0])", "[[1],0]"),
+        ("[0,1,2,1,2]", "getpath([[2]])", "[2,4]"),
+        ("[1,2]", "getpath([[1],0])", "0"),
+        ("[[1,2]]", "getpath([0,[1]])", "[0]"),
+        ("[1,2]", "path(getpath([[1]]))", "[[1]]"),
+        ("[1,2]", "[path(.[[1],[2]])]", "[[[1]],[[2]]]"),
+        ("[1,2]", "path(.[[9]])", "[[9]]"),
+        ("[1,2]", ".[[1]] = empty", ""),
+        ("[1,2]", "path(.[[1]]?)", "[[1]]"),
+        (
+            "[1,2]",
+            "try (.[[1]] = 5) catch .",
+            "\"Cannot update field at array index of array\"",
+        ),
+        ("{\"a\":[1,2]}", "path(.a[[1]])", "[\"a\",[1]]"),
+        ("[1,2]", "path(.[[1]]|.[0]?)", "[[1],0]"),
+        ("[1,2]", "[.[[1]] | path(.)]", "[[]]"),
+        ("[1,2]", "(.[[1]] = 5)?", ""),
+        ("[1,2]", "[(.[[1]] = 5)?]", "[]"),
+        ("[1,2]", "[paths(..)]", "[[0],[1]]"),
+        ("[1,2]", "[.[[1]]|paths]", "[[0]]"),
+        ("[1,2]", "path(first(.[[1]]))", "[[1]]"),
+        ("[1,2]", "[limit(1;path(.[[1],[2]]))]", "[[[1]]]"),
+        ("[[1,2],[1,2]]", "[path(.[]|.[[2]])]", "[[0,[2]],[1,[2]]]"),
+        ("[[1,2],[1,2]]", "path(.[0][[2]]|.[0])", "[0,[2],0]"),
+        ("[1,2]", "[paths]|length", "2"),
+        (
+            "[1,2]",
+            "to_entries",
+            "[{\"key\":0,\"value\":1},{\"key\":1,\"value\":2}]",
+        ),
+        ("[1,2]", "[.[[1]]]|length", "1"),
+        (
+            "[1,2]",
+            "path(.[[1]]|..)",
+            "[[1]]
+[[1],0]",
+        ),
+        ("[1,2]", "[path(.[[1]]|..)]", "[[[1]],[[1],0]]"),
+        ("[1,2]", "[getpath([[1]],[[2]])]", "[[0],[1]]"),
+        ("[1,2]", "[paths(type==\"number\")]", "[[0],[1]]"),
+        ("[1,2]", "walk(.)", "[1,2]"),
+        ("[1,2]", "path(.[[1]] // 5)", "[[1]]"),
+        ("[1,2]", "path(if .[[1]] then .[[1]] else . end)", "[[1]]"),
+        ("[1,2]", "path(.[[1]]|.[[0]])", "[[1],[0]]"),
+        ("[[1,2],[3]]", "path(.[0][[2]])", "[0,[2]]"),
+        ("[1,2]", ".[[1]] as $x | path(.[$x])", "[[0]]"),
+        ("[1,2]", "try path(.[[1]][[0]]) catch .", "[[1],[0]]"),
+        ("[1,2]", "[path(.[[1]]|.[]?)]", "[[[1],0]]"),
+        (
+            "[1,2]",
+            "try del(.[[1]][[0]]) catch .",
+            "\"Cannot delete array element of array\"",
+        ),
+        ("[1,2]", "[paths(..)]|length", "2"),
+        (
+            "[1,2]",
+            "try path([1,2] | .[[1]]) catch .",
+            "\"Invalid path expression near attempt to access element [1] of [1,2]\"",
+        ),
+        (
+            "[1,2]",
+            "try path(tojson|fromjson|.[[1]]) catch .",
+            "\"Invalid path expression near attempt to access element [1] of [1,2]\"",
+        ),
+        (
+            "[1,2]",
+            "try ((1,2) as $x | path([1,2]|.[[1]])) catch .",
+            "\"Invalid path expression near attempt to access element [1] of [1,2]\"",
+        ),
+        (
+            "[1,2]",
+            "try (([1,2]|.[[1]]) = 3) catch .",
+            "\"Invalid path expression near attempt to access element [1] of [1,2]\"",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3506: `{filter}` on {input}: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "#3506: `{filter}` on {input}");
+    }
+    for (input, filter, message) in [
+        (
+            "[0,1,2,1,2]",
+            ".[[2]] = 5",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[0,1,2,1,2]",
+            ".[[2]] |= 5",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[0,1,2,1,2]",
+            ".[[2]] += 1",
+            "array ([2,4]) and number (1) cannot be added",
+        ),
+        (
+            "[0,1,2,1,2]",
+            "setpath([[1]];5)",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[0,1,2,1,2]",
+            "del(.[[2]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[0,1,2,1,2]",
+            "delpaths([[[2]]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "pick(getpath([[1]]))",
+            "Cannot index null with array",
+        ),
+        (
+            "[1,2]",
+            "getpath([[1]]) = 3",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "del(getpath([[1]]))",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "(.[[9]]) = 1",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "(.[[]]) = 1",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "{\"a\":[1,2]}",
+            ".a[[1]] = 5",
+            "Cannot update field at array index of array",
+        ),
+        ("null", "setpath([[1]];5)", "Cannot index null with array"),
+        ("null", "path(.[[1]])", "Cannot index null with array"),
+        (
+            "[1,2]",
+            "(.[[1]]|.[0]) = 9",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "(.[[1]]|.[0]) |= 9",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "(.[[1]]|.[0]) |= empty",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            ".[[1]] |= empty",
+            "Cannot delete array element of array",
+        ),
+        ("[1,2]", ".[[1]] |= error(\"boom\")", "boom"),
+        (
+            "[1,2]",
+            ".[[1]]? = 5",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            ".[[1]] //= 3",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            ".[[1]] -= 3",
+            "array ([0]) and number (3) cannot be subtracted",
+        ),
+        (
+            "[1,2]",
+            ".[[1]] *= 3",
+            "array ([0]) and number (3) cannot be multiplied",
+        ),
+        ("{}", ".a[[1]] = 5", "Cannot index null with array"),
+        (
+            "{\"a\":[1]}",
+            ".a[[1]] |= 2",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[[1,2]]",
+            ".[0][[1]] = 3",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "(.[[1]],.[[2]]) |= 3",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[[1],[2]]",
+            "(.[]|.[[1]]) = 3",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]], .[0])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[0], .[[1]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[0],[[1]]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]]|.[0])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[1],0]])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "setpath([[1]];5)",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "setpath([[1],0];5)",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "setpath([0,[1]];5)",
+            "Cannot index number with array",
+        ),
+        (
+            "[[1,2]]",
+            "setpath([0,[1]];5)",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "with_entries(.)",
+            "Cannot use number (0) as object key",
+        ),
+        ("[1,2]", "pick(.[[1]])", "Cannot index null with array"),
+        ("[1,2]", "pick(.[[1]]|.[0])", "Cannot index null with array"),
+        (
+            "{\"a\":[1,2]}",
+            "pick(.a[[1]])",
+            "Cannot index null with array",
+        ),
+        (
+            "[1,2]",
+            "(.[[1]]|select(. != null)) = 3",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[[1,2],[1,2]]",
+            "del((.[]|.[[1]])?)",
+            "Cannot delete array element of array",
+        ),
+        ("[1,2]", "(.[[1]]|.[0]) |= error(\"boom\")", "boom"),
+        (
+            "[1,2]",
+            "[.[[1]] |= empty]",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            ".[[1]]? |= 9",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[1],[0]]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[9],[0]]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[1],\"a\"]])",
+            "Cannot delete string element of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[1],0,\"x\"]])",
+            "Cannot delete fields from number",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[1],0,0]])",
+            "Cannot delete fields from number",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[1],0]])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "delpaths([[[2],0]])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "[delpaths([[[1],5]])]",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[[1,2]]",
+            "delpaths([[0,[1],0]])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]][[0]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]]|.[0])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]][0][0])",
+            "Cannot index number with number",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]][0].a)",
+            "Cannot index number with string \"a\"",
+        ),
+        (
+            "[1,2]",
+            "(.[[1]]|.[0], .[1]) |= 5",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "(.[[1]]|.[0], .[1]) |= empty",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]]|.[0], .[1])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]], .[0])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]], .[[2]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "del((.[[1]], .[0]))",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "path([1,2] | .[[1]])",
+            "Invalid path expression near attempt to access element [1] of [1,2]",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]], .[0+0])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[0+0], .[[1]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[[1,2],[3]]",
+            "del(.[0][[1]]|.[0], .[1][0])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[[1,2],[3]]",
+            "(.[(0,1)][0], .[0][[1]][0]) |= empty",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[[1,2],[3]]",
+            "del(.[(0,1)][[1]], .[0][1])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[[1,2],[3]]",
+            "del(.[]|.[[1]])",
+            "Cannot delete array element of array",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "#3506: `{filter}` on {input}: {stdout:?}");
+        assert!(stdout.is_empty(), "#3506: `{filter}`: {stdout:?}");
+        assert!(
+            stderr.contains(message),
+            "#3506: `{filter}` on {input}: wanted {message:?}, got {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// yq has no array key, so none of its path or write forms change: the key is
+/// still refused with the same message everywhere it was.
+#[test]
+fn test_array_key_in_path_and_write_position_yq_mode_unchanged_3506() -> Result<()> {
+    // `setpath` is `--jq-extensions` surface there, and the array key is still
+    // refused through it (#3506 review).
+    for filter in [
+        ".a[[1]] = 5",
+        "del(.a[[1]])",
+        ".a[[1]] |= 5",
+        "[.a[[1]]]",
+        "setpath([\"a\",[1]]; 5)",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().expect("piped").write_all(
+                    b"a: [1,2,1]
+",
+                )?;
+                child.wait_with_output()
+            })?;
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Cannot index array with array"),
+            "#3506 (yq): `{filter}`: {output:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "#3506 (yq): `{filter}`: {output:?}"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
 // #3279: a `try`-wrapped `if` as a bind source keeps the path register
 // ============================================================================
 

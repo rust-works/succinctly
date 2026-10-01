@@ -793,6 +793,7 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
             start_key: start_key.clone(),
             end_key: end_key.clone(),
         },
+        Expr::ArrayKey(key) => Expr::ArrayKey(key.clone()), // omni-dev: coverage tolerate-line reason="unreachable: ArrayKey is only built from a resolved key at path-resolution time, never parsed, so no rewrite of parsed source meets it (#3506)"
         Expr::Iterate => Expr::Iterate,
         Expr::Literal(lit) => Expr::Literal(lit.clone()),
         Expr::RecursiveDescent => Expr::RecursiveDescent,
@@ -1182,6 +1183,7 @@ pub(crate) fn search_subexpr<F: FnMut(&Expr) -> Visit + ?Sized>(
         | Expr::Field(_)
         | Expr::Index { .. }
         | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
         | Expr::Iterate
         | Expr::Literal(_)
         | Expr::RecursiveDescent
@@ -1862,6 +1864,7 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
         | Expr::Field(..)
         | Expr::Index { .. }
         | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
         | Expr::Iterate
         | Expr::IndexExpr { .. }
         | Expr::SliceExpr { .. }
@@ -1926,6 +1929,7 @@ fn node_reads_ambient(node: &Expr) -> bool {
         | Expr::Field(_)
         | Expr::Index { .. }
         | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
         | Expr::Iterate
         | Expr::RecursiveDescent
         // `not` and `@base64` and friends all apply to `.`.

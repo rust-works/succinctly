@@ -2279,6 +2279,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         | Expr::Field(_)
         | Expr::Index { .. }
         | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
         | Expr::Iterate
         | Expr::RecursiveDescent
         | Expr::Literal(_)

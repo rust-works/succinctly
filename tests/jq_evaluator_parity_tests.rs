@@ -1347,6 +1347,90 @@ fn array_key_is_a_subarray_search_across_evaluators_3453() {
     }
 }
 
+/// #3506: an array key keeps its place in a path and refuses every write, in
+/// both evaluators. Each expectation is jq-1.7.1's.
+#[test]
+fn array_key_in_path_and_write_position_agrees_across_evaluators_3506() {
+    for (json, filter, expected) in [
+        ("[0,1,2,1,2]", "path(.[[2]])", "[[2]]"),
+        ("[1,2]", "path(.[[9]])", "[[9]]"),
+        ("[1,2]", "[path(.[[1],[2]])]", "[[[1]],[[2]]]"),
+        ("[1,2]", "path(.[[1]]|.[0])", "[[1],0]"),
+        ("[1,2]", "path(.[[1]][0])", "[[1],0]"),
+        ("{\"a\":[1,2]}", "path(.a[[1]])", "[\"a\",[1]]"),
+        ("[1,2]", "path(getpath([[1]]))", "[[1]]"),
+        ("[[1,2],[1,2]]", "[path(.[]|.[[2]])]", "[[0,[2]],[1,[2]]]"),
+        (
+            "[1,2]",
+            "try (.[[1]] = 5) catch .",
+            "\"Cannot update field at array index of array\"",
+        ),
+        (
+            "[1,2]",
+            "try (.[[1]] |= 5) catch .",
+            "\"Cannot update field at array index of array\"",
+        ),
+        (
+            "[1,2]",
+            "try (.[[1]] |= empty) catch .",
+            "\"Cannot delete array element of array\"",
+        ),
+        (
+            "[1,2]",
+            "try ((.[[1]]|.[0]) |= empty) catch .",
+            "\"Cannot update field at array index of array\"",
+        ),
+        (
+            "[1,2]",
+            "try (.[[1]] |= error(\"boom\")) catch .",
+            "\"boom\"",
+        ),
+        (
+            "[1,2]",
+            "try setpath([[1]]; 5) catch .",
+            "\"Cannot update field at array index of array\"",
+        ),
+        (
+            "[1,2]",
+            "try del(.[[1]]) catch .",
+            "\"Cannot delete array element of array\"",
+        ),
+        (
+            "[1,2]",
+            "try del(.[[1]]|.[0]) catch .",
+            "\"Cannot update field at array index of array\"",
+        ),
+        (
+            "[1,2]",
+            "try del(.[[1]][[0]]) catch .",
+            "\"Cannot delete array element of array\"",
+        ),
+        (
+            "[[1,2],[1,2]]",
+            "try del((.[]|.[[1]])?) catch .",
+            "\"Cannot delete array element of array\"",
+        ),
+        (
+            "[1,2]",
+            "try pick(getpath([[1]])) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        (
+            "null",
+            "try path(.[[1]]) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        ("[1,2]", "[(.[[1]] = 5)?]", "[]"),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json.as_bytes(), filter)),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}` on `{json}`"
+        );
+        assert_parity(json.as_bytes(), filter);
+    }
+}
+
 #[test]
 fn test_object_construction_product_parity_354() {
     // Object construction is a generator: an entry whose key or value yields n

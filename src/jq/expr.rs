@@ -356,6 +356,24 @@ pub enum Expr {
         end_key: Option<SliceBoundKey>,
     },
 
+    /// An array-valued key as a path component: `path(.[[2]])` is `[[2]]`
+    /// (#3506).
+    ///
+    /// jq appends the resolved key to the path exactly as given, so an array
+    /// key over an array is the component *whole*, verbatim and whether or not
+    /// it matches anything (`[1,2] | path(.[[9]])` is `[[9]]`). Reading
+    /// through it answers the subarray search's positions, `[0,1,2,1,2] |
+    /// getpath([[2]])` is `[2,4]`, and a path may continue into that array
+    /// (`path(.[[1]] | .[0])` is `[[1],0]`). Writing through it raises `Cannot
+    /// update field at array index of array`, deleting `Cannot delete array
+    /// element of array`.
+    ///
+    /// Only ever built from a resolved key over an array target
+    /// (`key_to_path_component`); the parser never produces it, because a
+    /// constant array key is an [`Expr::IndexExpr`] like any other computed
+    /// one. `Box`ed to keep [`Expr`] at its pinned size (#1401).
+    ArrayKey(Box<OwnedValue>),
+
     /// Iterate all elements: `.[]`
     Iterate,
 
@@ -373,11 +391,11 @@ pub enum Expr {
     /// path and every existing `Field`/`Index` match site are untouched.
     ///
     /// An array-valued key on an array is jq's indices-of-subarray search
-    /// (`[10,20,30] | .[[20]]` → `[1]`) when *read* (#3453). In `path()` and
-    /// write position it is still refused with `Cannot index array with array`
-    /// where jq answers (#3506). A NaN key, which reads as null in both, has no
-    /// path component here — jq's `path(.[nan])` is `[null]`, a path its own
-    /// `setpath` then rejects, so this errors at the source instead.
+    /// (`[10,20,30] | .[[20]]` → `[1]`) when read (#3453), and in `path()`
+    /// position it resolves to [`Expr::ArrayKey`], kept whole (#3506). A NaN
+    /// key, which reads as null in both, has no path component here — jq's
+    /// `path(.[nan])` is `[null]`, a path its own `setpath` then rejects, so
+    /// this errors at the source instead.
     ///
     /// A float key is *not* on that list any more: it keeps its own
     /// spelling in `path()` output, via [`Expr::Index`]'s own `key` field

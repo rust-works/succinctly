@@ -781,6 +781,18 @@ impl EvalError {
         Self::new(Self::OUT_OF_BOUNDS_NEGATIVE_INDEX)
     }
 
+    /// `Cannot update field at array index of array`.
+    ///
+    /// A write through an array-valued path component: jq's `setpath` finds
+    /// the subarray-search key where it wanted an index, so `[1,2] | .[[1]] =
+    /// 5`, `|= 5` and `setpath([[1]]; 5)` all stop here (#3506). A
+    /// write-time application error, so an inline `?` does not hide it.
+    pub fn cannot_update_field_at_array_index_of_array() -> Self {
+        Self::new(Self::CANNOT_UPDATE_ARRAY_INDEX_OF_ARRAY)
+    }
+
+    const CANNOT_UPDATE_ARRAY_INDEX_OF_ARRAY: &'static str =
+        "Cannot update field at array index of array";
     const OUT_OF_BOUNDS_NEGATIVE_INDEX: &'static str = "Out of bounds negative array index";
     const SLICE_ASSIGN_NON_ARRAY: &'static str =
         "A slice of an array can only be assigned another array";
@@ -790,12 +802,13 @@ impl EvalError {
     /// does not suppress, unlike every other indexing error it raises (`?`
     /// only suppresses a failure to *reach* a target while collecting a
     /// path; once a write is confirmed to land somewhere, a mismatch in what
-    /// gets written there survives even an inline `?`). Three messages
+    /// gets written there survives even an inline `?`). Four messages
     /// qualify, each confirmed live against jq 1.7.1: [`Self::out_of_bounds_negative_index`]
     /// (`.a[-5]? = 9` still raises), [`Self::slice_assign_non_array`]
     /// (`.a[0:1]? = 9`, a non-array RHS, still raises), and
     /// [`Self::cannot_update_string_slices`] (`"str"[0:1]? = "x"` still
-    /// raises) — #498, #1303.
+    /// raises) — #498, #1303 — and [`Self::cannot_update_field_at_array_index_of_array`]
+    /// (`.[[1]]? = 5`, #3506).
     ///
     /// Contrast a genuinely *non-sliceable* target (`true[0:1]? = 9`) — that
     /// one **is** suppressed, since it's a navigation failure (the slice
@@ -810,6 +823,7 @@ impl EvalError {
         self.message == Self::OUT_OF_BOUNDS_NEGATIVE_INDEX
             || self.message == Self::SLICE_ASSIGN_NON_ARRAY
             || self.message == Self::CANNOT_UPDATE_STRING_SLICES
+            || self.message == Self::CANNOT_UPDATE_ARRAY_INDEX_OF_ARRAY
     }
 
     /// `Array/string slice indices must be integers`.
