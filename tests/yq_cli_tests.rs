@@ -3138,16 +3138,29 @@ fn test_yq_inplace_refuses_colliding_complex_keys_2519() -> Result<()> {
 /// `[1]: x` entry was gone, exit 0. A fallback spelling is never a duplicate
 /// (#1385), so the mapping now keeps both entries: a stream of it shows both,
 /// and every materializing route raises #2519's error instead of dropping one.
+/// What *is* the same key still overrides (`FallbackKey` in `light.rs`): a
+/// sequence key of equal content, and the same source reached twice. A mapping
+/// used as a key is compared by node only, so two equal ones in different nodes
+/// refuse rather than collapse.
 const MERGED_VS_LOCAL_COMPLEX: &str = "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  ? [2]\n  : y\n";
 const TWO_MERGE_SOURCES_COMPLEX: &str =
     "a: &a\n  ? [1]\n  : x\nc: &c\n  ? [2]\n  : w\nb:\n  <<: [*a, *c]\n";
 const MERGED_COMPLEX_VS_GENUINE_EMPTY: &str = "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  \"\": z\n";
-// Two *identical* complex keys, merged-in and local: the local one used to win.
-// Key identity here is the spelling and a complex key has none, so both stay
-// and the materializing routes refuse -- the safe side, recorded in
-// limitations.md.
+// Two keys that are the same key, and so still override: a merged-in `? [1]`
+// and a local `? [1]` (the local one wins, as it always did).
 const MERGED_VS_LOCAL_IDENTICAL_COMPLEX: &str =
     "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  ? [1]\n  : y\n";
+// The same source mapping listed three times: one key, reached three times.
+const SAME_SOURCE_REPEATED_COMPLEX: &str = "a: &a\n  ? [1]\n  : x\nb:\n  <<: [*a, *a, *a]\n";
+// Two different source mappings that each define the same complex key.
+const TWO_SOURCES_SHARING_A_COMPLEX_KEY: &str =
+    "a: &a\n  ? [1]\n  : x\nc: &c\n  ? [1]\n  : w\nb:\n  <<: [*a, *c]\n";
+const MERGED_NUMBER_VS_STRING_KEY: &str =
+    "a: &a\n  ? [1]\n  : x\nb:\n  <<: *a\n  ? [\"1\"]\n  : y\n";
+const MERGED_DIFFERENT_MAPPING_KEYS: &str =
+    "a: &a\n  ? {p: 1}\n  : x\nb:\n  <<: *a\n  ? {p: 2}\n  : y\n";
+const MERGED_EQUAL_MAPPING_KEYS: &str =
+    "a: &a\n  ? {p: 1}\n  : x\nb:\n  <<: *a\n  ? {p: 1}\n  : y\n";
 
 #[test]
 fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()> {
@@ -3162,7 +3175,12 @@ fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()
         (TWO_MERGE_SOURCES_COMPLEX, ".b | length", "2\n"),
         (TWO_MERGE_SOURCES_COMPLEX, ".b | keys", "- ''\n- ''\n"),
         (MERGED_COMPLEX_VS_GENUINE_EMPTY, ".b | length", "2\n"),
-        (MERGED_VS_LOCAL_IDENTICAL_COMPLEX, ".b | length", "2\n"),
+        // Keys that only *look* alike stay two entries: `[1]` against `["1"]`
+        // (a number and a string), two different mapping keys, and two equal
+        // ones in different nodes (compared by node, never by content).
+        (MERGED_NUMBER_VS_STRING_KEY, ".b | length", "2\n"),
+        (MERGED_DIFFERENT_MAPPING_KEYS, ".b | length", "2\n"),
+        (MERGED_EQUAL_MAPPING_KEYS, ".b | length", "2\n"),
         // The identity route echoes the source, merge key and all.
         (
             MERGED_VS_LOCAL_COMPLEX,
@@ -3191,7 +3209,9 @@ fn test_yq_merge_keys_raise_instead_of_dropping_a_complex_key_3467() -> Result<(
         (MERGED_VS_LOCAL_COMPLEX, ".b | map_values(.)"),
         (TWO_MERGE_SOURCES_COMPLEX, ".b.z = 1"),
         (MERGED_COMPLEX_VS_GENUINE_EMPTY, ".b.z = 1"),
-        (MERGED_VS_LOCAL_IDENTICAL_COMPLEX, ".b.z = 1"),
+        (MERGED_NUMBER_VS_STRING_KEY, ".b.z = 1"),
+        (MERGED_DIFFERENT_MAPPING_KEYS, ".b.z = 1"),
+        (MERGED_EQUAL_MAPPING_KEYS, ".b.z = 1"),
     ];
     for &(yaml, filter) in rows {
         let (output, stderr, code) = run_yq_stdin_with_stderr(filter, yaml, &[])?;
@@ -3231,12 +3251,39 @@ fn test_yq_merge_keys_raise_instead_of_dropping_a_complex_key_3467() -> Result<(
 /// #3467's must-not-change rows: the fix is the fallback-spelling gate in
 /// `upsert_field`, so ordinary keys still override by name (a local `p`
 /// replaces the merged-in one), and a *genuine* `""` key is not a fallback and
-/// still overrides a merged-in `""`.
+/// still overrides a merged-in `""`. So does everything that is the *same key*
+/// despite the shared `""` spelling: a sequence key of equal content, the same
+/// source reached three times, and two sources defining the same key. Each of
+/// those used to resolve to one entry and still does, byte for byte (checked
+/// against a build of `main` without the fix).
 #[test]
 fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> Result<()> {
     const ORDINARY: &str = "a: &a\n  p: 1\n  q: 3\nb:\n  <<: *a\n  p: 2\n  r: 4\n";
     const GENUINE_EMPTY: &str = "a: &a\n  \"\": 1\nb:\n  <<: *a\n  \"\": 2\n";
     let rows: &[(&str, &str, &str)] = &[
+        (MERGED_VS_LOCAL_IDENTICAL_COMPLEX, ".b | length", "1\n"),
+        (
+            MERGED_VS_LOCAL_IDENTICAL_COMPLEX,
+            ".b | to_entries",
+            "- key: ''\n  value: y\n",
+        ),
+        (
+            MERGED_VS_LOCAL_IDENTICAL_COMPLEX,
+            ".b.z = 1",
+            "a: &a\n  '': x\nb:\n  '': y\n  z: 1\n",
+        ),
+        (SAME_SOURCE_REPEATED_COMPLEX, ".b | length", "1\n"),
+        (
+            SAME_SOURCE_REPEATED_COMPLEX,
+            ".b.z = 1",
+            "a: &a\n  '': x\nb:\n  '': x\n  z: 1\n",
+        ),
+        (TWO_SOURCES_SHARING_A_COMPLEX_KEY, ".b | length", "1\n"),
+        (
+            TWO_SOURCES_SHARING_A_COMPLEX_KEY,
+            ".b.z = 1",
+            "a: &a\n  '': x\nc: &c\n  '': w\nb:\n  '': x\n  z: 1\n",
+        ),
         (ORDINARY, ".b | length", "3\n"),
         (ORDINARY, ".b | keys", "- p\n- q\n- r\n"),
         (ORDINARY, ".b.p", "2\n"),

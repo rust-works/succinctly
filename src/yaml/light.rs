@@ -4972,10 +4972,10 @@ pub enum YamlValue<'a, W = Vec<u64>> {
 ///
 /// The common case (`Direct`) walks the mapping's direct BP children lazily,
 /// with no allocation. When the mapping contains a merge key (`<<`), fields
-/// are resolved once into an ordered, deduplicated `Merged` list per YAML's
-/// merge-key semantics (see [`resolve_merge_keys`]) and shared via `Rc` so
-/// cloning during iteration stays O(1) rather than re-copying the list at
-/// every step.
+/// are resolved once into an ordered `Merged` list, deduplicated by key
+/// (`KeyPositions`), per YAML's merge-key semantics (see
+/// [`resolve_merge_keys`]) and shared via `Rc` so cloning during iteration
+/// stays O(1) rather than re-copying the list at every step.
 #[derive(Debug)]
 enum FieldsInner<'a, W> {
     Direct(Option<YamlCursor<'a, W>>),
@@ -5118,7 +5118,10 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     ///
     /// YAML permits duplicate mapping keys; per YAML 1.2 and to match `yq`,
     /// the last matching entry wins (see issue #174). A `Merged` list is
-    /// already deduplicated, so this loop is a no-op scan for it.
+    /// deduplicated by key, so this loop is a no-op scan for it -- except that
+    /// fallback-spelled keys (a complex key is spelled `""`) are deduplicated
+    /// by identity, not spelling, so several can share the name `""` and the
+    /// last of them wins here (#3467).
     ///
     /// A name absent from this level falls back to recursing into any merge
     /// source's own nested `<<` (#1318) — see `merge_fallback`'s doc comment.
@@ -5242,7 +5245,7 @@ impl<'a, W: AsRef<[u64]>> Iterator for YamlFields<'a, W> {
     }
 }
 
-/// `resolve_merge_keys`'s result: the collapsed, deduplicated one-hop field
+/// `resolve_merge_keys`'s result: the collapsed one-hop field
 /// list, paired with each `<<` field's own raw value cursor in encounter
 /// order (used by `YamlFields::merge_fallback` to recurse into a merge
 /// source's *own* nested `<<` — see that function's doc comment, #1318).
@@ -5251,7 +5254,9 @@ type MergedFields<'a, W> = (
     Vec<YamlCursor<'a, W>>,
 );
 
-/// Resolve YAML merge keys (`<<`) into an ordered, deduplicated field list.
+/// Resolve YAML merge keys (`<<`) into an ordered field list, deduplicated by
+/// key: an ordinary key by its spelling, a fallback-spelled one by identity
+/// (`KeyPositions`, #3467).
 ///
 /// Returns `None` when the mapping has no merge key at all, so the common
 /// case stays a single forward pass with no `Vec`/`BTreeMap` allocation
@@ -5326,7 +5331,7 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
         if is_merge_key_value(&key_value) {
             let mut entries: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)> =
                 Vec::with_capacity(seen.len() + 1);
-            let mut positions: BTreeMap<String, usize> = BTreeMap::new();
+            let mut positions = KeyPositions::default();
             // Each `<<` field's own raw value cursor, in encounter order —
             // see `FieldsInner::Merged::merge_value_cursors`'s doc comment
             // for why `entries` alone can't support `find`/`find_cursor`'s
@@ -5365,6 +5370,133 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
     }
 }
 
+/// Where a merged mapping's entry for a key lives, so a later field with the
+/// same key overwrites it in place instead of appending a second one.
+///
+/// An ordinary key is the same key as another with the same decoded spelling.
+/// A *fallback-spelled* key (complex `? [1]`, an undecodable string, a
+/// non-string alias) is spelled `""` (#222), and that shared spelling says
+/// nothing about identity, so it is looked up by [`FallbackKey`] instead and
+/// never by name (#3467).
+#[derive(Default)]
+struct KeyPositions {
+    by_name: BTreeMap<String, usize>,
+    by_identity: BTreeMap<FallbackKey, usize>,
+}
+
+/// What makes two fallback-spelled keys the same key, since their spelling
+/// cannot.
+///
+/// - `Content`: a complex key whose whole subtree is plain scalars and plain
+///   string keys, by its rendering (`[1]`). Nothing nested can collapse to
+///   `""`, so equal renderings are equal keys. A merged-in `? [1]` and a local
+///   `? [1]` are one key, and the local one wins as it always did.
+/// - `Node`: anything else (a mapping used as a key, a complex key holding a
+///   complex key, an undecodable string, a dangling alias) is the same key
+///   only if it is the *same node*: the index of its own BP node. That covers
+///   the same source mapping reached twice (`<<: [*a, *a]`); two different
+///   nodes that merely look alike stay two entries, and a materializer then
+///   refuses them instead of silently keeping one.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum FallbackKey {
+    Content(String),
+    Node(usize),
+}
+
+/// How deep [`complex_key_content`] looks into a complex key before giving up
+/// and falling back to node identity. A complex key is a rarity; one nested
+/// this far is not worth rendering.
+const COMPLEX_KEY_CONTENT_MAX_DEPTH: usize = 16;
+
+/// A rendering of a complex key, when it is safe to compare keys by it.
+///
+/// Safe means nothing in the subtree is itself spelled `""`: every scalar
+/// decodes, every nested mapping key is a plain string, no alias dangles, and
+/// no container is empty. Otherwise two different keys could render alike
+/// (`{[1]: a}` and `{[2]: a}` both as `{"":"a"}`), and equating them would be
+/// the silent drop this exists to prevent -- so the answer is `None` and the
+/// caller uses node identity. An empty container is refused as well: a node
+/// that yields nothing to render is indistinguishable from a broken render.
+///
+/// Rendered from the key's own value, never from its cursor: for a complex key
+/// the cursor is a wrapper that `write_json_to` renders as `{}` for every
+/// mapping, which would equate all mapping keys.
+fn complex_key_content<W: AsRef<[u64]>>(key: &YamlCursor<'_, W>) -> Option<String> {
+    fn container<W: AsRef<[u64]>>(value: YamlValue<'_, W>, out: &mut String, depth: usize) -> bool {
+        if depth > COMPLEX_KEY_CONTENT_MAX_DEPTH {
+            return false;
+        }
+        let mut count = 0usize;
+        match value {
+            YamlValue::Sequence(elements) => {
+                out.push('[');
+                let mut rest = elements;
+                while let Some((element, next)) = rest.uncons_resolved_cursor() {
+                    if count > 0 {
+                        out.push(',');
+                    }
+                    count += 1;
+                    if !node(element, out, depth + 1) {
+                        return false;
+                    }
+                    rest = next;
+                }
+                out.push(']');
+            }
+            YamlValue::Mapping(fields) => {
+                out.push('{');
+                for field in fields {
+                    if count > 0 {
+                        out.push(',');
+                    }
+                    count += 1;
+                    let YamlValue::String(name) = field.key() else {
+                        return false;
+                    };
+                    let Ok(name) = name.as_str() else {
+                        return false;
+                    };
+                    write_json_string(out, &name);
+                    out.push(':');
+                    if !node(field.value_cursor(), out, depth + 1) {
+                        return false;
+                    }
+                }
+                out.push('}');
+            }
+            _ => return false,
+        }
+        count > 0
+    }
+
+    fn node<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>, out: &mut String, depth: usize) -> bool {
+        match cursor.value() {
+            YamlValue::Null => {
+                out.push_str("null");
+                true
+            }
+            YamlValue::String(s) => {
+                if s.as_str().is_err() {
+                    return false;
+                }
+                cursor.write_json_to(out);
+                true
+            }
+            value @ (YamlValue::Sequence(_) | YamlValue::Mapping(_)) => {
+                container(value, out, depth)
+            }
+            YamlValue::Alias {
+                target: Some(target),
+                ..
+            } => node(target, out, depth + 1),
+            YamlValue::Alias { target: None, .. } | YamlValue::Error(_) => false,
+        }
+    }
+
+    let mut rendered = String::new();
+    container(key.value(), &mut rendered, 0).then_some(rendered)
+}
+
 /// Expand one `<<` field's merge sources into `entries`/`positions`.
 ///
 /// Reverse the source list so an earlier-listed source (higher merge-spec
@@ -5373,7 +5505,7 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
 /// `resolve_merge_keys`'s doc comment).
 fn merge_field_into<'a, W: AsRef<[u64]>>(
     entries: &mut Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>,
-    positions: &mut BTreeMap<String, usize>,
+    positions: &mut KeyPositions,
     value_cursor: YamlCursor<'a, W>,
 ) {
     for source in merge_sources(value_cursor).into_iter().rev() {
@@ -5397,32 +5529,41 @@ fn merge_field_into<'a, W: AsRef<[u64]>>(
 /// second `YamlCursor::value()` call on an already-visited key is expensive.
 fn upsert_field<'a, W: AsRef<[u64]>>(
     entries: &mut Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>,
-    positions: &mut BTreeMap<String, usize>,
+    positions: &mut KeyPositions,
     key: YamlCursor<'a, W>,
     value: YamlCursor<'a, W>,
     key_value: &YamlValue<'a, W>,
 ) {
     let (name, is_fallback) = key_value.key_string_kind();
     // #3467: a fallback spelling is never a duplicate (#1385). A complex key
-    // (`? [1]`) is spelled `""` (#222), so two of them -- or one and a genuine
-    // `"": z` -- shared a name here and the later one silently replaced the
-    // earlier, dropping a merged-in entry from the mapping before any
-    // display-keyed map existed for #2519's collision guard to see. Both
-    // entries stay: a stream of the mapping shows both, and a materializer
-    // raises "object key \"\" is ambiguous" instead of losing one. The
-    // fallback key claims no `positions` slot, so nothing later overrides it
-    // either. (Two *identical* complex keys, a merged-in `? [1]` and a local
-    // one, now also stay distinct rather than the local one winning, because
-    // key identity here is the spelling and a complex key has none.)
+    // (`? [1]`) is spelled `""` (#222), so two different ones -- or one and a
+    // genuine `"": z` -- shared a name here and the later one silently
+    // replaced the earlier, dropping a merged-in entry from the mapping before
+    // any display-keyed map existed for #2519's collision guard to see. Both
+    // entries stay now: a stream of the mapping shows both, and a materializer
+    // raises "object key \"\" is ambiguous" instead of losing one. What *is*
+    // the same key still overrides: a complex key of plain content against an
+    // equal one, and the same node reached twice (see `FallbackKey`).
     if is_fallback {
-        entries.push((key, value));
+        let identity = if let Some(content) = complex_key_content(&key) {
+            FallbackKey::Content(content)
+        } else {
+            FallbackKey::Node(key.bp_pos)
+        };
+        match positions.by_identity.get(&identity) {
+            Some(&pos) => entries[pos] = (key, value),
+            None => {
+                positions.by_identity.insert(identity, entries.len());
+                entries.push((key, value));
+            }
+        }
         return;
     }
     let name = name.into_owned();
-    match positions.get(&name) {
+    match positions.by_name.get(&name) {
         Some(&pos) => entries[pos] = (key, value),
         None => {
-            positions.insert(name, entries.len());
+            positions.by_name.insert(name, entries.len());
             entries.push((key, value));
         }
     }

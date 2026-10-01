@@ -2380,12 +2380,20 @@ there now, so the merged mapping keeps both and behaves like the plain collision
 streaming routes show both under `""`, and every materializing route (including a write
 elsewhere in the document, `.a.k = 1`, which materializes `b` too) raises the same
 `object key "" is ambiguous` error. Ordinary keys and a genuine `""` key still override by
-name. One edge changed with it: two *identical* complex keys, a merged-in `? [1]` and a local
-`? [1]`, used to resolve to the local one (the YAML override rule) and now both stay and the
-materializing routes refuse, because a complex key has no spelling to compare. That is the
-refusing side of [ADR-0018](../../adrs/adr-0018.md)'s rule 4; comparing the keys structurally
-would remove it. How yq's key-list builtins treat a merge key at all (`keys`, `length`,
-`has`) is a separate gap, tracked in
+name.
+
+What is the *same key* still overrides, byte for byte as before: a sequence key of equal content
+(a merged-in `? [1]` and a local `? [1]`, or two sources that both define it, compared by
+rendering, and only when nothing inside it is itself spelled `""`), and the same source mapping
+reached more than once (`<<: [*a, *a]`). Anything else is the same key only if it is the same
+node, so two keys that merely look alike stay two entries and the materializing routes refuse
+them rather than keep one: `[1]` against `["1"]` (a
+number and a string), two different mappings used as keys, and **two equal mappings used as
+keys in different nodes**. That last case used to resolve to the local one (YAML's override
+rule) and now refuses; a mapping key cannot be compared by content yet because its cursor does
+not expose its fields. That is the refusing side of
+[ADR-0018](../../adrs/adr-0018.md)'s rule 4. How yq's key-list builtins treat a merge key at
+all (`keys`, `length`, `has`) is a separate gap, tracked in
 [#3556](https://github.com/rust-works/succinctly/issues/3556).
 
 **`-i` refuses a file holding a complex key

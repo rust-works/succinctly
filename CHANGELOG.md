@@ -429,10 +429,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrote `b` without the merged `[1]: x` and exited 0, and so did a write elsewhere in the
   document (`.a.k = 1`). The merged mapping now keeps both entries, so `.b | length` is `2`,
   and every route that builds a map raises `object key "" is ambiguous`, as for plain
-  colliding complex keys. Ordinary keys and a genuine `""` key still override by name. Two
-  *identical* complex keys, merged-in and local, used to resolve to the local one and now
-  also refuse. `-i` was already refused for a complex key (#3463) and still leaves the file
-  untouched. How yq's `keys`/`length`/`has` treat a merge key is a separate gap (#3556).
+  colliding complex keys. Ordinary keys and a genuine `""` key still override by name, and
+  so does what is the same key: a sequence key of equal content (a merged-in `? [1]` and a
+  local `? [1]`, or two sources that both define it) and the same source mapping reached
+  more than once. Two equal *mappings* used as keys in different nodes used to resolve to
+  the local one and now refuse. `-i` was already refused for a complex key (#3463) and
+  still leaves the file untouched. How yq's `keys`/`length`/`has` treat a merge key is a separate gap (#3556).
 
 - **jq: bare `first` and `last` are path steps** (#3545). jq defines `first` as
   `.[0]` and `last` as `.[-1]`, so `[1,2] | path(first)` is `[0]`, and
