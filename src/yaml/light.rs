@@ -11846,9 +11846,8 @@ mod tests {
                 }
             }
             panic!("did not find 'other' field");
-        } else {
-            panic!("expected mapping");
         }
+        panic!("expected mapping");
     }
 
     #[test]
@@ -11935,12 +11934,10 @@ mod tests {
                     }
                 }
                 panic!("did not find greeting field");
-            } else {
-                panic!("expected mapping for data");
             }
-        } else {
-            panic!("expected mapping");
+            panic!("expected mapping for data");
         }
+        panic!("expected mapping");
     }
 
     #[test]
@@ -12625,9 +12622,8 @@ mod tests {
                 }
             }
             panic!("did not find items field");
-        } else {
-            panic!("expected mapping, got: {:?}", first_doc(root));
         }
+        panic!("expected mapping, got: {:?}", first_doc(root));
     }
 
     #[test]
