@@ -2372,9 +2372,21 @@ refuses these (its `validate_yaml_display_keys` pre-walk stays for exactly this 
 [#1753](https://github.com/rust-works/succinctly/issues/1753). Merge keys (`<<`) collapse a
 merged-in complex key with a local one by their shared `""` spelling inside merge resolution
 itself, before any map is built, so even `.b.z = 1` drops an entry
-([#3467](https://github.com/rust-works/succinctly/issues/3467)). The `-i` fast path writing a
-complex key's `""` spelling into the file is
-[#3463](https://github.com/rust-works/succinctly/issues/3463).
+([#3467](https://github.com/rust-works/succinctly/issues/3467)).
+
+**`-i` refuses a file holding a complex key
+([#3463](https://github.com/rust-works/succinctly/issues/3463)).** Every `-i` route wrote a
+complex key back under its `""` spelling, so `-i '.'` turned `? [1]\n: v1\nb: 3` into
+`"": v1\nb: 3` with exit 0 -- the key gone from the user's own file, where real yq
+round-trips it. Emitting the `? key` form is the real fix and is not done; instead `-i` now
+exits 1 and leaves the file byte-identical for a YAML-sourced file with a complex key anywhere
+in it, one key or a colliding pair (`refuse_yaml_complex_keys_for_inplace`, the same
+`display_key_kind` flag as the pre-walk above). This is an
+[ADR-0018](../../adrs/adr-0018.md) rule-4 divergence: matching real yq is impossible without
+the writer, and the alternative is a silent write that corrupts data. It over-refuses a filter
+whose output omits the key (`-i '.b'`, which real yq performs), since proving that needs
+per-output provenance. Scalar keys that merely look unusual (`~`, `null`, `1`, `true`, a quoted
+`""`) are unaffected.
 
 ### `any`/`all`/`flatten`/`group_by`/`unique`/`unique_by`/`from_entries` on a non-array — resolved, real yq has its own wording per builtin, not jq's "Cannot iterate" template
 

@@ -733,7 +733,60 @@ impl OutputConfig {
 /// `validate_yaml_display_keys_agrees_with_yaml_to_owned_value_1349` pins
 /// that the two answer identically.
 fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
-    fn walk<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>, depth: usize) -> Result<()> {
+    walk_yaml_display_keys(bytes, false)
+}
+
+/// Refuse a `--inplace` rewrite of a document holding a *complex* mapping key
+/// (#3463): `? [1]`, `? {a: 1}`, or a block-sequence key.
+///
+/// Every route writes such a key back under #222's display spelling `""`, so
+/// the file would lose the key with exit 0 (`-i '.'` turned `? [1]\n: v` into
+/// `"": v`). Real yq round-trips it. Writing the `? key` form is the real fix
+/// and is not attempted here; refusing is the safe direction, the same one
+/// #1349/#1749 took for a colliding pair. A single complex key is enough --
+/// the collision guard above only sees two -- and the walk is the one
+/// [`validate_yaml_display_keys`] runs, keyed on the same
+/// `DocumentValue::display_key_kind` flag, so the two cannot disagree about
+/// which keys are complex.
+///
+/// Refuses even a filter whose output omits the key (`-i '.b'`): proving that
+/// would mean tracking each output's provenance, and ADR-0018 allows the
+/// divergence where matching the reference would corrupt a write.
+fn refuse_yaml_complex_keys_for_inplace(bytes: &[u8], file_path: &str) -> Result<()> {
+    walk_yaml_display_keys(bytes, true).map_err(|e| {
+        if e.downcast_ref::<ComplexKeyRefusal>().is_some() {
+            anyhow::anyhow!(
+                "refusing to rewrite {file_path} in place: it has a complex mapping key \
+                 (`? ...`), which would be written back as \"\" and lose the key"
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// Marker for [`refuse_yaml_complex_keys_for_inplace`]'s own error, so it can
+/// tell its refusal from a parse or nesting-depth error the walk also raises.
+#[derive(Debug)]
+struct ComplexKeyRefusal;
+
+impl core::fmt::Display for ComplexKeyRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("complex mapping key")
+    }
+}
+
+impl std::error::Error for ComplexKeyRefusal {}
+
+/// [`validate_yaml_display_keys`]'s walk; `refuse_complex` additionally raises
+/// [`ComplexKeyRefusal`] once the whole document has been walked and held a
+/// complex key (#3463).
+fn walk_yaml_display_keys(bytes: &[u8], refuse_complex: bool) -> Result<()> {
+    fn walk<W: AsRef<[u64]> + Clone>(
+        cursor: YamlCursor<'_, W>,
+        depth: usize,
+        saw_complex: &mut bool,
+    ) -> Result<()> {
         // The same limit `yaml_to_owned_value` recurses under; a document
         // deeper than this is refused there rather than overflowing here.
         check_nesting_depth(depth).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -747,13 +800,20 @@ fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
                 // and YAML has no `,`/`:` member delimiters for the
                 // delimiter half to check; only the shared key rule applies.
                 for field in fields {
+                    // Noted, not raised, so the walk still reaches a second
+                    // complex key: a colliding pair keeps the "ambiguous"
+                    // diagnostic every other route gives it (#1749/#2519).
                     let key = resolve_display_key(&field.key(), &seen, &mut guard)
                         .map_err(|e| anyhow::anyhow!("{e}"))?
                         // Never `None` for YAML (#222), as in
                         // `yaml_to_owned_value`.
                         .unwrap_or_default();
+                    *saw_complex |= field
+                        .key()
+                        .display_key_kind()
+                        .is_some_and(|(_, is_fallback)| is_fallback);
                     seen.insert(key, ());
-                    walk(field.value_cursor(), depth + 1)?;
+                    walk(field.value_cursor(), depth + 1, saw_complex)?;
                 }
                 Ok(())
             }
@@ -762,7 +822,7 @@ fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
                 // `uncons_resolved_cursor`, matching `yaml_to_owned_value`'s
                 // own sequence arm and its #835 note.
                 while let Some((elem_cursor, next)) = rest.uncons_resolved_cursor() {
-                    walk(elem_cursor, depth + 1)?;
+                    walk(elem_cursor, depth + 1, saw_complex)?;
                     rest = next;
                 }
                 Ok(())
@@ -772,7 +832,12 @@ fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
     }
 
     let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
-    walk(index.root(bytes), 0)
+    let mut saw_complex = false;
+    walk(index.root(bytes), 0, &mut saw_complex)?;
+    if refuse_complex && saw_complex {
+        return Err(ComplexKeyRefusal.into());
+    }
+    Ok(())
 }
 
 /// Convert a YAML value to an OwnedValue for jq evaluation.
@@ -7544,6 +7609,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
             {
                 return Ok(code);
+            }
+
+            // #3463: a YAML-sourced file with a complex mapping key would be
+            // written back with that key spelled `""`. Refused before either
+            // route runs, so the file stays byte-identical.
+            if format != InputFormat::Json {
+                refuse_yaml_complex_keys_for_inplace(&input_bytes, file_path)?;
             }
 
             let mut output_buffer = Vec::new();

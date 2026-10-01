@@ -42049,30 +42049,40 @@ mod issue_1349_inplace_presentation {
     /// they must accept and reject exactly the same documents.
     #[test]
     fn validate_yaml_display_keys_agrees_with_yaml_to_owned_value_1349() -> Result<()> {
-        // (document, must_raise)
+        // (document, must_raise, holds_complex_key). `must_raise` is the
+        // collision guard, which `--slurp` and `-i` share. `-i` additionally
+        // refuses any document holding a complex key (#3463), collision or
+        // not, because it would write the key back as `""`; `--slurp` has no
+        // file to damage and keeps answering.
         let cases = [
             // Two complex keys, both displaying as "".
-            ("? [1,2]\n: a\n? [3,4]\n: b\n", true),
+            ("? [1,2]\n: a\n? [3,4]\n: b\n", true, true),
             // Three of them: the guard fires at the second, not "eventually".
-            ("? [1,2]\n: a\n? [3,4]\n: b\n? [5,6]\n: c\n", true),
+            ("? [1,2]\n: a\n? [3,4]\n: b\n? [5,6]\n: c\n", true, true),
             // Nested one level down inside a sequence.
-            ("outer:\n  - ? [1,2]\n    : a\n    ? [3,4]\n    : b\n", true),
+            (
+                "outer:\n  - ? [1,2]\n    : a\n    ? [3,4]\n    : b\n",
+                true,
+                true,
+            ),
             // Nested inside another mapping.
             (
                 "outer:\n  inner:\n    ? [1,2]\n    : a\n    ? [3,4]\n    : b\n",
                 true,
+                true,
             ),
             // A genuine key colliding with a complex key's fallback spelling.
-            ("\"\": g\n? [1,2]\n: a\n", true),
+            ("\"\": g\n? [1,2]\n: a\n", true, true),
             // An *ordinary* repeated key still wins last, no raise.
-            ("a: 1\na: 2\n", false),
-            // A lone complex key has nothing to collide with.
-            ("? [1,2]\n: a\nb: 2\n", false),
+            ("a: 1\na: 2\n", false, false),
+            // A lone complex key has nothing to collide with, but `-i` would
+            // still lose it (#3463).
+            ("? [1,2]\n: a\nb: 2\n", false, true),
             // Two complex keys in *different* mappings do not collide.
-            ("x:\n  ? [1,2]\n  : a\ny:\n  ? [3,4]\n  : b\n", false),
-            ("plain: 1\nnested:\n  - 1\n  - two\n", false),
+            ("x:\n  ? [1,2]\n  : a\ny:\n  ? [3,4]\n  : b\n", false, true),
+            ("plain: 1\nnested:\n  - 1\n  - two\n", false, false),
         ];
-        for (doc, must_raise) in cases {
+        for (doc, must_raise, holds_complex_key) in cases {
             // `--slurp` with `.[0]`, not `.`: bare `.` under `--slurp`
             // streams without ever materializing, so it never reaches
             // `yaml_to_owned_value` at all. `.[0]` forces the DOM route --
@@ -42098,7 +42108,8 @@ mod issue_1349_inplace_presentation {
                 "--slurp on {doc:?}: stderr {slurp_err}"
             );
             assert_eq!(
-                inplace_raised, must_raise,
+                inplace_raised,
+                must_raise || holds_complex_key,
                 "-i on {doc:?}: stderr {inplace_err}"
             );
             if must_raise {
@@ -42106,6 +42117,13 @@ mod issue_1349_inplace_presentation {
                     inplace_err.contains("ambiguous"),
                     "-i on {doc:?} must name the ambiguity, got: {inplace_err}"
                 );
+            } else if holds_complex_key {
+                assert!(
+                    inplace_err.contains("complex mapping key"),
+                    "-i on {doc:?} must name the complex key, got: {inplace_err}"
+                );
+            }
+            if inplace_raised {
                 // A raise must never touch the file.
                 assert_eq!(std::fs::read_to_string(file.path())?, doc);
             }
@@ -49692,5 +49710,83 @@ fn test_destructuring_bind_yq_mode_unchanged_3466() -> Result<()> {
         &["--jq-extensions", "-o", "json", "-I0"],
     )?;
     assert_eq!((stdout.as_str(), code), ("[]\n", 0));
+    Ok(())
+}
+
+/// #3463: `-i` wrote a YAML complex mapping key back as `""` (#222's display
+/// spelling) and exited 0, destroying the key in the user's own file. It now
+/// refuses, exit 1, leaving the file byte-identical -- on the streaming route
+/// (`.`, `select(.)`) and the materializing one (`.x = 1`) alike, for a single
+/// complex key as well as a colliding pair, at any depth.
+#[test]
+fn test_yq_inplace_refuses_complex_mapping_key_leaves_file_untouched_3463() -> Result<()> {
+    for (content, filter) in [
+        ("? [1]\n: v1\nb: 3\n", "."),
+        ("? [1]\n: v1\nb: 3\n", ".x = 1"),
+        ("? [1]\n: v1\nb: 3\n", "select(.)"),
+        ("? [1]\n: v1\nb: 3\n", ".b"),
+        ("? {a: 1}\n: v\n", "."),
+        ("? - 1\n  - 2\n: v\n", "."),
+        ("a:\n  ? [1]\n  : v\n", "."),
+        ("- ? [1]\n  : v\n", "."),
+    ] {
+        let mut file = NamedTempFile::new()?;
+        write!(file, "{content}")?;
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-i", filter])
+            .arg(file.path())
+            .stdin(Stdio::null())
+            .output()?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`{filter}` on {content:?}: stderr {stderr}"
+        );
+        assert!(
+            stderr.contains("complex mapping key"),
+            "`{filter}` on {content:?}: stderr {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(file.path())?,
+            content,
+            "`{filter}` must leave the file untouched"
+        );
+    }
+    Ok(())
+}
+
+/// #3463, must not change: a key that only *looks* unusual -- a plain `~`,
+/// `null`, a number, a bool, a quoted `""`, a `? plain` explicit key -- is an
+/// ordinary scalar key and still rewrites in place.
+#[test]
+fn test_yq_inplace_still_rewrites_scalar_keys_3463() -> Result<()> {
+    for (content, filter, expected) in [
+        ("~: v\nb: 3\n", ".b = 4", "~: v\nb: 4\n"),
+        ("null: v\nb: 3\n", ".b = 4", "null: v\nb: 4\n"),
+        ("1: v\nb: 3\n", ".b = 4", "1: v\nb: 4\n"),
+        ("true: v\nb: 3\n", ".", "true: v\nb: 3\n"),
+        ("\"\": v\nb: 3\n", ".", "\"\": v\nb: 3\n"),
+        ("? a\n: v\nb: 3\n", ".", "a: v\nb: 3\n"),
+    ] {
+        let mut file = NamedTempFile::new()?;
+        write!(file, "{content}")?;
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-i", filter])
+            .arg(file.path())
+            .stdin(Stdio::null())
+            .output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "`{filter}` on {content:?}: stderr {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(file.path())?,
+            expected,
+            "`{filter}` on {content:?}"
+        );
+    }
     Ok(())
 }
