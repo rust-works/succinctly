@@ -68247,6 +68247,26 @@ fn test_array_key_in_path_and_write_position_3506() -> Result<()> {
             "\"Cannot delete array element of array\"",
         ),
         ("[1,2]", "[paths(..)]|length", "2"),
+        (
+            "[1,2]",
+            "try path([1,2] | .[[1]]) catch .",
+            "\"Invalid path expression near attempt to access element [1] of [1,2]\"",
+        ),
+        (
+            "[1,2]",
+            "try path(tojson|fromjson|.[[1]]) catch .",
+            "\"Invalid path expression near attempt to access element [1] of [1,2]\"",
+        ),
+        (
+            "[1,2]",
+            "try ((1,2) as $x | path([1,2]|.[[1]])) catch .",
+            "\"Invalid path expression near attempt to access element [1] of [1,2]\"",
+        ),
+        (
+            "[1,2]",
+            "try (([1,2]|.[[1]]) = 3) catch .",
+            "\"Invalid path expression near attempt to access element [1] of [1,2]\"",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "#3506: `{filter}` on {input}: {stderr:?}");
@@ -68519,6 +68539,71 @@ fn test_array_key_in_path_and_write_position_3506() -> Result<()> {
             "[1,2]",
             "del(.[[1]][0].a)",
             "Cannot index number with string \"a\"",
+        ),
+        (
+            "[1,2]",
+            "(.[[1]]|.[0], .[1]) |= 5",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "(.[[1]]|.[0], .[1]) |= empty",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]]|.[0], .[1])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]], .[0])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]], .[[2]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "del((.[[1]], .[0]))",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "path([1,2] | .[[1]])",
+            "Invalid path expression near attempt to access element [1] of [1,2]",
+        ),
+        (
+            "[1,2]",
+            "del(.[[1]], .[0+0])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[1,2]",
+            "del(.[0+0], .[[1]])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[[1,2],[3]]",
+            "del(.[0][[1]]|.[0], .[1][0])",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[[1,2],[3]]",
+            "(.[(0,1)][0], .[0][[1]][0]) |= empty",
+            "Cannot update field at array index of array",
+        ),
+        (
+            "[[1,2],[3]]",
+            "del(.[(0,1)][[1]], .[0][1])",
+            "Cannot delete array element of array",
+        ),
+        (
+            "[[1,2],[3]]",
+            "del(.[]|.[[1]])",
+            "Cannot delete array element of array",
         ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;

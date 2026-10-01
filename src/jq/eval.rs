@@ -31863,10 +31863,8 @@ fn update_path_with_deletes<S: EvalSemantics>(
         // filter that raises still raises its own error first, an inline `?`
         // hides neither, and the wording follows whether anything was written.
         Expr::ArrayKey(key) => {
-            let mut read = match index_one_owned::<S>(root, key, false)? {
-                Some(read) => read,
-                None => return Ok(false),
-            };
+            let mut read = index_one_owned::<S>(root, key, false)?
+                .expect("non-optional index yields a value or errors");
             let wrote =
                 update_root_with_filter::<S>(&mut read, filter_expr, None, Reentry::REBUILT, None)?;
             Err(if wrote {
@@ -32326,10 +32324,8 @@ fn update_path_steps<S: EvalSemantics>(
             // `setpath`, so even a filter with no output ends in the update
             // wording, unlike the terminal key in `update_path_with_deletes`.
             Expr::ArrayKey(key) => {
-                let mut read = match index_one_owned::<S>(root, key, false)? {
-                    Some(read) => read,
-                    None => return Ok(false),
-                };
+                let mut read = index_one_owned::<S>(root, key, false)?
+                    .expect("non-optional index yields a value or errors");
                 update_path_steps::<S>(
                     &mut read,
                     rest,
@@ -56673,8 +56669,9 @@ impl DeleteTrieBuilder {
                 return Err(EvalError::new("cannot use expression as delete target"));
             }
             // #3506: only a key with more path after it reaches here -- a
-            // terminal one is refused before the walk, in `insert_branch` and
-            // `insert_expr`, with the delete wording.
+            // terminal one is refused before the walk, in `insert_branch`,
+            // with the delete wording. (`insert_expr`'s rewritten paths are
+            // yq's, which has no such key.)
             Expr::ArrayKey(_) => {
                 return Err(EvalError::cannot_update_field_at_array_index_of_array())
             }
@@ -56847,14 +56844,6 @@ impl DeleteTrieBuilder {
         let mut steps = core::mem::take(&mut self.scratch);
         steps.clear();
         flatten_delete_path(path, false, &mut steps);
-        // #3506: see `insert_branch`.
-        if steps
-            .last()
-            .is_some_and(|step| ends_in_array_key(&step.component))
-        {
-            self.scratch = steps;
-            return Err(EvalError::cannot_delete_element_of_array("array"));
-        }
         let mut id = DELETE_TRIE_ROOT;
         let mut failed = None;
         for step in &steps {
