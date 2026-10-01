@@ -411,6 +411,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: `getpath` reads an array segment on an array as jq's subarray search**
+  (#2429, part of #3506). `[10,20] | getpath([[0],[1]])` is `[]` and
+  `[1,2,1,2] | getpath([[1,2]])` is `[0,2]`, where it raised `Cannot index array
+  with array` -- which made `[.. | (getpath([paths]))?]` drop the output at every
+  array position. Against an object, string, number, or a `null` reached partway
+  along the path (`[1,2] | getpath([5,[1]])`) it is still `Cannot index <type>
+  with array`, as in jq 1.7.1; a `null` or boolean segment on a `null` now
+  raises too (`null | getpath([true])` was `null`). `succinctly yq` is
+  unchanged. The same key on `.[K]`, `indices`, in `path(getpath(...))` and in
+  writes is still open under #3506.
+
 - **jq: an assignment's right-hand side is lazy, and its target is re-resolved
   per right-hand output** (#3448). `=`, `+=`, `-=`, `*=`, `/=`, `%=` and `//=`
   ran every output of their right side before the first document existed, so

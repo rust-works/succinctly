@@ -668,9 +668,16 @@ follows too. What it leaves:
   [$q])))` on `{"a":{"a":1}}` is `["a"]` in jq after two attempts and "Cannot index object with
   array" here after one, and `del(getpath(K))` likewise. Recorded on #3293 for its closing slice
   with `path_context_step_getpath`.
-- **An array key on an array is unimplemented** (#3506): jq's `.[[2]]` is a subarray search,
-  and `path(.[[2]])`, `del(.[[2]])` and `.[[2]] = 5` have answers of their own; succinctly
-  refuses all of them with "Cannot index array with array", with or without a `?//`.
+- **An array key on an array is only implemented for `getpath`** (#3506, #2429): jq's `.[[2]]`
+  is a subarray search, and `getpath([[2]])` now answers it (including past a `null` reached
+  mid-path, which refuses an array segment). `.[[2]]` itself, `indices`/`index`/`rindex` with an
+  array needle, `path(.[[2]])`, `del(.[[2]])` and `.[[2]] = 5` have answers of their own and are
+  still refused with "Cannot index array with array", with or without a `?//`.
+- **`getpath` with an array segment is value-only** (#2429): in path and write position it
+  still raises "Cannot index array with array" where jq answers, since those routes share the
+  `.[[2]]` gap above. `path(getpath([[1]]))` on `[1,2]` is `[[1]]` in jq; `pick(getpath([[1]]))`
+  is `Cannot index null with array`; `getpath([[1]]) = 3` and `|=` are `Cannot update field at
+  array index of array`, and `del(getpath([[1]]))` is `Cannot delete array element of array`.
 
 ## Path-mode `if`/`select` conditions and a `?//` retry (#3293)
 

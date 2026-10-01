@@ -20881,6 +20881,21 @@ fn position_arg_integer<V: DocumentValue>(result: &GenericResult<V>) -> Option<i
     }
 }
 
+/// What `getpath` answers once its walk has reached a `null` with `rest` of
+/// the path still to go: `null`, unless `rest` holds a segment `null` cannot
+/// be indexed by (jq mode), which raises -- see
+/// [`crate::jq::eval::getpath_null_refused_key`].
+fn getpath_null_tail<S: EvalSemantics, V: DocumentValue>(
+    rest: &[OwnedValue],
+    optional: bool,
+) -> GenericResult<V> {
+    match crate::jq::eval::getpath_null_refused_key::<S>(rest) {
+        None => GenericResult::Owned(OwnedValue::Null),
+        Some(_) if optional => GenericResult::None,
+        Some(key) => GenericResult::Error(EvalError::cannot_index("null", key)),
+    }
+}
+
 /// `getpath(p)` walked over cursors, resolving one already-evaluated path
 /// against the document without materializing it (#2168).
 ///
@@ -20936,8 +20951,11 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
         // segment past it -- the owned table's own first arm, which also
         // absorbs the "key not found" and "index out of range" exits below
         // by walking on from a `null`.
+        //
+        // The exceptions are a null, boolean or array segment (jq mode), which
+        // `null` cannot be indexed by (#2429).
         if v.is_null() {
-            return GenericResult::Owned(OwnedValue::Null);
+            return getpath_null_tail::<S, V>(&segments[i..], optional);
         }
 
         // Dispatch on the segment's own kind before touching `v` at all,
@@ -20975,7 +20993,7 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                         // function's own doc comment above already warns
                         // against exactly that).
                         Ok(None) => match empty_fields_tail_gap_ok(&fields, Some(&c)) {
-                            Ok(()) => GenericResult::Owned(OwnedValue::Null),
+                            Ok(()) => getpath_null_tail::<S, V>(&segments[i + 1..], optional),
                             Err(e) => GenericResult::Error(e),
                         },
                         Err(e) if suppresses(&e, optional) => GenericResult::None,
@@ -21007,7 +21025,7 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                         // helper against `elements` directly rather than
                         // `empty_container_gap_error(&v, ..)`.
                         None => match empty_elements_tail_gap_ok(&elements, Some(&c)) {
-                            Ok(()) => GenericResult::Owned(OwnedValue::Null),
+                            Ok(()) => getpath_null_tail::<S, V>(&segments[i + 1..], optional),
                             Err(e) => GenericResult::Error(e),
                         },
                     };
@@ -21078,6 +21096,21 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                 // just this node -- not the root -- and let the owned table
                 // finish the remaining segments, keeping exactly one
                 // definition of every step past here.
+                let owned = owned_or_suppress!(to_owned_cursor::<S, _>(&c), optional);
+                return query_result_to_generic::<V, S>(
+                    crate::jq::eval::getpath_walk_owned_segments::<Vec<u64>, S>(
+                        &owned,
+                        &segments[i..],
+                        optional,
+                    ),
+                );
+            }
+            // An array segment on an array is jq's subarray search (#2429),
+            // which has to compare every element against the needle, so the
+            // node is materialized -- the container only, never the root --
+            // and the owned table finishes the walk from this segment on.
+            // Against anything but an array it is the type error below.
+            OwnedValue::Array(_) if S::TAG != EvalTag::Yq && v.as_array().is_some() => {
                 let owned = owned_or_suppress!(to_owned_cursor::<S, _>(&c), optional);
                 return query_result_to_generic::<V, S>(
                     crate::jq::eval::getpath_walk_owned_segments::<Vec<u64>, S>(

@@ -1,0 +1,1 @@
+[getpath([[1,2]]), getpath([[1]]), getpath([[9]]), getpath([[1],0])]
