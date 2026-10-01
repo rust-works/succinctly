@@ -1389,10 +1389,13 @@ fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &
 /// deciding before the text does (`!!null foo` is null, `!!str null` is not
 /// -- #2639). A bare `value.is_null()` is not tag-aware (a `YamlValue` has no
 /// `bp_pos` to look a tag up with, only the cursor does), so a caller that
-/// holds a cursor and branches on nullness must come through here, the same
-/// way [`tagged_type_name`] is the one place `type` and every type-mismatch
-/// error name get their tag. A tag [`crate::yaml::resolve_tagged`] does not
-/// model (`!!map`, `!!seq`, a custom `!foo`) falls back to the untagged test.
+/// holds a cursor and branches on nullness should come through here, with the
+/// same tag lookup [`tagged_type_name`] does for `type` and every
+/// type-mismatch error name. Only `getpath`'s cursor walk does so far; the
+/// other cursor-holding `is_null()` tests (`length`, `has`, field and index
+/// access, `path_step_*`, ...) still read the text and are tracked separately.
+/// A tag [`crate::yaml::resolve_tagged`] does not model (`!!map`, `!!seq`, a
+/// custom `!foo`) falls back to the untagged test.
 fn tagged_is_null<V: DocumentValue>(value: &V, cursor: &V::Cursor) -> bool {
     cursor
         .explicit_tag()
@@ -21146,7 +21149,9 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
         // map -- off every step through a container, which measured +76% on a
         // 300-deep path when it ran per segment. The tag decides, not the
         // text: `!!null foo` is null here and `!!str null` is not, the same
-        // answer `type` and the cursor-less route give.
+        // answer `type` and the cursor-less route give. (A slice segment on a
+        // null node now reaches the owned table through the arm above rather
+        // than short-circuiting here; it answers `null` there too.)
         //
         // The exceptions are a null, boolean or array segment (jq mode), which
         // `null` cannot be indexed by (#2429).

@@ -23892,6 +23892,13 @@ fn test_getpath_cursor_walk_is_tag_aware_2639() -> Result<()> {
         ("o:\n  a: !!null foo\n", r#"getpath(["o","a","b"])"#, "null"),
         // Through an alias: the tag lives on the anchor (#903).
         ("x: &n !!null foo\ny: *n\n", r#"getpath(["y","b"])"#, "null"),
+        // An empty tagged scalar: `!!null` with no text is null.
+        ("a: !!null\n", r#"getpath(["a","b"])"#, "null"),
+        // The `?` form: `null` is an answer, not an error, so it still prints.
+        ("a: !!null foo\n", r#"getpath(["a","b"])?"#, "null"),
+        // ...and the type error it suppresses prints nothing at all.
+        ("a: !!str null\n", r#"getpath(["a","b"])?"#, ""),
+        ("a: !!str\n", r#"getpath(["a","b"])?"#, ""),
     ] {
         let (out, code) = run_yq_stdin(filter, doc, &args)?;
         assert_eq!(code, 0, "{doc:?} {filter}: {out:?}");
@@ -23925,6 +23932,12 @@ fn test_getpath_cursor_walk_is_tag_aware_2639() -> Result<()> {
             r#"getpath(["y","b"])"#,
             r#"Cannot index string with string "b""#,
         ),
+        // An empty `!!str` is a string, not the null its (absent) text spells.
+        (
+            "a: !!str\n",
+            r#"getpath(["a","b"])"#,
+            r#"Cannot index string with string "b""#,
+        ),
     ] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
         assert_eq!(code, 1, "{doc:?} {filter}: stderr {stderr}");
@@ -23955,6 +23968,9 @@ fn test_getpath_cursor_walk_agrees_with_cursorless_route_2639() -> Result<()> {
         "!!int 5",
         "!!bool yes",
         "!!float 1",
+        // An empty tagged scalar: the tag still decides.
+        "!!str",
+        "!!null",
         // Untagged controls, whose text decides.
         "null",
         "~",
