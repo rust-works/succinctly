@@ -4911,6 +4911,38 @@ pub(crate) fn owned_value_eq<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -
     owned_value_eq_at_depth_generic::<S>(a, b, 0)
 }
 
+/// jq's subarray search (`jv_array_indexes`), what an *array* key on an
+/// *array* means: `[1,2,1,2] | .[[1,2]]` is `[0,2]` (#2429, #3506).
+///
+/// An index is reported iff `needle` matches `hay` element for element from
+/// there, so overlapping matches all count (`[1,1,1] | .[[1,1]]` is `[0,1]`)
+/// and a needle running past the end matches nothing. An empty needle and a
+/// needle that never matches both answer `[]`, not `null`. Elements compare
+/// with [`owned_value_eq`], so the search agrees with `==` on every pair --
+/// numeric equality, deep container equality, and a NaN matching nothing.
+///
+/// O(`hay` x `needle`) worst case, as in jq; each start position stops at its
+/// first mismatch.
+pub(crate) fn subarray_indices<S: EvalSemantics>(
+    hay: &[OwnedValue],
+    needle: &[OwnedValue],
+) -> OwnedValue {
+    let mut found = Vec::new();
+    if !needle.is_empty() && needle.len() <= hay.len() {
+        for start in 0..=hay.len() - needle.len() {
+            let window = &hay[start..start + needle.len()];
+            if window
+                .iter()
+                .zip(needle)
+                .all(|(x, y)| owned_value_eq::<S>(x, y))
+            {
+                found.push(OwnedValue::Int(start as i64));
+            }
+        }
+    }
+    OwnedValue::array_from(found)
+}
+
 pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
     a: &OwnedValue,
     b: &OwnedValue,
@@ -5586,6 +5618,31 @@ impl<T: Into<Self>> From<Vec<T>> for OwnedValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2429/#3506: the subarray search counts overlapping matches, answers
+    /// `[]` (never `null`) for an empty needle, a miss, or a needle longer
+    /// than the haystack, and compares elements the way `==` does.
+    #[test]
+    fn subarray_indices_is_jvs_array_indexes_2429() {
+        let arr =
+            |v: &[i64]| -> Vec<OwnedValue> { v.iter().map(|n| OwnedValue::Int(*n)).collect() };
+        let idx = |hay: &[OwnedValue], needle: &[OwnedValue]| {
+            subarray_indices::<JqSemantics>(hay, needle).to_json()
+        };
+        assert_eq!(idx(&arr(&[1, 2, 1, 2]), &arr(&[1, 2])), "[0,2]");
+        assert_eq!(idx(&arr(&[1, 1, 1]), &arr(&[1, 1])), "[0,1]");
+        assert_eq!(idx(&arr(&[1, 2]), &arr(&[])), "[]");
+        assert_eq!(idx(&arr(&[]), &arr(&[])), "[]");
+        assert_eq!(idx(&arr(&[1, 2]), &arr(&[3])), "[]");
+        assert_eq!(idx(&arr(&[1, 2]), &arr(&[1, 2, 3])), "[]");
+        // Numeric equality, not representation: `2.0` matches `2`.
+        assert_eq!(idx(&[OwnedValue::Float(2.0)], &arr(&[2])), "[0]");
+        // Containers compare deeply; a NaN matches nothing, itself included.
+        let nested = vec![OwnedValue::array_from(arr(&[1]))];
+        assert_eq!(idx(&nested, &nested.clone()), "[0]");
+        let nan = vec![OwnedValue::Float(f64::NAN)];
+        assert_eq!(idx(&nan, &nan.clone()), "[]");
+    }
 
     /// The promote-on-bind wrappers (#3191) cost nothing in layout: a
     /// `SharableString` is exactly a `String` (the `Owned | Shared` tag

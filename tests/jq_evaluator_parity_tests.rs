@@ -1166,6 +1166,94 @@ fn slice_path_component_agrees_across_evaluators() {
     }
 }
 
+/// #2429: `getpath` on an array segment is jq's subarray search in both
+/// evaluators, including the walk through a `null` the cursor walk used to
+/// short-circuit past. Each expectation is jq-1.7.1's.
+#[test]
+fn getpath_array_segment_agrees_across_evaluators_2429() {
+    for (json, filter, expected) in [
+        ("[1,2,1,2]", "getpath([[1]])", "[0,2]"),
+        ("[1,2,1,2]", "getpath([[1,2]])", "[0,2]"),
+        ("[1,1,1]", "getpath([[1,1]])", "[0,1]"),
+        ("[1,2,1,2]", "getpath([[]])", "[]"),
+        ("[1,2,1,2]", "getpath([[9]])", "[]"),
+        ("[1,2,1,2]", "getpath([[\"a\"]])", "[]"),
+        ("[1,2,1,2]", "getpath([[1.5]])", "[]"),
+        ("[1,2,1,2]", "getpath([[[1]]])", "[]"),
+        ("[1,2.0,1]", "getpath([[2]])", "[1]"),
+        ("[1,null,1]", "getpath([[null]])", "[1]"),
+        ("[[1],[1],2]", "getpath([[[1]]])", "[0,1]"),
+        ("null", "[nan] | getpath([[nan]])", "[]"),
+        ("[1,2,1,2]", "getpath([[1],0])", "0"),
+        ("[1,2,1,2]", "getpath([[1],[2]])", "[1]"),
+        ("[1,2,1,2]", "[getpath([[1]],[[2]])]", "[[0,2],[1,3]]"),
+        ("{\"a\":[1,2,1]}", "getpath([\"a\",[1]])", "[0,2]"),
+        (
+            "{\"a\":{\"b\":[10,20]}}",
+            "[.. | getpath([paths])?]",
+            "[[],10,20]",
+        ),
+        (
+            "{\"a\":{\"b\":1,\"c\":2},\"d\":[10,20]}",
+            "[.. | (getpath([paths]))?]",
+            "[1,2,[],10,20]",
+        ),
+        (
+            "{\"a\":1}",
+            "try getpath([[1]]) catch .",
+            "\"Cannot index object with array\"",
+        ),
+        ("{\"a\":1}", "[getpath([[1]])?]", "[]"),
+        (
+            "\"abc\"",
+            "try getpath([[1]]) catch .",
+            "\"Cannot index string with array\"",
+        ),
+        (
+            "5",
+            "try getpath([[1]]) catch .",
+            "\"Cannot index number with array\"",
+        ),
+        (
+            "null",
+            "try getpath([[1]]) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        ("null", "[getpath([[1]])?]", "[]"),
+        (
+            "null",
+            "try getpath([\"a\",[1]]) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        ("null", "getpath([\"a\",\"b\"])", "null"),
+        (
+            "[1,2]",
+            "try getpath([5,[1]]) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        ("[1,2]", "[getpath([5,[1]])?]", "[]"),
+        ("[1,2]", "getpath([5,\"a\"])", "null"),
+        (
+            "{\"a\":1}",
+            "try getpath([\"b\",[1]]) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        ("{\"a\":1}", "getpath([\"b\",\"c\"])", "null"),
+        (
+            "[1,2]",
+            "try getpath([0,[1]]) catch .",
+            "\"Cannot index number with array\"",
+        ),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json.as_bytes(), filter)),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}` on `{json}`"
+        );
+        assert_parity(json.as_bytes(), filter);
+    }
+}
+
 #[test]
 fn test_object_construction_product_parity_354() {
     // Object construction is a generator: an entry whose key or value yields n

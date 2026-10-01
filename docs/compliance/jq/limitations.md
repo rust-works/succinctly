@@ -668,9 +668,16 @@ follows too. What it leaves:
   [$q])))` on `{"a":{"a":1}}` is `["a"]` in jq after two attempts and "Cannot index object with
   array" here after one, and `del(getpath(K))` likewise. Recorded on #3293 for its closing slice
   with `path_context_step_getpath`.
-- **An array key on an array is unimplemented** (#3506): jq's `.[[2]]` is a subarray search,
-  and `path(.[[2]])`, `del(.[[2]])` and `.[[2]] = 5` have answers of their own; succinctly
-  refuses all of them with "Cannot index array with array", with or without a `?//`.
+- **An array key on an array is only implemented for `getpath`** (#3506, #2429): jq's `.[[2]]`
+  is a subarray search, and `getpath([[2]])` now answers it (including past a `null` reached
+  mid-path, which refuses an array segment). `.[[2]]` itself, `indices`/`index`/`rindex` with an
+  array needle, `path(.[[2]])`, `del(.[[2]])` and `.[[2]] = 5` have answers of their own and are
+  still refused with "Cannot index array with array", with or without a `?//`.
+- **`getpath` on a `null` with a `null` or boolean segment is lenient** (#2429 follow-up): jq
+  raises `Cannot index null with null` / `with boolean` at the first such segment, where
+  succinctly reads `null` as `null` for them as it does for a string or number (an array
+  segment is refused, above). `null | try getpath([null,[1]]) catch .` therefore words its
+  error as "with array" where jq says "with null".
 
 ## Path-mode `if`/`select` conditions and a `?//` retry (#3293)
 

@@ -1,0 +1,1 @@
+[(.a, .b, .c, .d) | try getpath([[1]]) catch .]

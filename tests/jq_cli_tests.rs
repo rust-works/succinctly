@@ -67814,6 +67814,168 @@ fn test_object_index_key_yq_mode_unchanged_3300() -> Result<()> {
 }
 
 // ============================================================================
+// #2429: an array key on an array is jq's subarray search
+// ============================================================================
+
+/// `getpath` reads an array segment on an array as jq's subarray search
+/// (`jv_array_indexes`), so `[10,20] | getpath([[0],[1]])` is `[]` -- the
+/// output `[.. | (getpath([paths]))?]` was missing at `.d`. Against any other
+/// container (and against a `null` reached mid-path) it is still
+/// `Cannot index <type> with array`, which `?` suppresses. Every expectation
+/// was captured from `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_getpath_array_segment_is_a_subarray_search_2429() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[1,2,1,2]", "getpath([[1]])", "[0,2]"),
+        ("[1,2,1,2]", "getpath([[1,2]])", "[0,2]"),
+        ("[1,1,1]", "getpath([[1,1]])", "[0,1]"),
+        ("[1,2,1,2]", "getpath([[]])", "[]"),
+        ("[1,2,1,2]", "getpath([[9]])", "[]"),
+        ("[1,2,1,2]", "getpath([[\"a\"]])", "[]"),
+        ("[1,2,1,2]", "getpath([[1.5]])", "[]"),
+        ("[1,2,1,2]", "getpath([[[1]]])", "[]"),
+        ("[1,2.0,1]", "getpath([[2]])", "[1]"),
+        ("[1,null,1]", "getpath([[null]])", "[1]"),
+        ("[[1],[1],2]", "getpath([[[1]]])", "[0,1]"),
+        ("null", "[nan] | getpath([[nan]])", "[]"),
+        ("[1,2,1,2]", "getpath([[1],0])", "0"),
+        ("[1,2,1,2]", "getpath([[1],[2]])", "[1]"),
+        ("[1,2,1,2]", "[getpath([[1]],[[2]])]", "[[0,2],[1,3]]"),
+        ("{\"a\":[1,2,1]}", "getpath([\"a\",[1]])", "[0,2]"),
+        (
+            "{\"a\":{\"b\":[10,20]}}",
+            "[.. | getpath([paths])?]",
+            "[[],10,20]",
+        ),
+        (
+            "{\"a\":{\"b\":1,\"c\":2},\"d\":[10,20]}",
+            "[.. | (getpath([paths]))?]",
+            "[1,2,[],10,20]",
+        ),
+        (
+            "{\"a\":1}",
+            "try getpath([[1]]) catch .",
+            "\"Cannot index object with array\"",
+        ),
+        ("{\"a\":1}", "[getpath([[1]])?]", "[]"),
+        (
+            "\"abc\"",
+            "try getpath([[1]]) catch .",
+            "\"Cannot index string with array\"",
+        ),
+        (
+            "5",
+            "try getpath([[1]]) catch .",
+            "\"Cannot index number with array\"",
+        ),
+        (
+            "null",
+            "try getpath([[1]]) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        ("null", "[getpath([[1]])?]", "[]"),
+        (
+            "null",
+            "try getpath([\"a\",[1]]) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        ("null", "getpath([\"a\",\"b\"])", "null"),
+        (
+            "[1,2]",
+            "try getpath([5,[1]]) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        ("[1,2]", "[getpath([5,[1]])?]", "[]"),
+        ("[1,2]", "getpath([5,\"a\"])", "null"),
+        (
+            "{\"a\":1}",
+            "try getpath([\"b\",[1]]) catch .",
+            "\"Cannot index null with array\"",
+        ),
+        ("{\"a\":1}", "getpath([\"b\",\"c\"])", "null"),
+        (
+            "[1,2]",
+            "try getpath([0,[1]]) catch .",
+            "\"Cannot index number with array\"",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#2429: `{filter}` on {input}: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "#2429: `{filter}` on {input}");
+    }
+    // Unsuppressed, it is an error on a non-array container.
+    for (input, filter) in [
+        ("{\"a\":1}", "getpath([[1]])"),
+        ("null", "getpath([[1]])"),
+        ("[1,2]", "getpath([5,[1]])"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "#2429: `{filter}` on {input}: {stdout:?}");
+        assert!(stdout.is_empty(), "#2429: `{filter}`: {stdout:?}");
+        assert!(
+            stderr.contains("with array"),
+            "#2429: `{filter}`: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// yq has no array key, so `succinctly yq --jq-extensions` keeps `getpath`'s
+/// pre-#2429 answers exactly: an array segment is still refused on an array
+/// and on an object, and still reads `null` as `null`.
+#[test]
+fn test_getpath_array_segment_yq_mode_unchanged_2429() -> Result<()> {
+    for (input, filter, expect_error, expected) in [
+        (
+            "[1,2,1,2]",
+            "getpath([[1]])",
+            Some("Cannot index array with array"),
+            "",
+        ),
+        (
+            "{\"a\":[1]}",
+            "getpath([[1]])",
+            Some("Cannot index object with array"),
+            "",
+        ),
+        ("null", "getpath([[1]])", None, "null"),
+        ("[1,2]", "getpath([5,[1]])", None, "null"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match expect_error {
+            Some(message) => {
+                assert!(
+                    stderr.contains(message),
+                    "#2429 (yq): `{filter}` on {input}: {output:?}"
+                );
+                assert!(stdout.is_empty(), "#2429 (yq): `{filter}`: {output:?}");
+            }
+            None => assert_eq!(
+                stdout.trim_end(),
+                expected,
+                "#2429 (yq): `{filter}` on {input}: {output:?}"
+            ),
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
 // #3279: a `try`-wrapped `if` as a bind source keeps the path register
 // ============================================================================
 
