@@ -36021,8 +36021,8 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // array's `-1`, the near-access wording -- instead of restating them.
         // jq mode only, because yq's `first` is not `.[0]`: it is a root-only
         // operator (`first = 9` is `[9,2]` on `[1,2]`, `.a | first` is an
-        // error, and `last` is a lexer error, all yq v4.53.3), so yq mode
-        // keeps the old behaviour until #3551 settles what it should be.
+        // error, and `last` is a lexer error, all yq v4.53.3), so yq mode has
+        // its own arm below (#3551).
         Expr::Builtin(step @ (Builtin::First | Builtin::Last)) if S::TAG == EvalTag::Jq => {
             let component = Expr::index(if matches!(step, Builtin::First) {
                 0
@@ -36031,6 +36031,39 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             });
             resolve_node_sink::<S>(&component, value, trackable, snapshot, frame, keep, sink)
         }
+        // #3551 (yq mode): real yq's bare `first` is a path step at the head of
+        // an expression, so `first = 9`, `first |= 5`, `first += 1` and
+        // `del(first)` act on what it names (yq v4.53.3, input `[1,2]`:
+        // `[9,2]`, `[5,2]`, `[2,2]`, `[2]`). On a sequence that is element 0, so
+        // it re-dispatches as the index step like jq's `.[0]` above. On a
+        // *mapping* it names the first key, and assigning through it renames
+        // that key (`first = 9` on `{a: 1}` is `{"9":1}`): a write this
+        // evaluator has no path component for, so it is refused. A value with
+        // no first element -- an empty sequence, a scalar, `null` -- names no
+        // path at all, and real yq leaves the document untouched there for
+        // every write and delete, which is exactly a path step that resolves
+        // to nothing. The eager fallback below reported the element's *value*
+        // as an untracked result instead: `first = 9` silently left `[1,2]`
+        // unchanged (exit 0) and `del(first)` raised.
+        Expr::Builtin(Builtin::First) if S::TAG == EvalTag::Yq => match value {
+            OwnedValue::Array(items) if !items.is_empty() => resolve_node_sink::<S>(
+                &Expr::index(0),
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                sink,
+            ),
+            OwnedValue::Object(_) => ResolveFlow::Escaped(
+                EvalError::new(
+                    "bare `first` on a mapping names its first key; writing through it \
+                     (renaming the key) is not supported",
+                )
+                .into(),
+            ),
+            _ => ResolveFlow::Exhausted,
+        },
         // #3550: jq defines the one-argument `nth($n)` as `.[$n]`
         // (`def nth($n): .[$n];`), so in a path it extends it by that
         // component exactly as bare `first`/`last` do above. `$n` is a value
@@ -37916,11 +37949,11 @@ fn builtin_navigation<S: EvalSemantics>(
     value: &OwnedValue,
 ) -> Result<Option<BuiltinNavigation>, EvalEscape> {
     match builtin {
-        // Only yq mode reaches these two: in jq mode `resolve_node_sink`
-        // resolves a bare `first`/`last` as the `.[0]`/`.[-1]` step it is
-        // (#3545) before this check runs. Measured by making them assert
-        // `S::TAG != Jq` and running the lib and CLI suites plus the probe
-        // matrices: none tripped.
+        // `resolve_node_sink` resolves a bare `first` before this check runs in
+        // both modes: as the `.[0]` step it is in jq mode (#3545), and as yq's
+        // own path step in yq mode (#3551). Only a bare `last` in yq mode still
+        // reaches `Last` below, so the `First` arm is a fallback for a caller
+        // that asks about the builtin without going through that resolver.
         Builtin::First => Ok(Some(BuiltinNavigation::Access(OwnedValue::Int(0)))),
         Builtin::Last => Ok(Some(BuiltinNavigation::Access(OwnedValue::Int(-1)))),
         Builtin::Add

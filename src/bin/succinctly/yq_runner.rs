@@ -2096,6 +2096,19 @@ fn static_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
             out.push(PathStep::Index(*idx));
             true
         }
+        // #3551: bare `first` is yq's path step to a sequence's element 0
+        // (`del(first)` on `[1,2]` is `[2]`), so a delete through it shifts
+        // the same positions `del(.[0])` does. Without this arm the
+        // reconcile gave up on the write and fell back to positional
+        // lockstep, which put `# one` on what had been the second item and
+        // swapped anchors. A mapping never reaches a write through `first`
+        // (the evaluator refuses it), and on an empty sequence, a scalar or
+        // `null` it names no path, so the document -- and the reconcile --
+        // is untouched either way.
+        Expr::Builtin(Builtin::First) => {
+            out.push(PathStep::Index(0));
+            true
+        }
         Expr::Paren(inner) | Expr::Optional(inner) => static_path_steps(inner, out),
         Expr::Pipe(stages) => stages.iter().all(|s| static_path_steps(s, out)),
         _ => false,
