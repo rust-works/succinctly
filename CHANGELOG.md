@@ -428,13 +428,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tested the untagged text: `.a | length` was `3` and `0` where yq answers `0` and
   `4`, `.a | .b` and `.a | .[0]` were empty and `null` where yq answers `null` and
   empty, and `a: !!null foo | .a | map(.)` was `"foo"` where yq answers `[]`. `type`,
-  `tag`, `has` and `//` on the same node already agreed, and #2639 had fixed only
-  `getpath`. The rest of the cursor-holding sites (`has`, `first`/`last`/`values`
-  behind `--jq-extensions`, the path-step walkers) follow the same rule. A document
-  with no explicit tag anywhere skips the lookup, so it is unchanged (within 1% on a
-  6 MB document); one that carries a tag pays about 5% on a string-`length`-heavy
-  query. The owned conversion has no cursor and stays text-based, so `!!str 5 | map(.)`
-  still answers `5` where yq answers `"5"` (#747).
+  `tag`, `has` and `//` on a scalar already agreed, and #2639 had fixed only
+  `getpath`. `has`, `first`/`last`/`values` behind `--jq-extensions` and the
+  path-step walkers follow the same rule. A document with no explicit tag anywhere
+  skips the lookup, so it is unchanged (within 1% on a 6 MB document); one that
+  carries a tag pays about 5% on a string-`length`-heavy query. Still text-based,
+  because they have no cursor or reach the test before their container arms:
+  computed-key and multi-key indexing (`.[$k]`, `.[0,1]`), a container tagged
+  `!!null`, and the owned conversion (`!!str 5 | map(.)` answers `5` and
+  `!!str null | map(.)` answers `null` where yq answers the string, #747).
 
 - **yq: a `<<` merge no longer silently drops a complex mapping key** (#3467). Merge
   resolution overrode by key spelling, and a complex key (`? [1]`) is spelled `""`, so a

@@ -24440,9 +24440,11 @@ fn test_getpath_tag_aware_null_leaves_containers_and_untagged_alone_2639() -> Re
 /// text instead. `a: !!null foo` is null although its text is not, so
 /// `.a | length` is `0` and `.a | .b` is `null`; `a: !!str null` is a
 /// string although its text spells null, so `.a | length` is `4` and indexing
-/// it is the empty read yq gives a scalar. `type`, `tag`, `has` and `//` on the
-/// same node already agreed, which is how this stayed hidden (#2639 fixed the
-/// one site `getpath` owns).
+/// it is the empty read yq gives a scalar. `type`, `tag`, `has` and `//` on a
+/// scalar already agreed, which is how this stayed hidden (#2639 fixed the one
+/// site `getpath` owns). Covered: literal field and index access, `length` and
+/// `map`; not covered, and still text-based, are computed-key and multi-key
+/// indexing (`.[$k]`, `.[0,1]`) and a container tagged `!!null`.
 ///
 /// Every row is captured from yq v4.53.3 (`(document, filter, stdout, exit)`,
 /// `-o=json -I=0`) and spans both tag directions, the tagged forms that must not

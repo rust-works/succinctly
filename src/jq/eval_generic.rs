@@ -1411,19 +1411,23 @@ fn tagged_is_null<V: DocumentValue>(value: &V, cursor: &V::Cursor) -> bool {
         )
 }
 
-/// [`tagged_is_null`] for a caller whose cursor may be absent (#3533).
+/// [`tagged_is_null`] for a caller whose cursor may be absent (#3533): a node
+/// reached with no cursor (an owned value) has no tag to consult and keeps the
+/// text test.
 ///
-/// Only a node that carries an explicit tag can differ from its text, so the
-/// tag is asked for first and the text test stands for every other node. That
-/// order is what keeps this cheap where it is called on every scalar a query
-/// reaches: on a document with no explicit tag at all the lookup is one
-/// empty-map check (`YamlIndex::has_explicit_tags`), so an untagged document
-/// pays one branch over the plain `is_null()` it replaces.
+/// [`tagged_is_null`] asks the tag first and falls back to the text test when
+/// there is none, so this is a single tag lookup per call. That is what keeps
+/// it cheap where it runs on every scalar a query reaches: on a document with
+/// no explicit tag at all the lookup is one empty-map check
+/// (`YamlIndex::has_explicit_tags`), so an untagged document pays one branch
+/// over the plain `is_null()` it replaces.
+///
+/// Scalars only: a `!!null` tag on a *container* (`a: !!null {b: 1}`) is not
+/// honoured here, because [`tagged_is_null`] resolves a tag against the node's
+/// scalar text, and the field and index arms that call this reach it only after
+/// their container arms.
 fn cursor_is_null<V: DocumentValue>(value: &V, cursor: Option<&V::Cursor>) -> bool {
-    match cursor {
-        Some(c) if c.explicit_tag().is_some() => tagged_is_null(value, c),
-        _ => value.is_null(),
-    }
+    cursor.map_or_else(|| value.is_null(), |c| tagged_is_null(value, c))
 }
 
 /// The **untagged** YAML type tag (`!!str`, `!!int`, `!!map`, ...) for a
