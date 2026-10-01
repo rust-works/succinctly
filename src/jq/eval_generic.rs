@@ -3970,7 +3970,7 @@ fn fold_generic_owned_values<V: DocumentValue, S: EvalSemantics>(
 /// **One walk per node, and the same first error.** On the `Comma` route a
 /// node was built as soon as its branch yielded it, so its decode failure
 /// came ahead of anything a later branch did. Only a body whose every branch
-/// is pure navigation (`path_expr_is_cursor_navigable`) comes here, and
+/// is pure navigation (`array_route_stage_is_pure_navigation`) comes here, and
 /// navigation has no side effects -- no `input`, `debug` or `error` -- so a
 /// later branch running first is unobservable except through the one thing
 /// it can do, raise. Each node is therefore walked once, when the answer's
@@ -4096,14 +4096,15 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
 /// for the same pipe anywhere else.)
 ///
 /// The regrouping is sound because every stage is
-/// [`path_expr_is_cursor_navigable`]: no side effect for it to reorder, the
-/// argument [`comma_array_generic`] already makes for running a later
+/// [`array_route_stage_is_pure_navigation`]: no side effect for it to reorder,
+/// the argument [`comma_array_generic`] already makes for running a later
 /// branch's failure ahead of an earlier one's decode, and no stage the
 /// `Expr::Pipe` arm routes differently (path context, an `as` head, the owned
-/// identity pipe). **Widening that predicate widens this route** -- a stage
-/// with a side effect or its own routing must not be admitted to it without
-/// revisiting both, and the unit test `test_comma_head_pipe_array_route_3476`
-/// pins today's edge.
+/// identity pipe). That predicate is this route's own, not `path()`'s
+/// ([`path_expr_is_cursor_navigable`]), so widening the walker does not widen
+/// this (#3501); admitting a stage here means revisiting both arguments, and
+/// `test_comma_head_pipe_array_route_3476` and
+/// `test_array_route_predicate_is_navigation_only_3501` pin today's edge.
 ///
 /// One thing does change: a node the pipe *discards* is no longer walked
 /// (`[(., .) | .data]` no longer decodes the rest of the document), as
@@ -4116,7 +4117,7 @@ fn split_comma_head(body: &Expr) -> Option<(&[Expr], &[Expr])> {
     let Expr::Comma(branches) = unwrap_paren(head) else {
         return None;
     };
-    if rest.is_empty() || !stages.iter().all(path_expr_is_cursor_navigable) {
+    if rest.is_empty() || !stages.iter().all(array_route_stage_is_pure_navigation) {
         return None;
     }
     Some((branches, rest))
@@ -10369,7 +10370,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // (`[., 1]`), whose array ends up owned whatever the others are.
             if S::TAG == EvalTag::Jq {
                 if let Expr::Comma(exprs) = unwrap_paren(inner) {
-                    if exprs.iter().all(path_expr_is_cursor_navigable) {
+                    if exprs.iter().all(array_route_stage_is_pure_navigation) {
                         return comma_array_generic::<S, V>(exprs, &[], value, optional, cursor);
                     }
                 }
@@ -19061,6 +19062,34 @@ fn path_expr_is_cursor_navigable(expr: &Expr) -> bool {
         Expr::Index { .. } => true,
         Expr::Paren(inner) | Expr::Optional(inner) => path_expr_is_cursor_navigable(inner),
         Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(path_expr_is_cursor_navigable),
+        _ => false,
+    }
+}
+
+/// Whether an array constructor may keep `expr`'s branches as cursors and
+/// regroup or reorder them (#3317's `[a, b]`, #3473, #3476's
+/// `[(a, b) | c]`) -- the array routes' own admission test (#3501).
+///
+/// Written out, not borrowed from [`path_expr_is_cursor_navigable`], although
+/// today it admits the same shapes: that one gates `path()`'s cursor walker
+/// and has already widened in step with it (spine 2416 admitted slices and
+/// `getpath` heads there), whereas these routes are sound only for a stage
+/// that is *pure navigation* -- no side effect for a regrouped branch to
+/// reorder, and nothing the `Expr::Pipe` arm routes differently (path
+/// context, an `as` head, the owned identity pipe). A shape added for
+/// `path()`'s sake therefore does not reach the array routes until someone
+/// adds it here, having read that argument.
+///
+/// Fails closed: the `_` arm refuses every other `Expr`, new variants
+/// included. `test_array_route_predicate_is_navigation_only_3501` pins the
+/// admitted set and that it stays inside [`path_expr_is_cursor_navigable`].
+fn array_route_stage_is_pure_navigation(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Iterate | Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => array_route_stage_is_pure_navigation(inner),
+        Expr::Pipe(exprs) | Expr::Comma(exprs) => {
+            exprs.iter().all(array_route_stage_is_pure_navigation)
+        }
         _ => false,
     }
 }
@@ -40859,6 +40888,75 @@ mod tests {
         assert_eq!(split("[(., .) | length]"), None);
         assert_eq!(split("[(., .) | . + 1]"), None);
         assert_eq!(split("[((., .))? | .a]"), None);
+    }
+
+    /// #3501: the array routes' own predicate admits exactly the
+    /// pure-navigation shapes, stays inside `path()`'s, and refuses what
+    /// `path()`'s walker could one day admit.
+    #[test]
+    fn test_array_route_predicate_is_navigation_only_3501() {
+        let stage = |query: &str| crate::jq::parse(query).unwrap();
+        // Pure navigation, in every combinator the predicate recurses through.
+        for admitted in [
+            ".",
+            ".[]",
+            ".a",
+            ".[0]",
+            ".[-1]",
+            "(.a)",
+            ".a?",
+            ".a.b[]",
+            "(.a, .b)",
+            "(.a, .b) | .c",
+            ".a | (.b, .c)[0]",
+        ] {
+            let expr = stage(admitted);
+            assert!(array_route_stage_is_pure_navigation(&expr), "{admitted}");
+            assert!(path_expr_is_cursor_navigable(&expr), "{admitted}");
+        }
+        // A computed, effectful or specially routed stage is refused -- the
+        // route's soundness argument covers none of them -- including the
+        // shapes `path()`'s walker already admits or has been asked to
+        // (a slice and a `getpath` head, #2061 / spine 2416).
+        for refused in [
+            ".a + 1",
+            "length",
+            ".[1:2]",
+            ".[$k]",
+            "getpath([\"a\"])",
+            "first(.[])",
+            "(.a as $x | .b)",
+            "debug",
+            "input",
+            "error",
+            "select(.a)",
+            "(.a, 1)",
+            ".a | length",
+            ".a // .b",
+            "if . then .a else .b end",
+        ] {
+            assert!(
+                !array_route_stage_is_pure_navigation(&stage(refused)),
+                "{refused}"
+            );
+        }
+        // Whatever the array routes admit, `path()`'s predicate admits too
+        // (the reverse is the point of the split, so it is not asserted).
+        for query in [
+            ".a",
+            ".[]",
+            "(.a, .b) | .c",
+            ".[1:2]",
+            "getpath([\"a\"])",
+            ".a + 1",
+        ] {
+            let expr = stage(query);
+            assert!(
+                !array_route_stage_is_pure_navigation(&expr)
+                    || path_expr_is_cursor_navigable(&expr),
+                "{query}"
+            );
+        }
     }
 
     /// #3317: the `,` producer's sequence prints as its `Cursors` source,
