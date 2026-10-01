@@ -1431,6 +1431,40 @@ fn array_key_in_path_and_write_position_agrees_across_evaluators_3506() {
     }
 }
 
+/// #3550: bare `nth(n)` is a path step in both evaluators. Each expectation is
+/// jq-1.7.1's.
+#[test]
+fn bare_nth_is_a_path_step_across_evaluators_3550() {
+    for (json, filter, expected) in [
+        ("[1,2,3]", "path(nth(1))", "[1]"),
+        ("[1,2,3]", "[path(nth(0,2))]", "[[0],[2]]"),
+        ("[1,2,3]", "path(nth(-1))", "[-1]"),
+        ("{\"a\":[1,2,3]}", "path(.a|nth(1))", "[\"a\",1]"),
+        ("{\"a\":1}", "path(nth(\"a\"))", "[\"a\"]"),
+        ("null", "path(nth(1))", "[1]"),
+        ("[1,2,3]", "nth(1) = 9", "[1,9,3]"),
+        ("[1,2,3]", "nth(1) |= .+10", "[1,12,3]"),
+        ("[1,2,3]", "del(nth(1))", "[1,3]"),
+        ("[1,2,3]", "nth(0,2) = 9", "[9,2,9]"),
+        ("null", "nth(1) = 9", "[null,9]"),
+        ("{\"a\":[1,2,3]}", "pick(.a|nth(1))", "{\"a\":[null,2]}"),
+        ("[[1,2],[3,4]]", "(.[]|nth(1)) = 0", "[[1,0],[3,0]]"),
+        (
+            "[1,2,3]",
+            "try path(nth(\"a\")) catch .",
+            "\"Cannot index array with string \\\"a\\\"\"",
+        ),
+        ("[1,2,3]", "nth(1)", "2"),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json.as_bytes(), filter)),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}` on `{json}`"
+        );
+        assert_parity(json.as_bytes(), filter);
+    }
+}
+
 #[test]
 fn test_object_construction_product_parity_354() {
     // Object construction is a generator: an entry whose key or value yields n
