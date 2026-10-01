@@ -2278,11 +2278,32 @@ pub(crate) fn bridge_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>
     // Which document first, from the retained child cursor: a read from any
     // other document (the input, a sibling bridge) stops here, before the
     // BP `parent()` hop that naming the container's own node costs.
-    let text = match value {
-        StandardJson::Array(elements) => elements.document_text()?,
-        StandardJson::Object(fields) => fields.document_text()?,
+    let (text, empty) = match value {
+        StandardJson::Array(elements) => (elements.document_text()?, elements.is_empty()),
+        StandardJson::Object(fields) => (fields.document_text()?, fields.is_empty()),
         _ => return None,
     };
+    // An empty container answers `Some` above only since #3180 gave its list
+    // a tag, and its provenance is then asked of the table (a binary search
+    // over every container of the bridge document, then a refcount bump on
+    // storage the walk has not touched). The identity that buys is read in
+    // exactly two places: against a binding already in scope (the embed
+    // table), and by a resolver certifying a marker inside a path-mode
+    // argument (`path($x)`, `del(.. $x ..)`, an assignment target), which
+    // `scalar_identity_readable` says a program can do at all. With neither,
+    // nothing can ask, so the empty container is read fresh, exactly as
+    // before #3180 (#3491: the lookup was +5% to +8% on an empty-heavy
+    // `-n input` corpus, bound or not). The bind's own value is read before
+    // its entry exists, so it is the second test, not the first, that keeps
+    // it consistent with an ancestor read through the same table. A
+    // non-empty container keeps the unconditional lookup: #3069 measured
+    // and accepted that price.
+    if empty
+        && !super::eval_generic::embed_table_active()
+        && !super::eval_generic::scalar_identity_readable()
+    {
+        return None;
+    }
     let text = text.as_ptr() as usize;
     if !bridge_provenance::registered(text) {
         return None;

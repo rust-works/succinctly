@@ -1631,9 +1631,17 @@ is the revert that established what the other one costs.
      narrower target cannot spare the bit, so there the route refuses an empty container,
      as before #3180). The bridge provenance lookup
      (#3069) asks the same list for its document, so a second construct-and-navigate hop
-     over an empty container answers on both routes too. Pinned in
+     over an empty container answers on both routes too. That lookup is a binary search
+     over every container of the bridge document plus a refcount bump on cold storage, which
+     cost an empty-heavy `-n input` corpus 5-8% on both chips whether or not anything was
+     bound (#3491 first read it as 5-11% and blamed the bind), so an empty
+     container asks it only while a binding is in scope or the program can read a variable in
+     a path-mode argument (`scalar_identity_readable`); otherwise nothing can compare the
+     identity it buys, and the container is read fresh, as before #3180
+     ([#3491](https://github.com/rust-works/succinctly/issues/3491)). Pinned in
      `test_input_route_empty_container_keeps_embed_identity_3180`
-     ([#3180](https://github.com/rust-works/succinctly/issues/3180)).
+     ([#3180](https://github.com/rust-works/succinctly/issues/3180)) and
+     `bridge_provenance_of_an_empty_container_needs_something_to_ask_3491`.
    - *Closed.* A further re-entry between the embed and the read: collecting the pipe into
      an array (`[input | . as $x | {k:.} | .k | path($x)]`, `[inputs | ...]`) answers since
      #3180 — the array constructor reaches its constructions through `eval_owned_input`,

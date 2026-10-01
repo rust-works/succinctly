@@ -70959,6 +70959,60 @@ fn test_input_route_empty_container_keeps_embed_identity_3180() -> Result<()> {
     Ok(())
 }
 
+/// #3491: an *empty* container of a bridged `-n input` document is read
+/// fresh when nothing can compare the identity its bridge-provenance lookup
+/// would buy -- no binding in scope and no variable in a path-mode argument.
+/// The gate must not change what such a program prints, bound or not, and a
+/// program that does read a variable in `path()` must still get the shared
+/// storage (the #3180 rows). These are behaviour-neutral pins by design --
+/// the identity the gate skips is unobservable to them -- so the gate itself
+/// is guarded by
+/// `bridge_provenance_of_an_empty_container_needs_something_to_ask_3491`
+/// (`src/jq/value.rs`). Every expected output captured live against jq
+/// 1.7.1.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_input_route_empty_container_read_fresh_when_nothing_can_ask_3491() -> Result<()> {
+    let input = r#"{"a":[[],{},[],{}]}"#;
+    for (filter, want) in [
+        // No variable at all, then a bind nothing reads, then one read by `==`.
+        (r"input | [.a[] | [.] | .[0]]", "[[],{},[],{}]"),
+        (r"input | [.a[] | . as $x | [.] | .[0]]", "[[],{},[],{}]"),
+        (
+            r"input | [.a[] | . as $x | [.] | .[0] | $x == .]",
+            "[true,true,true,true]",
+        ),
+        (
+            r"input | [.a[] | [.] | .[0] | tostring]",
+            r#"["[]","{}","[]","{}"]"#,
+        ),
+        (
+            r"input | [.a[] | . as $x | {k:.} | .k | length]",
+            "[0,0,0,0]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3491: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3491: `{filter}`");
+    }
+    // A variable in `path()` is a reader: the shared storage is back. Only
+    // where #3180's accept rows are (a 64-bit target, shared containers).
+    #[cfg(all(not(feature = "unshared-containers"), target_pointer_width = "64"))]
+    {
+        let (stdout, stderr, code) = run_jq_full(
+            &[
+                "-n",
+                "-c",
+                r"input | [.a[] | . as $x | {k:.} | .k | path($x)]",
+            ],
+            Some(input),
+        )?;
+        assert_eq!(code, 0, "#3491 path($x): stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), "[[],[],[],[]]");
+    }
+    Ok(())
+}
+
 /// #3180 Stage 1: the default (generic-evaluator) route names an *empty*
 /// `{}`/`[]` as the node an `as` binding froze, so a construction that places
 /// it keeps jq's pointer identity. The embed gate asked `is_container()`,
