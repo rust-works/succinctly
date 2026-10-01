@@ -7800,6 +7800,72 @@ mod tests {
         );
     }
 
+    /// #3491: an *empty* container of a bridge document shares its source
+    /// storage only when something can ask about the identity it buys -- an
+    /// `as` binding in scope, or a program that reads a variable in a
+    /// path-mode argument. With neither, the lookup (a binary search over
+    /// every container, then a refcount bump on cold storage) cost 5-8% on an
+    /// empty-heavy `-n input` corpus for nothing; a non-empty container
+    /// shares either way (#3069).
+    // The empty-container tag lives in a BP position's top bit (#3180): on a
+    // narrower target an empty list retains no cursor and never shares.
+    #[cfg(all(feature = "std", target_pointer_width = "64"))]
+    #[test]
+    fn bridge_provenance_of_an_empty_container_needs_something_to_ask_3491() {
+        use crate::jq::eval_generic::{run_in_anchor_scope, AnchorScope};
+        use crate::jq::expr::BindOrigin;
+        let source = OwnedValue::array_from(vec![
+            OwnedValue::array_from(vec![]),
+            OwnedValue::object_from(Vec::<(String, OwnedValue)>::new()),
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+        ]);
+        let doc = source
+            .reindexed::<crate::jq::JqSemantics>()
+            .expect("shallow");
+        let read = |child: usize| {
+            let value = doc.root().children().nth(child).expect("child").value();
+            crate::jq::eval::bridge_shared_for_value::<crate::jq::JqSemantics, _>(&value)
+        };
+        assert!(!crate::jq::eval_generic::embed_table_active());
+
+        // Nothing can ask: no binding, and no variable in a path argument.
+        run_in_anchor_scope(AnchorScope::Off, || {
+            assert!(read(0).is_none(), "an empty array is read fresh");
+            assert!(read(1).is_none(), "an empty object is read fresh");
+            assert!(read(2).is_some(), "a non-empty array still shares");
+        });
+
+        // A resolver may certify a marker, or no entry point decided.
+        for scope in [AnchorScope::On, AnchorScope::Unknown] {
+            run_in_anchor_scope(scope, || {
+                assert!(read(0).is_some(), "{scope:?}: an empty array shares");
+                assert!(read(1).is_some(), "{scope:?}: an empty object shares");
+            });
+        }
+
+        // A binding is in scope, whatever the program reads.
+        let origin = BindOrigin::Node {
+            node: usize::MAX,
+            document: usize::MAX,
+        };
+        let mut bound = OwnedValue::array_from(vec![]);
+        let _guard = crate::jq::eval_generic::embed_table_push::<crate::jq::JqSemantics>(
+            Some(&origin),
+            &mut bound,
+        )
+        .expect("a container binding is registered");
+        run_in_anchor_scope(AnchorScope::Off, || {
+            assert!(
+                matches!(read(0), Some(OwnedValue::Array(shared)) if shared.is_empty()),
+                "an empty array shares while a binding is in scope"
+            );
+            assert!(
+                matches!(read(1), Some(OwnedValue::Object(shared)) if shared.is_empty()),
+                "an empty object shares while a binding is in scope"
+            );
+        });
+    }
+
     /// [`OwnedValue::input_bridge_doc`] is the exact `to_json_input_bridge` +
     /// `JsonIndex::build_reindex` pair `evaluate_input_streaming`
     /// (`src/bin/succinctly/jq_runner.rs`) used to spell out by hand, bundled

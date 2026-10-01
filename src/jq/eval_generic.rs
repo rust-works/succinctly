@@ -6533,6 +6533,14 @@ mod anchor_scope {
     }
 }
 
+/// Run `f` as an entry point that decided `scope` (#3491's test of the
+/// bridge-provenance gate, which no program text can set up in isolation).
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn run_in_anchor_scope<R>(scope: AnchorScope, f: impl FnOnce() -> R) -> R {
+    let _scope = anchor_scope::enter(scope);
+    f()
+}
+
 /// Run `f` with the [`AnchorScope`] of `expr`, unless an enclosing entry
 /// point already decided one -- a nested evaluation (a re-entry, a bridge)
 /// runs part of the same program, whose answer is already known.
