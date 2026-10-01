@@ -51,6 +51,43 @@ fn test_question_marks_in_yq_field_names_3356() -> Result<()> {
     Ok(())
 }
 
+/// #3479: after a write (or `-R`, `--slurp`, `--arg`) `succinctly yq` evaluates a
+/// value it re-indexed into throwaway JSON text, so `line`/`column` answer the
+/// fixed default `0` there, never a position inside that text. Real yq 4.53.3
+/// keeps the original node's position (`.c = 3 | .c | line` is `2`); the gap is
+/// recorded in `docs/compliance/yq/limitations.md`. These rows pin succinctly's
+/// current answers so moving the route onto the converged evaluator cannot turn
+/// them into plausible-looking synthetic positions (`1`).
+#[test]
+fn test_dom_route_cursor_metadata_is_positionless_3479() -> Result<()> {
+    let input = "a: 1\nc: 2\n";
+    for (filter, expected) in [
+        (".c | line", "2\n"), // the cursor route, for contrast
+        (".c = 3 | .c | line", "0\n"),
+        (".c = 3 | .a | line", "0\n"),
+        (".c = 3 | .c | column", "0\n"),
+        (".c |= . + 1 | .c | line", "0\n"),
+        (".d = 3 | .d | line", "0\n"),
+        (".c = 3 | .c | document_index", "0\n"),
+        (".c = 3 | [.[] | line]", "- 0\n- 0\n"),
+    ] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, &[])?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    // `at_offset` has no document to read after a write: the same error the
+    // previous evaluator raised, not a node of the synthetic text.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".c = 3 | at_offset(0)", input, &[])?;
+    assert_eq!((stdout.as_str(), code), ("", 1), "{stderr}");
+    assert!(
+        stderr.contains("at_offset requires document cursor context"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: adjacent `?//` is part of an unquoted key, while a
 /// question mark separated from the field by whitespace is a lexer error.
 #[test]

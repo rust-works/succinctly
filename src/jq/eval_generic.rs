@@ -3230,6 +3230,20 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     reentry: Reentry,
 ) -> GenericResult<V> {
+    eval_on_owned_over::<S, V>(expr, owned, optional, reentry, None)
+}
+
+/// [`eval_on_owned`], evaluating over `rooted`'s existing text and index
+/// instead of writing `owned` out and indexing it again (#3479). `rooted` is
+/// the reindexed document `owned` was decoded from, so the two describe the
+/// same value; `None` is the round trip.
+fn eval_on_owned_over<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    owned: OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    rooted: Option<Rc<super::value::ReindexedDoc>>,
+) -> GenericResult<V> {
     // Formats need neither an index nor a cursor, so the round-trip below is
     // pure overhead for them (#124). No non-finite-float guard is needed here
     // either: every non-JSON format bottoms out in `numeric_display_string`,
@@ -3313,15 +3327,40 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
             };
         }
     }
+    // #3479: on `succinctly yq`'s DOM route, which reaches this bridge once
+    // per `-R` line, the shapes `eval_owned_fast_path` answers against the
+    // tree (`.a`, `.[0]`, `. + <literal>`, `tostring`, ...) skip the round
+    // trip below. `fromjson | .id` is the case that needs it: the stage after
+    // the bridge hands back an owned object and would otherwise write it out
+    // and index it again to read one key. Limited to a mode that keeps no
+    // node identity, and to evaluations that registered a DOM document, so
+    // nothing else changes route; the fast path is the same evaluation the
+    // streaming owned entries already run (`eval_each_owned`).
+    if !S::REINDEX_BRIDGE_KEEPS_IDENTITY && dom_roots::active() && !embed_table_active() {
+        if let Some(result) = crate::jq::eval::eval_owned_fast_path::<S>(expr, &owned, optional) {
+            return match result {
+                Ok(Some(value)) => GenericResult::Owned(value),
+                Ok(None) => GenericResult::None,
+                Err(_) if optional => GenericResult::None,
+                Err(error) => GenericResult::Error(error),
+            };
+        }
+    }
 
     // After the bypasses on purpose: neither reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
     let expr = reentry.reroot::<S>(expr);
-    let doc = match owned.reindexed::<S>() {
-        Ok(doc) => doc,
-        Err(error) => return GenericResult::Error(error),
+    let rebuilt;
+    let cursor = match rooted.as_deref() {
+        Some(doc) => doc.root(),
+        None => {
+            rebuilt = match owned.reindexed::<S>() {
+                Ok(doc) => doc,
+                Err(error) => return GenericResult::Error(error),
+            };
+            rebuilt.root()
+        }
     };
-    let cursor = doc.root();
 
     // No `if optional { wrap in Expr::Optional }` here: every public entry
     // point (`eval`/`eval_using`/`eval_with_cursor`/`eval_with_cursor_using`)
@@ -3399,8 +3438,11 @@ fn bridge_to_full_evaluator<S: EvalSemantics, V: DocumentValue>(
     // this call's own root first (a no-op, `Cow::Borrowed`, unless `expr`
     // actually contains one).
     let root = RootWitness::of(cursor.as_ref());
-    match bridge_ambient_input::<_, S>(expr, &value, cursor) {
-        Ok(owned) => eval_on_owned::<S, V>(expr, owned, optional, Reentry::Against(root)),
+    let rooted = reindexed_root_for::<S, _>(expr, cursor.as_ref());
+    match bridge_input_over::<_, S>(expr, &value, cursor, rooted.as_deref()) {
+        Ok(owned) => {
+            eval_on_owned_over::<S, V>(expr, owned, optional, Reentry::Against(root), rooted)
+        }
         Err(e) if suppresses(&e, optional) => GenericResult::None,
         Err(e) => GenericResult::Error(e),
     }
@@ -3427,9 +3469,10 @@ fn bridge_to_full_evaluator_flow<S: EvalSemantics, V: DocumentValue>(
     // #2642: same rebuilt-root demotion as `bridge_to_full_evaluator`'s own
     // sibling fix -- see its comment.
     let root = RootWitness::of(cursor.as_ref());
-    match bridge_ambient_input::<_, S>(expr, &value, cursor) {
+    let rooted = reindexed_root_for::<S, _>(expr, cursor.as_ref());
+    match bridge_input_over::<_, S>(expr, &value, cursor, rooted.as_deref()) {
         Ok(owned) => drain_result_generic(
-            eval_on_owned::<S, V>(expr, owned, optional, Reentry::Against(root)),
+            eval_on_owned_over::<S, V>(expr, owned, optional, Reentry::Against(root), rooted),
             sink,
         ),
         Err(e) if suppresses(&e, optional) => Flow::Exhausted,
@@ -5707,6 +5750,156 @@ mod file_origin {
     }
 }
 
+/// The reindexed documents `succinctly yq`'s DOM route is evaluating, for the
+/// current thread (#3479).
+///
+/// The route hands the evaluator a cursor into text the serializer wrote from a
+/// value it already holds, and a construct the generic evaluator has no native
+/// arm for crosses back through `eval_on_owned`, which decodes that cursor,
+/// writes the same text again and builds an index over it again. When the
+/// value being bridged is the root of one of these documents, that text and
+/// index already exist, so the bridge evaluates over them instead. `-R` pays
+/// the saving once per line, on documents small enough that the rebuild was the
+/// whole cost.
+///
+/// A stack of `(root witness, document)`: a nested evaluation (a `load`ed
+/// file, an `--eval-all` combination) pushes its own without hiding the
+/// outer one. Matching on the root's node and document token is what keeps
+/// the shortcut to exactly the root: a navigated child, a computed value and
+/// a cursor into any other document all miss. `std` only, like its siblings;
+/// without a thread-local no document is registered and every bridge rebuilds
+/// as it always did.
+#[cfg(any(feature = "std", test))]
+mod dom_roots {
+    use super::super::value::ReindexedDoc;
+    use super::RootWitness;
+    use alloc::rc::Rc;
+    use alloc::vec::Vec;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ROOTS: RefCell<Vec<(RootWitness, Rc<ReindexedDoc>)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Whether any reindexed document is registered on this thread.
+    pub(crate) fn active() -> bool {
+        ROOTS.with(|roots| !roots.borrow().is_empty())
+    }
+
+    /// Whether `document` (a cursor's document token) is a registered one.
+    pub(crate) fn owns_document(document: usize) -> bool {
+        ROOTS.with(|roots| {
+            roots.borrow().iter().any(
+                |(root, _)| matches!(root, RootWitness::Node { document: d, .. } if *d == document),
+            )
+        })
+    }
+
+    pub(crate) fn find(witness: &RootWitness) -> Option<Rc<ReindexedDoc>> {
+        if !matches!(witness, RootWitness::Node { .. }) {
+            return None;
+        }
+        ROOTS.with(|roots| {
+            roots
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(root, _)| root == witness)
+                .map(|(_, doc)| Rc::clone(doc))
+        })
+    }
+
+    /// Registers `doc` for `f`'s dynamic extent, unregistering it on the way
+    /// out -- including when `f` unwinds.
+    pub(crate) fn with<R>(doc: &Rc<ReindexedDoc>, f: impl FnOnce() -> R) -> R {
+        struct Pop;
+        impl Drop for Pop {
+            fn drop(&mut self) {
+                ROOTS.with(|roots| {
+                    roots.borrow_mut().pop();
+                });
+            }
+        }
+        let witness = RootWitness::of(Some(&doc.root()));
+        ROOTS.with(|roots| roots.borrow_mut().push((witness, Rc::clone(doc))));
+        let _pop = Pop;
+        f()
+    }
+}
+
+#[cfg(not(any(feature = "std", test)))]
+mod dom_roots {
+    use super::super::value::ReindexedDoc;
+    use super::RootWitness;
+    use alloc::rc::Rc;
+
+    pub(crate) fn active() -> bool {
+        false
+    }
+
+    pub(crate) fn owns_document(_document: usize) -> bool {
+        false
+    }
+
+    pub(crate) fn find(_witness: &RootWitness) -> Option<Rc<ReindexedDoc>> {
+        None
+    }
+
+    pub(crate) fn with<R>(_doc: &Rc<ReindexedDoc>, f: impl FnOnce() -> R) -> R {
+        f()
+    }
+}
+
+/// Evaluate `f` with `doc` registered as a reindexed document whose root a
+/// bridge may evaluate over instead of rebuilding it (#3479). See
+/// [`dom_roots`].
+pub(crate) fn with_reindexed_document<R>(
+    doc: &Rc<super::value::ReindexedDoc>,
+    f: impl FnOnce() -> R,
+) -> R {
+    dom_roots::with(doc, f)
+}
+
+/// The registered reindexed document whose root `witness` names, if any
+/// (#3479). Test hook for [`dom_roots`], which has no other reader than
+/// [`reindexed_root_for`].
+#[cfg(test)]
+pub(crate) fn registered_reindexed_root(
+    witness: &RootWitness,
+) -> Option<Rc<super::value::ReindexedDoc>> {
+    dom_roots::find(witness)
+}
+
+/// The registered reindexed document `value` is the root of, when a bridge for
+/// `expr` may evaluate over it instead of reserializing the decoded value
+/// (#3479): the bridge must decode the whole value (a closed term decodes
+/// nothing), and a mode whose bridge keeps node identity registers provenance
+/// for the text it writes, which a reused document never did.
+fn reindexed_root_for<S: EvalSemantics, C: DocumentCursor>(
+    expr: &Expr,
+    cursor: Option<&C>,
+) -> Option<Rc<super::value::ReindexedDoc>> {
+    if S::REINDEX_BRIDGE_KEEPS_IDENTITY || !crate::jq::walk::reads_ambient_value(expr) {
+        return None;
+    }
+    dom_roots::find(&RootWitness::of(cursor))
+}
+
+/// [`bridge_ambient_input`], taking the string a registered document was written
+/// from instead of decoding it back out of its text (#3479). `rooted` is only
+/// ever the document `value` is the root of, so its string is `value`.
+fn bridge_input_over<V: DocumentValue, S: EvalSemantics>(
+    expr: &Expr,
+    value: &V,
+    cursor: Option<V::Cursor>,
+    rooted: Option<&super::value::ReindexedDoc>,
+) -> Result<OwnedValue, EvalError> {
+    match rooted.and_then(super::value::ReindexedDoc::root_string) {
+        Some(string) => Ok(string.clone()),
+        None => bridge_ambient_input::<_, S>(expr, value, cursor),
+    }
+}
+
 /// Install `table` as the ambient `--eval-all` file-origin table for `f`
 /// (#715, #2427). See [`file_origin`].
 pub(crate) fn with_file_origin<R>(table: &[usize], f: impl FnOnce() -> R) -> R {
@@ -6334,6 +6527,10 @@ mod embed_table {
     use alloc::vec::Vec;
 
     pub(crate) fn active() -> bool {
+        false
+    }
+
+    pub(crate) fn owns_document(_document: usize) -> bool {
         false
     }
 
@@ -24573,6 +24770,29 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             }
         }
     }
+    // #3479: a cursor into a document `succinctly yq`'s DOM route registered
+    // answers no position. Its text is the serializer's throwaway output, so
+    // the metadata builtins fall to their fixed defaults (and
+    // `at_offset`/`at_position` to their "requires document cursor context"
+    // error) instead of reporting offsets in text the user never wrote. Only
+    // these builtins: `key`/`parent`/`path` still need the cursor to navigate.
+    let cursor = if matches!(
+        builtin,
+        Builtin::Line
+            | Builtin::Column
+            | Builtin::DocumentIndex
+            | Builtin::Anchor
+            | Builtin::Style
+            | Builtin::LineComment
+            | Builtin::HeadComment
+            | Builtin::FootComment
+            | Builtin::AtOffset(_)
+            | Builtin::AtPosition(..)
+    ) {
+        cursor.filter(|c| !dom_roots::owns_document(c.document_token()))
+    } else {
+        cursor
+    };
     match builtin {
         Builtin::Line => {
             let line = cursor.map_or(0, |c| c.line());
@@ -25865,7 +26085,18 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // is a different node). Demote any marker not proven to be
             // `cursor`'s own node before either resolution route below.
             let root = RootWitness::of(cursor.as_ref());
-            let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
+            let owned_builtin_expr = Expr::Builtin(builtin.clone());
+            let rooted = reindexed_root_for::<S, _>(&owned_builtin_expr, cursor.as_ref());
+            let owned = owned_or_suppress!(
+                match rooted
+                    .as_deref()
+                    .and_then(super::value::ReindexedDoc::root_string)
+                {
+                    Some(string) => Ok(string.clone()),
+                    None => to_owned_with_cursor::<_, S>(&value, cursor),
+                },
+                optional
+            );
             // The reroot (`reroot_markers`, not `reroot_for_reentry` --
             // `path_expr` is the resolver's own argument, #3122) and the
             // `reindex_bridge_is_identity` gate both live in
@@ -25879,8 +26110,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     None => owned_vec_to_generic_result(values),
                 };
             }
-            let owned_builtin_expr = Expr::Builtin(builtin.clone());
-            eval_on_owned::<S, _>(&owned_builtin_expr, owned, optional, Reentry::Against(root))
+            eval_on_owned_over::<S, _>(
+                &owned_builtin_expr,
+                owned,
+                optional,
+                Reentry::Against(root),
+                rooted,
+            )
         }
 
         // #2168: `getpath(P)` reads one node, and now costs one read.
@@ -26278,11 +26514,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // argument), so it must be checked against this call's own root.
             let root = RootWitness::of(cursor.as_ref());
             let expr = Expr::Builtin(builtin.clone());
+            let rooted = reindexed_root_for::<S, _>(&expr, cursor.as_ref());
             let owned = owned_or_suppress!(
-                bridge_ambient_input::<_, S>(&expr, &value, cursor),
+                bridge_input_over::<_, S>(&expr, &value, cursor, rooted.as_deref()),
                 optional
             );
-            eval_on_owned::<S, _>(&expr, owned, optional, Reentry::Against(root))
+            eval_on_owned_over::<S, _>(&expr, owned, optional, Reentry::Against(root), rooted)
         }
     }
 }

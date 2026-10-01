@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **yq: the DOM route (`-R`, `--inplace`, `--slurp`, writes, `--arg`) runs on the converged
+  evaluator** (#3479). The hidden `jq::eval_reindexed` is gone. A construct the generic evaluator
+  bridges to the owned evaluator now evaluates over the document's existing index instead of
+  decoding, writing out and indexing the value again on every call, so `-R` no longer pays that
+  once per line (7950X, 1 MB and 10 MB of `-R` lines: every row within +6% of the previous route,
+  where the plain `eval` was +30% to +129% on `select(test(...))`, `tojson`, `sub` and
+  `fromjson | .id`). `to_json_for_reindex` now writes one buffer instead of a `String` per node,
+  with identical bytes; every reindex bridge in both modes gets it. Output is unchanged, and
+  `line`/`column`/`at_offset` after a write still answer the defaults, never a position in the
+  re-indexed text.
+
 - **jq: a string or number bound by `as` keeps jq's node identity** (#3191).
   `. as $x | {k:.} | .k | path($x)` on `"s"` or `5` answers `[]` as in jq 1.7.1,
   where it refused before, and the same holds through `[.] | .[0]`, `tostring`,

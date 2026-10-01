@@ -4255,7 +4255,84 @@ impl OwnedValue {
     /// the same pass that builds the text, rather than a separate
     /// pre-flight walk.
     pub fn to_json_for_reindex<S: EvalSemantics>(&self) -> Result<String, EvalError> {
-        self.to_json_for_reindex_at_depth::<S>(0)
+        let mut out = String::new();
+        self.write_json_for_reindex::<S>(&mut out, 0)?;
+        Ok(out)
+    }
+
+    /// [`to_json_for_reindex`](Self::to_json_for_reindex)'s text, appended to
+    /// `out` in one pass (#3479).
+    ///
+    /// The previous form built a `String` per node and joined them, so every
+    /// level of nesting copied everything below it again, and the reindex
+    /// bridge pays this on every call (`-R` makes one per line, on documents
+    /// of a few hundred bytes, where the allocations are the whole cost). The
+    /// bytes are the same as that form wrote; `reindex_text_matches_the_nested_form_3479`
+    /// compares the two on every value shape.
+    fn write_json_for_reindex<S: EvalSemantics>(
+        &self,
+        out: &mut String,
+        depth: usize,
+    ) -> Result<(), EvalError> {
+        use core::fmt::Write;
+        check_value_tree_depth(depth)?;
+        match self {
+            Self::Null => out.push_str("null"),
+            Self::Bool(true) => out.push_str("true"),
+            Self::Bool(false) => out.push_str("false"),
+            Self::Int(n) => {
+                // Writing into a `String` is infallible.
+                let _ = write!(out, "{n}");
+            }
+            Self::String(s) => {
+                out.push('"');
+                let _ = write_json_body_jq(out, s);
+                out.push('"');
+            }
+            Self::Float(f) if f.is_nan() => out.push_str(NAN_SENTINEL),
+            // A parsed NaN keeps its instance through the bridge (#3309).
+            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
+                out.push_str(&nan_instance_token(*f));
+            }
+            Self::Float(f) if f.is_infinite() => out.push_str(overflow_literal(*f)),
+            // The bridge must keep the source literal at every length.
+            Self::NumberLiteral(_, literal) => out.push_str(literal),
+            Self::Array(arr) => {
+                out.push('[');
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write_json_for_reindex::<S>(out, depth + 1)?;
+                }
+                out.push(']');
+            }
+            Self::Object(obj) => {
+                out.push('{');
+                for (i, (k, v)) in obj.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push('"');
+                    let _ = write_json_body_jq(out, k);
+                    out.push_str("\":");
+                    v.write_json_for_reindex::<S>(out, depth + 1)?;
+                }
+                out.push('}');
+            }
+            // A bare finite `Float` is a *computed* value and is written as
+            // the bridge-only token `computed_float_token` decodes (#2902);
+            // see `to_json_for_reindex_at_depth`, the nested form this
+            // replaced, for why. Every other variant is handled above.
+            other => out.push_str(&other.to_json_at_depth(
+                depth,
+                format_number_jq_compat,
+                crate::json::validate::computed_float_token,
+                infinite_float_preview_text,
+                printed_nan,
+            )),
+        }
+        Ok(())
     }
 
     /// Reports [`EvalError`] rather than panicking past
@@ -4270,6 +4347,7 @@ impl OwnedValue {
     /// reindex bridge) are exactly the ones that grow a value one level
     /// deeper per loop iteration with no adversarial document involved, so
     /// it needs the same guard [`to_json`](Self::to_json) does.
+    #[cfg(test)]
     fn to_json_for_reindex_at_depth<S: EvalSemantics>(
         &self,
         depth: usize,
@@ -4359,7 +4437,11 @@ impl OwnedValue {
     ) -> Result<ReindexedDoc, EvalError> {
         #[cfg(test)]
         reindex_count::bump();
-        Ok(ReindexedDoc::new(self.to_json_for_reindex::<S>()?, None))
+        let mut doc = ReindexedDoc::new(self.to_json_for_reindex::<S>()?, None);
+        if matches!(self, Self::String(_)) {
+            doc.root_string = Some(self.clone());
+        }
+        Ok(doc)
     }
 
     /// [`to_json_input_bridge`](Self::to_json_input_bridge)'s text, indexed
@@ -4408,6 +4490,12 @@ pub struct ReindexedDoc {
     /// Whether [`bridge_provenance`] holds this document's source, so
     /// dropping the document must unregister it.
     registered: bool,
+    /// The string this document was written from, when its root is one
+    /// (#3479). A string survives the round trip unchanged, so a bridge that
+    /// needs the root as an `OwnedValue` can take this instead of unescaping
+    /// the text it was just escaped into -- which `-R` would otherwise do
+    /// once per line.
+    root_string: Option<OwnedValue>,
 }
 
 impl ReindexedDoc {
@@ -4427,6 +4515,7 @@ impl ReindexedDoc {
             text,
             index,
             registered,
+            root_string: None,
         }
     }
 
@@ -4438,6 +4527,12 @@ impl ReindexedDoc {
     /// The bridge text itself.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// The string this document's root was written from, if its root is a
+    /// string (#3479); see the field of the same name.
+    pub(crate) fn root_string(&self) -> Option<&OwnedValue> {
+        self.root_string.as_ref()
     }
 }
 
@@ -9594,6 +9689,82 @@ mod tests {
             .to_json_for_reindex::<JqSemantics>()
             .expect_err("to_json_for_reindex should report an error at MAX_VALUE_TREE_DEPTH");
         assert_eq!(err.to_string(), "nesting depth exceeds limit of 384");
+    }
+
+    /// #3479: the reindex bridge text is written in one pass now; it must be the
+    /// bytes the nested per-node form wrote, for every kind of leaf the bridge
+    /// has a spelling for (computed floats, NaN instances, infinities, number
+    /// literals, escapes) and for the depth error at the limit.
+    #[test]
+    fn reindex_text_matches_the_nested_form_3479() {
+        let literal = |text: &str| OwnedValue::from_number_bytes::<JqSemantics>(text.as_bytes());
+        let leaves = vec![
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::Bool(false),
+            OwnedValue::Int(0),
+            OwnedValue::Int(i64::MIN),
+            OwnedValue::Int(i64::MAX),
+            OwnedValue::Float(1.5),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Float(1e300 * 1e300),
+            OwnedValue::Float(-1e300 * 1e300),
+            OwnedValue::Float(f64::NAN),
+            literal("1"),
+            literal("1.0"),
+            literal("1e100"),
+            literal("-0.0"),
+            literal("1e400"),
+            literal("100000000000000000000"),
+            OwnedValue::String("".into()),
+            OwnedValue::String("plain".into()),
+            OwnedValue::String("q\"b\\s\n\r\t\u{8}\u{c}\u{1}\u{7f}é😀".into()),
+        ];
+        let mut values = leaves.clone();
+        values.push(OwnedValue::array_from(leaves.clone()));
+        values.push(OwnedValue::array_from(vec![]));
+        values.push(OwnedValue::object_from(vec![]));
+        values.push(OwnedValue::object_from(
+            leaves
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (format!("k\"{i}\n"), v.clone()))
+                .collect::<Vec<_>>(),
+        ));
+        values.push(OwnedValue::object_from([
+            (
+                "a".to_string(),
+                OwnedValue::array_from(vec![
+                    OwnedValue::object_from([("b".to_string(), OwnedValue::array_from(leaves))]),
+                    OwnedValue::array_from(vec![OwnedValue::array_from(vec![])]),
+                ]),
+            ),
+            (String::new(), OwnedValue::object_from(vec![])),
+        ]));
+        for value in &values {
+            for (jq, yq) in [
+                (
+                    value.to_json_for_reindex::<JqSemantics>(),
+                    value.to_json_for_reindex_at_depth::<JqSemantics>(0),
+                ),
+                (
+                    value.to_json_for_reindex::<YqSemantics>(),
+                    value.to_json_for_reindex_at_depth::<YqSemantics>(0),
+                ),
+            ] {
+                assert_eq!(jq.expect("shallow"), yq.expect("shallow"), "{value:?}");
+            }
+        }
+        for depth in [MAX_VALUE_TREE_DEPTH - 1, MAX_VALUE_TREE_DEPTH] {
+            let nest = linear_array_nest(depth);
+            let new = nest.to_json_for_reindex::<JqSemantics>();
+            let old = nest.to_json_for_reindex_at_depth::<JqSemantics>(0);
+            match (new, old) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                (a, b) => panic!("depth {depth}: {a:?} vs {b:?}"),
+            }
+        }
     }
 
     /// #1005: `==` recurses through a private depth-tracked helper instead
