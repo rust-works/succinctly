@@ -2368,7 +2368,7 @@ mod tests {
                 JsonConvention::Preserve,
             )
             .unwrap();
-        assert!(!buf.is_empty());
+        assert!(!buf.is_empty(), "{buf:?}");
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2397,7 +2397,7 @@ mod tests {
         under
             .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
-        assert!(!buf.is_empty());
+        assert!(!buf.is_empty(), "{buf:?}");
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

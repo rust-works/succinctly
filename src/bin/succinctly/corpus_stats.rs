@@ -1375,7 +1375,7 @@ mod tests {
         // zero-byte input contributes no sample
         let mut e = Dist::default();
         push_escape_density(&mut e, 5, 0);
-        assert!(e.values.is_empty());
+        assert!(e.values.is_empty(), "{:?}", e.values);
         // empty density falls back to the placeholder row
         assert_eq!(density_row("escape density", &e)[3], "-");
     }

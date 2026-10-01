@@ -71441,17 +71441,28 @@ mod tests {
                 }
             );
         }
-        assert!(outputs(br#"{"a":[1],"b":{"k":1}}"#, "path([.b.k] | empty)").is_empty());
+        assert!(
+            outputs(br#"{"a":[1],"b":{"k":1}}"#, "path([.b.k] | empty)").is_empty(),
+            "{:?}",
+            outputs(br#"{"a":[1],"b":{"k":1}}"#, "path([.b.k] | empty)")
+        );
         let null_child = br#"{"x":{"a":1}}"#;
         assert_eq!(
             outputs(null_child, "path(.x | .x | tojson | fromjson | .a)"),
             [r#"["x","x","a"]"#]
         );
-        assert!(outputs(
-            null_child,
-            "path(.x | [.x | tojson | fromjson | .a] | empty)"
-        )
-        .is_empty());
+        assert!(
+            outputs(
+                null_child,
+                "path(.x | [.x | tojson | fromjson | .a] | empty)"
+            )
+            .is_empty(),
+            "{:?}",
+            outputs(
+                null_child,
+                "path(.x | [.x | tojson | fromjson | .a] | empty)"
+            )
+        );
     }
 
     /// Like `query!`, but parses in `ParserMode::Yq` and evaluates with
@@ -79599,7 +79610,7 @@ mod tests {
         let out: Vec<OwnedValue> =
             try_reserve_product_labeled(&[usize::MAX, 2, 0], cannot_reserve_cross_product)
                 .expect("a true product of 0 must succeed regardless of factor order");
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "{out:?}");
     }
 
     /// #1634: the guard must not become a de facto cap on legitimate,
@@ -79612,7 +79623,7 @@ mod tests {
             try_reserve_product_labeled(&[10, 20], cannot_reserve_cross_product)
                 .expect("a 10*20 product must not refuse");
         assert!(out.capacity() >= 200, "capacity: {}", out.capacity());
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "{out:?}");
     }
 
     /// #1634: end-to-end sanity that the guard is actually reachable from a
@@ -82170,7 +82181,11 @@ mod tests {
         // `[...]` yields nothing here. Object construction used to match that
         // (wrongly — see the comment above `atomic`); post-#354 it agrees with
         // jq 1.7.1 instead, printing the object built from the prefix.
-        assert!(outputs(b"null", "label $out | [1,(2,break $out),3]").is_empty());
+        assert!(
+            outputs(b"null", "label $out | [1,(2,break $out),3]").is_empty(),
+            "{:?}",
+            outputs(b"null", "label $out | [1,(2,break $out),3]")
+        );
         assert_eq!(
             outputs(b"null", "label $out | {a:1,b:(2,break $out)}"),
             [r#"{"a":1,"b":2}"#]
@@ -82511,7 +82526,11 @@ mod tests {
         // a bare control.
         assert_eq!(outputs(b"null", "foreach . as $x (0; .+1)"), ["1"]);
         assert_eq!(outputs(b"null", "foreach (1+1) as $x (0; .+$x)"), ["2"]);
-        assert!(outputs(b"null", "foreach empty as $x (0; .+$x)").is_empty());
+        assert!(
+            outputs(b"null", "foreach empty as $x (0; .+$x)").is_empty(),
+            "{:?}",
+            outputs(b"null", "foreach empty as $x (0; .+$x)")
+        );
         assert_collapses_to_error(
             b"null",
             r#"foreach error("x") as $x (0; .+$x)"#,
@@ -82945,7 +82964,11 @@ mod tests {
             [r#""t""#, r#""f""#, r#""t""#]
         );
         // An `empty` condition contributes no bits, so no branch runs at all.
-        assert!(outputs(b"null", r#"if empty then "t" else "f" end"#).is_empty());
+        assert!(
+            outputs(b"null", r#"if empty then "t" else "f" end"#).is_empty(),
+            "{:?}",
+            outputs(b"null", r#"if empty then "t" else "f" end"#)
+        );
     }
 
     #[test]
@@ -83965,7 +83988,11 @@ mod tests {
         // zero outputs too (same as any pipe into a filter with nothing to
         // feed it). Confirmed against jq 1.7.1: `"a" | in(empty)` exits 0
         // with no output.
-        assert!(outputs(br#""a""#, "in(empty)").is_empty());
+        assert!(
+            outputs(br#""a""#, "in(empty)").is_empty(),
+            "{:?}",
+            outputs(br#""a""#, "in(empty)")
+        );
     }
 
     #[test]
@@ -84031,7 +84058,11 @@ mod tests {
         // in(5, {a:1})?` produces no output at all, exit 0 -- `{a:1}`'s own
         // `true` is never reached (real jq's `try` truncates the stream,
         // it doesn't skip just the erroring candidate).
-        assert!(outputs(br#""a""#, "in(5, {a:1})?").is_empty());
+        assert!(
+            outputs(br#""a""#, "in(5, {a:1})?").is_empty(),
+            "{:?}",
+            outputs(br#""a""#, "in(5, {a:1})?")
+        );
     }
 
     #[test]
@@ -84062,7 +84093,11 @@ mod tests {
         // select outputs nothing if condition is false, collapsing to a bare
         // `None` since #1043 — `outputs()` is deliberately variant-agnostic
         // about the exact `QueryResult` shape, per its own doc comment.
-        assert!(outputs(br"2", "select(. > 3)").is_empty());
+        assert!(
+            outputs(br"2", "select(. > 3)").is_empty(),
+            "{:?}",
+            outputs(br"2", "select(. > 3)")
+        );
     }
 
     #[test]
@@ -84070,7 +84105,11 @@ mod tests {
         // A multi-output condition republishes the input once per truthy
         // output instead of only consulting the first one (#378). Pinned
         // against jq 1.7.1.
-        assert!(outputs(b"1", "select((false,false) and true)").is_empty());
+        assert!(
+            outputs(b"1", "select((false,false) and true)").is_empty(),
+            "{:?}",
+            outputs(b"1", "select((false,false) and true)")
+        );
         assert_eq!(outputs(b"1", "select((true,false) and true)"), ["1"]);
         assert_eq!(outputs(b"1", "select((true,true))"), ["1", "1"]);
     }
@@ -84083,7 +84122,11 @@ mod tests {
         // `select` needs a yq answer: yq's lexer rejects `if/then/else`
         // outright). Every row here is live-verified against yq v4.53.3;
         // jq's own per-bit fanout above must stay exactly as it was.
-        assert!(outputs_yq(b"1", "select((false,false))").is_empty());
+        assert!(
+            outputs_yq(b"1", "select((false,false))").is_empty(),
+            "{:?}",
+            outputs_yq(b"1", "select((false,false))")
+        );
         assert_eq!(outputs_yq(b"1", "select((true,false))"), ["1"]);
         assert_eq!(outputs_yq(b"1", "select((false,true))"), ["1"]);
         assert_eq!(outputs_yq(b"1", "select((true,true))"), ["1"]);
@@ -84093,7 +84136,11 @@ mod tests {
         // literal-only test would not have caught this, since the bug is in
         // how outputs are *counted*, not in how truthiness is computed.
         assert_eq!(outputs_yq(b"1", "select((. == 1, . == 1))"), ["1"]);
-        assert!(outputs_yq(b"1", "select((. == 1, . == 2) and false)").is_empty());
+        assert!(
+            outputs_yq(b"1", "select((. == 1, . == 2) and false)").is_empty(),
+            "{:?}",
+            outputs_yq(b"1", "select((. == 1, . == 2) and false)")
+        );
     }
 
     #[test]
@@ -95532,15 +95579,18 @@ mod tests {
         // Covers the None / Error / Break / Owned / ManyOwned arms and is_error,
         // which the integration parity tests do not exercise.
         let none: QueryResult<Vec<u64>> = QueryResult::None;
-        assert!(none.collect_owned::<JqSemantics>().is_empty());
+        let collected = none.collect_owned::<JqSemantics>();
+        assert!(collected.is_empty(), "{collected:?}");
         assert!(!QueryResult::<Vec<u64>>::None.is_error());
 
         let err: QueryResult<Vec<u64>> = QueryResult::Error(EvalError::new("boom"));
         assert!(err.is_error());
-        assert!(err.collect_owned::<JqSemantics>().is_empty());
+        let collected = err.collect_owned::<JqSemantics>();
+        assert!(collected.is_empty(), "{collected:?}");
 
         let brk: QueryResult<Vec<u64>> = QueryResult::Break("lbl".into());
-        assert!(brk.collect_owned::<JqSemantics>().is_empty());
+        let collected = brk.collect_owned::<JqSemantics>();
+        assert!(collected.is_empty(), "{collected:?}");
 
         let owned: QueryResult<Vec<u64>> = QueryResult::Owned(OwnedValue::Int(7));
         assert_eq!(
@@ -105908,7 +105958,8 @@ mod tests {
         // sibling `Break` arm right next to it. Mirrors `Break`'s "no
         // outputs" answer: a halt carries no output value of its own either.
         let halt: QueryResult<Vec<u64>> = QueryResult::Halt(0);
-        assert!(halt.collect_owned::<JqSemantics>().is_empty());
+        let collected = halt.collect_owned::<JqSemantics>();
+        assert!(collected.is_empty(), "{collected:?}");
     }
 
     #[test]
@@ -107030,7 +107081,7 @@ mod tests {
         ] {
             let mut args: Vec<OwnedValue> = Vec::new();
             assert!(apply_arg_fanout(gate, &mut args).is_ok());
-            assert!(args.is_empty());
+            assert!(args.is_empty(), "{args:?}");
         }
     }
 
@@ -107968,7 +108019,7 @@ mod tests {
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         let mut events = Vec::new();
         collect_tostream_events(&under, &mut Vec::new(), &mut events);
-        assert!(!events.is_empty());
+        assert!(!events.is_empty(), "{events:?}");
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -110680,7 +110731,7 @@ mod tests {
 
         // A zero-output key completes no match and escapes nothing.
         let (sets, flow) = binding_sets_2872(". as {(empty):$q} | .", &input, false, None);
-        assert!(sets.is_empty());
+        assert!(sets.is_empty(), "{sets:?}");
         assert!(matches!(flow, Flow::Exhausted));
     }
 
@@ -117464,7 +117515,7 @@ mod share_audit_2999 {
         let ((), recorded) = share_stats::measure(|| {
             drop(eval_full::<Vec<u64>, JqSemantics>(&expr, cursor));
         });
-        assert!(!recorded.is_empty());
+        assert!(!recorded.is_empty(), "{recorded:?}");
         for (site, _) in &recorded {
             assert!(
                 site.file.ends_with("src/jq/eval.rs"),

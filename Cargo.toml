@@ -369,7 +369,6 @@ single_match_else          = "allow"
 unnecessary_wraps          = "allow"  # some wrappers exist for API / trait consistency
 no_effect_underscore_binding = "allow"
 manual_assert              = "allow"
-assert_is_empty            = "allow"  # clippy 1.99; ~90 test sites, and its rewrite for a collection needs a spelled-out `[] as [T; 0]`
 wildcard_imports           = "allow"  # `use super::*` in test modules
 naive_bytecount            = "allow"
 case_sensitive_file_extension_comparisons = "allow"

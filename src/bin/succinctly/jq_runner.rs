@@ -9554,7 +9554,11 @@ mod tests {
             let mut cmd = JqCommand::try_parse_from(["jq", ".x", "in.json"]).unwrap();
             cmd.resolve_positional_args();
             assert_eq!(cmd.filter, Some(".x".into()));
-            assert!(cmd.positional_words.is_empty());
+            assert!(
+                cmd.positional_words.is_empty(),
+                "{:?}",
+                cmd.positional_words
+            );
             assert!(!cmd.positional_mode);
         }
     }

@@ -1176,16 +1176,32 @@ mod tests {
                 panic!("expected string keys");
             };
             let bp_pos = field.value_cursor().bp_position();
-            assert!(index.get_head_comments(bp_pos).is_empty());
-            assert!(index.get_foot_comments(bp_pos).is_empty());
+            assert!(
+                index.get_head_comments(bp_pos).is_empty(),
+                "{:?}",
+                index.get_head_comments(bp_pos)
+            );
+            assert!(
+                index.get_foot_comments(bp_pos).is_empty(),
+                "{:?}",
+                index.get_foot_comments(bp_pos)
+            );
             if k.raw_bytes() == b"a" {
                 // This position does carry other comment metadata (a line
                 // comment), so `comments.get` takes the `Some` arm.
-                assert!(!index.get_line_comments(bp_pos).is_empty());
+                assert!(
+                    !index.get_line_comments(bp_pos).is_empty(),
+                    "{:?}",
+                    index.get_line_comments(bp_pos)
+                );
             } else {
                 // This position has no entry in `comments` at all, so
                 // `map_or` falls through to its `&[]` default.
-                assert!(index.get_line_comments(bp_pos).is_empty());
+                assert!(
+                    index.get_line_comments(bp_pos).is_empty(),
+                    "{:?}",
+                    index.get_line_comments(bp_pos)
+                );
             }
         }
     }
@@ -1435,7 +1451,7 @@ mod tests {
         // `.b | key | head_comment` == "mid"; `.a | key | foot_comment` empty.
         let (head, foot) = field_key_head_foot(b"a: 1\n# mid\nb: 2\n", "b");
         assert_eq!(head, ["# mid"]);
-        assert!(foot.is_empty());
+        assert!(foot.is_empty(), "{foot:?}");
         let (_, a_foot) = field_key_head_foot(b"a: 1\n# mid\nb: 2\n", "a");
         assert!(a_foot.is_empty(), "{a_foot:?}");
     }

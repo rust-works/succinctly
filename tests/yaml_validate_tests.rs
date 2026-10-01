@@ -58,7 +58,7 @@ fn run_validate_file(path: &str, extra_args: &[&str]) -> Result<(String, String,
 fn valid_yaml_exits_zero() -> Result<()> {
     let (stdout, stderr, code) = run_validate_stdin("a: 1\nb: 2\n", &[])?;
     assert_eq!(code, 0, "stdout: {stdout}, stderr: {stderr}");
-    assert!(stdout.is_empty());
+    assert!(stdout.is_empty(), "{stdout:?}");
     Ok(())
 }
 
@@ -76,7 +76,7 @@ fn invalid_yaml_exits_one() -> Result<()> {
 fn quiet_mode_is_silent() -> Result<()> {
     let (stdout, stderr, code) = run_validate_stdin("foo: |0\n", &["--quiet"])?;
     assert_eq!(code, 1);
-    assert!(stdout.is_empty());
+    assert!(stdout.is_empty(), "{stdout:?}");
     assert!(
         stderr.is_empty(),
         "stderr should be empty in quiet mode: {stderr}"

@@ -2216,7 +2216,7 @@ mod tests {
             NestingTooDeep { limit: 128 },
         ];
         for k in &kinds {
-            assert!(!k.to_string().is_empty());
+            assert!(!k.to_string().is_empty(), "{:?}", k.to_string());
         }
         // Full error Display includes the position.
         let err = YamlValidationError {

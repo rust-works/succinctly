@@ -481,18 +481,46 @@ mod tests {
 
     #[test]
     fn test_registry_not_empty() {
-        assert!(!BENCHMARKS.is_empty());
+        assert!(!BENCHMARKS.is_empty(), "{BENCHMARKS:?}");
     }
 
     #[test]
     fn test_all_categories_have_benchmarks() {
-        assert!(!filter_by_category(BenchmarkCategory::Core).is_empty());
-        assert!(!filter_by_category(BenchmarkCategory::Json).is_empty());
-        assert!(!filter_by_category(BenchmarkCategory::Yaml).is_empty());
-        assert!(!filter_by_category(BenchmarkCategory::Dsv).is_empty());
-        assert!(!filter_by_category(BenchmarkCategory::Text).is_empty());
-        assert!(!filter_by_category(BenchmarkCategory::CrossParser).is_empty());
-        assert!(!filter_by_category(BenchmarkCategory::Corpus).is_empty());
+        assert!(
+            !filter_by_category(BenchmarkCategory::Core).is_empty(),
+            "{:?}",
+            filter_by_category(BenchmarkCategory::Core)
+        );
+        assert!(
+            !filter_by_category(BenchmarkCategory::Json).is_empty(),
+            "{:?}",
+            filter_by_category(BenchmarkCategory::Json)
+        );
+        assert!(
+            !filter_by_category(BenchmarkCategory::Yaml).is_empty(),
+            "{:?}",
+            filter_by_category(BenchmarkCategory::Yaml)
+        );
+        assert!(
+            !filter_by_category(BenchmarkCategory::Dsv).is_empty(),
+            "{:?}",
+            filter_by_category(BenchmarkCategory::Dsv)
+        );
+        assert!(
+            !filter_by_category(BenchmarkCategory::Text).is_empty(),
+            "{:?}",
+            filter_by_category(BenchmarkCategory::Text)
+        );
+        assert!(
+            !filter_by_category(BenchmarkCategory::CrossParser).is_empty(),
+            "{:?}",
+            filter_by_category(BenchmarkCategory::CrossParser)
+        );
+        assert!(
+            !filter_by_category(BenchmarkCategory::Corpus).is_empty(),
+            "{:?}",
+            filter_by_category(BenchmarkCategory::Corpus)
+        );
     }
 
     #[test]

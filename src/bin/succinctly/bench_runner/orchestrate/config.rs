@@ -229,7 +229,7 @@ nodes:
     #[test]
     fn rejects_invalid_yaml() {
         let err = serde_yaml::from_str::<Config>("not: [valid, config").unwrap_err();
-        assert!(!err.to_string().is_empty());
+        assert!(!err.to_string().is_empty(), "{:?}", err.to_string());
     }
 
     #[test]

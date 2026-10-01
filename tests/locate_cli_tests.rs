@@ -54,7 +54,7 @@ fn jq_locate_line_column_agrees_with_offset() -> Result<()> {
     let (by_offset, _, _) = run(&["jq-locate", JSON_FIXTURE, "--offset", "122"])?;
 
     assert_eq!(by_position, by_offset);
-    assert!(!by_position.is_empty());
+    assert!(!by_position.is_empty(), "{by_position:?}");
     Ok(())
 }
 

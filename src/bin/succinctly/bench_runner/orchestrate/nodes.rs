@@ -266,7 +266,7 @@ nodes:
         run_nodes_with(parsed, &FakeExec::new(), &ec2).unwrap();
 
         assert_eq!(ec2.start_calls(), vec!["i-0123456789abcdef0".to_string()]);
-        assert!(ec2.stop_calls().is_empty());
+        assert!(ec2.stop_calls().is_empty(), "{:?}", ec2.stop_calls());
     }
 
     #[test]
@@ -279,7 +279,7 @@ nodes:
         run_nodes_with(parsed, &FakeExec::new(), &ec2).unwrap();
 
         assert_eq!(ec2.stop_calls(), vec!["i-0123456789abcdef0".to_string()]);
-        assert!(ec2.start_calls().is_empty());
+        assert!(ec2.start_calls().is_empty(), "{:?}", ec2.start_calls());
     }
 
     #[test]

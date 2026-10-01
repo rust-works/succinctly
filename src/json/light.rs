@@ -5575,8 +5575,16 @@ mod tests {
         let json = br#"{"a": 1}"#;
         let index = JsonIndex::build(json);
         let root = index.root(json);
-        assert!(DocumentCursor::head_comment_raw(&root).is_empty());
-        assert!(DocumentCursor::foot_comment_raw(&root).is_empty());
+        assert!(
+            DocumentCursor::head_comment_raw(&root).is_empty(),
+            "{:?}",
+            DocumentCursor::head_comment_raw(&root)
+        );
+        assert!(
+            DocumentCursor::foot_comment_raw(&root).is_empty(),
+            "{:?}",
+            DocumentCursor::foot_comment_raw(&root)
+        );
     }
 
     /// `key_raw_source_span`'s non-`String` arm is unreachable via any real
@@ -7149,7 +7157,7 @@ mod tests {
         assert!(root
             .stream_yaml(&mut out, IndentSpec::COMPACT, false)
             .is_ok());
-        assert!(!out.is_empty());
+        assert!(!out.is_empty(), "{out:?}");
     }
 
     /// #1615 converted every arm of `stream_json_as_yaml` to `StreamResult`,

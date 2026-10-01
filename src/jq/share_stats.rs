@@ -249,12 +249,16 @@ mod tests {
         assert!(text.contains("share_stats.rs:"), "{text}");
         assert!(text.trim_start().starts_with('2'), "{text}");
         reset();
-        assert!(report().is_empty());
+        assert!(report().is_empty(), "{:?}", report());
     }
 
     #[test]
     fn exit_report_names_every_kind_and_is_empty_when_clean() {
-        assert!(exit_report(&BTreeMap::new()).is_empty());
+        assert!(
+            exit_report(&BTreeMap::new()).is_empty(),
+            "{:?}",
+            exit_report(&BTreeMap::new())
+        );
         let mut events = BTreeMap::new();
         for (i, kind) in [
             Kind::ArrayMakeMut,

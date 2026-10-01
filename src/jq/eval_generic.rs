@@ -35911,9 +35911,9 @@ mod tests {
             .collect();
         assert_eq!(collected[0].len(), 3); // Many -> 3 elements
         assert_eq!(collected[1], vec![OwnedValue::Int(9)]); // ManyOwned
-        assert!(collected[2].is_empty()); // None
-        assert!(collected[3].is_empty()); // Error
-        assert!(collected[4].is_empty()); // Break
+        assert!(collected[2].is_empty(), "{:?}", collected[2]); // None
+        assert!(collected[3].is_empty(), "{:?}", collected[3]); // Error
+        assert!(collected[4].is_empty(), "{:?}", collected[4]); // Break
         assert_eq!(collected[5], vec![OwnedValue::Bool(true)]); // Owned
 
         // Unlike `into_owned`, this keeps the prefix — #400/#494's whole point.

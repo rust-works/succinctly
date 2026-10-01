@@ -3303,8 +3303,8 @@ mod tests {
         let prog = Program::from_expr(Expr::identity());
         assert_eq!(prog.expr, Expr::Identity);
         assert!(prog.module.is_none());
-        assert!(prog.imports.is_empty());
-        assert!(prog.includes.is_empty());
+        assert!(prog.imports.is_empty(), "{:?}", prog.imports);
+        assert!(prog.includes.is_empty(), "{:?}", prog.includes);
     }
 
     /// #1371: `BoundBody` is derived state, so it must not participate in

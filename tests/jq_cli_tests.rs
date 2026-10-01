@@ -6537,7 +6537,7 @@ fn test_first_limit_echo_a_decode_failure_value_like_navigation_2103() -> Result
     // blanket "never validate a value" one.
     let (out, _err, code) = run_jq_full(&["-c", "map(.x)"], Some(doc))?;
     assert_eq!(code, 5, "map(.x) must still raise: out {out:?}");
-    assert!(out.is_empty());
+    assert!(out.is_empty(), "{out:?}");
 
     // The invalid-escape value variant echoes raw the same way.
     let (out, err, code) = run_jq_full(&["-c", "first(map(.x) | .[])"], Some(r#"[{"x":"a\q"}]"#))?;
@@ -12129,7 +12129,7 @@ fn test_reduce_foreach_input_error_mid_stream_path_context_1765() -> Result<()> 
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert!(stdout.trim().is_empty());
+    assert!(stdout.trim().is_empty(), "{:?}", stdout.trim());
 
     // `foreach` streams outputs one at a time (no atomic array wrapper
     // here, unlike `[foreach ...]`), so `key`'s two resolved outputs print
@@ -12275,7 +12275,7 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
         Some(r#"{"a":[1,2]}"#),
     )?;
     assert_eq!(code, 5);
-    assert!(stdout.is_empty());
+    assert!(stdout.is_empty(), "{stdout:?}");
     assert!(stderr.contains("boom"));
 
     // Same shape with `halt` instead of `error` -- exercises
@@ -12304,26 +12304,26 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
     // `accumulate_path_context_step` at all for this pipe.
     let (stdout, _, code) = run_jq_full(&["-c", ".a | first(empty) | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    assert!(stdout.trim().is_empty());
+    assert!(stdout.trim().is_empty(), "{:?}", stdout.trim());
 
     let (stdout, stderr, code) = run_jq_full(
         &["-c", ".a | first(error(\"x\")) | key"],
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 5);
-    assert!(stdout.is_empty());
+    assert!(stdout.is_empty(), "{stdout:?}");
     assert!(stderr.contains('x'));
 
     let (stdout, _, code) = run_jq_full(&["-c", ".a | first(halt) | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    assert!(stdout.trim().is_empty());
+    assert!(stdout.trim().is_empty(), "{:?}", stdout.trim());
 
     let (stdout, _, code) = run_jq_full(
         &["-c", "label $out | (.a | first(break $out) | key)"],
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 0);
-    assert!(stdout.trim().is_empty());
+    assert!(stdout.trim().is_empty(), "{:?}", stdout.trim());
 
     // `Partial` with an *empty* prefix (the very first comma branch is
     // what terminates, before any output was ever collected) -- `first`
@@ -12334,7 +12334,7 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 5);
-    assert!(stdout.is_empty());
+    assert!(stdout.is_empty(), "{stdout:?}");
     assert!(stderr.contains('x'));
 
     // Same bare-terminator cases for `last`.
@@ -12349,19 +12349,19 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-c", ".a | last(error(\"x\")) | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 5);
-    assert!(stdout.is_empty());
+    assert!(stdout.is_empty(), "{stdout:?}");
     assert!(stderr.contains('x'));
 
     let (stdout, _, code) = run_jq_full(&["-c", ".a | last(halt) | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    assert!(stdout.trim().is_empty());
+    assert!(stdout.trim().is_empty(), "{:?}", stdout.trim());
 
     let (stdout, _, code) = run_jq_full(
         &["-c", "label $out | (.a | last(break $out) | key)"],
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 0);
-    assert!(stdout.trim().is_empty());
+    assert!(stdout.trim().is_empty(), "{:?}", stdout.trim());
 
     // The common case (no path-context builtin in the body) is unaffected.
     let (stdout, _, code) = run_jq_full(&["-c", "[first(.[])]"], Some(r"[1,2,3]"))?;
@@ -12438,14 +12438,14 @@ fn test_literal_slice_path_context_resolves_2215() -> Result<()> {
     // isn't a divergence of its own.
     let (stdout, stderr, code) = run_jq_full(&["-c", ".a | .[0:3] | path"], Some(r#"{"a":5}"#))?;
     assert_eq!(code, 5);
-    assert!(stdout.is_empty());
+    assert!(stdout.is_empty(), "{stdout:?}");
     assert!(stderr.contains("Cannot index number with object"));
 
     // `?` on the slice itself suppresses that error into no output, not a
     // stubbed path.
     let (stdout, _, code) = run_jq_full(&["-c", ".a | .[0:3]? | path"], Some(r#"{"a":5}"#))?;
     assert_eq!(code, 0);
-    assert!(stdout.trim().is_empty());
+    assert!(stdout.trim().is_empty(), "{:?}", stdout.trim());
 
     Ok(())
 }
@@ -19643,7 +19643,7 @@ fn test_resolve_slice_expr_target_escape_does_not_panic_on_empty_later_ends_2245
         Some("[10,20,30]"),
     )?;
     assert_eq!(code, 0);
-    assert!(stdout.trim().is_empty());
+    assert!(stdout.trim().is_empty(), "{:?}", stdout.trim());
 
     Ok(())
 }
@@ -29227,7 +29227,7 @@ fn test_module_cycle_reached_through_discovery_pass_still_detected_2950() -> Res
         &["-nc", r#"include "ca"; x"#],
     )?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(stdout.is_empty());
+    assert!(stdout.is_empty(), "{stdout:?}");
     assert!(
         stderr.contains("module cycle detected"),
         "stderr: {stderr:?}"
@@ -76511,7 +76511,7 @@ fn test_repeated_postfix_optional_matches_jq_3273() -> Result<()> {
 
     let (stdout, stderr, code) = run_jq_full(&["-c", "path(1 | .a? | empty)"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
-    assert!(stdout.is_empty());
+    assert!(stdout.is_empty(), "{stdout:?}");
     Ok(())
 }
 
@@ -76839,7 +76839,7 @@ fn test_unknown_format_name_grammar_matches_jq_cli_3357() -> Result<()> {
     // there's no token there at all, unlike an unrecognized-but-present name.
     let (stdout, _stderr, code) = run_jq_full(&["-c", "@"], Some("1"))?;
     assert_eq!(code, 3);
-    assert!(stdout.is_empty());
+    assert!(stdout.is_empty(), "{stdout:?}");
 
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .args(["yq", "-c", "@"])

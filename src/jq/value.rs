@@ -5866,7 +5866,7 @@ mod tests {
 
         let (inline, recorded) = share_stats::measure(|| SharableString::from("a").into_string());
         assert_eq!(inline, "a");
-        assert!(recorded.is_empty());
+        assert!(recorded.is_empty(), "{recorded:?}");
 
         let mut s = SharableString::from("b");
         s.promote();
@@ -6390,7 +6390,7 @@ mod tests {
             OwnedValue::Int(1),
         )])]);
         let (mut copy, recorded) = share_stats::measure(|| original.clone());
-        assert!(recorded.is_empty());
+        assert!(recorded.is_empty(), "{recorded:?}");
         let items = as_array_vec(&copy);
         assert!(!items.is_shared());
         let ((), recorded) = share_stats::measure(|| {
