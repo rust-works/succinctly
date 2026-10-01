@@ -56,10 +56,12 @@ impl JqCommand {
     /// of the most recent `--args`/`--jsonargs`. This walks each captured list
     /// in order applying exactly that, and a `--` ends the mode switches.
     ///
-    /// Only words clap already captured are resequenced. An option-shaped
-    /// word among them (`--args '$ARGS.positional' -c a`) is never taken as
-    /// the program, as in jq, but is not applied as the flag either: it stays
-    /// a positional word, as it did before this change (#3447).
+    /// Only words clap already captured are resequenced. By the time clap
+    /// sees argv, `hoist_options_before_positional_flags` (`main.rs`) has
+    /// moved every option after the first `--args`/`--jsonargs` in front of
+    /// it (#3447), so the words captured here are positional by jq's rule;
+    /// an option-shaped word can still arrive (clap parsing without that
+    /// hoist, as the unit tests below do), and is never taken as the program.
     fn resolve_positional_args(&mut self) {
         // (starts in `--jsonargs` mode, the words clap captured under it)
         let captured = [
@@ -4854,11 +4856,10 @@ fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
 
 /// Get input files from arguments.
 fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
-    // With --args or --jsonargs, files are not used (they would have been consumed)
-    if args.positional_mode {
-        return vec![];
-    }
-
+    // `--args`/`--jsonargs` take every word after them, so `files` holds only
+    // the words *before* the flag, which jq still reads as input files
+    // (`jq . data.json --args a`, #3447). The words after it are in
+    // `positional_words`, never here.
     // When -f is used, the 'filter' field becomes the first input file
     // because the filter comes from a file instead of command line
     let mut files: Vec<std::path::PathBuf> = Vec::new();
@@ -9534,9 +9535,10 @@ mod tests {
             assert_eq!(words, vec![s("a"), s("b")]);
         }
 
-        /// jq's program is the first *non-option* word. An option-shaped
-        /// word is not applied as a flag here (#3447) but must not become the
-        /// program either; a `-7`-style word is not option-shaped.
+        /// jq's program is the first *non-option* word. Applying an option
+        /// is the hoist's job (#3447), not this resolver's, but an
+        /// option-shaped word that reaches it must not become the program
+        /// either; a `-7`-style word is not option-shaped.
         #[test]
         fn an_option_shaped_word_is_never_taken_as_the_filter() {
             let (filter, _) = resolved(&["jq", "--args", "-c", ".x", "a"]);
