@@ -2369,10 +2369,24 @@ a duplicate-capable object exists ([#1344](https://github.com/rust-works/succinc
 `from_entries` sees an ordinary repeated key and no fallback flag survives to catch it. `-i`
 refuses these (its `validate_yaml_display_keys` pre-walk stays for exactly this case). And the
 `load()` builtin's own YAML-mapping conversion is tracked separately in
-[#1753](https://github.com/rust-works/succinctly/issues/1753). Merge keys (`<<`) collapse a
-merged-in complex key with a local one by their shared `""` spelling inside merge resolution
-itself, before any map is built, so even `.b.z = 1` drops an entry
-([#3467](https://github.com/rust-works/succinctly/issues/3467)).
+[#1753](https://github.com/rust-works/succinctly/issues/1753).
+
+**Merge keys (`<<`) keep a merged-in complex key beside a local one
+([#3467](https://github.com/rust-works/succinctly/issues/3467)).** Merge resolution overrides
+by key spelling, and a complex key is spelled `""`, so a merged-in `? [1]` and a local `? [2]`
+(or a genuine `"": z`, or two merge sources) used to collapse into one entry before any map was
+built, and even `.b.z = 1` dropped the merged one. A fallback spelling is never a duplicate
+there now, so the merged mapping keeps both and behaves like the plain collision above: the
+streaming routes show both under `""`, and every materializing route (including a write
+elsewhere in the document, `.a.k = 1`, which materializes `b` too) raises the same
+`object key "" is ambiguous` error. Ordinary keys and a genuine `""` key still override by
+name. One edge changed with it: two *identical* complex keys, a merged-in `? [1]` and a local
+`? [1]`, used to resolve to the local one (the YAML override rule) and now both stay and the
+materializing routes refuse, because a complex key has no spelling to compare. That is the
+refusing side of [ADR-0018](../../adrs/adr-0018.md)'s rule 4; comparing the keys structurally
+would remove it. How yq's key-list builtins treat a merge key at all (`keys`, `length`,
+`has`) is a separate gap, tracked in
+[#3556](https://github.com/rust-works/succinctly/issues/3556).
 
 **`-i` refuses a file holding a complex key
 ([#3463](https://github.com/rust-works/succinctly/issues/3463)).** Every `-i` route wrote a
