@@ -81630,3 +81630,221 @@ fn test_comma_head_pipe_array_multi_stage_tail_3476() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3464: a position minted inside a resolver keeps the spelling of the step
+/// that reached it (`.b?`, `.[-1]`, `.[1.0]`), and `Frame::names` compared
+/// those spellings, so two routes to one node refused. jq's `jv_identical`
+/// sees the node, not the spelling. Every value is from jq 1.7.1 with `-c`.
+#[test]
+fn test_resolver_frame_position_is_spelling_insensitive_3464() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"x":[1,1]}"#;
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"path(.a.b as $y | .a | .b? | $y)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[1] as $y | .x[-1] | $y)",
+            "[\"x\",-1]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[1] as $y | .x[1.0] | $y)",
+            "[\"x\",1.0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[1] as $y | .x[1.7] | $y)",
+            "[\"x\",1.7]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[1] as $y | .x[-1]? | $y)",
+            "[\"x\",-1]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[-1] as $y | .x[1] | $y)",
+            "[\"x\",1]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[1] as $y | .x | .[1]? | $y)",
+            "[\"x\",1]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[1] as $y | .x[-1] | . as $z | $y)",
+            "[\"x\",-1]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[1] as $y | .x[-1.5] | $y)",
+            "[\"x\",-1.5]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[-1:] as $y | .x[1:] | $y)",
+            "[\"x\",{\"start\":1,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[0:] as $y | .x[-2:] | $y)",
+            "[\"x\",{\"start\":-2,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[1:] as $y | .x[1.5:] | $y)",
+            "[\"x\",{\"start\":1.5,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[0:1] as $y | .x[-2:-1] | $y)",
+            "[\"x\",{\"start\":-2,\"end\":-1}]\n",
+            "",
+            0,
+        ),
+        // A fractional bound keeps its spelling in the path and names the range it rounds to.
+        (
+            r#"{"y":[1,2,3]}"#,
+            r"path(.y[0:2] as $y | .y[0:1.5] | $y)",
+            "[\"y\",{\"start\":0,\"end\":1.5}]\n",
+            "",
+            0,
+        ),
+        // Below a slice, the elements are the array's own, however each side spells them.
+        (
+            r#"{"z":[[1,1],[1,1]]}"#,
+            r"path(.z[0:1][0][1] as $y | .z[-2:-1][0][-1] | $y)",
+            "[\"z\",{\"start\":-2,\"end\":-1},0,-1]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"z":[[1,1],[1,1]]}"#,
+            r"path(.z[1:][0] as $y | .z | .[-1:][-1] | $y)",
+            "[\"z\",{\"start\":-1,\"end\":null},-1]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"z":[[1,1],[1,1]]}"#,
+            r"del(.z[0:1][0][1] as $y | .z[-2:-1][0][-1] | $y)",
+            "{\"z\":[[1],[1,1]]}\n",
+            "",
+            0,
+        ),
+        // The write entry points take the same positions.
+        (
+            doc,
+            r"del(.x[1] as $y | .x[-1] | $y)",
+            "{\"a\":{\"b\":1},\"x\":[1]}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(.a.b as $y | .a | .b? | $y)",
+            "{\"a\":{},\"x\":[1,1]}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r".x[1] as $y | (.x[-1] | $y) |= 5",
+            "{\"a\":{\"b\":1},\"x\":[1,5]}\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3464: the same rows' other-node twins must keep refusing -- folding
+/// spellings together may only ever name one node, never a neighbour of it
+/// with an equal value.
+#[test]
+fn test_resolver_frame_position_spelling_controls_refuse_3464() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"x":[1,1]}"#;
+    let refused = "Invalid path expression";
+    assert_path_rows_3289(&[
+        (doc, r"path(.x[1] as $y | .x[-2] | $y)", "", refused, 5),
+        (doc, r"path(.x[1] as $y | .x[0] | $y)", "", refused, 5),
+        (doc, r"path(.a.b as $y | .a | .c? | $y)", "", refused, 5),
+        (doc, r"del(.x[1] as $y | .x[-2] | $y)", "", refused, 5),
+        // A fractional end that rounds to a wider range is another slice.
+        (
+            r#"{"y":[1,2,3]}"#,
+            r"path(.y[0:1] as $y | .y[0:1.5] | $y)",
+            "",
+            refused,
+            5,
+        ),
+        // Below a slice, a different element is still a different node.
+        (
+            r#"{"z":[[1,1],[1,1]]}"#,
+            r"path(.z[0:1][0][1] as $y | .z[-2:-1][0][0] | $y)",
+            "",
+            refused,
+            5,
+        ),
+        // An empty slice range, and a different range, are not the same slice.
+        (doc, r"path(.x[5:] as $y | .x[6:] | $y)", "", refused, 5),
+        (doc, r"path(.x[1:] as $y | .x[0:] | $y)", "", refused, 5),
+        // Already agreeing today; a spelling fold must not disturb them.
+        (
+            doc,
+            r#"path(.a.b as $y | .a | .["b"] | $y)"#,
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[-1] as $y | .x[-1] | $y)",
+            "[\"x\",-1]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.x[1:] as $y | .x[1:] | $y)",
+            "[\"x\",{\"start\":1,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        // A null compares by value, so an out-of-range index still answers.
+        (
+            doc,
+            r"path(.x[5] as $y | .x[-5]? | $y)",
+            "[\"x\",-5]\n",
+            "",
+            0,
+        ),
+    ])
+}
