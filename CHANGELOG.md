@@ -422,6 +422,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: bare `first` and `last` are path steps** (#3545). jq defines `first` as
+  `.[0]` and `last` as `.[-1]`, so `[1,2] | path(first)` is `[0]`, and
+  `(.a | first) = 9`, `(.a | last) |= .+1`, `del(.a | first)` and `pick(.a | last)`
+  write through them. They raised `Invalid path expression with result 1`, and on a
+  `null` input `path(first)` answered `[]` and `first = 9` wrote `9` where jq
+  writes `[9]`. `[] | last = 9` raises `Out of bounds negative array index` as in
+  jq. `first(f)`, `last(f)` and `.[0]` already worked, and `succinctly yq` is
+  unchanged: real yq has no bare `first` or `last`.
+
 - **jq: `getpath` reads an array segment on an array as jq's subarray search**
   (#2429, part of #3506). `[10,20] | getpath([[0],[1]])` is `[]` and
   `[1,2,1,2] | getpath([[1,2]])` is `[0,2]`, where it raised `Cannot index array
