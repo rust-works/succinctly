@@ -1421,6 +1421,33 @@ otherwise-verified fix (which is strictly more correct than what it replaced: it
 real regression at `-I=4` introduced mid-fix and two cases pre-#1485 `main` never got right
 at all, `-I=5`/`-I=6`).
 
+### Bare `first` as a path step — sequences, scalars and `null` agree; a mapping's key and a comma over `null` do not (#3551)
+
+Real yq's bare `first` is a path step at the head of an expression (v4.53.3): on a sequence it
+addresses element 0, so `first = 9`, `first |= 5`, `first += 1` and `del(first)` on `[1,2]` are
+`[9,2]`, `[5,2]`, `[2,2]` and `[2]`. On an empty sequence, a scalar and `null` it addresses
+nothing, and every write and delete leaves the document untouched. `succinctly yq` matches all
+of that. It used to drop the write silently on a sequence (`first = 9` stayed `[1,2]`, exit 0)
+and raise on `del(first)`.
+
+Two shapes still differ:
+
+- **On a mapping, `first` names the first *key***, and assigning through it renames that key:
+  `first = 9` on `{a: 1, b: 2}` is `{"9":1,"b":2}`, `first += 1` is `{"a1":1,"b":2}`, and
+  `del(first)` is `{"b":2}`. There is no path component for a key rename here, so every write and
+  delete through bare `first` on a mapping is refused (`bare first on a mapping names its first
+  key; writing through it (renaming the key) is not supported`) rather than dropped. Reading
+  `first` on a mapping is also still `Cannot index object with number`, where yq answers the key.
+- **A comma over `null` or an empty sequence**: `(first, .[1]) = 7` on `null` or `[]` is
+  `[7,7]` in yq, because the sibling path creates the sequence `first` then lands on; here it is
+  `[null,7]`.
+
+Not changed here: real yq reads bare `first` only at the head of an expression (`.a | first` is
+`'|' expects 2 args but there is 1`), where `succinctly yq` applies it after a pipe as it does in
+jq mode. Whether bare and argument `last`, which real yq's lexer rejects, should be gated behind
+`--jq-extensions` is a separate decision, because existing tests pin it ungated by design
+(#1521); it is tracked in #3560.
+
 ### `input`, `inputs`, `input_line_number` — resolved as a call target, matching real yq's lexer
 
 Real yq has no such builtins at any arity — its lexer rejects the identifiers exactly as it

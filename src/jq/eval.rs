@@ -36031,6 +36031,39 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             });
             resolve_node_sink::<S>(&component, value, trackable, snapshot, frame, keep, sink)
         }
+        // #3551 (yq mode): real yq's bare `first` is a path step at the head of
+        // an expression, so `first = 9`, `first |= 5`, `first += 1` and
+        // `del(first)` act on what it names (yq v4.53.3, input `[1,2]`:
+        // `[9,2]`, `[5,2]`, `[2,2]`, `[2]`). On a sequence that is element 0, so
+        // it re-dispatches as the index step like jq's `.[0]` above. On a
+        // *mapping* it names the first key, and assigning through it renames
+        // that key (`first = 9` on `{a: 1}` is `{"9":1}`): a write this
+        // evaluator has no path component for, so it is refused. A value with
+        // no first element -- an empty sequence, a scalar, `null` -- names no
+        // path at all, and real yq leaves the document untouched there for
+        // every write and delete, which is exactly a path step that resolves
+        // to nothing. The eager fallback below reported the element's *value*
+        // as an untracked result instead: `first = 9` silently left `[1,2]`
+        // unchanged (exit 0) and `del(first)` raised.
+        Expr::Builtin(Builtin::First) if S::TAG == EvalTag::Yq => match value {
+            OwnedValue::Array(items) if !items.is_empty() => resolve_node_sink::<S>(
+                &Expr::index(0),
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                sink,
+            ),
+            OwnedValue::Object(_) => ResolveFlow::Escaped(
+                EvalError::new(
+                    "bare `first` on a mapping names its first key; writing through it \
+                     (renaming the key) is not supported",
+                )
+                .into(),
+            ),
+            _ => ResolveFlow::Exhausted,
+        },
         // #3550: jq defines the one-argument `nth($n)` as `.[$n]`
         // (`def nth($n): .[$n];`), so in a path it extends it by that
         // component exactly as bare `first`/`last` do above. `$n` is a value

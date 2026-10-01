@@ -50218,3 +50218,85 @@ fn test_yq_negative_zero_document_and_literal_arithmetic_3445() -> Result<()> {
     }
     Ok(())
 }
+
+/// Real yq's bare `first` is a path step at the head of an expression: on a
+/// sequence it addresses element 0, and on a value with no first element (an
+/// empty sequence, a scalar, `null`) it addresses nothing, so every write and
+/// delete leaves the document untouched (#3551). `succinctly yq` used to drop
+/// the write on a sequence silently (`first = 9` on `[1,2]` stayed `[1,2]`,
+/// exit 0) and raise on `del(first)`. Every row was captured from Homebrew `yq`
+/// v4.53.3.
+#[test]
+fn test_bare_first_is_a_path_step_in_yq_3551() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[1,2]", "first = 9", "[9,2]"),
+        ("[1,2]", "first |= 5", "[5,2]"),
+        ("[1,2]", "first += 1", "[2,2]"),
+        ("[1,2]", "(first) = 9", "[9,2]"),
+        ("[1,2]", "del(first)", "[2]"),
+        ("[1,2]", "first = (1,2)", "[2,2]"),
+        ("[1,2,3]", "first = 9", "[9,2,3]"),
+        ("[1,2,3]", "first |= 5", "[5,2,3]"),
+        ("[1,2,3]", "first += 1", "[2,2,3]"),
+        ("[1,2,3]", "(first) = 9", "[9,2,3]"),
+        ("[1,2,3]", "del(first)", "[2,3]"),
+        ("[1,2,3]", "first = (1,2)", "[2,2,3]"),
+        ("5", "first = 9", "5"),
+        ("5", "first |= 5", "5"),
+        ("5", "first += 1", "5"),
+        ("5", "(first) = 9", "5"),
+        ("5", "del(first)", "5"),
+        ("5", "first = (1,2)", "5"),
+        ("null", "first = 9", "null"),
+        ("null", "first |= 5", "null"),
+        ("null", "first += 1", "null"),
+        ("null", "(first) = 9", "null"),
+        ("null", "del(first)", "null"),
+        ("null", "first = (1,2)", "null"),
+        ("[]", "first = 9", "[]"),
+        ("[]", "first |= 5", "[]"),
+        ("[]", "first += 1", "[]"),
+        ("[]", "(first) = 9", "[]"),
+        ("[]", "del(first)", "[]"),
+        ("[]", "first = (1,2)", "[]"),
+        ("\"s\"", "first = 9", "\"s\""),
+        ("\"s\"", "first |= 5", "\"s\""),
+        ("\"s\"", "first += 1", "\"s\""),
+        ("\"s\"", "(first) = 9", "\"s\""),
+        ("\"s\"", "del(first)", "\"s\""),
+        ("\"s\"", "first = (1,2)", "\"s\""),
+        ("[[1],2]", "first = 9", "[9,2]"),
+        ("[[1],2]", "first |= 5", "[5,2]"),
+        ("[[1],2]", "first += 1", "[[1,1],2]"),
+        ("[[1],2]", "(first) = 9", "[9,2]"),
+        ("[[1],2]", "del(first)", "[2]"),
+        ("[[1],2]", "first = (1,2)", "[2,2]"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "#3551: `{filter}` on {input}: {out:?}");
+        assert_eq!(out.trim_end(), expected, "#3551: `{filter}` on {input}");
+    }
+    Ok(())
+}
+
+/// On a mapping real yq's `first` names the first *key*, and assigning through
+/// it renames that key (`first = 9` on `{a: 1}` is `{"9":1}`). There is no path
+/// component for a key rename here, so the write is refused loudly rather than
+/// dropped; recorded in `docs/compliance/yq/limitations.md` (#3551).
+#[test]
+fn test_bare_first_on_a_mapping_is_refused_in_yq_3551() -> Result<()> {
+    for filter in ["first = 9", "first |= 5", "first += 1", "del(first)"] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "a: 1\nb: 2\n", &["-o=json", "-I=0"])?;
+        assert_ne!(code, 0, "#3551: `{filter}` on a mapping: {stdout:?}");
+        assert!(
+            stdout.is_empty(),
+            "#3551: `{filter}` on a mapping: {stdout:?}"
+        );
+        assert!(
+            stderr.contains("names its first key"),
+            "#3551: `{filter}` on a mapping: {stderr:?}"
+        );
+    }
+    Ok(())
+}

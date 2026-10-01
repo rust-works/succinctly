@@ -452,6 +452,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexer error), which is tracked in #3551. Bare `nth(n)` is the same gap and is
   fixed in the entry below (#3550).
 
+- **yq: bare `first` writes where real yq's does** (#3551). `first = 9`, `first |= 5`,
+  `first += 1` and `del(first)` on `[1,2]` are `[9,2]`, `[5,2]`, `[2,2]` and `[2]` as in yq
+  v4.53.3; `first = 9` used to leave `[1,2]` unchanged (exit 0) and `del(first)` raised. On an
+  empty sequence, a scalar and `null` there is no first element, so a write or delete leaves the
+  document untouched, as in yq. On a mapping yq's `first` names the first key and a write renames
+  it, which has no path component here, so it is now refused with an error instead of dropped;
+  see `docs/compliance/yq/limitations.md`.
+
 - **jq: bare `nth(n)` is a path step** (#3550). jq defines the one-argument `nth($n)` as
   `.[$n]`, so `[1,2,3] | path(nth(1))` is `[1]`, and `nth(1) = 9`, `nth(1) |= .+1`,
   `del(nth(1))` and `pick(nth(1))` write through it, as do a generator (`[path(nth(0,2))]` is
