@@ -23861,6 +23861,186 @@ fn test_getpath_resolves_through_an_alias_2168() -> Result<()> {
     Ok(())
 }
 
+/// #2639: `getpath`'s cursor walk decides a node's nullness by its explicit
+/// YAML tag, not by its text, in both directions.
+///
+/// `!!null foo` is null although its text is not, so every deeper segment
+/// reads `null` (jq: `null | getpath(["a","b"])` is `null`); `!!str null` is
+/// a string although its text spells null, so indexing it is a type error
+/// (jq: `"s" | getpath(["a","b"])` raises `Cannot index string with string`).
+/// Before the fix the walk tested the untagged text and got both backwards --
+/// the first raised a self-contradictory `Cannot index null`, the second
+/// answered `null` -- while `type` on the same node named the tag.
+///
+/// `getpath` is behind `--jq-extensions` in yq mode (#1512), so there is no
+/// yq oracle; what is pinned is jq's own model.
+#[test]
+fn test_getpath_cursor_walk_is_tag_aware_2639() -> Result<()> {
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+
+    for (doc, filter, want) in [
+        // `!!null` on non-null text: null at any depth.
+        ("a: !!null foo\n", r#"getpath(["a","b"])"#, "null"),
+        ("a: !!null foo\n", r#"getpath(["a",0])"#, "null"),
+        ("a: !!null foo\n", r#"getpath(["a","b","c"])"#, "null"),
+        // The landing node itself, which was already right: pinned so a
+        // later change to the null test cannot flip it.
+        ("a: !!null foo\n", r#"getpath(["a"])"#, "null"),
+        ("a: !!str null\n", r#"getpath(["a"])"#, r#""null""#),
+        // Per segment, not just the first: the tagged node is the second one
+        // the loop looks at, after the root mapping.
+        ("o:\n  a: !!null foo\n", r#"getpath(["o","a","b"])"#, "null"),
+        // Through an alias: the tag lives on the anchor (#903).
+        ("x: &n !!null foo\ny: *n\n", r#"getpath(["y","b"])"#, "null"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(code, 0, "{doc:?} {filter}: {out:?}");
+        assert_eq!(out.trim(), want, "{doc:?} {filter}");
+    }
+
+    for (doc, filter, want) in [
+        // `!!str` on text that spells null: a string, so a type error.
+        (
+            "a: !!str null\n",
+            r#"getpath(["a","b"])"#,
+            r#"Cannot index string with string "b""#,
+        ),
+        (
+            "a: !!str ~\n",
+            r#"getpath(["a","b"])"#,
+            r#"Cannot index string with string "b""#,
+        ),
+        (
+            "a: !!str null\n",
+            r#"getpath(["a",0])"#,
+            "Cannot index string with number",
+        ),
+        (
+            "o:\n  a: !!str null\n",
+            r#"getpath(["o","a","b"])"#,
+            r#"Cannot index string with string "b""#,
+        ),
+        (
+            "x: &s !!str null\ny: *s\n",
+            r#"getpath(["y","b"])"#,
+            r#"Cannot index string with string "b""#,
+        ),
+    ] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
+        assert_eq!(code, 1, "{doc:?} {filter}: stderr {stderr}");
+        assert!(stderr.contains(want), "{doc:?} {filter}: {stderr}");
+    }
+
+    Ok(())
+}
+
+/// #2639: `getpath(P)` agrees with the same read taken on a value that has
+/// **no cursor**, for every tagged and untagged scalar -- the two routes
+/// disagreeing on one document is what made the defect findable.
+///
+/// The control routes must genuinely drop the cursor. `. * {}` and
+/// `map_values(.)` do; `[.] | .[0]` no longer does (the root cursor survives
+/// that round trip), so it would compare the walk with itself and pass
+/// against the unfixed code. Stdout, stderr and the exit code are all
+/// compared, so a flip in either direction -- a value where the control
+/// raises, or a raise where it answers -- fails.
+#[test]
+fn test_getpath_cursor_walk_agrees_with_cursorless_route_2639() -> Result<()> {
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+    let scalars = [
+        "!!null foo",
+        "!!null \"\"",
+        "!!str null",
+        "!!str ~",
+        "!!int 5",
+        "!!bool yes",
+        "!!float 1",
+        // Untagged controls, whose text decides.
+        "null",
+        "~",
+        "foo",
+        "5",
+    ];
+    let paths = [
+        r#"["a"]"#,
+        r#"["a","b"]"#,
+        r#"["a",0]"#,
+        r#"["a","b","c"]"#,
+        // A slice descriptor is the one segment the walk hands to the owned
+        // table: `null` slices to `null`, a string slices as a string.
+        r#"["a",{"start":0,"end":1}]"#,
+    ];
+
+    for scalar in scalars {
+        let doc = format!("a: {scalar}\n");
+        for path in paths {
+            let direct = format!("getpath({path})");
+            let want = run_yq_stdin_with_stderr(&direct, &doc, &args)?;
+            for control in [
+                format!(". * {{}} | getpath({path})"),
+                format!("map_values(.) | getpath({path})"),
+            ] {
+                let got = run_yq_stdin_with_stderr(&control, &doc, &args)?;
+                assert_eq!(
+                    want, got,
+                    "{doc:?} {direct} (cursor walk) vs {control} (no cursor)"
+                );
+            }
+        }
+    }
+
+    // Nested one level down, so the tagged node is not the first one walked.
+    for scalar in ["!!null foo", "!!str null"] {
+        let doc = format!("o:\n  a: {scalar}\n");
+        let direct = r#"getpath(["o","a","b"])"#;
+        let want = run_yq_stdin_with_stderr(direct, &doc, &args)?;
+        let control = r#"{"w": .} | getpath(["w","o","a","b"])"#;
+        let got = run_yq_stdin_with_stderr(control, &doc, &args)?;
+        assert_eq!(want, got, "{doc:?} {direct} vs {control}");
+    }
+
+    Ok(())
+}
+
+/// #2639: the fix does not widen into containers or change an untagged
+/// scalar -- a tag on a mapping or sequence, and plain `null`/`~`/text, keep
+/// answering exactly as before.
+#[test]
+fn test_getpath_tag_aware_null_leaves_containers_and_untagged_alone_2639() -> Result<()> {
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+
+    for (doc, filter, want) in [
+        ("a: null\n", r#"getpath(["a","b"])"#, "null"),
+        ("a: ~\n", r#"getpath(["a","b"])"#, "null"),
+        ("a:\n", r#"getpath(["a","b"])"#, "null"),
+        ("a: !!str\n  k: 1\n", r#"getpath(["a","k"])"#, "1"),
+        ("a: !!int\n  - 7\n", r#"getpath(["a",0])"#, "7"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(code, 0, "{doc:?} {filter}: {out:?}");
+        assert_eq!(out.trim(), want, "{doc:?} {filter}");
+    }
+
+    for (doc, filter, want) in [
+        (
+            "a: foo\n",
+            r#"getpath(["a","b"])"#,
+            r#"Cannot index string with string "b""#,
+        ),
+        (
+            "a: !!int 5\n",
+            r#"getpath(["a","b"])"#,
+            r#"Cannot index number with string "b""#,
+        ),
+    ] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
+        assert_eq!(code, 1, "{doc:?} {filter}: stderr {stderr}");
+        assert!(stderr.contains(want), "{doc:?} {filter}: {stderr}");
+    }
+
+    Ok(())
+}
+
 /// #2168 coverage, yq mode: the two arms that only a value with **no cursor**
 /// reaches.
 ///

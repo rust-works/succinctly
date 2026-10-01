@@ -1385,6 +1385,27 @@ fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &
         .map_or_else(|| value.type_name(), crate::yaml::ResolvedScalar::type_name)
 }
 
+/// Whether the node at `cursor` is null, an applicable explicit YAML tag
+/// deciding before the text does (`!!null foo` is null, `!!str null` is not
+/// -- #2639). A bare `value.is_null()` is not tag-aware (a `YamlValue` has no
+/// `bp_pos` to look a tag up with, only the cursor does), so a caller that
+/// holds a cursor and branches on nullness must come through here, the same
+/// way [`tagged_type_name`] is the one place `type` and every type-mismatch
+/// error name get their tag. A tag [`crate::yaml::resolve_tagged`] does not
+/// model (`!!map`, `!!seq`, a custom `!foo`) falls back to the untagged test.
+fn tagged_is_null<V: DocumentValue>(value: &V, cursor: &V::Cursor) -> bool {
+    cursor
+        .explicit_tag()
+        .and_then(|tag| {
+            let text = value.as_str()?;
+            crate::yaml::resolve_tagged(&text, tag)
+        })
+        .map_or_else(
+            || value.is_null(),
+            |resolved| resolved == crate::yaml::ResolvedScalar::Null,
+        )
+}
+
 /// The **untagged** YAML type tag (`!!str`, `!!int`, `!!map`, ...) for a
 /// value with no explicit tag of its own -- i.e. what real yq's implicit
 /// resolution rules would assign it. `as_i64`/`as_f64` already distinguish
@@ -20947,17 +20968,6 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
     for (i, segment) in segments.iter().enumerate() {
         let v = c.value();
 
-        // jq: `null | getpath(["a"])` is `null`, and so is every deeper
-        // segment past it -- the owned table's own first arm, which also
-        // absorbs the "key not found" and "index out of range" exits below
-        // by walking on from a `null`.
-        //
-        // The exceptions are a null, boolean or array segment (jq mode), which
-        // `null` cannot be indexed by (#2429).
-        if v.is_null() {
-            return getpath_null_tail::<S, V>(&segments[i..], optional);
-        }
-
         // Dispatch on the segment's own kind before touching `v` at all,
         // rather than trying every accessor and letting the pattern/filter
         // discard the ones that don't apply: `is_null`/`as_object`/
@@ -21121,6 +21131,27 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                 );
             }
             _ => {}
+        }
+
+        // jq: `null | getpath(["a"])` is `null`, and so is every deeper
+        // segment past it -- the owned table's own first arm, which also
+        // absorbs the "key not found" and "index out of range" exits above
+        // by walking on from a `null`.
+        //
+        // Tested here, after the container arms, and not up front (#2639): a
+        // container is never null, so a segment that found the object or
+        // array it needs has already answered, and only a node that is
+        // neither reaches this check. That keeps the tag lookup -- an
+        // `explicit_tag` re-resolves the cursor's value and probes the tag
+        // map -- off every step through a container, which measured +76% on a
+        // 300-deep path when it ran per segment. The tag decides, not the
+        // text: `!!null foo` is null here and `!!str null` is not, the same
+        // answer `type` and the cursor-less route give.
+        //
+        // The exceptions are a null, boolean or array segment (jq mode), which
+        // `null` cannot be indexed by (#2429).
+        if tagged_is_null(&v, &c) {
+            return getpath_null_tail::<S, V>(&segments[i..], optional);
         }
 
         // Everything else -- including a segment kind above whose accessor
@@ -42657,6 +42688,75 @@ mod tests {
                 GenericResult::None => {}
                 other => panic!("[{label}] expected suppression at optional=true, got: {other:?}"),
             }
+        }
+    }
+
+    /// #2639: `tagged_is_null` lets an explicit YAML tag decide before the
+    /// text does, in both directions, and falls back to the untagged test for
+    /// a node with no tag (and for a JSON cursor, which never has one).
+    ///
+    /// Driven through `getpath_walk_cursor` so the walk's own use of it is
+    /// covered by the lib build too, not only by the CLI integration tests.
+    #[test]
+    fn test_tagged_is_null_and_getpath_walk_2639() {
+        use crate::json::JsonIndex;
+        use crate::yaml::YamlIndex;
+
+        type Yaml<'a> = crate::yaml::YamlValue<'a, Vec<u64>>;
+
+        let path = |segments: &[&str]| {
+            OwnedValue::Array(
+                segments
+                    .iter()
+                    .map(|s| OwnedValue::String((*s).into()))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        };
+
+        // (document, is the `a` node null?)
+        for (yaml, is_null) in [
+            (&b"a: !!null foo\n"[..], true),
+            (&b"a: !!str null\n"[..], false),
+            (&b"a: !!str ~\n"[..], false),
+            // Untagged: the text decides, as before.
+            (&b"a: null\n"[..], true),
+            (&b"a: ~\n"[..], true),
+            (&b"a: foo\n"[..], false),
+            // A tag `resolve_tagged` does not model falls back to the text.
+            (&b"a: !custom null\n"[..], true),
+        ] {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml).first_child().expect("document content");
+
+            let GenericResult::OneCursor(node) =
+                getpath_walk_cursor::<JqSemantics, Yaml<'_>>(root, &path(&["a"]), false)
+            else {
+                panic!("{yaml:?}: `getpath([\"a\"])` should land on the node");
+            };
+            assert_eq!(tagged_is_null(&node.value(), &node), is_null, "{yaml:?}");
+
+            // Past the node: null at any depth when it is null, a type error
+            // when it is not.
+            match getpath_walk_cursor::<JqSemantics, Yaml<'_>>(root, &path(&["a", "b"]), false) {
+                GenericResult::Owned(OwnedValue::Null) => assert!(is_null, "{yaml:?}"),
+                GenericResult::Error(_) => assert!(!is_null, "{yaml:?}"),
+                other => panic!("{yaml:?}: unexpected `getpath([\"a\",\"b\"])`: {other:?}"),
+            }
+        }
+
+        // JSON has no tags: the helper is the plain null test.
+        let json: &[u8] = br#"{"n":null,"s":"x"}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        for (key, is_null) in [("n", true), ("s", false)] {
+            let GenericResult::OneCursor(node) = getpath_walk_cursor::<
+                JqSemantics,
+                crate::json::light::StandardJson<'_, Vec<u64>>,
+            >(root, &path(&[key]), false) else {
+                panic!("`getpath([{key:?}])` should land on the node");
+            };
+            assert_eq!(tagged_is_null(&node.value(), &node), is_null, "{key}");
         }
     }
 

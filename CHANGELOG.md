@@ -422,6 +422,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. The same key on `.[K]`, `indices`, in `path(getpath(...))` and in
   writes is still open under #3506.
 
+- **yq: `getpath` reads an explicitly tagged scalar by its tag, not its text**
+  (#2639). Behind `--jq-extensions`, `getpath(["a","b"])` on `a: !!null foo`
+  raised `Cannot index null with string "b"` where jq's rule is `null` at any
+  depth, and on `a: !!str null` answered `null` where a string must raise
+  `Cannot index string with string "b"`. The cursor walk tested the untagged
+  text for nullness while `type` reported the tag; it now consults the tag first,
+  so `getpath(P)` agrees with the same read on a value that has no cursor
+  (`. * {} | getpath(P)`). JSON and untagged YAML are unchanged.
+
 - **jq: an assignment's right-hand side is lazy, and its target is re-resolved
   per right-hand output** (#3448). `=`, `+=`, `-=`, `*=`, `/=`, `%=` and `//=`
   ran every output of their right side before the first document existed, so
