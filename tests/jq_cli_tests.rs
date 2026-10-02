@@ -28423,8 +28423,9 @@ fn test_data_import_failures_are_reported_around_a_missing_module_3327() -> Resu
 /// The fixtures every #3573 row runs against: `bad` and `bad2` are data files
 /// holding `not json`; `synerr` and `synerr2` are modules that do not parse;
 /// `modbad1`/`modbad2` are modules whose own data imports fail; `modsyn`
-/// includes `synerr`; `modmiss` and `modsyn2` include missing modules; and
-/// `cyc1`/`cyc2` include each other. `m1` and `m2` are absent.
+/// includes `synerr`; `modmiss` and `modsyn2` include missing modules;
+/// `cyc1`/`cyc2` include each other and `self1`/`self2` each include
+/// themselves; `badutf` is not valid UTF-8. `m1` and `m2` are absent.
 fn write_directive_fixtures_3573(dir: &std::path::Path) -> Result<()> {
     for (name, text) in [
         ("bad.json", "not json"),
@@ -28450,9 +28451,17 @@ fn write_directive_fixtures_3573(dir: &std::path::Path) -> Result<()> {
         ),
         ("cyc1.jq", "include \"cyc2\"; def a: 1;\n"),
         ("cyc2.jq", "include \"cyc1\"; def b: 1;\n"),
+        ("self1.jq", "include \"self1\"; def s1: 1;\n"),
+        ("self2.jq", "include \"self2\"; def s2: 1;\n"),
+        (
+            "twoself.jq",
+            "include \"self1\"; include \"self2\"; def t: 1;\n",
+        ),
     ] {
         std::fs::write(dir.join(name), text)?;
     }
+    // A module the reader refuses whatever the platform or the user running it.
+    std::fs::write(dir.join("badutf.jq"), [0xff_u8, 0xfe, b' ', b'1', b'\n'])?;
     Ok(())
 }
 
@@ -28471,8 +28480,13 @@ fn failure_kinds_3573(stderr: &str) -> String {
     let mut kinds = Vec::new();
     for line in stderr.lines() {
         if let Some(rest) = line.strip_prefix("jq: error loading data file ") {
-            let path = rest.split(".json: ").next().unwrap_or(rest);
-            kinds.push(format!("D:{}.json", file_name(path)));
+            // A data file ends `.json`, an unreadable module `.jq`.
+            let end = [".json: ", ".jq: "]
+                .iter()
+                .filter_map(|ext| rest.find(ext).map(|at| at + ext.len() - 2))
+                .min()
+                .unwrap_or(rest.len());
+            kinds.push(format!("D:{}", file_name(&rest[..end])));
         } else if let Some(module) = line.strip_prefix("jq: error: module not found: ") {
             kinds.push(format!("M:{module}"));
         } else if line.starts_with("jq: error: module cycle detected: ") {
@@ -28628,6 +28642,8 @@ fn test_directive_failures_are_reported_in_jqs_walk_order_3573() -> Result<()> {
                 r#"include "modbad1"; include "modbad2"; 1"#,
                 "D:bad2.json D:bad.json D:bad.json T:3",
             ),
+            // an unreadable module behind a missing one is never reached, as in jq
+            (r#"include "badutf"; include "m1"; 1"#, "M:m1 T:1"),
             // a module whose own include has a syntax error
             (r#"include "modsyn"; 1"#, "S:synerr.jq T:1"),
             (r#"import "modsyn" as m; 1"#, "S:synerr.jq T:1"),
@@ -28718,6 +28734,109 @@ fn test_a_module_cycle_ends_the_walk_after_what_jq_printed_first_3573() -> Resul
         ],
         3,
     )
+}
+
+/// #3573: a module that exists but cannot be read is counted like a data file
+/// that did not load, and jq's walk goes on past it: `include "m1"; include
+/// "perm"` with `perm.jq` unreadable prints `error loading data file ...
+/// perm.jq`, then `module not found: m1`, `1 compile error`. It used to stop the
+/// whole report with a bare `module error`, and to hide a later-declared missing
+/// module jq reports (`include "perm"; include "m1"`). Every expectation but
+/// the invalid-UTF-8 rows' kind was captured from `/usr/bin/jq` 1.7.1: jq
+/// parses a module's raw bytes, so there `badutf.jq` is a syntax error (`S`),
+/// where succinctly's reader refuses it (`D`); the count and the walk are
+/// jq's. The permission rows need a user the permission bits bind, so they are
+/// skipped where `chmod 000` still reads (root).
+#[test]
+fn test_an_unreadable_module_is_counted_and_the_walk_goes_on_3573() -> Result<()> {
+    assert_directive_rows_3573(
+        &[
+            (r#"include "badutf"; 1"#, "D:badutf.jq T:1"),
+            (
+                r#"include "m1"; include "badutf"; 1"#,
+                "D:badutf.jq M:m1 T:1",
+            ),
+            (
+                r#"include "badutf"; import "bad" as $d; $d"#,
+                "D:bad.json D:badutf.jq T:2",
+            ),
+        ],
+        3,
+    )?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir()?;
+        write_directive_fixtures_3573(temp_dir.path())?;
+        let perm = temp_dir.path().join("perm.jq");
+        std::fs::write(&perm, "def p: 1;\n")?;
+        std::fs::set_permissions(&perm, std::fs::Permissions::from_mode(0o000))?;
+        if std::fs::read_to_string(&perm).is_ok() {
+            eprintln!("skipped: chmod 000 does not bind this user");
+            return Ok(());
+        }
+        for (filter, expected) in [
+            (r#"include "perm"; 1"#, "D:perm.jq T:1"),
+            (r#"include "m1"; include "perm"; 1"#, "D:perm.jq M:m1 T:1"),
+            (r#"include "perm"; include "m1"; 1"#, "M:m1 T:1"),
+            (
+                r#"import "bad" as $d; include "perm"; $d"#,
+                "D:perm.jq D:bad.json T:2",
+            ),
+        ] {
+            let (output, code) = spawn_with_signal_retry(
+                || {
+                    let mut command = Command::new(succinctly_bin());
+                    command
+                        .args(["jq", "-L"])
+                        .arg(temp_dir.path())
+                        .args(["-nc", filter]);
+                    command
+                },
+                None,
+            )?;
+            let stderr = String::from_utf8(output.stderr)?;
+            assert_eq!(code, 3, "{filter}: stderr {stderr:?}");
+            assert_eq!(
+                failure_kinds_3573(&stderr),
+                expected,
+                "{filter}: stderr {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3573: which cycle is named follows jq's walk order, last-declared first.
+/// `twoself.jq` includes two modules that each include themselves; jq would
+/// recurse into the *last-declared* one first, so that is the cycle reported
+/// (`self2 -> self2`). The loader's own first-declared order used to name
+/// `self1 -> self1`. jq crashes on a cycle, so this is the walk's order
+/// applied, not a captured answer; the chain text is pinned so the choice is
+/// deliberate.
+#[test]
+fn test_the_cycle_named_is_the_first_in_jqs_walk_order_3573() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    write_directive_fixtures_3573(temp_dir.path())?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "twoself"; 1"#]);
+            command
+        },
+        None,
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr {stderr:?}");
+    assert_eq!(
+        stderr,
+        "jq: error: module cycle detected: self2 -> self2\n\njq: 1 compile error\n"
+    );
+    Ok(())
 }
 
 /// #2857 guard: the error-selection refactor must not change what happens when

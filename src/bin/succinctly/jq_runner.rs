@@ -211,42 +211,37 @@ enum ModuleReach {
 /// A [`ModuleLoader`] failure, structured enough to report in jq's own
 /// per-case shape (#2703) -- unlike a flattened `anyhow::Error`, which loses
 /// the distinction [`report_module_load_error`] needs.
+///
+/// One or more `include`/`import` directives that could not be honoured, in
+/// the order jq prints them, with the trailer's count (#3573).
+///
+/// A single failure reaches the loader's callers as a one-entry report (see
+/// [`Self::single`]); the two entry points that report to the user
+/// ([`ModuleLoader::unqualified_def_names`] and
+/// [`ModuleLoader::process_program`]) replace it with the whole program's
+/// report, because jq prints every failure its walk reaches and the loader
+/// stops at the first (see [`ModuleLoader::failure_report`]).
 #[derive(Debug)]
-pub(crate) enum ModuleLoadError {
-    /// One or more `include`/`import` directives could not be honoured, in the
-    /// order jq prints them, with the trailer's count (#3573).
-    ///
-    /// A single failure reaches the loader's callers as a one-entry report
-    /// (see [`Self::single`]); the two entry points that report to the user
-    /// ([`ModuleLoader::unqualified_def_names`] and
-    /// [`ModuleLoader::process_program`]) replace it with the whole program's
-    /// report, because jq prints every failure its walk reaches and the loader
-    /// stops at the first (see [`ModuleLoader::failure_report`]).
-    Report {
-        entries: Vec<ReportEntry>,
-        /// The trailer's `N compile errors`. Not always `entries.len()`: a
-        /// missing module returns `1` for the level it stops, discarding what
-        /// that level had counted, and the level that loaded a module adds
-        /// that `1` to its own count.
-        errors: usize,
-    },
-    /// The module could not be read (as opposed to parsed). A *parse*
-    /// failure is [`ReportEntry::Syntax`]; this is the residue of the
-    /// pre-#2703 opaque `anyhow::Error`.
-    Other(anyhow::Error),
+pub(crate) struct ModuleLoadError {
+    entries: Vec<ReportEntry>,
+    /// The trailer's `N compile errors`. Not always `entries.len()`: a missing
+    /// module returns `1` for the level it stops, discarding what that level
+    /// had counted, and the level that loaded a module adds that `1` to its
+    /// own count.
+    errors: usize,
 }
 
 impl ModuleLoadError {
     /// A single directive failure, counted once.
     fn single(entry: ReportEntry) -> Self {
-        Self::Report {
+        Self {
             entries: vec![entry],
             errors: 1,
         }
     }
 }
 
-/// One failure in jq's compile-error report ([`ModuleLoadError::Report`]).
+/// One failure in jq's compile-error report ([`ModuleLoadError`]).
 #[derive(Debug)]
 pub(crate) enum ReportEntry {
     /// No `{module_path}.jq` (or, for a data import, `.json`) was found
@@ -289,7 +284,14 @@ pub(crate) enum ReportEntry {
         contents: String,
         error: jq::ParseError,
     },
-    /// A data import's file exists but could not be read or parsed (#2956).
+    /// A data import's file exists but could not be read or parsed (#2956),
+    /// or a module's file exists but could not be read (#3573): jq loads a
+    /// module through the same reader, so an unreadable module is printed
+    /// `error loading data file <path>: ...` and counted, and the walk goes on
+    /// (`include "m1"; include "perm"` prints `perm`, then `m1`). jq parses the
+    /// module's raw bytes, so a module with invalid UTF-8 is a syntax error
+    /// there, where succinctly's reader refuses it here, a difference of kind
+    /// that keeps the count.
     ///
     /// **Wording is succinctly's own** past the `error loading data file
     /// {path}:` prefix, the same fidelity limit [`Self::Syntax`] already
@@ -393,12 +395,6 @@ fn print_position_error(
     eprintln!("{line_text}{}", " ".repeat(column));
 }
 
-impl From<anyhow::Error> for ModuleLoadError {
-    fn from(e: anyhow::Error) -> Self {
-        Self::Other(e)
-    }
-}
-
 /// Print one [`ReportEntry`] the way jq prints it (#2703, #2956, #3573).
 fn print_report_entry(entry: &ReportEntry) {
     match entry {
@@ -440,20 +436,14 @@ fn print_report_entry(entry: &ReportEntry) {
 /// can't drift between them the way the two `eprintln!("jq: module error:
 /// {e}")` sites used to have to be kept in step by hand.
 fn report_module_load_error(e: &ModuleLoadError) {
-    match e {
-        ModuleLoadError::Report { entries, errors } => {
-            for entry in entries {
-                print_report_entry(entry);
-            }
-            eprintln!(
-                "jq: {errors} compile error{}",
-                if *errors == 1 { "" } else { "s" }
-            );
-        }
-        ModuleLoadError::Other(inner) => {
-            eprintln!("jq: module error: {inner}");
-        }
+    for entry in &e.entries {
+        print_report_entry(entry);
     }
+    eprintln!(
+        "jq: {} compile error{}",
+        e.errors,
+        if e.errors == 1 { "" } else { "s" }
+    );
 }
 
 /// A [`build_context`] (or [`get_filter`]) failure that jq treats as a
@@ -978,9 +968,7 @@ impl FailureWalk<'_> {
     /// jq's `process_dependencies` for one level: the failures reported and
     /// the count this level returns, `directives` already in walk order.
     ///
-    /// `Err` is a module that exists but cannot be read, which is the loader's
-    /// own error and not a directive's.
-    fn directives(&mut self, directives: &[Directive<'_>]) -> anyhow::Result<usize> {
+    fn directives(&mut self, directives: &[Directive<'_>]) -> usize {
         let mut errors = 0;
         for directive in directives {
             let resolved = if directive.data {
@@ -994,7 +982,7 @@ impl FailureWalk<'_> {
                 self.entries.push(ReportEntry::NotFound {
                     module_path: directive.path.to_string(),
                 });
-                return Ok(1);
+                return 1;
             };
             if directive.data {
                 // Counted, and never deduplicated: the same file imported
@@ -1005,17 +993,17 @@ impl FailureWalk<'_> {
                 }
                 continue;
             }
-            errors += self.module(directive.path, &resolved)?;
+            errors += self.module(directive.path, &resolved);
             if self.halted {
-                return Ok(1);
+                return 1;
             }
         }
-        Ok(errors)
+        errors
     }
 
     /// jq's `load_library` for one module: what it adds to its includer's
     /// count.
-    fn module(&mut self, as_written: &str, file: &Path) -> anyhow::Result<usize> {
+    fn module(&mut self, as_written: &str, file: &Path) -> usize {
         let canonical = canonical_or_self(file);
         if let Some(at) = self.chain.iter().position(|(seen, _)| *seen == canonical) {
             // From the repeat, as the loader names it (see
@@ -1027,33 +1015,48 @@ impl FailureWalk<'_> {
             chain.push(as_written.to_string());
             self.entries.push(ReportEntry::Cycle { chain });
             self.halted = true;
-            return Ok(1);
+            return 1;
         }
         if self.visited.contains(&canonical) {
-            return Ok(0);
+            return 0;
         }
-        let contents = std::fs::read_to_string(file)
-            .with_context(|| format!("failed to read module: {}", file.display()))?;
-        let errors = match jq::parse_program(&contents) {
+        let errors = match std::fs::read_to_string(file) {
+            // An unreadable module is counted like a data file that did not
+            // load, and the walk goes on (see [`ReportEntry::Data`]).
+            Err(e) => {
+                self.entries.push(ReportEntry::Data(DataFileFailure {
+                    path: canonical.clone(),
+                    detail: strerror_only(&e),
+                }));
+                1
+            }
+            Ok(contents) => self.parsed_module(as_written, &canonical, contents),
+        };
+        self.visited.insert(canonical);
+        errors
+    }
+
+    /// [`Self::module`] for a module whose text was read.
+    fn parsed_module(&mut self, as_written: &str, canonical: &Path, contents: String) -> usize {
+        match jq::parse_program(&contents) {
             // A module that does not parse counts once, and its own directives
             // are never reached.
             Err(error) => {
                 self.entries.push(ReportEntry::Syntax {
-                    path: canonical.clone(),
+                    path: canonical.to_path_buf(),
                     contents,
                     error,
                 });
                 1
             }
             Ok(program) => {
-                self.chain.push((canonical.clone(), as_written.to_string()));
+                self.chain
+                    .push((canonical.to_path_buf(), as_written.to_string()));
                 let errors = self.directives(&directives_of(&program));
                 self.chain.pop();
-                errors?
+                errors
             }
-        };
-        self.visited.insert(canonical);
-        Ok(errors)
+        }
     }
 }
 
@@ -1271,8 +1274,12 @@ impl ModuleLoader {
         }
 
         // Read and parse the module
-        let contents = std::fs::read_to_string(&file_path)
-            .with_context(|| format!("failed to read module: {}", file_path.display()))?;
+        let contents = std::fs::read_to_string(&file_path).map_err(|e| {
+            ModuleLoadError::single(ReportEntry::Data(DataFileFailure {
+                path: canonical.clone(),
+                detail: strerror_only(&e),
+            }))
+        })?;
 
         let program = jq::parse_program(&contents).map_err(|e| {
             ModuleLoadError::single(ReportEntry::Syntax {
@@ -1687,14 +1694,13 @@ impl ModuleLoader {
     ///   `include` of it, or a second path to it, prints nothing and counts
     ///   nothing.
     ///
+    /// - a module that exists but cannot be read is printed as `error loading
+    ///   data file` and counted, and the walk goes on, as for a data file.
+    ///
     /// A module cycle is #2865's divergence (jq runs out of stack). It ends the
     /// walk the way a missing module does, after what jq printed before it
-    /// died. The one failure that is not a directive's -- a module that cannot
-    /// be read -- is the loader's own error, unchanged.
+    /// died: the first cycle in jq's own walk order, last-declared first.
     fn failure_report(&self, program: &Program, first: ModuleLoadError) -> ModuleLoadError {
-        let ModuleLoadError::Report { .. } = first else {
-            return first;
-        };
         let mut walk = FailureWalk {
             search_path: &self.search_path,
             visited: BTreeSet::new(),
@@ -1702,12 +1708,17 @@ impl ModuleLoader {
             entries: Vec::new(),
             halted: false,
         };
-        match walk.directives(&directives_of(program)) {
-            Ok(errors) => ModuleLoadError::Report {
-                entries: walk.entries,
-                errors,
-            },
-            Err(unreadable) => ModuleLoadError::Other(unreadable),
+        let errors = walk.directives(&directives_of(program));
+        // The walk repeats the loader's resolution, parse and cycle checks, so
+        // a directive the loader failed on is one it fails on too. If the two
+        // ever drift apart, the loader's own report is the one to print: an
+        // empty one would read `jq: 0 compile errors` with no message.
+        if walk.entries.is_empty() {
+            return first; // omni-dev: coverage tolerate-line reason="unreachable while the walk and the loader agree on what fails: both resolve with resolve_module_in/resolve_data_file_in, parse with parse_program and name a cycle by canonical file, which the fuzz in #3573 held over thousands of programs; kept so drift prints the loader's failure and not `0 compile errors`"
+        }
+        ModuleLoadError {
+            entries: walk.entries,
+            errors,
         }
     }
 
