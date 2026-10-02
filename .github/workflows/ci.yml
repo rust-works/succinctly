@@ -900,6 +900,30 @@ jobs:
         with:
           fetch-depth: 0            # full history for git merge-base (PR fork point)
 
+      # #3585: from ~03:20 UTC on 2026-10-02 `Coverage (x86_64)` died on every PR
+      # after 30-31 minutes with `No space left on device` raised by the runner
+      # worker's own log file, no test failing, while `Coverage (ARM64)` (a
+      # different image) passed on the same commits. The instrumented build plus
+      # a profile file per spawned test process leaves little headroom on the
+      # hosted `ubuntu-latest` disk, so reclaim the multi-GB toolchains this job
+      # never uses (the Rust toolchain lives under the runner's home and is
+      # untouched) before the action starts. x86_64 only: ARM64 passes without it.
+      - name: Reclaim disk space (x86_64)
+        if: matrix.name == 'x86_64'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift
+          df -h /
+
+      # Sample the free space every 20 s so a passing run says how close it came.
+      # A failing run cannot report (the runner dies writing its own log), which
+      # is why the headroom above is printed *before* the action starts.
+      - name: Sample free disk space
+        run: |
+          samples="$RUNNER_TEMP/df-avail-kb"
+          nohup bash -c "while :; do df --output=avail -k / | tail -1 >> '$samples'; sleep 20; done" >/dev/null 2>&1 &
+
       - uses: action-works/omni-dev-coverage-check@v1
         with:
           # Pin; we're a consumer. Must stay >= 0.38.0: that release added the
@@ -933,6 +957,14 @@ jobs:
           baseline-artifact-name: coverage-baseline-${{ matrix.name }}
           artifact-name: coverage-summary-${{ matrix.name }}
           comment-header: coverage-${{ matrix.name }}
+
+      - name: Report disk headroom
+        if: always()
+        run: |
+          df -h /
+          if [ -s "$RUNNER_TEMP/df-avail-kb" ]; then
+            echo "lowest free space sampled: $(sort -n "$RUNNER_TEMP/df-avail-kb" | head -1 | awk '{printf "%.1f GiB", $1/1048576}')"
+          fi
 
   # Drift detector for the yq golden fixtures (tests/data/yq-golden/): the
   # goldens are frozen oracle output, so this is the one job that re-checks
