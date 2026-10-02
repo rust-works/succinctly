@@ -39223,6 +39223,12 @@ fn untracked_branches<'a, S: EvalSemantics>(
 /// ([`PathBranch::passthrough`]). Every other node in either walk is reached
 /// by genuine descent (structural, or through `f`), which breaks the mark
 /// regardless of ambient — only this one root entry is built this way.
+///
+/// **It is always the first branch a recursion delivers** (#3272):
+/// `resolve_seq_stage` keeps jq's path register across that one output
+/// ([`recurse_seed_keeps_register`]) and not past it, so a producer that
+/// emitted anything ahead of the seed would carry the register onto a
+/// navigated value. Keep the seed first in every walk that calls this.
 fn recurse_family_root_seed<'a>(
     value: &'a OwnedValue,
     trackable: bool,
@@ -40231,6 +40237,76 @@ fn getpath_preserves_register<S: EvalSemantics>(
         || branch_snapshot
             .position()
             .is_some_and(|(invocation, path)| !stage_frame.names(invocation, path))
+}
+
+/// [`getpath_preserves_register`]'s sibling for the recurse family (#3272):
+/// whether the **first** output of a recursion stage entering on an
+/// already-untracked branch leaves jq's register where it was.
+///
+/// The answer is per *output*, not per expression, so it cannot live in
+/// [`cannot_move_register`]. jq defines every spelling as `def r: ., (f | r);
+/// r;`, and the `.` is emitted down the first `FORK` branch before anything
+/// indexes -- the register is untouched for that one output. Every later output
+/// comes through `f`, which navigates, and that is where jq's own refusal
+/// happens. Confirmed live against jq 1.7.1 on `{"a":{"b":{"b":null}},"c":2}`:
+///
+/// ```console
+/// $ jq -c 'path(. as $x | 1 | .. | $x)'
+/// []                     # the seed re-establishes the register ...
+/// jq: error: Invalid path expression near attempt to iterate through 1
+///                        # ... and only the *next* output raises
+/// $ jq -c 'path(. as $x | 1 | try recurse(.a) | $x)'
+/// []                     # a caught later navigation is invisible
+/// ```
+///
+/// Dropping the register for the whole stage refused the `$x` at the seed
+/// with a guessed "with result" error before the recursion's own navigation
+/// error was ever reached, so a `try`/`?` around the recursion could not
+/// answer where jq does.
+///
+/// True only when all of these hold, each load-bearing:
+///
+/// - **jq mode.** yq keeps its eager recurse guard (#843); its lexer rejects
+///   `recurse(f)`, so there is no oracle for the deferred shape, and its
+///   scalar-write no-op convention would turn a wrong acceptance into silent
+///   corruption instead of a loud error (the reason
+///   [`trackable_step_register_eligible`] gives).
+/// - **An untracked branch.** A trackable one is its own register, so there
+///   is nothing to carry.
+/// - **The element is a recurse-family node**, seen through `Paren`,
+///   `Shared`, `Optional` and `try` (with or without a handler -- the handler
+///   only ever runs *after* the seed). Not through `Pipe`, `Comma`, `If` or a
+///   call (`first(..)`, `limit(n; ..)`): their first output is not provably
+///   the seed, and naming a call's body is what [`cannot_move_register`]
+///   refuses to do. Those stay refuse-only.
+///
+/// The caller consumes this on the **first** step the stage delivers only.
+/// That step is always the seed: `resolve_node_sink`'s jq untracked arm,
+/// [`resolve_recursive_descent_sink`] and [`resolve_recurse_sink`] all emit
+/// [`recurse_family_root_seed`] before anything else.
+fn recurse_seed_keeps_register<S: EvalSemantics>(element: &Expr, branch_trackable: bool) -> bool {
+    if S::TAG != EvalTag::Jq || branch_trackable {
+        return false;
+    }
+    let mut peeled = element;
+    loop {
+        match peeled {
+            Expr::Paren(inner) | Expr::Optional(inner) => peeled = inner,
+            Expr::Shared(inner) => peeled = inner.expr(),
+            Expr::Try { expr, .. } => peeled = expr,
+            _ => break,
+        }
+    }
+    matches!(
+        peeled,
+        Expr::RecursiveDescent
+            | Expr::Builtin(
+                Builtin::Recurse
+                    | Builtin::RecurseDown
+                    | Builtin::RecurseF(_)
+                    | Builtin::RecurseCond(_, _)
+            )
+    )
 }
 
 /// Whether `expr` can produce more than one output -- a syntactic
@@ -47550,6 +47626,10 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // only when its input *is* the register), so the static predicate is
     // joined by [`getpath_preserves_register`] and this is computed after
     // the branch is in hand rather than from `element` alone.
+    //
+    // #3272: the recurse family is per-*output*, which is finer still: only
+    // its first output (the seed) leaves the register alone, so that is
+    // answered inside `place_step` by `seed_pending` below, not here.
     // #3289: when `and`/`or`/unary minus resolve their operands live
     // ([`and_or_negate_resolves_live`]), each result sits at the register its
     // own branch left ([`register_after`]), path components included, so the
@@ -47599,9 +47679,15 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // stands, at `prefix + components`; with none in hand the rule below is
     // unchanged and a nested route cannot have re-established anything.
     let step_may_reestablish = stage_frame.register().is_some();
+    // #3272: a recursion stage's *first* output is its own seed -- `.`, no
+    // navigation -- which leaves jq's register where it was, whatever the later
+    // outputs do ([`recurse_seed_keeps_register`]). Consumed by the first step
+    // delivered, so only the seed can use it.
+    let mut seed_pending = recurse_seed_keeps_register::<S>(element, branch_trackable);
     let mut place_step = |step: PathBranch<'a>| -> Demand {
         // #3293: only a `?//` retry re-invokes this after a stop.
         downstream.begin();
+        let first_step = core::mem::take(&mut seed_pending);
         let PathBranch {
             path: components,
             value: resulting,
@@ -47609,6 +47695,16 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             snapshot: step_snapshot,
             register: step_register,
         } = step;
+        // The tripwire for the first-output invariant
+        // ([`recurse_family_root_seed`]): a recursion that delivered something
+        // before its seed would have this exemption carry the register onto a
+        // navigated value. Release builds stay safe on the same check: a step
+        // that navigated is never the seed.
+        debug_assert!(
+            !first_step || components.depth() == 0,
+            "a recurse-family stage's first delivered step navigated (#3272)"
+        );
+        let seed = first_step && components.depth() == 0;
         // #3456: what the step's producer says the register is after its
         // leaf ran -- `Unmoved` only when the leaf provably left it alone, a
         // lost state when it may not have.
@@ -47636,7 +47732,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // part) and is the only rule that reaches a register carried on an
         // untracked entry, which no leaf producer sees. A lost state
         // (`LostAt`, `LostSomewhere`) vouches for nothing.
-        let register_entering = if !stage_preserves_register {
+        let register_entering = if !(stage_preserves_register || seed) {
             None
         } else if trackable_step_eligible {
             step_register.unmoved_value()
@@ -109394,6 +109490,120 @@ mod tests {
         assert_eq!(
             outputs(br#"{"a":1}"#, r"del(.a as $z | .a | 1 | getpath([]) | $z)"),
             ["{}"]
+        );
+    }
+
+    // =========================================================================
+    // #3272: a recursion's first output is its seed -- `.`, no navigation -- so
+    // jq's path register is untouched for that one output and a later `$x`
+    // frozen from it re-establishes; only the *next* output navigates and
+    // raises. Every expectation is confirmed live against jq 1.7.1.
+    // =========================================================================
+
+    /// The predicate's truth table: jq mode, an untracked branch, and a
+    /// recurse-family node seen through the wrappers that cannot put an output
+    /// ahead of its seed. A call, a fork or a nested pipe is not provably the
+    /// seed and stays refuse-only.
+    #[test]
+    fn test_recurse_seed_keeps_register_predicate_3272() {
+        let jq = |filter: &str| {
+            recurse_seed_keeps_register::<JqSemantics>(&parse(filter).unwrap(), false)
+        };
+        for filter in [
+            "..",
+            "recurse",
+            "recurse_down",
+            "recurse(.a)",
+            "recurse(.a; . != null)",
+            "(..)",
+            "..?",
+            "(recurse(.a))?",
+            "try ..",
+            "try .. catch 7",
+            "try (try recurse(.a))",
+        ] {
+            assert!(jq(filter), "{filter}");
+        }
+        for filter in [
+            "first(..)",
+            "limit(2; ..)",
+            "(.., 1)",
+            ".. | .",
+            "(.. | select(true))",
+            "if true then .. else 1 end",
+            "[..]",
+            ".. // 3",
+            "recurse(.a) | .",
+            "1",
+            ".a",
+            "empty",
+        ] {
+            assert!(!jq(filter), "{filter}");
+        }
+        // A closure parameter is as transparent as a paren (#3149).
+        let shared = |filter: &str| Expr::Shared(Rc::new(SharedArg::new(parse(filter).unwrap())));
+        assert!(recurse_seed_keeps_register::<JqSemantics>(
+            &shared(".."),
+            false
+        ));
+        assert!(!recurse_seed_keeps_register::<JqSemantics>(
+            &shared("1"),
+            false
+        ));
+        // A trackable branch is its own register, so there is nothing to carry.
+        let recursion = parse("..").unwrap();
+        assert!(!recurse_seed_keeps_register::<JqSemantics>(
+            &recursion, true
+        ));
+        // yq keeps its eager guard: no oracle, and a wrong acceptance there is
+        // a silent write rather than a loud error.
+        assert!(!recurse_seed_keeps_register::<YqSemantics>(
+            &recursion, false
+        ));
+    }
+
+    /// The filed repro, read and write: the seed re-establishes the register,
+    /// so a caught recursion answers where jq does, and an uncaught one raises
+    /// jq's own "near attempt" error *after* emitting the seed's `[]`.
+    #[test]
+    fn test_recurse_seed_re_establishes_register_3272() {
+        let doc = br#"{"a":{"b":{"b":null}},"c":2}"#;
+        assert_eq!(
+            outputs(doc, r"[path(. as $x | 1 | try (.. | $x))]"),
+            ["[[]]"]
+        );
+        assert_eq!(
+            outputs(doc, r"path(. as $x | 1 | try recurse(.a) | $x)"),
+            ["[]"]
+        );
+        assert_eq!(
+            outputs(doc, r"del(. as $x | 1 | try recurse(.a) | $x | .c)"),
+            [r#"{"a":{"b":{"b":null}}}"#]
+        );
+        query!(doc, r"path(. as $x | 1 | .. | $x)",
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix.len(), 1);
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to iterate through 1"
+                );
+            }
+        );
+    }
+
+    /// yq mode is untouched: its lexer rejects `recurse(f)`, there is no oracle
+    /// for the deferred shape, and its scalar-write no-op convention would turn
+    /// a wrong acceptance into silent corruption. The message is `main`'s own,
+    /// captured from the merge-base binary, so this fails if the gate is
+    /// removed.
+    #[test]
+    fn test_yq_mode_recurse_seed_register_unchanged_3272() {
+        yq_query!(
+            br#"{"a":{"b":{"b":null}},"c":2}"#,
+            r"path(. as $x | 1 | .. | $x)",
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "Invalid path expression with result 1");
+            }
         );
     }
 
