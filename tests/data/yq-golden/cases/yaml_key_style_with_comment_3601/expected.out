@@ -1,0 +1,5 @@
+"a": # key comment
+  b: 1
+"1": # on a key with no value
+d: "e" # value comment
+zz: 1

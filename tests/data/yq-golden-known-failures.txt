@@ -35,4 +35,3 @@ path_ctx_path_with_arg      yq_gating      `path(.a)` answers `["a"]` and exits 
 json_string_style_line_break_3587      yaml_output    a JSON string with a line break is written as an escaped double-quoted scalar where yq writes a literal block (`a: |-`), or double-quoted for `\r` and U+0085 and a folded single-quoted scalar for U+2028 — #3587
 json_string_style_line_break_key_3587  yaml_output    a JSON key with a line break is written as an escaped double-quoted key where yq writes `? |-` explicit-key syntax — #3587
 json_merge_key_dom_3600            yaml_output    a JSON object key `<<` is dropped from YAML output on the DOM route (a write, `del`, `sort_keys`, `-P`), where yq keeps it as the string key `"<<": 1` — #3600
-yaml_quoted_keys_dom_write_3601    yaml_output    the DOM route drops the quote style of a YAML-sourced mapping key (`"a": 1` is written `a: 1`, and `"1": 3` becomes the integer key `1: 3`), where yq keeps the key as written — #3601
