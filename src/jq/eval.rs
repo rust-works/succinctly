@@ -35958,6 +35958,16 @@ fn resolve_limit_sink<'a, S: EvalSemantics>(
 /// `n` is the outer loop and `classify_nth_n` is shared with
 /// `builtin_nth_stream`, for the same anti-drift reason
 /// [`resolve_limit_sink`] shares `classify_limit_n`.
+///
+/// **The leaf cap (#3625).** `nth` needs `n + 1` outputs of a single leaf -- the
+/// `n` it drops and the one it delivers -- so the body is resolved with the
+/// caller's cap widened by `n` ([`Keep::widened_by`], as [`resolve_skip_sink`]
+/// does) and then narrowed to exactly `n + 1`. [`Keep::at_most`] alone only
+/// narrows: a `First` cap (and an `AtMost(k)` with `k <= n`) cut a leaf that
+/// makes many values (`nth(1; paths)`, `nth(1; range(3))`) before the delivered
+/// one existed, and jq's `Invalid path expression` for it was swallowed -- a
+/// write through it silently a no-op. The cost is up to `n + 1` leaf outputs
+/// before the first delivery, which is what jq's own `nth` does too.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: `frame` (#2042) joins `trackable`/`snapshot` as the resolver's third threaded ambient
 fn resolve_nth_sink<'a, S: EvalSemantics>(
     n_expr: &Expr,
@@ -35977,13 +35987,17 @@ fn resolve_nth_sink<'a, S: EvalSemantics>(
         };
         let mut skipped = 0usize;
         let mut downstream_stopped = false;
+        // #3625: widened by the `n` it drops, then narrowed to the `n + 1` it
+        // needs of a single leaf -- see the cap paragraph above. `n == 0`
+        // leaves the caller's own cap as it was.
+        let leaf_keep = keep.widened_by(n).at_most(n.saturating_add(1));
         let flow = resolve_node_sink::<S>(
             expr,
             value,
             trackable,
             snapshot,
             frame,
-            keep.at_most(n.saturating_add(1)),
+            leaf_keep,
             &mut |branch| {
                 if skipped < n {
                     skipped += 1;

@@ -84070,6 +84070,173 @@ fn test_nth_laziness_and_error_placement_3610() -> Result<()> {
     Ok(())
 }
 
+/// #3625: `nth(n; f)` over a body that is one leaf making many non-path values
+/// (`paths`, `range(3)`) must raise jq's `Invalid path expression` for the
+/// element it delivers. The resolver cut such a leaf to one output before `nth`
+/// had dropped its first `n`, so the delivered element was never produced:
+/// `[path(nth(1; paths))]` answered `[]` and `del(nth(1; paths))` returned the
+/// document untouched, where the pinned jq 1.7.1 raises. Every row runs on both
+/// routes -- `-n` with the document as a prefix builds an owned value, the
+/// document on stdin keeps the cursor.
+#[test]
+fn test_nth_path_over_a_many_valued_leaf_raises_like_jq_3625() -> Result<()> {
+    let doc = r#"{"a":{"b":[1,2]},"c":3}"#;
+    for (filter, expected_error) in [
+        (
+            "[path(nth(1; paths))]",
+            r#"Invalid path expression with result ["a","b"]"#,
+        ),
+        (
+            "del(nth(1; paths))",
+            r#"Invalid path expression with result ["a","b"]"#,
+        ),
+        (
+            "[path(nth(1; range(3)))]",
+            "Invalid path expression with result 1",
+        ),
+        // a generator index: the first value's prefix is produced, then the second
+        (
+            "[path(nth(1, 0; paths))]",
+            r#"Invalid path expression with result ["a","b"]"#,
+        ),
+        // as a fold source and under the bounded consumers: the caller's own cap
+        // must not cut the leaf either
+        (
+            "reduce path(nth(1; range(3))) as $p (0; . + 1)",
+            "Invalid path expression with result 1",
+        ),
+        (
+            "first(path(nth(1; range(3))))",
+            "Invalid path expression with result 1",
+        ),
+        // `n = 0` drops nothing: the first value is the one delivered
+        (
+            "[path(nth(0; paths))]",
+            r#"Invalid path expression with result ["a"]"#,
+        ),
+        // the write forms and `pick` reach the same resolver through their own caps
+        (
+            "(nth(1; paths)) |= 1",
+            r#"Invalid path expression with result ["a","b"]"#,
+        ),
+        (
+            "(nth(1; range(3))) = 1",
+            "Invalid path expression with result 1",
+        ),
+        (
+            "(nth(1; range(3))) += 1",
+            "Invalid path expression with result 1",
+        ),
+        (
+            "pick(nth(1; paths))",
+            r#"Invalid path expression with result ["a","b"]"#,
+        ),
+        (
+            "del(nth(1; range(3)))",
+            "Invalid path expression with result 1",
+        ),
+    ] {
+        let owned = format!("{doc} | {filter}");
+        for ((stdout, stderr, code), route) in [
+            (run_jq_full(&["-nc", &owned], None)?, "owned"),
+            (run_jq_full(&["-c", filter], Some(doc))?, "cursor"),
+        ] {
+            assert_eq!(
+                (stdout.as_str(), code),
+                ("", 5),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains(expected_error),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+        }
+    }
+    // Where jq does not raise, neither does this: nothing is delivered to be
+    // checked, the body is not pulled past what the consumer needs, and a halt
+    // in the body stops the program at exit 0.
+    for (filter, expected) in [
+        ("[path(nth(1; paths) | empty)]", "[]"),
+        ("[path(nth(5; paths))]", "[]"),
+        // an index past the leaf's end, however large, delivers nothing
+        ("[path(nth(1000000; range(3)))]", "[]"),
+        ("[path(nth(1e19; range(3)))]", "[]"),
+        (r#"first(path(nth(1; .a, .c, error("x"))))"#, r#"["c"]"#),
+        ("reduce path(nth(1; .a, .c)) as $p (0; . + 1)", "1"),
+        (
+            "[path(nth(1; (range(3) | if . == 1 then halt else . end)))]",
+            "",
+        ),
+    ] {
+        let owned = format!("{doc} | {filter}");
+        for ((stdout, stderr, code), route) in [
+            (run_jq_full(&["-nc", &owned], None)?, "owned"),
+            (run_jq_full(&["-c", filter], Some(doc))?, "cursor"),
+        ] {
+            assert_eq!(
+                (stdout.trim_end(), code),
+                (expected, 0),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3625, yq mode: `nth` is not yq syntax (yq v4.53.3's lexer rejects it;
+/// `--jq-extensions` opts into succinctly's jq surface), so there is no yq
+/// oracle for it, and yq mode keeps its own leniency for a non-path value in a
+/// path expression (`path()` and the writes ignore it, `del` raises). What the
+/// index `n` must not change is which of those happens: over a leaf that makes
+/// non-path values it only picks which of them is delivered, so every form
+/// answers for `nth(1; ..)` exactly as it does for `nth(0; ..)` (over a body that
+/// navigates, `n` picks a different element, as it should). `nth(1; ..)` used to cut the leaf
+/// before the delivered value existed, so `del` alone answered differently.
+#[test]
+fn test_nth_index_does_not_change_the_yq_mode_answer_3625() -> Result<()> {
+    let input = "a:\n  b: [1, 2]\nc: 3\n";
+    let run = |filter: &str| -> Result<(String, Option<i32>)> {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        Ok((
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            output.status.code(),
+        ))
+    };
+    for form in [
+        "del(nth(N; range(3)))",
+        "[path(nth(N; range(3)))]",
+        "(nth(N; range(3))) = 1",
+        "(nth(N; range(3))) |= 1",
+    ] {
+        assert_eq!(
+            run(&form.replace('N', "1"))?,
+            run(&form.replace('N', "0"))?,
+            "#3625 (yq): `{form}` must answer alike for n = 1 and n = 0"
+        );
+    }
+    // and `del` does raise there, as it does for `nth(0; ..)` and `limit`
+    let (_, code) = run("del(nth(1; range(3)))")?;
+    assert_ne!(
+        code,
+        Some(0),
+        "#3625 (yq): `del(nth(1; range(3)))` must raise"
+    );
+    Ok(())
+}
+
 /// #3611: `skip(n; f)` as a path expression. The path resolver had an arm for
 /// `limit` and for `nth` and none for `skip`, so its outputs fell to the
 /// value-producing default and `path`, `del`, `=`, `|=`, `+=` and `pick`
