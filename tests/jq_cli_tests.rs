@@ -28304,6 +28304,175 @@ fn test_last_failing_directive_with_successes_before_and_after_2857() -> Result<
     Ok(())
 }
 
+/// #3327: every data import whose file cannot be parsed is reported, in jq's
+/// order. jq walks the directives last-declared first: a data-file failure is
+/// printed and the walk goes on (and counts), a missing module stops it. A data
+/// import declared *before* the stopping directive is therefore never read, and
+/// one declared after it is reported ahead of it, under the module's own
+/// `1 compile error` trailer. Each row is captured from `/usr/bin/jq` 1.7.1;
+/// `bad` and `bad2` hold `not json`, `good` holds `{}`, `m1`/`m2` are absent.
+/// The parse detail after `bad.json: ` is succinctly's own (jq's comes from
+/// its C parser, documented in `limitations.md`), so it is masked.
+#[test]
+fn test_data_import_failures_are_reported_around_a_missing_module_3327() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("bad.json"), "not json")?;
+    std::fs::write(temp_dir.path().join("bad2.json"), "not json")?;
+    std::fs::write(temp_dir.path().join("good.json"), "{}")?;
+    let dir = temp_dir.path().canonicalize()?;
+
+    // Report lines in order: `bad`/`bad2` are data-file failures, `!m1` a
+    // missing module. The trailer is the exact last line.
+    let rows: &[(&str, &[&str], &str)] = &[
+        (
+            r#"include "m1"; import "bad" as $d; $d"#,
+            &["bad", "!m1"],
+            "jq: 1 compile error",
+        ),
+        (
+            r#"import "bad" as $d; include "m1"; $d"#,
+            &["!m1"],
+            "jq: 1 compile error",
+        ),
+        (
+            r#"include "m1"; import "bad" as $d; include "m2"; $d"#,
+            &["!m2"],
+            "jq: 1 compile error",
+        ),
+        (
+            r#"include "m1"; include "m2"; import "bad" as $d; import "bad2" as $e; $d"#,
+            &["bad2", "bad", "!m2"],
+            "jq: 1 compile error",
+        ),
+        (
+            r#"import "bad" as $d; include "m1"; import "bad2" as $e; $d"#,
+            &["bad2", "!m1"],
+            "jq: 1 compile error",
+        ),
+        (
+            r#"import "m1" as $d; import "bad" as $e; $d"#,
+            &["bad", "!m1"],
+            "jq: 1 compile error",
+        ),
+        (
+            r#"import "bad" as $e; import "m1" as $d; $d"#,
+            &["!m1"],
+            "jq: 1 compile error",
+        ),
+        // No module stops the walk: every failure counts.
+        (
+            r#"import "bad" as $d; import "bad2" as $e; $d"#,
+            &["bad2", "bad"],
+            "jq: 2 compile errors",
+        ),
+        (
+            r#"import "bad" as $d; import "bad" as $e; $d"#,
+            &["bad", "bad"],
+            "jq: 2 compile errors",
+        ),
+        (
+            r#"import "bad" as $d; import "good" as $e; $d"#,
+            &["bad"],
+            "jq: 1 compile error",
+        ),
+        (
+            r#"import "good" as $e; import "bad" as $d; $d"#,
+            &["bad"],
+            "jq: 1 compile error",
+        ),
+    ];
+    for (filter, report, trailer) in rows {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command.args(["jq", "-L"]).arg(&dir).args(["-nc", filter]);
+                command
+            },
+            None,
+        )?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(code, 3, "{filter}: stderr {stderr:?}");
+        let masked = stderr
+            .lines()
+            .map(|line| match line.find(".json: ") {
+                Some(at) if line.starts_with("jq: error loading data file ") => {
+                    format!("{}.json: <D>", &line[..at])
+                }
+                _ => line.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut expected = String::new();
+        for entry in *report {
+            match entry.strip_prefix('!') {
+                Some(module) => {
+                    expected.push_str(&format!("jq: error: module not found: {module}\n\n"));
+                }
+                None => expected.push_str(&format!(
+                    "jq: error loading data file {}/{entry}.json: <D>\n\n",
+                    dir.display()
+                )),
+            }
+        }
+        expected.push_str(trailer);
+        assert_eq!(masked, expected, "{filter}: stderr {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #3327 scope guard: a stop that is not a missing module keeps the single
+/// report it had. jq goes on past a module's own syntax error and counts it
+/// (`include "synerr"; import "bad" as $d; $d` prints the data error, then the
+/// syntax error, `2 compile errors`), and its module cycle is #2865's
+/// divergence, so a data import declared after either is not reported yet --
+/// recorded in `limitations.md`, pinned here so it changes on purpose.
+#[test]
+fn test_data_import_failure_after_a_syntax_error_or_cycle_is_not_reported_yet_3327() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("bad.json"), "not json")?;
+    std::fs::write(temp_dir.path().join("synerr.jq"), "def f: 1 +;\n")?;
+    std::fs::write(
+        temp_dir.path().join("cyc1.jq"),
+        "include \"cyc2\"; def a: 1;\n",
+    )?;
+    std::fs::write(
+        temp_dir.path().join("cyc2.jq"),
+        "include \"cyc1\"; def b: 1;\n",
+    )?;
+
+    for (filter, reported) in [
+        (r#"include "synerr"; import "bad" as $d; $d"#, "synerr.jq"),
+        (
+            r#"include "cyc1"; import "bad" as $d; $d"#,
+            "module cycle detected: cyc1 -> cyc2 -> cyc1",
+        ),
+    ] {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command
+                    .args(["jq", "-L"])
+                    .arg(temp_dir.path())
+                    .args(["-nc", filter]);
+                command
+            },
+            None,
+        )?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(code, 3, "{filter}: stderr {stderr:?}");
+        assert!(stderr.contains(reported), "{filter}: stderr {stderr:?}");
+        assert!(
+            !stderr.contains("error loading data file"),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert!(
+            stderr.ends_with("jq: 1 compile error\n"),
+            "{filter}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2857 guard: the error-selection refactor must not change what happens when
 /// *every* directive resolves -- `process_program`'s wrapping order (last
 /// include innermost, then `~/.jq`, then imports) is load-order-sensitive and
