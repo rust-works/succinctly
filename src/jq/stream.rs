@@ -36,6 +36,10 @@ use super::value::{
     assert_value_tree_depth, format_number_for_preview, format_number_jq_compat,
     infinite_float_preview_text, jq_bare_float_display, NumberRepr, OwnedValue,
 };
+use crate::yaml::encode_style::{
+    go_yaml_string_style, write_go_yaml_double_quoted, write_go_yaml_single_quoted,
+    EncodedStringStyle,
+};
 use crate::yaml::{format_float_with_fraction, format_float_yq_yaml, format_float_yq_yaml_nested};
 
 /// A value that can be streamed directly to output without intermediate allocation.
@@ -1063,15 +1067,17 @@ fn compact_indent(indent: &str) -> String {
 /// Uses double quotes if the string contains special characters,
 /// otherwise outputs unquoted or single-quoted based on content.
 pub fn stream_yaml_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fmt::Result {
-    if s.is_empty() {
-        return out.write_str("''");
-    }
-
-    // Check if we need quoting
-    if needs_yaml_quoting(s) {
-        stream_yaml_double_quoted(out, s)
-    } else {
-        out.write_str(s)
+    // #3588: a computed string has no style of its own, so it is written the way
+    // go-yaml's encoder writes one -- plain, single or double quotes -- which is
+    // not what the heuristic this replaced answered (it wrote a date or a
+    // number-shaped string bare, and chose single or double quotes by another
+    // rule). A string with a line break, which go-yaml writes as a block scalar,
+    // keeps the old text.
+    match go_yaml_string_style(s, false) {
+        Some(EncodedStringStyle::Plain) => out.write_str(s),
+        Some(EncodedStringStyle::SingleQuoted) => write_go_yaml_single_quoted(out, s),
+        Some(EncodedStringStyle::DoubleQuoted) => write_go_yaml_double_quoted(out, s),
+        None => stream_yaml_double_quoted(out, s),
     }
 }
 
@@ -1168,113 +1174,6 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
         }
         Ok(())
     }
-}
-
-/// Check if a string needs quoting in YAML.
-fn needs_yaml_quoting(s: &str) -> bool {
-    if s.is_empty() {
-        return true;
-    }
-
-    let bytes = s.as_bytes();
-
-    // Check first character - indicators that require quoting
-    let first = bytes[0];
-    if matches!(
-        first,
-        b'-' | b'?'
-            | b':'
-            | b','
-            | b'['
-            | b']'
-            | b'{'
-            | b'}'
-            | b'#'
-            | b'&'
-            | b'*'
-            | b'!'
-            | b'|'
-            | b'>'
-            | b'\''
-            | b'"'
-            | b'%'
-            | b'@'
-            | b'`'
-    ) {
-        return true;
-    }
-
-    // Check for leading/trailing whitespace
-    if bytes[0] == b' ' || bytes[bytes.len() - 1] == b' ' {
-        return true;
-    }
-
-    // Check for special values that look like YAML keywords
-    let lower = s.to_lowercase();
-    if matches!(
-        lower.as_str(),
-        "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off" | ".inf" | "-.inf" | ".nan"
-    ) {
-        return true;
-    }
-
-    // Check if it looks like a number
-    if looks_like_number(s) {
-        return true;
-    }
-
-    // Check for characters that need escaping
-    for b in bytes {
-        if *b < 0x20 || *b == b':' || *b == b'#' {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Check if a string looks like a number.
-fn looks_like_number(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-
-    let bytes = s.as_bytes();
-    let mut i = 0;
-
-    // Optional sign
-    if bytes[i] == b'-' || bytes[i] == b'+' {
-        i += 1;
-        if i >= bytes.len() {
-            return false;
-        }
-    }
-
-    // Must have at least one digit
-    if !bytes[i].is_ascii_digit() {
-        return false;
-    }
-
-    // Check remaining characters
-    let mut has_dot = false;
-    let mut has_exp = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'0'..=b'9' => {}
-            b'.' if !has_dot && !has_exp => has_dot = true,
-            b'e' | b'E' if !has_exp => {
-                has_exp = true;
-                // Optional sign after exponent
-                if i + 1 < bytes.len() && (bytes[i + 1] == b'-' || bytes[i + 1] == b'+') {
-                    i += 1;
-                }
-            }
-            _ => return false,
-        }
-        i += 1;
-    }
-
-    true
 }
 
 /// Stream a double-quoted YAML string with proper escaping.

@@ -71,7 +71,7 @@
 //! (bracket-based like JSON), anchors, aliases, and block scalars uniformly.
 
 mod advance_positions;
-mod encode_style;
+pub(crate) mod encode_style;
 mod end_positions;
 mod error;
 mod index;
@@ -273,6 +273,7 @@ pub(crate) enum QuotedSpanEnd {
     Unterminated,
 }
 
+pub use encode_style::{go_yaml_resolves_to_non_str, go_yaml_string_scalar};
 pub use error::YamlError;
 pub use index::YamlIndex;
 pub use light::{

@@ -9470,16 +9470,18 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
         // `canonicalize` (a JSON-sourced index, see above) hands the choice to
         // the encoder yq itself uses. A string it declines to decide (one with a
         // line break) keeps the escaped double-quoted form it always had.
-        YamlString::DoubleQuoted { .. } if canonicalize => match go_yaml_string_style(&str_val) {
-            Some(EncodedStringStyle::Plain) => Ok(out.write_str(&str_val)?),
-            Some(EncodedStringStyle::SingleQuoted) => {
-                Ok(write_go_yaml_single_quoted(out, &str_val)?)
+        YamlString::DoubleQuoted { .. } if canonicalize => {
+            match go_yaml_string_style(&str_val, false) {
+                Some(EncodedStringStyle::Plain) => Ok(out.write_str(&str_val)?),
+                Some(EncodedStringStyle::SingleQuoted) => {
+                    Ok(write_go_yaml_single_quoted(out, &str_val)?)
+                }
+                Some(EncodedStringStyle::DoubleQuoted) => {
+                    Ok(write_go_yaml_double_quoted(out, &str_val)?)
+                }
+                None => Ok(stream_yaml_double_quoted(out, &str_val)?),
             }
-            Some(EncodedStringStyle::DoubleQuoted) => {
-                Ok(write_go_yaml_double_quoted(out, &str_val)?)
-            }
-            None => Ok(stream_yaml_double_quoted(out, &str_val)?),
-        },
+        }
         YamlString::DoubleQuoted { .. } => Ok(stream_yaml_double_quoted(out, &str_val)?),
         YamlString::SingleQuoted { .. } => Ok(stream_yaml_single_quoted(out, &str_val)?),
         YamlString::Unquoted { .. } => {
