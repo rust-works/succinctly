@@ -6557,6 +6557,7 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
 /// Go's `encoding/json`, so a JSON-sourced scalar decodes the way that does
 /// ([`json_surrogate_escape`]); a YAML document's lone surrogate stays the
 /// error go-yaml raises.
+#[inline]
 fn decode_u_escape(
     bytes: &[u8],
     at: usize,
@@ -6585,6 +6586,10 @@ fn decode_u_escape(
 /// `first` is the escape just read; `rest` is the text after it. Returns the
 /// character and how many bytes of `rest` it consumed (the six of the second
 /// escape for a pair, none otherwise).
+///
+/// The pair arithmetic is also in `json::light`'s `decode_escapes` and `jq::eval`'s
+/// `parse_json_string_value`, which are other readers with their own policy for a
+/// lone surrogate (an error, where Go's, and so this one, is U+FFFD).
 fn json_surrogate_escape(first: u32, rest: &[u8]) -> (char, usize) {
     let low = match rest {
         [b'\\', b'u', hex @ ..] if first < 0xDC00 && hex.len() >= 4 => parse_hex(&hex[..4])

@@ -542,7 +542,7 @@ at all. The justification is the spec target, which is why the case belongs here
 Representative cases, each live-verified. These are gaps to close, listed here so they are
 not rediscovered from scratch.
 
-### String style of JSON-sourced output — closed on the streaming route (#3575); two gaps remain
+### String style of JSON-sourced output — closed on the streaming route (#3575); three gaps remain
 
 `yq -p json -o yaml` writes every string and key in go-yaml's own style, not the JSON text's:
 `{"name":"a","n":["x","1"]}` is `name: a` / `n:` / `- x` / `- "1"`, where this route used to echo
@@ -558,7 +558,7 @@ they do in yq). A string that *starts* with U+FEFF has every following character
 well, which yq does and nothing else explains. Checked against about 30,000 random strings,
 values and keys, with no difference, and pinned by the `json_string_style_*_3575` goldens.
 
-Still open, each separate from this fix (and one closed since):
+Still open, each separate from this fix:
 
 - **A string with a line break** ([#3587](https://github.com/rust-works/succinctly/issues/3587)) (`\n`, `\r`, U+0085, U+2028, U+2029). yq writes a literal block
   for a value (`k: |-` / `  a` / `  b`) and `? ` explicit-key syntax for a key; this route, like
@@ -575,11 +575,15 @@ Still open, each separate from this fix (and one closed since):
   quotes, base-prefixed numbers, bare `inf`/`nan`, and a date or a number-shaped key written bare
   (`d: 2001-12-14` and `1: "2"` read back as a timestamp and an integer key, where yq quotes
   both). They could take `go_yaml_string_style` as it is.
-- **A JSON surrogate-pair escape** (`"\ud83d\ude00"`) used to fail with `invalid escape sequence`
-  on every route; closed by [#3589](https://github.com/rust-works/succinctly/issues/3589). A
-  JSON-sourced scalar now decodes it as Go's `encoding/json` does: a high half and an
-  immediately following low half are one character, any other surrogate escape is U+FFFD. A
-  YAML document's surrogate escape stays an error, as in go-yaml.
+
+The fourth gap first listed here, a JSON surrogate-pair escape
+(`"\ud83d\ude00"`), used to fail with `invalid escape sequence` on every route and is closed: it is
+now decoded as Go's `encoding/json` does ([#3589](https://github.com/rust-works/succinctly/issues/3589)): a
+high half and an immediately following low half are one character, any other surrogate escape is
+U+FFFD. It applies to a JSON-sourced scalar only, so a YAML document's surrogate escape stays an
+error, as in go-yaml. Pinned by the `json_surrogate_escape_*_3589` goldens, which include the DOM
+routes (`-P` and a write). `succinctly yaml validate` still accepts such an escape in a YAML
+document, where go-yaml rejects it.
 
 ### The `---` between results is per-run, not per-node as real yq's printer makes it (#2427)
 
