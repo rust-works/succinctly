@@ -1551,13 +1551,11 @@ struct CheckCtx {
 /// child blocks are kept in two lists the walk can re-sequence afterwards
 /// ([`CheckCtx::reorder`]) instead of being read back off the walk's order.
 struct Blocks {
-    /// `parents[i]` is the parent of block `i + 1`. A parent is always
-    /// numbered before its children.
-    parents: Vec<usize>,
     /// The block the walk is currently inside.
     current: usize,
     /// `children[b]`: the blocks created directly in block `b`, in the order
-    /// jq compiles them.
+    /// jq compiles them. One entry per block, so its length is the block
+    /// count.
     children: Vec<Vec<usize>>,
     /// `own[b]`: indices into [`CheckCtx::errors`] of the diagnostics found
     /// directly in block `b`, in the order jq reports them.
@@ -1567,7 +1565,6 @@ struct Blocks {
 impl Default for Blocks {
     fn default() -> Self {
         Self {
-            parents: Vec::new(),
             current: 0,
             children: alloc::vec![Vec::new()],
             own: alloc::vec![Vec::new()],
@@ -1670,8 +1667,7 @@ fn permute_spans(list: &mut [usize], bounds: &[usize], order: &[usize]) {
 /// is in (#3391) -- see [`Blocks`].
 fn check_in_block(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
     let parent = cx.blocks.current;
-    cx.blocks.parents.push(parent);
-    let block = cx.blocks.parents.len();
+    let block = cx.blocks.children.len();
     cx.blocks.children[parent].push(block);
     cx.blocks.children.push(Vec::new());
     cx.blocks.own.push(Vec::new());
@@ -1866,10 +1862,21 @@ fn bind_patterns(
     cx: &mut CheckCtx,
     reachable: &BTreeSet<usize>,
 ) -> Vec<String> {
+    check_pattern_keys_all(patterns, cx, reachable);
+    pattern_alternatives_var_names(patterns)
+}
+
+/// Checks every `?//`-alternative's computed keys, in the scope the caller is
+/// in. [`bind_patterns`] without the union of names, for a caller that has
+/// something to check between the keys and the binding (`reduce`'s `init`).
+fn check_pattern_keys_all(
+    patterns: &mut [Pattern],
+    cx: &mut CheckCtx,
+    reachable: &BTreeSet<usize>,
+) {
     for pattern in patterns.iter_mut() {
         check_pattern_keys(pattern, cx, reachable);
     }
-    pattern_alternatives_var_names(patterns)
 }
 
 /// The arity an `Expr::FuncCall` with these `args` and `builtin_fallback`
@@ -2516,23 +2523,22 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         // has been bound. Same union-of-alternatives and computed-key
         // treatment as `Expr::AsPattern` above.
         //
-        // `init` is checked *before* the pattern's own computed keys here,
-        // even though the pattern is written first
-        // (`reduce EXPR as PATTERN (INIT; UPDATE)`) -- confirmed live this
-        // is not merely an implementation quirk but matches real jq's own
-        // diagnostic order for this construct: `reduce (1,2) as {($x): $v}
-        // ($x; .)` reports `init`'s `$x` (column 29) *before* the pattern
-        // key's `$x` (column 19), i.e. jq's own compiler visits `init`
-        // before the pattern too. A same-named `$var`/`break $x` split
-        // across a computed pattern key and `init` still has its *position*
-        // misattributed against `collect_var_sites`/`collect_break_sites`
-        // (both sorted by pure text offset, so the earlier-in-text pattern
-        // key occupies the table slot init's occurrence index expects) --
-        // a #2635-class residual, not a new, independently fixable
-        // ordering bug: swapping this visit order to
-        // fix the position match was tried and reverted, since it fixes the
-        // *position* only by making the *order* of the two diagnostics
-        // wrong relative to jq instead.
+        // The walk visits the pieces in source order -- the source, the
+        // pattern's computed keys, `init`, the update -- so each occurrence
+        // counter lines up with `collect_var_sites`/`collect_break_sites`,
+        // which are sorted by text offset (#3583; before it, `init` was
+        // visited first and a same-named `$var`/`break` in a key and in
+        // `init` had each caret attributed to the other, #2964). jq itself
+        // reports `init` first -- `reduce (1,2) as {($x): $v} ($x; .)` prints
+        // `init`'s `$x` (column 29) before the key's (column 19) -- so the
+        // pieces are re-sequenced afterwards, for the block's own errors and
+        // for its units alike. The keys are checked in the pre-binding scope,
+        // `init` sees no bound vars, and the update sees them.
+        //
+        // #2734: `patterns`' vars are bound in `update` only, not `init` --
+        // `reduce .[] as $x (0; . + $x)` evaluates `init` before any element
+        // has been bound. Same union-of-alternatives treatment as
+        // `Expr::AsPattern` above.
         Expr::Reduce {
             input,
             patterns,
@@ -2542,25 +2548,23 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             let start = cx.mark();
             check(input, cx, reachable);
             let after_input = cx.mark();
+            check_pattern_keys_all(patterns, cx, reachable);
+            let after_keys = cx.mark();
             check(init, cx, reachable);
             let after_init = cx.mark();
             let outer = cx.var_scope.len();
-            let bound = bind_patterns(patterns, cx, reachable);
-            cx.var_scope.extend(bound);
-            let after_patterns = cx.mark();
+            cx.var_scope
+                .extend(pattern_alternatives_var_names(patterns));
             check(update, cx, reachable);
             let end = cx.mark();
             cx.var_scope.truncate(outer);
-            // #3583: jq's instruction order is `init`, then the source, then
-            // the pattern's computed keys, then the update.
-            let marks = [start, after_input, after_init, after_patterns, end];
-            cx.reorder(&marks, Some(&[1, 0, 2, 3]), Some(&[1, 0, 2, 3]));
+            let marks = [start, after_input, after_keys, after_init, end];
+            cx.reorder(&marks, Some(&[2, 0, 1, 3]), Some(&[2, 0, 1, 3]));
         }
 
         // #2734: same rule as `Expr::Reduce` above -- `init` sees no bound
-        // vars, `update`/`extract` both do. Visit-order rationale (`init`
-        // before the pattern, matching jq's own diagnostic order) is the
-        // same as `Expr::Reduce`'s own doc comment above.
+        // vars, `update`/`extract` both do -- and the same visit and report
+        // order (#3583).
         Expr::Foreach {
             input,
             patterns,
@@ -2571,20 +2575,27 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             let start = cx.mark();
             check(input, cx, reachable);
             let after_input = cx.mark();
+            check_pattern_keys_all(patterns, cx, reachable);
+            let after_keys = cx.mark();
             check(init, cx, reachable);
             let after_init = cx.mark();
             let outer = cx.var_scope.len();
-            let bound = bind_patterns(patterns, cx, reachable);
-            cx.var_scope.extend(bound);
-            let after_patterns = cx.mark();
+            cx.var_scope
+                .extend(pattern_alternatives_var_names(patterns));
             check(update, cx, reachable);
             let after_update = cx.mark();
             check_opt(extract.as_deref_mut(), cx, reachable);
             let end = cx.mark();
             cx.var_scope.truncate(outer);
-            // #3583: as for `reduce` -- `init` first, then the source.
-            let marks = [start, after_input, after_init, after_patterns, after_update, end];
-            cx.reorder(&marks, Some(&[1, 0, 2, 3, 4]), Some(&[1, 0, 2, 3, 4]));
+            let marks = [
+                start,
+                after_input,
+                after_keys,
+                after_init,
+                after_update,
+                end,
+            ];
+            cx.reorder(&marks, Some(&[2, 0, 1, 3, 4]), Some(&[2, 0, 1, 3, 4]));
         }
 
         Expr::Pipe(exprs) | Expr::Comma(exprs) => {
@@ -2837,6 +2848,12 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
 /// side that never hides a sibling's error -- and
 /// `builtin_operand_kinds_match_the_pinned_capture` fails if the roster and
 /// this list disagree.
+///
+/// The same split decides the *order* of a builtin's operands (#3583): jq
+/// compiles a C-implemented builtin's operands last to first and a `def`'s
+/// closure arguments in the order written, and `check` reverses the former on
+/// the strength of this list. The two properties coincide for the whole
+/// roster (`closure_order_follows_the_operand_kind_across_the_roster`).
 fn builtin_operands_are_inline(builtin: &Builtin) -> bool {
     matches!(
         builtin,
@@ -4760,6 +4777,33 @@ mod tests {
             "strptime/1",
             "yn/2",
         ];
+
+        /// #3583: the order the closure units of a multi-argument builtin come
+        /// out in follows its operand kind -- last to first for a
+        /// C-implemented one, as written for a `def` -- for every roster entry
+        /// of arity 2 or more. `NAME(map(ua1); map(ua2); ...)` was captured
+        /// from the pinned jq for all of them (43 entries, no exception).
+        #[test]
+        fn closure_order_follows_the_operand_kind_across_the_roster() {
+            let mut checked = 0;
+            for &(name, arity) in JQ_BUILTIN_ROSTER.iter().filter(|&&(_, a)| a >= 2) {
+                let args: Vec<String> = (1..=arity).map(|i| format!("ua{i}")).collect();
+                let filter = format!(
+                    "{name}({})",
+                    args.iter()
+                        .map(|a| format!("map({a})"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                let mut expected: Vec<String> = args.iter().map(|a| format!("{a}/0")).collect();
+                if INLINE.contains(&format!("{name}/{arity}").as_str()) {
+                    expected.reverse();
+                }
+                assert_eq!(reported(&filter), expected, "{filter}");
+                checked += 1;
+            }
+            assert_eq!(checked, 43, "the roster's entries of arity 2 or more");
+        }
 
         #[test]
         fn builtin_operand_kinds_match_the_pinned_capture() {
