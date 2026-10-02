@@ -50508,6 +50508,52 @@ fn test_bare_first_on_a_mapping_is_refused_in_yq_3551() -> Result<()> {
     Ok(())
 }
 
+/// #3589: a JSON string spells a character outside the BMP as a surrogate pair
+/// (`\ud83d\ude00`), which `succinctly yq -p json` rejected with `invalid escape
+/// sequence` on every route. yq reads JSON with Go's `encoding/json`: a high
+/// half and an immediately following low half are one character, and any other
+/// surrogate escape is U+FFFD. A YAML document has no such escape (go-yaml
+/// rejects it), so that stays an error. Every expected value is yq v4.53.3's.
+#[test]
+fn test_yq_json_sourced_surrogate_escapes_decode_like_go_3589() -> Result<()> {
+    let pair = r#"{"k":"\ud83d\ude00"}"#;
+    let lone = r#"{"k":"\ud83d","e":"\ude00x"}"#;
+    let args = |output: &'static str| ["--input-format", "json", output, "-I=0"];
+
+    for (json, filter, output, expected) in [
+        (pair, ".k", "-o=yaml", "😀\n"),
+        (pair, ".k", "-o=json", "\"😀\"\n"),
+        (pair, ".", "-o=yaml", "k: \"\\U0001F600\"\n"),
+        (pair, ".", "-o=json", "{\"k\":\"😀\"}\n"),
+        (lone, ".k", "-o=yaml", "\u{FFFD}\n"),
+        (lone, ".k", "-o=json", "\"\u{FFFD}\"\n"),
+        (
+            lone,
+            "[.k, .e]",
+            "-o=json",
+            "[\"\u{FFFD}\",\"\u{FFFD}x\"]\n",
+        ),
+        // A key goes through the same decoder.
+        (r#"{"\ud83d\ude00":1}"#, ".", "-o=json", "{\"😀\":1}\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, json, &args(output))?;
+        assert_eq!(code, 0, "`{filter}` on {json} as {output}");
+        assert_eq!(stdout, expected, "`{filter}` on {json} as {output}");
+    }
+
+    // A YAML document's surrogate escape is an error in yq (go-yaml: "found
+    // invalid Unicode character escape code"), a pair and a lone half alike.
+    for doc in ["a: \"\\ud83d\\ude00\"\n", "a: \"\\ud83d\"\n"] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(".a", doc, &[])?;
+        assert_eq!(code, 1, "{doc:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "{doc:?}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3574: yq's JSON decoder reads a zero as the integer `0` whatever its
 /// spelling (`-0`, `-0.0`, `-0e0`), so JSON-sourced input never prints a sign
 /// on zero, in YAML or JSON output. The cursor route echoed the source text

@@ -3740,14 +3740,9 @@ fn transcode_double_quoted_to_json(
                     }
                     b'u' => {
                         // \uNNNN - 4 hex digits
-                        if i + 4 >= bytes.len() {
-                            return Err(YamlStringError::InvalidEscape);
-                        }
-                        let hex = &bytes[i + 1..i + 5];
-                        let codepoint = parse_hex(hex)?;
-                        let ch = char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?;
+                        let (ch, last) = decode_u_escape(bytes, i, json_sourced)?;
                         write_json_escape(output, ch);
-                        i += 4;
+                        i = last;
                     }
                     b'U' => {
                         // \UNNNNNNNN - 8 hex digits
@@ -4587,14 +4582,9 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                         i += 2;
                     }
                     b'u' => {
-                        if i + 4 >= bytes.len() {
-                            return Err(YamlStringError::InvalidEscape);
-                        }
-                        let hex = &bytes[i + 1..i + 5];
-                        let codepoint = parse_hex(hex)?;
-                        let ch = char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?;
+                        let (ch, last) = decode_u_escape(bytes, i, json_sourced)?;
                         stream_json_escape(out, ch).map_err(|_| YamlStringError::InvalidUtf8)?;
-                        i += 4;
+                        i = last;
                     }
                     b'U' => {
                         if i + 8 >= bytes.len() {
@@ -6501,14 +6491,9 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
                     }
                     b'u' => {
                         // \uNNNN - 4 hex digits
-                        if i + 4 >= bytes.len() {
-                            return Err(YamlStringError::InvalidEscape);
-                        }
-                        let hex = &bytes[i + 1..i + 5];
-                        let codepoint = parse_hex(hex)?;
-                        result
-                            .push(char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?);
-                        i += 4;
+                        let (c, last) = decode_u_escape(bytes, i, json_sourced)?;
+                        result.push(c);
+                        i = last;
                     }
                     b'U' => {
                         // \UNNNNNNNN - 8 hex digits
@@ -6559,6 +6544,67 @@ fn decode_double_quoted(bytes: &[u8], json_sourced: bool) -> Result<String, Yaml
     }
 
     Ok(result)
+}
+
+/// Decode the `\uNNNN` escape whose `u` is at `bytes[at]`, returning the
+/// character and the index of the last byte the escape consumed (the caller
+/// steps past it). The one definition behind the three double-quoted decoders
+/// ([`decode_double_quoted`], [`transcode_double_quoted_to_json`] and the
+/// streaming one), which each used to carry their own copy.
+///
+/// `json_sourced` (#3589): a JSON string spells a character outside the BMP as
+/// a surrogate pair, which YAML's grammar has no escape for. yq reads JSON with
+/// Go's `encoding/json`, so a JSON-sourced scalar decodes the way that does
+/// ([`json_surrogate_escape`]); a YAML document's lone surrogate stays the
+/// error go-yaml raises.
+#[inline]
+fn decode_u_escape(
+    bytes: &[u8],
+    at: usize,
+    json_sourced: bool,
+) -> Result<(char, usize), YamlStringError> {
+    if at + 4 >= bytes.len() {
+        return Err(YamlStringError::InvalidEscape);
+    }
+    let codepoint = parse_hex(&bytes[at + 1..at + 5])?;
+    let last = at + 4;
+    if json_sourced && (0xD800..=0xDFFF).contains(&codepoint) {
+        let (c, consumed) = json_surrogate_escape(codepoint, &bytes[last + 1..]);
+        return Ok((c, last + consumed));
+    }
+    let c = char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?;
+    Ok((c, last))
+}
+
+/// A JSON `\uXXXX` escape that is a UTF-16 surrogate, decoded as Go's
+/// `encoding/json` does (#3589): a high half (`first` in `D800..=DBFF`)
+/// followed *immediately* by an escaped low half (`DC00..=DFFF`) is one
+/// character outside the BMP; every other surrogate, a lone half or a high
+/// half followed by anything else, is U+FFFD, and the text after it decodes
+/// normally.
+///
+/// `first` is the escape just read; `rest` is the text after it. Returns the
+/// character and how many bytes of `rest` it consumed (the six of the second
+/// escape for a pair, none otherwise).
+///
+/// The pair arithmetic is also in `json::light`'s `decode_escapes` and `jq::eval`'s
+/// `parse_json_string_value`, which are other readers with their own policy for a
+/// lone surrogate (an error, where Go's, and so this one, is U+FFFD).
+fn json_surrogate_escape(first: u32, rest: &[u8]) -> (char, usize) {
+    let low = match rest {
+        [b'\\', b'u', hex @ ..] if first < 0xDC00 && hex.len() >= 4 => parse_hex(&hex[..4])
+            .ok()
+            .filter(|low| (0xDC00..=0xDFFF).contains(low)),
+        _ => None,
+    };
+    match low {
+        Some(low) => (
+            char::from_u32(0x1_0000 + ((first - 0xD800) << 10) + (low - 0xDC00))
+                .unwrap_or('\u{FFFD}'),
+            6,
+        ),
+        None => ('\u{FFFD}', 0),
+    }
 }
 
 /// Decode a single-quoted YAML string, handling '' escapes and line folding.
@@ -11583,6 +11629,97 @@ mod tests {
             json_sourced: false,
         };
         assert_eq!(&*s.as_str().unwrap(), "x y");
+    }
+
+    /// #3589: Go's `encoding/json` (yq's JSON decoder) joins a high surrogate
+    /// escape and an *immediately following* low one into one character, and
+    /// reads every other surrogate escape as U+FFFD; the text after it decodes
+    /// normally. Each expected value is yq v4.53.3's.
+    #[test]
+    fn test_decode_double_quoted_json_sourced_surrogate_escapes_3589() {
+        for (text, expected) in [
+            (r#""\ud83d\ude00""#, "😀"),
+            (r#""\uD83D\uDE00""#, "😀"),
+            (r#""a\ud83d\ude00b""#, "a😀b"),
+            (r#""\ud83d\ude00\ud83d\ude01""#, "😀😁"),
+            (r#""\ud800\udc00""#, "\u{10000}"),
+            (r#""\ud83d""#, "\u{FFFD}"),
+            (r#""a\ud83d""#, "a\u{FFFD}"),
+            (r#""\ude00""#, "\u{FFFD}"),
+            (r#""\ude00\ud83d""#, "\u{FFFD}\u{FFFD}"),
+            (r#""\ud83dx""#, "\u{FFFD}x"),
+            (r#""\ud83d\u0041""#, "\u{FFFD}A"),
+            (r#""\ud83d\n""#, "\u{FFFD}\n"),
+            (r#""\ud83d\\ude00""#, "\u{FFFD}\\ude00"),
+            (r#""\ud83d\ud83d\ude00""#, "\u{FFFD}😀"),
+            (r#""\ud83d\ud83d""#, "\u{FFFD}\u{FFFD}"),
+            // A BMP escape next to the surrogate range is unaffected.
+            (r#""\ud7ff\ue000""#, "\u{D7FF}\u{E000}"),
+        ] {
+            let s = YamlString::DoubleQuoted {
+                text: text.as_bytes(),
+                start: 0,
+                json_sourced: true,
+            };
+            assert_eq!(&*s.as_str().unwrap(), expected, "{text}");
+        }
+    }
+
+    /// A YAML document has no such escape: go-yaml rejects a surrogate, and so
+    /// does this, for a pair and for a lone half alike.
+    #[test]
+    fn test_decode_double_quoted_non_json_sourced_surrogate_escape_is_an_error_3589() {
+        for text in [r#""\ud83d\ude00""#, r#""\ud83d""#, r#""\ude00""#] {
+            let s = YamlString::DoubleQuoted {
+                text: text.as_bytes(),
+                start: 0,
+                json_sourced: false,
+            };
+            assert_eq!(s.as_str(), Err(YamlStringError::InvalidEscape), "{text}");
+        }
+    }
+
+    /// A second escape that is cut short is the same error a lone malformed
+    /// escape is, not a replacement character.
+    #[test]
+    fn test_decode_double_quoted_json_sourced_truncated_surrogate_pair_is_an_error_3589() {
+        for text in [r#""\ud83d\ude""#, r#""\ud83d\u""#, r#""\ud83d\uzzzz""#] {
+            let s = YamlString::DoubleQuoted {
+                text: text.as_bytes(),
+                start: 0,
+                json_sourced: true,
+            };
+            assert_eq!(s.as_str(), Err(YamlStringError::InvalidEscape), "{text}");
+        }
+    }
+
+    /// The three double-quoted decoders carry one `\u` definition
+    /// (`decode_u_escape`), so a surrogate escape means the same in each: the
+    /// decoded string, the JSON the transcoder builds and the one the streaming
+    /// transcoder writes all agree.
+    #[test]
+    fn test_json_sourced_surrogate_escapes_agree_across_the_three_decoders_3589() {
+        for (text, expected) in [
+            (r"\ud83d\ude00", "😀"),
+            (r"a\ud83d\ude00b", "a😀b"),
+            (r"\ud83d", "\u{FFFD}"),
+            (r"\ude00", "\u{FFFD}"),
+            (r"\ud83dx", "\u{FFFD}x"),
+            (r"\ud83d\ud83d\ude00", "\u{FFFD}😀"),
+        ] {
+            let bytes = text.as_bytes();
+            assert_eq!(
+                decode_double_quoted(bytes, true).unwrap(),
+                expected,
+                "{text}"
+            );
+            let mut transcoded = String::new();
+            transcode_double_quoted_to_json(&mut transcoded, bytes, true).unwrap();
+            assert_eq!(transcoded, format!("\"{expected}\""), "{text}");
+            let mut streamed = String::new();
+            stream_transcode_double_quoted_to_json(&mut streamed, bytes, true).unwrap();
+            assert_eq!(streamed, transcoded, "{text}");
+        }
     }
 
     /// Trailing whitespace before the raw byte must not be trimmed either
