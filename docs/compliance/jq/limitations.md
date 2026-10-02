@@ -724,9 +724,8 @@ and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` 
   and is answered by this same owned walk, which is why one change fixed both. It delivers the
   one output after `n` dropped ones (none when the body has fewer), with `classify_nth_n`'s own
   count rules.
-- **An owned-input `[... | key]` collector prints the array it had collected after the error its
-  body raises** (#3512), and on the cursor route `limit(1; .[] | <retrying body>) | key` runs the
-  `?//` retry past `limit`'s own stop (#3514). Neither is a stale slot.
+- **On the cursor route, `limit(1; .[] | <retrying body>) | key` runs the `?//` retry past
+  `limit`'s own stop** (#3514). It is not a stale slot.
 - **`limit` with a string, array or object count raises on the body's first output, as jq's
   does** (#3486). jq 1.7.1's `limit` is `foreach f as $item ($n; .-1; ...)`, and such a count sorts
   above every number, so `$n - 1` raises `array ([1]) and number (1) cannot be subtracted` on

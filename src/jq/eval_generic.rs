@@ -24575,15 +24575,19 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             }
         }
         Expr::Paren(inner) => Expr::Paren(boxed(inner)?),
-        // An array is atomic (STYLE-0012): an escape raised while its body is
-        // evaluated early ends the stage with the array never delivered, where
-        // a stream delivers what came before the escape (#2495). The prefix is
-        // delivered, then the escape, and an array built after one is not
-        // delivered either: it is `empty`, not the `[]` its emptied body
-        // would spell (#3512).
+        // An array is atomic (STYLE-0012): an escape raised while its *own*
+        // body is evaluated early ends the stage with this array never
+        // delivered, where a stream delivers what came before the escape
+        // (#2495) -- it is `empty`, not the `[]` its emptied body would spell
+        // (#3512). Only an escape this body raised counts: one already left
+        // by an earlier sub-expression of the stage (a sibling field, a
+        // comma operand) is reported after the prefix, and an array whose
+        // body never reads it is built as it always was.
         Expr::Array(inner) => {
+            let escaped_now = || at.prefetch_escaped.is_some_and(|escaped| escaped());
+            let escaped_before = escaped_now();
             let resolved = boxed(inner)?;
-            if at.prefetch_escaped.is_some_and(|escaped| escaped()) {
+            if !escaped_before && escaped_now() {
                 Expr::Builtin(Builtin::Empty)
             } else {
                 Expr::Array(resolved)

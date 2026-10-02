@@ -50919,3 +50919,26 @@ fn test_yq_error_of_an_empty_message_aborts_3488() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3512 is a jq-mode fix: yq's `[...]` collector over a raising body is atomic
+/// over an owned input already (yq v4.53.3 prints the error alone), and the
+/// owned-identity change that made jq's atomic must leave yq's answer as it was.
+/// `key` is real yq's own builtin, so every row is captured from yq v4.53.3.
+#[test]
+fn test_yq_array_collector_over_a_raising_key_body_is_atomic_3512() -> Result<()> {
+    for filter in [
+        r#"{"a":1} | [(error("E2")) | key]"#,
+        r#"{"a":1} | [(.a, error("E2")) | key]"#,
+        r#"{"a":1} | [[(error("E2")) | key], 9]"#,
+        r#"{"a":1} | .a | {"x": (1, (error("E2") | key)), "y": [key]}"#,
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "", &["-n", "-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", "Error: E2\n", 1),
+            "`{filter}`"
+        );
+    }
+    Ok(())
+}
