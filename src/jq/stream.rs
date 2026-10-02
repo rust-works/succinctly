@@ -1206,6 +1206,35 @@ mod tests {
     use super::*;
     use indexmap::IndexMap;
 
+    /// #3588: a computed string is written the way go-yaml's encoder writes one, in
+    /// block context and, inside `[...]`/`{...}`, in flow context; a string with a
+    /// line break, which go-yaml writes as a block scalar, keeps the escaped
+    /// double-quoted text.
+    #[test]
+    fn stream_yaml_string_follows_go_yaml_in_block_and_flow() {
+        let render = |s: &str, flow: bool| {
+            let mut out = String::new();
+            stream_yaml_string_in(&mut out, s, flow).unwrap();
+            out
+        };
+        for (s, block, flow) in [
+            ("abc", "abc", "abc"),
+            ("1", "\"1\"", "\"1\""),
+            ("", "\"\"", "\"\""),
+            ("2001-12-14", "\"2001-12-14\"", "\"2001-12-14\""),
+            ("- x", "'- x'", "'- x'"),
+            ("a,b", "a,b", "'a,b'"),
+            ("a:b", "a:b", "'a:b'"),
+            ("a\nb", "\"a\\nb\"", "\"a\\nb\""),
+        ] {
+            assert_eq!(render(s, false), block, "{s:?} in block");
+            assert_eq!(render(s, true), flow, "{s:?} in flow");
+        }
+        let mut out = String::new();
+        stream_yaml_string(&mut out, "a,b").unwrap();
+        assert_eq!(out, "a,b", "the block entry point");
+    }
+
     #[test]
     fn test_stream_null() {
         let mut buf = String::new();
