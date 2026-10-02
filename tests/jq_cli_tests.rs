@@ -60372,6 +60372,73 @@ fn test_path_register_compound_stage_is_refused_as_a_whole_3456() -> Result<()> 
     ])
 }
 
+/// #3456 (the B2b/B3 guard): by-value `and`/`or` operands that jq navigates
+/// inside -- `any`, `all`, `isempty(g)` move the register exactly when they
+/// emit, `range`/`paths` do not move it -- followed by an `R` that navigates.
+/// Every row but the control exits 5 with nothing written in jq 1.7.1 *and* on
+/// `main`, which is what makes them a guard: they were written against a gate-dropping
+/// experiment that wrote `{}` for `del(any and .a)`, answered `[]` for
+/// `path(. as $x | (any and .) | $x)`, and (once that was closed) let a `try`
+/// or `?` swallow the resolver's own guess so `del(try (any or .b?))` echoed
+/// the document -- three different ways to lose the refusal. jq words some of
+/// these as "near attempt to access element" where `main` says "with result",
+/// so the message check is the part both share. The control is the one row
+/// where `R` navigates a register `any` did not move.
+///
+/// Rows jq *accepts* and `main` refuses (`del(try (any and .a))`, jq: the
+/// document unchanged) are deliberately absent: they are not guarded, they
+/// are what the change that closes #3428 has to answer.
+#[test]
+fn test_path_register_by_value_operand_refusals_stay_refused_3456() -> Result<()> {
+    let refused = "Invalid path expression";
+    assert_path_rows_3289(&[
+        (r#"{"a":true}"#, r"del(any and .a)", "", refused, 5),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | (any and .) | $x)",
+            "",
+            refused,
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del(try (any or .b?))",
+            "",
+            refused,
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del((any or .b?)?)",
+            "",
+            refused,
+            5,
+        ),
+        (
+            r#"{"a":true,"b":null}"#,
+            r"del(try (all and .b?))",
+            "",
+            refused,
+            5,
+        ),
+        (r#"{"a":1}"#, r"del(isempty(.[]?) or .a)", "", refused, 5),
+        (r"{}", r"del(isempty(.[]?) or .a)", "", refused, 5),
+        (r#"{"a":1}"#, r"del(try (range(2) and .a))", "", refused, 5),
+        (r#"{"a":1}"#, r"path(range(2) and .a)", "", refused, 5),
+        (r#"{"a":1}"#, r"del(paths and .a)", "", refused, 5),
+        (
+            r#"{"a":[true]}"#,
+            r"path(. as $x | (.a | any) | $x)",
+            "",
+            refused,
+            5,
+        ),
+        // Control: `any` of `[]` emits nothing, so the register is where it
+        // entered, `.b?` finds nothing to index, and there is no output.
+        (r"[]", r"path(any or .b?)", "", "", 0),
+    ])
+}
+
 /// #2760 seen from the side that does damage: `del()` and `|=` consume the
 /// same resolution, so the missing refusal was a **refused edit reported as
 /// a successful no-op** -- the document came back unchanged at exit 0 where
