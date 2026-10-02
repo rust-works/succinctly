@@ -6266,6 +6266,7 @@ pub(crate) fn resolve_path_context_at<S: EvalSemantics>(
             path: &|| Cow::Borrowed(path),
             parent_of: Some(parent_of),
             prefetch: None,
+            prefetch_escaped: None,
         },
     )
 }
@@ -24448,6 +24449,7 @@ fn path_context_resolve_absent<S: EvalSemantics, V: DocumentValue>(
             path: &|| Cow::Owned(pos.trail.to_vec()),
             parent_of: None,
             prefetch: None,
+            prefetch_escaped: None,
         },
     )
 }
@@ -24479,6 +24481,11 @@ struct PathContextAt<'a> {
     /// ([`owned_identity_prefetch`]); the constant route supplies none and
     /// its gate refuses such shapes up front.
     prefetch: Option<&'a PrefetchFn<'a>>,
+    /// Whether an earlier [`Self::prefetch`] escaped: the stage stops where the
+    /// escape stops it, so nothing built after that is delivered. Only the owned
+    /// identity pipe supplies one, with its `escaped` cell; where there is no
+    /// `prefetch` there is nothing to have escaped.
+    prefetch_escaped: Option<&'a dyn Fn() -> bool>,
 }
 
 /// [`PathContextAt::prefetch`]'s hook: a sub-expression in, its outputs at
@@ -24568,7 +24575,20 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             }
         }
         Expr::Paren(inner) => Expr::Paren(boxed(inner)?),
-        Expr::Array(inner) => Expr::Array(boxed(inner)?),
+        // An array is atomic (STYLE-0012): an escape raised while its body is
+        // evaluated early ends the stage with the array never delivered, where
+        // a stream delivers what came before the escape (#2495). The prefix is
+        // delivered, then the escape, and an array built after one is not
+        // delivered either: it is `empty`, not the `[]` its emptied body
+        // would spell (#3512).
+        Expr::Array(inner) => {
+            let resolved = boxed(inner)?;
+            if at.prefetch_escaped.is_some_and(|escaped| escaped()) {
+                Expr::Builtin(Builtin::Empty)
+            } else {
+                Expr::Array(resolved)
+            }
+        }
         Expr::Optional(inner) => Expr::Optional(boxed(inner)?),
         Expr::FirstExpr(inner) => Expr::FirstExpr(boxed(inner)?),
         Expr::LastExpr(inner) => Expr::LastExpr(boxed(inner)?),
@@ -28515,6 +28535,7 @@ fn owned_identity_resolve_component<S: EvalSemantics, V: DocumentValue>(
             // appear in one.
             parent_of: None,
             prefetch: None,
+            prefetch_escaped: None,
         },
     )
 }
@@ -30221,6 +30242,7 @@ fn owned_identity_resolve_at<S: EvalSemantics, V: DocumentValue>(
     let prefetch = |sub: &Expr| -> Result<Vec<OwnedValue>, EvalError> {
         owned_identity_prefetch::<S, V>(sub, value, id, optional, escaped)
     };
+    let prefetch_escaped = || escaped.borrow().is_some();
     path_context_resolve_constants::<S>(
         stage,
         &PathContextAt {
@@ -30228,6 +30250,7 @@ fn owned_identity_resolve_at<S: EvalSemantics, V: DocumentValue>(
             path: &|| Cow::Borrowed(path.as_slice()),
             parent_of: Some(&parent_of),
             prefetch: Some(&prefetch),
+            prefetch_escaped: Some(&prefetch_escaped),
         },
     )
 }

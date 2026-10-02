@@ -90318,3 +90318,134 @@ fn test_error_of_an_empty_message_yields_nothing_3488() -> Result<()> {
         ),
     ])
 }
+
+/// #3512: an array collector over a body that reads path context (`key`,
+/// `parent`, `path`) and raises is atomic over an owned input, as it is over a
+/// document cursor and as jq's `[path(...)]` is: the error is the array's
+/// answer, and no `[]` or partial array is delivered ahead of it. The owned
+/// route prefetches such a body (a pipe that moves before it reads) and used to
+/// deliver the prefix as the array, then the escape, which printed `[]` after
+/// `E2`, `["a"]` for `[(.a, error("E2")) | key]`, `0` for its `length`, and
+/// both `[]` and `"c"` through `try ... catch`. Values the *stream* produces
+/// before the escape are still delivered (`(.a | key), [...]` prints `"a"`
+/// first), and an array whose body does not raise is unchanged.
+///
+/// Every expectation is the cursor route's answer to the same body over the same
+/// document, which matches jq 1.7.1's `[path(...)]` (`key` is succinctly's).
+/// Not pinned: a *consumer* of such a body inside the same stage (`isempty`,
+/// `reduce`, `limit`), which decides from the prefix and then raises on both
+/// routes' owned side -- a separate, older gap.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_array_collector_over_a_raising_path_context_body_is_atomic_3512() -> Result<()> {
+    for (filter, stdout, stderr, code) in [
+        (
+            r#"{"a":1} | [(error("E2")) | key]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a, error("E2")) | key]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(error("E2"), .a) | key]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a, error("E2"), .a) | key]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [.a | (key, error("E2"))]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a, error("E2")) | parent]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a, error("E2")) | path]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(error("E2")) | key] | length"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | try [(error("E2")) | key] catch "c""#,
+            "\"c\"\n",
+            "",
+            0,
+        ),
+        (r#"{"a":1} | [(error("E2")) | key]?"#, "", "", 0),
+        (
+            r#"{"a":1} | [[(error("E2")) | key], 9]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | ([(error("E2")) | key], 7)"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | {k: [(error("E2")) | key]}"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | first([(error("E2")) | key])"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | (.a | key), [(error("E2")) | key]"#,
+            "\"a\"\n",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a | key), [(error("E2")) | key]]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (r#"{"a":1} | [(.a | key), 7]"#, "[\"a\",7]\n", "", 0),
+        (r#"{"a":1} | [(.a, .a) | key]"#, "[\"a\",\"a\"]\n", "", 0),
+        (
+            r#"{"a":1} | [(.a, .a) | path]"#,
+            "[[\"a\"],[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (r#"{"a":1} | [[(.a | key)], 9]"#, "[[\"a\"],9]\n", "", 0),
+    ] {
+        let (out, err, got) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), got),
+            (stdout, stderr, code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
