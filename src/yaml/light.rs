@@ -30,7 +30,7 @@ use super::index::YamlIndex;
 use super::line_break::{is_line_break, line_break_len, line_break_len_before};
 use super::scalar::{
     could_be_null_or_bool, is_preservable_float_literal, preservable_float_literal_text,
-    resolve_plain, resolve_plain_sourced, resolve_tagged, ResolvedScalar,
+    resolve_plain, resolve_plain_sourced, resolve_tagged, whole_float_as_int, ResolvedScalar,
 };
 use super::{starts_inline_seq_entry, starts_seq_entry};
 use crate::util::simd::escape::find_json_escape;
@@ -1635,12 +1635,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             // got its quotes silently dropped and its type corrupted into
             // a bare float (`1.5`) -- caught in review before merge.
             if s.is_unquoted() {
-                if let Some(f) = json_sourced_canonical_float(
+                if let Some(number) = json_sourced_canonical_float(
                     resolve_plain(&str_val),
                     &str_val,
                     self_.index.canonicalize_numbers(),
                 ) {
-                    return Ok(write!(out, "{f}")?);
+                    return Ok(number.write(out)?);
                 }
             }
             out.write_str(&str_val)?;
@@ -4304,9 +4304,28 @@ pub fn yq_float_is_scientific(f: f64) -> bool {
     magnitude != 0.0 && !(1e-4..1e6).contains(&magnitude)
 }
 
-/// If `canonicalize` and `resolved` is a finite `Float`, the value to
-/// re-serialize through bare `f64` `Display` instead of the scalar's own
-/// source-text spelling -- matching the DOM path's
+/// A JSON-sourced number as yq's JSON decoder produced it, ready to print
+/// (#996, #3577): an integer for a whole-valued float, else the float itself.
+#[derive(Clone, Copy)]
+enum CanonicalNumber {
+    Int(i64),
+    Float(f64),
+}
+
+impl CanonicalNumber {
+    /// Print the number: an integer exactly, a float through bare `f64`
+    /// `Display`.
+    #[inline]
+    fn write<W: core::fmt::Write>(self, out: &mut W) -> core::fmt::Result {
+        match self {
+            Self::Int(i) => write_i64(out, i),
+            Self::Float(f) => write!(out, "{f}"),
+        }
+    }
+}
+
+/// If `canonicalize` and `resolved` is a finite `Float`, the number to print
+/// instead of the scalar's own source-text spelling -- matching the DOM path's
 /// `to_owned_canonicalizing_numbers`/`OwnedValue::from_number_literal_plain`
 /// baseline for JSON-sourced input (#996), not real yq's own threshold-switching
 /// convention for *computed* floats ([`format_float_yq`], a different,
@@ -4318,14 +4337,18 @@ pub fn yq_float_is_scientific(f: f64) -> bool {
 /// through `canonicalize`'s only caller, but is still the semantically
 /// correct answer if it weren't).
 ///
-/// A zero is always the positive one (#3574). yq's JSON decoder turns a
-/// whole-number float into an integer, which has no sign for zero, so `-0`,
-/// `-0.0` and `-0e0` all print `0`, as the DOM path already does
-/// (`OwnedValue::from_number_literal_plain` takes any whole float to an
-/// `Int`). `-0` resolves as `Int(0)` for JSON, which the literal-preserving
-/// callers would echo as `-0`, so that case is answered here too, from the
-/// source text `str_val`: it is the only integer whose spelling differs from
-/// its value, and a plain `0` stays on the callers' own cheaper path.
+/// A whole-valued float is an integer (#3577, #3574): yq's JSON decoder turns
+/// `2.0`, `1e2`, `-0.0` and `1234567890123456789.0` into the integers `2`,
+/// `100`, `0` and `1234567890123456768` (Go's saturating `int64` round trip,
+/// [`whole_float_as_int`], the one definition the cursor route's typing
+/// [`resolve_plain_sourced`] and the DOM route's
+/// `OwnedValue::from_number_literal_plain` share). Printed through `f64`
+/// `Display` instead, a float past `2^53` pads zeros (`...456800`) where yq
+/// prints the integer's exact digits, and a zero keeps its sign. `-0` resolves
+/// as `Int(0)` for JSON, which the literal-preserving callers would echo as
+/// `-0`, so that case is answered here too, from the source text `str_val`: it
+/// is the only integer whose spelling differs from its value, and a plain `0`
+/// stays on the callers' own cheaper path.
 ///
 /// The single point every canonicalize-aware call site routes through
 /// (`stream_resolved_scalar_as_json`/`write_resolved_scalar_as_json`,
@@ -4336,20 +4359,24 @@ pub fn yq_float_is_scientific(f: f64) -> bool {
 /// JSON string that merely looked numeric, e.g. `"1.50"`, was silently
 /// reinterpreted as a bare float). Callers still own their own
 /// `is_unquoted()`/quoting-style checks -- this only answers "is the
-/// *value*, once you've already decided it's eligible, a float that needs
+/// *value*, once you've already decided it's eligible, a number that needs
 /// canonicalizing."
 #[inline]
 fn json_sourced_canonical_float(
     resolved: ResolvedScalar,
     str_val: &str,
     canonicalize: bool,
-) -> Option<f64> {
+) -> Option<CanonicalNumber> {
     match resolved {
-        // `f == 0.0` holds for both zeros; `0.0` is the positive one.
         ResolvedScalar::Float(f) if canonicalize && f.is_finite() => {
-            Some(if f == 0.0 { 0.0 } else { f })
+            Some(match whole_float_as_int(f) {
+                Some(i) => CanonicalNumber::Int(i),
+                None => CanonicalNumber::Float(f),
+            })
         }
-        ResolvedScalar::Int(0) if canonicalize && str_val.starts_with('-') => Some(0.0),
+        ResolvedScalar::Int(0) if canonicalize && str_val.starts_with('-') => {
+            Some(CanonicalNumber::Int(0))
+        }
         _ => None,
     }
 }
@@ -4902,8 +4929,8 @@ fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
     // path's already-canonicalized `Float` variant (`to_owned_canonicalizing_numbers`
     // in `yq_runner.rs`). Checked before the literal-preserving arms
     // below, which exist only for genuine YAML source text.
-    if let Some(f) = json_sourced_canonical_float(resolved, str_val, canonicalize) {
-        return write!(out, "{f}");
+    if let Some(number) = json_sourced_canonical_float(resolved, str_val, canonicalize) {
+        return number.write(out);
     }
     match resolved {
         ResolvedScalar::Null => out.write_str("null"),
@@ -9464,10 +9491,10 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
             // arm's pre-#996 behavior) is still the right answer, rather
             // than fabricating a YAML-specific non-finite spelling this
             // function has never needed before.
-            if let Some(f) =
+            if let Some(number) =
                 json_sourced_canonical_float(resolve_plain(&str_val), &str_val, canonicalize)
             {
-                return Ok(write!(out, "{f}")?);
+                return Ok(number.write(out)?);
             }
             // Source plain scalar: re-emit verbatim so both the scalar type and
             // its representation survive (`1`, `true`, `1.0`, `.5`, `yes`),

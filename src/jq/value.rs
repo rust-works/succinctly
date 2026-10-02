@@ -3332,9 +3332,10 @@ impl OwnedValue {
             // The rule is shared with the cursor route's JSON scalars
             // (`resolve_plain_sourced`), which typed these as floats until
             // #3577.
-            Some(NumberRepr::Float(f)) if crate::yaml::whole_float_as_int(f).is_some() => {
-                Self::Int(f as i64)
-            }
+            Some(NumberRepr::Float(f)) => match crate::yaml::whole_float_as_int(f) {
+                Some(i) => Self::Int(i),
+                None => Self::Float(f),
+            },
             repr => Self::plain_number_from_repr(repr),
         }
     }
