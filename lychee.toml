@@ -16,17 +16,18 @@ max_retries = 3
 retry_wait_time = 2
 accept = ["100..=399"]
 
-# These are regular expressions, not paths, and `.` matches any character, so
-# they skip any path with a character before `/target` or `/data`: not a
-# top-level `target/` or `data/` (which the glob spells without a leading `./`)
-# but, by accident, docs/optimizations/targets.md and
-# tests/data/bench-corpus/*.md. Carried over unchanged from the arguments this
-# file replaced; anchoring them would start checking those files (#3632).
+# Regular expressions, matched against the path as the glob spells it (no
+# leading `./`; `lychee .` spells one, which `^(\./)?` allows for). lychee's glob
+# ignores .gitignore, so the generated output a local build or benchmark run
+# leaves behind is listed by hand: cargo's `target/` at any depth (the top level,
+# bench-compare/, fuzz/) and the top-level `data/` (bench corpora and results).
+# Neither holds a tracked file, so CI never sees them; `tests/data/` is tracked
+# and is checked.
 #
 # The last entry is the first attempt's own report, which lists every failing
 # URL as a link, so the retry skips it (it does not exist yet during the first
 # attempt).
-exclude_path = ["./target", "./data", '(^|/)lychee/out\.md$']
+exclude_path = ['(^|/)target/', '^(\./)?data/', '(^|/)lychee/out\.md$']
 
 exclude = [
   '^https://crates\.io/crates/',
