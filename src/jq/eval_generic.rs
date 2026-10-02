@@ -27481,7 +27481,6 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Ltrimstr(_)
             | Builtin::Mktime
             | Builtin::Normals
-            | Builtin::NthStream(..)
             | Builtin::Nulls
             | Builtin::Numbers
             | Builtin::Objects
@@ -27572,14 +27571,16 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             Builtin::Min | Builtin::Max | Builtin::MinBy(_) | Builtin::MaxBy(_) => Extremum,
             // Navigation ([`owned_identity_nav_supported`]) and the stages
             // `eval_owned_identity_stages` answers itself: no rule to need.
-            // `skip(n; f)` (#3513) is `limit`'s twin here: its outputs are
-            // outputs of `f` at this position, so `f` runs through the pipe
-            // and each one carries its own identity, where a rule would
-            // place every one of them at the stage's input.
+            // `skip(n; f)` (#3513) and `nth(n; f)` (#3610) are `limit`'s
+            // twins here: their outputs are outputs of `f` at this position,
+            // so `f` runs through the pipe and each one carries its own
+            // identity, where a rule would place every one of them at the
+            // stage's input.
             Builtin::GetPath(_)
             | Builtin::First
             | Builtin::Last
             | Builtin::Nth(_)
+            | Builtin::NthStream(..)
             | Builtin::Skip(..)
             | Builtin::Recurse
             | Builtin::RecurseDown
@@ -27901,14 +27902,12 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
                     return false;
                 }
             }
-            Expr::Limit { n, expr } => {
-                if !owned_identity_stage_resolvable(n) || !body(expr) {
-                    return false;
-                }
-            }
-            // #3513: `skip(n; f)` is `limit`'s twin -- same count, same body,
-            // the first `n` outputs dropped rather than the rest.
-            Expr::Builtin(Builtin::Skip(n, expr)) => {
+            // #3513, #3610: `skip(n; f)` and `nth(n; f)` are `limit`'s twins
+            // -- same count, same body, a different window of its outputs.
+            // `Expr::NthExpr`, `nth`'s parser-unreachable spelling, has no
+            // rule either, so it stays refused here as it always was.
+            Expr::Limit { n, expr }
+            | Expr::Builtin(Builtin::Skip(n, expr) | Builtin::NthStream(n, expr)) => {
                 if !owned_identity_stage_resolvable(n) || !body(expr) {
                     return false;
                 }
@@ -29968,11 +29967,11 @@ fn eval_owned_identity_any_all<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// The outputs of a body that `limit`, `first` and `skip` deliver (#3513):
-/// the first `skip` are dropped, then at most `take` of the rest are
-/// delivered (all of them for `None`). `limit` and `first` drop none and
-/// `skip` bounds nothing, but any pair means the same thing -- drop, then
-/// take.
+/// The outputs of a body that `limit`, `first`, `skip` and `nth` deliver
+/// (#3513, #3610): the first `skip` are dropped, then at most `take` of the
+/// rest are delivered (all of them for `None`). `limit` and `first` drop none,
+/// `skip` bounds nothing and `nth` drops `n` and takes one, but any pair means
+/// the same thing -- drop, then take.
 #[derive(Clone, Copy)]
 struct OutputWindow {
     skip: usize,
@@ -30004,13 +30003,22 @@ impl OutputWindow {
             take: None,
         })
     }
+
+    /// `nth(n; body)` for the index `n_value`: the one output after `n`
+    /// dropped ones, and none at all when the body has fewer.
+    fn nth(n_value: OwnedValue) -> Result<Self, EvalError> {
+        Ok(Self {
+            skip: classify_nth_n(n_value)?,
+            take: Some(1),
+        })
+    }
 }
 
-/// `limit(n; body)` / `first(body)` / `skip(n; body)` over an owned value
-/// with identity: the body's outputs in `window`, each continued into `rest`
-/// before the next is pulled -- the same order `each_limit_with_n_generic`
-/// delivers. A dropped output is never continued, and never counts towards
-/// the window's `take`.
+/// `limit(n; body)` / `first(body)` / `skip(n; body)` / `nth(n; body)` over an
+/// owned value with identity: the body's outputs in `window`, each continued
+/// into `rest` before the next is pulled -- the same order
+/// `each_limit_with_n_generic` delivers. A dropped output is never continued,
+/// and never counts towards the window's `take`.
 fn eval_owned_identity_bounded<S: EvalSemantics, V: DocumentValue>(
     body: &Expr,
     window: OutputWindow,
@@ -30514,17 +30522,20 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 Err(control) => Flow::Escaped(control),
             }
         }
-        // #3513: `skip(n; body)` is `limit`'s twin -- the count is read and
-        // retried exactly as `limit`'s is, and the body runs through this
-        // pipe so each output in the window keeps its own identity. `skip`
-        // used to be a ruled stage, which placed every output at the
-        // stage's *input* (`.a | skip(1; .b[]) | key` was `"a"`, not `1`).
-        Expr::Limit { n, expr } | Expr::Builtin(Builtin::Skip(n, expr)) => {
+        // #3513, #3610: `skip(n; body)` and `nth(n; body)` are `limit`'s
+        // twins -- the count is read and retried exactly as `limit`'s is, and
+        // the body runs through this pipe so each output in the window keeps
+        // its own identity. They used to be ruled stages, which placed every
+        // output at the stage's *input* (`.a | skip(1; .b[]) | key` was
+        // `"a"`, not `1`).
+        Expr::Limit { n, expr }
+        | Expr::Builtin(Builtin::Skip(n, expr) | Builtin::NthStream(n, expr)) => {
             let window_of: fn(OwnedValue) -> Result<OutputWindow, EvalError> =
-                if matches!(strip_parens(stage), Expr::Builtin(Builtin::Skip(..))) {
-                    OutputWindow::skip
-                } else {
-                    OutputWindow::limit
+                match strip_parens(stage) {
+                    Expr::Limit { .. } => OutputWindow::limit,
+                    Expr::Builtin(Builtin::Skip(..)) => OutputWindow::skip,
+                    Expr::Builtin(Builtin::NthStream(..)) => OutputWindow::nth,
+                    _ => unreachable!("the arm's pattern admits `limit`, `skip` and `nth` only"), // omni-dev: coverage tolerate-line reason="unreachable: the arm's or-pattern admits Expr::Limit, Builtin::Skip and Builtin::NthStream only, and each has its own arm above (#3610)"
                 };
             let escaped = core::cell::RefCell::new(None);
             let resolved =

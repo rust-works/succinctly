@@ -62419,7 +62419,9 @@ fn test_identity_pass_constructs_jq_2416() -> anyhow::Result<()> {
         (".a.b | first(parent) | key", "\"a\""),
         (".a.b | last(key, parent) | key", "\"a\""),
         (".a.b | last(parent) | key", "\"a\""),
-        (".a.b | nth(1; key, parent) | key", "\"b\""),
+        // #3610: `nth` delivers the `parent` and places it at the ancestor, as
+        // `last(key, parent)` above does (it printed `"b"`, the stage's input).
+        (".a.b | nth(1; key, parent) | key", "\"a\""),
         (
             ".a.b | if key == \"b\" then parent else \"y\" end | key",
             "\"a\"",
@@ -62697,7 +62699,9 @@ fn test_walk_residue_constructs_jq_2416() -> anyhow::Result<()> {
 \"m\"
 \"s\"
 \"u\"", 0),
-        (".a | nth(0; .[]) | key", "\"a\"", 0),
+        // #3610: the element's own key, as pinned jq 1.7.1's `path(.a | nth(0;
+        // .[]))` (`["a","b"]`) and `first(.[])` say (it printed `"a"`).
+        (".a | nth(0; .[]) | key", "\"b\"", 0),
         // recursive descent
         ("[.. | key]", "[\"a\",\"b\",\"e\",\"c\",0,1,\"n\",\"m\",\"s\",\"u\"]", 0),
         ("[.. | path]", "[[],[\"a\"],[\"a\",\"b\"],[\"a\",\"e\"],[\"c\"],[\"c\",0],[\"c\",1],[\"n\"],[\"m\"],[\"s\"],[\"u\"]]", 0),
@@ -83411,6 +83415,23 @@ const RETRY_ROWS_OWNED_IDENTITY_3293: &[RetryRow3293] = &[
         "skip doesn't support negative count",
         5,
     ),
+    // #3610, pinned jq 1.7.1: `path(nth(K; .a[])) | last`, `K`'s retry
+    // answering `1`, so the delivered element is `.a[1]`
+    (
+        r#"nth(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then error("E") else 1 end); .a[]) | key"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    // #3610: the retry's own negative index surfaces, not the abandoned `E`
+    (
+        r#"nth(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then error("E") else -1 end); .a[]) | key"#,
+        "",
+        "AA",
+        "nth doesn't support negative indices",
+        5,
+    ),
 ];
 
 #[test]
@@ -83628,6 +83649,183 @@ fn test_skip_errors_in_dropped_and_delivered_positions_3513() -> Result<()> {
                 "`{filter}` ({route} route): stderr {stderr:?}"
             );
         }
+    }
+    Ok(())
+}
+
+/// #3610: `nth(n; f) | key` (and `| path`) names the position of the element
+/// it delivers, as `limit`'s and `skip`'s twins do. `nth` was a ruled stage
+/// on the owned-identity walk, which placed its output at the stage's *input*
+/// (`.a | nth(1; .b[]) | key` was `"a"`), and the cursor route reached the
+/// same rule once its pipe left the cursor domain at the `nth` stage, so both
+/// routes were wrong. Each row runs on both routes -- `-n` with the document
+/// as a prefix builds an owned value, the document on stdin keeps the cursor
+/// -- and every expectation is the pinned jq 1.7.1's `[path(F) | last]` and
+/// `[path(F)]`.
+#[test]
+fn test_nth_key_and_path_name_the_delivered_element_on_both_routes_3610() -> Result<()> {
+    let doc = r#"{"a":{"b":[10,20,30,40],"c":{"x":1,"y":2,"z":3}},"d":[1,[2,3],4]}"#;
+    for (filter, keys, paths) in [
+        (r".a | nth(1; .b[])", r"[1]", r#"[["a","b",1]]"#),
+        (r".a | nth(0; .b[])", r"[0]", r#"[["a","b",0]]"#),
+        (r".a | nth(3; .b[])", r"[3]", r#"[["a","b",3]]"#),
+        (r".a | nth(4; .b[])", r"[]", r"[]"),
+        (r".a | nth(1; .c[])", r#"["y"]"#, r#"[["a","c","y"]]"#),
+        (
+            r".a | nth(0, 2; .b[])",
+            r"[0,2]",
+            r#"[["a","b",0],["a","b",2]]"#,
+        ),
+        (r".a | nth(1.5; .b[])", r"[2]", r#"[["a","b",2]]"#),
+        (r".d | nth(1; .[1][])", r"[1]", r#"[["d",1,1]]"#),
+        (r".a | nth(1; .b[], .c[])", r"[1]", r#"[["a","b",1]]"#),
+        (r".a | nth(4; .b[], .c[])", r#"["x"]"#, r#"[["a","c","x"]]"#),
+        (r".a | nth(1; limit(3; .b[]))", r"[1]", r#"[["a","b",1]]"#),
+        (r".a | limit(3; nth(1; .b[]))", r"[1]", r#"[["a","b",1]]"#),
+        (r".a | first(nth(1; .b[]))", r"[1]", r#"[["a","b",1]]"#),
+    ] {
+        for (tail, expected) in [("key", keys), ("path", paths)] {
+            let collected = format!("[{filter} | {tail}]");
+            let (stdout, stderr, code) = run_jq_full(&["-c", &collected], Some(doc))?;
+            assert_eq!(
+                (stdout.trim_end(), code),
+                (expected, 0),
+                "`{collected}` (cursor route): stderr {stderr:?}"
+            );
+            let owned = format!("{doc} | {collected}");
+            let (stdout, stderr, code) = run_jq_full(&["-nc", &owned], None)?;
+            assert_eq!(
+                (stdout.trim_end(), code),
+                (expected, 0),
+                "`{owned}` (owned route): stderr {stderr:?}"
+            );
+        }
+    }
+    // `nth` composed with `skip`: jq 1.7.1 has no `skip`, so these two rows are
+    // jq 1.8.2's `[path(F) | last]`.
+    for (filter, expected) in [
+        (".a | nth(1; skip(1; .b[]))", "[2]"),
+        (".a | skip(1; nth(0; .b[]))", "[]"),
+    ] {
+        let collected = format!("[{filter} | key]");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &collected], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{collected}` (cursor route): stderr {stderr:?}"
+        );
+        let owned = format!("{doc} | {collected}");
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &owned], None)?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{owned}` (owned route): stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3610: `nth(n; f)` pulls its body no further than index `n`, an error the
+/// body raises at a dropped position surfaces before anything is delivered,
+/// and one raised downstream of the delivered element still propagates -- on
+/// both routes, as the pinned jq 1.7.1's `path(nth(...))` does.
+#[test]
+fn test_nth_laziness_and_error_placement_3610() -> Result<()> {
+    let doc = r#"{"a":{"b":[10,20,30,40]}}"#;
+    for (filter, expected_stdout, expected_code, expected_error) in [
+        // jq 1.7.1: `path(.a | nth(1; .b[0], .b[1], error("E"))) | last` is `1`,
+        // never reaching the `error`
+        (
+            r#".a | nth(1; .b[0], .b[1], error("E")) | key"#,
+            "1\n",
+            0,
+            "",
+        ),
+        // jq 1.7.1: the error at the first, dropped, position surfaces
+        (
+            r#".a | nth(1; .b[] | if . == 10 then error("E") else . end) | key"#,
+            "",
+            5,
+            ": E",
+        ),
+        // jq 1.7.1: an error downstream of the delivered element propagates
+        (
+            r#".a | nth(1; .b[]) | if key == 1 then error("tail") else key end"#,
+            "",
+            5,
+            ": tail",
+        ),
+    ] {
+        let owned = format!("{doc} | {filter}");
+        for ((stdout, stderr, code), route) in [
+            (run_jq_full(&["-nc", &owned], None)?, "owned"),
+            (run_jq_full(&["-c", filter], Some(doc))?, "cursor"),
+        ] {
+            assert_eq!(
+                (stdout.as_str(), code),
+                (expected_stdout, expected_code),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains(expected_error),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3610, yq mode: `nth` is not yq syntax (yq v4.53.3's lexer rejects it;
+/// `--jq-extensions` opts into succinctly's jq surface), so there is no yq
+/// oracle for it and the rule is `limit`'s and `skip`'s -- an output keeps
+/// the position of the element `nth` delivered, on the owned route (`-n`) as
+/// on the cursor route.
+#[test]
+fn test_nth_key_names_the_delivered_element_in_yq_mode_3610() -> Result<()> {
+    let doc = r#"{"a":{"b":[1,2,3]}}"#;
+    let cursor_doc = "a:\n  b: [1, 2, 3]\n";
+    for (filter, expected) in [
+        (".a | [nth(1; .b[]) | key]", "[1]"),
+        (".a | [nth(1; .b[]) | path]", r#"[["a","b",1]]"#),
+    ] {
+        let owned = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args([
+                "yq",
+                "--jq-extensions",
+                "-n",
+                "-o",
+                "json",
+                "-I",
+                "0",
+                &format!("{doc} | {filter}"),
+            ])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&owned.stderr);
+        assert_eq!(
+            String::from_utf8_lossy(&owned.stdout).trim_end(),
+            expected,
+            "#3610 (yq, owned): `{filter}`: stderr={stderr:?}"
+        );
+        let cursor = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(cursor_doc.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        let stderr = String::from_utf8_lossy(&cursor.stderr);
+        assert_eq!(
+            String::from_utf8_lossy(&cursor.stdout).trim_end(),
+            expected,
+            "#3610 (yq, cursor): `{filter}`: stderr={stderr:?}"
+        );
     }
     Ok(())
 }

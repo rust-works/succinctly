@@ -706,8 +706,8 @@ and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` 
   (`resolve_seq_stage`) compares the whole `select(...)` rather than its condition, so
   `path(.a | select([1] as $q ?// $b | $q) | error("E"))` keeps the first alternative's `E`
   in `no_std`.
-- **`key` after `if`/`limit`/`skip` over an owned input** takes the owned-identity walk, which
-  collected the condition's (or count's) outputs before running the branch, so a `?//` in it
+- **`key` after `if`/`limit`/`skip`/`nth` over an owned input** takes the owned-identity walk,
+  which collected the condition's (or count's) outputs before running the branch, so a `?//` in it
   never retried (`{"a":{"a":1}} | (if ([1] as $q ?// $b | $q) then error("E") else .a end) |
   key` raised `E` after a single attempt; the cursor route prints `"a"`). The branch now runs
   inside the condition's own sink (`owned_identity_drive_each`, #3293 slice 9). `key` is a
@@ -718,7 +718,14 @@ and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` 
   `path(...)` answer `1` and `[1,2]`. Its count is read and retried exactly as `limit`'s is.
   `skip` is a jq 1.8 builtin and the pinned jq 1.7.1 does not define it, so there is no pinned
   oracle for these rows: they follow jq 1.8.2 (Homebrew), the same stand-in `classify_skip_n`
-  documents, until the pin moves (#1880).
+  documents, until the pin moves (#1880). `nth(n; f)` is the third twin (#3610), and the pinned
+  jq 1.7.1 does define it: `{"a":{"b":[1,2,3]}} | .a | nth(1; .b[]) | key` was `"a"` where
+  `path(...)` answers `1`, because `nth` too was an opaque stage placing every output at the
+  stage's input -- on *both* routes. The cursor route's `path_context_step_generic` has `limit`
+  and `skip` arms but no `nth` arm, so a pipe there leaves the cursor domain at the `nth` stage
+  and is answered by this same owned walk, which is why one change fixed both. It delivers the
+  one output after `n` dropped ones (none when the body has fewer), with `classify_nth_n`'s own
+  count rules.
 - **An owned-input `[... | key]` collector prints the array it had collected after the error its
   body raises** (#3512), and on the cursor route `limit(1; .[] | <retrying body>) | key` runs the
   `?//` retry past `limit`'s own stop (#3514). Neither is a stale slot.
