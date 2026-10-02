@@ -9137,18 +9137,22 @@ own source is parsed with no shadow-candidate seeding
 stream binds to the `$`-variable, scoped exactly as jq scopes it -- a module's own data
 import is visible only inside that module's own def bodies, never to an includer's
 unrelated scope, and a top-level one shadows a same-named `--arg`/`--argjson` entirely.
-Two recorded divergences. First, the detail text on a data file that exists but fails to
-parse as JSON: jq's own message comes from its C parser (`Invalid numeric literal at
+One recorded divergence: the detail text on a data file that exists but fails to
+parse as JSON. jq's own message comes from its C parser (`Invalid numeric literal at
 line 1, column 4`); succinctly's is its own JSON reader's wording, the same fidelity limit
-already recorded above for a module body's own parse failures. Second, when a data
-import's own read/parse failure and an unrelated *earlier* directive's resolution failure
-both occur in the same program, jq reports both (confirmed live: `include "missing";
-import "bad" as $d; $d` prints the data-file error *and* `module not found: missing`);
-succinctly reports only the earlier one, since nothing here actually attempts the data
-file's load once an earlier directive has already failed to resolve. Filed as
-[#3327](https://github.com/rust-works/succinctly/issues/3327) rather than fixed inline: it
-needs an independent failure channel alongside the existing "last unresolvable directive"
-merge (#2857), not a fix at this call site alone.
+already recorded above for a module body's own parse failures.
+
+Every data import's read/parse failure is reported, and in jq's order
+([#3327](https://github.com/rust-works/succinctly/issues/3327)). jq walks the directives
+last-declared first: a data-file failure is printed and the walk goes on (and counts), while
+a missing module stops it. So a data import declared *before* the stopping directive is never
+read (`import "bad" as $d; include "missing"; $d` prints only `module not found: missing`),
+one declared after it is reported ahead of it under the module's own `1 compile error`
+(`include "missing"; import "bad" as $d; $d`), and with no missing module the trailer counts
+every failure (`2 compile errors`). A module's own *syntax error* is not handled this way yet:
+jq goes on past it and counts it (`include "synerr"; import "bad" as $d; $d` is
+`2 compile errors`, data error first), where succinctly still reports the syntax error alone.
+A module cycle keeps #2865's divergence.
 
 **A module body seeing names it should not** — `~/.jq`'s defs, and sibling `include`d and
 `import`ed modules' defs in a declaration-order-dependent way — **is closed**
