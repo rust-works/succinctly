@@ -287,6 +287,27 @@ fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) ->
     }
 }
 
+/// Whether `value` is a number scalar of a JSON-sourced document (#3597), whose
+/// `length` is the width of the number yq's JSON decoder produced rather than of
+/// the source spelling `as_str` hands back.
+///
+/// yq's decoder drops the spelling: `2.0` is the integer `2` (width 1), `1e5` is
+/// `100000` (6), and `1e20` stays a float that prints `1e+20` (5), where the
+/// source text is 3, 3 and 4 wide. A YAML document is not asked: go-yaml keeps a
+/// scalar's source text as its value, so `a: 2.0` is width 3 in yq and here
+/// (`canonicalize_numbers` is false). A quoted string, a boolean and a null are
+/// not numbers (`as_f64` reads only an unquoted scalar that resolves to one).
+///
+/// `Builtin::Length` skips its `as_str` arm for such a value and answers from
+/// the numeric arms below it, which share [`numeric_length_owned`] with the
+/// owned-number path, so there is one definition of what a cursor's number
+/// decodes to rather than two. An integer past `2^53` is measured as written,
+/// as it is printed: yq rounds it through `float64` first, which changes the
+/// printed digits and so the width (#3605).
+fn is_json_sourced_number<V: DocumentValue>(value: &V, cursor: Option<&V::Cursor>) -> bool {
+    cursor.is_some_and(DocumentCursor::canonicalize_numbers) && value.as_f64().is_some()
+}
+
 /// [`OwnedValue::from_document_float`] for a double read from `value`, except
 /// a NaN jq parsed from the document keeps the instance identity jq's `==`
 /// compares it by (#3309), keyed by the token's address.
@@ -25365,7 +25386,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Length => {
             if cursor_is_null(&value, cursor.as_ref()) {
                 GenericResult::Owned(OwnedValue::Int(0))
-            } else if let Some(s) = value.as_str() {
+            } else if let Some(s) = value
+                .as_str()
+                // A JSON number's `as_str` is its source spelling, which is
+                // not what yq measures: it declines here and the numeric arms
+                // below answer (#3597).
+                .filter(|_| !is_json_sourced_number(&value, cursor.as_ref()))
+            {
                 GenericResult::Owned(OwnedValue::Int(s.chars().count() as i64))
             } else if let Some(elements) = value.as_array() {
                 // #2261: `_checked` refuses a trailing stray comma after a
@@ -25411,7 +25438,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 }
             } else if let Some(i) = value.as_i64() {
                 // Reached only for a value with no source text of its own
-                // to answer from (`as_str()` above already declined) --
+                // to answer from (`as_str()` above already declined), or a
+                // JSON-sourced number whose source text is not what yq
+                // measures (#3597) --
                 // `numeric_length_owned`'s doc comment (`eval.rs`) has the
                 // full jq-vs-yq rule and why it's one shared definition
                 // (#2453).

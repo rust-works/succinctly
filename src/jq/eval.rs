@@ -17759,13 +17759,17 @@ pub(crate) fn owned_to_string<S: EvalSemantics>(value: &OwnedValue) -> String {
 /// (CLAUDE.md's "duplicated predicates diverge silently" case, and this
 /// exact issue's own root cause: the two sites already had drifted).
 ///
-/// yq's cursor-backed path gets its own rule "for free" without ever
-/// calling this: a YAML scalar's raw source text is a `String` in that
-/// representation regardless of its resolved type, so `Length`'s
+/// yq's cursor-backed path over a *YAML* document gets its own rule "for
+/// free" without calling this: a YAML scalar's raw source text is a `String`
+/// in that representation regardless of its resolved type, so `Length`'s
 /// `as_str()` check fires before either arm's numeric fallback runs, and
 /// the string arm's plain `chars().count()` already answers with the
 /// source spelling's width (confirmed live: `1e3`/`!!float 2` both answer
 /// with their raw text's width, not a re-rendering of the parsed value).
+/// A *JSON* document is the exception (#3597): yq's JSON decoder keeps no
+/// spelling, so `Length` declines the string arm for a JSON-sourced number
+/// (`is_json_sourced_number`, `eval_generic.rs`) and the numeric fallbacks
+/// reach this function, as a computed number does.
 /// This function is the *owned* counterpart for a value with no source
 /// text left to read -- computed via arithmetic, or threaded through an
 /// array/object literal, `to_entries`, a comma fan-out, ... (all of which
