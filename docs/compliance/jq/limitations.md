@@ -706,17 +706,22 @@ and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` 
   (`resolve_seq_stage`) compares the whole `select(...)` rather than its condition, so
   `path(.a | select([1] as $q ?// $b | $q) | error("E"))` keeps the first alternative's `E`
   in `no_std`.
-- **`key` after `if`/`limit` over an owned input** takes the owned-identity walk, which
+- **`key` after `if`/`limit`/`skip` over an owned input** takes the owned-identity walk, which
   collected the condition's (or count's) outputs before running the branch, so a `?//` in it
   never retried (`{"a":{"a":1}} | (if ([1] as $q ?// $b | $q) then error("E") else .a end) |
   key` raised `E` after a single attempt; the cursor route prints `"a"`). The branch now runs
   inside the condition's own sink (`owned_identity_drive_each`, #3293 slice 9). `key` is a
-  succinctly extension, so the oracle is jq's `path()` spelling.
-- **`skip(n; f) | key` over an owned input** names the input's key, not the skipped-to
-  element's, with or without a `?//` (#3513); an owned-input `[... | key]` collector prints the
-  array it had collected after the error its body raises (#3512); and on the cursor route
-  `limit(1; .[] | <retrying body>) | key` runs the `?//` retry past `limit`'s own stop (#3514).
-  None is a stale slot.
+  succinctly extension, so the oracle is jq's `path()` spelling. `skip(n; f)` runs through the
+  walk as `limit`'s twin (#3513): it had been an opaque stage that placed every output at the
+  stage's *input*, so `{"a":{"b":[1,2]}} | .a | skip(1; .b[]) | key` was `"a"`, and
+  `[1,2,3] | [skip(1; .[]) | key]` was `[]`, where the cursor route and jq 1.8.2's
+  `path(...)` answer `1` and `[1,2]`. Its count is read and retried exactly as `limit`'s is.
+  `skip` is a jq 1.8 builtin and the pinned jq 1.7.1 does not define it, so there is no pinned
+  oracle for these rows: they follow jq 1.8.2 (Homebrew), the same stand-in `classify_skip_n`
+  documents, until the pin moves (#1880).
+- **An owned-input `[... | key]` collector prints the array it had collected after the error its
+  body raises** (#3512), and on the cursor route `limit(1; .[] | <retrying body>) | key` runs the
+  `?//` retry past `limit`'s own stop (#3514). Neither is a stale slot.
 - **`limit` raises its own error for a non-number count, at the count** (#3486): `path(limit(([1]
   as $q ?// $b | $q); .a))` is `["a"]` in jq 1.7.1 -- its `$n - 1` fails downstream of the count,
   so the `?//` retries to a `null` (unlimited) count -- and "limit requires non-negative
