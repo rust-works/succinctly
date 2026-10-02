@@ -542,6 +542,42 @@ at all. The justification is the spec target, which is why the case belongs here
 Representative cases, each live-verified. These are gaps to close, listed here so they are
 not rediscovered from scratch.
 
+### String style of JSON-sourced output — closed on the streaming route (#3575); four gaps remain
+
+`yq -p json -o yaml` writes every string and key in go-yaml's own style, not the JSON text's:
+`{"name":"a","n":["x","1"]}` is `name: a` / `n:` / `- x` / `- "1"`, where this route used to echo
+JSON's double quotes on every key and string (`"name": "a"`). A JSON string has no YAML style of
+its own, so the cursor route now asks `yaml::encode_style::go_yaml_string_style`, a port of the
+encoder's choice captured from yq v4.53.3 rather than read from go-yaml's source: **double**
+quotes for a string that would read back as another type (`"1"`, `"true"`, `"null"`, `"0x1f"`,
+`"1_000"`, `"2001-12-14"`, `"<<"`, `""`) or that holds a character the emitter will not write raw
+(a tab, a control character, U+007F, the C1 block, U+FEFF, any character outside the BMP as
+`\U0001F600`); **single** quotes where plain would not read back (`'- x'`, `'a: b'`, `'a #b'`,
+`'#x'`, `'x '`, `'---'`); plain otherwise (`yes`, `no`, `on`, `inf`, `12:30:45` stay plain, as
+they do in yq). A string that *starts* with U+FEFF has every following character escaped as
+well, which yq does and nothing else explains. Checked against about 30,000 random strings,
+values and keys, with no difference, and pinned by the `json_string_style_*_3575` goldens.
+
+Still open, each separate from this fix:
+
+- **A string with a line break** ([#3587](https://github.com/rust-works/succinctly/issues/3587)) (`\n`, `\r`, U+0085, U+2028, U+2029). yq writes a literal block
+  for a value (`k: |-` / `  a` / `  b`) and `? ` explicit-key syntax for a key; this route, like
+  `-P`, writes the escaped double-quoted form (`"a\nb"`). The style function declines these
+  (`None`) so the old text is unchanged.
+- **A key over 128 bytes** (also #3587). yq writes `? key` / `: value`; this route writes an ordinary key.
+- **The DOM route** ([#3588](https://github.com/rust-works/succinctly/issues/3588)): `-P`, every
+  write or reshaping filter (`del(.a)`, `.a = "1"`, `sort_keys(.)`, `with_entries(.)`, a slice,
+  `. *= {...}`, `style="flow"`), and a string computed by a filter (`{"k": (.k + "")}`) quote
+  with their own heuristics (`yaml_quote_string` and `yaml_quote_key` in `yq_runner.rs`,
+  `needs_yaml_quoting` in `jq/stream.rs`), so the same string is styled one way under an identity
+  filter and another under `del(.a)`. On the 223-string battery they agree with yq on 132
+  (`-P`) and 133 (computed) of the values, and `-P` on 88 of the keys: single against double
+  quotes, base-prefixed numbers, bare `inf`/`nan`, and a date or a number-shaped key written bare
+  (`d: 2001-12-14` and `1: "2"` read back as a timestamp and an integer key, where yq quotes
+  both). They could take `go_yaml_string_style` as it is.
+- **A JSON surrogate-pair escape** ([#3589](https://github.com/rust-works/succinctly/issues/3589)) (`"\ud83d\ude00"`) fails with `invalid escape sequence`,
+  where yq decodes it. The YAML double-quoted grammar has no such pair; a raw `😀` is fine.
+
 ### The `---` between results is per-run, not per-node as real yq's printer makes it (#2427)
 
 Real yq's printer decides the `---` separator **per output node**, from two fields the node

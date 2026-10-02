@@ -1,0 +1,13 @@
+lf: |-
+  x
+  y
+trailing: |
+  p
+only: |+
+
+leading: |-
+
+  a
+crlf: "a\r\nb"
+nel: "a\Nb"
+ls: 'a   b'

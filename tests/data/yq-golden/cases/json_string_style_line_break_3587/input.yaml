@@ -1,0 +1,9 @@
+{
+  "lf": "x\ny",
+  "trailing": "p\n",
+  "only": "\n",
+  "leading": "\na",
+  "crlf": "a\r\nb",
+  "nel": "a\u0085b",
+  "ls": "a\u2028b"
+}
