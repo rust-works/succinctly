@@ -256,8 +256,32 @@ pub fn resolve_plain_sourced(s: &str, json_sourced: bool) -> ResolvedScalar {
     // compare, not a string compare, on the streaming hot path.
     match resolve_plain(s) {
         ResolvedScalar::Int(0) if !json_sourced && s == "-0" => ResolvedScalar::Float(-0.0),
+        // #3577: yq's JSON decoder types a whole-valued float as an integer
+        // (`2.0`, `1e2` and `-0.0` are `!!int`), where go-yaml keeps it a
+        // float. A YAML document's `2.0` is untouched.
+        ResolvedScalar::Float(f) if json_sourced => {
+            whole_float_as_int(f).map_or(ResolvedScalar::Float(f), ResolvedScalar::Int)
+        }
         resolved => resolved,
     }
+}
+
+/// The integer yq's JSON decoder reads a whole-valued float as, or `None` for a
+/// float it keeps (#2902, #3577).
+///
+/// Go's `f == float64(int64(f))` with a saturating cast, which Rust's `as` also
+/// is: `1.0`, `1e2`, `-0.0` and `20000000000.0` are integers, as is
+/// `9223372036854775808.0` (it saturates to `9223372036854775807`, whose
+/// `float64` is itself), while `1e19`, `1e300`, `2.5` and every non-finite
+/// value stay floats. Captured live from yq v4.53.3 with `-p json`.
+///
+/// The single definition both routes share: the DOM route
+/// (`OwnedValue::from_number_literal_plain`) and the cursor route
+/// ([`resolve_plain_sourced`]) typed these differently until #3577.
+#[must_use]
+#[inline(always)]
+pub(crate) fn whole_float_as_int(f: f64) -> Option<i64> {
+    (f.is_finite() && (f as i64) as f64 == f).then_some(f as i64)
 }
 
 #[inline(always)]
@@ -704,6 +728,32 @@ mod tests {
     #[track_caller]
     fn assert_resolves(input: &str, expected: ResolvedScalar) {
         assert_eq!(resolve_plain(input), expected, "input: {input:?}");
+    }
+
+    /// #3577: Go's saturating `f == float64(int64(f))`, every row from yq
+    /// v4.53.3 with `-p json` (`.x | tag`).
+    #[test]
+    fn whole_float_as_int_follows_gos_saturating_round_trip_3577() {
+        for (f, want) in [
+            (1.0, Some(1)),
+            (-0.0, Some(0)),
+            (1e2, Some(100)),
+            (20_000_000_000.0, Some(20_000_000_000)),
+            (-5.0, Some(-5)),
+            // Saturates to `i64::MAX`, whose `float64` is the input itself.
+            (9_223_372_036_854_775_808.0, Some(i64::MAX)),
+            (-9_223_372_036_854_775_808.0, Some(i64::MIN)),
+            (1e19, None),
+            (1e20, None),
+            (1e300, None),
+            (2.5, None),
+            (-0.5, None),
+            (f64::INFINITY, None),
+            (f64::NEG_INFINITY, None),
+            (f64::NAN, None),
+        ] {
+            assert_eq!(whole_float_as_int(f), want, "{f}");
+        }
     }
 
     #[test]

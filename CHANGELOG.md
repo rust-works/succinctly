@@ -422,6 +422,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **yq: a whole-number JSON float is an integer, as in yq** (#3577). yq's JSON decoder types `2.0`,
+  `1e2`, `-0.0` and `9223372036854775808.0` as `!!int`, and keeps `2.5`, `1e19`, `1e20` and `1e300`
+  `!!float`. The cursor route typed every one of them a float, so `.p | tag`, `type`,
+  `.arr[] | tag` and `.. | select(tag == "!!int")` saw a different document than the DOM route
+  (`-P`, `--inplace`, a multi-document file) already did. The streaming printers had the same gap
+  in YAML output: a whole float past `2^53` printed `f64` `Display`'s padded zeros
+  (`1234567890123456789.0` as `1234567890123456800`, `9223372036854775808.0` as
+  `9223372036854776000`) where yq prints the integer (`1234567890123456768`,
+  `9223372036854775807`). The typing and every printing path now share one definition
+  (`whole_float_as_int`, Go's saturating `f == float64(int64(f))`), and a test pins the cursor and
+  DOM routes against each other over a sweep of literals. A YAML document's `2.0` is untouched:
+  go-yaml keeps it a float.
+
 - **jq: a terminal `null`/`true`/`false` after a navigation no longer writes over the document
   root** (#3579). On a `null` document, `(.a as $x | .a | 5 | first(7) | $x) = 9` wrote `9` where jq
   writes `{"a":9}`, and `path(.a as $x | .a | 5 | select(true) | $x)` answered `[]` where jq says

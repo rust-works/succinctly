@@ -50608,3 +50608,160 @@ fn test_yq_json_sourced_negative_zero_prints_unsigned_3574() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3577: yq's JSON decoder types a whole-valued float as an integer (`2.0`,
+/// `1e2`, `-0.0` and `9223372036854775808.0` are `!!int`), where a float with
+/// a fraction, or one past `i64`'s exact range (`1e19`, `1e20`, `1e300`), stays
+/// `!!float`. The cursor route typed every one of them a float, so `tag`, `type`,
+/// `length`-of-type and any `select(tag == ...)` saw a different document than
+/// the DOM route (`-P`, `--inplace`, a multi-document file) already did.
+/// Every expected value is yq v4.53.3's.
+#[test]
+fn test_yq_json_sourced_whole_float_is_an_integer_3577() -> Result<()> {
+    let json = r#"{"p":2.0,"n":-0.0,"e":1e2,"z":0.0,"neg":-5.0,"m":9223372036854775808.0,"big":1e20,"h":1e19,"g":1e300,"f":2.5,"i":3,"s":"2.0","arr":[1.0,2.5,1e2],"nested":{"x":4.0}}"#;
+    for (filter, expected) in [
+        (r".p|tag", "\"!!int\"\n"),
+        (r".n|tag", "\"!!int\"\n"),
+        (r".e|tag", "\"!!int\"\n"),
+        (r".z|tag", "\"!!int\"\n"),
+        (r".neg|tag", "\"!!int\"\n"),
+        (r".m|tag", "\"!!int\"\n"),
+        (r".big|tag", "\"!!float\"\n"),
+        (r".h|tag", "\"!!float\"\n"),
+        (r".g|tag", "\"!!float\"\n"),
+        (r".f|tag", "\"!!float\"\n"),
+        (r".i|tag", "\"!!int\"\n"),
+        (r".s|tag", "\"!!str\"\n"),
+        (r".arr[]|tag", "\"!!int\"\n\"!!float\"\n\"!!int\"\n"),
+        (r".nested.x|tag", "\"!!int\"\n"),
+        (r".p|type", "\"!!int\"\n"),
+        (
+            r"[.p, .e, .f] | map(tag)",
+            "[\"!!int\",\"!!int\",\"!!float\"]\n",
+        ),
+        (
+            r#".. | select(tag == "!!int") | ."#,
+            "2\n0\n100\n0\n-5\n9223372036854775807\n3\n1\n100\n4\n",
+        ),
+        (
+            r#". | to_entries | map(select(.value | tag == "!!int")) | map(.key)"#,
+            "[\"p\",\"n\",\"e\",\"z\",\"neg\",\"m\",\"i\"]\n",
+        ),
+        (r".p == 2", "true\n"),
+        (r".p + 1", "3\n"),
+        (r".arr | map(. + 0)", "[1,2.5,100]\n"),
+        (r".p | tostring", "\"2\"\n"),
+    ] {
+        let (stdout, code) =
+            run_yq_stdin(filter, json, &["--input-format", "json", "-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, expected, "`{filter}` on a JSON document");
+    }
+
+    // Must not change: go-yaml keeps a YAML document's whole float a float, so
+    // the same literals typed through the YAML decoder stay `!!float`.
+    let yaml = "a: 2.0\nb: 1e2\nc: -0.0\nd: 2.5\ne: 3\nf: 1e20\ng: [1.0, 2.0]\n";
+    for (filter, expected) in [
+        (r".a|tag", "\"!!float\"\n"),
+        (r".b|tag", "\"!!float\"\n"),
+        (r".c|tag", "\"!!float\"\n"),
+        (r".d|tag", "\"!!float\"\n"),
+        (r".e|tag", "\"!!int\"\n"),
+        (r".f|tag", "\"!!float\"\n"),
+        (r".g[]|tag", "\"!!float\"\n\"!!float\"\n"),
+        (r".a + 1", "3.0\n"),
+        (r".a == 2", "false\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, expected, "`{filter}` on a YAML document");
+    }
+    Ok(())
+}
+
+/// #3577: a whole-valued JSON float *prints* as the integer yq decodes it to,
+/// in YAML and JSON output alike. Past `2^53` the old `f64` `Display` padded
+/// zeros (`1234567890123456789.0` was `1234567890123456800`, yq's
+/// `1234567890123456768`, and `9223372036854775808.0` was `9223372036854776000`,
+/// yq's `9223372036854775807`), which the cursor route's printer still did after
+/// its typing was fixed. Every expected value is yq v4.53.3's.
+#[test]
+fn test_yq_json_sourced_whole_float_prints_as_yq_does_3577() -> Result<()> {
+    let json = r#"{"a":1234567890123456789.0,"c":-9223372036854775808.0,"d":9223372036854775808.0,"e":1E2,"f":1.0e+2,"g":1e-0,"i":4611686018427387904.0,"j":5e-1,"s":"2.0"}"#;
+    let run = |filter: &str, args: &[&str]| -> Result<String> {
+        let (stdout, code) = run_yq_stdin(filter, json, args)?;
+        assert_eq!(code, 0, "`{filter}` with {args:?}");
+        Ok(stdout)
+    };
+
+    // The cursor route in YAML output (yq's default) and JSON output.
+    for (filter, expected) in [
+        (r".", "a: 1234567890123456768\nc: -9223372036854775808\nd: 9223372036854775807\ne: 100\nf: 100\ng: 1\ni: 4611686018427387904\nj: 0.5\ns: \"2.0\"\n"),
+        (r".a", "1234567890123456768\n"),
+        (r".c", "-9223372036854775808\n"),
+        (r".d", "9223372036854775807\n"),
+        (r".e", "100\n"),
+        (r".f", "100\n"),
+        (r".g", "1\n"),
+        (r".i", "4611686018427387904\n"),
+        (r".j", "0.5\n"),
+        (r".s", "2.0\n"),
+    ] {
+        assert_eq!(
+            run(filter, &["--input-format", "json", "-o=yaml"])?,
+            expected,
+            "`{filter}` as YAML"
+        );
+    }
+    for (filter, expected) in [
+        (r".", "{\"a\":1234567890123456768,\"c\":-9223372036854775808,\"d\":9223372036854775807,\"e\":100,\"f\":100,\"g\":1,\"i\":4611686018427387904,\"j\":0.5,\"s\":\"2.0\"}\n"),
+        (r".a", "1234567890123456768\n"),
+        (r".c", "-9223372036854775808\n"),
+        (r".d", "9223372036854775807\n"),
+        (r".e", "100\n"),
+        (r".f", "100\n"),
+        (r".g", "1\n"),
+        (r".i", "4611686018427387904\n"),
+        (r".j", "0.5\n"),
+        (r".s", "\"2.0\"\n"),
+    ] {
+        assert_eq!(
+            run(filter, &["--input-format", "json", "-o=json", "-I=0"])?,
+            expected,
+            "`{filter}` as JSON"
+        );
+    }
+
+    // `-P` takes the DOM route, which must print what the cursor route does.
+    for (filter, expected) in [
+        (r".a", "1234567890123456768\n"),
+        (r".c", "-9223372036854775808\n"),
+        (r".d", "9223372036854775807\n"),
+        (r".e", "100\n"),
+        (r".a|tag", "\"!!int\"\n"),
+    ] {
+        assert_eq!(
+            run(filter, &["--input-format", "json", "-P", "-o=json"])?,
+            expected,
+            "`{filter}` with -P"
+        );
+    }
+
+    // A multi-document file, where every document is typed alike.
+    let multi = "{\"p\":2.0,\"q\":1e2}\n{\"p\":3.0}\n";
+    for (filter, expected) in [
+        (r".p", "2\n3\n"),
+        (r".p|tag", "\"!!int\"\n\"!!int\"\n"),
+        (r".q", "100\nnull\n"),
+        (r".q|tag", "\"!!int\"\n\"!!null\"\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(
+            filter,
+            multi,
+            &["--input-format", "json", "-o=json", "-I=0"],
+        )?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, expected, "`{filter}` on two JSON documents");
+    }
+    Ok(())
+}

@@ -281,6 +281,7 @@ pub use light::{
     YamlCursor, YamlElements, YamlField, YamlFields, YamlNumber, YamlString, YamlValue,
 };
 pub use locate::{locate_offset, locate_offset_detailed, LocateResult};
+pub(crate) use scalar::whole_float_as_int;
 pub use scalar::{resolve_plain, resolve_plain_sourced, resolve_tagged, ResolvedScalar};
 
 #[cfg(test)]
