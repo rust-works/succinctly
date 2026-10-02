@@ -9199,15 +9199,36 @@ inline. Pinned in the `jq_reported` tests of `resolve.rs` (including the whole-r
 `succinctly yq` is unchanged: it keeps the first error from the full list
 (`resolve_func_calls_all`), and yq has no such rule to match.
 
-**Still open: the *order* of errors among closures** ([#3583](https://github.com/rust-works/succinctly/issues/3583)).
-The surviving errors keep source order. A block's own errors come out in source order in jq
-too, but it reports the closures it owns in the order of its compiled instructions, which
-differs from source order for some constructs: `a op= b` visits `b` before `a`, `reduce`/`foreach`
-visit `init` before the source, and the operands of a binary operator (`+`, `==`, ...) or of a
-C-implemented builtin with several arguments (`pow`, `setpath`, ...) come out right to left
-when they hold closures (`map(ua) + map(ub)` is `ub`, `ua`). The set and count of errors now
-match jq on all of them; only the order of the closures differs, and it did before this change
-too.
+**The order of errors among closures — closed ([#3583](https://github.com/rust-works/succinctly/issues/3583)).**
+jq reports a block's own errors, or, when it has none, the errors of the closures it owns, in
+the order of its compiled instructions, which is not source order for every construct. The
+walk behind `resolve_all_jq` still visits the tree in source order, so every occurrence
+counter and caret position is unchanged; `Blocks` keeps each unit's own diagnostics and its
+child units in two lists, and the constructs below re-sequence the operands they visited
+(`CheckCtx::reorder`). Every rule was captured against 1.7.1 and held on about 19,000
+random multi-error programs, plus every roster builtin of arity two or more.
+
+| Construct                                                    | Closure units                      | The block's own errors             |
+|--------------------------------------------------------------|------------------------------------|------------------------------------|
+| `a + b`, `a == b` and the other arithmetic/compare operators | `b`, then `a`                      | source order                       |
+| `pow(a; b)`, `setpath(a; b)`, `fma(a; b; c)` (C builtins)    | last argument first                | source order                       |
+| `"\(a)\(b)"`, `@fmt "\(a)\(b)"`                              | last part first                    | source order                       |
+| `a op= b`, `a //= b`                                         | `b`, then `a`                      | not applicable (`a` is a unit)     |
+| `reduce`/`foreach`                                           | `init`, source, pattern keys, body | `init`, source, pattern keys, body |
+| `(t)[k]`                                                     | `k`, then `t`                      | `k`, then `t`                      |
+| `(t)[from:to]`                                               | `from`, `to`, then `t`             | `from`, `to`, then `t`             |
+
+`and`, `or`, `//`, `=`, `|=`, `if`, `try`, `label`, a pipe, a comma, an object or array
+constructor, `.[from:to]` and a call to a `def` or to a jq-defined builtin (`map`, `sub`,
+`limit`, ...) all keep source order. `resolve_all` (what `succinctly yq` reads) is unchanged and
+stays in source order. Pinned in the `jq_reported` tests of `resolve.rs` and in
+`test_compile_errors_follow_jq_instruction_order_3583`.
+
+One related residual is *not* closed here: with `reduce`/`foreach` a same-named `$var` or
+`break` in both a pattern's computed key and `init` still has its caret attributed to the other
+occurrence ([#2964](https://github.com/rust-works/succinctly/issues/2964), pinned in
+`test_break_reduce_pattern_key_and_init_caret_positions_are_swapped_2964`), because the walk
+visits `init` before the pattern while the position table is sorted by text offset.
 
 The stubs point *into* the linked run, not the other way round, because that run is wrapped
 outermost and so is visible from every stub whatever order the directives are declared in.
