@@ -28946,8 +28946,9 @@ fn test_module_search_path_falls_through_to_a_later_dir_2395() -> Result<()> {
 /// #2703 closed the shape half of this path: jq 1.7.1 names the module by
 /// its resolved *absolute* path (`/var/folders/…`, not the `-L` path as
 /// given), reports `at … , line N:` with the module's own echoed source
-/// line, leaves a blank line, and closes with `jq: 1 compile error` -- all
-/// reproduced here. The message *wording* (`unexpected character ';',
+/// line, and closes with `jq: 1 compile error` -- all reproduced here. #2703
+/// recorded a blank line before the trailer; neither the pinned macOS
+/// `/usr/bin/jq` nor the static Linux 1.7.1 release binary prints one (#3624). The message *wording* (`unexpected character ';',
 /// expected expression`) is still succinctly's own: jq's `syntax error,
 /// unexpected ';' (Unix shell quoting issues?)` phrasing is a function of
 /// its bison parse state, and jq's source-echo padding is not a fixed
@@ -28985,13 +28986,56 @@ fn test_module_with_a_syntax_error_is_a_compile_error_2395() -> Result<()> {
         stderr.contains("\ndef broken: ( ;"),
         "the module's echoed source line is missing: {stderr:?}"
     );
+    // The trailer follows the echoed source line (and its padding) directly: no blank
+    // line, as jq 1.7.1 prints it (#3624).
     assert!(
-        stderr.contains("\n\njq: 1 compile error"),
-        "the blank line + trailer are missing: {stderr:?}"
+        stderr.contains("\njq: 1 compile error") && !stderr.contains("\n\njq: 1 compile error"),
+        "the trailer must follow the echoed line with no blank line between: {stderr:?}"
     );
     assert!(
         !stderr.contains("jq: module error") && !stderr.contains("parse error in module"),
         "the pre-#2703 flat shape is back: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #3624: in a report with several entries a module's syntax error is followed
+/// directly by the next entry, no blank line between them. Captured from jq 1.7.1
+/// (the pinned macOS `/usr/bin/jq` and the static Linux release binary): the entry
+/// for `synerr.jq` (`def f: 1 +;`), its echoed line, then `jq: error: module not
+/// found: nosuch`, a blank line, and `jq: 1 compile error`. The wording and the
+/// echo's padding are succinctly's own (#2703).
+#[test]
+fn test_module_syntax_error_is_followed_directly_by_the_next_entry_3624() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("synerr.jq"), "def f: 1 +;")?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "nosuch"; include "synerr"; 1"#]);
+            command
+        },
+        None,
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    let echoed = lines
+        .iter()
+        .position(|line| line.starts_with("def f: 1 +;"))
+        .unwrap_or_else(|| panic!("the module's echoed source line is missing: {stderr:?}"));
+    assert_eq!(
+        lines[echoed + 1],
+        "jq: error: module not found: nosuch",
+        "the next entry must follow the echoed line directly: {stderr:?}"
+    );
+    assert_eq!(
+        &lines[echoed + 2..],
+        ["", "jq: 1 compile error"],
+        "{stderr:?}"
     );
     Ok(())
 }
