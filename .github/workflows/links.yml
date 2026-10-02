@@ -24,6 +24,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Two exclusions that keep the job about link rot, not GitHub's web tier:
+      # a permalink pinned to a tag or a commit SHA is immutable, so it cannot
+      # rot, and GitHub serves those HTML pages with intermittent 503/504s for
+      # hours at a time (#3594), which the 1d cache below used to hide until its
+      # entries expired. `lychee/out.md` is the first attempt's own report,
+      # which the retry step would otherwise rescan and fail on again. Both
+      # invocations below carry the same lists; keep them in step.
+      #
       # Successful results are reused across runs (max-cache-age 1d), so a
       # retry or re-run only re-checks links that actually failed. lychee
       # never caches failures, so a flake can't stick.
@@ -63,6 +71,8 @@ jobs:
             --exclude '^https://no-color\.org/'
             --exclude '^https://www\.reddit\.com/'
             --exclude '^https://vigna\.di\.unimi\.it/'
+            --exclude '^https://github\.com/[^/]+/[^/]+/(blob|tree|commit)/([0-9a-f]{7,40}|v[0-9][^/]*)(/|$)'
+            --exclude-path ./lychee
             '**/*.md'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -98,6 +108,8 @@ jobs:
             --exclude '^https://no-color\.org/'
             --exclude '^https://www\.reddit\.com/'
             --exclude '^https://vigna\.di\.unimi\.it/'
+            --exclude '^https://github\.com/[^/]+/[^/]+/(blob|tree|commit)/([0-9a-f]{7,40}|v[0-9][^/]*)(/|$)'
+            --exclude-path ./lychee
             '**/*.md'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
