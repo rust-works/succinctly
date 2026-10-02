@@ -1627,6 +1627,17 @@ impl CheckCtx {
         }
     }
 
+    /// [`Self::reorder`] with the child blocks of the operands `marks` bounds
+    /// last to first -- the rule for an operator, a C builtin and an
+    /// interpolation. Fewer than two operands (`marks` empty, or one operand)
+    /// have nothing to reverse.
+    fn reorder_reversed(&mut self, marks: &[Mark]) {
+        if marks.len() > 2 {
+            let order: Vec<usize> = (0..marks.len() - 1).rev().collect();
+            self.reorder(marks, Some(&order), None);
+        }
+    }
+
     /// The diagnostics real jq reports: those of every block with no
     /// ancestor block that raised one of its own (#3391), in the order jq
     /// reports them (#3583).
@@ -1651,6 +1662,11 @@ impl CheckCtx {
 /// Rewrites `list[bounds[0]..bounds[n]]` so the `n` spans `bounds` delimits
 /// come out in `order`, a permutation of `0..n`.
 fn permute_spans(list: &mut [usize], bounds: &[usize], order: &[usize]) {
+    debug_assert_eq!(order.len() + 1, bounds.len(), "one order entry per span");
+    debug_assert!(
+        bounds.windows(2).all(|w| w[0] <= w[1]),
+        "span bounds only grow: a walk never shortens the list it is marking"
+    );
     let start = bounds[0];
     let end = bounds[bounds.len() - 1];
     let original = list[start..end].to_vec();
@@ -2770,15 +2786,17 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         // `"\(map(ua))\(map(ub))"` come out `ub`, `ua` -- the same right to
         // left order as any other `+`.
         Expr::StringInterpolation(parts) => {
-            let mut marks = alloc::vec![cx.mark()];
+            let mut marks = Vec::new();
             for part in parts.iter_mut() {
                 if let StringPart::Expr(e) = part {
+                    if marks.is_empty() {
+                        marks.push(cx.mark());
+                    }
                     check(e, cx, reachable);
                     marks.push(cx.mark());
                 }
             }
-            let order: Vec<usize> = (0..marks.len() - 1).rev().collect();
-            cx.reorder(&marks, Some(&order), None);
+            cx.reorder_reversed(&marks);
         }
 
         // No builtin introduces a function or variable binding, so its
@@ -2807,25 +2825,26 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         // `builtin_operands_are_inline`.
         Expr::Builtin(builtin) => {
             let inline = builtin_operands_are_inline(builtin);
-            let mut marks = alloc::vec![cx.mark()];
+            // #3583: the operands of a builtin implemented in C are compiled
+            // right to left (`pow(map(ua); map(ub))` is `ub`, `ua`); a jq
+            // `def`'s closure arguments are compiled in the order written, so
+            // only an inline builtin records where each operand ends.
+            let mut marks = Vec::new();
+            if inline {
+                marks.push(cx.mark());
+            }
             *builtin = map_builtin_subexprs(builtin, &mut |sub| {
                 let mut copy = sub.clone();
                 let rebased = rebase_reachable(sub, &copy, reachable);
                 if inline {
                     check(&mut copy, cx, &rebased);
+                    marks.push(cx.mark());
                 } else {
                     check_in_block(&mut copy, cx, &rebased);
                 }
-                marks.push(cx.mark());
                 copy
             });
-            // #3583: the operands of a builtin implemented in C are compiled
-            // right to left (`pow(map(ua); map(ub))` is `ub`, `ua`); a jq
-            // `def`'s closure arguments are compiled in the order written.
-            if inline {
-                let order: Vec<usize> = (0..marks.len() - 1).rev().collect();
-                cx.reorder(&marks, Some(&order), None);
-            }
+            cx.reorder_reversed(&marks);
         }
     }
 }
@@ -4712,6 +4731,16 @@ mod tests {
             assert_eq!(all("map(ua) + map(ub)"), ["ua/0", "ub/0"]);
             assert_eq!(all("reduce ua as $x (ub; uc)"), ["ua/0", "ub/0", "uc/0"]);
             assert_eq!(all("(ua)[ub]"), ["ua/0", "ub/0"]);
+            // `reduce`'s pieces are visited as written -- source, the
+            // pattern's computed key, `init`, update -- not in jq's order.
+            assert_eq!(
+                all("reduce ua as {(ub): $v} (uc; ud)"),
+                ["ua/0", "ub/0", "uc/0", "ud/0"]
+            );
+            assert_eq!(
+                reported("reduce ua as {(ub): $v} (uc; ud)"),
+                ["uc/0", "ua/0", "ub/0", "ud/0"]
+            );
         }
 
         #[test]

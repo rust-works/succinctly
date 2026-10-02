@@ -9213,9 +9213,11 @@ random multi-error programs, plus every roster builtin of arity two or more.
 
 `and`, `or`, `//`, `=`, `|=`, `if`, `try`, `label`, a pipe, a comma, an object or array
 constructor, `.[from:to]` and a call to a `def` or to a jq-defined builtin (`map`, `sub`,
-`limit`, ...) all keep source order. `resolve_all` (what `succinctly yq` reads) is unchanged and
-stays in source order. Pinned in the `jq_reported` tests of `resolve.rs` and in
-`test_compile_errors_follow_jq_instruction_order_3583`.
+`limit`, ...) all keep source order. `resolve_all` (what `succinctly yq` reads) stays in the walk's
+source order throughout; for `reduce`/`foreach` that now means the pattern's computed keys come
+before `init`, where the walk used to visit `init` first. Real yq's lexer rejects `reduce` and
+`foreach` outright, so no yq oracle exists for the order in that construct. Pinned in the
+`jq_reported` tests of `resolve.rs` and in `test_compile_errors_follow_jq_instruction_order_3583`.
 
 This also closes the `reduce`/`foreach` caret residual described under #2964 above, pinned in
 `test_break_reduce_pattern_key_and_init_caret_positions_match_jq_2964` and its `foreach` twin.
