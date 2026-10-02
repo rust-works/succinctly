@@ -51027,6 +51027,102 @@ fn test_module_diagnostic_occurrence_counting_is_arity_aware_3109() -> Result<()
     Ok(())
 }
 
+/// #2866: a module-sourced unresolved call is attributed to the module that
+/// wrote it, byte for byte as jq prints it. The rows are captured from
+/// `/usr/bin/jq` 1.7.1; the trailing padding on each echoed line is the
+/// column of the failing name (`%*s`), and `bad_call.jq` is `def h:
+/// nosuch;\n`.
+///
+/// - Two sources, one spelling: `include "bad_call"; def t: nosuch; t, h`
+///   has `nosuch` unresolved both in the module and in the main filter. Each
+///   report names its own source, in jq's order (the module first). A
+///   regression to "search the main text first" fails this row in both
+///   directions, which no single-error row can show.
+/// - A symlinked `-L` directory: the report names the canonical target's
+///   file, not the link's.
+/// - An arity mismatch inside a module (`f/3` against `def f(x)`).
+///
+/// No row combines a module error with a main-*body* error: jq prints one
+/// error there and succinctly more (#3391), and a test here must not freeze
+/// that divergence.
+#[test]
+#[cfg(unix)]
+fn test_module_sourced_unresolved_call_report_is_byte_exact_2866() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let dir = std::fs::canonicalize(temp_dir.path())?;
+    std::fs::write(dir.join("bad_call.jq"), "def h: nosuch;\n")?;
+    std::fs::write(dir.join("arity.jq"), "def f(x): x;\ndef g: f(1;2;3);\n")?;
+    std::fs::create_dir(dir.join("real"))?;
+    std::fs::write(dir.join("real").join("bad_call.jq"), "def h: nosuch;\n")?;
+    std::os::unix::fs::symlink(dir.join("real"), dir.join("link"))?;
+
+    // The line jq echoes under an error: the source line, then one space per
+    // column before the failing name.
+    let echoed = |line: &str, name: &str| {
+        let column = line.find(name).expect("the failing name is in its line");
+        format!("{line}{}\n", " ".repeat(column))
+    };
+
+    let main_filter = r#"include "bad_call"; def t: nosuch; t, h"#;
+    let mut rows: Vec<(&std::path::Path, &str, String)> = vec![
+        (
+            &dir,
+            r#"include "bad_call"; h"#,
+            format!(
+                "jq: error: nosuch/0 is not defined at {}/bad_call.jq, line 1:\n{}jq: 1 compile error\n",
+                dir.display(),
+                echoed("def h: nosuch;", "nosuch"),
+            ),
+        ),
+        (
+            &dir,
+            main_filter,
+            format!(
+                "jq: error: nosuch/0 is not defined at {}/bad_call.jq, line 1:\n{}\
+                 jq: error: nosuch/0 is not defined at <top-level>, line 1:\n{}\
+                 jq: 2 compile errors\n",
+                dir.display(),
+                echoed("def h: nosuch;", "nosuch"),
+                echoed(main_filter, "nosuch"),
+            ),
+        ),
+        (
+            &dir,
+            r#"include "arity"; g"#,
+            format!(
+                "jq: error: f/3 is not defined at {}/arity.jq, line 2:\n{}jq: 1 compile error\n",
+                dir.display(),
+                echoed("def g: f(1;2;3);", "f(1;2;3)"),
+            ),
+        ),
+    ];
+    let link = dir.join("link");
+    rows.push((
+        &link,
+        r#"include "bad_call"; h"#,
+        format!(
+            "jq: error: nosuch/0 is not defined at {}/real/bad_call.jq, line 1:\n{}jq: 1 compile error\n",
+            dir.display(),
+            echoed("def h: nosuch;", "nosuch"),
+        ),
+    ));
+
+    for (search, filter, expected) in rows {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command.args(["jq", "-L"]).arg(search).args(["-nc", filter]);
+                command
+            },
+            None,
+        )?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(code, 3, "{filter}: stderr {stderr:?}");
+        assert_eq!(stderr, expected, "{filter}");
+    }
+    Ok(())
+}
+
 /// #2991: a namespaced call inside a module body must find its own line, not
 /// fall through to the file-name-only report. Originally this relied on
 /// `report_unresolved_call`'s text-search fallback, since `collect_call_sites`
