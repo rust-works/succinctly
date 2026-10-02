@@ -3932,7 +3932,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // call-only view) -- see that function's own doc comment for why: real
     // yq is fully permissive about unbound variables (#2981), the opposite
     // direction of divergence from what this fixes here.
-    let compile_errors = jq::resolve_all(&mut expr);
+    //
+    // #3391: reduced to the errors jq itself reports -- one in the main body
+    // hides every one in a `def` or call argument below it.
+    let compile_errors = jq::resolve_all_jq(&mut expr);
     if !compile_errors.is_empty() {
         report_compile_errors(&compile_errors, &filter_str, &module_loader);
         return Ok(exit_codes::COMPILE_ERROR);

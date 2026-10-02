@@ -284,10 +284,56 @@ pub(crate) fn join_expr_into_args(expr: Expr) -> Result<Vec<Expr>, Expr> {
     };
     // The pair stage carries `idx_expr`; every other stage is its own argument.
     for stage in stages {
-        let is_pair = matches!(&stage, Expr::Array(inner) if matches!(inner.as_ref(), Expr::Comma(items) if matches!(items.last(), Some(Expr::IndexExpr { target, .. }) if matches!(target.as_ref(), Expr::Var(v) if v == JOIN_IDX_VAR))));
+        let is_pair = is_join_pair(&stage);
         args.push(if is_pair { idx_expr_of(stage) } else { stage });
     }
     Ok(args)
+}
+
+/// Whether `stage` is the `[., $idx[idx_expr]]` pair stage [`join_expr`]
+/// builds -- the one stage that carries an argument inside it rather than
+/// being one.
+fn is_join_pair(stage: &Expr) -> bool {
+    matches!(stage, Expr::Array(inner) if matches!(inner.as_ref(), Expr::Comma(items) if matches!(items.last(), Some(Expr::IndexExpr { target, .. }) if matches!(target.as_ref(), Expr::Var(v) if v == JOIN_IDX_VAR))))
+}
+
+/// The arguments a [`join_expr`] desugaring was built from, borrowed in call
+/// order, for a caller that visits them rather than takes them (#3391).
+/// `idx` and `body` are the parts of its `Expr::As`, which the caller has
+/// already matched on [`JOIN_IDX_VAR`]; the synthetic `.[]` and pair scaffolding
+/// is not an argument and is not returned.
+pub(crate) fn join_expr_operands_mut<'a>(
+    idx: &'a mut Expr,
+    body: &'a mut Expr,
+) -> Vec<&'a mut Expr> {
+    let stages: Vec<&mut Expr> = match body {
+        // JOIN/2: `[.[] | pair]` -- the `.[]` is not an argument.
+        Expr::Array(inner) => match inner.as_mut() {
+            Expr::Pipe(stages) => stages.iter_mut().skip(1).collect(),
+            _ => unreachable!("join_expr's JOIN/2 body is `[.[] | pair]`"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+        },
+        // JOIN/3: `stream | pair`; JOIN/4: `stream | pair | join_expr`
+        Expr::Pipe(stages) => stages.iter_mut().collect(),
+        _ => unreachable!("join_expr builds an array or a pipe"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+    };
+    let mut operands = alloc::vec![idx];
+    for stage in stages {
+        operands.push(if is_join_pair(stage) {
+            match stage {
+                Expr::Array(inner) => match inner.as_mut() {
+                    Expr::Comma(items) => match items.last_mut() {
+                        Some(Expr::IndexExpr { key, .. }) => key.as_mut(),
+                        _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: is_join_pair just matched this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+                    },
+                    _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: is_join_pair just matched this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+                },
+                _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: is_join_pair just matched this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+            }
+        } else {
+            stage
+        });
+    }
+    operands
 }
 
 /// [`join_expr_into_args`]'s arity, without moving anything.

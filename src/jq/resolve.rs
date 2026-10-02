@@ -64,8 +64,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::eval::pattern_alternatives_var_names;
+use super::parser::{join_expr_operands_mut, JOIN_IDX_VAR};
 use super::walk::{any_subexpr, builtin_kids, map_builtin_subexprs, BuiltinKids};
-use super::{Expr, ObjectKey, Pattern, StringPart};
+use super::{Builtin, Expr, ObjectKey, Pattern, StringPart};
 
 /// The module-level `def` a module-body diagnostic sits inside (#3085): the
 /// scope its occurrence index is counted in.
@@ -1434,6 +1435,23 @@ pub fn resolve_func_calls_all(expr: &mut Expr) -> Vec<UnresolvedCall> {
 /// jq-mode only in practice — see [`resolve_func_calls_all`]'s doc comment
 /// for why `yq_runner.rs` must keep using the function-only view instead.
 pub fn resolve_all(expr: &mut Expr) -> Vec<ResolveError> {
+    walk_resolve(expr).errors
+}
+
+/// [`resolve_all`], reduced to the diagnostics real jq itself reports (#3391).
+///
+/// jq's compiler hides every error beneath a compile unit that has one of its
+/// own -- `def t: topmissing; t, bodymissing` is `1 compile error` (only
+/// `bodymissing`), not two -- where [`resolve_all`] reports every error in the
+/// tree. The rule is in [`Blocks`]. jq mode only: yq has no such rule to
+/// match, and `resolve_func_calls_all` (which yq mode filters) keeps the
+/// full list.
+pub fn resolve_all_jq(expr: &mut Expr) -> Vec<ResolveError> {
+    walk_resolve(expr).into_jq_reported()
+}
+
+/// The walk behind [`resolve_all`] and [`resolve_all_jq`].
+fn walk_resolve(expr: &mut Expr) -> CheckCtx {
     // #2740: a `def` whose call never appears anywhere reachable is never
     // checked -- jq's own compiler never compiles such a body either, since
     // it only ever compiles a `def` at the call site substituting it in.
@@ -1447,7 +1465,7 @@ pub fn resolve_all(expr: &mut Expr) -> Vec<ResolveError> {
 
     let mut cx = CheckCtx::default();
     check(expr, &mut cx, &reachable);
-    cx.errors
+    cx
 }
 
 /// Whether `(name, arity)` is one of the pinned jq's own builtins.
@@ -1505,6 +1523,74 @@ struct CheckCtx {
     /// answer by itself, resolved here by counting as we go (see
     /// `UnresolvedLabel::occurrence`).
     occurrences: Occurrences,
+    /// The compile-unit tree the walk is inside (#3391) and, parallel to
+    /// `errors`, the unit each diagnostic was found in.
+    blocks: Blocks,
+    error_blocks: Vec<usize>,
+}
+
+/// The compile units real jq reports errors against (#3391).
+///
+/// jq's compiler resolves one *block* at a time: it reports every unresolved
+/// call, `$variable` and `break` that sits directly in the block, and compiles
+/// the closures the block owns -- each `def` body, and each argument of a call
+/// to a jq-defined function -- only when that block raised nothing. So a block
+/// with an error of its own hides every error beneath it, while sibling
+/// blocks are each still reported (`def a: x; def b: y; a, b` is two errors,
+/// `def a: x; a, y` is one). The main program is block 0.
+///
+/// A block is *created* by [`check_in_block`]; what counts as one is decided
+/// at each arm of [`check`], from what jq itself compiles to a closure.
+#[derive(Default)]
+struct Blocks {
+    /// `parents[i]` is the parent of block `i + 1`. A parent is always
+    /// numbered before its children, which is what lets
+    /// [`CheckCtx::into_jq_reported`] settle every block in one forward pass.
+    parents: Vec<usize>,
+    /// The block the walk is currently inside.
+    current: usize,
+}
+
+impl CheckCtx {
+    /// Records a diagnostic against the block the walk is in.
+    fn push_error(&mut self, error: ResolveError) {
+        self.error_blocks.push(self.blocks.current);
+        self.errors.push(error);
+    }
+
+    /// Drops every diagnostic recorded after the first `len`.
+    fn truncate_errors(&mut self, len: usize) {
+        self.errors.truncate(len);
+        self.error_blocks.truncate(len);
+    }
+
+    /// The diagnostics real jq reports: those of every block with no
+    /// ancestor block that raised one of its own (#3391).
+    fn into_jq_reported(self) -> Vec<ResolveError> {
+        let mut has_error = vec![false; self.blocks.parents.len() + 1];
+        for &block in &self.error_blocks {
+            has_error[block] = true;
+        }
+        let mut hidden = vec![false; has_error.len()];
+        for (child, &parent) in self.blocks.parents.iter().enumerate() {
+            hidden[child + 1] = hidden[parent] || has_error[parent];
+        }
+        self.errors
+            .into_iter()
+            .zip(self.error_blocks)
+            .filter_map(|(error, block)| (!hidden[block]).then_some(error))
+            .collect()
+    }
+}
+
+/// [`check`] `expr` as a compile unit of its own, a child of the one the walk
+/// is in (#3391) -- see [`Blocks`].
+fn check_in_block(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
+    let parent = cx.blocks.current;
+    cx.blocks.parents.push(parent);
+    cx.blocks.current = cx.blocks.parents.len();
+    check(expr, cx, reachable);
+    cx.blocks.current = parent;
 }
 
 impl Occurrences {
@@ -1625,7 +1711,7 @@ fn check_break(name: &str, cx: &mut CheckCtx) {
     // that body. `label_scope` is a stack pushed/popped by the `Label` arm,
     // so this check sees only genuinely enclosing labels.
     if in_label_scope(&cx.label_scope, name).hit.is_none() {
-        cx.errors.push(ResolveError::Break(UnresolvedLabel {
+        cx.push_error(ResolveError::Break(UnresolvedLabel {
             name: name.to_string(),
             occurrence,
             origin,
@@ -1885,7 +1971,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         }
         Expr::DefCall { args, .. } => {
             for arg in args.iter_mut() {
-                check(arg, cx, reachable);
+                check_in_block(arg, cx, reachable);
             }
         }
         // Leaves: nothing nested to descend into. Mirrors `walk::any_subexpr`'s
@@ -1966,7 +2052,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             *count += 1;
             let found = in_var_scope(&cx.var_scope, name);
             if found.hit.is_none() {
-                cx.errors.push(ResolveError::Var(UnboundVar {
+                cx.push_error(ResolveError::Var(UnboundVar {
                     name: name.clone(),
                     origin: found.run.map(|(id, _)| id),
                     occurrence,
@@ -1978,10 +2064,13 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         Expr::Optional(inner)
         | Expr::Array(inner)
         | Expr::Paren(inner)
-        | Expr::Negate(inner)
-        | Expr::FirstExpr(inner)
-        | Expr::LastExpr(inner)
-        | Expr::Repeat(inner) => check(inner, cx, reachable),
+        | Expr::Negate(inner) => check(inner, cx, reachable),
+
+        // #3391: `first(f)`, `last(f)` and `repeat(f)` are jq-defined, so their
+        // operand is a closure -- a compile unit of its own.
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) | Expr::Repeat(inner) => {
+            check_in_block(inner, cx, reachable);
+        }
 
         // #2840: real jq's `label $x | BODY` intercepts every escape that
         // isn't its own `{"__jq":N}` break sentinel and re-raises it
@@ -2014,9 +2103,10 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             }
         }
 
+        // #3391: `error(msg)` is jq-defined; its operand is a closure.
         Expr::Error(inner) => {
             if let Some(e) = inner.as_deref_mut() {
-                check(e, cx, reachable);
+                check_in_block(e, cx, reachable);
             }
         }
 
@@ -2028,8 +2118,16 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         | Expr::IndexExpr {
             target: left,
             key: right,
+        } => {
+            check(left, cx, reachable);
+            check(right, cx, reachable);
         }
-        | Expr::Limit {
+
+        // #3391: each of these is a call to a jq-defined function in real jq
+        // (`limit`, `until`, `while`, and `=`/`|=` via `_assign`/`_modify`),
+        // so both operands are closures -- compile units of their own, not
+        // part of the enclosing block.
+        Expr::Limit {
             n: left,
             expr: right,
         }
@@ -2059,7 +2157,19 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             path: left,
             filter: right,
         }
-        | Expr::CompoundAssign {
+        | Expr::MetaAssign {
+            target: left,
+            value: right,
+            ..
+        } => {
+            check_in_block(left, cx, reachable);
+            check_in_block(right, cx, reachable);
+        }
+
+        // #3391: `a op= b` and `a //= b` evaluate `b` once, up front, as an
+        // ordinary operand (`b as $x | a |= . op $x`); only the path `a` is a
+        // closure, handed to `_modify`.
+        Expr::CompoundAssign {
             path: left,
             value: right,
             ..
@@ -2067,14 +2177,19 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         | Expr::AlternativeAssign {
             path: left,
             value: right,
-        }
-        | Expr::MetaAssign {
-            target: left,
-            value: right,
-            ..
         } => {
-            check(left, cx, reachable);
+            check_in_block(left, cx, reachable);
             check(right, cx, reachable);
+        }
+
+        // #3391: `JOIN` is jq-defined, so what the program wrote to it are
+        // closures -- compile units of their own -- even though the parser
+        // has desugared the call into this binding (`parser::join_expr`). Its
+        // `$idx` is not nameable, so none of them can see it.
+        Expr::As { expr, var, body } if var == JOIN_IDX_VAR => {
+            for operand in join_expr_operands_mut(expr, body) {
+                check_in_block(operand, cx, reachable);
+            }
         }
 
         // #2734: binds `var` in `body` only, not `expr` -- `.foo as $x | ...`
@@ -2180,8 +2295,10 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
                     ));
                 }
             }
+            // #3391: a def body is a compile unit of its own, a child of the
+            // block the `def` is written in.
             if reachable.contains(&body_addr) {
-                check(body, cx, reachable);
+                check_in_block(body, cx, reachable);
             } else if !module_level {
                 // #3085: an unreferenced body is not diagnosed, but its
                 // sites are still in the source tables the occurrence
@@ -2189,8 +2306,8 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
                 // module-level def needs no such walk: it is a counting
                 // scope of its own, so skipping it shifts nothing.
                 let kept = cx.errors.len();
-                check(body, cx, reachable);
-                cx.errors.truncate(kept);
+                check_in_block(body, cx, reachable);
+                cx.truncate_errors(kept);
             }
             if module_level {
                 if let Some(run) = cx.occurrences.runs.last_mut() {
@@ -2259,10 +2376,15 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             check_opt(end.as_deref_mut(), cx, reachable);
         }
 
+        // #3391: `range/1..3` are jq-defined; every operand is a closure.
         Expr::Range { from, to, step } => {
-            check(from, cx, reachable);
-            check_opt(to.as_deref_mut(), cx, reachable);
-            check_opt(step.as_deref_mut(), cx, reachable);
+            check_in_block(from, cx, reachable);
+            if let Some(to) = to.as_deref_mut() {
+                check_in_block(to, cx, reachable);
+            }
+            if let Some(step) = step.as_deref_mut() {
+                check_in_block(step, cx, reachable);
+            }
         }
 
         // #2734: `patterns`' vars are bound in `update` only, not `init` --
@@ -2438,8 +2560,11 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
                     })
                 });
                 let reachable = rebased.as_ref().unwrap_or(reachable);
+                // #3391: the callee is a `def` (or a parameter, which takes no
+                // arguments), so each argument is a closure -- a compile unit
+                // of its own.
                 for a in args.iter_mut() {
-                    check(a, cx, reachable);
+                    check_in_block(a, cx, reachable);
                 }
             } else if let Some(fallback) = builtin_fallback.take() {
                 // Not shadowed after all -- restore the original parse in
@@ -2458,7 +2583,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
                 }
             } else {
                 let occurrence_index = next_call_occurrence(&mut cx.occurrences, name, arity);
-                cx.errors.push(ResolveError::Call(UnresolvedCall {
+                cx.push_error(ResolveError::Call(UnresolvedCall {
                     name: name.clone(),
                     arity,
                     origin,
@@ -2475,7 +2600,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         // undefined here.
         Expr::NamespacedCall { args, .. } => {
             for a in args.iter_mut() {
-                check(a, cx, reachable);
+                check_in_block(a, cx, reachable);
             }
         }
 
@@ -2516,15 +2641,67 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         // and failed at runtime (exit 5) where jq refuses to compile it
         // (exit 3). The gate is right; only its key went stale, so the key is
         // carried across the clone rather than the gate being weakened.
+        //
+        // #3391: whether an operand is a compile unit of its own depends on
+        // how jq itself builds the builtin -- see
+        // `builtin_operands_are_inline`.
         Expr::Builtin(builtin) => {
+            let inline = builtin_operands_are_inline(builtin);
             *builtin = map_builtin_subexprs(builtin, &mut |sub| {
                 let mut copy = sub.clone();
                 let rebased = rebase_reachable(sub, &copy, reachable);
-                check(&mut copy, cx, &rebased);
+                if inline {
+                    check(&mut copy, cx, &rebased);
+                } else {
+                    check_in_block(&mut copy, cx, &rebased);
+                }
                 copy
             });
         }
     }
+}
+
+/// Whether `builtin`'s operands are evaluated inline in the block that calls
+/// it, rather than being closures -- compile units of their own (#3391, see
+/// [`Blocks`]).
+///
+/// jq builds a builtin one of two ways. The ones implemented in C (`has`,
+/// `ltrimstr`, `getpath`, `setpath`, `strftime`, `pow` and the other libm
+/// functions, ...) take their arguments as inline sub-expressions, so an
+/// unresolved name in one is an error of the calling block itself. Everything
+/// else -- `map`, `select`, `path`, `first`, `test`, `sub`, `limit`, ... -- is
+/// a jq `def` whose arguments are closures, and an error in one is only
+/// reported when the calling block has none of its own.
+///
+/// Captured argument by argument against the pinned jq, for every roster
+/// entry of arity 1 or more; no builtin mixes the two. This lists the inline
+/// ones, so a variant added later is a closure until it is named here -- the
+/// side that never hides a sibling's error -- and
+/// `builtin_operand_kinds_match_the_pinned_capture` fails if the roster and
+/// this list disagree.
+fn builtin_operands_are_inline(builtin: &Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Has(_)
+            | Builtin::Contains(_)
+            | Builtin::Ltrimstr(_)
+            | Builtin::Rtrimstr(_)
+            | Builtin::Startswith(_)
+            | Builtin::Endswith(_)
+            | Builtin::Split(_)
+            | Builtin::GetPath(_)
+            | Builtin::DelPaths(_)
+            | Builtin::SetPath(..)
+            | Builtin::HaltErrorCode(_)
+            | Builtin::FormatNamed(_)
+            | Builtin::Strftime(_)
+            | Builtin::Strflocaltime(_)
+            | Builtin::Strptime(_)
+            | Builtin::Pow(..)
+            | Builtin::Atan2(..)
+            | Builtin::Libm2(..)
+            | Builtin::Libm3(..)
+    )
 }
 
 /// `reachable`, re-keyed onto `copy` -- a fresh [`Clone`] of `original`
@@ -3950,6 +4127,349 @@ mod tests {
             // yq-facing view: `break $x` is not a function-call error.
             let mut expr = parse("break $x").expect("filter must parse");
             assert_eq!(resolve_func_calls_all(&mut expr), Vec::new());
+        }
+    }
+    /// #3391: which diagnostics real jq reports -- an error in a compile unit
+    /// hides every error in the units beneath it ([`Blocks`]). Every
+    /// expectation below was captured from the pinned oracle (`/usr/bin/jq`,
+    /// jq-1.7.1), program by program, never from succinctly's own output.
+    mod jq_reported {
+        use super::*;
+
+        /// The names `resolve_all_jq` reports, in order, as `name/arity`,
+        /// `$name` or `$*label-name` -- the same spelling jq prints.
+        fn reported(filter: &str) -> Vec<String> {
+            let mut expr = parse(filter).expect("filter must parse");
+            names(resolve_all_jq(&mut expr))
+        }
+
+        /// The same, for `resolve_all`, which keeps every error in the tree.
+        fn all(filter: &str) -> Vec<String> {
+            let mut expr = parse(filter).expect("filter must parse");
+            names(resolve_all(&mut expr))
+        }
+
+        fn names(errors: Vec<ResolveError>) -> Vec<String> {
+            errors
+                .into_iter()
+                .map(|e| match e {
+                    ResolveError::Call(c) => format!("{}/{}", c.name, c.arity),
+                    ResolveError::Var(v) => format!("${}", v.name),
+                    ResolveError::Break(b) => format!("$*label-{}", b.name),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn an_error_in_the_main_body_hides_a_def_bodys() {
+            // The issue's own row: jq prints `bodymissing` and `1 compile
+            // error`, where `resolve_all` still sees both.
+            let filter = "def t: topmissing; t, bodymissing";
+            assert_eq!(reported(filter), ["bodymissing/0"]);
+            assert_eq!(all(filter), ["topmissing/0", "bodymissing/0"]);
+        }
+
+        #[test]
+        fn a_variable_or_break_in_the_main_body_hides_a_def_bodys_too() {
+            // Every kind of error is an error of the unit it sits in.
+            assert_eq!(reported("def t: topmissing; t | $nov"), ["$nov"]);
+            assert_eq!(
+                reported("def t: topmissing; t | break $nol"),
+                ["$*label-nol"]
+            );
+            assert_eq!(reported("def t: $v1; t, bodymissing"), ["bodymissing/0"]);
+            assert_eq!(
+                reported("def t: break $l1; t, bodymissing"),
+                ["bodymissing/0"]
+            );
+        }
+
+        #[test]
+        fn a_main_body_error_after_an_inline_construct_still_hides_a_def() {
+            // `if`, `as`, `reduce`, `try` and the like are not compile units:
+            // an error inside one is an error of the block around it.
+            for filter in [
+                "def t: tm; if t then bodymissing else 1 end",
+                "def t: tm; t as $x | bodymissing",
+                "def t: tm; reduce bodymissing as $x (0; 1), t",
+                "def t: tm; try 1 catch bodymissing, t",
+                "def t: tm; \"\\(bodymissing)\", t",
+                "def t: tm; label $l | bodymissing, t",
+            ] {
+                assert_eq!(reported(filter), ["bodymissing/0"], "{filter}");
+            }
+        }
+
+        #[test]
+        fn sibling_defs_are_each_reported_in_declaration_order() {
+            // No error of the main body itself, so each def is compiled.
+            assert_eq!(
+                reported("def a: undef_a; def b: undef_b; a, b"),
+                ["undef_a/0", "undef_b/0"]
+            );
+            assert_eq!(
+                reported("def b: ub; def a: ua; a, b"),
+                ["ub/0", "ua/0"],
+                "declaration order, not call order"
+            );
+            // ... but one error in the body hides both.
+            assert_eq!(
+                reported("def a: undef_a; def b: undef_b; a, b, undef_main"),
+                ["undef_main/0"]
+            );
+        }
+
+        #[test]
+        fn a_def_nested_in_a_def_is_hidden_by_the_enclosing_defs_own_error() {
+            assert_eq!(
+                reported("def f: def g: undef_g; g, undef_f; f"),
+                ["undef_f/0"]
+            );
+            assert_eq!(reported("def f: def g: gg; g; f"), ["gg/0"]);
+            assert_eq!(
+                reported("def f: def g: gg; g; def h: hh; f, h"),
+                ["gg/0", "hh/0"]
+            );
+            // A def nested in the *body* is still a unit beneath it.
+            assert_eq!(reported("1 | def f: undef1; f, undef2"), ["undef2/0"]);
+        }
+
+        #[test]
+        fn the_whole_chain_below_a_blocked_unit_is_hidden() {
+            // `w` calls `u`; both defs are children of the main block.
+            assert_eq!(
+                reported("def t: 1; def u: topmissing; def w: u; w, bodymissing"),
+                ["bodymissing/0"]
+            );
+        }
+
+        #[test]
+        fn an_argument_of_a_def_call_is_a_unit_of_its_own() {
+            // Hidden by an error in the calling block ...
+            assert_eq!(
+                reported("def f(x): x; f(undef_a), undef_main"),
+                ["undef_main/0"]
+            );
+            assert_eq!(
+                reported("def f(x): x; f(undef_a) | undef_main"),
+                ["undef_main/0"]
+            );
+            // ... reported on its own, alongside a def's ...
+            assert_eq!(
+                reported("def f(x): undef_in_f, x; f(undef_a)"),
+                ["undef_in_f/0", "undef_a/0"]
+            );
+            // ... and defs come before the arguments of calls after them.
+            assert_eq!(
+                reported("def f(x): x; def g: undef_g; f(undef_a), g"),
+                ["undef_g/0", "undef_a/0"]
+            );
+            // `$param` is the same closure.
+            assert_eq!(reported("def f($p): $p; f(ua), uz"), ["uz/0"]);
+            assert_eq!(reported("def f($p; q): $p, q; f(ua; ub)"), ["ua/0", "ub/0"]);
+        }
+
+        #[test]
+        fn an_argument_nested_in_an_argument_is_hidden_by_the_outer_ones_error() {
+            assert_eq!(reported("def f(x): x; f(ua | map(ub))"), ["ua/0"]);
+            assert_eq!(reported("def f(x): x; f(map(ub) | ua)"), ["ua/0"]);
+            assert_eq!(reported("def f(x): x; f(def g: gg; g), uz"), ["uz/0"]);
+            assert_eq!(reported("def f(x): x; f(def g: gg; g)"), ["gg/0"]);
+        }
+
+        #[test]
+        fn a_def_in_a_later_pipe_stage_is_a_sibling_of_an_earlier_argument() {
+            assert_eq!(reported("[1] | map(ua) | def g: ug; g"), ["ua/0", "ug/0"]);
+            assert_eq!(reported("def g: ug; [1] | map(ua) | g"), ["ug/0", "ua/0"]);
+            assert_eq!(
+                reported("def t: topmissing; t | def g: inner; g"),
+                ["topmissing/0", "inner/0"]
+            );
+        }
+
+        #[test]
+        fn a_jq_defined_builtins_argument_is_a_unit_of_its_own() {
+            // `map` is a jq `def`: its argument does not hide the def's error,
+            // and is itself hidden by one in the calling block.
+            assert_eq!(
+                reported("def t: topmissing; [t] | map(bodymissing)"),
+                ["topmissing/0", "bodymissing/0"]
+            );
+            assert_eq!(
+                reported("[undef_a] | map(undef_b), undef_c"),
+                ["undef_a/0", "undef_c/0"]
+            );
+            assert_eq!(
+                reported("def t: tm; (.a |= ua) | (.b |= ub), t"),
+                ["tm/0", "ua/0", "ub/0"]
+            );
+        }
+
+        #[test]
+        fn a_c_implemented_builtins_argument_belongs_to_the_calling_block() {
+            // `ltrimstr` is a cfunction: the argument is inline, so its error
+            // hides the def's like any other error of the block.
+            assert_eq!(reported("def t: tm; ltrimstr(ua), t"), ["ua/0"]);
+            assert_eq!(
+                reported("def t: tm; ltrimstr(ua), rtrimstr(ub), t"),
+                ["ua/0", "ub/0"]
+            );
+            assert_eq!(reported("def t: tm; setpath(ua; ub), t"), ["ua/0", "ub/0"]);
+            assert_eq!(reported("def t: tm; ltrimstr(ua | map(ub)), t"), ["ua/0"]);
+        }
+
+        #[test]
+        fn assignment_operands_are_closures_except_a_compound_right_side() {
+            // `=` and `|=` are `_assign`/`_modify` calls: both sides closures.
+            assert_eq!(reported("def t: tm; .a |= ua, t"), ["tm/0", "ua/0"]);
+            assert_eq!(reported("def t: tm; .a = ua, t"), ["tm/0", "ua/0"]);
+            assert_eq!(reported("def t: tm; (ua |= 1), t"), ["tm/0", "ua/0"]);
+            // `a op= b` evaluates `b` inline, and hands only the path `a` to
+            // `_modify`.
+            assert_eq!(reported("def t: tm; .a += ua, t"), ["ua/0"]);
+            assert_eq!(reported("def t: tm; .a //= ua, t"), ["ua/0"]);
+            assert_eq!(reported("def t: tm; (ua += 1), t"), ["tm/0", "ua/0"]);
+            assert_eq!(reported("def t: tm; (ua //= 1), t"), ["tm/0", "ua/0"]);
+            assert_eq!(reported("def t: tm; (.a += ua), ub"), ["ua/0", "ub/0"]);
+            assert_eq!(reported("def t: tm; (ua += 1), ub"), ["ub/0"]);
+        }
+
+        #[test]
+        fn the_forms_jq_defines_take_closures() {
+            for filter in [
+                "def t: tm; limit(1; ua), t",
+                "def t: tm; first(ua), t",
+                "def t: tm; last(ua), t",
+                "def t: tm; repeat(ua), t",
+                "def t: tm; error(ua), t",
+                "def t: tm; range(ua), t",
+                "def t: tm; path(ua), t",
+                "def t: tm; del(ua), t",
+                "def t: tm; .a[ua] = 1, t",
+            ] {
+                assert_eq!(reported(filter), ["tm/0", "ua/0"], "{filter}");
+            }
+            assert_eq!(
+                reported("def t: tm; until(ua; ub), uc"),
+                ["uc/0"],
+                "the call's own error hides both closures"
+            );
+            assert_eq!(
+                reported("def t: tm; while(ua; ub), t"),
+                ["tm/0", "ua/0", "ub/0"]
+            );
+            assert_eq!(
+                reported("def t: tm; range(1; ua; ub), t"),
+                ["tm/0", "ua/0", "ub/0"]
+            );
+        }
+
+        #[test]
+        fn a_user_def_shadowing_a_builtin_takes_closures_whatever_the_builtin_does() {
+            // `ltrimstr` is inline in jq, but a user `def ltrimstr(x)` is a
+            // def like any other.
+            assert_eq!(
+                reported("def t: tm; def ltrimstr(x): x; ltrimstr(ua), t"),
+                ["tm/0", "ua/0"]
+            );
+        }
+
+        #[test]
+        fn the_errors_of_every_ancestor_less_unit_are_kept_in_source_order() {
+            // Two main-body errors and a def's: only the body's, in order.
+            assert_eq!(reported("def t: tm; (ua | t), ub"), ["ua/0", "ub/0"]);
+        }
+
+        #[test]
+        fn a_program_without_a_body_error_is_unchanged() {
+            for filter in [
+                "def t: topmissing; t",
+                "def t: topmissing; def u: bodymissing; u",
+                "def a: undef_a; def b: undef_b; a, b",
+                "def f(x): x | ux; f(ua)",
+            ] {
+                assert_eq!(reported(filter), all(filter), "{filter}");
+            }
+        }
+
+        #[test]
+        fn an_unreferenced_def_stays_silent_either_way() {
+            // jq never compiles it; the walk already skips it, and its
+            // discarded errors must not count as a unit's own.
+            assert_eq!(
+                reported("def t: topmissing; bodymissing"),
+                ["bodymissing/0"]
+            );
+            assert_eq!(reported("def t: topmissing; 1"), Vec::<String>::new());
+        }
+
+        /// The yq-facing views keep every error: the rule is jq's, and yq
+        /// has no compile-time diagnostic of this kind to match.
+        #[test]
+        fn resolve_func_calls_all_still_sees_every_call_error() {
+            let mut expr = parse("def t: topmissing; t, bodymissing").expect("filter must parse");
+            let names: Vec<String> = resolve_func_calls_all(&mut expr)
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            assert_eq!(names, ["topmissing", "bodymissing"]);
+        }
+
+        /// The inline builtins, as `name/arity`, captured argument by argument
+        /// from the pinned jq: `def t: tm; t, NAME(ua; ...)` prints only the
+        /// `ua`s for these and `tm` as well for every other entry (no builtin
+        /// mixes the two). Everything else in [`JQ_BUILTIN_ROSTER`] with
+        /// arguments is a jq-defined function.
+        const INLINE: &[&str] = &[
+            "atan2/2",
+            "contains/1",
+            "copysign/2",
+            "delpaths/1",
+            "drem/2",
+            "endswith/1",
+            "fdim/2",
+            "fma/3",
+            "fmax/2",
+            "fmin/2",
+            "fmod/2",
+            "format/1",
+            "getpath/1",
+            "halt_error/1",
+            "has/1",
+            "hypot/2",
+            "jn/2",
+            "ldexp/2",
+            "ltrimstr/1",
+            "nextafter/2",
+            "nexttoward/2",
+            "pow/2",
+            "remainder/2",
+            "rtrimstr/1",
+            "scalb/2",
+            "scalbln/2",
+            "setpath/2",
+            "split/1",
+            "startswith/1",
+            "strflocaltime/1",
+            "strftime/1",
+            "strptime/1",
+            "yn/2",
+        ];
+
+        #[test]
+        fn builtin_operand_kinds_match_the_pinned_capture() {
+            let mut checked = 0;
+            for &(name, arity) in JQ_BUILTIN_ROSTER.iter().filter(|&&(_, a)| a >= 1) {
+                let args: Vec<String> = (1..=arity).map(|i| format!("ua{i}")).collect();
+                let filter = format!("def t: tm; t, {name}({})", args.join("; "));
+                let mut expected: Vec<String> = args.iter().map(|a| format!("{a}/0")).collect();
+                if !INLINE.contains(&format!("{name}/{arity}").as_str()) {
+                    expected.insert(0, "tm/0".into());
+                }
+                assert_eq!(reported(&filter), expected, "{filter}");
+                checked += 1;
+            }
+            assert_eq!(checked, 100, "the roster's entries of arity 1 or more");
         }
     }
 }

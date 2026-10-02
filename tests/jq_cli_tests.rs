@@ -50516,9 +50516,10 @@ fn test_unresolved_call_positional_lookup_keeps_repeat_arity_and_fallback_2085()
     // it must not borrow a line marker from one, while the filter's own
     // `nosuch` on line 3 keeps its position.
     //
-    // jq reports only its own here -- a main-*body* error suppresses def
-    // errors, a separate pre-existing divergence with its own oracle matrix
-    // still to build. What this row pins is that the second error does not
+    // The filter's own `nosuch` is a `map` argument, not a bare call of the
+    // main body: a main-*body* error hides every def error (#3391), so a
+    // body-level `nosuch` here would leave the module's unreported and this
+    // row with nothing to pin. What it pins is that the second error does not
     // repeat line 3's marker.
     //
     // #2951: the module error now names the module's own canonical file
@@ -50535,7 +50536,7 @@ fn test_unresolved_call_positional_lookup_keeps_repeat_arity_and_fallback_2085()
     std::fs::write(dir.path().join("m.jq"), "def helper: nosuch;\n")?;
     let lib = dir.path().to_string_lossy().to_string();
     let (stdout, stderr, code) = run_jq_full(
-        &["-c", "-L", &lib, "include \"m\";\nhelper\n| nosuch"],
+        &["-c", "-L", &lib, "include \"m\";\nhelper\n| map(nosuch)"],
         Some("null"),
     )?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
@@ -51042,9 +51043,10 @@ fn test_module_diagnostic_occurrence_counting_is_arity_aware_3109() -> Result<()
 ///   file, not the link's.
 /// - An arity mismatch inside a module (`f/3` against `def f(x)`).
 ///
-/// No row combines a module error with a main-*body* error: jq prints one
-/// error there and succinctly more (#3391), and a test here must not freeze
-/// that divergence.
+/// No row combines a module error with a main-*body* error: jq hides the
+/// module's there (#3391, pinned in
+/// `test_main_body_error_hides_module_def_error_3391`), so such a row would
+/// have no module error left to locate.
 #[test]
 #[cfg(unix)]
 fn test_module_sourced_unresolved_call_report_is_byte_exact_2866() -> Result<()> {
@@ -52271,23 +52273,13 @@ fn test_break_in_included_module_names_its_own_file_2964() -> Result<()> {
 /// stealing the other's slot (which, keyed by name alone, would have
 /// misattributed at least one of the two positions).
 ///
-/// The `jq: 2 compile errors` this pins is itself a *known, pre-existing*
-/// characterized bug, not something #2964 verifies or introduces: confirmed
-/// live, `/usr/bin/jq` reports only **1** compile error for this exact
-/// program -- a main-body compile error suppresses a def-body one entirely,
-/// a gap already recorded (generically, for Call/Var too) in
-/// `docs/compliance/jq/limitations.md`'s "Module-scope gaps that are
-/// genuinely open" section ("a main-*body* error suppresses def errors
-/// entirely"). This test's own job is the occurrence-counter/module-
-/// attribution claim above, not the error *count* -- the count is pinned
-/// as-is (2, matching succinctly's honest behavior, verified identical
-/// before and after #2964's own dedup refactor) so a future change can't
-/// silently regress the counter claim without this test noticing, not
-/// because 2 is the oracle-correct answer. If the main-body/def-body
-/// suppression gap is ever closed, update this test's expected count to 1.
+/// The main file's `break $x` is the body of a top-level `def` here, not a bare
+/// body expression: a main-*body* error hides every module and def error
+/// (#3391, see `test_main_body_error_hides_module_def_error_3391`), which would
+/// leave this claim with a single error to attribute. Both errors are reported
+/// by the pinned jq 1.7.1, byte for byte as below.
 #[test]
-fn test_break_occurrence_counters_do_not_cross_module_boundaries_characterize_preexisting_error_count_bug_2964(
-) -> Result<()> {
+fn test_break_occurrence_counters_do_not_cross_module_boundaries_2964() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     std::fs::write(temp_dir.path().join("mymod.jq"), "def f: break $x;\n")?;
 
@@ -52296,7 +52288,7 @@ fn test_break_occurrence_counters_do_not_cross_module_boundaries_characterize_pr
             let mut cmd = Command::new(succinctly_bin());
             cmd.args(["jq", "-n", "-L"])
                 .arg(temp_dir.path())
-                .arg(r#"include "mymod"; f, break $x"#);
+                .arg(r#"include "mymod"; def g: break $x; f, g"#);
             cmd
         },
         None,
@@ -52314,12 +52306,190 @@ fn test_break_occurrence_counters_do_not_cross_module_boundaries_characterize_pr
             "jq: error: $*label-x is not defined at {at}, line 1:\n\
              def f: break $x;{}\n\
              jq: error: $*label-x is not defined at <top-level>, line 1:\n\
-             include \"mymod\"; f, break $x{}\n\
+             include \"mymod\"; def g: break $x; f, g{}\n\
              jq: 2 compile errors\n",
             " ".repeat(7),
-            " ".repeat(20)
+            " ".repeat(24)
         )
     );
+    Ok(())
+}
+
+/// #3391: a compile unit with an error of its own hides every error in the
+/// units beneath it. jq compiles a block's own calls, `$variable`s and
+/// `break`s first and only then the closures it owns -- each `def` body, and
+/// each argument of a call to a jq-defined function -- so a main-*body* error
+/// drops every def error, a module's included, while an argument or a def
+/// beside it is still reported (`def t: topmissing; [t] | map(bodymissing)` is
+/// two errors). Whether a builtin's argument is such a closure depends on how
+/// jq builds it: `map`, `limit` and `|=` take closures, `ltrimstr` and the right
+/// side of `+=` are inline.
+///
+/// Compared on the `jq: ` lines, which carry every diagnostic's name,
+/// location, order and the count: the echoed source line under each is its own
+/// caret-padding rule, pinned elsewhere. Every row is a capture of jq 1.7.1
+/// (`-L <dir>`), the module path shown as `<DIR>`.
+#[test]
+fn test_main_body_error_hides_module_def_error_3391() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let dir = std::fs::canonicalize(temp_dir.path())?;
+    std::fs::write(dir.join("a.jq"), "def a: undef_in_a;\n")?;
+    std::fs::write(dir.join("mid.jq"), "include \"a\";\ndef m: undef_in_m;\n")?;
+    let lib = dir.to_string_lossy().to_string();
+    let dir_text = dir.display().to_string();
+
+    let rows: &[(&str, &[&str])] = &[
+        (
+            "def t: topmissing; t, bodymissing",
+            &[
+                "jq: error: bodymissing/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "def t: $v1; t, bodymissing",
+            &[
+                "jq: error: bodymissing/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "def t: break $l1; t, bodymissing",
+            &[
+                "jq: error: bodymissing/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "def t: topmissing; t as $x | $x, bodymissing",
+            &[
+                "jq: error: bodymissing/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "1 | def f: undef1; f, undef2",
+            &[
+                "jq: error: undef2/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "def a: undef_a; def b: undef_b; a, b, undef_main",
+            &[
+                "jq: error: undef_main/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "def a: undef_a; def b: undef_b; a, b",
+            &[
+                "jq: error: undef_a/0 is not defined at <top-level>, line 1:",
+                "jq: error: undef_b/0 is not defined at <top-level>, line 1:",
+                "jq: 2 compile errors",
+            ],
+        ),
+        (
+            "def t: topmissing; [t] | map(bodymissing)",
+            &[
+                "jq: error: topmissing/0 is not defined at <top-level>, line 1:",
+                "jq: error: bodymissing/0 is not defined at <top-level>, line 1:",
+                "jq: 2 compile errors",
+            ],
+        ),
+        (
+            "def f(x): x; f(undef_a), undef_main",
+            &[
+                "jq: error: undef_main/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "def f(x): undef_in_f, x; f(undef_a)",
+            &[
+                "jq: error: undef_in_f/0 is not defined at <top-level>, line 1:",
+                "jq: error: undef_a/0 is not defined at <top-level>, line 1:",
+                "jq: 2 compile errors",
+            ],
+        ),
+        (
+            "def t: tm; ltrimstr(ua), t",
+            &[
+                "jq: error: ua/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "def t: tm; limit(1; ua), t",
+            &[
+                "jq: error: tm/0 is not defined at <top-level>, line 1:",
+                "jq: error: ua/0 is not defined at <top-level>, line 1:",
+                "jq: 2 compile errors",
+            ],
+        ),
+        (
+            "def t: tm; .a |= ua, t",
+            &[
+                "jq: error: tm/0 is not defined at <top-level>, line 1:",
+                "jq: error: ua/0 is not defined at <top-level>, line 1:",
+                "jq: 2 compile errors",
+            ],
+        ),
+        (
+            "def t: tm; .a += ua, t",
+            &[
+                "jq: error: ua/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "include \"a\"; [a, nomain]",
+            &[
+                "jq: error: nomain/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "include \"a\"; [a] | nomain",
+            &[
+                "jq: error: nomain/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+        (
+            "include \"a\"; def t: tm; t, a",
+            &[
+                "jq: error: undef_in_a/0 is not defined at <DIR>/a.jq, line 1:",
+                "jq: error: tm/0 is not defined at <top-level>, line 1:",
+                "jq: 2 compile errors",
+            ],
+        ),
+        (
+            "include \"mid\"; include \"a\"; [a, m, nomain]",
+            &[
+                "jq: error: nomain/0 is not defined at <top-level>, line 1:",
+                "jq: 1 compile error",
+            ],
+        ),
+    ];
+
+    for (filter, want) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-L", &lib, filter], None)?;
+        assert_eq!(
+            code, 3,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(
+            stdout, "",
+            "`{filter}` -- a compile error produces no output"
+        );
+        let got: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.starts_with("jq: "))
+            .map(|l| l.replace(&dir_text, "<DIR>"))
+            .collect();
+        assert_eq!(got, *want, "`{filter}` -- stderr: {stderr:?}");
+    }
     Ok(())
 }
 

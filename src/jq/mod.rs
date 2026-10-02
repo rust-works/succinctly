@@ -130,8 +130,8 @@ pub use parser::{
     BreakSite, CallSite, DefSite, ParseError, ParserMode, VarSite,
 };
 pub use resolve::{
-    call_arity, resolve_all, resolve_func_calls, resolve_func_calls_all, ModuleDef, ModuleRun,
-    ResolveError, RunMarker, UnboundVar, UnresolvedCall, UnresolvedLabel,
+    call_arity, resolve_all, resolve_all_jq, resolve_func_calls, resolve_func_calls_all, ModuleDef,
+    ModuleRun, ResolveError, RunMarker, UnboundVar, UnresolvedCall, UnresolvedLabel,
 };
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
