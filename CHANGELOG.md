@@ -422,6 +422,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a terminal `null`/`true`/`false` after a navigation no longer writes over the document
+  root** (#3579). On a `null` document, `(.a as $x | .a | 5 | first(7) | $x) = 9` wrote `9` where jq
+  writes `{"a":9}`, and `path(.a as $x | .a | 5 | select(true) | $x)` answered `[]` where jq says
+  `["a"]`, with nothing refused (exit 0). #3125's carve-out for a terminal `null`/`true`/`false`
+  identical to the register answers the root path, which is right only while the register never left
+  the root; it now applies only before the first navigation. After one the call refuses with jq's
+  wording (as it always did on `{"a":null}`), and the refusal is uncatchable, so `try` cannot turn it
+  into a dropped write. Every shape the carve-out answered correctly is unchanged.
+
 - **jq: a recursion's first output keeps the path register across it** (#3272). jq's
   `def r: ., (f | r); r;` emits the seed before anything indexes, so on an untracked input
   `path(. as $x | 1 | .. | $x)` is `[]` and only the *next* output raises `near attempt to
