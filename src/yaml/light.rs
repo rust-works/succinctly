@@ -22,10 +22,7 @@ use std::rc::Rc;
 #[cfg(test)]
 use std::string::ToString;
 
-use super::encode_style::{
-    go_yaml_string_style, write_go_yaml_double_quoted, write_go_yaml_single_quoted,
-    EncodedStringStyle,
-};
+use super::encode_style::write_go_yaml_string;
 use super::index::YamlIndex;
 use super::line_break::{is_line_break, line_break_len, line_break_len_before};
 use super::scalar::{
@@ -9471,14 +9468,8 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
         // the encoder yq itself uses. A string it declines to decide (one with a
         // line break) keeps the escaped double-quoted form it always had.
         YamlString::DoubleQuoted { .. } if canonicalize => {
-            match go_yaml_string_style(&str_val, false) {
-                Some(EncodedStringStyle::Plain) => Ok(out.write_str(&str_val)?),
-                Some(EncodedStringStyle::SingleQuoted) => {
-                    Ok(write_go_yaml_single_quoted(out, &str_val)?)
-                }
-                Some(EncodedStringStyle::DoubleQuoted) => {
-                    Ok(write_go_yaml_double_quoted(out, &str_val)?)
-                }
+            match write_go_yaml_string(out, &str_val, false) {
+                Some(written) => Ok(written?),
                 None => Ok(stream_yaml_double_quoted(out, &str_val)?),
             }
         }

@@ -5944,6 +5944,19 @@ fn test_nul_output_eval_all_no_separator_leak_on_later_doc_failure_1709() -> Res
     Ok(())
 }
 
+/// #3588: a NUL inside a mapping value is *escaped* (`\0`), never written raw, so `-0`
+/// has nothing to refuse and the only NUL bytes in the output are its own separators.
+/// The old DOM heuristic wrote the byte raw, which is invalid YAML.
+#[test]
+fn test_nul_in_a_mapping_value_is_escaped_not_raw_under_nul_output_3588() -> Result<()> {
+    let input = "a: 1\n---\nb: \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".", input, &["--eval-all", "-0"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(output.matches('\0').count(), 2, "{output:?}");
+    assert!(output.contains("b: \"x\\0y\""), "{output:?}");
+    Ok(())
+}
+
 /// #1709 code review: `stream_maybe_colored`'s `use_color` (`--colors`)
 /// branch read `separator.is_some()` to gate its own NUL scan but never
 /// consulted `DocSeparatorArgs` to actually *write* the `---` marker,

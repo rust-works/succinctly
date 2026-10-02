@@ -33,9 +33,8 @@ use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    format_float_yq_yaml, format_float_yq_yaml_nested, go_yaml_resolves_to_non_str,
-    go_yaml_string_scalar, resolve_tagged, stream_json_sequence, stream_yaml_sequence, YamlCursor,
-    YamlIndex, YamlValue,
+    format_float_yq_yaml, format_float_yq_yaml_nested, go_yaml_dom_scalar, resolve_tagged,
+    stream_json_sequence, stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
 };
 
 use super::m2_gate::can_use_m2_streaming;
@@ -609,6 +608,11 @@ struct OutputConfig {
     /// source, not global: set by the caller for the specific file/stream
     /// currently being formatted, since `--input-format auto` can mix
     /// JSON and YAML sources in one invocation.
+    ///
+    /// Also the DOM writer's "this text is JSON" flag for typing a string (#3588): a
+    /// JSON key or value is always a string, so it takes go-yaml's quoting, where a
+    /// YAML document's key or plain scalar spelled like a number, bool, null or
+    /// timestamp is echoed as it was written. Named for its first use.
     json_sourced_floats: bool,
 }
 
@@ -4948,7 +4952,9 @@ fn emit_yaml_value_at_depth(
             // and yq preserves a document literal's exact text.
             literal.to_string()
         }
-        OwnedValue::String(s) => yaml_quote_string_with_style(s, comments.style(), in_flow),
+        OwnedValue::String(s) => {
+            yaml_quote_string_with_style(s, comments.style(), in_flow, config.json_sourced_floats)
+        }
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
                 "[]".to_string()
@@ -5355,7 +5361,7 @@ fn can_single_quote(s: &str) -> bool {
 /// are block-scalar styles this DOM writer doesn't reproduce; see
 /// `CommentTree`'s own doc comment) falls back to the plain heuristic
 /// unchanged.
-fn yaml_quote_string_with_style(s: &str, style: &str, in_flow: bool) -> String {
+fn yaml_quote_string_with_style(s: &str, style: &str, in_flow: bool, json_sourced: bool) -> String {
     // No empty-string special case needed here (unlike `yaml_quote_string`
     // below): every arm already renders `""` correctly on its own -
     // `yaml_double_quote_escaped`/`yaml_single_quote_escaped` produce
@@ -5367,35 +5373,31 @@ fn yaml_quote_string_with_style(s: &str, style: &str, in_flow: bool) -> String {
     match style {
         "single" if can_single_quote(s) => yaml_single_quote_escaped(s),
         "double" => yaml_double_quote_escaped(s),
-        // #3588: no style to preserve, so the choice is the encoder's own --
-        // plain, single or double quotes exactly as go-yaml picks them -- rather
-        // than `yaml_quote_string`'s approximation, which wrote a date or a
-        // number-shaped string bare (`d: 2001-12-14` reads back as a timestamp)
-        // and chose single or double quotes by a different rule. A string with a
-        // line break, which go-yaml writes as a block scalar, keeps the old text.
-        _ => go_yaml_string_scalar(s, in_flow).unwrap_or_else(|| yaml_quote_string(s)),
+        // #3588: no style to preserve, so the choice is the encoder's own -- plain, single
+        // or double quotes exactly as go-yaml picks them (`go_yaml_dom_scalar`, which also
+        // decides what a YAML plain scalar that yq types is) -- rather than
+        // `yaml_quote_string`'s approximation, which wrote a date or a number-shaped string
+        // bare and chose single or double quotes by a different rule. What it declines (a
+        // line break, which go-yaml writes as a block scalar, or a YAML plain scalar yq
+        // types as a timestamp or `1_000`) keeps the old text.
+        _ => go_yaml_dom_scalar(s, in_flow, json_sourced, false)
+            .unwrap_or_else(|| yaml_quote_string(s)),
     }
 }
 
 /// Quote a YAML key if needed.
 ///
-/// #3588: a key is a string with no style of its own here, so it takes the
-/// encoder's choice (`flow` is whether it sits in a `{...}` mapping). The heuristic
-/// below only keeps what that cannot decide: a key with a line break, which
-/// go-yaml writes in `? ` explicit-key syntax (#3587) and this writer does not, and
-/// a typed key.
-///
-/// A mapping key reaches this writer as its display text, with no record of whether
-/// it was a string, so in a YAML document a key spelled like a number, a bool, a
-/// null or a timestamp (`200: ok`, `~: v`) is echoed bare, as before: quoting it
-/// would turn an integer key into a string key. `json_sourced` lifts that, since a
-/// JSON object key is always a string (`{"1": a}` is `"1": a` in yq).
+/// #3588: a key is a string with no style of its own here, so it takes the encoder's
+/// choice (`flow` is whether it sits in a `{...}` mapping), except for what
+/// `go_yaml_dom_scalar` leaves to the heuristic below: a key with a line break, which
+/// go-yaml writes in `? ` explicit-key syntax (#3587) and this writer does not, and the
+/// empty key of a YAML document. A key reaches this writer as its display text, with no
+/// record of whether it was a string, so in a YAML document one spelled like a number, a
+/// bool, a null or a timestamp (`200: ok`, `~: v`) is echoed as it is rather than quoted
+/// into a string key; `json_sourced` lifts that, since a JSON key is always a string.
 fn yaml_quote_key(s: &str, flow: bool, json_sourced: bool) -> String {
-    let typed_key = !json_sourced && go_yaml_resolves_to_non_str(s);
-    if !typed_key {
-        if let Some(scalar) = go_yaml_string_scalar(s, flow) {
-            return scalar;
-        }
+    if let Some(scalar) = go_yaml_dom_scalar(s, flow, json_sourced, true) {
+        return scalar;
     }
     // Keys have similar rules but are a bit more permissive
     if s.is_empty() {

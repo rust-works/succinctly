@@ -273,7 +273,7 @@ pub(crate) enum QuotedSpanEnd {
     Unterminated,
 }
 
-pub use encode_style::{go_yaml_resolves_to_non_str, go_yaml_string_scalar};
+pub use encode_style::go_yaml_dom_scalar;
 pub use error::YamlError;
 pub use index::YamlIndex;
 pub use light::{

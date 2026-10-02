@@ -36,10 +36,7 @@ use super::value::{
     assert_value_tree_depth, format_number_for_preview, format_number_jq_compat,
     infinite_float_preview_text, jq_bare_float_display, NumberRepr, OwnedValue,
 };
-use crate::yaml::encode_style::{
-    go_yaml_string_style, write_go_yaml_double_quoted, write_go_yaml_single_quoted,
-    EncodedStringStyle,
-};
+use crate::yaml::encode_style::write_go_yaml_string;
 use crate::yaml::{format_float_with_fraction, format_float_yq_yaml, format_float_yq_yaml_nested};
 
 /// A value that can be streamed directly to output without intermediate allocation.
@@ -890,7 +887,7 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
             // caller exists), so there is no jq convention to protect here.
             out.write_str(literal)
         }
-        OwnedValue::String(s) => stream_yaml_string(out, s),
+        OwnedValue::String(s) => stream_yaml_string_in(out, s, indent_spaces == 0 && depth > 0),
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
                 out.write_str("[]")
@@ -965,7 +962,7 @@ fn stream_owned_value_yaml_at_depth<W: core::fmt::Write>(
                     if i > 0 {
                         out.write_str(", ")?;
                     }
-                    stream_yaml_string(out, key)?;
+                    stream_yaml_string_in(out, key, true)?;
                     out.write_str(": ")?;
                     stream_owned_value_yaml_at_depth(val, out, "", 0, unit, sort_keys, depth + 1)?;
                 }
@@ -1067,16 +1064,18 @@ fn compact_indent(indent: &str) -> String {
 /// Uses double quotes if the string contains special characters,
 /// otherwise outputs unquoted or single-quoted based on content.
 pub fn stream_yaml_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fmt::Result {
-    // #3588: a computed string has no style of its own, so it is written the way
-    // go-yaml's encoder writes one -- plain, single or double quotes -- which is
-    // not what the heuristic this replaced answered (it wrote a date or a
-    // number-shaped string bare, and chose single or double quotes by another
-    // rule). A string with a line break, which go-yaml writes as a block scalar,
-    // keeps the old text.
-    match go_yaml_string_style(s, false) {
-        Some(EncodedStringStyle::Plain) => out.write_str(s),
-        Some(EncodedStringStyle::SingleQuoted) => write_go_yaml_single_quoted(out, s),
-        Some(EncodedStringStyle::DoubleQuoted) => write_go_yaml_double_quoted(out, s),
+    stream_yaml_string_in(out, s, false)
+}
+
+/// [`stream_yaml_string`] for a string inside `[...]` or `{...}` when `flow` is set,
+/// where go-yaml also quotes `,[]{}?` and any `:` (#3588).
+pub fn stream_yaml_string_in<W: core::fmt::Write>(
+    out: &mut W,
+    s: &str,
+    flow: bool,
+) -> core::fmt::Result {
+    match write_go_yaml_string(out, s, flow) {
+        Some(written) => written,
         None => stream_yaml_double_quoted(out, s),
     }
 }
