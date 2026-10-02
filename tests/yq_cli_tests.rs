@@ -50875,3 +50875,31 @@ fn test_yq_json_sourced_number_length_is_its_decoded_width_3597() -> Result<()> 
     }
     Ok(())
 }
+
+/// #3488: real yq raises `aborted` (exit 1) for an `error(msg)` whose message
+/// produces no output, where jq's `msg | error` yields nothing -- the rule is
+/// the mode's, not the document's, so `succinctly yq` keeps raising and
+/// `succinctly jq` does not (`test_error_of_an_empty_message_yields_nothing_3488`).
+/// A message that does produce a value is raised as before. Every expectation
+/// is yq v4.53.3's.
+#[test]
+fn test_yq_error_of_an_empty_message_aborts_3488() -> Result<()> {
+    let doc = "a: 1\nc: []\nd:\n  - 1\n";
+    for (filter, stderr) in [
+        ("error(select(false))", "Error: aborted\n"),
+        ("error(.c[])", "Error: aborted\n"),
+        ("[error(select(false))]", "Error: aborted\n"),
+        (".a |= error(select(false))", "Error: aborted\n"),
+        (r#"(error(select(false))) // "d""#, "Error: aborted\n"),
+        (".d[] | error(select(. > 5))", "Error: aborted\n"),
+        ("error(\"x\")", "Error: x\n"),
+    ] {
+        let (stdout, err, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.as_str(), err.as_str(), code),
+            ("", stderr, 1),
+            "`{filter}`"
+        );
+    }
+    Ok(())
+}

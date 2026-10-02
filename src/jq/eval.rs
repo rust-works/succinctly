@@ -327,6 +327,15 @@ pub trait EvalSemantics: Copy + Default {
     /// at all. See `yq_read_only_context`'s own doc comment for which
     /// contexts force it on and for the captured rows.
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool;
+
+    /// If true (yq, #3488), `error(msg)` whose message produces **no output**
+    /// raises `aborted` -- live-verified against yq v4.53.3, where
+    /// `error(select(false))`, `error(.c[])`, `[error(select(false))]` and
+    /// `.a |= error(select(false))` all exit 1 with `Error: aborted`. If false
+    /// (jq), `error(msg)` is `msg | error`, which runs `error` once per output
+    /// of `msg`, so an empty message raises nothing and the call yields
+    /// nothing (`[error(empty), 1]` is `[1]`).
+    const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -361,6 +370,7 @@ impl EvalSemantics for JqSemantics {
     const EMPTY_OPERAND_BINARY_RULE: bool = false;
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = false;
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = false;
+    const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool = false;
 }
 
 /// yq-compatible evaluation semantics.
@@ -397,6 +407,7 @@ impl EvalSemantics for YqSemantics {
     const EMPTY_OPERAND_BINARY_RULE: bool = true;
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = true;
     const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = true;
+    const ERROR_OF_EMPTY_MESSAGE_ABORTS: bool = true;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -5498,8 +5509,8 @@ fn prepend<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// real jq, not "no value") with no exceptions found, unlike the narrower,
 /// escape-specific exceptions above for the *trailing* case. A caller must
 /// return `QueryResult::None` on `Ok(None)` instead of treating it as an
-/// error. `error(msg)` was the last caller that raised "no value" here, until
-/// #3488.
+/// error, unless the *mode* has its own rule for the case (yq's `error(msg)`
+/// raises `aborted`, `EvalSemantics::ERROR_OF_EMPTY_MESSAGE_ABORTS`).
 fn result_to_owned_full<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> Result<Option<(OwnedValue, Option<Control>)>, EvalEscape> {
@@ -13054,8 +13065,7 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // case and on `Many`'s first element, not the plain `to_owned_lossy`
         // `result_to_owned_full` uses internally -- the same asymmetry the `None`
         // arm below was already fixed for by #1820.
-        // `result_to_owned_full` backs ~47 other call sites across this file
-        // (the one such helper left, #3488), each with its own
+        // `result_to_owned_full` is shared with `each_limit`, each with its own
         // optional/catchability contract, so this fixes only `error(msg)`'s
         // own materialization here rather than touching the shared helper
         // (#1907's own "Category 2 territory" scope note). `Owned`/`ManyOwned`
@@ -13103,9 +13113,20 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             } else {
                 match result_to_owned_full::<_, S>(msg_result) {
-                    // Only the first output is raised; a trailing control after
-                    // it never runs, as `error((1, break $out))` raises `1`.
+                    // Only the first output is raised; a trailing `break` or
+                    // error after it never runs, as `error((1, break $out))`
+                    // raises `1`. A trailing `halt` is the exception
+                    // (`result_to_owned_full` returns it as an escape, #791).
                     Ok(Some((v, _trailing))) => v,
+                    // yq raises `aborted` for a message that produces nothing,
+                    // and `?` suppresses it as it does any raised error.
+                    Ok(None) if S::ERROR_OF_EMPTY_MESSAGE_ABORTS => {
+                        return if optional {
+                            QueryResult::None
+                        } else {
+                            QueryResult::Error(EvalError::new("aborted"))
+                        };
+                    }
                     // jq's `error(msg)` is `msg | error`, which runs `error`
                     // once per output of `msg`: a message that produces
                     // nothing raises nothing and the call yields nothing
@@ -52866,8 +52887,8 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1313: `result_to_owned` collapses a genuinely zero-output bound
-    // (`limit(empty; ...)`) into `result_to_owned_ctrl`'s own `Err("no
+    // #1313: the removed `result_to_owned` collapsed a genuinely zero-output
+    // bound (`limit(empty; ...)`) into its own `Err("no
     // value")` -- not real jq's behavior (`n as $n | ...` never binds, so
     // the whole call produces zero output, not an error -- verified live
     // against jq 1.7.1: `limit(empty; .a,.b)` on `{"a":1,"b":2}` produces
@@ -83384,7 +83405,7 @@ mod tests {
         // whose first element is undecodable fall through to
         // `result_to_owned`'s own unchecked `to_owned_lossy` (#1907 review).
         // `error`'s generator-argument semantics only ever consume the
-        // *first* output (see `result_to_owned_ctrl`'s doc comment), so
+        // *first* output (see `result_to_owned_full`'s doc comment), so
         // checking `Many`'s first element is the correct, matching fix.
         query!(br#"{"a": "\uXXXX", "b": "ok"}"#, "error((.a, .b))",
             QueryResult::Error(e) => {
