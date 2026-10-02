@@ -2598,6 +2598,40 @@ answers `["b"]` — and classified the two residuals appended below):
   per-step register" *and* "still identical to the persistent one") without regressing the
   `[]` case above — recorded rather than built, since the exit code and value already match
   and only wording differs.
+- **A recursion's first output keeps the path register; the later ones move it
+  ([#3272](https://github.com/rust-works/succinctly/issues/3272)).** jq defines every spelling
+  (`..`, `recurse`, `recurse(f)`, `recurse(f; cond)`) as `def r: ., (f | r); r;`, so the `.` is
+  emitted down the first `FORK` branch before anything indexes. On an untracked input the
+  register is still where it was for that one output, and a `$x` frozen from it re-establishes.
+  Only the *next* output navigates, and that is where jq raises, with its own wording, which a
+  `try`/`?` around the recursion catches:
+  ```
+  $ echo '{"a":{"b":{"b":null}},"c":2}' | jq -c 'path(. as $x | 1 | .. | $x)'
+  []
+  jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1
+  $ echo '{"a":{"b":{"b":null}},"c":2}' | jq -c 'path(. as $x | 1 | try recurse(.a) | $x)'
+  []
+  ```
+  succinctly used to drop the register for the whole stage, so `$x` was refused at the seed with
+  a guessed `… with result …` error before the recursion's own error was reached, and
+  `del`/`=`/`|=` over the `try` form refused where jq writes. `resolve_seq_stage` now keeps the
+  register across the stage's **first delivered step only**, which every recurse producer emits
+  as `recurse_family_root_seed` (`recurse_seed_keeps_register`: jq mode, an untracked branch, and
+  a recurse-family node seen through `Paren`, a closure parameter, `?` or `try`). It is the same
+  per-branch shape as `getpath` below, and a debug assertion trips if a producer ever emits
+  something ahead of its seed. yq mode keeps its eager guard.
+
+  **What still refuses**, each loudly (an exit 5, never a write that is silently lost) and
+  pinned by `test_recurse_seed_residuals_stay_loud_3272`:
+  - a recursion behind a call, a fork or a nested pipe, whose first output is not provably the
+    seed: `path(. as $x | 1 | first(..) | $x)`, `limit(2; ..)`, `(., ..)`,
+    `if true then .. else 1 end`, `(.. | select(true))` and `(try ..) // 3` are `[]` in jq.
+    Naming a call's body is what `cannot_move_register` declines to do;
+  - the output a `catch` handler adds after the seed: `path(. as $x | 1 | try recurse(.a) catch 7
+    | $x)` is `[]` twice in jq, and `[]` followed by the refusal here. Closing it needs "a caught
+    untracked-navigation refusal did not move the register", a separate rule;
+  - a recursion in a fold's UPDATE or EXTRACT, which consults only the static predicate:
+    `path(. as $x | reduce (1,2) as $i (1; try ..) | $x)` is `[]` in jq.
 - **`getpath` is transparent to the path register, and succinctly now models it
   ([#2896](https://github.com/rust-works/succinctly/issues/2896),
   [#2978](https://github.com/rust-works/succinctly/issues/2978)).** The mechanism recorded

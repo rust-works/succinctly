@@ -422,6 +422,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a recursion's first output keeps the path register across it** (#3272). jq's
+  `def r: ., (f | r); r;` emits the seed before anything indexes, so on an untracked input
+  `path(. as $x | 1 | .. | $x)` is `[]` and only the *next* output raises `near attempt to
+  iterate through 1`, which `try`/`?` around the recursion catches. succinctly refused the
+  `$x` at the seed with a guessed `with result` error. `..`, `recurse`, `recurse(f)` and
+  `recurse(f; cond)`, also through `try`, `?`, parentheses and a closure parameter, now answer
+  as jq does in `path()`, `del()` and the assignments, including the writes under `try` that
+  used to refuse. A recursion behind a call, a fork or a nested pipe (`first(..)`), a `catch`
+  handler's own output and a recursion inside a fold body still refuse, loudly, as before.
+  yq mode is unchanged.
+
 - **jq: a data import's read/parse failure is no longer dropped behind a missing module,
   and every top-level one is reported** (#3327). `include "missing"; import "bad" as $d; $d` printed
   only `module not found: missing`, where jq prints the data-file error first, and two bad
