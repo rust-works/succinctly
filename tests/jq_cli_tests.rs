@@ -84898,6 +84898,113 @@ fn test_halt_in_a_fold_source_try_writes_once_in_yq_mode_3518() -> Result<()> {
     Ok(())
 }
 
+/// #3612: `error(msg)` over a message that produces a value and *then* halts
+/// raises the value. jq runs `error` on the message's first output and only
+/// reaches the `halt` on backtracking, so `error((1, halt))` raises `1` at exit
+/// 5 (and `try ... catch .` sees `1`), where this halted at exit 0: the helper
+/// `error` reduced its message through turned a trailing `halt` into an escape
+/// before `error` ran (#791). A message that halts *first* still halts, and a
+/// trailing `break` or error already raised the first value. Every value
+/// captured from jq 1.7.1, on both routes.
+#[test]
+fn test_error_of_a_message_that_halts_after_a_value_raises_the_value_3612() -> Result<()> {
+    let doc = r#"{"a":1}"#;
+    for (filter, expected_stdout, expected_code, expected_error) in [
+        ("error((1, halt))", "", 5, "(not a string): 1"),
+        (r#"error(("m", halt))"#, "", 5, ": m"),
+        ("error((1, 2, halt))", "", 5, "(not a string): 1"),
+        ("error((1, halt, 2))", "", 5, "(not a string): 1"),
+        ("try error((1, halt)) catch .", "1\n", 0, ""),
+        ("[try error((1, halt)) catch .]", "[1]\n", 0, ""),
+        (r#"try (error(("m", halt))) catch ."#, "\"m\"\n", 0, ""),
+        ("[error((1, halt))?]", "[]\n", 0, ""),
+        ("error((1, halt))?", "", 0, ""),
+        // output before the raise survives; the raise is the first message value
+        ("1, error((2, halt))", "1\n", 5, "(not a string): 2"),
+        ("[(1, error((2, halt)))?]", "[1]\n", 0, ""),
+        // every consumer of the message reaches the same answer
+        ("path(error((1, halt)))", "", 5, "(not a string): 1"),
+        ("del(error((1, halt)))", "", 5, "(not a string): 1"),
+        (".a |= error((1, halt))", "", 5, "(not a string): 1"),
+        (
+            "reduce (1, error((2, halt))) as $x (0; . + $x)",
+            "",
+            5,
+            "(not a string): 2",
+        ),
+        (
+            "[limit(2; 1, error((2, halt)))]",
+            "",
+            5,
+            "(not a string): 2",
+        ),
+        // a message that halts *first* still halts, quietly, at exit 0
+        ("error((halt, 1))", "", 0, ""),
+        ("error(halt)", "", 0, ""),
+    ] {
+        let owned = format!("{doc} | {filter}");
+        for ((stdout, stderr, code), route) in [
+            (run_jq_full(&["-c", "--", filter], Some(doc))?, "cursor"),
+            (run_jq_full(&["-nc", "--", &owned], None)?, "owned"),
+        ] {
+            assert_eq!(
+                (stdout.as_str(), code),
+                (expected_stdout, expected_code),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+            if expected_error.is_empty() {
+                assert_eq!(
+                    stderr, "",
+                    "`{filter}` ({route} route): nothing may reach stderr"
+                );
+            } else {
+                assert!(
+                    stderr.contains(expected_error),
+                    "`{filter}` ({route} route): stderr {stderr:?}"
+                );
+            }
+        }
+    }
+    // `halt_error` inside the message is still a halt with its own code.
+    let (stdout, _, code) = run_jq_full(&["-nc", "error(halt_error(3))"], None)?;
+    assert_eq!((stdout.as_str(), code), ("", 3));
+    Ok(())
+}
+
+/// #3612, yq mode: `error` is shared with `succinctly yq`, where `halt` is a
+/// `--jq-extensions` surface real yq lacks (no oracle), so the rule is jq's: the
+/// message's first value is raised, and `try` catches it.
+#[test]
+fn test_error_of_a_message_that_halts_after_a_value_in_yq_mode_3612() -> Result<()> {
+    for (filter, expected_code, expected_stdout, expected_stderr) in [
+        ("error((1, halt))", Some(1), "", "Error: 1\n"),
+        ("try error((1, halt)) catch .", Some(0), "1\n", ""),
+        // a message that halts first still halts, quietly
+        ("error((halt, 1))", Some(0), "", ""),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().expect("piped").write_all(b"a: 1\n")?;
+                child.wait_with_output()
+            })?;
+        assert_eq!(
+            (
+                String::from_utf8_lossy(&output.stdout).as_ref(),
+                String::from_utf8_lossy(&output.stderr).as_ref(),
+                output.status.code()
+            ),
+            (expected_stdout, expected_stderr, expected_code),
+            "#3612 (yq): `{filter}`"
+        );
+    }
+    Ok(())
+}
+
 /// #3293 slice 4 and #2163: a `?//` retry that supersedes a consumer's stop
 /// lets the fold go on to its next INIT fork, and there the source runs
 /// against the real `.` where jq gives it a synthetic `null` -- #2163's open
