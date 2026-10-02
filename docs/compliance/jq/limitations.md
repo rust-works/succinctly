@@ -663,11 +663,6 @@ follows too. What it leaves:
   `[first(path(foreach 1 as $x (.; .[K]))), 9]` with a key whose retry raises after a satisfied
   first alternative is `[["a"],9]` after a single attempt here and an error in jq. Not a stale
   slot: no retry happens at all.
-- **`getpath(K)` in path mode evaluates `K` once, with no retry** (the #3487 "arguments
-  evaluated eagerly" family, not the index sink): `path(getpath(([["a"]] as [$q] ?// [[$q]] |
-  [$q])))` on `{"a":{"a":1}}` is `["a"]` in jq after two attempts and "Cannot index object with
-  array" here after one, and `del(getpath(K))` likewise. Recorded on #3293 for its closing slice
-  with `path_context_step_getpath`.
 - **An array key on an array** (#3506, #3453, #2429): jq's `.[[2]]` is a subarray search, and
   here too, in value, path and write position alike. `.[[2]]`, `indices`/`index`/`rindex` with
   an array needle and `getpath([[2]])` answer it (including past a `null` reached mid-path,
@@ -756,6 +751,38 @@ retry's child is fine), was the abandoned alternative's `E`. The value and path 
   before it descends into any child, so no retry can follow a child's failure there and its stash
   needed no change. No row here runs queued: it starts only in a walk deeper than the native
   budget.
+
+## A builtin's argument and a `?//` retry (#3487)
+
+jq binds a builtin's argument once per value: a `$param` of a jq-defined builtin (`flatten($x)`,
+`join($x)`) is an `as`, and a C-coded one (`has`, `startswith`, `ltrimstr`, `test`, ...) evaluates
+its argument as a backtracking sub-expression. So a failure raised after the call -- by the
+builtin, the rest of the pipe, or a consumer's stop (jq retries a `?//` past `first`'s `break` and
+delivers a second output) -- reaches a `?//` in the argument. The argument was run to completion
+before the builtin acted, so none of that did: `has(K)` with a first alternative that is not a key
+raised after one attempt, `try error(K) catch .` printed the first alternative, and `[first("ab" |
+ltrimstr([1] as $q ?// $b | "a")), 9]` was `["b",9]` where jq prints `["b","b",9]`.
+
+The parser now binds the argument first, `K as $v | B($v)`, when it holds a `?//` (and `error(K)` is
+jq's `K | error`), which every route already drives through a live sink. It covers `has`,
+`ltrimstr`, `rtrimstr`, `startswith`, `endswith`, `split`, `join`, `contains`, `inside`, `flatten`,
+`test`, `index`, `indices`, `rindex`, `getpath`, `delpaths`, `bsearch`, `strftime`, `strptime`,
+`strflocaltime`, `match`, `capture`, `scan`, `splits` and `error`, in value mode and in path mode
+(`path(getpath(K))` and `del(getpath(K))` retry, as in jq). A program with no `?//` parses as
+before. What it leaves:
+
+- **Two-argument builtins** (`setpath`, `sub`, ...) and the closure-parameter builtins
+  (`with_entries(K)`) are not rebound.
+- **Only a `?//` written in the argument is bound.** An argument that reaches one through a user
+  function or a closure parameter (`def f: [1] as $q ?// $b | "a"; ... ltrimstr(f)`, `def g(x):
+  ltrimstr(x); g(K)`) or an imported one makes a single attempt where jq retries: the parser cannot
+  see behind the call, and binding every argument that calls a function changes how undefined
+  names are reported. A builtin whose name a definition shadows (`def has(x): ...`) is left as
+  written, so a call that still resolves to the builtin keeps the old behaviour.
+- **`path(B(K))` for a builtin that is not a path expression** (`path(ltrimstr(K))`,
+  `path(inside(K))`, which jq answers or refuses on its own terms) retries where jq makes a
+  single attempt: the path-mode retry of an "Invalid path expression" refusal is jq-specific and
+  was already divergent before this change. `has` and the rest of the list above match.
 
 ## `while`/`until` and a `?//` retry in `update` or `cond` (#3503, #3617)
 
