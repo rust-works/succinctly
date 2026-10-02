@@ -82113,6 +82113,301 @@ fn test_loop_update_retry_follows_a_later_rounds_failure_3503() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_LOOP_3503)
 }
 
+/// #3617: a `?//` in the `cond` of `while`/`until` retries past a failure the branch
+/// it chose raises on a later round, as jq's does, the `cond` twin of
+/// [`RETRY_ROWS_LOOP_3503`]. `cond`'s first alternative picks a branch whose own
+/// `update` raises `E`; the retry answers, produces nothing, raises, fails to
+/// destructure or fans out, and the update is a `halt_error` for the last row of each
+/// group, which is never retried. `first`/`limit` rows pin a consumer's stop. Input
+/// `[10,20,30]`; every value captured from jq 1.7.1 with `-c`.
+const RETRY_ROWS_LOOP_COND_3617: &[RetryRow3293] = &[
+    (
+        r#"[while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else length>1 end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)]"#,
+        "[[10,20,30],[10],[20,30]]\n",
+        "AAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else length>1 end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[10,20,30],[10,20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else length>1 end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[10,20,30],[10,20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else length>1 end); if length==3 then .[0:1], .[1:] elif length==1 then ("h"|halt_error(3)) else [] end)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"[until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else length>1 end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)]"#,
+        "[[10],[]]\n",
+        "AAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else length>1 end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[10],[10],9]\n",
+        "AAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else length>1 end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[10],[10],9]\n",
+        "AAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else length>1 end))|not; if length==3 then .[0:1], .[1:] elif length==1 then ("h"|halt_error(3)) else [] end)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"[while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else empty end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)]"#,
+        "[[10,20,30],[10],[20,30]]\n",
+        "AAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else empty end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[10,20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else empty end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[10,20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else empty end); if length==3 then .[0:1], .[1:] elif length==1 then ("h"|halt_error(3)) else [] end)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"[until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else empty end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)]"#,
+        "[[]]\n",
+        "AAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else empty end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[],9]\n",
+        "AAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else empty end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[],9]\n",
+        "AAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else empty end))|not; if length==3 then .[0:1], .[1:] elif length==1 then ("h"|halt_error(3)) else [] end)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"[while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else error("E2") end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)]"#,
+        "",
+        "AAAA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else error("E2") end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else error("E2") end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else error("E2") end); if length==3 then .[0:1], .[1:] elif length==1 then ("h"|halt_error(3)) else [] end)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"[until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else error("E2") end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)]"#,
+        "",
+        "AAAA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else error("E2") end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "",
+        "AAAA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else error("E2") end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "",
+        "AAAA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then length>0 else error("E2") end))|not; if length==3 then .[0:1], .[1:] elif length==1 then ("h"|halt_error(3)) else [] end)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"[while(([1] as $q ?// {$z} | ("A"|stderr) as $_ | length>0); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)]"#,
+        "",
+        "AA",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[first(while(([1] as $q ?// {$z} | ("A"|stderr) as $_ | length>0); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[limit(1; while(([1] as $q ?// {$z} | ("A"|stderr) as $_ | length>0); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[while(([1] as $q ?// {$z} | ("A"|stderr) as $_ | length>0); if length==3 then .[0:1], .[1:] elif length==1 then ("h"|halt_error(3)) else [] end)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"[until((([1] as $q ?// {$z} | ("A"|stderr) as $_ | length>0))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)]"#,
+        "",
+        "AA",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[first(until((([1] as $q ?// {$z} | ("A"|stderr) as $_ | length>0))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "",
+        "AA",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[limit(1; until((([1] as $q ?// {$z} | ("A"|stderr) as $_ | length>0))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "",
+        "AA",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[until((([1] as $q ?// {$z} | ("A"|stderr) as $_ | length>0))|not; if length==3 then .[0:1], .[1:] elif length==1 then ("h"|halt_error(3)) else [] end)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"[while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then (length>0, length>1) else length>1 end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)]"#,
+        "[[10,20,30],[10],[20,30],[20,30],[10,20,30],[10],[20,30],[20,30]]\n",
+        "AAAAAAAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then (length>0, length>1) else length>1 end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[10,20,30],[10,20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then (length>0, length>1) else length>1 end); if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[10,20,30],[10,20,30],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[while(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then (length>0, length>1) else length>1 end); if length==3 then .[0:1], .[1:] elif length==1 then ("h"|halt_error(3)) else [] end)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"[until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then (length>0, length>1) else length>1 end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)]"#,
+        "[[10],[],[],[],[],[10],[],[],[],[]]\n",
+        "AAAAAAAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then (length>0, length>1) else length>1 end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[10],[10],9]\n",
+        "AAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then (length>0, length>1) else length>1 end))|not; if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end)), 9]"#,
+        "[[10],[10],9]\n",
+        "AAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[until((([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then (length>0, length>1) else length>1 end))|not; if length==3 then .[0:1], .[1:] elif length==1 then ("h"|halt_error(3)) else [] end)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+];
+
+#[test]
+fn test_loop_cond_retry_follows_a_later_rounds_failure_3617() -> Result<()> {
+    assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_LOOP_COND_3617)
+}
+
 /// #3293 slice 5: a `?//` retry inside a *path-mode* computed index supersedes
 /// what `resolve_index_expr_sink` stashed for the abandoned alternative --
 /// its `target_escape` and the consumer's stop -- whichever way the retry
@@ -83747,6 +84042,7 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("[10,20,30] | ", RETRY_ROWS_PATH_FOLD_3293),
         ("[10,20,30] | ", RETRY_ROWS_RECURSE_3293),
         ("[10,20,30] | ", RETRY_ROWS_LOOP_3503),
+        ("[10,20,30] | ", RETRY_ROWS_LOOP_COND_3617),
         (r#"{"a":{"a":1}} | "#, RETRY_ROWS_PATH_INDEX_3293),
         // slice 9: `key` over an owned input takes the owned-identity walk.
         ("[10,20,30] | ", RETRY_ROWS_PATH_CONTEXT_SLICE_3293),
@@ -83765,7 +84061,14 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
                 // #3503's table also runs `first`/`limit` over `while`; on this route the
                 // loop is collected eagerly, so it runs one `update` past the consumer's
                 // stop (an `A` on stderr where jq prints none) with or without a `?//`.
-                !(filter.contains("first(while(") || filter.contains("limit(1; while("))
+                // #3617's `until` rows over a `?//` condition (`until((C)|not; ...)`)
+                // differ the same way: jq retries the condition past `first`'s stop and
+                // delivers a second output, which the eagerly collected loop cannot.
+                !(filter.contains("?//")
+                    && (filter.contains("first(while(")
+                        || filter.contains("limit(1; while(")
+                        || filter.contains("first(until((")
+                        || filter.contains("limit(1; until((")))
                     && !(exit == 5
                         && filter.starts_with('[')
                         && (filter.contains("| key") || filter.contains("| path]")))
