@@ -50544,8 +50544,12 @@ fn test_yq_json_sourced_surrogate_escapes_decode_like_go_3589() -> Result<()> {
     // A YAML document's surrogate escape is an error in yq (go-yaml: "found
     // invalid Unicode character escape code"), a pair and a lone half alike.
     for doc in ["a: \"\\ud83d\\ude00\"\n", "a: \"\\ud83d\"\n"] {
-        let (_, code) = run_yq_stdin(".a", doc, &[])?;
-        assert_ne!(code, 0, "{doc:?}");
+        let (_, stderr, code) = run_yq_stdin_with_stderr(".a", doc, &[])?;
+        assert_eq!(code, 1, "{doc:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "{doc:?}: {stderr:?}"
+        );
     }
     Ok(())
 }
