@@ -5406,6 +5406,14 @@ accepting the equivalent bare-comma spelling in #2863 does not change this
 existing evaluator limitation. `builtin_skip` needs count fan-out separately
 from the parser change; tracked as [#2934](https://github.com/rust-works/succinctly/issues/2934).
 
+`skip(n; f)` is also a path expression (#3611): `path(.a | skip(1; .b[]))`, `del(...)`, `=`, `|=`,
+`+=` and `pick` over it follow the elements it delivers, as `limit` and `nth` do. The path
+resolver (`resolve_skip_sink`) had no arm for it, so every one of them raised `Invalid path
+expression with result ...`. Because jq 1.7.1 does not define `skip`, the oracle for these rows
+is jq 1.8.2 (Homebrew), the same stand-in `classify_skip_n` documents (#1880). A non-number
+count raises succinctly's own `expected number, got ...` where jq 1.8.2's `-` operator says
+`... cannot be subtracted`; only the exit code agrees.
+
 ## A generator `n` under a truncating consumer: fixed for `limit`, residual for `nth`/`isempty`
 
 Real jq passes `limit($n; f)`'s `$n` through the same backtracking arg-passing convention
