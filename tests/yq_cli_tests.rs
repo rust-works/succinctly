@@ -50790,3 +50790,85 @@ fn test_yq_json_sourced_whole_float_prints_as_yq_does_3577() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3597: for a JSON document, yq's `length` of a number is the width of the
+/// number its JSON decoder produced, rendered the way yq prints it -- `2.0`
+/// decodes to the integer `2` (width 1), `1.50` to `1.5` (3), `1e5` to `100000`
+/// (6), `1e20` stays a float that prints `1e+20` (5) -- not the width of the
+/// source spelling (3, 4, 3, 4), which the cursor route measured. Every
+/// expected value is yq v4.53.3's.
+#[test]
+fn test_yq_json_sourced_number_length_is_its_decoded_width_3597() -> Result<()> {
+    let json = r#"{"p":2.0,"n":-0.0,"e":1e2,"m":9223372036854775808.0,"f":2.5,"x":1.50,"w":1e5,"i":3,"neg":-3.0,"big":1e20,"t":-1e-7,"q":12345678901234567890,"s":"2.0","b":true,"nu":null,"arr":[1.0,1e5,2.50,"2.0"],"o":{"k":4.0}}"#;
+    let json_args = ["--input-format", "json", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        (".p | length", "1\n"),
+        (".n | length", "1\n"),
+        (".e | length", "3\n"),
+        (".m | length", "19\n"),
+        (".f | length", "3\n"),
+        (".x | length", "3\n"),
+        (".w | length", "6\n"),
+        (".i | length", "1\n"),
+        (".neg | length", "2\n"),
+        (".big | length", "5\n"),
+        (".t | length", "6\n"),
+        (".q | length", "22\n"),
+        // A string that spells a number, a boolean and a null keep their own width.
+        (".s | length", "3\n"),
+        (".b | length", "4\n"),
+        (".nu | length", "0\n"),
+        (".o.k | length", "1\n"),
+        (".arr[] | length", "1\n6\n3\n3\n"),
+        ("[.arr[] | length]", "[1,6,3,3]\n"),
+        ("[.p, .w, .x] | map(length)", "[1,6,3]\n"),
+        (".p as $v | $v | length", "1\n"),
+        ("[.[] | length]", "[1,1,3,19,3,3,6,1,2,5,6,22,3,4,0,4,1]\n"),
+        (
+            r#".. | select(tag == "!!int" or tag == "!!float") | length"#,
+            "1\n1\n3\n19\n3\n3\n6\n1\n2\n5\n6\n22\n1\n6\n3\n1\n",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, json, &json_args)?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, expected, "`{filter}` on a JSON document");
+    }
+
+    // The same answer in YAML output, and on the DOM route (`-P`).
+    for args in [
+        &["--input-format", "json", "-o=yaml"][..],
+        &["--input-format", "json", "-P", "-o=json"][..],
+    ] {
+        for (filter, expected) in [(".p | length", "1\n"), (".w | length", "6\n")] {
+            let (stdout, code) = run_yq_stdin(filter, json, args)?;
+            assert_eq!(code, 0, "`{filter}` with {args:?}");
+            assert_eq!(stdout, expected, "`{filter}` with {args:?}");
+        }
+    }
+
+    // A multi-document file, where every document is measured alike.
+    let multi = "{\"a\":2.0}\n{\"a\":1e5}\n{\"a\":1.50}\n";
+    let (stdout, code) = run_yq_stdin(".a | length", multi, &json_args)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n6\n3\n", "`.a | length` on three JSON documents");
+
+    // Must not change: go-yaml keeps a YAML scalar's source text as its value,
+    // so `length` stays the width of the spelling.
+    let yaml =
+        "a: 2.0\nb: 1e5\nc: 1.50\nd: 0x1F\ne: -0.0\nf: 1e20\ng: \"2.0\"\nh: 12345678901234567890\n";
+    for (filter, expected) in [
+        (".a | length", "3\n"),
+        (".b | length", "3\n"),
+        (".c | length", "4\n"),
+        (".d | length", "4\n"),
+        (".e | length", "4\n"),
+        (".f | length", "4\n"),
+        (".g | length", "3\n"),
+        (".h | length", "20\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, expected, "`{filter}` on a YAML document");
+    }
+    Ok(())
+}

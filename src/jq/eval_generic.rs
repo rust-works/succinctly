@@ -287,6 +287,34 @@ fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) ->
     }
 }
 
+/// `length` of a number scalar read from a JSON-sourced document (#3597): the
+/// width of the number yq's JSON decoder produced, rendered the way yq
+/// prints it -- `2.0` decodes to the integer `2` (width 1), `1e5` to
+/// `100000` (6), `1e20` stays a float that prints `1e+20` (5) -- not the
+/// width of the source spelling the cursor hands back through `as_str`
+/// (3, 3, 4). [`numeric_length_owned`] is the one definition of that
+/// rendering, shared with the owned-number path, so a materialized number
+/// and the cursor it came from cannot disagree.
+///
+/// `None` for everything the caller's own arms already answer correctly: a
+/// document that is not JSON-sourced (go-yaml keeps a YAML scalar's source
+/// text as its value, so `a: 2.0` is width 3 in yq too), a quoted string
+/// (`as_i64`/`as_f64` read only an unquoted scalar), a boolean, and a
+/// non-finite float, which has no yq rendering to measure.
+fn json_sourced_number_length<V: DocumentValue, S: EvalSemantics>(
+    value: &V,
+    cursor: Option<&V::Cursor>,
+) -> Option<OwnedValue> {
+    if !cursor?.canonicalize_numbers() {
+        return None;
+    }
+    let number = match value.as_i64() {
+        Some(i) => OwnedValue::Int(i),
+        None => OwnedValue::Float(value.as_f64().filter(|f| f.is_finite())?),
+    };
+    Some(numeric_length_owned::<S>(number))
+}
+
 /// [`OwnedValue::from_document_float`] for a double read from `value`, except
 /// a NaN jq parsed from the document keeps the instance identity jq's `==`
 /// compares it by (#3309), keyed by the token's address.
@@ -25365,6 +25393,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Length => {
             if cursor_is_null(&value, cursor.as_ref()) {
                 GenericResult::Owned(OwnedValue::Int(0))
+            } else if let Some(length) = json_sourced_number_length::<V, S>(&value, cursor.as_ref())
+            {
+                // Ahead of the string arm: a JSON number's `as_str` is its
+                // source spelling, which is not what yq measures (#3597).
+                GenericResult::Owned(length)
             } else if let Some(s) = value.as_str() {
                 GenericResult::Owned(OwnedValue::Int(s.chars().count() as i64))
             } else if let Some(elements) = value.as_array() {
