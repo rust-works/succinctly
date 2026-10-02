@@ -3132,11 +3132,13 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 /// arity mismatch, so this reproduces the column rule rather than every case.
 /// It is trailing whitespace either way.
 ///
-/// Diagnostics are reported in `errors`' own order — [`jq::resolve_all`]
-/// already walks the tree in source order, and real jq interleaves a
-/// program's undefined calls and undefined variables by position rather than
-/// grouping by kind (confirmed live: `$bar, foo, $baz` reports all three left
-/// to right), so this function must not re-sort or re-group them.
+/// Diagnostics are reported in `errors`' own order — [`jq::resolve_all_jq`]
+/// walks the tree in source order and only drops the errors jq itself never
+/// reports (those beneath a compile unit with an error of its own, #3391), and
+/// real jq interleaves a program's undefined calls and undefined variables by
+/// position rather than grouping by kind (confirmed live: `$bar, foo, $baz`
+/// reports all three left to right), so this function must not re-sort or
+/// re-group them.
 /// Report one unresolved call, in jq's own `name/arity is not defined at
 /// {location}[, line N:]` shape. Tries `source`'s own call-site table first
 /// (the real, parser-recorded position -- see [`jq::CallSite`], and since
@@ -3932,7 +3934,10 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // call-only view) -- see that function's own doc comment for why: real
     // yq is fully permissive about unbound variables (#2981), the opposite
     // direction of divergence from what this fixes here.
-    let compile_errors = jq::resolve_all(&mut expr);
+    //
+    // #3391: reduced to the errors jq itself reports -- one in the main body
+    // hides every one in a `def` or call argument below it.
+    let compile_errors = jq::resolve_all_jq(&mut expr);
     if !compile_errors.is_empty() {
         report_compile_errors(&compile_errors, &filter_str, &module_loader);
         return Ok(exit_codes::COMPILE_ERROR);
