@@ -48,6 +48,11 @@ jobs:
           # page, which has no raw form, is skipped. Branch, issue and PR links are
           # checked as before. The retry step carries the same two lines; keep
           # them in step.
+          #
+          # A PDF under drops.dagstuhl.de/storage/ answers slowly enough to time
+          # out from the runner on every retry (#3616), so those are skipped; the
+          # host's landing pages are still checked. Drop that exclude once the
+          # server recovers. The retry step carries it too.
           args: >-
             --verbose
             --no-progress
@@ -71,7 +76,7 @@ jobs:
             --exclude '^https://no-color\.org/'
             --exclude '^https://www\.reddit\.com/'
             --exclude '^https://vigna\.di\.unimi\.it/'
-            --exclude '^https://drops\.dagstuhl\.de/'
+            --exclude '^https://drops\.dagstuhl\.de/storage/'
             --exclude '^https://github\.com/[^/]+/[^/]+/commit/[0-9a-f]{7,40}([/?#.]|$)'
             --remap '^https://github\.com/([^/]+)/([^/]+)/blob/([0-9a-f]{7,40}|v[0-9][^/]*)/ https://raw.githubusercontent.com/$1/$2/$3/'
             '**/*.md'
@@ -111,7 +116,7 @@ jobs:
             --exclude '^https://no-color\.org/'
             --exclude '^https://www\.reddit\.com/'
             --exclude '^https://vigna\.di\.unimi\.it/'
-            --exclude '^https://drops\.dagstuhl\.de/'
+            --exclude '^https://drops\.dagstuhl\.de/storage/'
             --exclude '^https://github\.com/[^/]+/[^/]+/commit/[0-9a-f]{7,40}([/?#.]|$)'
             --remap '^https://github\.com/([^/]+)/([^/]+)/blob/([0-9a-f]{7,40}|v[0-9][^/]*)/ https://raw.githubusercontent.com/$1/$2/$3/'
             --exclude-path '(^|/)lychee/out\.md$'
