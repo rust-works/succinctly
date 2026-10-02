@@ -8875,11 +8875,10 @@ $x
 jq: 1 compile error
 ```
 
-A second, distinct shape hits the same table-vs-counter mismatch for a different reason:
-`reduce`/`foreach` checks `init` before the bound pattern's own computed keys (`init` must
-not see the pattern's not-yet-bound variables, #2734) even though the pattern is written
-*first* in the source (`reduce EXPR as PATTERN (INIT; UPDATE)`) — confirmed this is not an
-implementation quirk but matches real jq's own diagnostic order for the construct, live:
+**Formerly a residual, closed by [#3583](https://github.com/rust-works/succinctly/issues/3583): a
+same-named `$var`/`break` in a `reduce`/`foreach` pattern's computed key and in `init`.** jq
+reports `init`'s diagnostic before the pattern key's although the pattern is written first
+(`reduce EXPR as PATTERN (INIT; UPDATE)`), live:
 
 ```console
 $ jq -nc 'reduce (1,2) as {($x): $v} ($x; .)'
@@ -8890,17 +8889,11 @@ reduce (1,2) as {($x): $v} ($x; .)
 jq: 2 compile errors
 ```
 
-jq's own compiler visits `init` before the pattern too (its first reported error is
-`init`'s `$x`, not the pattern key's, even though the pattern is written first) — so the
-resolver's visit order already matches jq's *diagnostic order*. What it cannot also match
-is `collect_var_sites`/`collect_break_sites`'s table order, which is sorted by pure text
-offset (the pattern key's `$x` sorts before `init`'s): a same-named `$var`/`break $x` split
-across a computed pattern key and `init` gets the *right two messages in the right order*,
-each pointing at the *other* one's position. Reordering the visit to match textual order
-was tried and reverted: it fixes the position match at the cost of reporting the two
-diagnostics in the wrong order relative to jq, which is a worse trade for a construct real
-jq itself does not compile in textual order. Confirmed live with `break $x` in place of
-`$x` (same swap, `reduce (1,2) as {(break $x): $v} (break $x; .)`).
+The resolver used to visit `init` first to match that order, which numbered the two
+occurrences the other way round from `collect_var_sites`/`collect_break_sites`'s text-offset
+table, so each message pointed at the *other* one's position. It now visits in source order and
+re-sequences the diagnostics afterwards (see the order table under #3583 below), so message
+order, count and carets all match.
 
 ### A module `include` cycle is a compile error, where jq segfaults — accepted divergence, ADR-0018 rule 4 (#2865)
 
@@ -9199,15 +9192,35 @@ inline. Pinned in the `jq_reported` tests of `resolve.rs` (including the whole-r
 `succinctly yq` is unchanged: it keeps the first error from the full list
 (`resolve_func_calls_all`), and yq has no such rule to match.
 
-**Still open: the *order* of errors among closures** ([#3583](https://github.com/rust-works/succinctly/issues/3583)).
-The surviving errors keep source order. A block's own errors come out in source order in jq
-too, but it reports the closures it owns in the order of its compiled instructions, which
-differs from source order for some constructs: `a op= b` visits `b` before `a`, `reduce`/`foreach`
-visit `init` before the source, and the operands of a binary operator (`+`, `==`, ...) or of a
-C-implemented builtin with several arguments (`pow`, `setpath`, ...) come out right to left
-when they hold closures (`map(ua) + map(ub)` is `ub`, `ua`). The set and count of errors now
-match jq on all of them; only the order of the closures differs, and it did before this change
-too.
+**The order of errors among closures — closed ([#3583](https://github.com/rust-works/succinctly/issues/3583)).**
+jq reports a block's own errors, or, when it has none, the errors of the closures it owns, in
+the order of its compiled instructions, which is not source order for every construct. The
+walk behind `resolve_all_jq` still visits the tree in source order, so every occurrence
+counter and caret position is unchanged; `Blocks` keeps each unit's own diagnostics and its
+child units in two lists, and the constructs below re-sequence the operands they visited
+(`CheckCtx::reorder`). Every rule was captured against 1.7.1 and held on about 19,000
+random multi-error programs, plus every roster builtin of arity two or more.
+
+| Construct                                                    | Closure units                      | The block's own errors             |
+|--------------------------------------------------------------|------------------------------------|------------------------------------|
+| `a + b`, `a == b` and the other arithmetic/compare operators | `b`, then `a`                      | source order                       |
+| `pow(a; b)`, `setpath(a; b)`, `fma(a; b; c)` (C builtins)    | last argument first                | source order                       |
+| `"\(a)\(b)"`, `@fmt "\(a)\(b)"`                              | last part first                    | source order                       |
+| `a op= b`, `a //= b`                                         | `b`, then `a`                      | not applicable (`a` is a unit)     |
+| `reduce`/`foreach`                                           | `init`, source, pattern keys, body | `init`, source, pattern keys, body |
+| `(t)[k]`                                                     | `k`, then `t`                      | `k`, then `t`                      |
+| `(t)[from:to]`                                               | `from`, `to`, then `t`             | `from`, `to`, then `t`             |
+
+`and`, `or`, `//`, `=`, `|=`, `if`, `try`, `label`, a pipe, a comma, an object or array
+constructor, `.[from:to]` and a call to a `def` or to a jq-defined builtin (`map`, `sub`,
+`limit`, ...) all keep source order. `resolve_all` (what `succinctly yq` reads) stays in the walk's
+source order throughout; for `reduce`/`foreach` that now means the pattern's computed keys come
+before `init`, where the walk used to visit `init` first. Real yq's lexer rejects `reduce` and
+`foreach` outright, so no yq oracle exists for the order in that construct. Pinned in the
+`jq_reported` tests of `resolve.rs` and in `test_compile_errors_follow_jq_instruction_order_3583`.
+
+This also closes the `reduce`/`foreach` caret residual described under #2964 above, pinned in
+`test_break_reduce_pattern_key_and_init_caret_positions_match_jq_2964` and its `foreach` twin.
 
 The stubs point *into* the linked run, not the other way round, because that run is wrapped
 outermost and so is visible from every stub whatever order the directives are declared in.

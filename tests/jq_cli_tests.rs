@@ -52493,6 +52493,69 @@ fn test_main_body_error_hides_module_def_error_3391() -> Result<()> {
     Ok(())
 }
 
+/// #3583: jq compiles the closures a block owns in the order of its compiled
+/// instructions, not of its source: `a op= b` visits `b` first, `reduce` and
+/// `foreach` visit `init` before the source, and the operands of an operator,
+/// of a C-implemented builtin, of an interpolation and the target of an index
+/// or slice are visited last to first. A block's own errors follow the same
+/// rule only for `reduce`/`foreach` and for the index/slice target.
+///
+/// Compared on the `jq: ` lines, which carry each diagnostic's name,
+/// location, order and the count. Every row is a capture of jq 1.7.1; a name's
+/// digit-free spelling (`ua`, `ub`) is its position in the source.
+#[test]
+fn test_compile_errors_follow_jq_instruction_order_3583() -> Result<()> {
+    let rows: &[(&str, &[&str])] = &[
+        ("map(ua) + map(ub)", &["ub", "ua"]),
+        ("map(ua) + map(ub) + map(uc)", &["uc", "ub", "ua"]),
+        (
+            "[map(ua) + map(ub), map(uc) + map(ud)]",
+            &["ub", "ua", "ud", "uc"],
+        ),
+        ("(map(ua)) += (map(ub))", &["ub", "ua"]),
+        ("(map(ua)) |= (map(ub))", &["ua", "ub"]),
+        ("pow(map(ua); map(ub))", &["ub", "ua"]),
+        ("fma(map(ua); map(ub); map(uc))", &["uc", "ub", "ua"]),
+        ("\"\\(map(ua))\\(map(ub))\\(map(uc))\"", &["uc", "ub", "ua"]),
+        ("reduce ua as $x (ub; uc)", &["ub", "ua", "uc"]),
+        ("reduce ua as [$a, {(ub): $b}] (uc; .)", &["uc", "ua", "ub"]),
+        ("foreach (ua) as $x (ub; uc; ud)", &["ub", "ua", "uc", "ud"]),
+        ("(ua)[ub]", &["ub", "ua"]),
+        ("(ua)[ub:uc]", &["ub", "uc", "ua"]),
+        ("(map(ua))[map(ub):map(uc)]", &["ub", "uc", "ua"]),
+        // Unchanged: a block's own errors under an operator, a call to a
+        // jq-defined function, `and`/`//`, and `.[from:to]`.
+        ("ua + ub", &["ua", "ub"]),
+        ("sub(map(ua); map(ub))", &["ua", "ub"]),
+        ("map(ua) and map(ub)", &["ua", "ub"]),
+        (".[ua:ub]", &["ua", "ub"]),
+    ];
+
+    for (filter, names) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(
+            code, 3,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(
+            stdout, "",
+            "`{filter}` -- a compile error produces no output"
+        );
+        let mut want: Vec<String> = names
+            .iter()
+            .map(|n| format!("jq: error: {n}/0 is not defined at <top-level>, line 1:"))
+            .collect();
+        want.push(format!("jq: {} compile errors", names.len()));
+        let got: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.starts_with("jq: "))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(got, want, "`{filter}` -- stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #2964 review finding, closed by #3085: a same-named `break` inside an
 /// unreferenced `def` used to take the failing break's slot in the
 /// position table, citing column 7. The resolver now counts the skipped
@@ -52515,18 +52578,51 @@ fn test_break_in_unreferenced_def_body_does_not_shift_the_caret_2964() -> Result
     Ok(())
 }
 
-/// #2964 review finding, documented as an accepted residual in
-/// `docs/compliance/jq/limitations.md`: `reduce`/`foreach` checks `init`
-/// before the bound pattern's own computed keys (#2734), even though the
-/// pattern is written *first* in source -- matching real jq's own
-/// *diagnostic order* for this construct (init's error reported first).
-/// What it cannot also match is `collect_break_sites`' table, which is
-/// sorted by pure text offset (the pattern key sorts first) -- so each
-/// message's *caret* points at the *other* occurrence's position, even
-/// though the message order and count are correct. Pins today's honest
-/// (swapped-caret) behavior.
+/// #3583: the echoed source line and its caret padding follow each
+/// diagnostic to its new place. The diagnostics are numbered in walk order and
+/// printed in jq's, so a repeated name or a multi-line filter is where a
+/// mix-up would show. Exact stderr, captured from jq 1.7.1.
 #[test]
-fn test_break_reduce_pattern_key_and_init_caret_positions_are_swapped_2964() -> Result<()> {
+fn test_reordered_compile_errors_keep_their_own_echo_3583() -> Result<()> {
+    let rows: &[(&str, &str)] = &[
+        (
+            "map(ua) + map(ua)",
+            "jq: error: ua/0 is not defined at <top-level>, line 1:\nmap(ua) + map(ua)              \njq: error: ua/0 is not defined at <top-level>, line 1:\nmap(ua) + map(ua)    \njq: 2 compile errors\n",
+        ),
+        (
+            "(ua)\n[ub]",
+            "jq: error: ub/0 is not defined at <top-level>, line 2:\n[ub] \njq: error: ua/0 is not defined at <top-level>, line 1:\n(ua) \njq: 2 compile errors\n",
+        ),
+        (
+            "reduce ua\n as $x\n (ub;\n uc)",
+            "jq: error: ub/0 is not defined at <top-level>, line 3:\n (ub;  \njq: error: ua/0 is not defined at <top-level>, line 1:\nreduce ua       \njq: error: uc/0 is not defined at <top-level>, line 4:\n uc) \njq: 3 compile errors\n",
+        ),
+    ];
+
+    for (filter, want) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(
+            code, 3,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(
+            stdout, "",
+            "`{filter}` -- a compile error produces no output"
+        );
+        assert_eq!(stderr, *want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2964's accepted residual, closed by #3583: `reduce`/`foreach` print
+/// `init`'s diagnostic before the bound pattern's computed key's, as jq does,
+/// but the walk used to visit `init` first and so number the two occurrences
+/// the other way round -- each caret pointed at the *other* occurrence's
+/// position. The walk now visits in source order and the diagnostics are
+/// re-sequenced afterwards, so the carets match: `init`'s (the later one in
+/// the text) first, then the key's.
+#[test]
+fn test_break_reduce_pattern_key_and_init_caret_positions_match_jq_2964() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-n",
@@ -52537,9 +52633,7 @@ fn test_break_reduce_pattern_key_and_init_caret_positions_are_swapped_2964() -> 
     )?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "", "a compile error produces no output");
-    // The pinned oracle reports the same two messages in the same order, but
-    // with the two caret paddings swapped (34 then 18, `init`'s own break
-    // first) -- see limitations.md.
+    // Captured from jq 1.7.1: `init`'s break is padded to 34, the key's to 18.
     assert_eq!(
         stderr,
         format!(
@@ -52548,19 +52642,16 @@ fn test_break_reduce_pattern_key_and_init_caret_positions_are_swapped_2964() -> 
              jq: error: $*label-x is not defined at <top-level>, line 1:\n\
              reduce (1,2) as {{(break $x): $v}} (break $x; .+1){}\n\
              jq: 2 compile errors\n",
-            " ".repeat(18),
-            " ".repeat(34)
+            " ".repeat(34),
+            " ".repeat(18)
         )
     );
     Ok(())
 }
 
-/// #2964 review finding: `foreach`'s doc comment in `resolve.rs` claims the
-/// same `init`-before-pattern visit-order rationale as `Expr::Reduce` above,
-/// but until now that claimed parity had no test of its own -- confirmed
-/// live this is exactly the same swapped-caret residual, one construct over.
+/// `foreach`'s twin of the test above (#2964, #3583).
 #[test]
-fn test_break_foreach_pattern_key_and_init_caret_positions_are_swapped_2964() -> Result<()> {
+fn test_break_foreach_pattern_key_and_init_caret_positions_match_jq_2964() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-n",
@@ -52571,9 +52662,7 @@ fn test_break_foreach_pattern_key_and_init_caret_positions_are_swapped_2964() ->
     )?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "", "a compile error produces no output");
-    // The pinned oracle reports the same two messages in the same order, but
-    // with the two caret paddings swapped (35 then 19, `init`'s own break
-    // first) -- see limitations.md.
+    // Captured from jq 1.7.1: `init`'s break is padded to 35, the key's to 19.
     assert_eq!(
         stderr,
         format!(
@@ -52582,8 +52671,8 @@ fn test_break_foreach_pattern_key_and_init_caret_positions_are_swapped_2964() ->
              jq: error: $*label-x is not defined at <top-level>, line 1:\n\
              foreach (1,2) as {{(break $x): $v}} (break $x; .+1){}\n\
              jq: 2 compile errors\n",
-            " ".repeat(19),
-            " ".repeat(35)
+            " ".repeat(35),
+            " ".repeat(19)
         )
     );
     Ok(())
