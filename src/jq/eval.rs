@@ -3918,9 +3918,9 @@ enum ObjectEscape {
 /// (#1277). Real jq emits the prefix and *then* halts — `echo '"abc"' | jq -c
 /// 'ltrimstr((1, halt_error(6)))'` prints `"abc"` on stdout, `abc` on stderr,
 /// and exits 6 — which is exactly what `(prefix, Some(Control::Halt))` plus
-/// [`partial`] produces. [`result_to_owned_full`]'s dedicated
-/// `Partial(_, Halt) => Err(Halt)` arm exists only because *that* function
-/// keeps a single value and so has no honest prefix to emit alongside it.
+/// [`partial`] produces. [`result_to_owned_full`] keeps a single value, so it
+/// hands the trailing halt back beside that value (#3612) for its caller to
+/// re-attach to a successful result, or to drop when it raises first.
 fn stream_outputs_lossy<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> (Vec<OwnedValue>, Option<Control>) {
@@ -5497,7 +5497,11 @@ fn prepend<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// its own error paths alone (#833's `ltrimstr(("a", break $out))` repro:
 /// `ltrimstr` computes and returns `"bcabc"`, *then* unwinds to `$out` --
 /// `"after"` never prints). A caller that has no result to wrap, because it
-/// raises (`error(msg)`), drops it.
+/// raises (`error(msg)`), drops it. `trailing` can be a `Halt` too (#3612): a
+/// value-returning builtin re-attaches it and so prints, then halts
+/// (`has(("a", halt))`), while `error(msg)` raises the first value and never
+/// reaches the halt (`error((1, halt))` raises `1`). A halt with *no* prior
+/// output is `Err(Halt)`, below.
 ///
 /// jq's `as` binding also runs its body *once per output* `x` produces, zero
 /// times if `x` produces none. So `x` producing no output at all makes the
@@ -5527,12 +5531,16 @@ fn result_to_owned_full<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `Many`/`ManyOwned` above — a `Partial` prefix is never empty (see
         // `partial`), so there is always a first value to take.
         //
-        // A `Partial`'s trailing `Halt` still wins over the prefix, though:
-        // an argument stream that produced values and *then* halted must
-        // halt, not quietly compute with the first value (#791) -- unlike
-        // `Break`/`Error`, a `Halt` has no "run to completion first" jq
-        // semantics to preserve.
-        QueryResult::Partial(_, Control::Halt(code)) => Err(EvalEscape::Halt(code)),
+        // The trailing control is handed back whatever it is, a `Halt`
+        // included (#3612). jq runs the caller's computation on the
+        // argument's first output and only reaches the `halt` on
+        // backtracking, so a caller that returns a value prints it first and
+        // then halts (`has(("a", halt))`), and one that raises
+        // (`error((1, halt))`) raises before the `halt` is evaluated at all.
+        // This arm used to turn the halt into an escape before the caller
+        // ran (#791), so `error((1, halt))` halted at exit 0 where jq raises
+        // `1` at exit 5. A halt with *no* prior output is still `Halt`,
+        // below.
         QueryResult::Partial(vs, control) => {
             Ok(Some((vs.into_iter().next().unwrap(), Some(control))))
         }
@@ -5544,8 +5552,8 @@ fn result_to_owned_full<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // forwards the `EvalEscape` verbatim via `?`/`Err(e) =>
         // return e.into()`, or (a handful of sites) has its own dedicated
         // arm, so the real label can unwind past the builtin call to an
-        // outer `label`. Doesn't cover the `Partial` case above, whose own
-        // comment explains why that's a separate, harder fix.
+        // outer `label`. Doesn't cover the `Partial` case above, which hands
+        // its trailing control back to the caller instead.
         QueryResult::Break(label) => Err(EvalEscape::Break(label)),
         // An operand-context halt (`1 + halt`) travels as its own
         // `EvalEscape` variant, so no consumer can mistake it for a
@@ -13166,10 +13174,10 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             } else {
                 match result_to_owned_full::<_, S>(msg_result) {
-                    // Only the first output is raised; a trailing `break` or
-                    // error after it never runs, as `error((1, break $out))`
-                    // raises `1`. A trailing `halt` is the exception
-                    // (`result_to_owned_full` returns it as an escape, #791).
+                    // Only the first output is raised; a trailing `break`,
+                    // error or `halt` after it never runs, as
+                    // `error((1, break $out))` and `error((1, halt))` raise
+                    // `1` (#3612).
                     Ok(Some((v, _trailing))) => v,
                     // yq raises `aborted` for a message that produces nothing,
                     // through the same tail as any other payload, so `?`
@@ -13183,9 +13191,12 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // (#3488), where this used to raise "no value".
                     Ok(None) => return QueryResult::None,
                     // `?` swallows only a genuine, catchable error in the
-                    // message expression; a halt inside it always escapes
-                    // (#791) -- `isvalid(error(halt_error(3)))` must still
-                    // halt, not report `false`.
+                    // message expression; a halt that comes *before* any
+                    // output always escapes (#791) --
+                    // `isvalid(error(halt_error(3)))` must still halt, not
+                    // report `false`. A halt after a value never gets here: it
+                    // is the first value's trailing control, dropped above
+                    // (#3612).
                     Err(EvalEscape::Error(_)) if optional => return QueryResult::None,
                     Err(escape) => return escape.into(),
                 }
@@ -107777,6 +107788,36 @@ mod tests {
             Ok(Some((OwnedValue::String(s), None))) => assert_eq!(s, "x"),
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    /// #3612: a `Partial` whose trailing control is a `Halt` hands the halt back
+    /// beside its first value instead of turning it into an escape before the
+    /// caller runs -- jq runs the caller on the first output and only reaches the
+    /// `halt` on backtracking. A halt with no prior output is still `Err(Halt)`.
+    #[test]
+    fn result_to_owned_full_returns_a_trailing_halt_beside_the_first_value_3612() {
+        let expr = parse("1, 2, halt").unwrap();
+        let result = eval_owned_input::<Vec<u64>, JqSemantics>(
+            &expr,
+            &OwnedValue::Null,
+            false,
+            Reentry::REBUILT,
+        );
+        match result_to_owned_full::<_, JqSemantics>(result) {
+            Ok(Some((first, Some(Control::Halt(0))))) => assert_eq!(first, OwnedValue::Int(1)),
+            other => panic!("expected the first value and a trailing halt: {other:?}"),
+        }
+        let expr = parse("halt, 1").unwrap();
+        let result = eval_owned_input::<Vec<u64>, JqSemantics>(
+            &expr,
+            &OwnedValue::Null,
+            false,
+            Reentry::REBUILT,
+        );
+        assert!(matches!(
+            result_to_owned_full::<_, JqSemantics>(result),
+            Err(EvalEscape::Halt(0))
+        ));
     }
 
     /// #1279: `fanout_arg`'s loop over a *borrowed* multi-output argument
