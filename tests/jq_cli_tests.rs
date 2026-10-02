@@ -38002,8 +38002,8 @@ fn test_limit_path_mode_negative_float_bound_is_unlimited_passthrough_1313() -> 
 }
 
 /// #1313: the plain value-mode sibling of the fix above -- `eval_limit`
-/// used `result_to_owned`, which collapses a zero-output bound into
-/// `result_to_owned_ctrl`'s own `Err("no value")` instead of the zero-output
+/// used the since-removed `result_to_owned`, which collapsed a zero-output bound
+/// into its own `Err("no value")` instead of the zero-output
 /// case `result_to_owned_full` (#1045) already exists to distinguish (and
 /// every other #1045-migrated caller, e.g. `builtin_ltrimstr`, already
 /// uses).
@@ -42539,7 +42539,7 @@ fn test_first_over_limit_generator_n_is_never_evaluated_1596() -> Result<()> {
 /// jq's generator-argument backtracking genuinely RESUMES after the body
 /// runs, so an ordinary builtin's argument must never get a stopping sink.
 ///
-/// `result_to_owned_ctrl`'s own doc comment (`src/jq/eval.rs`) records the
+/// `result_to_owned_full`'s own doc comment (`src/jq/eval.rs`) records the
 /// desugaring -- `f(x)` is roughly `x as $b | body` -- and #833's
 /// `ltrimstr(("a", break $out))` repro. This test pins both halves:
 ///
@@ -87540,4 +87540,121 @@ fn test_options_after_args_and_jsonargs_are_options_3447() -> Result<()> {
     assert_eq!(code, 2, "stdout {stdout:?}");
     assert!(stdout.is_empty(), "{stdout:?}");
     Ok(())
+}
+
+/// #3488: jq's `error(msg)` is `msg | error`, which runs `error` once per
+/// output of `msg`, so a message that produces nothing raises nothing and the
+/// call yields nothing. This raised `no value` (exit 5) instead, in every
+/// position: bare, collected, under `try`, as a consumer's operand, in path
+/// mode and on the right of `|=`. Every expectation was captured from
+/// `/usr/bin/jq` 1.7.1.
+///
+/// The last rows must not change: a message that does produce a value is still
+/// raised (the first output of a generator, `error((1, error("x")))` raising
+/// `1`, and a trailing `break` after it never runs), `catch` still sees the
+/// payload, and bare `error` still raises its input. A trailing `halt` after the
+/// first output is not pinned: `main` halts where jq raises, which predates this
+/// fix.
+#[allow(clippy::literal_string_with_formatting_args)]
+#[test]
+fn test_error_of_an_empty_message_yields_nothing_3488() -> Result<()> {
+    assert_rows_2764(&[
+        // bare and collected
+        (r"error(empty)", "", "", 0),
+        (r"[error(empty)]", "[]\n", "", 0),
+        (r"[error(empty), 1]", "[1]\n", "", 0),
+        (r"[1, error(empty), 2]", "[1,2]\n", "", 0),
+        (r#"error(empty) | error("later")"#, "", "", 0),
+        // try / optional / catch
+        (r"try error(empty) catch .", "", "", 0),
+        (r"[try error(empty) catch .]", "[]\n", "", 0),
+        (r"error(empty)?", "", "", 0),
+        (r"[error(empty)?]", "[]\n", "", 0),
+        (
+            r#"[try (error(empty), error("y")) catch .]"#,
+            "[\"y\"]\n",
+            "",
+            0,
+        ),
+        (r#"[try error((empty, "x")) catch .]"#, "[\"x\"]\n", "", 0),
+        (r"[try error((1,2)) catch .]", "[1]\n", "", 0),
+        (
+            r#"error((1, error("x")))"#,
+            "",
+            "jq: error (at <stdin>:1) (not a string): 1\n",
+            5,
+        ),
+        (r"error(error(empty))", "", "", 0),
+        // operand positions
+        (r"[.[]?|error(empty)]", "[]\n", "", 0),
+        (r"[.c | error(empty)]", "[]\n", "", 0),
+        (r".a as $x | error(empty)", "", "", 0),
+        (r"[.a as $x | error(empty)]", "[]\n", "", 0),
+        (r"[range(3) | error(empty)]", "[]\n", "", 0),
+        (r"[.c, error(empty)]", "[2]\n", "", 0),
+        (r"[1,2] | map(error(empty))", "[]\n", "", 0),
+        (r#""x" | [error(empty)]"#, "[]\n", "", 0),
+        (r"[error(.c | empty)]", "[]\n", "", 0),
+        (r"[error(.nosuch | empty)]", "[]\n", "", 0),
+        // consumers
+        (r"[first(error(empty))]", "[]\n", "", 0),
+        (r"isempty(error(empty))", "true\n", "", 0),
+        (r"[limit(3; error(empty))]", "[]\n", "", 0),
+        (r"reduce (1,2) as $x (0; error(empty))", "null\n", "", 0),
+        (r"[foreach (1,2) as $x (0; error(empty))]", "[]\n", "", 0),
+        (r"[if error(empty) then 1 else 2 end]", "[]\n", "", 0),
+        (r"[error(empty) // 5]", "[5]\n", "", 0),
+        (r"[(error(empty)) | . + 1]", "[]\n", "", 0),
+        (r"[label $out | error(empty)]", "[]\n", "", 0),
+        (r"[.. | error(empty)]", "[]\n", "", 0),
+        // path mode
+        (r"path(error(empty))", "", "", 0),
+        (r"[path(error(empty))]", "[]\n", "", 0),
+        (r"[paths(error(empty))]", "[]\n", "", 0),
+        (r"[path(.a | error(empty))]", "[]\n", "", 0),
+        (
+            r"[path(.a, error(empty), .c)]",
+            "[[\"a\"],[\"c\"]]\n",
+            "",
+            0,
+        ),
+        (r"[path(error(empty) | .a)]", "[]\n", "", 0),
+        // assignment
+        (
+            r".c |= error(empty)",
+            "{\"a\":{\"b\":{\"b\":null}}}\n",
+            "",
+            0,
+        ),
+        (r"[.c] | map(. |= error(empty))", "[null]\n", "", 0),
+        // unchanged behaviour (must still match)
+        (
+            r"label $out | error((1, break $out))",
+            "",
+            "jq: error (at <stdin>:1) (not a string): 1\n",
+            5,
+        ),
+        (
+            r"[label $out | try error((1, break $out)) catch .]",
+            "[1]\n",
+            "",
+            0,
+        ),
+        (r#"[try error((1, error("x"))) catch .]"#, "[1]\n", "", 0),
+        (r"try error(null) catch .", "null\n", "", 0),
+        (r#"try error("x") catch ."#, "\"x\"\n", "", 0),
+        (r"try error({a:1}) catch .", "{\"a\":1}\n", "", 0),
+        (
+            r"[.[]?|try error catch .]",
+            "[{\"b\":{\"b\":null}},2]\n",
+            "",
+            0,
+        ),
+        (
+            r"try error catch .",
+            "{\"a\":{\"b\":{\"b\":null}},\"c\":2}\n",
+            "",
+            0,
+        ),
+    ])
 }

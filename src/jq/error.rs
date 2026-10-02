@@ -132,7 +132,7 @@ pub enum Control {
 /// to some enclosing `label` (#824), or a `halt` that nothing may catch
 /// (#791).
 ///
-/// This is the error type of `result_to_owned`, `eval_owned_multi` and the
+/// This is the error type of `result_to_owned_full`, `eval_owned_multi` and the
 /// other `eval.rs` helpers that evaluate a sub-expression to owned values. An
 /// earlier design smuggled a halt through [`EvalError`] behind a marker field,
 /// which made correctness opt-in at every call site: the natural
@@ -149,19 +149,18 @@ pub enum Control {
 /// `eval_owned_multi_first` and `resolve_node`'s own arms (in `eval.rs`)
 /// were the first to propagate a real `Break`, for `path()` and the
 /// computed-key path this type also drives for `=`/`|=`/`del()`. `#833`
-/// closed the far broader remaining gap: `result_to_owned` and
-/// `eval_owned_expr` (used by dozens of builtins' argument evaluation, not
-/// just path context) now propagate a *bare* unmatched `Break` too (#575's
+/// closed the far broader remaining gap: `result_to_owned_full` and
+/// `eval_owned_expr` (used by builtins' argument evaluation, not just path
+/// context) now propagate a *bare* unmatched `Break` too (#575's
 /// precedent: a `_ctrl`-suffixed twin that preserves [`Control`] losslessly
 /// exists at the few call sites that need it -- today `eval_owned_expr_ctrl_full`,
 /// and `eval_owned_expr_full` beneath it keeps a trailing `Control` beside the
-/// value rather than dropping it, #1559). One shape is still open,
-/// though: when the argument generator produces one or more values *before*
-/// breaking/erroring (`QueryResult::Partial`), `result_to_owned` still
-/// silently takes the first value and drops the trailing escape — tracked as
-/// #1164, since fixing it means every caller becoming `Partial`-aware itself,
-/// not something this function can solve alone; see its own
-/// `Partial(vs, _control)` arm in `eval.rs` for the full rationale.
+/// value rather than dropping it, #1559). One shape was open: when the
+/// argument generator produces one or more values *before* breaking/erroring
+/// (`QueryResult::Partial`), the helper took the first value and dropped the
+/// trailing escape (#1164). `result_to_owned_full` now hands that trailing
+/// `Control` back beside the value, for each caller to re-wrap around its own
+/// successful result; see its own doc comment in `eval.rs` for the rationale.
 ///
 /// Consumers should write `Err(EvalEscape::Error(e))` for the catchable case
 /// and let everything else flow through the `From` conversions into

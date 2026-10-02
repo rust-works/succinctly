@@ -422,6 +422,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: `error(empty)` yields nothing instead of raising `no value`** (#3488). jq's `error(msg)` is
+  `msg | error`, so it runs once per output of `msg`: a message that produces nothing raises
+  nothing, and `[error(empty), 1]` is `[1]`, `try error(empty) catch .` prints nothing and
+  `[path(.a, error(empty), .c)]` is `[["a"],["c"]]`. It raised `no value` (exit 5) in every
+  position: bare, collected, under `try`, as an operand or consumer's argument, in `path()` and on
+  the right of `|=`. A message that does produce a value is unchanged, including the first output
+  of a generator (`error((1, error("x")))` raises `1`). The rule is the mode's
+  (`EvalSemantics::ERROR_OF_EMPTY_MESSAGE_ABORTS`): `succinctly yq` keeps raising, now with yq's
+  own `Error: aborted` (exit 1) for `error(select(false))`, `error(.c[])` and `.a |= error(select(false))`,
+  where it said `Error: no value`. `result_to_owned` and `result_to_owned_ctrl`, whose "empty means
+  `no value`" rule this was the last caller of, are removed; `result_to_owned_full` carries their
+  documentation. `error((1, halt))` still halts where jq raises `1`; that predates this change.
+
 - **yq: `length` of a JSON number is the width of the number yq decodes** (#3597). yq measures
   what its JSON decoder produced, rendered the way it prints: `2.0` is the integer `2` (width 1),
   `1.50` is `1.5` (3), `1e5` is `100000` (6), and `1e20` stays a float that prints `1e+20` (5).
