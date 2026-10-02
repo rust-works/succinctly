@@ -343,21 +343,11 @@ pub(crate) struct DataFileFailure {
 ///   this points at the error column and differs from jq, where it differs
 ///   at all, only in trailing whitespace.
 ///
-/// Whether a blank line sits between the echoed line and the trailer is
-/// per-path in real jq (measured live against 1.7.1): a top-level syntax
-/// error has none, while a module-body syntax error leaves one. `blank_line`
-/// reproduces that.
-fn report_syntax_error(
-    message: &str,
-    source: &str,
-    offset: usize,
-    location: &str,
-    blank_line: bool,
-) {
+/// This is the main filter's report, a single error with no blank line before
+/// the trailer, as in jq. A *module's* syntax error is a [`ReportEntry::Syntax`]
+/// among the other entries and is printed by [`print_report_entry`].
+fn report_syntax_error(message: &str, source: &str, offset: usize, location: &str) {
     print_syntax_error(message, source, offset, location);
-    if blank_line {
-        eprintln!();
-    }
     eprintln!("jq: 1 compile error");
 }
 
@@ -410,7 +400,7 @@ fn print_report_entry(entry: &ReportEntry) {
         }
         // jq 1.7.1 names the module by its resolved *absolute* path and
         // leaves a blank line after the echoed source; both measured live
-        // (see [`report_syntax_error`]).
+        // (see [`print_syntax_error`]).
         ReportEntry::Syntax {
             path,
             contents,
@@ -3909,7 +3899,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     let program = match parse_filter(&BTreeSet::new()) {
         Ok(program) => program,
         Err(e) => {
-            report_syntax_error(&e.message, &filter_str, e.position, "<top-level>", false);
+            report_syntax_error(&e.message, &filter_str, e.position, "<top-level>");
             return Ok(exit_codes::COMPILE_ERROR);
         }
     };
@@ -10022,6 +10012,63 @@ mod tests {
             assert!(
                 names.iter().all(|n| !n.starts_with('\u{0}')),
                 "hidden spelling leaked: {names:?}"
+            );
+        }
+    }
+
+    /// #3573: `process_program` ends at the first directive that fails to load
+    /// and reports the whole program's walk, as `unqualified_def_names` does.
+    /// The CLI runs `unqualified_def_names` first and so reaches a failing
+    /// `include`/`import` there; these call `process_program` directly, which
+    /// is the contract a caller that skips it relies on.
+    mod process_program_reports_the_walk_3573 {
+        use super::*;
+
+        /// The kinds and count of the report `filter` fails with, with `syn.jq`
+        /// (a module that does not parse) and `bad.json` (a data file that does
+        /// not) on the search path.
+        fn failure(filter: &str) -> (Vec<&'static str>, usize) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("syn.jq"), "def f: 1 +;\n").expect("write syn");
+            std::fs::write(dir.path().join("bad.json"), "not json").expect("write bad");
+            let mut loader = ModuleLoader::new(&[dir.path().to_path_buf()]);
+            let program = jq::parse_program(filter).expect("parse");
+            let e = loader.process_program(&program).expect_err("must fail");
+            let kinds = e
+                .entries
+                .iter()
+                .map(|entry| match entry {
+                    ReportEntry::NotFound { .. } => "M",
+                    ReportEntry::Cycle { .. } => "C",
+                    ReportEntry::Syntax { .. } => "S",
+                    ReportEntry::Data(_) => "D",
+                })
+                .collect();
+            (kinds, e.errors)
+        }
+
+        #[test]
+        fn a_failing_include_reports_the_walk() {
+            // Last-declared first: the include, then the data import.
+            assert_eq!(
+                failure("import \"bad\" as $d; include \"syn\"; 1"),
+                (vec!["S", "D"], 2)
+            );
+        }
+
+        #[test]
+        fn a_failing_module_import_reports_the_walk() {
+            assert_eq!(
+                failure("import \"syn\" as s; import \"bad\" as $d; 1"),
+                (vec!["D", "S"], 2)
+            );
+        }
+
+        #[test]
+        fn a_failing_data_import_reports_the_walk() {
+            assert_eq!(
+                failure("include \"syn\"; import \"bad\" as $d; 1"),
+                (vec!["D", "S"], 2)
             );
         }
     }
