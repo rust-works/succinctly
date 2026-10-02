@@ -50511,6 +50511,58 @@ fn test_del_first_keeps_comments_and_anchors_with_their_items_3551() -> Result<(
     Ok(())
 }
 
+/// #3456: what a by-value stage says about jq's path register is a jq-mode
+/// admission (ADR-0018) -- yq has no oracle for `has`, `range` or `paths`
+/// leaving it in place, and its scalar-write no-op convention would turn a
+/// wrong acceptance into silent corruption. These rows pin yq's answers as
+/// they were before the jq-mode work that made `has`, `range` and `paths`
+/// "leave the register alone": a stage after a `$var` rebinding does not
+/// re-establish anything in yq, `del` of it is refused, and an ordinary value
+/// use of the same builtins is untouched.
+#[test]
+fn test_yq_by_value_stages_keep_no_path_register_3456() -> Result<()> {
+    let doc = r#"{"a":1,"b":2}"#;
+    let unchanged = "{\n  \"a\": 1,\n  \"b\": 2\n}\n";
+    for (filter, extra, expected) in [
+        (
+            r#"(. as $x | has("a") | $x) = 5"#,
+            &["-o", "json"][..],
+            Some(unchanged),
+        ),
+        (
+            r#".a = (has("a"))"#,
+            &["-o", "json"][..],
+            Some("{\n  \"a\": true,\n  \"b\": 2\n}\n"),
+        ),
+        (
+            r#"(.. | select(has("a"))) = 3"#,
+            &["-o", "json"][..],
+            Some("3\n"),
+        ),
+        (
+            "(. as $x | range(2) | $x) = 5",
+            &["--jq-extensions", "-o", "json"][..],
+            Some(unchanged),
+        ),
+        // The refused one: a `$x` frozen from the root is not re-established
+        // after a stage in yq, and `del` raises rather than writing.
+        (r#"del(. as $x | has("a") | $x)"#, &["-o", "json"][..], None),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, doc, extra)?;
+        match expected {
+            Some(expected) => {
+                assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
+                assert_eq!(stdout, expected, "`{filter}`");
+            }
+            None => {
+                assert_ne!(code, 0, "`{filter}`: stdout {stdout:?}");
+                assert!(stdout.is_empty(), "`{filter}`: stdout {stdout:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// On a mapping real yq's `first` names the first *key*, and assigning through
 /// it renames that key (`first = 9` on `{a: 1}` is `{"9":1}`). There is no path
 /// component for a key rename here, so the write is refused loudly rather than

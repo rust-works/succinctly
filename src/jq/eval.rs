@@ -36927,12 +36927,15 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 &mut |_branch| Demand::Stop,
             );
             let is_empty = !matches!(flow, ResolveFlow::Stopped);
-            forward_drained_result(
-                flow,
-                OwnedValue::Bool(is_empty),
-                drained_register::<S>(trackable, value),
-                sink,
-            )
+            // #3456: an empty generator backtracked every branch it explored,
+            // so jq's register is where it entered; an emitting one may have
+            // moved it ([`register_stays_on_result`]).
+            let register = if trackable && S::TAG == EvalTag::Jq && is_empty {
+                BranchRegister::Unmoved(Cow::Borrowed(value))
+            } else {
+                drained_register::<S>(trackable, value)
+            };
+            forward_drained_result(flow, OwnedValue::Bool(is_empty), register, sink)
         }
 
         Expr::Builtin(Builtin::UpperIndexStream(stream, idx_expr)) => {
@@ -38437,10 +38440,10 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
 
     let mut delivered = 0usize;
     let mut stopped_by_sink = false;
-    // One answer for every value this leaf delivers ([`leaf_register`]),
+    // One answer for every value this leaf delivers ([`LeafRegister`]),
     // worked out when the first one arrives: a leaf that delivers nothing
     // never pays for a `LostAt`'s `Rc`.
-    let mut register: Option<BranchRegister<'a>> = None;
+    let mut register: Option<LeafRegister<'a>> = None;
     // #3271: set the moment `expr` produces a value one of the five
     // always-refuses constructs recognizes -- checked on that produced
     // value, never before it exists. See `always_refuses_as_live_path`'s
@@ -38460,10 +38463,10 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
                 construct_refusal = Some(e);
                 return Demand::Stop;
             }
-            let register = register
-                .get_or_insert_with(|| leaf_register::<S>(expr, trackable, value))
-                .clone();
-            let branch = untracked_at_register(Cow::Owned(v), register);
+            let state = register
+                .get_or_insert_with(|| LeafRegister::new::<S>(expr, trackable, value))
+                .of::<S>(&v);
+            let branch = untracked_at_register(Cow::Owned(v), state);
             // `untracked_branches`' own rule, applied one value at a time --
             // see its doc comment for why the register is recorded here.
             let demand = sink(branch);
@@ -38910,13 +38913,15 @@ fn untracked_at_register<'a>(
 /// `trackable`; on an untracked entry the register is carried by the stage and
 /// no leaf sees it, so there is nothing to state ([`BranchRegister::None`]).
 ///
-/// [`BranchRegister::Unmoved`] only when `expr` provably cannot move the
-/// register ([`cannot_move_register`]); otherwise [`BranchRegister::LostAt`]
-/// `value`, where the register stood when the leaf ran. That is the leaf's own
-/// answer; the stage may still know better or worse
-/// ([`resolve_seq_stage`]'s stage-level rule), and takes the stricter.
+/// [`BranchRegister::Unmoved`] only when `expr` provably leaves the register
+/// where it entered ([`leaves_register_in_place`]); otherwise
+/// [`BranchRegister::LostAt`] `value`, where the register stood when the leaf
+/// ran. That is the leaf's own answer; the stage may still know better or
+/// worse ([`resolve_seq_stage`]'s stage-level rule), and takes the stricter. A
+/// leaf whose register follows its result ([`register_stays_on_result`])
+/// refines this per value in [`LeafRegister`].
 ///
-/// `cannot_move_register` is read once per leaf call and only when
+/// `leaves_register_in_place` is read once per leaf call and only when
 /// `trackable`, never per emitted value. What it returns is cloned once per
 /// emitted value, and is only ever a borrow or an `Rc`, so that clone is a
 /// pointer copy or a refcount bump -- never a deep copy of the register.
@@ -38927,11 +38932,38 @@ fn leaf_register<'a, S: EvalSemantics>(
 ) -> BranchRegister<'a> {
     if !trackable {
         BranchRegister::None
-    } else if cannot_move_register(expr) {
+    } else if leaves_register_in_place::<S>(expr) {
         BranchRegister::Unmoved(Cow::Borrowed(value))
     } else {
         lost_at::<S>(value)
     }
+}
+
+/// Whether a by-value leaf that ran on the register itself leaves jq's register
+/// where it entered (#3456): [`cannot_move_register`], plus, in jq mode, the
+/// builtins that *navigate* -- `add` is `reduce .[] as $x (null; . + $x)`,
+/// `map(f)` is `[.[] | f]` -- and then backtrack their source to exhaustion
+/// before they emit, so jq's register is back where it started (`path(. as $x
+/// | add | $x)` is `[]` on `{"a":1,"b":2}`, `map(.+1)` on `[1]`). The extras
+/// are jq-only like every admission here (ADR-0018): yq has no oracle for them.
+///
+/// Not part of [`cannot_move_register`], because that predicate also stands
+/// for "navigates nothing, so a register that is not on this expression's
+/// input is never checked": [`resolve_from_restored_input`] runs `R` on an
+/// input that is *not* the register, and an `R` of `add` or `map(.)` does
+/// check its `.[]` there. It is sound *here* because a leaf's input is the
+/// register itself on a trackable entry, so what it navigates passes. `map`
+/// qualifies only for an `f` that navigates nothing: jq path-checks `f` against
+/// every element and a by-value `map` does not (`map({a:1} | .a)` is a path
+/// error in jq and `[1]` here).
+fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
+    cannot_move_register(expr)
+        || (S::TAG == EvalTag::Jq
+            && match expr {
+                Expr::Builtin(Builtin::Add) => true,
+                Expr::Builtin(Builtin::Map(f)) => cannot_move_register(f),
+                _ => false,
+            })
 }
 
 /// [`BranchRegister::LostAt`] `value` in jq mode, where the position is read
@@ -38960,6 +38992,79 @@ fn drained_register<'a, S: EvalSemantics>(
         lost_at::<S>(value)
     } else {
         BranchRegister::None
+    }
+}
+
+/// The result of a by-value leaf that says jq's register stayed where it
+/// entered (#3456): `Some(r)` when the register stayed exactly when the leaf's
+/// boolean result is `r`, `None` for every other leaf.
+///
+/// jq 1.7.1 defines `isempty(g)` as `first((g | false), true)`, `any(g; c)` as
+/// `isempty(g | (c or empty)) | not` and `all(g; c)` as `isempty(g | (c and
+/// empty))` (read off `--debug-dump-disasm`). Each leaves the register where
+/// it was whenever the generator inside produced nothing, because every
+/// branch it explored backtracked, and moves it when one did (the output is
+/// emitted from inside the generator). So the result says which: `any` is
+/// `false`, `all` is `true` and `isempty` is `true` exactly when nothing was
+/// emitted. The other result proves nothing -- an `isempty(1)` emits without
+/// navigating -- so it stays a loss ([`lost_at`]).
+///
+/// Captured against jq 1.7.1, `path(. as $x | OP | $x)`: `any` on
+/// `{"a":false,"b":null}` is `[]`, on `{"a":true,"b":null}` it refuses; `all`
+/// on `{"a":true,"b":true}` is `[]`, on `{"a":true,"b":false}` it refuses;
+/// `isempty(.[]?)` on `{}` is `[]`, on `{"a":1}` it refuses.
+fn register_stays_on_result(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Builtin(Builtin::Any | Builtin::AnyF(_) | Builtin::AnyCond(..)) => Some(false),
+        Expr::Builtin(Builtin::All | Builtin::AllF(_) | Builtin::AllCond(..)) => Some(true),
+        Expr::Builtin(Builtin::IsEmpty(_)) => Some(true),
+        _ => None,
+    }
+}
+
+/// What one by-value leaf call says about jq's register for each value it
+/// delivers: the leaf's static answer ([`leaf_register`]), read once, unless
+/// the leaf is one whose register follows its result
+/// ([`register_stays_on_result`]), in which case the answer is worked out per
+/// value from that value. `entry` is where the register stood entering the
+/// leaf, which is `value` itself on a trackable entry; there is nothing to
+/// state on an untracked one.
+struct LeafRegister<'a> {
+    /// The static answer, or [`BranchRegister::None`] when `stays_on` decides.
+    base: BranchRegister<'a>,
+    stays_on: Option<bool>,
+    entry: &'a OwnedValue,
+}
+
+impl<'a> LeafRegister<'a> {
+    fn new<S: EvalSemantics>(expr: &Expr, trackable: bool, value: &'a OwnedValue) -> Self {
+        // jq mode only, like every admission here (ADR-0018): yq has no oracle
+        // for `any`/`all`/`isempty`, and its lost registers carry no position.
+        let stays_on = if trackable && S::TAG == EvalTag::Jq {
+            register_stays_on_result(expr)
+        } else {
+            None
+        };
+        Self {
+            base: if stays_on.is_some() {
+                BranchRegister::None
+            } else {
+                leaf_register::<S>(expr, trackable, value)
+            },
+            stays_on,
+            entry: value,
+        }
+    }
+
+    /// The register to state for the value `result` this leaf delivered.
+    fn of<S: EvalSemantics>(&self, result: &OwnedValue) -> BranchRegister<'a> {
+        match self.stays_on {
+            Some(stays) if matches!(result, OwnedValue::Bool(b) if *b == stays) => {
+                BranchRegister::Unmoved(Cow::Borrowed(self.entry))
+            }
+            Some(_) => lost_at::<S>(self.entry),
+            None => self.base.clone(),
+        }
     }
 }
 
@@ -39276,12 +39381,15 @@ fn untracked_branches<'a, S: EvalSemantics>(
     if values.is_empty() {
         return Vec::new();
     }
-    // The same for every value this call produces: they all come from
-    // resolving `expr` against `value`.
-    let register = leaf_register::<S>(expr, trackable, value);
+    // The same for every value this call produces unless the leaf's register
+    // follows its result: they all come from resolving `expr` against `value`.
+    let register = LeafRegister::new::<S>(expr, trackable, value);
     values
         .into_iter()
-        .map(|v| untracked_at_register(Cow::Owned(v), register.clone()))
+        .map(|v| {
+            let state = register.of::<S>(&v);
+            untracked_at_register(Cow::Owned(v), state)
+        })
         .collect()
 }
 
@@ -40015,7 +40123,17 @@ fn cannot_move_register(expr: &Expr) -> bool {
             // never touching the register (confirmed live:
             // `path(. as {a:$q} | (debug|$q))` is `["a"]` in jq 1.7.1).
             | Builtin::Stderr
-            | Builtin::Debug => true,
+            | Builtin::Debug
+            // #3456: `def paths: path(..) | select(length > 0);` -- `path(f)`
+            // saves and restores the register around `f`, and the `select`
+            // condition is a subexp. `path(. as $x | paths | $x)` is `[]` on
+            // `{"a":1}` in jq 1.7.1 (`paths(f)` is not listed: its filter is
+            // evaluated against `getpath`'s result, a navigation).
+            | Builtin::Paths
+            // #3456: `has(k)` is C-coded, and a C builtin's arguments are
+            // subexps, so even a navigating `k` leaves the register
+            // (`path(. as $x | has(.a | tostring) | $x)` is `[]` in jq 1.7.1).
+            | Builtin::Has(_) => true,
             // #3126 review: `msg` is evaluated (and its own value printed)
             // but, like `error`'s message and `halt_error`'s code just
             // above, is not itself part of the output -- so this recurses
@@ -40083,6 +40201,22 @@ fn cannot_move_register(expr: &Expr) -> bool {
                 && cannot_move_register(update)
                 && extract.as_deref().map_or(true, cannot_move_register)
         }
+
+        // #3456: `range(a; b; c)` and `range(n)` are jq-defined over `$param`
+        // bindings, and a parameter binding is an `as` source -- a subexp --
+        // so nothing in the arguments moves the register. The two-argument
+        // form is the exception: jq codes it in C with closure arguments run
+        // unwrapped, so an argument that navigates moves it (`path(. as $x |
+        // range(0; .a) | $x)` refuses on `{"a":2}`, `range(.a)` and
+        // `range(.a; 0; -1)` do not). The parser spells `range(n)` as
+        // `range(0; n)`, so an argument that can navigate is refused for both
+        // -- the safe direction, never a fabricated path. Oracle rows:
+        // `test_path_register_range_and_paths_do_not_move_it_3456`.
+        Expr::Range { from, to, step } => match (to, step) {
+            (_, Some(_)) => true,
+            (Some(to), None) => cannot_move_register(from) && cannot_move_register(to),
+            (None, None) => cannot_move_register(from),
+        },
 
         // Everything else — navigation, a function definition or call,
         // `..`, and every builtin not listed above — is assumed to have
@@ -42846,9 +42980,9 @@ fn head_may_be_frozen(head: &Expr, snapshot: &Snapshot) -> bool {
 /// A refusal is exact when jq's register is known, or when `value` could
 /// not be the register this resolver lost ([`could_be_lost_register`]):
 /// then jq refuses the same step, and catching it is what jq does too
-/// (`has("a") | try (5 | .a)` is empty in both). Otherwise it is a guess.
+/// (`contains({a:{}}) | try (5 | .a)` is empty in both). Otherwise it is a guess.
 /// Caught, a guess silently lost the write jq makes -- `del(. as $x |
-/// has("a") | try ($x | .a))` echoed the document where jq deletes `.a` --
+/// contains({a:{}}) | try ($x | .a))` echoed the document where jq deletes `.a` --
 /// so [`EvalError::into_guessed_path_refusal`] makes it uncatchable in path
 /// and value position alike: ADR-0018's rule 4.
 fn guess_refusal(
@@ -112968,6 +113102,146 @@ mod tests {
              See docs/plan/jq-path-register-producer-contract.md section 9 \
              before re-pinning.",
         );
+    }
+
+    /// #3456: the predicates that decide what a by-value operand says about
+    /// jq's register, row by row (the oracle captures are in
+    /// `test_path_register_range_and_paths_do_not_move_it_3456` and its
+    /// siblings).
+    #[test]
+    fn by_value_operand_register_predicates_3456() {
+        // `cannot_move_register`: `range`'s one- and three-argument forms are
+        // jq-defined over `$param` bindings, so even a navigating argument
+        // leaves the register; the two-argument form is C-coded with closure
+        // arguments run unwrapped, and the parser spells `range(n)` as
+        // `range(0; n)`, so `range(.a)` keeps the conservative answer.
+        for (src, stays) in [
+            ("range(2)", true),
+            ("range(0; 5)", true),
+            ("range(1; 5; 2)", true),
+            ("range(.a; 0; -1)", true),
+            ("range(0; 5; .a)", true),
+            ("range(0; .a)", false),
+            ("range(.a)", false),
+            ("paths", true),
+            ("paths(type == \"number\")", false),
+            ("has(\"a\")", true),
+            ("has(.a | tostring)", true),
+            ("add", false),
+            ("map(.)", false),
+            ("first(.[])", false),
+        ] {
+            assert_eq!(
+                cannot_move_register(&parse(src).unwrap()),
+                stays,
+                "cannot_move_register({src})"
+            );
+        }
+        // `leaves_register_in_place` adds `add` and `map(f)` for an `f` that
+        // navigates nothing: they navigate their source and backtrack it, so
+        // the register is back where it started, but they also *check* that
+        // navigation, which is why they are not in `cannot_move_register`.
+        for (src, stays) in [
+            ("add", true),
+            ("map(.)", true),
+            ("map(. + 1)", true),
+            ("map(.a)", false),
+            ("range(.a)", false),
+            ("first(.[])", false),
+            ("true", true),
+        ] {
+            assert_eq!(
+                leaves_register_in_place::<JqSemantics>(&parse(src).unwrap()),
+                stays,
+                "leaves_register_in_place({src})"
+            );
+        }
+        // The extras are jq-only: yq keeps the allowlist it had.
+        for src in ["add", "map(.)"] {
+            assert!(
+                !leaves_register_in_place::<YqSemantics>(&parse(src).unwrap()),
+                "leaves_register_in_place::<yq>({src})"
+            );
+        }
+        // One definition of "an `f` that navigates nothing" for `map`: the `[E]`
+        // claim and the register verdict must agree on it, or one of them is
+        // admitting a `map` the other refuses.
+        for src in [
+            "map(.)",
+            "map(. + 1)",
+            "map(.a)",
+            "map(first)",
+            "map(empty)",
+            "map(has(\"a\"))",
+            "map(has(.a | tostring))",
+            "map(range(2))",
+            "map(paths)",
+            "map(.[] | .a)",
+        ] {
+            let expr = parse(src).unwrap();
+            assert_eq!(
+                leaves_register_in_place::<JqSemantics>(&expr),
+                array_contents_are_checked(&expr),
+                "`[{src}]`: the register verdict and the `[E]` claim disagree"
+            );
+        }
+        // The result decides for exactly `any`/`all`/`isempty`, in each of
+        // their spellings: `false` / `true` / `true` when nothing was emitted.
+        for (src, decides) in [
+            ("any", Some(false)),
+            ("any(.a)", Some(false)),
+            ("any(.[]; .)", Some(false)),
+            ("all", Some(true)),
+            ("all(.a)", Some(true)),
+            ("all(.[]; .)", Some(true)),
+            ("isempty(.[]?)", Some(true)),
+            ("first(.[])", None),
+            ("add", None),
+            ("length", None),
+        ] {
+            assert_eq!(
+                register_stays_on_result(&parse(src).unwrap()),
+                decides,
+                "register_stays_on_result({src})"
+            );
+        }
+    }
+
+    /// #3456: the mark a lost `and`/`or` seed carries makes [`guess_refusal`]
+    /// treat the input as a value jq may still hold as its register, and
+    /// proves nothing to anyone else: it never certifies a marker, carries no
+    /// position, and is not [`Snapshot::is_marked`], so the recurse guards and
+    /// the folds read the value as the unmarked one it is.
+    #[test]
+    fn register_entry_snapshot_is_inert_3456() {
+        let mark = Snapshot::register_entry();
+        assert_ne!(mark, Snapshot::No);
+        assert!(!mark.is_marked());
+        assert!(mark.position().is_none());
+        assert!(mark.is_register_entry());
+        assert!(!Snapshot::No.is_register_entry());
+        // A fold's `relocate` gate (#2896) opens for a positional mark only.
+        assert!(!mark.proves_position());
+        assert!(Snapshot::At(Origin::SnapshotAt {
+            invocation: 1,
+            path: BindPath(PathPrefix::root()),
+        })
+        .proves_position());
+        assert!(!Frame::enter(&Expr::Identity).certifies(&Origin::Untracked));
+        // A refusal of a non-null, unfrozen object is exact without the mark and
+        // a guess with it, which is the whole point.
+        let object = OwnedValue::Object(IndexMap::new().into());
+        let lost = RegisterLoss::LostSomewhere;
+        for (snapshot, guessed) in [(Snapshot::No, false), (mark, true)] {
+            let e = guess_refusal(
+                EvalError::invalid_path_expression_near_iterate(&object),
+                &lost,
+                &snapshot,
+                &object,
+                Some(NavKind::Iterate),
+            );
+            assert_eq!(e.is_guessed_path_refusal(), guessed, "{snapshot:?}");
+        }
     }
 
     /// #2889: `RootWitness::of_owned` reports the node an owned value still
