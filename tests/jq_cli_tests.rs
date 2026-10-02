@@ -49718,8 +49718,7 @@ fn join_wrong_arity_matches_jq_3046() -> Result<()> {
 }
 
 /// #3046: `strflocaltime` under POSIX `TZ` offset strings, captured from jq
-/// 1.7.1. (An IANA zone name is not resolved by `localtime` either; see
-/// `limitations.md`.)
+/// 1.7.1.
 #[test]
 fn strflocaltime_matches_jq_3046() -> Result<()> {
     for (tz, filter, want_out, want_err, want_code) in [
@@ -49890,6 +49889,258 @@ fn strflocaltime_matches_jq_3046() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", "0 | strflocaltime(1)"], None)?;
     assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
     assert!(stderr.starts_with("jq: error"), "{stderr:?}");
+    Ok(())
+}
+
+/// Whether the tz files the zone-name rows of the #3054 tests read exist. A
+/// machine without them skips those rows with a message, but CI must not: an
+/// image without `tzdata` would otherwise pass every one of them vacuously.
+fn tz_database_present() -> bool {
+    const ZONES: [&str; 8] = [
+        "Asia/Tokyo",
+        "America/New_York",
+        "Australia/Sydney",
+        "Asia/Kolkata",
+        "Asia/Kathmandu",
+        "Europe/London",
+        "Etc/GMT+5",
+        "UTC",
+    ];
+    let missing: Vec<&str> = ZONES
+        .iter()
+        .copied()
+        .filter(|zone| {
+            !std::path::Path::new("/usr/share/zoneinfo")
+                .join(zone)
+                .exists()
+        })
+        .collect();
+    if missing.is_empty() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "CI needs a tz database: no {missing:?} under /usr/share/zoneinfo"
+    );
+    eprintln!("skipping: no tz files for {missing:?} under /usr/share/zoneinfo");
+    false
+}
+
+/// #3054: `localtime` (and so `localtime | mktime`) resolves an IANA zone name
+/// and takes the zone's offset *at the timestamp*, so daylight time follows the
+/// date. Every row is jq's output (1.7.1 and 1.8.2 agree on all of them).
+///
+/// Skipped when the machine has no tz database: the rows name zones, and a
+/// container without `tzdata` cannot resolve any of them.
+#[test]
+fn localtime_follows_the_zone_at_the_timestamp_3054() -> Result<()> {
+    if !tz_database_present() {
+        return Ok(());
+    }
+    for (tz, filter, want) in [
+        (
+            "Asia/Tokyo",
+            "0 | [localtime, (localtime | mktime)]",
+            "[[1970,0,1,9,0,0,4,0],32400]\n",
+        ),
+        (
+            "America/New_York",
+            "0 | [localtime, (localtime | mktime)]",
+            "[[1969,11,31,19,0,0,3,364],-18000]\n",
+        ),
+        (
+            "America/New_York",
+            "1720000000 | [localtime, (localtime | mktime)]",
+            "[[2024,6,3,5,46,40,3,184],1719985600]\n",
+        ),
+        (
+            "America/New_York",
+            "1705000000 | localtime",
+            "[2024,0,11,14,6,40,4,10]\n",
+        ),
+        // Either side of New York's 2024 spring-forward and fall-back.
+        (
+            "America/New_York",
+            "[1710053999, 1710054000, 1730613599, 1730613600] | map(localtime[3])",
+            "[1,3,1,1]\n",
+        ),
+        // The southern hemisphere's daylight time is in January.
+        (
+            "Australia/Sydney",
+            "[1705000000, 1720000000] | map(localtime[3])",
+            "[6,19]\n",
+        ),
+        (
+            "Asia/Kolkata",
+            "1720000000 | localtime",
+            "[2024,6,3,15,16,40,3,184]\n",
+        ),
+        // The zone's history, not today's offset: Nepal was +5:30 until 1986.
+        ("Asia/Kathmandu", "0 | localtime", "[1970,0,1,5,30,0,4,0]\n"),
+        (
+            "America/New_York",
+            "-2000000000 | localtime",
+            "[1906,7,16,15,26,40,4,227]\n",
+        ),
+        (
+            "America/New_York",
+            "1720000000.75 | localtime",
+            "[2024,6,3,5,46,40.75,3,184]\n",
+        ),
+        ("Etc/GMT+5", "0 | localtime", "[1969,11,31,19,0,0,3,364]\n"),
+        (
+            "UTC",
+            "1720000000 | localtime",
+            "[2024,6,3,9,46,40,3,184]\n",
+        ),
+        // Past year 9999 the zone's rule still applies, as in libc: 1e12 s is
+        // 33658-09-26 (daylight time) and 100 days on is January (standard time).
+        (
+            "America/New_York",
+            "[1000000000000, 1000008640000] | map(localtime[3])",
+            "[21,20]\n",
+        ),
+        // A format that prints no zone label reads no zone for a broken-down array.
+        (
+            "America/New_York",
+            "[2024,6,3,5,46,40,3,184] | strflocaltime(\"%H:%M\")",
+            "\"05:46\"\n",
+        ),
+        // `:name` is the same zone as `name`.
+        (":Asia/Tokyo", "0 | localtime[3]", "9\n"),
+        (
+            "Asia/Tokyo",
+            "0 | strflocaltime(\"%Y-%m-%d %H:%M:%S\")",
+            "\"1970-01-01 09:00:00\"\n",
+        ),
+    ] {
+        let (output, code) = spawn_jq_with_env(&["-nc", filter], "TZ", tz, None)?;
+        let stdout = String::from_utf8(output.stdout)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "TZ={tz} {filter}");
+    }
+    Ok(())
+}
+
+/// #3054: POSIX `TZ` strings need no tz database. A string with a rule applies
+/// its daylight time; one with a daylight-time name but no rule (`EST5EDT`)
+/// gets the US rule when no tz file carries the name -- as in jq on macOS and
+/// glibc, and as `EST5EDT` meant before newer distributions stopped shipping
+/// the legacy files. `XYZ5XYD` names no tz file anywhere, so it exercises that
+/// path on every machine. An unrecognised name is UTC, as in jq.
+#[test]
+fn posix_tz_strings_apply_daylight_time_3054() -> Result<()> {
+    // Jan 2024, Jul 2024, 2024-03-10 07:00:00Z (spring-forward), one second
+    // before it, and 2024-11-03 06:00:00Z (fall-back).
+    let edges = "[1705000000, 1720000000, 1710054000, 1710053999, 1730613600] | map(localtime[3])";
+    for (tz, filter, want) in [
+        ("EST5EDT,M3.2.0,M11.1.0", edges, "[14,5,3,1,1]\n"),
+        ("EST5EDT", edges, "[14,5,3,1,1]\n"),
+        ("XYZ5XYD", edges, "[14,5,3,1,1]\n"),
+        (
+            "XYZ5XYD",
+            "1720000000 | strflocaltime(\"%z %Z\")",
+            "\"-0400 XYD\"\n",
+        ),
+        // No daylight-time name: the offset all year.
+        (
+            "EST5",
+            "[1705000000, 1720000000] | map(localtime[3])",
+            "[14,4]\n",
+        ),
+        (
+            "UTC-9",
+            "[1705000000, 1720000000] | map(localtime[3])",
+            "[4,18]\n",
+        ),
+        // Not a zone: UTC.
+        (
+            "Foo/Bar",
+            "[1705000000, 1720000000] | map(localtime[3])",
+            "[19,9]\n",
+        ),
+    ] {
+        let (output, code) = spawn_jq_with_env(&["-nc", filter], "TZ", tz, None)?;
+        let stdout = String::from_utf8(output.stdout)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "TZ={tz} {filter}");
+    }
+    Ok(())
+}
+
+/// #3054: `strflocaltime` prints the zone's own offset (`%z`), abbreviation
+/// (`%Z`) and epoch (`%s`) for the instant. jq 1.7.1 labels a daylight-time
+/// instant with the zone's *standard* offset and abbreviation (and `%s` an hour
+/// late), and on glibc prints `+0000` for `%z` in every zone; jq 1.8.2 prints
+/// the values below except where marked. The divergence from the pinned 1.7.1
+/// is recorded in `limitations.md`.
+#[test]
+fn strflocaltime_prints_the_zones_own_labels_3054() -> Result<()> {
+    if !tz_database_present() {
+        return Ok(());
+    }
+    for (tz, filter, want) in [
+        // Where jq 1.7.1 and 1.8.2 agree: standard time.
+        (
+            "Asia/Tokyo",
+            "0 | strflocaltime(\"%z %Z\")",
+            "\"+0900 JST\"\n",
+        ),
+        (
+            "Asia/Kolkata",
+            "0 | strflocaltime(\"%z %Z\")",
+            "\"+0530 IST\"\n",
+        ),
+        (
+            "America/New_York",
+            "1705000000 | strflocaltime(\"%z %Z %s\")",
+            "\"-0500 EST 1705000000\"\n",
+        ),
+        // A zone with no letters of its own: tzdata's numeric abbreviation.
+        (
+            "Etc/GMT+5",
+            "0 | strflocaltime(\"%z %Z\")",
+            "\"-0500 -05\"\n",
+        ),
+        // Daylight time. 1.7.1: `-0500 EST 1720003600` (and `+1000 AEST`, `-0500 EST`).
+        (
+            "America/New_York",
+            "1720000000 | strflocaltime(\"%z %Z %s\")",
+            "\"-0400 EDT 1720000000\"\n",
+        ),
+        (
+            "Australia/Sydney",
+            "1705000000 | strflocaltime(\"%z %Z\")",
+            "\"+1100 AEDT\"\n",
+        ),
+        // A broken-down array is labelled by the zone at that wall-clock time.
+        (
+            "America/New_York",
+            "[2024,6,3,5,46,40,3,184] | strflocaltime(\"%z %Z\")",
+            "\"-0400 EDT\"\n",
+        ),
+        (
+            "America/New_York",
+            "[2024,0,11,14,6,40,4,10] | strflocaltime(\"%z %Z\")",
+            "\"-0500 EST\"\n",
+        ),
+        // Where jq 1.8.2 is itself wrong: the repeated hour after the 2024 fall-back
+        // (it prints `-0400 EDT 1730610000`, an hour early) ...
+        (
+            "America/New_York",
+            "1730613600 | strflocaltime(\"%z %Z %s\")",
+            "\"-0500 EST 1730613600\"\n",
+        ),
+        // ... and on macOS a historical offset (London in 1970 was +0100 all year;
+        // 1.8.2 prints `+0000 BST`).
+        (
+            "Europe/London",
+            "0 | strflocaltime(\"%z %Z %s\")",
+            "\"+0100 BST 0\"\n",
+        ),
+    ] {
+        let (output, code) = spawn_jq_with_env(&["-nc", filter], "TZ", tz, None)?;
+        let stdout = String::from_utf8(output.stdout)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "TZ={tz} {filter}");
+    }
     Ok(())
 }
 
