@@ -59534,6 +59534,68 @@ fn test_and_or_negate_path_accepts_where_the_result_is_the_register_3289() -> Re
     ])
 }
 
+/// #3456: an `[E]` whose `E` is an `and`/`or`/unary minus carries the path
+/// register only while `register_movement_tracked` says the register's position
+/// is known after each operand. Since #3428 the `and`/`or` arms no longer ask
+/// it, so the array claim is its one reader, and each composite operand shape
+/// below is an arm of it that nothing else reaches: a postfix-`?` primitive, a
+/// nested `and`/`or`, unary minus, and an `as` source. Each answers `[]` in jq
+/// 1.7.1 and here; an arm that said `false` would refuse it ("with result").
+#[test]
+fn test_array_claim_over_composite_and_or_operands_carries_the_register_3456() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [.a? and 5] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [5 and .a?] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [(.a and 5) and 6] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [(.a or 5) or 6] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [(-.a) and 5] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [(. as $y | .a) and 5] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [-(. as $y | .a)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3289's negative control: a number or string register is never identical
 /// to a fresh boolean, so these stay refused -- the conjunct that keeps the
 /// class-B acceptance from turning into a write jq refuses.
@@ -60565,6 +60627,12 @@ fn test_and_or_path_by_value_operands_track_the_register_3428() -> Result<()> {
             "Invalid path expression",
             5,
         ),
+        // Where the `(.a)?` step could never succeed on the value (`.a` over an
+        // array) there is nothing to guess: jq's `try` catches the path error
+        // it raises or never raises one, and either way the branch is empty and
+        // the document is echoed. Only the step that *could* succeed is a guess.
+        (r"[1]", r"del(flatten and (.a)?)", "[1]\n", "", 0),
+        (r"[1]", r"del(try (flatten and (.a)?))", "[1]\n", "", 0),
         // A bare optional primitive (`.a?`, `.[]?`) is jq's `INDEX_OPT`, which
         // suppresses a type error but not a path error, so on a value that may
         // be the lost register its refusal is a guess even when the step could
@@ -60587,6 +60655,54 @@ fn test_and_or_path_by_value_operands_track_the_register_3428() -> Result<()> {
         (
             r#"[{"a":1}]"#,
             r"del((flatten and (.. | .a?))?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // The same where the step could never succeed on the value (`.a` over an
+        // array, `.[0]` or a slice over an object): the step's own refusal is
+        // exact there, so it is the bare `?` that has to call it a guess. jq
+        // exits 5 on each -- the path error `INDEX_OPT` does not suppress -- and
+        // a `try` that swallowed it would print the document instead. The `1`
+        // is what makes them refuse in jq: without it jq answers (next rows).
+        (
+            r"[1]",
+            r"del(try (flatten and (.a?, 1)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(try (flatten and (.[0]?, 1)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(try (flatten and (.[1:2]?, 1)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // The boundary: with nothing after the `?` step jq answers, because
+        // `flatten` leaves the register where `.a?` can fail on a type error
+        // and be suppressed. The resolver cannot tell that from the register
+        // having moved, which jq refuses (the rows above), so it refuses --
+        // under `try` too. `main`'s by-value route answered these; the cost is
+        // the second residual in `limitations.md` (#3428), and lifting it needs
+        // `flatten` in `cannot_move_register`'s allowlist with its own rows.
+        (
+            r"[1]",
+            r"del(try (flatten and (.a?, empty)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(try (flatten and (.[0]?, empty)))",
             "",
             "Invalid path expression",
             5,
@@ -87217,6 +87333,70 @@ fn test_assign_rhs_is_lazy_on_the_generic_route_3448() -> Result<()> {
     assert_eq!(out, "[[1,\"b\"],[2,\"b\"]]\n[[1,\"2\"],[2,\"2\"]]\n");
     assert_eq!(err.matches("DEBUG").count(), 2, "stderr={err:?}");
     Ok(())
+}
+
+/// #3466 (kept reachable by #3428): the borrowed evaluator's destructuring
+/// bind registers each bound node as the generic evaluator's does, and the
+/// only programs in this suite that ran it were by-value `and`/`or`/minus
+/// operands that held a destructuring bind (`del(-(. as [$a] ?// $a | ..))`).
+/// #3428 made those operands resolve live, so what still reaches it is any
+/// other by-value evaluation in path position that holds one -- a `select`
+/// condition -- and these rows pin that it answers as jq does for an object
+/// pattern, an array pattern, a nested source and a `?//` alternative, in
+/// `path` and `del` alike (every row captured from jq 1.7.1).
+#[test]
+fn test_destructuring_bind_in_a_select_condition_answers_as_jq_3466() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1}"#,
+            r"path(select(. as {a:$v} | $v == 1))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(select(. as {a:$v} | $v == 2))",
+            "",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"path(select(. as [$x,$y] | $y == 2))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":3}}"#,
+            r"path(.a | select(. as {b:$z} | $z == 3))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(select(. as [$q] ?// {a:$q} | $q == 1))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(select(. as {a:$v} | $v == 1))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1},{"a":2}]"#,
+            r"del(.[] | select(. as {a:$v} | $v == 1))",
+            "[{\"a\":2}]\n",
+            "",
+            0,
+        ),
+    ])
 }
 
 /// #3466 controls: the walk mints identity only where the cursor proves the

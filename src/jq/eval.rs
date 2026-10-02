@@ -37963,14 +37963,19 @@ fn navigation_element(component: &Expr) -> Option<OwnedValue> {
 }
 
 /// [`navigation_element`] of the first step of a flattened path component,
-/// looking through a `?` over a multi-step group (#2909 leaves such a group one
-/// opaque element, `Optional(Pipe([.a, .b]))`): the step it can refuse first is
-/// the group's first. Kept apart from [`navigation_element`] so that function's
-/// other callers, which name the element of a *leaf*, are not affected (#3456).
+/// looking through the `?`/parens that [`push_path_components`] wraps a
+/// `try`-scoped step in (`Optional(Paren(.a))`). Kept apart from
+/// [`navigation_element`] so that function's other callers, which name the
+/// element of a *leaf*, are not affected (#3456).
+///
+/// No `Pipe` arm: a flattened component is never a pipe, and the one that
+/// wraps a pipe -- a `?` over a group that can fan out (#2909) -- is dynamic
+/// ([`needs_fanout_pass`]), so it ends the static tail this is asked about
+/// instead of sitting in it. An earlier cut had the arm and patch coverage
+/// flagged it as unreached, which is what confirmed the shape cannot arrive.
 fn first_step_element(component: &Expr) -> Option<OwnedValue> {
     match component {
         Expr::Optional(inner) | Expr::Paren(inner) => first_step_element(inner),
-        Expr::Pipe(parts) => parts.first().and_then(first_step_element),
         other => navigation_element(other),
     }
 }
@@ -113145,6 +113150,23 @@ mod tests {
                 cannot_move_register(&parse(src).unwrap()),
                 stays,
                 "cannot_move_register({src})"
+            );
+        }
+        // The parser never builds `Range { to: None }` (it spells `range(n)` as
+        // `range(0; n)`), but `Expr` is public and the evaluators read that shape
+        // as `range(0; n)` (#2698), so it gets the one-argument verdict by hand:
+        // the argument is a `$param` binding, so a literal one leaves the register
+        // and one that navigates keeps the conservative answer `range(.a)` has.
+        for (arg, stays) in [("2", true), (".a", false)] {
+            let range = Expr::Range {
+                from: Box::new(parse(arg).unwrap()),
+                to: None,
+                step: None,
+            };
+            assert_eq!(
+                cannot_move_register(&range),
+                stays,
+                "cannot_move_register(Range {{ from: {arg}, to: None }})"
             );
         }
         // `leaves_register_in_place` adds `add` and `map(f)` for an `f` that
