@@ -50901,5 +50901,21 @@ fn test_yq_error_of_an_empty_message_aborts_3488() -> Result<()> {
             "`{filter}`"
         );
     }
+
+    // `?` is a jq extension in yq mode (yq's lexer rejects it), gated behind
+    // `--jq-extensions`; it suppresses the raised `aborted` like any other
+    // raised error, so there is no yq answer to capture.
+    for (filter, expected) in [
+        ("error(select(false))?", ""),
+        ("[error(select(false))?]", "[]\n"),
+    ] {
+        let (stdout, err, code) =
+            run_yq_stdin_with_stderr(filter, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.as_str(), err.as_str(), code),
+            (expected, "", 0),
+            "`{filter}` with --jq-extensions"
+        );
+    }
     Ok(())
 }
