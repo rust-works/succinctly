@@ -1476,17 +1476,29 @@ impl<'a> Validator<'a> {
         // `escape_kind`, not `kind`: `Self::error` takes its own `kind:
         // YamlValidationErrorKind` parameter, and this is an unrelated `char`.
         let escape_kind = self.advance().expect("caller matched on this byte") as char; // consume x/u/U
+        let mut code_point: u32 = 0;
         for _ in 0..n {
-            match self.peek() {
-                Some(c) if c.is_ascii_hexdigit() => {
+            match self.peek().and_then(|c| (c as char).to_digit(16)) {
+                Some(digit) => {
                     self.advance();
+                    code_point = (code_point << 4) | digit;
                 }
-                _ => {
+                None => {
                     return Err(self.error(YamlValidationErrorKind::InvalidEscape {
                         sequence: escape_kind,
                     }))
                 }
             }
+        }
+        // #3592: the digits must also name a scalar value. go-yaml rejects a
+        // surrogate (D800-DFFF) and a `\U` above 10FFFF at scan time, and the
+        // decoder (`char::from_u32`) rejects them too -- checking only the
+        // digits' shape let `validate` accept what `yq` then fails on. `\x`
+        // tops out at FF, so it never trips this.
+        if char::from_u32(code_point).is_none() {
+            return Err(self.error(YamlValidationErrorKind::InvalidEscape {
+                sequence: escape_kind,
+            }));
         }
         Ok(())
     }
@@ -1856,6 +1868,71 @@ mod tests {
     fn accepts_valid_escapes() {
         assert!(validate(b"a: \"tab\\tnl\\n hex \\x41 \\u0041 \\U00000041\"\n").is_ok());
         assert!(validate(b"a: \"q \\\" s \\/ b \\\\ nbsp \\_ next \\N\"\n").is_ok());
+    }
+
+    /// #3592: a `u`/`U` escape must name a scalar value, not just carry the right
+    /// number of hex digits. go-yaml (so yq) rejects a surrogate and a `U` above
+    /// 10FFFF at scan time; the validator used to accept both. The documents are
+    /// built from a backslash constant, so no escape literal sits in this source.
+    #[test]
+    fn rejects_surrogate_and_out_of_range_escapes_3592() {
+        const BS: char = '\\';
+        let doc = |esc: &str| format!("a: \"{BS}{esc}\"\n").into_bytes();
+
+        for (esc, sequence) in [
+            ("ud83d", 'u'),
+            ("ude00", 'u'),
+            ("uD83D", 'u'),
+            ("ud800", 'u'),
+            ("udfff", 'u'),
+            ("U0000d83d", 'U'),
+            ("U0000dfff", 'U'),
+            ("U00110000", 'U'),
+            ("UFFFFFFFF", 'U'),
+        ] {
+            assert!(
+                matches!(kind(&doc(esc)), InvalidEscape { sequence: s } if s == sequence),
+                "escape {esc} should be rejected as InvalidEscape({sequence})"
+            );
+        }
+
+        // A surrogate pair is two escapes, each rejected: YAML has no pairing.
+        let pair = format!("a: \"{BS}ud83d{BS}ude00\"\n").into_bytes();
+        assert!(matches!(kind(&pair), InvalidEscape { sequence: 'u' }));
+
+        // The same check applies in a key, a flow sequence and mid-string.
+        let key = format!("\"{BS}ud83d\": 1\n");
+        assert!(validate(key.as_bytes()).is_err());
+        let flow = format!("[\"{BS}ud83d\"]\n");
+        assert!(validate(flow.as_bytes()).is_err());
+        let mid = format!("a: \"x{BS}ud83dy\"\n");
+        assert!(validate(mid.as_bytes()).is_err());
+    }
+
+    /// #3592: the boundaries of the rejected ranges stay accepted -- the last
+    /// scalar below the surrogates, the first above them, the top of Unicode, a
+    /// noncharacter, and an astral escape that a naive pair check could confuse.
+    #[test]
+    fn accepts_escapes_at_the_surrogate_and_range_boundaries_3592() {
+        const BS: char = '\\';
+        for esc in [
+            "ud7ff",
+            "ue000",
+            "uffff",
+            "ufffe",
+            "U0000d7ff",
+            "U0000e000",
+            "U0010ffff",
+            "U0001F600",
+            "x41",
+            "xFF",
+        ] {
+            let doc = format!("a: \"{BS}{esc}\"\n");
+            assert!(
+                validate(doc.as_bytes()).is_ok(),
+                "escape {esc} should be accepted"
+            );
+        }
     }
 
     /// #1636: `scan_hex_escape` used to hardcode `sequence: 'x'` regardless
