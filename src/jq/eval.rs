@@ -39262,7 +39262,15 @@ fn recurse_family_root_seed<'a>(
 /// so `path(limit(2; ..))` over a root that is a single wide `Array`/`Object`
 /// builds one child's `PathPrefix`/`PathBranch` past the root, not one per
 /// child. Until #2895 every child of a popped node was pushed before the
-/// loop asked `sink` again, which made that query O(width).
+/// loop asked `sink` again, which made that query O(width). What is still
+/// paid per *delivered* child is unchanged: one `PathPrefix` node, and for an
+/// object entry its key `String`.
+///
+/// The parameterised spellings ([`resolve_recurse_sink`], and the value-path
+/// `recurse(f)` evaluator) stay eager on purpose: their `f` can fan out and
+/// raise, so a node's children are the *output of running `f`*, not a slice
+/// already in hand, and they are capped by [`RECURSE_MAX_ITEMS`]. Bare `..`
+/// has no `f`, so its children are exactly the container's own.
 ///
 /// Every value this function ever visits is a live sub-part of the original
 /// top-level `value`, so every branch can borrow directly (`Cow::Borrowed`)
@@ -39360,8 +39368,8 @@ fn resolve_recursive_descent_sink<'a>(
         }
         // Deferred past the `sink` call above (needed only for the
         // descent below, not to deliver `current` itself) -- every branch
-        // on this stack was built from a `Cow::Borrowed` above and by the
-        // `Cow::Borrowed` pushes below, so structural descent never
+        // delivered here was built from a `Cow::Borrowed`, by the seed above
+        // or by `DescentFrame::next_child`, so structural descent never
         // computes a new value and this unwraps unconditionally, the same
         // lifetime `value` itself carries.
         let current: &'a OwnedValue = match current {
