@@ -1012,29 +1012,42 @@ is the revert that established what the other one costs.
    oracle matrix per arm — left for a follow-up rather than attempted alongside the
    already-substantial change above.
 
-   **`and`/`or`/unary minus track the register the way jq's bytecode does** — for operands
-   whose register movement the resolver can follow
-   ([#3289](https://github.com/rust-works/succinctly/issues/3289), after #2689 and #2760). jq's
+   **`and`/`or`/unary minus track the register the way jq's bytecode does**
+   ([#3289](https://github.com/rust-works/succinctly/issues/3289), after #2689 and #2760; every
+   operand since [#3428](https://github.com/rust-works/succinctly/issues/3428)). jq's
    `and`/`or` are not subexps: `L` moves the register, `R` runs on the `DUP`ed input with the
    register where `L` left it, and the result is a fresh boolean *at* that register, which
    `PATH_END` accepts only when it is `jv_identical` to it. The resolver models exactly that,
-   per `L` branch, when every step inside the operands navigates natively, provably leaves the
-   register alone, or composes such steps (`register_movement_tracked`, `src/jq/eval.rs`):
-   `path((.a and .b) \| empty)` on `{"a":1}` refuses near `"b"`, `path(.a and .b)` on
-   `{"a":false}` is `["a"]` (so `del`/`=`/`|=` write there), `path(.a and 5)` on `{"a":0}`
-   refuses, and a later `$var` re-establishes the register the operator left
-   (`path(.a as $y \| -.a \| $y)` is `["a"]`). The register each branch reports is stated by
-   the leaf that produced it
-   ([#3456](https://github.com/rust-works/succinctly/issues/3456); the contract and its open
-   steps are in `docs/plan/jq-path-register-producer-contract.md`). Three residuals remain:
+   per `L` branch: `path((.a and .b) \| empty)` on `{"a":1}` refuses near `"b"`,
+   `path(.a and .b)` on `{"a":false}` is `["a"]` (so `del`/`=`/`|=` write there),
+   `path(.a and 5)` on `{"a":0}` refuses, and a later `$var` re-establishes the register the
+   operator left (`path(.a as $y \| -.a \| $y)` is `["a"]`). What the register is after each
+   operand is stated by the leaf that produced it
+   ([#3456](https://github.com/rust-works/succinctly/issues/3456); the contract is in
+   `docs/plan/jq-path-register-producer-contract.md`): the branch's own position when the
+   operand navigated natively, the register it entered with when it provably left it alone
+   (`cannot_move_register`; for `any`/`all`/`isempty(g)` the result says whether they moved it;
+   for `add` and `map(f)`, `leaves_register_in_place`), and a *loss* otherwise. `R` then runs
+   from a lost seed, so a navigation in it refuses -- loudly, because the refusal is the
+   resolver's guess about where jq's register went (#3267), and a `try` or `?` around the
+   `and` must not swallow a guess. Residuals:
 
-   - **An operand jq navigates inside but this resolver evaluates by value** (`first`, `last`,
-     `any`, `nth(n)`, `range`, `paths`, a `try`, a `//`, an `if`, a `def`) keeps the eager
-     by-value evaluation it had before #3289, on a trackable input. That is refuse-only where
-     jq accepts, but it also still *accepts* some shapes jq refuses — `path((first and .b?))`
-     on `[true]` is empty here and refuses near `"b"` in jq — tracked as a follow-up. Treating
-     such an operand as though it left the register alone would write where jq refuses
-     (`del(first and .[0])` on `[true]`), which is why it is not attempted.
+   - **An operand jq leaves in place that this resolver cannot prove it leaves** (`sort`,
+     `to_entries`, any builtin outside `cannot_move_register`'s allowlist) is read as a loss, so a
+     navigation in `R` is refused where jq accepts: `del(sort and .[0])` on `[true]` is `[]` in
+     jq. Before #3428 the by-value route answered some of these by accident and accepted others
+     jq refuses (`path((first and .b?))` on `[true]` was empty there and refuses near `"b"` in
+     jq), so the boundary moved from "accepts, sometimes wrongly" to "refuses, loudly". The
+     allowlist grows only with an oracle row.
+   - **A refusal jq makes and catches is loud here.** jq catches its own path error inside a
+     `try`: `del(try (any and .a))` on `{"a":true}` leaves the document. Where an operand may have
+     moved the register this resolver cannot tell which error jq would raise, so its refusal is a
+     guess, uncatchable by design (#3267), and the row exits 5. The same holds for a right operand
+     wrapped in `?`: a bare `.a?` is jq's `INDEX_OPT`, which suppresses a type error but not a
+     path error, so on the node the register may still be on its refusal is a guess even when the
+     step could never succeed (`del(try (flatten and .a?))` on `[{"a":1}]` is the document in jq),
+     and a `(.a)?`/`(.a | .b)?` first step is no longer pruned silently there. Refuse-only, and
+     pinned (`test_and_or_path_by_value_operands_track_the_register_3428`).
    - **A refusal inside a `?//` body is not retried** (`path_alternative_retries`), so
      `del(. as $x ?// $y \| if $x then (.a and .b) else .c end)` on `{"a":1,"c":2}` refuses
      where jq retries past its own path error and answers `{"a":1}`. Before #3289 the by-value
@@ -1044,11 +1057,26 @@ is the revert that established what the other one costs.
      identical -- #3494), so `path(.a as $v \| . as $w \| $v \| (($w \| .a)
      and .b))` refuses where jq answers.
 
-   A generated sweep (29 operands including the by-value ones above, `and`/`or`/`-`, 10
-   inputs, 10 path contexts including `try`-wrapped and `$var`-rebinding writes; 171,100 rows)
-   against jq 1.7.1 and the pre-#3289 build finds no row where #3289 accepts or answers
-   differently where the earlier build matched jq, and 9,686 rows fixed. yq mode is unchanged
-   by #3289 and keeps its eager evaluation.
+   A generated sweep (`scripts/jq-path-register-sweep.py`: 54 operands -- native navigation,
+   literals, by-value builtins, `try`/`//`/`if`/`def` wrappers, folds, `label`, `limit`,
+   recursion -- under `and`/`or`/`-` and 7 right operands (single steps, `?`-wrapped steps and
+   pipes, a descent), 11 inputs, 18 path contexts including `try`-wrapped, `?`-wrapped and
+   `$var`-rebinding writes; 310,095 rows) against jq 1.7.1: before #3428, 293,013 rows match
+   jq, 883 accept where jq refuses and 16,102 refuse where jq accepts; after, 304,142 match,
+   36 accept and 5,915 refuse. 778 rows that matched before refuse now -- 467 are `sort`,
+   `to_entries` and `flatten` (the first residual above), 182 are `any`/`all`/`isempty` where
+   jq catches its own error under a `try` or `?` (the second), 91 are a `foreach` operand,
+   whose fold branches state no register, and 38 are a by-value or compound right operand after
+   a navigating left one on a `null` input, where the earlier match was luck (the eager route
+   answered the root path where jq answers `["b"]`, and `del` of either leaves the same
+   document) and #3579's rule now refuses a terminal `null` that followed a navigation -- and
+   0 rows are newly accepted wrongly; the 36 that
+   still accept are all `.[0:] and R` and `.[0:0] and R` on `[]` (an empty slice is a fresh
+   array, #3494's identity rule; unchanged by this work). yq mode is unchanged: the per-result
+   and `add`/`map` verdicts are gated on jq mode, and 1,400 yq-mode runs of
+   `has`/`range`/`paths`/`add`/`map`/`any` and friends in write contexts (610 succeed, the rest
+   fail identically) answer the same before and after; five of them are pinned
+   (`test_yq_by_value_stages_keep_no_path_register_3456`).
 
    The register is also carried **only across stages this resolver can prove did not move
    it** (`cannot_move_register`, `src/jq/eval.rs`) — the same allowlist now gates both
@@ -1065,9 +1093,10 @@ is the revert that established what the other one costs.
    comparison operator, and an `if` condition. Nothing within `SUBEXP_BEGIN`/`SUBEXP_END`
    moves jq's register or raises a path error, so `path(. as $x \| {k:.a} \| $x)` is `[]`
    in both tools. jq has more subexps than these four (a C-implemented builtin's arguments,
-   so `path(. as $x \| has("a") \| $x)` is `[]` in jq), and a `reduce`/`foreach` stage or a
-   `//` also leaves jq's register where it was on inputs this predicate can't tell apart
-   statically. Those still drop the register here. Before #3186 these refused, and under `try` the refusal was caught as if it
+   so `path(. as $x \| contains({a:{}}) \| $x)` is `[]` in jq; `has` and `range` are named
+   explicitly since [#3456](https://github.com/rust-works/succinctly/issues/3456)), and a
+   `reduce`/`foreach` stage or a `//` also leaves jq's register where it was on inputs this
+   predicate can't tell apart statically. Those still drop the register here. Before #3186 these refused, and under `try` the refusal was caught as if it
    were jq's own: `del(. as $v \| {k: .a} \| try ($v \| .[]?))` echoed the document where jq
    deletes every key. The register is also dropped **per stage, not per leaf**: a compound stage
    that mixes a leaf that navigates with one that does not (`(.a // 1)`, an `if` or a
@@ -1124,7 +1153,7 @@ is the revert that established what the other one costs.
    refuse-only, and since [#3267](https://github.com/rust-works/succinctly/issues/3267) it stays
    refuse-only under `try`/`?` too. It used to be caught as if it were jq's own path error, so
    the write was silently lost at exit 0 where jq writes:
-   `del(. as $x \| has("a") \| try ($x \| .a))` returned the document unchanged, and jq
+   `del(. as $x \| contains({a:{}}) \| try ($x \| .a))` returned the document unchanged, and jq
    returns `{"k":1}`. A navigation refusal is now uncatchable when both hold:
 
    - a live register did not come out of a stage upstream that did not navigate (the stage is
@@ -1149,8 +1178,8 @@ is the revert that established what the other one costs.
    The price is the case this resolver can't tell apart: a value at or inside the lost register
    that jq's register did *not* land on. There jq's refusal is exact and caught, and this refuses
    loudly, because the stage in between is opaque and might have moved the register there:
-   - `del(.a as $y \| has("z") \| try ($y \| .b))` returns the document unchanged in jq, since
-     `has` left the register at the root, but `first(.a)` would have moved it onto `$y`;
+   - `del(.a as $y \| contains({z:1}) \| try ($y \| .b))` returns the document unchanged in jq, since
+     `contains` left the register at the root, but `first(.a)` would have moved it onto `$y`;
    - after a `reduce`/`foreach` stage, whose route hands back no register value, where the
      register was lost isn't known at all, so every `$var` or `null` refusal after one is loud:
      `path((.a \| ..) as $v0 \| reduce (1) as $i (.; $v0) \| ($v0 \| .b?)?)` is empty in jq
@@ -1169,11 +1198,11 @@ is the revert that established what the other one costs.
    call, and stays refuse-only.
 
    The wording can differ too, both tools refusing: jq ends
-   `del(. as $x \| has("a") \| reduce (1) as $i ($x; try ($x \| .zz)))` with its try-caught
+   `del(. as $x \| contains({a:{}}) \| reduce (1) as $i ($x; try ($x \| .zz)))` with its try-caught
    fold's `Invalid path expression with result null`, while this raises the refusal itself
    (`… near attempt to access element "zz" of …`). Likewise a guess raised in an earlier
    branch pre-empts the error jq reports from a later one:
-   `del(. as $x \| has("a") \| (try ($x \| .a)), .k)` fails in jq on the `.k` (applied to
+   `del(. as $x \| contains({a:{}}) \| (try ($x \| .a)), .k)` fails in jq on the `.k` (applied to
    `true`), and here on the guessed `$x \| .a`.
 
    The same price now covers a frozen `$var` reached through a composite bind source
@@ -1198,7 +1227,7 @@ is the revert that established what the other one costs.
 
    One residual keeps the silent drop. A *terminal* refusal (the pipe's last value is a `$var`,
    with no navigation after it) is still decided where the per-branch knowledge is gone, so a
-   value-position `?` catches it: `[path(. as $x \| has("a") \| $x)?]` is `[]` here and
+   value-position `?` catches it: `[path(. as $x \| contains({a:{}}) \| $x)?]` is `[]` here and
    `[[]]` in jq, as it was before #3267. (A third shape used to sit here too — an `as` whose bind source navigates —
    but [#2042](https://github.com/rust-works/succinctly/issues/2042) established that jq
    evaluates an `as` source with path tracking suspended, so the source alone never moves the

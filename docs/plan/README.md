@@ -30,7 +30,7 @@ These plans are kept for:
 | [decode-failure-routing.md](decode-failure-routing.md)                         | Proposed    | `src/jq/`, `src/yaml/`             | Decode-failure error routing                            |
 | [path-context-arm-reachability.md](path-context-arm-reachability.md)           | Current     | `src/jq/eval.rs`                   | Eager path-context evaluator arm reachability audit     |
 | [jq-bind-origin-frame.md](jq-bind-origin-frame.md)                             | Implemented | `src/jq/eval.rs`, `src/jq/expr.rs` | Node identity for a navigated `$var` in path position   |
-| [jq-path-register-producer-contract.md](jq-path-register-producer-contract.md) | Proposed    | `src/jq/eval.rs`                   | Truthful `PathBranch::register` at the producer (#3456) |
+| [jq-path-register-producer-contract.md](jq-path-register-producer-contract.md) | Partial     | `src/jq/eval.rs`                   | Truthful `PathBranch::register` at the producer (#3456) |
 
 ## Archived Plans
 

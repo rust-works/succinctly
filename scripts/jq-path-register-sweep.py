@@ -67,6 +67,7 @@ Usage:
       --base main=/path/to/main-build [--base pre3425=/path/to/older-build]
   ./scripts/jq-path-register-sweep.py --candidate ... --sample 2000 --seed 7
   ./scripts/jq-path-register-sweep.py --candidate ... --list-axes
+  ./scripts/jq-path-register-sweep.py --candidate ... --operand any --operand 'all'
 """
 
 import argparse
@@ -127,12 +128,62 @@ OPERANDS = [
     "(.a // .b)",
     "if . then .a else .b end",
     "(. as $v | .a)",  # `as` extends right: unparenthesised it swallows the combinator
+    # (#3456 B2b) by-value builtins jq runs without moving the register: a C
+    # builtin's arguments are subexps, and a jq-defined one built on `reduce` or
+    # an array collect backtracks its source. A static `LostAt` is too coarse
+    # for these, so each is a lost match the day a by-value operand stops
+    # keeping the eager route.
+    "has(\"a\")",
+    "keys",
+    "add",
+    "map(.)",
+    # Left in place by jq and not named by `cannot_move_register`: the boundary,
+    # where a lost register must refuse loudly and a `try` must not swallow it.
+    "sort",
+    "to_entries",
+    "flatten",
+    # (#3456) the producers a wrong `Unmoved` would hurt most, now that an
+    # and/or operand's stated register is read as given: a generator that emits
+    # from inside a fork (`label`, `limit`, `first(f)`, `nth`), the folds,
+    # recursion, a comma, a `try` with a handler, and a pipe that navigates and
+    # then computes.
+    "(reduce .[]? as $k (.; .))",
+    "(foreach .[]? as $k (.; .; .))",
+    "(label $o | (.a, break $o))",
+    "limit(2; .a, 1)",
+    "first(.a, 1)",
+    "nth(1; .[]?, 1)",
+    "recurse(.[]?)",
+    "(.a, 1)",
+    "(try error(\"x\") catch .)",
+    "(.a | tostring)",
+    "(.[0] | length)",
+    "(getpath([\"a\"]) // 1)",
+    # (#3456 B2b) a compound stage with a by-value leaf. jq backtracks to the
+    # fork, so the by-value leaf's register is unmoved there while a sibling
+    # leaf navigates.
+    "(.a // 1)",
+    "if . then 1 else .a end",
+    "try 1 catch .a",
+    "(def f: 5; f)",
 ]
 
 # The other side of a two-operand shape. Chosen so that, against the inputs
 # below, `R` sometimes navigates off a register `L` moved and sometimes
 # lands on a value identical to it.
-COMPANIONS = [".b?", ".[0]", "true", ".a"]
+COMPANIONS = [
+    ".b?",
+    ".[0]",
+    "true",
+    ".a",
+    # (#3456) a right operand wrapped in `?` is pruned, not refused, when its
+    # first step fails on an untracked input, which on a lost register is a
+    # guess that must not be silent; and a generator whose inner `?` jq catches
+    # locally before it goes on to the children.
+    "(.a)?",
+    "(.a | .b)?",
+    "(.. | .a?)",
+]
 
 INPUTS = [
     "null",
@@ -145,6 +196,9 @@ INPUTS = [
     '{"a":1,"b":2}',
     '{"a":[true]}',
     '{"a":false,"b":null}',
+    # an object with the key `a` below the root: a descent (`..`) reaches a
+    # value `.a` can navigate that the root is not
+    '[{"a":1}]',
 ]
 
 # Contexts wrap a shape `X` in a path-consuming expression. `X` is spliced in
@@ -186,15 +240,17 @@ def shapes_for(operand):
         yield f"{c} or {operand}"
 
 
-def build_rows():
+def build_rows(operands=None):
     """The grid and the chain rows, separately: (label, input, program).
 
-    The chain rows are the timing axis and are never sampled away.
+    The chain rows are the timing axis and are never sampled away. `operands`
+    restricts the grid to a subset of OPERANDS (the `--operand` flag): a fast
+    targeted run while iterating, never the number a gate is judged on.
     """
     ctx = dict(CONTEXTS)
     rows = []
     chains = []
-    for operand in OPERANDS:
+    for operand in OPERANDS if operands is None else operands:
         for shape in shapes_for(operand):
             for cname, template in CONTEXTS:
                 program = template.replace("{X}", shape)
@@ -304,14 +360,26 @@ def main():
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--show", type=int, default=25, help="max rows printed per section")
     ap.add_argument("--json", metavar="PATH", help="write every non-MATCH row as JSON lines")
+    ap.add_argument(
+        "--operand",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="restrict the grid to this operand (exact text from --list-axes); repeatable",
+    )
     ap.add_argument("--list-axes", action="store_true", help="print the grid's size and exit")
     args = ap.parse_args()
 
-    grid, chains = build_rows()
+    unknown = [o for o in args.operand if o not in OPERANDS]
+    if unknown:
+        ap.error(f"--operand {unknown[0]!r} is not an operand; see --list-axes")
+    grid, chains = build_rows(args.operand or None)
     if args.list_axes:
         print(f"operands={len(OPERANDS)} companions={len(COMPANIONS)} inputs={len(INPUTS)} "
               f"contexts={len(CONTEXTS)}")
         print(f"rows={len(grid) + len(chains)} ({len(grid)} grid + {len(chains)} chain)")
+        for operand in OPERANDS:
+            print(f"  operand: {operand}")
         return 0
     if not args.candidate:
         ap.error("--candidate is required")

@@ -59948,6 +59948,68 @@ fn test_and_or_negate_path_accepts_where_the_result_is_the_register_3289() -> Re
     ])
 }
 
+/// #3456: an `[E]` whose `E` is an `and`/`or`/unary minus carries the path
+/// register only while `register_movement_tracked` says the register's position
+/// is known after each operand. Since #3428 the `and`/`or` arms no longer ask
+/// it, so the array claim is its one reader, and each composite operand shape
+/// below is an arm of it that nothing else reaches: a postfix-`?` primitive, a
+/// nested `and`/`or`, unary minus, and an `as` source. Each answers `[]` in jq
+/// 1.7.1 and here; an arm that said `false` would refuse it ("with result").
+#[test]
+fn test_array_claim_over_composite_and_or_operands_carries_the_register_3456() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [.a? and 5] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [5 and .a?] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [(.a and 5) and 6] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [(.a or 5) or 6] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [(-.a) and 5] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [(. as $y | .a) and 5] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [-(. as $y | .a)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3289's negative control: a number or string register is never identical
 /// to a fresh boolean, so these stay refused -- the conjunct that keeps the
 /// class-B acceptance from turning into a write jq refuses.
@@ -60780,6 +60842,445 @@ fn test_path_register_compound_stage_is_refused_as_a_whole_3456() -> Result<()> 
             r#"{"a":null}"#,
             r"path(. as $x | (empty, 1) | $x)",
             "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3456 (the B2b/B3 guard): by-value `and`/`or` operands that jq navigates
+/// inside -- `any`, `all`, `isempty(g)` move the register exactly when they
+/// emit, `range`/`paths` do not move it -- followed by an `R` that navigates.
+/// Every row but the control exits 5 with nothing written in jq 1.7.1 *and* on
+/// `main`, which is what makes them a guard: they were written against a gate-dropping
+/// experiment that wrote `{}` for `del(any and .a)`, answered `[]` for
+/// `path(. as $x | (any and .) | $x)`, and (once that was closed) let a `try`
+/// or `?` swallow the resolver's own guess so `del(try (any or .b?))` echoed
+/// the document -- three different ways to lose the refusal. jq words some of
+/// these as "near attempt to access element" where `main` says "with result",
+/// so the message check is the part both share. The control is the one row
+/// where `R` navigates a register `any` did not move.
+///
+/// Rows jq *accepts* and `main` refuses (`del(try (any and .a))`, jq: the
+/// document unchanged) are deliberately absent: they are not guarded, they
+/// are what the change that closes #3428 has to answer.
+#[test]
+fn test_path_register_by_value_operand_refusals_stay_refused_3456() -> Result<()> {
+    let refused = "Invalid path expression";
+    assert_path_rows_3289(&[
+        (r#"{"a":true}"#, r"del(any and .a)", "", refused, 5),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | (any and .) | $x)",
+            "",
+            refused,
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del(try (any or .b?))",
+            "",
+            refused,
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del((any or .b?)?)",
+            "",
+            refused,
+            5,
+        ),
+        (
+            r#"{"a":true,"b":null}"#,
+            r"del(try (all and .b?))",
+            "",
+            refused,
+            5,
+        ),
+        (r#"{"a":1}"#, r"del(isempty(.[]?) or .a)", "", refused, 5),
+        (r"{}", r"del(isempty(.[]?) or .a)", "", refused, 5),
+        (r#"{"a":1}"#, r"del(try (range(2) and .a))", "", refused, 5),
+        (r#"{"a":1}"#, r"path(range(2) and .a)", "", refused, 5),
+        (r#"{"a":1}"#, r"del(paths and .a)", "", refused, 5),
+        (
+            r#"{"a":[true]}"#,
+            r"path(. as $x | (.a | any) | $x)",
+            "",
+            refused,
+            5,
+        ),
+        // Control: `any` of `[]` emits nothing, so the register is where it
+        // entered, `.b?` finds nothing to index, and there is no output.
+        (r"[]", r"path(any or .b?)", "", "", 0),
+    ])
+}
+
+/// #3428 (closed by #3456's B3): an `and`/`or` operand jq navigates inside
+/// but the resolver evaluates by value -- `first`, `last`, `any`, `all`,
+/// `nth(n)`, `isempty(g)`, a `//`, an `if`, a `try`, a `def` -- used to keep
+/// the eager by-value route on a trackable input, which never checked `R`'s
+/// navigation against the register `L` moved. Every operand's branch now says
+/// what became of the register, and `R` runs from that. Every row is captured
+/// from jq 1.7.1.
+#[test]
+fn test_and_or_path_by_value_operands_track_the_register_3428() -> Result<()> {
+    let near_b = r#"Invalid path expression near attempt to access element "b" of [true]"#;
+    let near_0 = "Invalid path expression near attempt to access element 0 of [true]";
+    assert_path_rows_3289(&[
+        // The issue's own table: these wrote or answered where jq exits 5.
+        (r"[true]", r"del((first and .b?))", "", near_b, 5),
+        (r"[true]", r"del((last and .b?))", "", near_b, 5),
+        (r"[true]", r"del((any and .b?))", "", near_b, 5),
+        (r"[true]", r"path((first and .b?))", "", near_b, 5),
+        (r"[true]", r"del((nth(0) and .b?))", "", near_b, 5),
+        // The same family, refused with jq's own wording instead of "with result".
+        (r"[true]", r"del(first and .[0])", "", near_0, 5),
+        (
+            r#"{"a":[true]}"#,
+            r"del(.a | (first(.[]) and .[0]))",
+            "",
+            near_0,
+            5,
+        ),
+        (
+            r"[1]",
+            r"del((.[0] // 1) and .[0])",
+            "",
+            "Invalid path expression near attempt to access element 0 of [1]",
+            5,
+        ),
+        // jq answers these, and a by-value operand that leaves the register
+        // alone must let `R` navigate it: `main` refused every one.
+        (
+            r"[true]",
+            r"del((if . then 1 else .b end) and .[0])",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"[true]", r"del((try 1 catch .b) and .[0])", "[]\n", "", 0),
+        (r"[true]", r"del((def f: 5; f) and .[0])", "[]\n", "", 0),
+        (r"[true]", r"del(try ([.[]?] and .[0]))", "[]\n", "", 0),
+        // `any`/`all` move the register exactly when they emit: a result that
+        // says nothing was emitted leaves `R` a register it can navigate.
+        (r"[true]", r"del(all and .[0])", "[]\n", "", 0),
+        (
+            r#"{"a":true,"b":true}"#,
+            r"del(all and .a)",
+            "{\"b\":true}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del(try (any or .a))",
+            "{\"b\":null}\n",
+            "",
+            0,
+        ),
+        // The resolver's guess is uncatchable (#3267): jq catches its own
+        // error inside `try` and leaves the document, this refuses -- loudly,
+        // and never by writing.
+        (
+            r#"{"a":true}"#,
+            r"del(try (any and .a))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // `add` and `map(f)` navigate their source and backtrack it before they
+        // emit, so as `L` they leave `R` a register it can navigate; as `R`
+        // (run on an input that is not the register) their `.[]` is checked.
+        (r"[true]", r"del(add and .b?)", "[true]\n", "", 0),
+        (r"[[]]", r"del(add and .b?)", "[[]]\n", "", 0),
+        (r"[]", r"path(map(.) and .b?)", "", "", 0),
+        (
+            r#"{"a":true}"#,
+            r"del(.a and add)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[true]",
+            r"del(.[0] and map(.))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // A right operand wrapped in `?` -- a bare `(.a)?`, or a group of steps
+        // (`(.a | .b)?`) -- is pruned, not refused, when its first step fails on
+        // an untracked input: jq's `?` catches its own path error. On a value that
+        // may be the lost register that prune is a guess, and a guess is loud
+        // (found by the second review of #3456's PR: these printed the document).
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(flatten and (.a | .b)?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(flatten and (.a)?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"{}",
+            r"path(flatten and (.a | .b)?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(to_entries and (.a | .b)?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // Where the `(.a)?` step could never succeed on the value (`.a` over an
+        // array) there is nothing to guess: jq's `try` catches the path error
+        // it raises or never raises one, and either way the branch is empty and
+        // the document is echoed. Only the step that *could* succeed is a guess.
+        (r"[1]", r"del(flatten and (.a)?)", "[1]\n", "", 0),
+        (r"[1]", r"del(try (flatten and (.a)?))", "[1]\n", "", 0),
+        // A bare optional primitive (`.a?`, `.[]?`) is jq's `INDEX_OPT`, which
+        // suppresses a type error but not a path error, so on a value that may
+        // be the lost register its refusal is a guess even when the step could
+        // never succeed -- and a generator after it (`..`) goes on to a child
+        // where `.a?` succeeds, which is what a swallowing `try` or `?` hid.
+        (
+            r#"[{"a":1}]"#,
+            r"del(try (flatten and (.. | .a?)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del(try (sort and (.. | .a?)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del((flatten and (.. | .a?))?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // The same where the step could never succeed on the value (`.a` over an
+        // array, `.[0]` or a slice over an object): the step's own refusal is
+        // exact there, so it is the bare `?` that has to call it a guess. jq
+        // exits 5 on each -- the path error `INDEX_OPT` does not suppress -- and
+        // a `try` that swallowed it would print the document instead. The `1`
+        // is what makes them refuse in jq: without it jq answers (next rows).
+        (
+            r"[1]",
+            r"del(try (flatten and (.a?, 1)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(try (flatten and (.[0]?, 1)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(try (flatten and (.[1:2]?, 1)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // The boundary: with nothing after the `?` step jq answers, because
+        // `flatten` leaves the register where `.a?` can fail on a type error
+        // and be suppressed. The resolver cannot tell that from the register
+        // having moved, which jq refuses (the rows above), so it refuses --
+        // under `try` too. `main`'s by-value route answered these; the cost is
+        // the second residual in `limitations.md` (#3428), and lifting it needs
+        // `flatten` in `cannot_move_register`'s allowlist with its own rows.
+        (
+            r"[1]",
+            r"del(try (flatten and (.a?, empty)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(try (flatten and (.[0]?, empty)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // A builtin that leaves the register alone and is in
+        // `cannot_move_register`'s allowlist lets `R` navigate it (`has` is
+        // C-coded, its argument a subexp).
+        (r#"{"a":true}"#, r#"del(has("a") and .a)"#, "{}\n", "", 0),
+        // The boundary: `sort` is C-coded too and jq answers `[]`, but it is
+        // not in the allowlist, so `R`'s navigation is refused -- as `main`
+        // refused it, with "result true" -- until it gets its own oracle row.
+        (
+            r"[true]",
+            r"del(sort and .[0])",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+    ])
+}
+
+/// #3456: `range` and `paths` generate values without navigating, so jq's
+/// register stays where it entered and a later `$x` frozen there is still
+/// the register -- `path(. as $x | range(2) | $x)` is `[] []` and writes
+/// through it land. `range`'s one- and three-argument forms are jq-defined
+/// over `$param` bindings (an `as` source, a subexp), so even a navigating
+/// argument leaves the register alone; the two-argument form is C-coded with
+/// closure arguments run unwrapped, so `range(0; .a)` moves it. The parser
+/// spells `range(n)` as `range(0; n)`, so `range(.a)` -- which jq leaves
+/// alone -- is refused with the two-argument form's conservatism. Every row
+/// captured from jq 1.7.1 except that one, which is pinned as the current
+/// (refuse-only) behaviour so lifting it is a deliberate change.
+#[test]
+fn test_path_register_range_and_paths_do_not_move_it_3456() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | range(2) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":2}"#,
+            r"path(. as $x | range(.a; 0; -1) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":2}"#,
+            r"path(. as $x | range(0; 5; .a) | $x)",
+            "[]\n[]\n[]\n",
+            "",
+            0,
+        ),
+        (r#"{"a":1}"#, r"path(. as $x | paths | $x)", "[]\n", "", 0),
+        (
+            r#"{"a":[1,2]}"#,
+            r"path(. as $x | paths | $x)",
+            "[]\n[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(.a | . as $x | range(2) | $x)",
+            "[\"a\"]\n[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [range(2)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r#"{"a":1}"#, r"path(. as $x | [paths] | $x)", "[]\n", "", 0),
+        (r#"{"a":1}"#, r"del(. as $x | paths | $x)", "null\n", "", 0),
+        (
+            r#"{"a":1}"#,
+            r"(. as $x | range(2) | $x) |= 9",
+            "9\n",
+            "",
+            0,
+        ),
+        // The register did move: the two-argument form's navigating `to`.
+        (
+            r#"{"a":2}"#,
+            r"path(. as $x | range(0; .a) | $x)",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        // And a navigation after `range` is checked against a register that
+        // is not on `range`'s output.
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | range(2) | .a)",
+            "",
+            r#"near attempt to access element "a" of 0"#,
+            5,
+        ),
+        // jq answers `[] []` here; the parser's `range(0; n)` spelling cannot
+        // tell the one-argument form from the two-argument one.
+        (
+            r#"{"a":2}"#,
+            r"path(. as $x | range(.a) | $x)",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+    ])
+}
+
+/// #3456: `has(k)` is C-coded, and a C builtin's arguments are subexps, so
+/// even a navigating `k` leaves jq's register where it entered. Every row
+/// captured from jq 1.7.1.
+#[test]
+fn test_path_register_has_does_not_move_it_3456() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1}"#,
+            r#"path(. as $x | has("a") | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | has(.a | tostring) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"del(. as $x | has("a") | $x)"#,
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"path(. as $x | [has("a")] | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        // What #3267's tests used `has` to lose: jq keeps the register, so the
+        // frozen `$x` is still it and `del` lands -- or, for a `z` that is not
+        // there, jq's own caught error leaves the document alone.
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r#"del(. as $x | has("a") | try ($x | .a))"#,
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1}"#,
+            r#"del(.a as $y | has("z") | try ($y | .b))"#,
+            "{\"a\":{\"b\":1},\"k\":1}\n",
             "",
             0,
         ),
@@ -77767,7 +78268,7 @@ fn test_write_through_root_snapshot_after_subexp_stage_under_try_3186() -> Resul
 }
 
 /// #3267: inside `path()`/`del()`/assignment, a stage this resolver cannot
-/// see inside (`has`, `test`, a `reduce`, a `def` call, `//`, an array) loses
+/// see inside (`contains`, `test`, a `reduce`, a `def` call, `//`, an array) loses
 /// jq's path register, and a later `$x` frozen from it can no longer
 /// re-establish -- a refusal where jq may well answer. Under `try`/`?` that
 /// refusal used to be caught as though jq had raised it, so the write
@@ -77776,27 +78277,29 @@ fn test_write_through_root_snapshot_after_subexp_stage_under_try_3186() -> Resul
 /// register (a frozen `$x`, or `null`) after the register was lost is now
 /// uncatchable -- by the `try` beside it, by any `try` further out, and by a
 /// value-position `?` around the whole `del` -- so each is a loud exit 5
-/// instead (ADR-0018 rule 4).
+/// instead (ADR-0018 rule 4). The lossy stage was `has(k)` until #3456, which
+/// proved `has` leaves the register alone (`cannot_move_register`); `contains`
+/// is the same kind of C-coded boolean this resolver still cannot vouch for.
 #[test]
 fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
     for filter in [
-        r#"del(. as $x | has("a") | try ($x | .a))"#,
+        r#"del(. as $x | contains({"a":{}}) | try ($x | .a))"#,
         r#"del(. as $x | ("a"|test("a")) | try ($x | .a))"#,
-        r#"del(. as $x | has("a") | ($x | .a)?)"#,
-        r#"del(. as $x | has("a") | ($x.a)?)"#,
-        r#"del(. as $x | has("a") | try $x["a"])"#,
-        r#"del(. as $x | has("a") | try ($x | .[]))"#,
-        r#"del(. as $x | has("a") | "a" as $k | try ($x | .[$k]))"#,
-        r#"del(. as $x | has("a") | 0 as $i | try ($x | .l[$i:1]))"#,
-        r#"del(. as $x | has("a") | try ($x as {a:$q} | $q))"#,
-        r#"del(. as $x | has("a") | try ($x | .a) catch empty)"#,
-        r#"del(. as $x | has("a") | $x | try .a)"#,
-        r#"del(. as $x | has("a") | label $out | try ($x | .a))"#,
+        r#"del(. as $x | contains({"a":{}}) | ($x | .a)?)"#,
+        r#"del(. as $x | contains({"a":{}}) | ($x.a)?)"#,
+        r#"del(. as $x | contains({"a":{}}) | try $x["a"])"#,
+        r#"del(. as $x | contains({"a":{}}) | try ($x | .[]))"#,
+        r#"del(. as $x | contains({"a":{}}) | "a" as $k | try ($x | .[$k]))"#,
+        r#"del(. as $x | contains({"a":{}}) | 0 as $i | try ($x | .l[$i:1]))"#,
+        r#"del(. as $x | contains({"a":{}}) | try ($x as {a:$q} | $q))"#,
+        r#"del(. as $x | contains({"a":{}}) | try ($x | .a) catch empty)"#,
+        r#"del(. as $x | contains({"a":{}}) | $x | try .a)"#,
+        r#"del(. as $x | contains({"a":{}}) | label $out | try ($x | .a))"#,
         // The loss happens *inside* the `try`: its own frame predates it.
-        r#"del(try (. as $x | has("a") | $x | .a))"#,
-        r#"del((. as $x | has("a") | $x | .a)?)"#,
+        r#"del(try (. as $x | contains({"a":{}}) | $x | .a))"#,
+        r#"del((. as $x | contains({"a":{}}) | $x | .a)?)"#,
         // And a value-position `?` around the whole write catches nothing.
-        r#"[del(. as $x | has("a") | try ($x | .a))?]"#,
+        r#"[del(. as $x | contains({"a":{}}) | try ($x | .a))?]"#,
         r"del(. as $x | reduce (1) as $i (.; 5) | try ($x | .k))",
         r"del(. as $x | foreach (1) as $i (.; 5) | try ($x | .k))",
         r"del(. as $x | (.zz // 5) | try ($x | .k))",
@@ -77820,23 +78323,23 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
     // register was lost; after `.a` the register provably moved.
     for (filter, expected) in [
         (
-            r#"del(. as $x | has("a") | try (5 | .a))"#,
+            r#"del(. as $x | contains({"a":{}}) | try (5 | .a))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | try (.a))"#,
+            r#"del(. as $x | contains({"a":{}}) | try (.a))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | $x | try (5 | .a))"#,
+            r#"del(. as $x | contains({"a":{}}) | $x | try (5 | .a))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | $x | (5 | .a)?)"#,
+            r#"del(. as $x | contains({"a":{}}) | $x | (5 | .a)?)"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | $x | try ("s" | .a))"#,
+            r#"del(. as $x | contains({"a":{}}) | $x | try ("s" | .a))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
@@ -77844,15 +78347,15 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | try (5 | .[]))"#,
+            r#"del(. as $x | contains({"a":{}}) | try (5 | .[]))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | try ($x | if true then 5 | .a else . end))"#,
+            r#"del(. as $x | contains({"a":{}}) | try ($x | if true then 5 | .a else . end))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | try ($x | reduce (1) as $i (5; .a)))"#,
+            r#"del(. as $x | contains({"a":{}}) | try ($x | reduce (1) as $i (5; .a)))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
@@ -77867,43 +78370,43 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         // Where the register was lost is known, so a `$x` or `null` that is
         // not that value or inside it cannot be it: jq's refusal is exact.
         (
-            r#"del(. as $x | .a | has("b") | try ($x | .k))"#,
+            r#"del(. as $x | .a | contains({"b":1}) | try ($x | .k))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(.a.zz as $x | has("a") | try ($x | .q))"#,
+            r#"del(.a.zz as $x | contains({"a":{}}) | try ($x | .q))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(.a | has("b") | try (null | .x))"#,
+            r#"del(.a | contains({"b":1}) | try (null | .x))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (r"[path(.arr[0:1]? as $v0 | (abs?) | ($v0 | .b?)?)]", "[]"),
         (
-            r#"del(. as $x | has("a") | "a" as $k | try (5 | .[$k]))"#,
+            r#"del(. as $x | contains({"a":{}}) | "a" as $k | try (5 | .[$k]))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | try ({"z":1} as {a:$q} | $q))"#,
+            r#"del(. as $x | contains({"a":{}}) | try ({"z":1} as {a:$q} | $q))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         // A step jq fails with a type error wherever its register is -- an
         // object indexed by a number, iterating `null`, an array pattern
         // over an object -- is refused exactly, so caught as in jq.
         (
-            r#"del(. as $x | has("a") | try ($x | .[0]))"#,
+            r#"del(. as $x | contains({"a":{}}) | try ($x | .[0]))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | 0 as $i | try ($x | .[$i]))"#,
+            r#"del(. as $x | contains({"a":{}}) | 0 as $i | try ($x | .[$i]))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | try (null | .[]))"#,
+            r#"del(. as $x | contains({"a":{}}) | try (null | .[]))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (
-            r#"del(. as $x | has("a") | try ($x as [$q] | $q))"#,
+            r#"del(. as $x | contains({"a":{}}) | try ($x as [$q] | $q))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
         // #3263: nor does an array resolved live -- jq's collect backtracks
@@ -77930,9 +78433,9 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
     // at or inside the lost register that jq's register did *not* land on --
     // its refusal is exact and caught in jq 1.7.1, which prints the document
     // unchanged -- but this resolver cannot tell the stage that left the
-    // register alone (`has`) from one that moved it there (`first(.a)`), so
+    // register alone (`contains`) from one that moved it there (`first(.a)`), so
     // it refuses loudly rather than risk the silent loss above.
-    let filter = r#"del(.a as $y | has("z") | try ($y | .b))"#;
+    let filter = r#"del(.a as $y | contains({"z":1}) | try ($y | .b))"#;
     let (stdout, _stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
     assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
     Ok(())
@@ -86446,35 +86949,35 @@ fn test_frozen_source_through_a_composite_head_refuses_loudly_3334() -> Result<(
     for (doc, filter) in [
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | has("k") | try ($orig as {a:{b:$q}} | $q))"#,
+            r#"del(. as $orig | contains({"k":1}) | try ($orig as {a:{b:$q}} | $q))"#,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | has("k") | try (($orig,$orig) as {a:{b:$q}} | $q))"#,
+            r#"del(. as $orig | contains({"k":1}) | try (($orig,$orig) as {a:{b:$q}} | $q))"#,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | has("k") | try (($orig,1) as {a:{b:$q}} | $q))"#,
+            r#"del(. as $orig | contains({"k":1}) | try (($orig,1) as {a:{b:$q}} | $q))"#,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | has("k") | try (($orig,$orig) as $x | $x.a.b))"#,
+            r#"del(. as $orig | contains({"k":1}) | try (($orig,$orig) as $x | $x.a.b))"#,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | has("k") | try ((if true then $orig else $orig end) as {a:{b:$q}} | $q))"#,
+            r#"del(. as $orig | contains({"k":1}) | try ((if true then $orig else $orig end) as {a:{b:$q}} | $q))"#,
         ),
         (
             r#"{"a":{"b":1}}"#,
-            r#"del(. as $orig | has("k") | try (($orig // 1) as {a:{b:$q}} | $q))"#,
+            r#"del(. as $orig | contains({"k":1}) | try (($orig // 1) as {a:{b:$q}} | $q))"#,
         ),
         (
             r#"{"a":5}"#,
-            r#"[path(. as $orig | has("k") | try ($orig as {a:{b:$q}} | $q))]"#,
+            r#"[path(. as $orig | contains({"k":1}) | try ($orig as {a:{b:$q}} | $q))]"#,
         ),
         (
             r#"{"a":5}"#,
-            r#"[path(. as $orig | has("k") | try (($orig,$orig) as {a:{b:$q}} | $q))]"#,
+            r#"[path(. as $orig | contains({"k":1}) | try (($orig,$orig) as {a:{b:$q}} | $q))]"#,
         ),
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
@@ -86493,7 +86996,7 @@ fn test_frozen_source_through_a_composite_head_refuses_loudly_3334() -> Result<(
     let (out, stderr, code) = run_jq_full(
         &[
             "-c",
-            r#"[path(. as $orig | has("k") | $orig | try ((try error({"a":{"b":1}}) catch .) as {a:{b:$q}} | $q))]"#,
+            r#"[path(. as $orig | contains({"k":1}) | $orig | try ((try error({"a":{"b":1}}) catch .) as {a:{b:$q}} | $q))]"#,
         ],
         Some(r#"{"a":{"b":1}}"#),
     )?;
@@ -89809,6 +90312,70 @@ fn test_assign_rhs_is_lazy_on_the_generic_route_3448() -> Result<()> {
     assert_eq!(out, "[[1,\"b\"],[2,\"b\"]]\n[[1,\"2\"],[2,\"2\"]]\n");
     assert_eq!(err.matches("DEBUG").count(), 2, "stderr={err:?}");
     Ok(())
+}
+
+/// #3466 (kept reachable by #3428): the borrowed evaluator's destructuring
+/// bind registers each bound node as the generic evaluator's does, and the
+/// only programs in this suite that ran it were by-value `and`/`or`/minus
+/// operands that held a destructuring bind (`del(-(. as [$a] ?// $a | ..))`).
+/// #3428 made those operands resolve live, so what still reaches it is any
+/// other by-value evaluation in path position that holds one -- a `select`
+/// condition -- and these rows pin that it answers as jq does for an object
+/// pattern, an array pattern, a nested source and a `?//` alternative, in
+/// `path` and `del` alike (every row captured from jq 1.7.1).
+#[test]
+fn test_destructuring_bind_in_a_select_condition_answers_as_jq_3466() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1}"#,
+            r"path(select(. as {a:$v} | $v == 1))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(select(. as {a:$v} | $v == 2))",
+            "",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"path(select(. as [$x,$y] | $y == 2))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":3}}"#,
+            r"path(.a | select(. as {b:$z} | $z == 3))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(select(. as [$q] ?// {a:$q} | $q == 1))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(select(. as {a:$v} | $v == 1))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1},{"a":2}]"#,
+            r"del(.[] | select(. as {a:$v} | $v == 1))",
+            "[{\"a\":2}]\n",
+            "",
+            0,
+        ),
+    ])
 }
 
 /// #3466 controls: the walk mints identity only where the cursor proves the
