@@ -4680,7 +4680,7 @@ already an error — the pass only moves the error earlier and extends it to the
 rejects. `expand_func_calls`'s substitution model is unchanged; the programs it mis-resolves
 are now rejected before it runs.
 
-Two deliberate remainders:
+What remains, and what closed since:
 
 - **The reported line comes from the parser's own call-site table, with a text search only
   as the fallback.** `Expr::FuncCall` carries no source position, so
@@ -4713,7 +4713,8 @@ Two deliberate remainders:
   against jq. The attribution is by `origin`, not by searching text, so the same name
   unresolved in a module and in the main filter reports each at its own site, and a symlinked
   `-L` directory names the canonical target's file
-  ([#2866](https://github.com/rust-works/succinctly/issues/2866), pinned byte for byte by
+  ([#2866](https://github.com/rust-works/succinctly/issues/2866); the `include`d-module rows
+  are pinned byte for byte by
   `test_module_sourced_unresolved_call_report_is_byte_exact_2866`).
 - **Closed: a namespaced call (`ns::f`) no longer relies on a text search at all.**
   [#3010](https://github.com/rust-works/succinctly/issues/3010): `parse_namespaced_call`
@@ -4723,12 +4724,13 @@ Two deliberate remainders:
   or string literals — a coincidental earlier occurrence of the same spelling inside
   either would win over the real call. `parse_namespaced_call` now pushes its own
   `CallSite` under the joined `namespace::name` spelling, so the diagnostic is a direct
-  table lookup like any other call, the same fix #2085's own sibling gap would need for
-  plain identifiers.
-- **jq's trailing padding on the echoed source line is not reproduced exactly.** jq pads with
-  a `%*s` whose width follows the failing node's start column for a simple undefined name but
-  points elsewhere for an arity mismatch; succinctly reproduces the column rule. It is
-  trailing whitespace either way.
+  table lookup like any other call, as #2085 made it for plain identifiers.
+- **jq's trailing padding on the echoed source line matches in every shape measured, but
+  its rule is not one we have.** jq pads with a `%*s` whose width follows the failing node's
+  start column. An undefined name and an arity mismatch, in a module or the main filter,
+  bare or nested in a pipe, array or object, all match byte for byte, and
+  `test_module_sourced_unresolved_call_report_is_byte_exact_2866` pins the module rows. A
+  shape nobody measured could still differ; it is trailing whitespace either way.
 - **Closed: whitespace around `::` in a namespaced call (`mymod :: func`) is
   now a syntax error, matching both reference tools.**
   [#3116](https://github.com/rust-works/succinctly/issues/3116) removed the

@@ -51046,6 +51046,7 @@ fn test_module_diagnostic_occurrence_counting_is_arity_aware_3109() -> Result<()
 /// error there and succinctly more (#3391), and a test here must not freeze
 /// that divergence.
 #[test]
+#[cfg(unix)]
 fn test_module_sourced_unresolved_call_report_is_byte_exact_2866() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let dir = std::fs::canonicalize(temp_dir.path())?;
@@ -51053,7 +51054,6 @@ fn test_module_sourced_unresolved_call_report_is_byte_exact_2866() -> Result<()>
     std::fs::write(dir.join("arity.jq"), "def f(x): x;\ndef g: f(1;2;3);\n")?;
     std::fs::create_dir(dir.join("real"))?;
     std::fs::write(dir.join("real").join("bad_call.jq"), "def h: nosuch;\n")?;
-    #[cfg(unix)]
     std::os::unix::fs::symlink(dir.join("real"), dir.join("link"))?;
 
     // The line jq echoes under an error: the source line, then one space per
@@ -51097,7 +51097,6 @@ fn test_module_sourced_unresolved_call_report_is_byte_exact_2866() -> Result<()>
         ),
     ];
     let link = dir.join("link");
-    #[cfg(unix)]
     rows.push((
         &link,
         r#"include "bad_call"; h"#,
