@@ -1820,6 +1820,13 @@ pub struct KeyMeta {
 /// (`yq -P` keeps `"1": 3`, where a plain key `1: 3` is an integer).
 pub const KEY_STYLE_STRING: &str = "string";
 
+/// The value style for a string whose quoting `-P` stripped (#3614).
+///
+/// The same fact [`KEY_STYLE_STRING`] records for a key. The tree does not hold the text, so a
+/// string a YAML document would read as another type once plain (`2001-12-14`, `1_000`, `0b11`,
+/// `<<`) has to be told from a plain scalar of that type, which stays bare.
+pub const VALUE_STYLE_STRING: &str = "string";
+
 impl KeyMeta {
     /// A key with a trailing comment and/or a quoted style, or `None` for a
     /// key with neither - the one place that decides whether a key earns an
@@ -1849,6 +1856,11 @@ impl KeyMeta {
             value_absent,
             if keep_style { self.style } else { "" },
         )
+    }
+
+    /// Whether the source quoted this key (`"single"` or `"double"`), not yet stripped by `-P`.
+    pub fn is_quoted(&self) -> bool {
+        matches!(self.style, "single" | "double")
     }
 
     /// This entry with its quoting stripped to [`KEY_STYLE_STRING`] (`-P`).

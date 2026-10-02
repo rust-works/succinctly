@@ -20,7 +20,7 @@ use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
     check_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
     to_owned_cursor as generic_to_owned_cursor, to_owned_with_comments, AnchorMark, CommentTree,
-    GenericResult, NodeMeta, KEY_STYLE_STRING,
+    GenericResult, NodeMeta, KEY_STYLE_STRING, VALUE_STYLE_STRING,
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
@@ -4213,8 +4213,8 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // of every node, not the tree shape.
     if strip_style {
         if let Ok(docs) = &mut docs {
-            for (_value, comments) in docs.iter_mut() {
-                *comments = strip_presentation_style(comments);
+            for (value, comments) in docs.iter_mut() {
+                *comments = strip_presentation_style(value, comments);
             }
         }
     }
@@ -4250,8 +4250,19 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
 /// `a: &x 1\nb: *x\n` still prints `a: &x 1\nb: *x` (verified against the
 /// pinned binary). `-P` is documented as `... style = ""`, and anchor/alias
 /// syntax is identity, not style (#763).
-fn strip_presentation_style(tree: &CommentTree) -> CommentTree {
-    strip_presentation_style_at_depth(tree, 0)
+fn strip_presentation_style(value: &OwnedValue, tree: &CommentTree) -> CommentTree {
+    strip_presentation_style_at_depth(value, tree, 0)
+}
+
+/// Whether yq's encoder keeps a *quoted* string quoted under `-P` (#3614): the YAML 1.1 bool
+/// spellings, in any case (`y`, `Yes`, `ON`, `nO`, ...). `-P` strips every other quoted string to
+/// plain unless plain would read back as another type; for these it writes the source's own
+/// quote style back (`"yes"` stays double, `'on'` stays single), where a plain `off` stays
+/// plain. Captured against yq v4.53.3 over 38 spellings in each source style.
+fn is_yaml_11_bool_word(text: &str) -> bool {
+    ["y", "yes", "n", "no", "on", "off"]
+        .iter()
+        .any(|word| text.eq_ignore_ascii_case(word))
 }
 
 /// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
@@ -4260,29 +4271,83 @@ fn strip_presentation_style(tree: &CommentTree) -> CommentTree {
 /// guard at all. Currently only fed an already-reconciled/bounded tree,
 /// so this is defense-in-depth against that call chain changing, not a
 /// currently-live independent crash path.
-fn strip_presentation_style_at_depth(tree: &CommentTree, depth: usize) -> CommentTree {
+///
+/// Walks `value` alongside `tree` (#3614): a node's quoting is kept when its string is a YAML 1.1
+/// bool spelling ([`is_yaml_11_bool_word`]), which the tree alone cannot say. A `value` that does
+/// not match the tree's shape contributes `null`, so the node's style is stripped as before.
+fn strip_presentation_style_at_depth(
+    value: &OwnedValue,
+    tree: &CommentTree,
+    depth: usize,
+) -> CommentTree {
     assert_value_tree_depth(depth);
-    let meta = tree.meta().with_style("");
+    // A quoted string keeps its quoting when yq's encoder would (a YAML 1.1 bool spelling), and
+    // is otherwise remembered as a string, so a spelling that reads back as a timestamp or a
+    // number once plain is quoted rather than echoed bare (#3614).
+    let kept_quote = |text: &str, style: &'static str| match style {
+        "single" | "double" if is_yaml_11_bool_word(text) => style,
+        "single" | "double" => VALUE_STYLE_STRING,
+        _ => "",
+    };
     match tree {
-        CommentTree::Leaf(_) => CommentTree::Leaf(meta),
-        CommentTree::Array(_, items) => CommentTree::Array(
-            meta,
-            items
-                .iter()
-                .map(|v| strip_presentation_style_at_depth(v, depth + 1))
-                .collect(),
-        ),
-        CommentTree::Object(_, fields, key_comments) => CommentTree::Object(
-            meta,
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), strip_presentation_style_at_depth(v, depth + 1)))
-                .collect(),
-            key_comments
-                .iter()
-                .map(|(k, meta)| (k.clone(), meta.with_style_stripped()))
-                .collect(),
-        ),
+        CommentTree::Leaf(meta) => {
+            let style = match value {
+                OwnedValue::String(text) => kept_quote(text, tree.style()),
+                _ => "",
+            };
+            CommentTree::Leaf(meta.with_style(style))
+        }
+        CommentTree::Array(meta, items) => {
+            let elements = match value {
+                OwnedValue::Array(elements) => Some(elements),
+                _ => None,
+            };
+            CommentTree::Array(
+                meta.with_style(""),
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let child = elements.and_then(|e| e.get(i)).unwrap_or(&OwnedValue::Null);
+                        strip_presentation_style_at_depth(child, v, depth + 1)
+                    })
+                    .collect(),
+            )
+        }
+        CommentTree::Object(meta, fields, key_comments) => {
+            let members = match value {
+                OwnedValue::Object(members) => Some(members),
+                _ => None,
+            };
+            CommentTree::Object(
+                meta.with_style(""),
+                fields
+                    .iter()
+                    .map(|(k, v)| {
+                        let child = members.and_then(|m| m.get(k)).unwrap_or(&OwnedValue::Null);
+                        (
+                            k.clone(),
+                            strip_presentation_style_at_depth(child, v, depth + 1),
+                        )
+                    })
+                    .collect(),
+                key_comments
+                    .iter()
+                    .map(|(k, key_meta)| {
+                        // A quoted key spelled as a YAML 1.1 bool keeps its quoting too.
+                        let kept = key_meta.is_quoted() && is_yaml_11_bool_word(k);
+                        (
+                            k.clone(),
+                            if kept {
+                                key_meta.clone()
+                            } else {
+                                key_meta.with_style_stripped()
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        }
     }
 }
 
@@ -5380,7 +5445,8 @@ fn can_single_quote(s: &str) -> bool {
 /// Any other style (`""`, `"flow"`, `"literal"`, `"folded"` — the last two
 /// are block-scalar styles this DOM writer doesn't reproduce; see
 /// `CommentTree`'s own doc comment) falls back to the plain heuristic
-/// unchanged.
+/// unchanged; so does [`VALUE_STYLE_STRING`] (`-P`'s "a quoted string, quoting stripped", #3614),
+/// as a string known not to be a plain scalar of another type.
 fn yaml_quote_string_with_style(s: &str, style: &str, in_flow: bool, json_sourced: bool) -> String {
     // No empty-string special case needed here (unlike `yaml_quote_string`
     // below): every arm already renders `""` correctly on its own -
@@ -5400,8 +5466,17 @@ fn yaml_quote_string_with_style(s: &str, style: &str, in_flow: bool, json_source
         // bare and chose single or double quotes by a different rule. What it declines (a
         // line break, which go-yaml writes as a block scalar, or a YAML plain scalar yq
         // types as a timestamp or `1_000`) keeps the old text.
-        _ => go_yaml_dom_scalar(s, in_flow, json_sourced, false)
-            .unwrap_or_else(|| yaml_quote_string(s)),
+        //
+        // #3614: a quoted string `-P` stripped ([`VALUE_STYLE_STRING`]) is known to be a string, so
+        // it is written as a JSON-sourced one is: plain unless that would read back as another
+        // type (a timestamp, `1_000`).
+        _ => go_yaml_dom_scalar(
+            s,
+            in_flow,
+            json_sourced || style == VALUE_STYLE_STRING,
+            false,
+        )
+        .unwrap_or_else(|| yaml_quote_string(s)),
     }
 }
 
@@ -9468,6 +9543,75 @@ mod tests {
         t
     }
 
+    /// #3614: `-P` keeps the quoting of a string yq's encoder keeps quoted -- a YAML 1.1 bool
+    /// spelling, in any case -- and remembers every other quoted string as a string, so one that
+    /// reads as a timestamp or a number once plain is quoted. Plain scalars and non-strings
+    /// carry no style.
+    #[test]
+    fn strip_presentation_style_keeps_bool_word_quotes_and_remembers_strings_3614() {
+        for word in [
+            "y", "Y", "yes", "Yes", "YES", "n", "No", "on", "ON", "off", "oFf", "yEs",
+        ] {
+            assert!(is_yaml_11_bool_word(word), "{word}");
+        }
+        for word in ["t", "f", "true", "null", "yesno", "", "ye", "of", "1"] {
+            assert!(!is_yaml_11_bool_word(word), "{word}");
+        }
+
+        let leaf =
+            |style: &'static str| CommentTree::Leaf(NodeMeta::from_comment_and_style(None, style));
+        let string = |s: &str| OwnedValue::String(s.to_string().into());
+        let style_of = |value: &OwnedValue, style: &'static str| {
+            strip_presentation_style(value, &leaf(style)).style()
+        };
+        assert_eq!(style_of(&string("yes"), "double"), "double");
+        assert_eq!(style_of(&string("On"), "single"), "single");
+        assert_eq!(
+            style_of(&string("2001-12-14"), "double"),
+            VALUE_STYLE_STRING
+        );
+        assert_eq!(style_of(&string("a"), "single"), VALUE_STYLE_STRING);
+        // Plain, and not a string: nothing to remember.
+        assert_eq!(style_of(&string("yes"), ""), "");
+        assert_eq!(style_of(&OwnedValue::Int(1), "double"), "");
+        // A value that does not match the tree's shape is read as `null`.
+        let mismatched = CommentTree::Array(
+            NodeMeta::from_comment_and_style(None, "flow"),
+            vec![leaf("double")],
+        );
+        let stripped = strip_presentation_style(&string("x"), &mismatched);
+        assert_eq!(stripped.style(), "");
+        assert_eq!(stripped.at_index(0).style(), "");
+
+        // Keys: a quoted bool spelling keeps its style, any other quoted key is a string.
+        let mut fields = IndexMap::new();
+        fields.insert("on".to_string(), leaf(""));
+        fields.insert("a".to_string(), leaf(""));
+        fields.insert("n".to_string(), leaf(""));
+        let mut keys = IndexMap::new();
+        keys.insert(
+            "on".to_string(),
+            succinctly::jq::eval_generic::KeyMeta::new(None, false, "single").unwrap(),
+        );
+        keys.insert(
+            "a".to_string(),
+            succinctly::jq::eval_generic::KeyMeta::new(None, false, "double").unwrap(),
+        );
+        let tree = CommentTree::Object(NodeMeta::empty(), fields, keys);
+        let value = OwnedValue::Object(
+            IndexMap::from([
+                ("on".to_string(), OwnedValue::Int(1)),
+                ("a".to_string(), OwnedValue::Int(2)),
+                ("n".to_string(), OwnedValue::Int(3)),
+            ])
+            .into(),
+        );
+        let stripped = strip_presentation_style(&value, &tree);
+        assert_eq!(stripped.key_style("on"), "single");
+        assert_eq!(stripped.key_style("a"), KEY_STYLE_STRING);
+        assert_eq!(stripped.key_style("n"), "");
+    }
+
     /// #1017: `strip_presentation_style` had no guard, reachable on a
     /// `CommentTree` built up alongside a computed value with no live
     /// document cursor behind it.
@@ -9476,11 +9620,11 @@ mod tests {
         use succinctly::jq::MAX_VALUE_TREE_DEPTH;
 
         let under = linear_comment_tree_nest(MAX_VALUE_TREE_DEPTH - 1);
-        let _ = strip_presentation_style(&under);
+        let _ = strip_presentation_style(&OwnedValue::Null, &under);
 
         let over = linear_comment_tree_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            strip_presentation_style(&over)
+            strip_presentation_style(&OwnedValue::Null, &over)
         }));
         assert!(
             result.is_err(),
