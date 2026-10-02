@@ -422,6 +422,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: the compile-error report lists every directive failure jq's walk reaches, with its count**
+  (#3573, after #3327). jq walks a program's `include`/`import` directives last-declared first, and
+  a module's own directives the same way, and prints each failure it reaches: a data file that does
+  not load and a module that does not parse are counted and the walk goes on, a missing module stops
+  its level and returns `1` for it, and a module is reached once. `include "synerr"; import "bad"
+  as $d; $d` is the data error, the syntax error and `2 compile errors`; a module whose own data
+  imports fail reports each of them; a module that includes a missing module, beside a failing data
+  import, is `2 compile errors`. succinctly reported the first failure its loader stopped at, which
+  differed from jq on 27 of 42 hand-picked directive combinations; it now matches on the kind,
+  order and count of every failure, in those and in a 1,500-program random sweep of module, data
+  and nested-module combinations. A module that exists but cannot be read is counted like a data
+  file and the walk goes on, as in jq (it used to stop the report with a bare `module error`, and to
+  hide a later-declared missing module jq reports). A module cycle (jq overflows its stack there,
+  #2865) ends the walk, prints what jq printed before it died, and names the first cycle in jq's
+  walk order. The wording of a syntax error and of a data file's parse failure is still
+  succinctly's own.
+
 - **jq: `error(empty)` yields nothing instead of raising `no value`** (#3488). jq's `error(msg)` is
   `msg | error`, so it runs once per output of `msg`: a message that produces nothing raises
   nothing, and `[error(empty), 1]` is `[1]`, `try error(empty) catch .` prints nothing and

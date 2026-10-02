@@ -28420,34 +28420,99 @@ fn test_data_import_failures_are_reported_around_a_missing_module_3327() -> Resu
     Ok(())
 }
 
-/// #3327 scope guard: a stop that is not a missing module keeps the single
-/// report it had. jq goes on past a module's own syntax error and counts it
-/// (`include "synerr"; import "bad" as $d; $d` prints the data error, then the
-/// syntax error, `2 compile errors`), and its module cycle is #2865's
-/// divergence, so a data import declared after either is not reported yet --
-/// recorded in `limitations.md`, pinned here so it changes on purpose.
-#[test]
-fn test_data_import_failure_after_a_syntax_error_or_cycle_is_not_reported_yet_3327() -> Result<()> {
-    let temp_dir = tempfile::tempdir()?;
-    std::fs::write(temp_dir.path().join("bad.json"), "not json")?;
-    std::fs::write(temp_dir.path().join("synerr.jq"), "def f: 1 +;\n")?;
-    std::fs::write(
-        temp_dir.path().join("cyc1.jq"),
-        "include \"cyc2\"; def a: 1;\n",
-    )?;
-    std::fs::write(
-        temp_dir.path().join("cyc2.jq"),
-        "include \"cyc1\"; def b: 1;\n",
-    )?;
-
-    for (filter, reported) in [
-        (r#"include "synerr"; import "bad" as $d; $d"#, "synerr.jq"),
+/// The fixtures every #3573 row runs against: `bad` and `bad2` are data files
+/// holding `not json`; `synerr` and `synerr2` are modules that do not parse;
+/// `modbad1`/`modbad2` are modules whose own data imports fail; `modsyn`
+/// includes `synerr`; `modmiss` and `modsyn2` include missing modules;
+/// `cyc1`/`cyc2` include each other and `self1`/`self2` each include
+/// themselves; `badutf` is not valid UTF-8. `m1` and `m2` are absent.
+fn write_directive_fixtures_3573(dir: &std::path::Path) -> Result<()> {
+    for (name, text) in [
+        ("bad.json", "not json"),
+        ("bad2.json", "not json"),
+        ("synerr.jq", "def f: 1 +;\n"),
+        ("synerr2.jq", "def h: 2 *;\n"),
+        ("modok.jq", "def g: 1;\n"),
+        ("modbad1.jq", "import \"bad\" as $x; def g: 1;\n"),
         (
-            r#"include "cyc1"; import "bad" as $d; $d"#,
-            "module cycle detected: cyc1 -> cyc2 -> cyc1",
+            "modbad2.jq",
+            "import \"bad\" as $x; import \"bad2\" as $y; def g: 1;\n",
+        ),
+        ("modsyn.jq", "include \"synerr\"; def g: 1;\n"),
+        ("modmiss.jq", "include \"m1\"; def g: 1;\n"),
+        ("useboth1.jq", "include \"modbad1\"; def k: 1;\n"),
+        (
+            "modnest.jq",
+            "import \"modbad1\" as q; import \"bad2\" as $w; def y: 1;\n",
+        ),
+        (
+            "modsyn2.jq",
+            "include \"synerr2\"; include \"m2\"; def z: 1;\n",
+        ),
+        ("cyc1.jq", "include \"cyc2\"; def a: 1;\n"),
+        ("cyc2.jq", "include \"cyc1\"; def b: 1;\n"),
+        ("self1.jq", "include \"self1\"; def s1: 1;\n"),
+        ("self2.jq", "include \"self2\"; def s2: 1;\n"),
+        (
+            "twoself.jq",
+            "include \"self1\"; include \"self2\"; def t: 1;\n",
         ),
     ] {
-        let (output, code) = spawn_with_signal_retry(
+        std::fs::write(dir.join(name), text)?;
+    }
+    // A module the reader refuses whatever the platform or the user running it.
+    std::fs::write(dir.join("badutf.jq"), [0xff_u8, 0xfe, b' ', b'1', b'\n'])?;
+    Ok(())
+}
+
+/// Reduce a compile-error report to the kinds of failure it lists and its
+/// trailer: `D:<file>` a data file that did not load, `S:<file>` a module that
+/// did not parse, `M:<module>` a module that was not found, `C` a module
+/// cycle, `T:<n>` the `n compile errors` trailer. The wording of a data-file or
+/// syntax error is succinctly's own (`limitations.md`), so a row compares the
+/// kinds and their order, which is what jq's walk decides.
+fn failure_kinds_3573(stderr: &str) -> String {
+    let file_name = |path: &str| {
+        std::path::Path::new(path)
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+    };
+    let mut kinds = Vec::new();
+    for line in stderr.lines() {
+        if let Some(rest) = line.strip_prefix("jq: error loading data file ") {
+            // A data file ends `.json`, an unreadable module `.jq`.
+            let end = [".json: ", ".jq: "]
+                .iter()
+                .filter_map(|ext| rest.find(ext).map(|at| at + ext.len() - 2))
+                .min()
+                .unwrap_or(rest.len());
+            kinds.push(format!("D:{}", file_name(&rest[..end])));
+        } else if let Some(module) = line.strip_prefix("jq: error: module not found: ") {
+            kinds.push(format!("M:{module}"));
+        } else if line.starts_with("jq: error: module cycle detected: ") {
+            kinds.push("C".to_string());
+        } else if let Some((_, rest)) = line
+            .strip_prefix("jq: error: ")
+            .and_then(|l| l.rsplit_once(" at "))
+        {
+            if let Some((path, _)) = rest.split_once(", line ") {
+                kinds.push(format!("S:{}", file_name(path)));
+            }
+        } else if let Some(count) = line
+            .strip_prefix("jq: ")
+            .and_then(|l| l.split_once(" compile error"))
+        {
+            kinds.push(format!("T:{}", count.0));
+        }
+    }
+    kinds.join(" ")
+}
+
+fn assert_directive_rows_3573(rows: &[(&str, &str)], code: i32) -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    write_directive_fixtures_3573(temp_dir.path())?;
+    for (filter, expected) in rows {
+        let (output, got) = spawn_with_signal_retry(
             || {
                 let mut command = Command::new(succinctly_bin());
                 command
@@ -28459,17 +28524,318 @@ fn test_data_import_failure_after_a_syntax_error_or_cycle_is_not_reported_yet_33
             None,
         )?;
         let stderr = String::from_utf8(output.stderr)?;
-        assert_eq!(code, 3, "{filter}: stderr {stderr:?}");
-        assert!(stderr.contains(reported), "{filter}: stderr {stderr:?}");
-        assert!(
-            !stderr.contains("error loading data file"),
-            "{filter}: stderr {stderr:?}"
-        );
-        assert!(
-            stderr.ends_with("jq: 1 compile error\n"),
+        assert_eq!(got, code, "{filter}: stderr {stderr:?}");
+        assert_eq!(
+            failure_kinds_3573(&stderr),
+            *expected,
             "{filter}: stderr {stderr:?}"
         );
     }
+    Ok(())
+}
+
+/// #3573: a program whose directives do not all load reports every failure
+/// jq's walk reaches, in its order, with its count -- not the first one the
+/// loader stops at. jq walks the directives **last-declared first**, and a
+/// module's own directives the same way one level down: a data file that does
+/// not load and a module that does not parse are printed and *counted* while
+/// the walk goes on (a module that does not parse skips its own directives); a
+/// missing module stops its level and returns `1` for it, discarding what the
+/// level had counted, and the level above adds that `1` to its own; a module
+/// is reached once, failed or not, while a data file imported twice is reported
+/// twice. #3327 had left the syntax-error and module-level shapes out on
+/// purpose; a module's own data imports and a module that includes a missing
+/// module are the same walk one level down.
+///
+/// Every row's expectation was captured from `/usr/bin/jq` 1.7.1 (kinds and
+/// order; see [`failure_kinds_3573`]), and `main` differed from it on 27 of
+/// the 42 rows the first group below came from.
+#[test]
+fn test_directive_failures_are_reported_in_jqs_walk_order_3573() -> Result<()> {
+    assert_directive_rows_3573(
+        &[
+            // the issue's rows
+            (
+                r#"include "synerr"; import "bad" as $d; $d"#,
+                "D:bad.json S:synerr.jq T:2",
+            ),
+            (
+                r#"import "bad" as $d; include "synerr"; $d"#,
+                "S:synerr.jq D:bad.json T:2",
+            ),
+            (
+                r#"include "synerr"; import "bad" as $d; import "bad2" as $e; $d"#,
+                "D:bad2.json D:bad.json S:synerr.jq T:3",
+            ),
+            (
+                r#"import "modbad2" as m; import "bad" as $d; m::g"#,
+                "D:bad.json D:bad2.json D:bad.json T:3",
+            ),
+            // syntax error alone, and two of them
+            (r#"include "synerr"; 1"#, "S:synerr.jq T:1"),
+            (
+                r#"include "synerr"; include "synerr2"; 1"#,
+                "S:synerr2.jq S:synerr.jq T:2",
+            ),
+            (r#"import "synerr" as s; 1"#, "S:synerr.jq T:1"),
+            (
+                r#"import "synerr" as s; import "synerr2" as t; 1"#,
+                "S:synerr2.jq S:synerr.jq T:2",
+            ),
+            // syntax error with a missing module
+            (r#"include "synerr"; include "m1"; 1"#, "M:m1 T:1"),
+            (
+                r#"include "m1"; include "synerr"; 1"#,
+                "S:synerr.jq M:m1 T:1",
+            ),
+            (r#"import "synerr" as s; include "m1"; 1"#, "M:m1 T:1"),
+            (
+                r#"include "m1"; import "synerr" as s; 1"#,
+                "S:synerr.jq M:m1 T:1",
+            ),
+            (
+                r#"include "synerr"; include "m1"; import "bad" as $d; $d"#,
+                "D:bad.json M:m1 T:1",
+            ),
+            (
+                r#"include "m1"; include "synerr"; import "bad" as $d; $d"#,
+                "D:bad.json S:synerr.jq M:m1 T:1",
+            ),
+            (
+                r#"import "bad" as $d; include "synerr"; include "m1"; $d"#,
+                "M:m1 T:1",
+            ),
+            (
+                r#"import "bad" as $d; include "m1"; include "synerr"; $d"#,
+                "S:synerr.jq M:m1 T:1",
+            ),
+            // syntax error and data errors, mixed orders
+            (
+                r#"import "bad" as $d; import "bad2" as $e; include "synerr"; $d"#,
+                "S:synerr.jq D:bad2.json D:bad.json T:3",
+            ),
+            (
+                r#"include "synerr"; import "bad" as $d; include "synerr2"; $d"#,
+                "S:synerr2.jq D:bad.json S:synerr.jq T:3",
+            ),
+            (
+                r#"include "synerr"; include "synerr2"; import "bad" as $d; $d"#,
+                "D:bad.json S:synerr2.jq S:synerr.jq T:3",
+            ),
+            (
+                r#"import "bad" as $d; include "synerr"; import "bad2" as $e; $d"#,
+                "D:bad2.json S:synerr.jq D:bad.json T:3",
+            ),
+            // a module's own data imports
+            (r#"import "modbad1" as m; 1"#, "D:bad.json T:1"),
+            (r#"import "modbad2" as m; 1"#, "D:bad2.json D:bad.json T:2"),
+            (r#"include "modbad2"; 1"#, "D:bad2.json D:bad.json T:2"),
+            (
+                r#"include "modbad2"; import "bad" as $d; $d"#,
+                "D:bad.json D:bad2.json D:bad.json T:3",
+            ),
+            (
+                r#"import "bad" as $d; include "modbad2"; $d"#,
+                "D:bad2.json D:bad.json D:bad.json T:3",
+            ),
+            (
+                r#"include "modbad1"; include "modbad2"; 1"#,
+                "D:bad2.json D:bad.json D:bad.json T:3",
+            ),
+            // an unreadable module behind a missing one is never reached, as in jq
+            (r#"include "badutf"; include "m1"; 1"#, "M:m1 T:1"),
+            // a module whose own include has a syntax error
+            (r#"include "modsyn"; 1"#, "S:synerr.jq T:1"),
+            (r#"import "modsyn" as m; 1"#, "S:synerr.jq T:1"),
+            (
+                r#"include "modsyn"; import "bad" as $d; $d"#,
+                "D:bad.json S:synerr.jq T:2",
+            ),
+            // a module that includes a missing module
+            (r#"include "modmiss"; 1"#, "M:m1 T:1"),
+            (
+                r#"include "modmiss"; import "bad" as $d; $d"#,
+                "D:bad.json M:m1 T:2",
+            ),
+            (
+                r#"import "bad" as $d; include "modmiss"; $d"#,
+                "M:m1 D:bad.json T:2",
+            ),
+            // a module with data errors plus a missing module
+            (r#"import "modbad2" as m; include "m1"; 1"#, "M:m1 T:1"),
+            (
+                r#"include "m1"; import "modbad2" as m; 1"#,
+                "D:bad2.json D:bad.json M:m1 T:1",
+            ),
+            // controls: the #3327 rows, which must not change
+            (
+                r#"include "m1"; import "bad" as $d; $d"#,
+                "D:bad.json M:m1 T:1",
+            ),
+            (r#"import "bad" as $d; include "m1"; $d"#, "M:m1 T:1"),
+            (
+                r#"import "bad" as $d; import "bad2" as $e; $d"#,
+                "D:bad2.json D:bad.json T:2",
+            ),
+            (r#"include "m1"; include "m2"; 1"#, "M:m2 T:1"),
+            (
+                r#"include "synerr"; import "synerr" as s; 1"#,
+                "S:synerr.jq T:1",
+            ),
+            (
+                r#"include "modbad1"; import "modbad1" as m; 1"#,
+                "D:bad.json T:1",
+            ),
+            (
+                r#"include "useboth1"; include "modbad1"; 1"#,
+                "D:bad.json T:1",
+            ),
+            (
+                r#"include "modmiss"; import "modmiss" as m; import "bad" as $d; $d"#,
+                "D:bad.json M:m1 T:2",
+            ),
+            (
+                r#"import "bad" as $d; import "bad" as $e; import "bad" as $f; $d"#,
+                "D:bad.json D:bad.json D:bad.json T:3",
+            ),
+            (r#"include "modnest"; 1"#, "D:bad2.json D:bad.json T:2"),
+            (r#"include "modsyn2"; 1"#, "M:m2 T:1"),
+            (
+                r#"include "modok"; include "modok"; import "bad" as $d; $d"#,
+                "D:bad.json T:1",
+            ),
+        ],
+        3,
+    )
+}
+
+/// #3573: a module cycle is #2865's divergence -- real jq runs out of stack
+/// (exit 139) and prints only what its walk reached first -- so succinctly
+/// ends its walk at the cycle the way a missing module does: what jq printed
+/// before it died, in jq's order, then the cycle and `1 compile error`. The
+/// row `include "cyc1"; import "bad" as $d; $d` prints jq's `bad` first (jq's
+/// own output, before the crash), `include "cyc1"; include "synerr"; 1` jq's
+/// `synerr`, and a cycle with nothing before it prints the cycle alone, as it
+/// always did.
+#[test]
+fn test_a_module_cycle_ends_the_walk_after_what_jq_printed_first_3573() -> Result<()> {
+    assert_directive_rows_3573(
+        &[
+            (r#"include "cyc1"; 1"#, "C T:1"),
+            (r#"import "bad" as $d; include "cyc1"; $d"#, "C T:1"),
+            (
+                r#"include "cyc1"; import "bad" as $d; $d"#,
+                "D:bad.json C T:1",
+            ),
+            (
+                r#"include "cyc1"; include "synerr"; 1"#,
+                "S:synerr.jq C T:1",
+            ),
+        ],
+        3,
+    )
+}
+
+/// #3573: a module that exists but cannot be read is counted like a data file
+/// that did not load, and jq's walk goes on past it: `include "m1"; include
+/// "perm"` with `perm.jq` unreadable prints `error loading data file ...
+/// perm.jq`, then `module not found: m1`, `1 compile error`. It used to stop the
+/// whole report with a bare `module error`, and to hide a later-declared missing
+/// module jq reports (`include "perm"; include "m1"`). Every expectation but
+/// the invalid-UTF-8 rows' kind was captured from `/usr/bin/jq` 1.7.1: jq
+/// parses a module's raw bytes, so there `badutf.jq` is a syntax error (`S`),
+/// where succinctly's reader refuses it (`D`); the count and the walk are
+/// jq's. The permission rows need a user the permission bits bind, so they are
+/// skipped where `chmod 000` still reads (root).
+#[test]
+fn test_an_unreadable_module_is_counted_and_the_walk_goes_on_3573() -> Result<()> {
+    assert_directive_rows_3573(
+        &[
+            (r#"include "badutf"; 1"#, "D:badutf.jq T:1"),
+            (
+                r#"include "m1"; include "badutf"; 1"#,
+                "D:badutf.jq M:m1 T:1",
+            ),
+            (
+                r#"include "badutf"; import "bad" as $d; $d"#,
+                "D:bad.json D:badutf.jq T:2",
+            ),
+        ],
+        3,
+    )?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir()?;
+        write_directive_fixtures_3573(temp_dir.path())?;
+        let perm = temp_dir.path().join("perm.jq");
+        std::fs::write(&perm, "def p: 1;\n")?;
+        std::fs::set_permissions(&perm, std::fs::Permissions::from_mode(0o000))?;
+        if std::fs::read_to_string(&perm).is_ok() {
+            eprintln!("skipped: chmod 000 does not bind this user");
+            return Ok(());
+        }
+        for (filter, expected) in [
+            (r#"include "perm"; 1"#, "D:perm.jq T:1"),
+            (r#"include "m1"; include "perm"; 1"#, "D:perm.jq M:m1 T:1"),
+            (r#"include "perm"; include "m1"; 1"#, "M:m1 T:1"),
+            (
+                r#"import "bad" as $d; include "perm"; $d"#,
+                "D:perm.jq D:bad.json T:2",
+            ),
+        ] {
+            let (output, code) = spawn_with_signal_retry(
+                || {
+                    let mut command = Command::new(succinctly_bin());
+                    command
+                        .args(["jq", "-L"])
+                        .arg(temp_dir.path())
+                        .args(["-nc", filter]);
+                    command
+                },
+                None,
+            )?;
+            let stderr = String::from_utf8(output.stderr)?;
+            assert_eq!(code, 3, "{filter}: stderr {stderr:?}");
+            assert_eq!(
+                failure_kinds_3573(&stderr),
+                expected,
+                "{filter}: stderr {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3573: which cycle is named follows jq's walk order, last-declared first.
+/// `twoself.jq` includes two modules that each include themselves; jq would
+/// recurse into the *last-declared* one first, so that is the cycle reported
+/// (`self2 -> self2`). The loader's own first-declared order used to name
+/// `self1 -> self1`. jq crashes on a cycle, so this is the walk's order
+/// applied, not a captured answer; the chain text is pinned so the choice is
+/// deliberate.
+#[test]
+fn test_the_cycle_named_is_the_first_in_jqs_walk_order_3573() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    write_directive_fixtures_3573(temp_dir.path())?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "twoself"; 1"#]);
+            command
+        },
+        None,
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr {stderr:?}");
+    assert_eq!(
+        stderr,
+        "jq: error: module cycle detected: self2 -> self2\n\njq: 1 compile error\n"
+    );
     Ok(())
 }
 
