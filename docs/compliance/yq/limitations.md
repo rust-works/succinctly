@@ -560,18 +560,18 @@ values and keys, with no difference, and pinned by the `json_string_style_*_3575
 
 Still open, each separate from this fix:
 
-- **A string with a line break** (`\n`, `\r`, U+0085, U+2028, U+2029). yq writes a literal block
+- **A string with a line break** ([#3587](https://github.com/rust-works/succinctly/issues/3587)) (`\n`, `\r`, U+0085, U+2028, U+2029). yq writes a literal block
   for a value (`k: |-` / `  a` / `  b`) and `? ` explicit-key syntax for a key; this route, like
   `-P`, writes the escaped double-quoted form (`"a\nb"`). The style function declines these
   (`None`) so the old text is unchanged.
-- **A key over 128 bytes.** yq writes `? key` / `: value`; this route writes an ordinary key.
-- **`-P` (DOM) and a string computed by a filter** (`{"k": (.k + "")}`) still use their own
+- **A key over 128 bytes** (also #3587). yq writes `? key` / `: value`; this route writes an ordinary key.
+- **`-P` (DOM) and a string computed by a filter** ([#3588](https://github.com/rust-works/succinctly/issues/3588)) (`{"k": (.k + "")}`) still use their own
   quoting heuristics (`yaml_quote_string` in `yq_runner.rs`, `needs_yaml_quoting` in
   `jq/stream.rs`). On the same 223-string battery they agree with yq on 132 (`-P`) and 133
   (computed) of the values, and `-P` on 88 of the keys: single against double quotes,
   base-prefixed numbers, timestamps and bare `inf`/`nan` are where they part. They could take
   `go_yaml_string_style` as it is.
-- **A JSON surrogate-pair escape** (`"\ud83d\ude00"`) fails with `invalid escape sequence`,
+- **A JSON surrogate-pair escape** ([#3589](https://github.com/rust-works/succinctly/issues/3589)) (`"\ud83d\ude00"`) fails with `invalid escape sequence`,
   where yq decodes it. The YAML double-quoted grammar has no such pair; a raw `😀` is fine.
 
 ### The `---` between results is per-run, not per-node as real yq's printer makes it (#2427)
