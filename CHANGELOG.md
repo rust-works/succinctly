@@ -422,6 +422,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **yq: `length` of a JSON number is the width of the number yq decodes** (#3597). yq measures
+  what its JSON decoder produced, rendered the way it prints: `2.0` is the integer `2` (width 1),
+  `1.50` is `1.5` (3), `1e5` is `100000` (6), and `1e20` stays a float that prints `1e+20` (5).
+  The cursor route measured the source spelling instead (3, 4, 3, 4), and so did every program
+  that reached the number through a cursor (`[.arr[] | length]`, `.. | length`, `as $v | $v`).
+  The width now comes from the same rendering the owned-number path already used
+  (`numeric_length_owned`), so the two cannot disagree. A YAML document is untouched: go-yaml
+  keeps a scalar's source text as its value, and `a: 2.0` is width 3 in yq and here.
+
 - **yq: a whole-number JSON float is an integer, as in yq** (#3577). yq's JSON decoder types `2.0`,
   `1e2`, `-0.0` and `9223372036854775808.0` as `!!int`, and keeps `2.5`, `1e19`, `1e20` and `1e300`
   `!!float`. The cursor route typed every one of them a float, so `.p | tag`, `type`,
