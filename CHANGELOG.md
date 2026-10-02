@@ -464,7 +464,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `no value`" rule this was the last caller of, are removed; `result_to_owned_full` carries their
   documentation. A message that makes a value and then halts raises the value, as jq does
   (`error((1, halt))` is `1` at exit 5, `try error((1, halt)) catch .` prints `1`; it halted at
-  exit 0, #3612); a message that halts first still halts.
+  exit 0, #3612); a message that halts first still halts. The message is read only up to its
+  first output, so a later output's side effect never fires: `error((1, ("x"|stderr)))` raises
+  `1` with nothing written before it, where it wrote `x` first (#3636).
 
 - **yq: `length` of a JSON number is the width of the number yq decodes** (#3597). yq measures
   what its JSON decoder produced, rendered the way it prints: `2.0` is the integer `2` (width 1),
