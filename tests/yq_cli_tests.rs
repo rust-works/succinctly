@@ -50507,3 +50507,58 @@ fn test_bare_first_on_a_mapping_is_refused_in_yq_3551() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3574: yq's JSON decoder reads a zero as the integer `0` whatever its
+/// spelling (`-0`, `-0.0`, `-0e0`), so JSON-sourced input never prints a sign
+/// on zero, in YAML or JSON output. The cursor route echoed the source text
+/// (`-0`) or the float's `Display` (`-0.0`). Every expected value is yq
+/// v4.53.3's.
+#[test]
+fn test_yq_json_sourced_negative_zero_prints_unsigned_3574() -> Result<()> {
+    let json =
+        r#"{"a":-0,"b":-0.0,"c":-0e0,"d":[-0,-0.0],"e":{"f":-0},"g":0,"h":-1,"i":-0.5,"s":"-0"}"#;
+    let args = |output: &'static str| ["--input-format", "json", output];
+
+    // YAML output: a scalar root, a sequence, a nested mapping value, and
+    // `.[]`'s several results.
+    for (filter, expected) in [
+        (".a", "0\n"),
+        (".b", "0\n"),
+        (".c", "0\n"),
+        (".d", "- 0\n- 0\n"),
+        (".d[]", "0\n0\n"),
+        (".e.f", "0\n"),
+        ("[.a, .b, .c]", "- 0\n- 0\n- 0\n"),
+        // Must not change: every other number, and a string that merely
+        // looks like `-0`, keeps its spelling.
+        (".g", "0\n"),
+        (".h", "-1\n"),
+        (".i", "-0.5\n"),
+        (".s", "-0\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, json, &args("-o=yaml"))?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, expected, "`{filter}` as YAML");
+    }
+
+    // JSON output: `-0` already printed `0`; `-0.0` and `-0e0` did not.
+    let (stdout, code) = run_yq_stdin(".", json, &["--input-format", "json", "-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout,
+        "{\"a\":0,\"b\":0,\"c\":0,\"d\":[0,0],\"e\":{\"f\":0},\"g\":0,\"h\":-1,\"i\":-0.5,\"s\":\"-0\"}\n"
+    );
+
+    // Must not change: a YAML *document's* `-0` is a float in yq and keeps
+    // its sign (#3445), spelled `-0.0` in JSON output.
+    for (doc, filter, args, expected) in [
+        ("a: -0\n", ".a", &[][..], "-0\n"),
+        ("a: -0.0\n", ".a", &[][..], "-0.0\n"),
+        ("a: -0\n", ".a", &["-o=json"][..], "-0.0\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}` on {doc:?}");
+        assert_eq!(stdout, expected, "`{filter}` on {doc:?} with {args:?}");
+    }
+    Ok(())
+}

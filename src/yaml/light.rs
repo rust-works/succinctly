@@ -4318,6 +4318,14 @@ pub fn yq_float_is_scientific(f: f64) -> bool {
 /// through `canonicalize`'s only caller, but is still the semantically
 /// correct answer if it weren't).
 ///
+/// A zero is always the positive one (#3574). yq's JSON decoder turns a
+/// whole-number float into an integer, which has no sign for zero, so `-0`,
+/// `-0.0` and `-0e0` all print `0`, as the DOM path already does
+/// (`OwnedValue::from_number_literal_plain` takes any whole float to an
+/// `Int`). `-0` resolves as `Int(0)` for JSON, which the literal-preserving
+/// callers would echo as `-0`, so that case is answered here too: it is the
+/// only integer whose source spelling differs from its value.
+///
 /// The single point every canonicalize-aware call site routes through
 /// (`stream_resolved_scalar_as_json`/`write_resolved_scalar_as_json`,
 /// `stream_yaml_string_value`, `stream_yaml_as_document`'s scalar-root
@@ -4332,7 +4340,11 @@ pub fn yq_float_is_scientific(f: f64) -> bool {
 #[inline]
 fn json_sourced_canonical_float(resolved: ResolvedScalar, canonicalize: bool) -> Option<f64> {
     match resolved {
-        ResolvedScalar::Float(f) if canonicalize && f.is_finite() => Some(f),
+        // `f == 0.0` holds for both zeros; `0.0` is the positive one.
+        ResolvedScalar::Float(f) if canonicalize && f.is_finite() => {
+            Some(if f == 0.0 { 0.0 } else { f })
+        }
+        ResolvedScalar::Int(0) if canonicalize => Some(0.0),
         _ => None,
     }
 }
