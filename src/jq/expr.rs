@@ -2520,6 +2520,63 @@ pub enum Builtin {
     AtPosition(Box<Expr>, Box<Expr>),
 }
 
+/// Declares [`Builtin::value_arg`] and [`Builtin::with_value_arg`] for the single-argument
+/// builtins whose argument jq binds with `as` -- a `$param` of a jq-defined builtin
+/// (`def flatten($x)`, `def join($x)`) or an argument of a C-coded one, which jq evaluates
+/// as a backtracking sub-expression before the call (`has`, `startswith`, ...) -- so a
+/// failure raised anywhere after the call, and a consumer's stop, reaches the argument
+/// generator (#3487). Closure parameters (`map(f)`, `select(f)`, `limit(n; f)`) are not
+/// listed: they are not bound once per argument value. A builtin added to the parser with a
+/// single bound argument belongs in the list below; nothing else checks that it is.
+macro_rules! value_arg_builtins {
+    ($($variant:ident),* $(,)?) => {
+        impl Builtin {
+            /// The argument jq binds with `as` for this builtin, if it has one (#3487).
+            pub fn value_arg(&self) -> Option<&Expr> {
+                match self {
+                    $(Self::$variant(arg) => Some(arg),)*
+                    _ => None,
+                }
+            }
+
+            /// This builtin with its [`Self::value_arg`] replaced by `arg`.
+            pub fn with_value_arg(&self, arg: Expr) -> Option<Self> {
+                match self {
+                    $(Self::$variant(_) => Some(Self::$variant(Box::new(arg))),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+value_arg_builtins!(
+    Has,
+    Ltrimstr,
+    Rtrimstr,
+    Startswith,
+    Endswith,
+    Split,
+    Join,
+    Contains,
+    Inside,
+    FlattenDepth,
+    Test,
+    Indices,
+    Index,
+    Rindex,
+    GetPath,
+    DelPaths,
+    BSearch,
+    Strftime,
+    Strptime,
+    Strflocaltime,
+    Match,
+    Capture,
+    Scan,
+    Splits,
+);
+
 /// Arithmetic operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArithOp {
