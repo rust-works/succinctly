@@ -53096,23 +53096,26 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md).
 pub(crate) const WHILE_UNTIL_MAX_STEPS: usize = 100_000;
 
-/// The native-stack budget a `while`/`until` loop nests its rounds under when
-/// its `update` holds a `?//`, or `None` when it holds none (#3503).
+/// The native-stack budget a `while`/`until` loop nests its rounds under when an
+/// operand (`update`, #3503; `cond`, #3617) holds a `?//`, or `None` when it holds
+/// none.
 ///
 /// `jq` retries a `?//` alternative when a failure raised *after* it -- in a
-/// later round of the loop, which is everything downstream of `update` -- reaches
-/// it, so `update` has to be driven through a live sink with the rest of the loop
-/// run inside it, one native level per round. An `update` without a `?//` has
-/// nothing to retry and keeps the in-place loop, which costs no stack depth.
-/// [`contains_retrying_pattern_bind`] answers `false` after one load for a
-/// program with no `?//` at all, so this adds nothing there.
+/// later round of the loop, which is everything downstream of the operand --
+/// reaches it, so the operand has to be driven through a live sink with the rest
+/// of the loop run inside it, one native level per round. An operand without a
+/// `?//` has nothing to retry and keeps the in-place loop, which costs no stack
+/// depth. [`contains_retrying_pattern_bind`] answers `false` after one load for a
+/// program with no `?//` at all, so this adds nothing there. A loop whose `cond`
+/// *and* `update` both hold one nests two levels per round, so it reaches the
+/// ceiling in about half the rounds.
 ///
 /// The budget is `recurse`'s own ([`RecurseNativeBudget`]): it measures from the
-/// outermost live level, so a loop nested in another's `update`, in a `recurse`
+/// outermost live level, so a loop nested in another's operand, in a `recurse`
 /// walk or in `def` recursion spends from one ceiling rather than starting a
 /// fresh one, and each round's frames are charged on the ambient frame guard.
-pub(crate) fn loop_stream_budget(update: &Expr) -> Option<RecurseNativeBudget> {
-    contains_retrying_pattern_bind(update).then(RecurseNativeBudget::start)
+pub(crate) fn loop_stream_budget(operand: &Expr) -> Option<RecurseNativeBudget> {
+    contains_retrying_pattern_bind(operand).then(RecurseNativeBudget::start)
 }
 
 /// Enter the next native level of a loop whose [`loop_stream_budget`] is `budget`,
@@ -53158,7 +53161,7 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let demoted_cond = demote_for_reentry(cond, &RootWitness::Owned);
     let demoted_update = demote_for_reentry(update, &RootWitness::Owned);
     let cond = LoopOperand::new(cond, &demoted_cond);
-    let update = LoopOperand::for_update(update, &demoted_update);
+    let update = LoopOperand::new(update, &demoted_update);
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut budget = WHILE_UNTIL_MAX_STEPS;
     let result = until_step::<S>(
@@ -53182,23 +53185,17 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 struct LoopOperand<'e> {
     expr: &'e Expr,
     demoted: &'e Expr,
-    /// #3503: the native-stack budget a loop whose operand holds a `?//` nests
-    /// its rounds under (see [`loop_stream_budget`]); `None` for any other.
+    /// #3503/#3617: the native-stack budget a loop whose `update` or `cond` holds
+    /// a `?//` nests its rounds under (see [`loop_stream_budget`]); `None` for an
+    /// operand without one.
     stream: Option<RecurseNativeBudget>,
 }
 
 impl<'e> LoopOperand<'e> {
+    /// An operand with its demoted twin; one holding a `?//` is driven through a
+    /// live sink so a retry can follow a failure a later round raises: `update`
+    /// (#3503) and `cond` (#3617).
     fn new(expr: &'e Expr, demoted: &'e Expr) -> Self {
-        Self {
-            expr,
-            demoted,
-            stream: None,
-        }
-    }
-
-    /// [`Self::new`] for `update`, which a `?//` retry has to reach through a
-    /// live sink (#3503).
-    fn for_update(expr: &'e Expr, demoted: &'e Expr) -> Self {
         Self {
             expr,
             demoted,
@@ -53304,6 +53301,24 @@ fn until_step<S: EvalSemantics>(
         }
         *budget -= 1;
 
+        // #3617: a `cond` holding a `?//` runs the branch each of its outputs
+        // chooses inside its sink, so the retry can follow a failure that branch
+        // (the update, a later round, the consumer) raises.
+        if let Some(_level) = cond.enter_stream() {
+            return cond.drive_each::<S>(&state, optional, ambient, &mut |cond_val| {
+                until_decided::<S>(
+                    cond,
+                    update,
+                    &state,
+                    cond_val.is_truthy(),
+                    optional,
+                    outputs,
+                    budget,
+                    ambient,
+                )
+            });
+        }
+
         let (cond_vals, cond_control) = cond.fork::<S>(&state, optional, ambient);
 
         // Fast path: exactly one falsy `cond` output and exactly one
@@ -53333,27 +53348,53 @@ fn until_step<S: EvalSemantics>(
         }
 
         for cond_val in &cond_vals {
-            if cond_val.is_truthy() {
-                outputs.push(state.clone());
-            } else if let Some(_level) = update.enter_stream() {
-                update.drive_each::<S>(&state, optional, ambient, &mut |next| {
-                    until_step::<S>(cond, update, next, optional, outputs, budget, false)
-                })?;
-            } else {
-                let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
-                for update_val in update_vals {
-                    until_step::<S>(cond, update, update_val, optional, outputs, budget, false)?;
-                }
-                if let Some(control) = update_control {
-                    return Err(control);
-                }
-            }
+            until_decided::<S>(
+                cond,
+                update,
+                &state,
+                cond_val.is_truthy(),
+                optional,
+                outputs,
+                budget,
+                ambient,
+            )?;
         }
         return match cond_control {
             Some(control) => Err(control),
             None => Ok(()),
         };
     }
+}
+
+/// One branch of [`until_step`] once a `cond` output has chosen it: a truthy one
+/// emits `state` and stops there, a falsy one steps `update` and runs the rest of
+/// the loop from each output (#3617 factored this out so the collected and the
+/// streamed `cond` share it).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors until_step's own seven, plus the chosen bit.
+fn until_decided<S: EvalSemantics>(
+    cond: LoopOperand<'_>,
+    update: LoopOperand<'_>,
+    state: &OwnedValue,
+    truthy: bool,
+    optional: bool,
+    outputs: &mut Vec<OwnedValue>,
+    budget: &mut usize,
+    ambient: bool,
+) -> Result<(), Control> {
+    if truthy {
+        outputs.push(state.clone());
+        return Ok(());
+    }
+    if let Some(_level) = update.enter_stream() {
+        return update.drive_each::<S>(state, optional, ambient, &mut |next| {
+            until_step::<S>(cond, update, next, optional, outputs, budget, false)
+        });
+    }
+    let (update_vals, update_control) = update.fork::<S>(state, optional, ambient);
+    for update_val in update_vals {
+        until_step::<S>(cond, update, update_val, optional, outputs, budget, false)?;
+    }
+    update_control.map_or(Ok(()), Err)
 }
 
 /// Evaluate `while(cond; update)` - output values while cond is true.
@@ -53378,7 +53419,7 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let demoted_cond = demote_for_reentry(cond, &RootWitness::Owned);
     let demoted_update = demote_for_reentry(update, &RootWitness::Owned);
     let cond = LoopOperand::new(cond, &demoted_cond);
-    let update = LoopOperand::for_update(update, &demoted_update);
+    let update = LoopOperand::new(update, &demoted_update);
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut budget = WHILE_UNTIL_MAX_STEPS;
     let result = while_step::<S>(
@@ -53427,6 +53468,22 @@ fn while_step<S: EvalSemantics>(
         }
         *budget -= 1;
 
+        // #3617: see [`until_step`].
+        if let Some(_level) = cond.enter_stream() {
+            return cond.drive_each::<S>(&state, optional, ambient, &mut |cond_val| {
+                while_decided::<S>(
+                    cond,
+                    update,
+                    &state,
+                    cond_val.is_truthy(),
+                    optional,
+                    outputs,
+                    budget,
+                    ambient,
+                )
+            });
+        }
+
         let (cond_vals, cond_control) = cond.fork::<S>(&state, optional, ambient);
 
         // Fast path: exactly one truthy `cond` output and exactly one
@@ -53456,28 +53513,52 @@ fn while_step<S: EvalSemantics>(
         }
 
         for cond_val in &cond_vals {
-            if cond_val.is_truthy() {
-                outputs.push(state.clone());
-                if let Some(_level) = update.enter_stream() {
-                    update.drive_each::<S>(&state, optional, ambient, &mut |next| {
-                        while_step::<S>(cond, update, next, optional, outputs, budget, false)
-                    })?;
-                    continue;
-                }
-                let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
-                for update_val in update_vals {
-                    while_step::<S>(cond, update, update_val, optional, outputs, budget, false)?;
-                }
-                if let Some(control) = update_control {
-                    return Err(control);
-                }
-            }
+            while_decided::<S>(
+                cond,
+                update,
+                &state,
+                cond_val.is_truthy(),
+                optional,
+                outputs,
+                budget,
+                ambient,
+            )?;
         }
         return match cond_control {
             Some(control) => Err(control),
             None => Ok(()),
         };
     }
+}
+
+/// One branch of [`while_step`] once a `cond` output has chosen it: a truthy one
+/// emits `state`, then steps `update` and runs the rest of the loop from each
+/// output; a falsy one is `empty` (#3617, see [`until_decided`]).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors while_step's own seven, plus the chosen bit.
+fn while_decided<S: EvalSemantics>(
+    cond: LoopOperand<'_>,
+    update: LoopOperand<'_>,
+    state: &OwnedValue,
+    truthy: bool,
+    optional: bool,
+    outputs: &mut Vec<OwnedValue>,
+    budget: &mut usize,
+    ambient: bool,
+) -> Result<(), Control> {
+    if !truthy {
+        return Ok(());
+    }
+    outputs.push(state.clone());
+    if let Some(_level) = update.enter_stream() {
+        return update.drive_each::<S>(state, optional, ambient, &mut |next| {
+            while_step::<S>(cond, update, next, optional, outputs, budget, false)
+        });
+    }
+    let (update_vals, update_control) = update.fork::<S>(state, optional, ambient);
+    for update_val in update_vals {
+        while_step::<S>(cond, update, update_val, optional, outputs, budget, false)?;
+    }
+    update_control.map_or(Ok(()), Err)
 }
 
 /// Demand-driven twin of [`eval_repeat`] (#2014): pulls one round of
@@ -105484,6 +105565,17 @@ mod tests {
                 "`{filter}`"
             );
         }
+        // ... and `no_std` pins that answer.
+        #[cfg(not(feature = "std"))]
+        {
+            let filter = r#"[while(length>0; if length==3 then ([1] as $q ?// $b | if $q then .[0:1] else empty end) elif length==1 then error("E") else [] end)]"#;
+            let (got, got_end) = outputs_and_end(b"[10,20,30]", filter);
+            assert_eq!(
+                (got, got_end.as_str()),
+                (Vec::<String>::new(), "error: E"),
+                "`{filter}`"
+            );
+        }
     }
 
     /// #3503: a loop whose `update` holds a `?//` nests one native level per round,
@@ -105495,6 +105587,95 @@ mod tests {
         for filter in [
             "until(. >= 20000; (. + 1) as $x ?// $y | $x)",
             "last(while(. < 20000; (. + 1) as $x ?// $y | $x)) | . + 1",
+        ] {
+            let (got, got_end) = outputs_and_end(b"0", filter);
+            assert_eq!(
+                (got, got_end.as_str()),
+                (vec!["20000".to_string()], ""),
+                "`{filter}`"
+            );
+        }
+    }
+
+    /// #3617: `while`/`until` drive a `cond` that holds a `?//` through a live sink, with
+    /// the branch each output chooses run inside it, so the retry follows a failure that
+    /// branch raises on a later round. In `no_std` only a `cond` that *is* a `?//` bind is
+    /// recognised ([`direct_pattern_retry`]). Captured from jq 1.7.1 with `-c` over
+    /// `[10,20,30]`.
+    #[test]
+    fn test_loop_cond_retry_follows_a_later_rounds_failure_3617() {
+        let upd = r#"if length==3 then .[0:1], .[1:] elif length==1 then error("E") else [] end"#;
+        let direct = r"([1] as $q ?// $b | if $q then length>0 else length>1 end)";
+        for (filter, values, end) in [
+            (
+                format!("[while({direct}; {upd})]"),
+                vec![r"[[10,20,30],[10],[20,30]]"],
+                "",
+            ),
+            (
+                format!("[until(({direct})|not; {upd})]"),
+                vec![r"[[10],[]]"],
+                "",
+            ),
+            (
+                format!(
+                    r#"[while(([1] as $q ?// $b | if $q then length>0 else error("E2") end); {upd})]"#
+                ),
+                vec![],
+                "error: E2",
+            ),
+            (
+                r#"[until(([1] as $q ?// $b | if $q then length<=0 else true end); if length==3 then .[0:1] elif length==1 then ("h"|halt_error(3)) else [] end)]"#.to_string(),
+                vec![],
+                "halt: 3",
+            ),
+            // No `?//`: one attempt, then the error.
+            (format!("[while(length>0; {upd})]"), vec![], "error: E"),
+        ] {
+            let (got, got_end) = outputs_and_end(b"[10,20,30]", &filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!((got, got_end.as_str()), (values, end), "`{filter}`");
+        }
+        // `cond` wrapped in an `if`, with a retry that produces nothing: not a direct
+        // bind, so `no_std` keeps the first alternative's `E` (recorded in
+        // `limitations.md`).
+        #[cfg(feature = "std")]
+        {
+            let filter = format!(
+                r"[while(if true then ([1] as $q ?// $b | if $q then length>0 else empty end) else false end; {upd})]"
+            );
+            let (got, got_end) = outputs_and_end(b"[10,20,30]", &filter);
+            assert_eq!(
+                (got, got_end.as_str()),
+                (vec![r"[[10,20,30],[10],[20,30]]".to_string()], ""),
+                "`{filter}`"
+            );
+        }
+        // ... and `no_std` pins that answer.
+        #[cfg(not(feature = "std"))]
+        {
+            let filter = format!(
+                r"[while(if true then ([1] as $q ?// $b | if $q then length>0 else empty end) else false end; {upd})]"
+            );
+            let (got, got_end) = outputs_and_end(b"[10,20,30]", &filter);
+            assert_eq!(
+                (got, got_end.as_str()),
+                (Vec::<String>::new(), "error: E"),
+                "`{filter}`"
+            );
+        }
+    }
+
+    /// #3617: a loop whose `cond` holds a `?//` (alone, and with `update` holding one
+    /// too, which nests two levels per round) nests until the ceiling and then takes
+    /// the in-place path, so a long run still counts every round on a default 2 MiB
+    /// test thread.
+    #[test]
+    fn test_loop_cond_retry_stays_within_the_native_stack_3617() {
+        for filter in [
+            "until(((. >= 20000) as $x ?// $y | $x); . + 1)",
+            "until(((. >= 20000) as $x ?// $y | $x); (. + 1) as $a ?// $b | $a)",
+            "last(while(((. < 20000) as $x ?// $y | $x); (. + 1) as $a ?// $b | $a)) | . + 1",
         ] {
             let (got, got_end) = outputs_and_end(b"0", filter);
             assert_eq!(
