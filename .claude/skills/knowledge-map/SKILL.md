@@ -38,7 +38,7 @@ Every concept page follows this structure:
 
 1. Add to the Academic Foundations table in `docs/index.md`
 2. Add to the relevant concept page's Academic Papers section
-3. If the URL's host is one `.github/workflows/links.yml` excludes, CI will not check it: `doi.org` (returns 403 to bots) and PDFs under `drops.dagstuhl.de/storage/` (time out from the runner) are, so verify those by hand
+3. If the URL's host is one `lychee.toml` excludes, CI will not check it: `doi.org` (returns 403 to bots) and PDFs under `drops.dagstuhl.de/storage/` (time out from the runner) are, so verify those by hand
 
 ### New SIMD path
 

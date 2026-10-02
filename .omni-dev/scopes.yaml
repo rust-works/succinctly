@@ -70,7 +70,7 @@ scopes:
   - name: "ci"
     description: "CI/CD pipelines, GitHub Actions, and commit-lint configuration"
     examples: ["ci: add SIMD feature matrix", "ci: fix benchmark workflow"]
-    file_patterns: [".github/**", ".omni-dev/**"]
+    file_patterns: [".github/**", ".omni-dev/**", "lychee.toml"]
   - name: "build"
     description: "Build configuration and feature flags"
     examples: ["build: add mmap-tests feature", "build: update dependencies"]

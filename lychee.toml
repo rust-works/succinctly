@@ -1,10 +1,14 @@
-# Options shared by both lychee passes in .github/workflows/links.yml (the first
+# The options of both lychee passes in .github/workflows/links.yml (the first
 # attempt and the retry that follows it), so an exclude added here reaches both
-# (#3620). The retry's own `--exclude-path` and the input glob stay on the
-# command line: lychee merges a command-line `--exclude`/`--exclude-path` with
-# these.
+# (#3620). Both steps run `lychee --config lychee.toml '**/*.md'`.
+#
+# lychee reads ./lychee.toml by default, so a bare `lychee '**/*.md'` from the
+# repository root uses these too, including the one-day cache of successful
+# links (`lychee --cache=false` skips it).
 
-verbose = "info"
+# `--verbose` was one -v, which lychee 0.24 calls "warn": the excluded and
+# failing links, not every successful one ("info" prints all of them).
+verbose = "warn"
 no_progress = true
 cache = true
 max_cache_age = "1d"
@@ -12,7 +16,17 @@ max_retries = 3
 retry_wait_time = 2
 accept = ["100..=399"]
 
-exclude_path = ["./target", "./data"]
+# These are regular expressions, not paths, and `.` matches any character, so
+# they skip any path with a character before `/target` or `/data`: not a
+# top-level `target/` or `data/` (which the glob spells without a leading `./`)
+# but, by accident, docs/optimizations/targets.md and
+# tests/data/bench-corpus/*.md. Carried over unchanged from the arguments this
+# file replaced; anchoring them would start checking those files (#3632).
+#
+# The last entry is the first attempt's own report, which lists every failing
+# URL as a link, so the retry skips it (it does not exist yet during the first
+# attempt).
+exclude_path = ["./target", "./data", '(^|/)lychee/out\.md$']
 
 exclude = [
   '^https://crates\.io/crates/',

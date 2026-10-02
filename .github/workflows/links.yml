@@ -59,11 +59,10 @@ jobs:
         if: steps.lychee.outputs.exit_code != '0'
         uses: lycheeverse/lychee-action@v2
         with:
-          # The first attempt's own report (`lychee/out.md`) is in the workspace
-          # by now and lists every failing URL as a link, so this step skips it.
+          # The same options as the first attempt, from lychee.toml, which also
+          # skips the first attempt's own report (`lychee/out.md`).
           args: >-
             --config lychee.toml
-            --exclude-path '(^|/)lychee/out\.md$'
             '**/*.md'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
