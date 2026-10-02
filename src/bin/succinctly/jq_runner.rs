@@ -398,22 +398,20 @@ fn print_report_entry(entry: &ReportEntry) {
             eprintln!("jq: error: module cycle detected: {}", chain.join(" -> "));
             eprintln!();
         }
-        // jq 1.7.1 names the module by its resolved *absolute* path and
-        // leaves a blank line after the echoed source; both measured live
-        // (see [`print_syntax_error`]).
+        // jq 1.7.1 names the module by its resolved *absolute* path, and the next
+        // entry or the trailer follows the echoed source line directly: no blank
+        // line, as after a top-level syntax error (#3624, measured on the pinned
+        // macOS `/usr/bin/jq` and on the static Linux 1.7.1 release binary).
         ReportEntry::Syntax {
             path,
             contents,
             error,
-        } => {
-            print_syntax_error(
-                &error.message,
-                contents,
-                error.position,
-                &path.display().to_string(),
-            );
-            eprintln!();
-        }
+        } => print_syntax_error(
+            &error.message,
+            contents,
+            error.position,
+            &path.display().to_string(),
+        ),
         ReportEntry::Data(DataFileFailure { path, detail }) => {
             eprintln!("jq: error loading data file {}: {detail}", path.display());
             eprintln!();

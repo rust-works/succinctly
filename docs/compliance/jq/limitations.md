@@ -4962,9 +4962,9 @@ trailer. The flat `jq: compile error: parse error at position N: …` is gone.
 
 **Closed for a syntax error inside an `include`d module.** Same reporter, with the module's
 *canonical absolute* resolved path in the `at …` label (`/private/tmp/…` — canonicalizing
-`-L /tmp` matches jq's own naming), the module's echoed source line, a blank line before the
-trailer (jq 1.7.1 leaves one here, but not after a *top-level* syntax error — reproduced
-per-path), and the trailer. The pre-#2703 `jq: module error: parse error in module
+`-L /tmp` matches jq's own naming), the module's echoed source line, and the trailer, with no
+blank line between them (#2703 recorded one; the pinned macOS `/usr/bin/jq` and the static Linux
+1.7.1 release binary both print none, #3624). The pre-#2703 `jq: module error: parse error in module
 '{path-as-given}': …` is gone.
 
 **What remains open, all three narrower than the shape gap:**
