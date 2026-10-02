@@ -746,37 +746,36 @@ retry's child is fine), was the abandoned alternative's `E`. The value and path 
   needed no change. No row here runs queued: it starts only in a walk deeper than the native
   budget.
 
-## `while`/`until` and a `?//` retry in `update` (#3503)
+## `while`/`until` and a `?//` retry in `update` or `cond` (#3503, #3617)
 
-A `?//` in the `update` of `while(cond; update)` / `until(cond; update)` retries past a failure a
-later round raises, as jq's does: `[.|while(length>0; if length==3 then ([1] as $q ?// $b | if $q
-then .[0:1] else .[1:] end) elif length==1 then error("E") else [] end)]` on `[10,20,30]` is
-`[[10,20,30],[10],[20,30]]` (the first alternative's state `[10]` fails on its own next round; the
-retry's is fine). It raised that round's `E` after a single attempt. The loop collected `update`'s
-outputs before running the next round, so the `?//` had already finished when the failure came. An
-`update` that holds a `?//` is now driven through a live sink with the rest of the loop run inside
-it, the same shape as `recurse`'s walkers, on the cursor route, the owned route and the eager entry
-point. An `update` with no `?//` keeps the in-place loop, which costs no stack depth. What it
-leaves:
+A `?//` in the `update` or the `cond` of `while(cond; update)` / `until(cond; update)` retries past
+a failure a later round raises, as jq's does: `[.|while(length>0; if length==3 then ([1] as $q ?//
+$b | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else [] end)]` on
+`[10,20,30]` is `[[10,20,30],[10],[20,30]]` (the first alternative's state `[10]` fails on its own
+next round; the retry's is fine). It raised that round's `E` after a single attempt. The loop
+collected the operand's outputs before running the next round, so the `?//` had already finished
+when the failure came. An operand that holds a `?//` is now driven through a live sink with the
+rest of the loop run inside it (for `cond`, the branch each output chooses: the emission, the
+update and every later round), the same shape as `recurse`'s walkers, on the cursor route, the
+owned route and the eager entry point. An operand with no `?//` keeps the in-place loop, which
+costs no stack depth. What it leaves:
 
 - **A loop stops retrying past the native stack ceiling, which a build profile moves.** One round
-  is one native level while `update` holds a `?//`, up to `RECURSE_NATIVE_STACK_BYTES` of stack
-  (the budget `recurse` uses, shared with any loop, walk or `def` recursion that encloses it);
-  past that the loop takes the in-place path, which answers as it did before (the first
+  is one native level for each of `update` and `cond` that holds a `?//` (two when both do, which
+  halves the figures below), up to `RECURSE_NATIVE_STACK_BYTES` of stack (the budget `recurse`
+  uses, shared with any loop, walk or `def` recursion that encloses it); past that the loop takes the in-place path, which answers as it did before (the first
   alternative's failure) but cannot overflow. A trivial `update` (`(. + 1) as $x ?// $y | $x`)
   nests about 41 rounds in a release build and 8 in a debug build, so a failure raised after that
   many rounds is not retried, in either build. `until(. >= 50000; (. + 1) as $x ?// $y | $x)`
   still answers `50000`. Raising the ceiling means a heap-held retry rather than native levels.
 - **`no_std` recognises only a direct bind**, for the reason the fold section above gives: an
-  `update` that *is* a `?//` bind is covered, and one wrapped in an `if`, `first` or a pipe keeps
+  operand that *is* a `?//` bind is covered, and one wrapped in an `if`, `first` or a pipe keeps
   the previous answer when the retry produces nothing or raises (a retry that produces a value
   is recognised).
-- **A `?//` in `cond`** ([#3617](https://github.com/rust-works/succinctly/issues/3617)) still
-  makes one attempt where jq retries (`[while(COND; U)]` with a `?//` in `COND` raises the first
-  alternative's `E`), the same shape this entry fixed for `update`: `cond`'s bits are collected
-  before the round runs.
 - **On the owned route `first(while(...))` runs one `update` past the consumer's stop** (an `A`
-  on stderr where jq prints none), with or without a `?//`: the loop is collected eagerly there.
+  on stderr where jq prints none), with or without a `?//`, and `first(until(...))` over a `?//`
+  `cond` does not see the second output jq delivers when the retry follows `first`'s stop: the
+  loop is collected eagerly there.
 
 ## Where succinctly errors and jq does not
 
