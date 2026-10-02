@@ -63,7 +63,7 @@ use super::eval::{
     finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
     format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_assignment_expr, is_eager_arg,
-    is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq,
+    is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
     owned_to_expr, owned_to_string, pattern_alternatives_var_names, prefer_pending_control,
@@ -13066,11 +13066,18 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     let n = match classify_limit_n(n_value) {
-        Ok(LimitN::Unlimited) => {
-            return eval_each_generic::<S, V>(expr, value, optional, cursor, sink)
+        LimitN::Unlimited => return eval_each_generic::<S, V>(expr, value, optional, cursor, sink),
+        // #3486: raised on `expr`'s first output, as jq's `foreach` does.
+        LimitN::Raise(error) => {
+            return eval_each_generic::<S, V>(
+                &limit_raising(expr, &error),
+                value,
+                optional,
+                cursor,
+                sink,
+            )
         }
-        Ok(LimitN::Take(n)) => n,
-        Err(e) => return Flow::Escaped(Control::Error(e)),
+        LimitN::Take(n) => n,
     };
 
     if n == 0 {
@@ -17106,12 +17113,14 @@ fn limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    let n = match classify_limit_n(n_value) {
-        Ok(LimitN::Unlimited) => {
+    let (n, raise) = match classify_limit_n(n_value) {
+        LimitN::Unlimited => {
             return eval_single::<S, V>(expr, value, optional, cursor);
         }
-        Ok(LimitN::Take(n)) => n,
-        Err(e) => return GenericResult::Error(e),
+        // #3486: jq's `foreach` raises this on `expr`'s first output, so pull one
+        // and raise (below); see `eval::limit_with_n`.
+        LimitN::Raise(error) => (1, Some(error)),
+        LimitN::Take(n) => (n, None),
     };
     if n == 0 {
         return GenericResult::None;
@@ -17138,6 +17147,16 @@ fn limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
             }
         }),
     );
+    if let Some(error) = raise {
+        return if out.is_empty() {
+            match flow {
+                Flow::Escaped(control) => partial_generic(Vec::new(), control),
+                Flow::Exhausted | Flow::Stopped { .. } => GenericResult::None,
+            }
+        } else {
+            GenericResult::Error(error)
+        };
+    }
     match flow {
         // The sink returns `Demand::Stop` the instant `out.len() >= n`, and
         // every `eval_each_generic` arm stops pulling as soon as `Demand`
@@ -21186,9 +21205,12 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                 walk_error.begin();
                 let _scope = was_read_only.then(yq_read_only_context::enter);
                 let take = match classify_limit_n(n_value) {
-                    Ok(LimitN::Unlimited) => None,
-                    Ok(LimitN::Take(n)) => Some(n),
-                    Err(e) => return walk_error.stop(Control::Error(e)),
+                    LimitN::Unlimited => None,
+                    LimitN::Take(n) => Some(n),
+                    // #3486: jq raises this on `expr`'s first output; this walk
+                    // raises it at the count (jq's own message, but also when
+                    // `expr` is empty, where jq produces nothing).
+                    LimitN::Raise(error) => return walk_error.stop(Control::Error(error)),
                 };
                 match path_context_step_bounded::<S, V>(expr, take, pos, out) {
                     Ok(()) => Demand::Continue,
@@ -30044,9 +30066,11 @@ impl OutputWindow {
     fn limit(n_value: OwnedValue) -> Result<Self, EvalError> {
         Ok(Self {
             skip: 0,
-            take: match classify_limit_n(n_value)? {
+            take: match classify_limit_n(n_value) {
                 LimitN::Unlimited => None,
                 LimitN::Take(n) => Some(n),
+                // #3486: see `path_context_step`'s `Expr::Limit` arm.
+                LimitN::Raise(error) => return Err(error),
             },
         })
     }

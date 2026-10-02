@@ -6973,6 +6973,40 @@ pub(crate) enum LimitN {
     Unlimited,
     /// Take at most this many outputs (`0` means the empty result).
     Take(usize),
+    /// A count jq's `$n > 0` holds for but `$n - 1` cannot subtract from: an
+    /// array, string or object (they sort above every number). jq 1.7.1's
+    /// `limit` is `foreach f as $item ($n; .-1; ...)`, so the error is raised on
+    /// `f`'s first output -- nothing at all when `f` is empty -- and after the
+    /// count, which is why a `?//` in the count retries past it (#3486). A caller
+    /// that can run `f` itself runs [`limit_raising`] instead.
+    Raise(EvalError),
+}
+
+/// How an eager `limit` ends for a [`LimitN::Raise`] count once its body has been
+/// pulled for one output (#3486): the subtraction error when it produced one, else
+/// the body's own escape (it raised before its first output), else nothing.
+fn limit_raise_result<'a, W: Clone + AsRef<[u64]>>(
+    produced: bool,
+    flow: Flow,
+    error: EvalError,
+) -> QueryResult<'a, W> {
+    if produced {
+        return QueryResult::Error(error);
+    }
+    match flow {
+        Flow::Escaped(control) => partial(Vec::new(), control),
+        Flow::Exhausted | Flow::Stopped { .. } => QueryResult::None,
+    }
+}
+
+/// `f | error(message)` for a [`LimitN::Raise`] count: what jq's `limit` does with
+/// an unsubtractable `$n`, since its `foreach` raises on `f`'s first output (#3486).
+/// Run wherever `f` would have been run unbounded.
+pub(crate) fn limit_raising(expr: &Expr, error: &EvalError) -> Expr {
+    Expr::Pipe(vec![
+        expr.clone(),
+        Expr::error(Some(Expr::literal(Literal::string(error.message.clone())))),
+    ])
 }
 
 /// jq's `limit($n; f)`/`nth($n; f)` both take `ceil($n)` outputs of `f` for
@@ -7001,15 +7035,15 @@ fn ceil_positive_float_to_usize(f: f64) -> usize {
     f.ceil() as usize
 }
 
-pub(crate) fn classify_limit_n(n_value: OwnedValue) -> Result<LimitN, EvalError> {
+pub(crate) fn classify_limit_n(n_value: OwnedValue) -> LimitN {
     match n_value {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
-            Ok(LimitN::Take(i as usize))
+            LimitN::Take(i as usize)
         }
         OwnedValue::Int(_)
         | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
         | OwnedValue::Null
-        | OwnedValue::Bool(_) => Ok(LimitN::Unlimited),
+        | OwnedValue::Bool(_) => LimitN::Unlimited,
         // `$n == 0.0` (including `-0.0`, which compares equal to `0.0`
         // under IEEE 754) takes the `$n == 0` branch; NaN satisfies neither
         // `> 0` nor `== 0`, so it falls to the same unlimited `else f`
@@ -7018,18 +7052,22 @@ pub(crate) fn classify_limit_n(n_value: OwnedValue) -> Result<LimitN, EvalError>
         // `limit(-1; 1,2,3)`).
         OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
             if f > 0.0 {
-                Ok(LimitN::Take(ceil_positive_float_to_usize(f)))
+                LimitN::Take(ceil_positive_float_to_usize(f))
             } else if f == 0.0 {
-                Ok(LimitN::Take(0))
+                LimitN::Take(0)
             } else {
-                Ok(LimitN::Unlimited)
+                LimitN::Unlimited
             }
         }
-        // Unchanged from before this fix: a non-numeric `$n` (a string,
-        // array, or object) isn't part of #1825's scope, so its message
-        // stays whatever it already was rather than being swapped for a
-        // differently-worded, equally-unverified-against-jq alternative.
-        _ => Err(EvalError::new("limit requires non-negative integer")),
+        // A string, array or object sorts above every number, so `$n > 0`
+        // holds and the `foreach`'s `.-1` raises on `f`'s first output (#3486):
+        // jq 1.7.1's own message, `array ([1]) and number (1) cannot be
+        // subtracted`, not an error of our own raised at the count.
+        other => LimitN::Raise(EvalError::binary_op(
+            &other,
+            &OwnedValue::Int(1),
+            BinOp::Subtract,
+        )),
     }
 }
 
@@ -7163,16 +7201,31 @@ fn each_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
-    let n_value = match result_to_owned_full::<_, S>(n_result) {
-        Ok(None) => return Flow::Exhausted,
-        Ok(Some((v, _trailing))) => v,
-        Err(e) => return Flow::Escaped(e.into()),
-    };
+    // #3486: `n` is the outer loop, driven through [`fanout_arg_each`] like
+    // [`each_nth`]'s, so what the body raises reaches a `?//` inside it -- the
+    // single `eval_single` this took first collected `n` to its first value, so
+    // `limit(([1] as $q ?// $b | $q); .a)` never retried past the count's own
+    // failure.
+    fanout_arg_each::<W, S, _>(n_expr, value.clone(), optional, |n_value| {
+        each_limit_with_n::<W, S>(n_value, expr, value.clone(), optional, sink)
+    })
+}
+
+/// [`each_limit`]'s sink-driven work for one already-resolved `n`.
+fn each_limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    n_value: OwnedValue,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
     let n = match classify_limit_n(n_value) {
-        Ok(LimitN::Unlimited) => return eval_each::<W, S>(expr, value, optional, sink),
-        Ok(LimitN::Take(n)) => n,
-        Err(e) => return Flow::Escaped(Control::Error(e)),
+        LimitN::Unlimited => return eval_each::<W, S>(expr, value, optional, sink),
+        // #3486: raised on `expr`'s first output, as jq's `foreach` does.
+        LimitN::Raise(error) => {
+            return eval_each::<W, S>(&limit_raising(expr, &error), value, optional, sink)
+        }
+        LimitN::Take(n) => n,
     };
 
     if n == 0 {
@@ -35602,6 +35655,21 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
     trackable: bool,
     mut dispatch: impl FnMut(bool) -> ResolveFlow,
 ) -> ResolveFlow {
+    resolve_value_fork_stream::<S>(cond, value, trackable, |c| dispatch(c.is_truthy()))
+}
+
+/// [`resolve_cond_fork_stream`] for a generator whose outputs are values a
+/// `dispatch` reads whole -- an `if`'s `cond` reads their truthiness, a
+/// `limit`'s count their size (#3486). Every rule above is the same: `generator`
+/// is pulled one output at a time, the first `dispatch` answer that is not
+/// [`ResolveFlow::Exhausted`] ends the fork, and a `?//` inside `generator`
+/// retries past it.
+fn resolve_value_fork_stream<S: EvalSemantics>(
+    cond: &Expr,
+    value: &OwnedValue,
+    trackable: bool,
+    mut dispatch: impl FnMut(OwnedValue) -> ResolveFlow,
+) -> ResolveFlow {
     // #3293: a [`StashedVerdict`]. A `?//` inside `cond` retries past the
     // stop `dispatch` answered (#1519), and a retry that emits again drops
     // the stale answer at the top of the sink; one that produces nothing or
@@ -35616,7 +35684,7 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
         Reentry::at_register(trackable),
         &mut |c| {
             dispatched.begin();
-            match dispatch(c.is_truthy()) {
+            match dispatch(c) {
                 ResolveFlow::Exhausted => Demand::Continue,
                 other => {
                     // The `?//` retry is the one producer that may push
@@ -35914,23 +35982,30 @@ fn resolve_limit_sink<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
-    let (n_values, escape) = eval_owned_multi_keep_partial::<S>(n_expr, value);
-    for n_value in n_values {
-        let flow = match classify_limit_n(n_value) {
-            Ok(LimitN::Unlimited) => {
+    // #3486: `n` is the outer loop, pulled one output at a time through the same
+    // fork `if`'s `cond` uses, so a failure the body raises reaches a `?//` inside
+    // the count -- `path(limit(([1] as $q ?// $b | $q); .a))` is `["a"]` in jq
+    // 1.7.1. This collected the whole count generator first.
+    resolve_value_fork_stream::<S>(n_expr, value, trackable, |n_value| {
+        match classify_limit_n(n_value) {
+            LimitN::Unlimited => {
                 resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink)
             }
-            Ok(LimitN::Take(n)) => {
+            // #3486: raised on `expr`'s first output, as jq's `foreach` does.
+            LimitN::Raise(error) => resolve_node_sink::<S>(
+                &limit_raising(expr, &error),
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                sink,
+            ),
+            LimitN::Take(n) => {
                 resolve_bounded_sink::<S>(expr, value, trackable, snapshot, frame, keep, n, sink)
             }
-            Err(e) => return ResolveFlow::Escaped(e.into()),
-        };
-        match flow {
-            ResolveFlow::Exhausted => {}
-            other => return other,
         }
-    }
-    flow_result(escape)
+    })
 }
 
 /// `path(nth(n; expr))` (#1952) — the arm `nth` had none of at all, which is
@@ -52980,10 +53055,13 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //
     // Uses main's `classify_limit_n`, shared with `resolve_limit_sink`,
     // in place of the inline match this commit first duplicated.
-    let n = match classify_limit_n(n_value) {
-        Ok(LimitN::Unlimited) => return eval_single::<W, S>(expr, value, optional),
-        Ok(LimitN::Take(n)) => n,
-        Err(e) => return QueryResult::Error(e),
+    let (n, raise) = match classify_limit_n(n_value) {
+        LimitN::Unlimited => return eval_single::<W, S>(expr, value, optional),
+        // #3486: jq's `foreach` raises this on `expr`'s first output, so pull one
+        // and raise (below); evaluating `expr` to completion first would fire the
+        // side effects of every output after it.
+        LimitN::Raise(error) => (1, Some(error)),
+        LimitN::Take(n) => (n, None),
     };
 
     if n == 0 {
@@ -52994,6 +53072,9 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // and `.take(n)` the result, which had already run the branches past `n`
     // and fired their side effects (#820).
     let (taken, flow, retried) = each_take_n::<W, S>(expr, value, optional, n);
+    if let Some(error) = raise {
+        return limit_raise_result(!taken.is_empty(), flow, error);
+    }
     let satisfied = taken.len() >= n && !retried;
     // #2024: the mainline `Stopped`/`Exhausted` arms below return `result`
     // straight through, so a mixed `Owned`/`Borrowed` `taken` batch (e.g.
@@ -63012,12 +63093,13 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Real yq has no `limit` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_owned| {
-            let n = match classify_limit_n(n_owned) {
-                Ok(LimitN::Unlimited) => {
+            let (n, raise) = match classify_limit_n(n_owned) {
+                LimitN::Unlimited => {
                     return eval_single::<W, S>(expr, value.clone(), optional);
                 }
-                Ok(LimitN::Take(n)) => n,
-                Err(e) => return QueryResult::Error(e),
+                // #3486: see `limit_with_n`.
+                LimitN::Raise(error) => (1, Some(error)),
+                LimitN::Take(n) => (n, None),
             };
 
             if n == 0 {
@@ -63028,6 +63110,9 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // differing from `eval_limit` only in always materializing its answer.
             // Same sink, same trailing-control rule (#820).
             let (taken, flow, retried) = each_take_n::<W, S>(expr, value.clone(), optional, n);
+            if let Some(error) = raise {
+                return limit_raise_result(!taken.is_empty(), flow, error);
+            }
             let satisfied = taken.len() >= n && !retried;
             // #1989: `into_owned`, not `into_owned_lossy` -- these values
             // *are* the query's output, so an undecodable string here was
@@ -107146,6 +107231,52 @@ mod tests {
         }
     }
 
+    /// #3486: a string, array or object count raises jq's own subtraction error rather
+    /// than one of ours, and `limit_raising` wraps the body so it fires on the body's
+    /// first output -- nothing when the body is empty.
+    #[test]
+    fn classify_limit_n_raises_jqs_subtraction_error_for_a_non_number_count_3486() {
+        for (count, message) in [
+            (
+                OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+                "array ([1]) and number (1) cannot be subtracted",
+            ),
+            (
+                OwnedValue::String("a".to_string().into()),
+                r#"string ("a") and number (1) cannot be subtracted"#,
+            ),
+            (
+                OwnedValue::Object(IndexMap::new().into()),
+                "object ({}) and number (1) cannot be subtracted",
+            ),
+        ] {
+            let LimitN::Raise(error) = classify_limit_n(count) else {
+                panic!("expected LimitN::Raise");
+            };
+            assert_eq!(error.message, message);
+            let Expr::Pipe(stages) = limit_raising(&Expr::Identity, &error) else {
+                panic!("expected a pipe");
+            };
+            assert!(matches!(
+                stages.as_slice(),
+                [Expr::Identity, Expr::Error(Some(_))]
+            ));
+        }
+        // The controls that never reach the subtraction.
+        assert!(matches!(
+            classify_limit_n(OwnedValue::Null),
+            LimitN::Unlimited
+        ));
+        assert!(matches!(
+            classify_limit_n(OwnedValue::Bool(true)),
+            LimitN::Unlimited
+        ));
+        assert!(matches!(
+            classify_limit_n(OwnedValue::Int(2)),
+            LimitN::Take(2)
+        ));
+    }
+
     #[test]
     fn classify_limit_n_treats_a_negative_number_literal_as_unlimited() {
         // The other half of `builtin_limit`'s old drift from
@@ -107160,7 +107291,7 @@ mod tests {
         // level test would not actually distinguish the two.
         let n = OwnedValue::NumberLiteral(NumberRepr::Int(-1), "-1".into());
         match classify_limit_n(n) {
-            Ok(LimitN::Unlimited) => {}
+            LimitN::Unlimited => {}
             other => panic!("expected LimitN::Unlimited, got {other:?}"),
         }
     }

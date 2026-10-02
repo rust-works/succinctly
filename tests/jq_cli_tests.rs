@@ -17681,22 +17681,22 @@ fn test_resolve_node_try_catch_handles_ordinary_error() -> Result<()> {
 }
 
 #[test]
-fn test_resolve_limit_path_context_rejects_non_numeric_n() -> Result<()> {
+fn test_resolve_limit_path_context_raises_the_subtraction_error_for_a_non_numeric_n() -> Result<()>
+{
     // `resolve_limit`'s wildcard arm (`path(limit(...))`'s own `n`-argument
-    // check, the path-tracking sibling of `eval_limit`'s equivalent check):
-    // any `n` that isn't a non-negative int reports "limit requires
-    // non-negative integer" rather than silently coercing. Real jq's
-    // `limit/2` is defined via `foreach`/arithmetic, so a non-numeric `n`
-    // fails there with its own "cannot be subtracted" wording instead --
-    // different text, but the same "reject, don't silently misbehave" shape:
-    // both exit non-zero. Verified against jq 1.7.1:
-    // `jq -c 'path(limit("x"; .a))'` on `{"a":1}` exits 5.
+    // check, the path-tracking sibling of `eval_limit`'s equivalent check): a
+    // string, array or object `n` sorts above every number, so jq's `limit/2`,
+    // defined via `foreach` and arithmetic, fails on the body's first output with
+    // its own "cannot be subtracted" message (#3486), which is what this reports
+    // now rather than an error of its own. Verified against jq 1.7.1:
+    // `jq -c 'path(limit("x"; .a))'` on `{"a":1}` exits 5 with
+    // `string ("x") and number (1) cannot be subtracted`.
     let (stdout, stderr, code) =
         run_jq_full(&["-c", "path(limit(\"x\"; .a))"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
     assert!(
-        stderr.contains("limit requires non-negative integer"),
+        stderr.contains("string (\"x\") and number (1) cannot be subtracted"),
         "{stderr}"
     );
     Ok(())
@@ -53085,9 +53085,13 @@ fn test_1687_limit_and_nth_still_bridge_a_live_input_queue() -> Result<()> {
     let inputs = "1\n2\n3\n4\n";
 
     // `first(...)` routes through `each_limit_generic`, the sink-side arm.
+    // jq pulls `inputs` one value at a time (#3486 drives the count the same way), so
+    // `first` stops it after `2`; the program then runs again on the next document,
+    // `3`, and prints once more. This used to print once because the count drained
+    // every remaining input before the body ran.
     let (stdout, code) = run_jq_stdin("first(limit(inputs; 10,20,30))", inputs, &[])?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "10\n");
+    assert_eq!(stdout, "10\n10\n");
 
     // Bare `limit`: `inputs` yields 2,3,4 against the first document, so the
     // body runs once per value of `n`.
@@ -81820,6 +81824,216 @@ fn test_recurse_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_RECURSE_3293)
 }
 
+/// #3486: `limit`'s count is the outer loop, and a string, array or object count
+/// sorts above every number, so jq 1.7.1's `foreach f as $item ($n; .-1; ...)` raises
+/// `<type> (<n>) and number (1) cannot be subtracted` on `f`'s *first output* -- nothing
+/// when `f` is empty -- which is downstream of the count, so a `?//` in the count retries
+/// past it. The raise comes after the first output only: an `A` per output the body
+/// computes shows a body evaluated further. The rows cover value mode, `first`, the path
+/// resolver, `del` and `|=`; the retry answering, producing nothing, raising and halting;
+/// the error with no `?//` (including an empty body, an erroring body and `?`/`try`); and
+/// the `null`, `true`, negative, zero and positive controls. Input `{"a":1,"b":2}`; every
+/// value captured from jq 1.7.1 with `-c`.
+const RETRY_ROWS_LIMIT_NON_NUMBER_COUNT_3486: &[RetryRow3293] = &[
+    (
+        r#"try [limit([1]; ("A"|stderr), ("A"|stderr), 1)] catch ."#,
+        "\"array ([1]) and number (1) cannot be subtracted\"\n",
+        "A",
+        "",
+        0,
+    ),
+    (r#"[limit({}; ("A"|stderr), 1)]?"#, "", "A", "", 0),
+    (r#"[limit("a"; ("A"|stderr) | empty)]"#, "[]\n", "A", "", 0),
+    (
+        r#"[path(limit([1]; (.a, .b) | ("A"|stderr) as $_ | .))]?"#,
+        "",
+        "A",
+        "",
+        0,
+    ),
+    (r#"first(limit([1]; ("A"|stderr), 1))?"#, "", "A", "", 0),
+    (
+        r#"path(limit(([1] as $q ?// $b | ("A"|stderr) | $q); .a))"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(limit(([1] as $q ?// $b | ("A"|stderr) | $q); .a, .b))]"#,
+        "[[\"a\"],[\"b\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(([1] as $q ?// $b | ("A"|stderr) | $q); 1,2,3)]"#,
+        "[1,2,3]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(limit(([1] as $q ?// $b | ("A"|stderr) | $q); 1,2,3)), 9]"#,
+        "[1,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(([1] as $q ?// $b | ("A"|stderr) | $q); 1,2,3)] | length"#,
+        "3\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(limit(([1] as $q ?// $b | ("A"|stderr) | $q); .a))"#,
+        "{\"b\":2}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(limit(([1] as $q ?// $b | ("A"|stderr) | $q); .a)) |= 5"#,
+        "{\"a\":5,\"b\":2}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(([1] as $q ?// $b | ("A"|stderr) | if $q then $q else error("E2") end); 1,2,3)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(limit(([1] as $q ?// $b | ("A"|stderr) | if $q then $q else error("E2") end); .a))"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(([1] as $q ?// $b | ("A"|stderr) | $q // empty); 1,2,3)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(limit(([1] as $q ?// $b | ("A"|stderr) | $q // empty); .a))"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(([1] as $q ?// $b | ("A"|stderr) | if $q then $q else ("h"|halt_error(3)) end); 1,2,3)]"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"path(limit(([1] as $q ?// $b | ("A"|stderr) | if $q then $q else ("h"|halt_error(3)) end); .a))"#,
+        "",
+        "AA",
+        "h",
+        3,
+    ),
+    (
+        r#"[limit(([1] as $q ?// $b | ("A"|stderr) | $q // (1,2)); 10,20,30)]"#,
+        "[10,10,20]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r"[limit([1]; 1,2,3)]",
+        "",
+        "",
+        "array ([1]) and number (1) cannot be subtracted",
+        5,
+    ),
+    (
+        r#"[limit("a"; 1,2,3)]"#,
+        "",
+        "",
+        "string (\"a\") and number (1) cannot be subtracted",
+        5,
+    ),
+    (
+        r"[limit({}; 1,2,3)]",
+        "",
+        "",
+        "object ({}) and number (1) cannot be subtracted",
+        5,
+    ),
+    (r"[limit([1]; empty)]", "[]\n", "", "", 0),
+    (r#"[limit("a"; empty)]"#, "[]\n", "", "", 0),
+    (r#"[limit([1]; error("x"))]"#, "", "", "x", 5),
+    (
+        r#"[limit([1]; 1, error("x"))]"#,
+        "",
+        "",
+        "array ([1]) and number (1) cannot be subtracted",
+        5,
+    ),
+    (r"[limit({}; 1,2,3)?]", "[]\n", "", "", 0),
+    (
+        r#"try limit("a"; 1,2,3) catch ."#,
+        "\"string (\\\"a\\\") and number (1) cannot be subtracted\"\n",
+        "",
+        "",
+        0,
+    ),
+    (
+        r"path(limit([1]; .a))",
+        "",
+        "",
+        "array ([1]) and number (1) cannot be subtracted",
+        5,
+    ),
+    (
+        r#"path(limit("x"; .a))"#,
+        "",
+        "",
+        "string (\"x\") and number (1) cannot be subtracted",
+        5,
+    ),
+    (r"[path(limit({}; empty))]", "[]\n", "", "", 0),
+    (
+        r"del(limit([1]; .a))",
+        "",
+        "",
+        "array ([1]) and number (1) cannot be subtracted",
+        5,
+    ),
+    (r"[limit(null; 1,2,3)]", "[1,2,3]\n", "", "", 0),
+    (r"[limit(true; 1,2,3)]", "[1,2,3]\n", "", "", 0),
+    (r"[limit(-1; 1,2,3)]", "[1,2,3]\n", "", "", 0),
+    (r"[limit(0; 1,2,3)]", "[]\n", "", "", 0),
+    (r"[limit(2; 1,2,3)]", "[1,2]\n", "", "", 0),
+    (
+        r"path(limit(null; .a, .b))",
+        "[\"a\"]\n[\"b\"]\n",
+        "",
+        "",
+        0,
+    ),
+];
+
+#[test]
+fn test_limit_non_number_count_raises_downstream_of_the_count_3486() -> Result<()> {
+    assert_retry_rows_3293(
+        Some(r#"{"a":1,"b":2}"#),
+        "",
+        RETRY_ROWS_LIMIT_NON_NUMBER_COUNT_3486,
+    )
+}
+
 /// #3503: a `?//` in the `update` of `while(cond; update)` / `until(cond; update)`
 /// retries past a failure a later round raises, as jq's does. `update`'s first
 /// alternative yields a state whose own next round raises `E`; the retry
@@ -84452,6 +84666,10 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("[10,20,30] | ", RETRY_ROWS_PATH_FOLD_3293),
         ("[10,20,30] | ", RETRY_ROWS_RECURSE_3293),
         ("[10,20,30] | ", RETRY_ROWS_LOOP_3503),
+        (
+            r#"{"a":1,"b":2} | "#,
+            RETRY_ROWS_LIMIT_NON_NUMBER_COUNT_3486,
+        ),
         ("[10,20,30] | ", RETRY_ROWS_LOOP_COND_3617),
         (r#"{"a":{"a":1}} | "#, RETRY_ROWS_PATH_INDEX_3293),
         // slice 9: `key` over an owned input takes the owned-identity walk.
