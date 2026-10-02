@@ -1,0 +1,45 @@
+# Options shared by both lychee passes in .github/workflows/links.yml (the first
+# attempt and the retry that follows it), so an exclude added here reaches both
+# (#3620). The retry's own `--exclude-path` and the input glob stay on the
+# command line: lychee merges a command-line `--exclude`/`--exclude-path` with
+# these.
+
+verbose = "info"
+no_progress = true
+cache = true
+max_cache_age = "1d"
+max_retries = 3
+retry_wait_time = 2
+accept = ["100..=399"]
+
+exclude_path = ["./target", "./data"]
+
+exclude = [
+  '^https://crates\.io/crates/',
+  '^https://docs\.rs/',
+  '^https://www\.intel\.com/',
+  '^https://dl\.acm\.org/',
+  '^https://lib\.rs/',
+  '^https://developer\.arm\.com/',
+  '^https://www\.agner\.org/',
+  '^https://github\.com/rust-works/succinctly/compare/v',
+  '^https://www\.cs\.cmu\.edu/',
+  '^https://doi\.org/',
+  '^https://no-color\.org/',
+  '^https://www\.reddit\.com/',
+  '^https://vigna\.di\.unimi\.it/',
+  # A PDF under drops.dagstuhl.de/storage/ answers slowly enough to time out
+  # from the runner on every retry (#3616); the host's landing pages are still
+  # checked. Drop this once the server recovers.
+  '^https://drops\.dagstuhl\.de/storage/',
+  # A link pinned to a commit SHA cannot rot, but GitHub's web tier serves those
+  # HTML pages with 503/504s for hours at a time (#3594), and a `commit/` page
+  # has no raw form to check instead.
+  '^https://github\.com/[^/]+/[^/]+/commit/[0-9a-f]{7,40}([/?#.]|$)',
+]
+
+# A pinned `blob/` link is checked at raw.githubusercontent.com instead (still a
+# 404 for a mistyped path, ref or repo).
+remap = [
+  '^https://github\.com/([^/]+)/([^/]+)/blob/([0-9a-f]{7,40}|v[0-9][^/]*)/ https://raw.githubusercontent.com/$1/$2/$3/',
+]
