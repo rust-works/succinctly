@@ -15,7 +15,7 @@ Every environment variable succinctly reads, what it accepts, and what it change
 | [`JQ_COLORS`](#jq_colors)                                 | `succinctly jq`                  | Eight `:`-separated SGR fields | Built-in color scheme         |
 | [`JQ_LIBRARY_PATH`](#jq_library_path)                     | `succinctly jq`                  | `:`-separated directories      | Only `-L` paths and `~/.jq`   |
 | [`HOME`](#home)                                           | `succinctly jq`                  | A directory path               | No `~/.jq` auto-loading       |
-| [`TZ`](#tz)                                               | Library (jq date builtins)       | POSIX `STDoffset[DST]`         | UTC                           |
+| [`TZ`](#tz)                                               | Library (jq date builtins)       | IANA name or POSIX string      | System zone                   |
 | [`SUCCINCTLY_EXPECT_SIMD`](#succinctly_expect_simd)       | Test suite (`cargo test`)        | Comma-separated CPU features   | Expectation check skipped     |
 
 Queries can also read **any** variable through the [`env` builtins](#reading-the-environment-from-a-query).
@@ -109,31 +109,37 @@ non-streaming SVE2, so locally the equivalent check is
 
 ### `TZ`
 
-Sets the timezone used by the jq `localtime` and `mktime` family of date builtins
-([`src/jq/eval.rs`](../../src/jq/eval.rs)).
+Sets the timezone used by the jq `localtime` and `strflocaltime` date builtins, and so by
+`localtime | mktime` ([`src/jq/local_zone.rs`](../../src/jq/local_zone.rs)).
 
-Only the POSIX `STDoffset[DST[offset][,rule]]` form is understood, such as `EST5EDT`, `PST8PDT`, or
-`UTC-5:30`. The offset is read as `hours[:minutes]` and follows the POSIX sign convention, which is
-the opposite of the one most people expect: it is the amount **added to local time to reach UTC**, so
-the positive `5` in `EST5EDT` means five hours *behind* UTC.
+With the `local-zone` feature (on in `cli`, so in the shipped binary) the zone is resolved by
+[`jiff`](https://docs.rs/jiff): `TZ` as an IANA name (`Asia/Tokyo`, `America/New_York`), a
+`:name`, a path to a tz file or a POSIX `STDoffset[DST[offset][,rule]]` string, otherwise the
+system zone (`/etc/localtime`) when `TZ` is unset. The offset and abbreviation are the ones in
+effect **at the timestamp**, so daylight time follows the date. A `TZ` that cannot be read means
+UTC, as it does in jq. `TZ` is read once per process, on the first conversion.
 
-Two limitations are worth knowing, because neither produces an error:
+A POSIX offset follows the POSIX sign convention, the opposite of the one most people expect: it is
+the amount **added to local time to reach UTC**, so the positive `5` in `EST5EDT` means five hours
+*behind* UTC. A daylight-time name with no rule (`EST5EDT`) gets the US rule when no tz file carries
+the name.
 
-- **IANA zone names such as `America/New_York` are not supported.** They fail to parse and silently
-  mean UTC.
-- **DST transition rules are not applied.** The DST portion is parsed but its transition dates are
-  ignored, so `EST5EDT` is always UTC-5 — even in July, when New York is really UTC-4.
+`strflocaltime`'s `%z`, `%Z` and `%s` are the zone's own for the instant, which is not what jq 1.7.1
+prints in daylight time; see
+[limitations.md](../compliance/jq/limitations.md#strflocaltimes-z-z-and-s-are-the-zones-own-where-jq-171s-are-not-3054).
 
-Anything unparseable, and an unset `TZ`, both mean UTC.
+**Windows** does not use the system zone: the released binary reads only a POSIX offset string
+(`EST5`, `UTC-9`) with no daylight-time rule, and everything else is UTC (a name with a digit or a
+sign, such as `Etc/GMT+5`, is misread as a POSIX offset there). A bare `std` library build (no
+`local-zone`) behaves the same, re-reading `TZ` on every call, and `no_std` is always UTC.
 
 ```bash
-# 1700000000 is 2023-11-14T22:13:20Z
-succinctly jq -nc '1700000000 | gmtime'               # [2023,10,14,22,13,20,2,317]
-TZ=EST5EDT succinctly jq -nc '1700000000 | localtime' # [2023,10,14,17,13,20,2,317] (UTC-5)
+# 1720000000 is 2024-07-03T09:46:40Z
+succinctly jq -nc '1720000000 | gmtime'                        # [2024,6,3,9,46,40,3,184]
+TZ=Asia/Tokyo succinctly jq -nc '1720000000 | localtime'       # [2024,6,3,18,46,40,3,184] (UTC+9)
+TZ=America/New_York succinctly jq -nc '1720000000 | localtime' # [2024,6,3,5,46,40,3,184]  (UTC-4, daylight time)
+TZ=America/New_York succinctly jq -nc '1720000000 | strflocaltime("%z %Z")' # "-0400 EDT"
 ```
-
-For anything requiring true local time, set an explicit numeric offset rather than a zone name, and
-change it yourself across DST boundaries.
 
 ## Test-Only Variables
 

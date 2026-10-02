@@ -465,6 +465,7 @@ for the full list.
 | `serde`               | Serde serialize/deserialize support                                                                                       |
 | `regex`               | Regex builtins in jq (included in `cli`)                                                                                  |
 | `cli`                 | CLI tool (jq, yq, locate, generators)                                                                                     |
+| `local-zone`          | System local zone for jq `localtime`/`strflocaltime` via jiff (in `cli`; not Windows)                                     |
 | `bench-runner`        | Unified benchmark runner (bench list/run)                                                                                 |
 | `large-tests`         | 1GB bitvector tests                                                                                                       |
 | `huge-tests`          | 5GB bitvector tests                                                                                                       |

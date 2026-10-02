@@ -129,10 +129,9 @@
 # including a direct port of jq's own leap-year/weekday round-trip torture
 # test from tests/optional.test — surfaced three distinct bugs, each filed
 # with its own verified repro. `localtime` is deliberately absent from the
-# corpus: succinctly's implementation is a best-effort TZ-environment stub
-# (see estimate_local_offset in src/jq/eval.rs) and real jq's localtime output
-# depends on the capturing host's timezone, so a golden captured on one
-# machine would spuriously fail the jq-drift CI check on another.
+# corpus: real jq's localtime output depends on the capturing host's timezone
+# (succinctly's own comes from src/jq/local_zone.rs), so a golden captured on
+# one machine would spuriously fail the jq-drift CI check on another.
 #
 # strftime_unsupported_specifiers originally also covered `%s`, but real jq's
 # `%s` round-trips through libc mktime() on the (UTC-valued) broken-down time,

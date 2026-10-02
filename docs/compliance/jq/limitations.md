@@ -6737,13 +6737,86 @@ succinctly raises a catchable error at exit 5 instead — the "would take the ho
 down" condition. The wording is succinctly's own (`expected string, got strflocaltime
 format`), since jq has none to match.
 
-`strflocaltime` uses the local zone `localtime` already uses, so the two agree with each
-other, and each matches jq for a POSIX `TZ` offset string (`EST5EDT`, `UTC-9`). They do not
-yet resolve an IANA zone name or the system zone and use UTC there instead — a gap rather
-than a deliberate divergence, tracked in
-[#3054](https://github.com/rust-works/succinctly/issues/3054). The `strftime` specifiers the
-two share, and `strftime`'s own `%z`/`%Z`, are tracked in
+`strflocaltime` uses the local zone `localtime` uses, so the two agree with each other
+([#3054](https://github.com/rust-works/succinctly/issues/3054)). Both resolve `TZ` as an IANA
+name, a `:name`, a path or a POSIX string, and the system zone when `TZ` is unset, with the offset
+and abbreviation in effect *at the timestamp* (see
+[the labels below](#strflocaltimes-z-z-and-s-are-the-zones-own-where-jq-171s-are-not-3054)). The
+`strftime` specifiers the two share, and `strftime`'s own `%z`/`%Z`, are tracked in
 [#3055](https://github.com/rust-works/succinctly/issues/3055).
+
+### `strflocaltime`'s `%z`, `%Z` and `%s` are the zone's own, where jq 1.7.1's are not (#3054)
+
+`localtime` and `strflocaltime` ask the system zone through [`jiff`](https://docs.rs/jiff) (the
+`local-zone` feature, on in `cli`), so `strflocaltime` prints the offset, abbreviation and epoch
+the zone has *at that instant*. jq 1.7.1 does not, and the two builds of it disagree with each
+other (`TZ=America/New_York`, `1720000000`, a daylight-time instant; the fields are `05:46:40`,
+four hours behind UTC):
+
+|                           | `strflocaltime("%z %Z %s")`                                                     |
+|---------------------------|---------------------------------------------------------------------------------|
+| jq 1.7.1, macOS           | `"-0500 EST 1720003600"` — the standard offset and name, `%s` an hour late      |
+| jq 1.7.1, glibc           | `"+0000 EST 1720003600"` — `%z` is `+0000` in every zone, `Asia/Tokyo` included |
+| jq 1.8.2, macOS and glibc | `"-0400 EDT 1720000000"`                                                        |
+| succinctly                | `"-0400 EDT 1720000000"`                                                        |
+
+This is recorded as an ADR-0018 rule 4 divergence ("matching would corrupt data"), and that
+reading is for the ADR's owners to confirm: jq 1.7.1's string is well-formed, but a formatted
+`2024-07-03T05:46:40-0500` names an instant an hour off the one the fields describe, and jq 1.8.2
+prints the values succinctly does. If the reading is rejected, the labels would have to reproduce
+1.7.1's per-platform quirks, which 1.8.2 has since dropped. It applies to every instant in
+daylight time, to zones whose offset has changed
+(`TZ=Europe/London`, `0`: `%z` is `+0100`, jq 1.7.1 prints `+0000`), and to `%s`, which jq 1.7.1
+computes from the standard offset. Against the real zone (Python `zoneinfo`; 13 zones, 22
+instants) jq 1.7.1 is right on 64.7% of `%z`, 73.4% of `%Z` and 72.7% of `%s`, jq 1.8.2 on 90.6%,
+98.6% and 98.6%, and this on all of them. jq 1.8.2's remaining mistakes are not reproduced: the
+repeated hour after a fall-back (`America/New_York`, `1730613600` is `-0500 EST`; 1.8.2 prints
+`-0400 EDT` and a `%s` an hour early) and, on macOS, `%z` for a historical offset (`Europe/London`,
+`0`: `+0100 BST`; 1.8.2 prints `+0000 BST`).
+
+Where jq prints the true value, so does this: `localtime` and `localtime | mktime` match jq on
+macOS for every instant tried, in both hemispheres, across the 2024 daylight-time edges, back to
+1684, and for a zone whose offset has changed (`Asia/Kathmandu` was `+05:30` until 1986); on Linux
+the same except before 1900 (last bullet below). `mktime` itself is `timegm`, as in jq, and does
+not read the zone at all.
+
+What else differs from jq 1.7.1 and 1.8.2 (each measured against `/usr/bin/jq`, `/opt/homebrew/bin/jq`
+and the `jq-linux-arm64` release binaries):
+
+- **Windows is unchanged.** `jiff` has no zoneinfo directory to read there, so the Windows binary
+  keeps reading only a POSIX offset string (`EST5`, `UTC-9`); an IANA name or an unset `TZ` is UTC
+  and a daylight-time rule is not applied. A bare `std` library build (no `local-zone`) is the
+  same, and `no_std` is UTC. In that POSIX-only reading a name containing a digit or a sign
+  (`Etc/GMT+5`) is taken for a POSIX offset (`-5h`, labelled `Etc`), as it was before.
+- **`TZ` is read once per process**, on the first conversion. An embedder that changes `TZ`
+  afterwards (`std::env::set_var`) keeps the first zone; the POSIX-only reading above re-reads it
+  on every call. jq cannot change its own environment, so the CLI is unaffected.
+- **A `TZ` jiff cannot read is UTC**, as in jq (`Foo/Bar`, `garbage`, an empty `TZ`). The offset
+  forms libc accepts that jiff does not read as UTC: `TZ=5`, and an offset beyond ±24h
+  (`XXX99`, `XXX-25`; jq applies them as written on macOS and clamped to ±24h on glibc).
+- **`TZ=5` with `%Z`** raises `strflocaltime/1: unknown system failure` in jq (libc's `%Z` is empty
+  for a name-less zone); this prints `UTC`.
+- **A POSIX string with a daylight-time name and no rule** (`EST5EDT`) gets the US rule
+  (`M3.2.0,M11.1.0`) when no tz file carries the name, as libc does — newer distributions no
+  longer ship `EST5EDT`. For a US-offset name every jq build tried agrees (`XYZ5XYD`); for another
+  offset (`CET-1CEST`) macOS jq applies the same rule and glibc a different one, so the glibc
+  result differs.
+- **A POSIX string with an explicit rule** applies it to every year; jq on macOS showed standard
+  time in 1906, on 1970-01-01 and in year 33658 for `NZST-12NZDT,M9.5.0,M4.1.0/3` and
+  `EST5EDT,M3.2.0,M11.1.0`.
+- **Instants past year 9999** are folded back by whole 400-year cycles (146097 days, a whole
+  number of weeks, so the weekday and the daylight-time rule recur) and answered by the zone at
+  that position, as libc does for an IANA zone: `TZ=America/New_York`, `1e12` (33658-09-26) is
+  daylight time and 100 days on is standard time, in all four jq builds tried. Before year
+  -9999 the zone's earliest offset applies, as in libc. jq reaches year 2³¹ and wraps the year
+  there (`67768036191676799` under `TZ=America/New_York` prints a negative year); this raises
+  `error converting number of seconds since epoch to datetime`.
+- **A broken-down array** passed to `strflocaltime` is labelled by the zone at that wall-clock
+  time, normalised as `mktime` does; a time the zone skipped takes the later offset and a repeated
+  one the earlier.
+- **`mktime` and `%s` before 1900** fail (`mktime`) or print `-1` (`%s`) by succinctly's existing
+  `timegm` rule, modelled on the macOS jq; jq on Linux converts such dates. This is unrelated to
+  the zone source and is the same with any `TZ`.
 
 ### A structurally malformed value doesn't abort the rest of a multi-value stream — no carve-out; this one is out of policy
 

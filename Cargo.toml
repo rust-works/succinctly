@@ -54,7 +54,14 @@ portable-popcount = []
 serde = ["dep:serde"]
 
 # CLI tool features
-cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", "md5", "serde", "ctrlc", "regex"]
+cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", "md5", "serde", "ctrlc", "regex", "local-zone"]
+
+# Resolve the system's local time zone for jq's `localtime`/`strflocaltime`
+# (#3054) through jiff: an IANA `TZ` name or the system zone, with the offset
+# and abbreviation in effect at the timestamp. Without it, and on Windows (jiff
+# needs a bundled tz database there; see docs/compliance/jq/limitations.md), the
+# evaluator reads only a POSIX `TZ` offset string.
+local-zone = ["std", "dep:jiff"]
 
 # Enable regex support in jq query language
 regex = ["dep:regex"]
@@ -123,6 +130,12 @@ md5 = { version = "0.8", optional = true }
 ctrlc = { version = "3.4", optional = true }
 chrono = { version = "0.4", optional = true }
 serde_yaml = { version = "0.9", optional = true }
+
+# The system time zone for the `local-zone` feature. Not on Windows, which has no
+# zoneinfo directory for `tzdb-zoneinfo` to read: the released Windows binary keeps
+# the POSIX-offset-string model exactly (#3054).
+[target.'cfg(not(windows))'.dependencies]
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"], optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
