@@ -27408,7 +27408,6 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::SetPath(..)
             | Builtin::Sin
             | Builtin::Sinh
-            | Builtin::Skip(..)
             | Builtin::SplitRegex(..)
             | Builtin::Splits(_)
             | Builtin::SplitsFlags(..)
@@ -27480,10 +27479,15 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             Builtin::Min | Builtin::Max | Builtin::MinBy(_) | Builtin::MaxBy(_) => Extremum,
             // Navigation ([`owned_identity_nav_supported`]) and the stages
             // `eval_owned_identity_stages` answers itself: no rule to need.
+            // `skip(n; f)` (#3513) is `limit`'s twin here: its outputs are
+            // outputs of `f` at this position, so `f` runs through the pipe
+            // and each one carries its own identity, where a rule would
+            // place every one of them at the stage's input.
             Builtin::GetPath(_)
             | Builtin::First
             | Builtin::Last
             | Builtin::Nth(_)
+            | Builtin::Skip(..)
             | Builtin::Recurse
             | Builtin::RecurseDown
             // `at_offset`/`at_position` jump to another *document* node,
@@ -27805,6 +27809,13 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
                 }
             }
             Expr::Limit { n, expr } => {
+                if !owned_identity_stage_resolvable(n) || !body(expr) {
+                    return false;
+                }
+            }
+            // #3513: `skip(n; f)` is `limit`'s twin -- same count, same body,
+            // the first `n` outputs dropped rather than the rest.
+            Expr::Builtin(Builtin::Skip(n, expr)) => {
                 if !owned_identity_stage_resolvable(n) || !body(expr) {
                     return false;
                 }
@@ -29864,22 +29875,63 @@ fn eval_owned_identity_any_all<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// `limit(n; body)` / `first(body)` over an owned value with identity: at
-/// most `take` outputs of the body (all of them for `None`), each continued
-/// into `rest` before the next is pulled -- the same order
-/// `each_limit_with_n_generic` delivers.
+/// The outputs of a body that `limit`, `first` and `skip` deliver (#3513):
+/// the first `skip` are dropped, then at most `take` of the rest are
+/// delivered (all of them for `None`). `limit` and `first` drop none and
+/// `skip` bounds nothing, but any pair means the same thing -- drop, then
+/// take.
+#[derive(Clone, Copy)]
+struct OutputWindow {
+    skip: usize,
+    take: Option<usize>,
+}
+
+impl OutputWindow {
+    /// `first(body)`: the first output.
+    const FIRST: Self = Self {
+        skip: 0,
+        take: Some(1),
+    };
+
+    /// `limit(n; body)` for the count `n_value`.
+    fn limit(n_value: OwnedValue) -> Result<Self, EvalError> {
+        Ok(Self {
+            skip: 0,
+            take: match classify_limit_n(n_value)? {
+                LimitN::Unlimited => None,
+                LimitN::Take(n) => Some(n),
+            },
+        })
+    }
+
+    /// `skip(n; body)` for the count `n_value`.
+    fn skip(n_value: OwnedValue) -> Result<Self, EvalError> {
+        Ok(Self {
+            skip: classify_skip_n(n_value)?,
+            take: None,
+        })
+    }
+}
+
+/// `limit(n; body)` / `first(body)` / `skip(n; body)` over an owned value
+/// with identity: the body's outputs in `window`, each continued into `rest`
+/// before the next is pulled -- the same order `each_limit_with_n_generic`
+/// delivers. A dropped output is never continued, and never counts towards
+/// the window's `take`.
 fn eval_owned_identity_bounded<S: EvalSemantics, V: DocumentValue>(
     body: &Expr,
-    take: Option<usize>,
+    window: OutputWindow,
     rest: &[Expr],
     value: Cow<'_, OwnedValue>,
     id: OwnedIdentity<V>,
     optional: bool,
     tail: &mut OwnedIdentityTail<'_, V>,
 ) -> Flow {
+    let OutputWindow { skip, take } = window;
     if take == Some(0) {
         return Flow::Exhausted;
     }
+    let mut to_skip = skip;
     let mut count = 0usize;
     let mut rest_escape: Option<Control> = None;
     let mut rest_stopped: Option<Flow> = None;
@@ -29889,6 +29941,10 @@ fn eval_owned_identity_bounded<S: EvalSemantics, V: DocumentValue>(
         id,
         optional,
         OwnedIdentityTail::Pairs(&mut |v, vid| {
+            if to_skip > 0 {
+                to_skip -= 1;
+                return Flow::Exhausted;
+            }
             count += 1;
             match eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail.reborrow()) {
                 Flow::Exhausted => {
@@ -30365,7 +30421,18 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 Err(control) => Flow::Escaped(control),
             }
         }
-        Expr::Limit { n, expr } => {
+        // #3513: `skip(n; body)` is `limit`'s twin -- the count is read and
+        // retried exactly as `limit`'s is, and the body runs through this
+        // pipe so each output in the window keeps its own identity. `skip`
+        // used to be a ruled stage, which placed every output at the
+        // stage's *input* (`.a | skip(1; .b[]) | key` was `"a"`, not `1`).
+        Expr::Limit { n, expr } | Expr::Builtin(Builtin::Skip(n, expr)) => {
+            let window_of: fn(OwnedValue) -> Result<OutputWindow, EvalError> =
+                if matches!(strip_parens(stage), Expr::Builtin(Builtin::Skip(..))) {
+                    OutputWindow::skip
+                } else {
+                    OutputWindow::limit
+                };
             let escaped = core::cell::RefCell::new(None);
             let resolved =
                 match owned_identity_resolve_at::<S, V>(n, &value, &id, optional, &escaped) {
@@ -30379,14 +30446,13 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 optional,
                 &id.root_witness(),
                 &mut |n_value| {
-                    let take = match classify_limit_n(n_value) {
-                        Ok(LimitN::Unlimited) => None,
-                        Ok(LimitN::Take(n)) => Some(n),
+                    let window = match window_of(n_value) {
+                        Ok(window) => window,
                         Err(e) => return Flow::Escaped(Control::Error(e)),
                     };
                     eval_owned_identity_bounded::<S, V>(
                         expr,
-                        take,
+                        window,
                         rest,
                         Cow::Borrowed(&value),
                         id.clone(),
@@ -30402,7 +30468,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::FirstExpr(inner) => eval_owned_identity_bounded::<S, V>(
             inner,
-            Some(1),
+            OutputWindow::FIRST,
             rest,
             value,
             id,

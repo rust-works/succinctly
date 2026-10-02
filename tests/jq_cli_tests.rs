@@ -83097,11 +83097,330 @@ const RETRY_ROWS_OWNED_IDENTITY_3293: &[RetryRow3293] = &[
         "E",
         5,
     ),
+    // #3513, jq 1.8.2 (1.7.1 has no `skip`): `path(skip(K; .a[])) | last`,
+    // `K`'s retry answering `1`, so the one element left is `.a[1]`
+    (
+        r#"skip(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then error("E") else 1 end); .a[]) | key"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    // #3513: the retry's own negative count surfaces, not the abandoned `E`
+    (
+        r#"skip(([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then error("E") else -1 end); .a[]) | key"#,
+        "",
+        "AA",
+        "skip doesn't support negative count",
+        5,
+    ),
 ];
 
 #[test]
 fn test_owned_identity_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some(r#"{"a":[1,2]}"#), "", RETRY_ROWS_OWNED_IDENTITY_3293)
+}
+
+/// #3513: `skip(n; f) | key` (and `| path`) names the position of the output
+/// it delivers, as `limit`'s twin does. Over an owned input the owned-identity
+/// walk treated `skip` as an opaque stage and placed every output at the
+/// stage's *input* (`.a | skip(1; .b[]) | key` was `"a"`, and
+/// `[1,2,3] | [skip(1; .[]) | key]` was `[]`, the root having no key); the
+/// body now runs through the walk. Each row runs on both routes -- `-n` with
+/// the document as a prefix builds an owned value, the document on stdin keeps
+/// the cursor -- and every expectation is jq 1.8.2's `[path(F) | last]` and
+/// `[path(F)]` (jq 1.7.1 has no `skip`).
+#[test]
+fn test_skip_key_and_path_name_the_delivered_element_on_both_routes_3513() -> Result<()> {
+    let doc = r#"{"a":{"b":[10,20,30,40],"c":{"x":1,"y":2,"z":3}},"d":[1,[2,3],4]}"#;
+    for (filter, keys, paths) in [
+        (
+            r".a | skip(1; .b[])",
+            r"[1,2,3]",
+            r#"[["a","b",1],["a","b",2],["a","b",3]]"#,
+        ),
+        (
+            r".a | skip(0; .b[])",
+            r"[0,1,2,3]",
+            r#"[["a","b",0],["a","b",1],["a","b",2],["a","b",3]]"#,
+        ),
+        // a count past the end leaves nothing to name
+        (r".a | skip(9; .b[])", r"[]", r"[]"),
+        (
+            r".a | skip(1; .c[])",
+            r#"["y","z"]"#,
+            r#"[["a","c","y"],["a","c","z"]]"#,
+        ),
+        // a generator count drops once per count value
+        (
+            r".a | skip(0, 1; .b[])",
+            r"[0,1,2,3,1,2,3]",
+            r#"[["a","b",0],["a","b",1],["a","b",2],["a","b",3],["a","b",1],["a","b",2],["a","b",3]]"#,
+        ),
+        (r".d | skip(1; .[])", r"[1,2]", r#"[["d",1],["d",2]]"#),
+        (r".d | skip(1; .[1][])", r"[1]", r#"[["d",1,1]]"#),
+        // a fractional count floors
+        (
+            r".a | skip(1.5; .b[])",
+            r"[1,2,3]",
+            r#"[["a","b",1],["a","b",2],["a","b",3]]"#,
+        ),
+        (
+            r".a.b | skip(2; .[])",
+            r"[2,3]",
+            r#"[["a","b",2],["a","b",3]]"#,
+        ),
+        (
+            r".a | skip(1; .b[], .c[])",
+            r#"[1,2,3,"x","y","z"]"#,
+            r#"[["a","b",1],["a","b",2],["a","b",3],["a","c","x"],["a","c","y"],["a","c","z"]]"#,
+        ),
+        // composed with the other bounded stages
+        (
+            r".a | limit(2; skip(1; .b[]))",
+            r"[1,2]",
+            r#"[["a","b",1],["a","b",2]]"#,
+        ),
+        (
+            r".a | skip(1; limit(3; .b[]))",
+            r"[1,2]",
+            r#"[["a","b",1],["a","b",2]]"#,
+        ),
+        (
+            r".a | skip(1; skip(1; .b[]))",
+            r"[2,3]",
+            r#"[["a","b",2],["a","b",3]]"#,
+        ),
+        (r".a | first(skip(1; .b[]))", r"[1]", r#"[["a","b",1]]"#),
+    ] {
+        for (tail, expected) in [("key", keys), ("path", paths)] {
+            let collected = format!("[{filter} | {tail}]");
+            let (stdout, stderr, code) = run_jq_full(&["-c", &collected], Some(doc))?;
+            assert_eq!(
+                (stdout.trim_end(), code),
+                (expected, 0),
+                "`{collected}` (cursor route): stderr {stderr:?}"
+            );
+            let owned = format!("{doc} | {collected}");
+            let (stdout, stderr, code) = run_jq_full(&["-nc", &owned], None)?;
+            assert_eq!(
+                (stdout.trim_end(), code),
+                (expected, 0),
+                "`{owned}` (owned route): stderr {stderr:?}"
+            );
+        }
+    }
+    // At the root: the stage's input has no key, so placing every output
+    // there answered `[]` where the delivered elements are `[1,2]`.
+    for (args, input, expected) in [
+        (["-nc", "[1,2,3] | [skip(1; .[]) | key]"], None, "[1,2]"),
+        (["-c", "[skip(1; .[]) | key]"], Some("[1,2,3]"), "[1,2]"),
+        (
+            ["-nc", "[1,2,3] | [skip(1; .[]) | path]"],
+            None,
+            "[[1],[2]]",
+        ),
+        (
+            ["-c", "[skip(1; .[]) | path]"],
+            Some("[1,2,3]"),
+            "[[1],[2]]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&args, input)?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{}`: stderr {stderr:?}",
+            args[1]
+        );
+    }
+    // A negative count keeps its error on both routes.
+    for (args, input) in [
+        (["-nc", r#"{"b":[1,2]} | skip(-1; .b[]) | key"#], None),
+        (["-c", "skip(-1; .b[]) | key"], Some(r#"{"b":[1,2]}"#)),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&args, input)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "`{}`: stderr {stderr:?}",
+            args[1]
+        );
+        assert!(
+            stderr.contains("skip doesn't support negative count"),
+            "`{}`: stderr {stderr:?}",
+            args[1]
+        );
+    }
+    Ok(())
+}
+
+/// #3513: `skip(n; f)` is `limit`'s twin on the owned-identity walk, so past
+/// the walk's own gates it must do what `limit` does -- `skip(0; f)` is `f`,
+/// as `limit(1000; f)` is on a body this short. Two shapes the walk does not
+/// take: a body it cannot run (`at_offset` has no offsets to jump to over an
+/// owned value, so the gate refuses the whole pipe and it is answered
+/// elsewhere), and a count whose own path-context read fails to resolve
+/// (`parent(-1)`). Pinned as agreement with `limit`, not as a value of their
+/// own: jq has no `at_offset`, and the count's error text is `parent`'s.
+#[test]
+fn test_skip_follows_limit_where_the_owned_walk_refuses_or_fails_3513() -> Result<()> {
+    let doc = r#"{"a":{"b":[1,2,3]}}"#;
+    for body in ["at_offset(0)", "at_position(1; 1)"] {
+        let skipped = run_jq_full(
+            &["-nc", &format!("{doc} | .a | [skip(0; {body}) | key]")],
+            None,
+        )?;
+        let limited = run_jq_full(
+            &["-nc", &format!("{doc} | .a | [limit(1000; {body}) | key]")],
+            None,
+        )?;
+        assert_eq!(skipped, limited, "`{body}`: skip must answer as limit does");
+    }
+    for count in ["parent(-1) | length", r#"parent("x") | length"#] {
+        let (stdout, stderr, code) = run_jq_full(
+            &["-nc", &format!("{doc} | .a | skip({count}; .b[]) | key")],
+            None,
+        )?;
+        let (l_stdout, l_stderr, l_code) = run_jq_full(
+            &["-nc", &format!("{doc} | .a | limit({count}; .b[]) | key")],
+            None,
+        )?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "`skip({count}; ..)`: stderr {stderr:?}"
+        );
+        assert_eq!(
+            (&stdout, &stderr, code),
+            (&l_stdout, &l_stderr, l_code),
+            "`{count}`: the count's error is the same for skip and limit"
+        );
+    }
+    Ok(())
+}
+
+/// #3513: an error raised while the body produces a dropped position
+/// surfaces before anything is delivered, and one raised downstream of a
+/// delivered position surfaces after the earlier deliveries -- on both
+/// routes, as jq 1.8.2's `path(skip(...))` does (jq 1.7.1 has no `skip`).
+#[test]
+fn test_skip_errors_in_dropped_and_delivered_positions_3513() -> Result<()> {
+    let doc = r#"{"a":{"b":[1,2,3]}}"#;
+    for (filter, expected_stdout) in [
+        // jq 1.8.2: `path(skip(1; .b[0], error("E"), .b[1])) | last`
+        (r#".a | skip(1; .b[0], error("E"), .b[1]) | key"#, ""),
+        // jq 1.8.2: `path(skip(1; .b[])) | last | if . == 2 then error("E") else . end`
+        (
+            r#".a | skip(1; .b[]) | if key == 2 then error("E") else key end"#,
+            "1\n",
+        ),
+    ] {
+        let owned = format!("{doc} | {filter}");
+        for ((stdout, stderr, code), route) in [
+            (run_jq_full(&["-nc", &owned], None)?, "owned"),
+            (run_jq_full(&["-c", filter], Some(doc))?, "cursor"),
+        ] {
+            assert_eq!(
+                (stdout.as_str(), code),
+                (expected_stdout, 5),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains(": E"),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3513: the count of `limit` shares the window `skip`'s count builds, and a
+/// negative one still means "no limit" there, as in the pinned jq 1.7.1
+/// (`path(.a | limit(-1; .b[]))` is every path; jq 1.8.2 raises instead, which
+/// this follows the pin over) -- on both routes.
+#[test]
+fn test_limit_negative_count_key_and_path_follow_the_pinned_jq_3513() -> Result<()> {
+    let doc = r#"{"a":{"b":[1,2,3]}}"#;
+    for (tail, expected) in [
+        ("key", "[0,1,2]"),
+        ("path", r#"[["a","b",0],["a","b",1],["a","b",2]]"#),
+    ] {
+        let filter = format!(".a | [limit(-1; .b[]) | {tail}]");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}` (cursor route): stderr {stderr:?}"
+        );
+        let owned = format!("{doc} | {filter}");
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &owned], None)?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{owned}` (owned route): stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3513, yq mode: `skip` is not yq syntax (yq v4.53.3's lexer rejects it;
+/// `--jq-extensions` opts into succinctly's jq surface), so there is no yq
+/// oracle for it and the rule is the one `limit` already follows -- an output
+/// keeps the position of the element `skip` delivered, on the owned route
+/// (`-n`) as on the cursor route. Rows captured from `succinctly yq
+/// --jq-extensions` on the cursor route, which was already right.
+#[test]
+fn test_skip_key_names_the_delivered_element_in_yq_mode_3513() -> Result<()> {
+    let doc = r#"{"a":{"b":[1,2,3]}}"#;
+    let cursor_doc = "a:\n  b: [1, 2, 3]\n";
+    for (filter, expected) in [
+        (".a | [skip(1; .b[]) | key]", "[1,2]"),
+        (
+            ".a | [skip(1; .b[]) | path]",
+            r#"[["a","b",1],["a","b",2]]"#,
+        ),
+    ] {
+        let owned = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args([
+                "yq",
+                "--jq-extensions",
+                "-n",
+                "-o",
+                "json",
+                "-I",
+                "0",
+                &format!("{doc} | {filter}"),
+            ])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&owned.stderr);
+        assert_eq!(
+            String::from_utf8_lossy(&owned.stdout).trim_end(),
+            expected,
+            "#3513 (yq, owned): `{filter}`: stderr={stderr:?}"
+        );
+        let cursor = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(cursor_doc.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        let stderr = String::from_utf8_lossy(&cursor.stderr);
+        assert_eq!(
+            String::from_utf8_lossy(&cursor.stdout).trim_end(),
+            expected,
+            "#3513 (yq, cursor): `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
 }
 
 /// #3293 slice 2: every table above again, with the operand's input built
