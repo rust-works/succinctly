@@ -546,6 +546,38 @@ for rc_entry in "${RC_ENTRIES[@]}"; do
   done
 done
 
+# #3503 (`while`/`until`): `update`'s first `?//` alternative yields a state whose own
+# next round raises `E`; the retry answers, produces nothing, raises, fails to
+# destructure, fans out, or the failure is a `halt_error` (never retried past). The
+# marker is `as $_`. `__U__` stands for `update`; input is RETRY_INPUT (`[10,20,30]`).
+WU_VARIANTS=(
+  'if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else [] end'
+  'if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else empty end) elif length==1 then error("E") else [] end'
+  'if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else [] end'
+  'if length==3 then ([1] as $q ?// {$z} | ("A"|stderr) as $_ | .[0:1]) elif length==1 then error("E") else [] end'
+  'if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then (.[0:1], .[1:]) else .[1:] end) elif length==1 then error("E") else [] end'
+  'if length==3 then ([1] as $q ?// $b | ("A"|stderr) as $_ | if $q then .[0:1] else .[1:] end) elif length==1 then ("h"|halt_error(3)) else [] end'
+)
+WU_ENTRIES=(
+  'while::::while(length>0; __U__)'
+  'until::::until(length<=0; __U__)'
+  'while-optional::::(while(length>0; __U__))?'
+  'until-optional::::(until(length<=0; __U__))?'
+)
+for wu_entry in "${WU_ENTRIES[@]}"; do
+  wu_rest="$wu_entry"
+  wu_label="${wu_rest%%::*}"
+  wu_rest="${wu_rest#*::}"
+  wu_tag="${wu_rest%%::*}"
+  wu_template="${wu_rest#*::}"
+  for v in "${WU_VARIANTS[@]}"; do
+    wu_filled="${wu_template//__U__/$v}"
+    for c in "${R_CONSUMERS[@]}"; do
+      run_case "$wu_label" "${c//__W__/$wu_filled}" "$wu_tag" "$RETRY_STDIN_FILE"
+    done
+  done
+done
+
 # #3293 slice 5 (path-mode computed index): a `?//` in `.[K]`'s key whose first
 # alternative is an array, so indexing the object fails at the sink, and whose
 # retry is the string key. The key generators' endings: the retry answers,

@@ -44504,7 +44504,7 @@ fn native_recurse_end(abort: Option<RecurseAbort>, flow: Flow) -> Option<Recurse
 /// lazy operand inside `f` suspends it on the way into the sink the next
 /// node is visited from.
 #[derive(Clone, Copy)]
-struct RecurseNativeBudget {
+pub(crate) struct RecurseNativeBudget {
     /// A stack address taken when the walk started.
     origin: usize,
     /// The ambient frame depth when the walk started.
@@ -44514,7 +44514,7 @@ struct RecurseNativeBudget {
 }
 
 /// The ambient state one native `recurse` level holds while its `f` runs.
-struct RecurseNativeLevel {
+pub(crate) struct RecurseNativeLevel {
     _frames: ambient_frame_depth::Guard,
     _origin: recurse_native_origin::Guard,
 }
@@ -53096,6 +53096,34 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md).
 pub(crate) const WHILE_UNTIL_MAX_STEPS: usize = 100_000;
 
+/// The native-stack budget a `while`/`until` loop nests its rounds under when
+/// its `update` holds a `?//`, or `None` when it holds none (#3503).
+///
+/// `jq` retries a `?//` alternative when a failure raised *after* it -- in a
+/// later round of the loop, which is everything downstream of `update` -- reaches
+/// it, so `update` has to be driven through a live sink with the rest of the loop
+/// run inside it, one native level per round. An `update` without a `?//` has
+/// nothing to retry and keeps the in-place loop, which costs no stack depth.
+/// [`contains_retrying_pattern_bind`] answers `false` after one load for a
+/// program with no `?//` at all, so this adds nothing there.
+///
+/// The budget is `recurse`'s own ([`RecurseNativeBudget`]): it measures from the
+/// outermost live level, so a loop nested in another's `update`, in a `recurse`
+/// walk or in `def` recursion spends from one ceiling rather than starting a
+/// fresh one, and each round's frames are charged on the ambient frame guard.
+pub(crate) fn loop_stream_budget(update: &Expr) -> Option<RecurseNativeBudget> {
+    contains_retrying_pattern_bind(update).then(RecurseNativeBudget::start)
+}
+
+/// Enter the next native level of a loop whose [`loop_stream_budget`] is `budget`,
+/// or `None` when it has none or the stack it has spent is past the ceiling a
+/// `recurse` walk descends to before it queues ([`RECURSE_NATIVE_STACK_BYTES`]).
+/// Past it the loop takes the in-place path, which cannot see a retry but cannot
+/// overflow the stack either (#3503). Hold the guard while the round runs.
+pub(crate) fn loop_enter_stream(budget: Option<RecurseNativeBudget>) -> Option<RecurseNativeLevel> {
+    budget?.enter_level(0)
+}
+
 /// Evaluate `until(cond; update)` - apply update until cond is true.
 ///
 /// jq defines this as a backtracking generator (`def _until: if cond then .
@@ -53130,7 +53158,7 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let demoted_cond = demote_for_reentry(cond, &RootWitness::Owned);
     let demoted_update = demote_for_reentry(update, &RootWitness::Owned);
     let cond = LoopOperand::new(cond, &demoted_cond);
-    let update = LoopOperand::new(update, &demoted_update);
+    let update = LoopOperand::for_update(update, &demoted_update);
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut budget = WHILE_UNTIL_MAX_STEPS;
     let result = until_step::<S>(
@@ -53154,11 +53182,62 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 struct LoopOperand<'e> {
     expr: &'e Expr,
     demoted: &'e Expr,
+    /// #3503: the native-stack budget a loop whose operand holds a `?//` nests
+    /// its rounds under (see [`loop_stream_budget`]); `None` for any other.
+    stream: Option<RecurseNativeBudget>,
 }
 
 impl<'e> LoopOperand<'e> {
     fn new(expr: &'e Expr, demoted: &'e Expr) -> Self {
-        Self { expr, demoted }
+        Self {
+            expr,
+            demoted,
+            stream: None,
+        }
+    }
+
+    /// [`Self::new`] for `update`, which a `?//` retry has to reach through a
+    /// live sink (#3503).
+    fn for_update(expr: &'e Expr, demoted: &'e Expr) -> Self {
+        Self {
+            expr,
+            demoted,
+            stream: loop_stream_budget(expr),
+        }
+    }
+
+    /// The native level the next round nests under, when this operand must be
+    /// driven through a live sink ([`Self::drive_each`]) rather than collect its
+    /// outputs first; hold it for as long as the round runs (#3503).
+    fn enter_stream(&self) -> Option<RecurseNativeLevel> {
+        loop_enter_stream(self.stream)
+    }
+
+    /// [`Self::fork`] with each output handed to `step` as it is produced
+    /// instead of collected first, so a failure `step` raises on one output
+    /// reaches a `?//` inside this operand while it can still retry (#3503).
+    /// The same ordering as the fork's: every output the operand produced
+    /// before its own escape is stepped, then the escape fires.
+    fn drive_each<S: EvalSemantics>(
+        &self,
+        input: &OwnedValue,
+        optional: bool,
+        ambient: bool,
+        step: &mut dyn FnMut(OwnedValue) -> Result<(), Control>,
+    ) -> Result<(), Control> {
+        let expr = if ambient { self.expr } else { self.demoted };
+        let abort = StashedEscape::new();
+        let flow = eval_each_owned::<S>(expr, input, optional, Reentry::Proven, &mut |next| {
+            abort.begin();
+            match step(next) {
+                Ok(()) => Demand::Continue,
+                Err(control) => abort.stop(control),
+            }
+        });
+        match abort.resume(flow, direct_pattern_retry(expr)) {
+            Flow::Escaped(control) => Err(control),
+            Flow::Exhausted | Flow::Stopped { .. } => Ok(()),
+        }
     }
 
     /// [`eval_owned_expr_fork`] over this operand: `expr` itself while
@@ -53231,6 +53310,13 @@ fn until_step<S: EvalSemantics>(
         // `update` output — continue the loop in place rather than
         // recursing, so this step costs no stack depth.
         if cond_control.is_none() && cond_vals.len() == 1 && !cond_vals[0].is_truthy() {
+            // #3503: an `update` holding a `?//` runs the rest of the loop inside
+            // its sink, so the retry can follow a failure a later round raises.
+            if let Some(_level) = update.enter_stream() {
+                return update.drive_each::<S>(&state, optional, ambient, &mut |next| {
+                    until_step::<S>(cond, update, next, optional, outputs, budget, false)
+                });
+            }
             let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {
                 state = update_vals.into_iter().next().unwrap();
@@ -53249,6 +53335,10 @@ fn until_step<S: EvalSemantics>(
         for cond_val in &cond_vals {
             if cond_val.is_truthy() {
                 outputs.push(state.clone());
+            } else if let Some(_level) = update.enter_stream() {
+                update.drive_each::<S>(&state, optional, ambient, &mut |next| {
+                    until_step::<S>(cond, update, next, optional, outputs, budget, false)
+                })?;
             } else {
                 let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
                 for update_val in update_vals {
@@ -53288,7 +53378,7 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let demoted_cond = demote_for_reentry(cond, &RootWitness::Owned);
     let demoted_update = demote_for_reentry(update, &RootWitness::Owned);
     let cond = LoopOperand::new(cond, &demoted_cond);
-    let update = LoopOperand::new(update, &demoted_update);
+    let update = LoopOperand::for_update(update, &demoted_update);
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut budget = WHILE_UNTIL_MAX_STEPS;
     let result = while_step::<S>(
@@ -53344,6 +53434,12 @@ fn while_step<S: EvalSemantics>(
         // recursing, so this step costs no stack depth (see [`until_step`]).
         if cond_control.is_none() && cond_vals.len() == 1 && cond_vals[0].is_truthy() {
             outputs.push(state.clone());
+            // #3503: see [`until_step`].
+            if let Some(_level) = update.enter_stream() {
+                return update.drive_each::<S>(&state, optional, ambient, &mut |next| {
+                    while_step::<S>(cond, update, next, optional, outputs, budget, false)
+                });
+            }
             let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {
                 state = update_vals.into_iter().next().unwrap();
@@ -53362,6 +53458,12 @@ fn while_step<S: EvalSemantics>(
         for cond_val in &cond_vals {
             if cond_val.is_truthy() {
                 outputs.push(state.clone());
+                if let Some(_level) = update.enter_stream() {
+                    update.drive_each::<S>(&state, optional, ambient, &mut |next| {
+                        while_step::<S>(cond, update, next, optional, outputs, budget, false)
+                    })?;
+                    continue;
+                }
                 let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
                 for update_val in update_vals {
                     while_step::<S>(cond, update, update_val, optional, outputs, budget, false)?;
@@ -105331,6 +105433,108 @@ mod tests {
                 "`{filter}`"
             );
         }
+    }
+
+    /// #3503: `while`/`until` drive an `update` that holds a `?//` through a live
+    /// sink, so the retry follows a failure a later round raises. In `no_std` only
+    /// an `update` that *is* a `?//` bind is recognised ([`direct_pattern_retry`]);
+    /// the wrapped form needs the retry generation. Captured from jq 1.7.1 with
+    /// `-c` over `[10,20,30]`.
+    #[test]
+    fn test_loop_update_retry_follows_a_later_rounds_failure_3503() {
+        let direct = r#"([1] as $q ?// $b | if length==3 then (if $q then .[0:1] else .[1:] end) elif length==1 then error("E") else [] end)"#;
+        for (filter, values, end) in [
+            (
+                format!("[while(length>0; {direct})]"),
+                vec![r"[[10,20,30],[10],[20,30]]"],
+                "",
+            ),
+            (format!("[until(length<=0; {direct})]"), vec![r"[[]]"], ""),
+            (
+                r#"[while(length>0; ([1] as $q ?// $b | if length==3 then (if $q then .[0:1] else error("E2") end) elif length==1 then error("E") else [] end))]"#.to_string(),
+                vec![],
+                "error: E2",
+            ),
+            (
+                r#"[until(length<=0; ([1] as $q ?// $b | if length==3 then (if $q then .[0:1] else .[1:] end) elif length==1 then ("h"|halt_error(3)) else [] end))]"#.to_string(),
+                vec![],
+                "halt: 3",
+            ),
+            // No `?//`: one attempt, then the error.
+            (
+                r#"[while(length>0; if length==3 then .[0:1] elif length==1 then error("E") else [] end)]"#.to_string(),
+                vec![],
+                "error: E",
+            ),
+        ] {
+            let (got, got_end) = outputs_and_end(b"[10,20,30]", &filter);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!((got, got_end.as_str()), (values, end), "`{filter}`");
+        }
+        // `update` wrapped in an `if`, with a retry that produces nothing: not a
+        // direct bind, so `no_std` keeps the first alternative's `E` (recorded in
+        // `limitations.md`).
+        #[cfg(feature = "std")]
+        {
+            let filter = r#"[while(length>0; if length==3 then ([1] as $q ?// $b | if $q then .[0:1] else empty end) elif length==1 then error("E") else [] end)]"#;
+            let (got, got_end) = outputs_and_end(b"[10,20,30]", filter);
+            assert_eq!(
+                (got, got_end.as_str()),
+                (vec![r"[[10,20,30],[10]]".to_string()], ""),
+                "`{filter}`"
+            );
+        }
+    }
+
+    /// #3503: a loop whose `update` holds a `?//` nests one native level per round,
+    /// up to [`RECURSE_NATIVE_STACK_BYTES`] of stack, then takes the in-place path
+    /// (which cannot retry but cannot overflow either). A long loop therefore runs on
+    /// a default 2 MiB test thread and still counts every round.
+    #[test]
+    fn test_loop_update_retry_stays_within_the_native_stack_3503() {
+        for filter in [
+            "until(. >= 20000; (. + 1) as $x ?// $y | $x)",
+            "last(while(. < 20000; (. + 1) as $x ?// $y | $x)) | . + 1",
+        ] {
+            let (got, got_end) = outputs_and_end(b"0", filter);
+            assert_eq!(
+                (got, got_end.as_str()),
+                (vec!["20000".to_string()], ""),
+                "`{filter}`"
+            );
+        }
+    }
+
+    /// #3503: a loop whose `update` holds a `?//` spends from the native-stack ceiling of
+    /// the level that encloses it (another loop's round, a `recurse` walk), instead of
+    /// starting a fresh one -- the budget is `recurse`'s own. A loop that started its own
+    /// origin each time would let `def f: ... | while(...; U) | f` take a full ceiling per
+    /// level of recursion.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_loop_stream_budget_measures_from_the_enclosing_level_3503() {
+        let update = crate::jq::parse("(. + 1) as $x ?// $y | $x").expect("parses");
+        // No enclosing level: the loop starts its own budget and may nest.
+        let own = loop_stream_budget(&update).expect("holds a ?//");
+        assert!(loop_enter_stream(Some(own)).is_some());
+        // An enclosing level whose origin is past the ceiling: the loop inherits it
+        // and takes the in-place path at once.
+        let far = stack_address() + 2 * RECURSE_NATIVE_STACK_BYTES;
+        let _outer = recurse_native_origin::enter(far);
+        let inherited = loop_stream_budget(&update).expect("holds a ?//");
+        assert_eq!(inherited.origin, far);
+        assert!(loop_enter_stream(Some(inherited)).is_none());
+        // A nested level made while the loop streams reports the same origin.
+        drop(_outer);
+        let level = loop_enter_stream(Some(own)).expect("room");
+        assert_eq!(
+            loop_stream_budget(&update).expect("holds a ?//").origin,
+            own.origin
+        );
+        drop(level);
+        // No `?//`: nothing to stream.
+        let plain = crate::jq::parse(". + 1").expect("parses");
+        assert!(loop_stream_budget(&plain).is_none());
     }
 
     /// #3293 slice 4: `foreach_forks`/`reduce_forks` are shared with the

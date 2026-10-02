@@ -13909,7 +13909,6 @@ impl LoopKind {
 /// already streamed stand, the `finish_fork` rule (#1902: never a decode
 /// failure, a resource-limit raise or a yq negative-index raise --
 /// [`suppresses`]); a `break`/`halt` always propagates.
-#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors until_step's own six, plus the loop kind and the sink it streams to.
 fn each_loop_generic<S: EvalSemantics, V: DocumentValue>(
     kind: LoopKind,
     cond: &Expr,
@@ -13921,11 +13920,48 @@ fn each_loop_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     let mut budget = WHILE_UNTIL_MAX_STEPS;
     let state = LoopState::Document(value, cursor);
-    match loop_step_generic::<S, V>(kind, cond, update, state, optional, &mut budget, sink) {
+    let spec = LoopSpec {
+        kind,
+        cond,
+        update,
+        optional,
+        stream: crate::jq::eval::loop_stream_budget(update),
+    };
+    match loop_step_generic::<S, V>(spec, state, &mut budget, sink) {
         Ok(Demand::Continue) => Flow::Exhausted,
         Ok(Demand::Stop) => Flow::Stopped { pending: None },
         Err(Control::Error(e)) if suppresses(&e, optional) => Flow::Exhausted,
         Err(control) => Flow::Escaped(control),
+    }
+}
+
+/// What [`loop_step_generic`] reads of the loop it runs, fixed for the whole
+/// tree: which loop, its two operands and the ambient `optional`, plus the
+/// native-stack budget a `?//`-holding `update` streams under (#3503, see
+/// [`crate::jq::eval::loop_stream_budget`]).
+#[derive(Clone, Copy)]
+struct LoopSpec<'e> {
+    kind: LoopKind,
+    cond: &'e Expr,
+    update: &'e Expr,
+    optional: bool,
+    stream: Option<crate::jq::eval::RecurseNativeBudget>,
+}
+
+/// Why one branch of a streamed `update`'s subtree ended early (#3503), the
+/// [`StashedVerdict`] payload of [`loop_update_streaming`].
+enum LoopAbort {
+    /// The sink answered [`Demand::Stop`].
+    Stopped,
+    /// A later round raised.
+    Escaped(Control),
+}
+
+/// A `halt` or a decode failure is never retried past, whichever way it got
+/// here; a stop is retried past exactly as an escaping `break` is.
+impl crate::jq::eval::Nonretryable for LoopAbort {
+    fn is_nonretryable(&self) -> bool {
+        matches!(self, Self::Escaped(control) if control.is_nonretryable())
     }
 }
 
@@ -13936,14 +13972,18 @@ fn each_loop_generic<S: EvalSemantics, V: DocumentValue>(
 /// (`while`) or instead of it (`until`). `Ok(Demand::Stop)` is the sink's
 /// own stop, unwinding every level.
 fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
-    kind: LoopKind,
-    cond: &Expr,
-    update: &Expr,
+    spec: LoopSpec<'_>,
     mut state: LoopState<V>,
-    optional: bool,
     budget: &mut usize,
     sink: &mut dyn Sink<V>,
 ) -> Result<Demand, Control> {
+    let LoopSpec {
+        kind,
+        cond,
+        update,
+        optional,
+        ..
+    } = spec;
     // `until` steps on a falsy `cond`; `while` on a truthy one.
     let continues_on = kind == LoopKind::While;
     loop {
@@ -13964,6 +14004,11 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
         if cond_control.is_none() && bits.len() == 1 && bits[0] == continues_on {
             if kind == LoopKind::While && sink.push(state.emit()) == Demand::Stop {
                 return Ok(Demand::Stop);
+            }
+            // #3503: an `update` holding a `?//` runs the rest of the loop
+            // inside its sink, so the retry can follow a later round's failure.
+            if let Some(_level) = crate::jq::eval::loop_enter_stream(spec.stream) {
+                return loop_update_streaming::<S, V>(spec, &state, budget, sink);
             }
             // The single continuing branch owns its state after emission.
             // Consume eligible updates here, so changing `.i` need not
@@ -13994,10 +14039,7 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
                 continue;
             }
             for next_state in next {
-                if loop_step_generic::<S, V>(
-                    kind, cond, update, next_state, optional, budget, sink,
-                )? == Demand::Stop
-                {
+                if loop_step_generic::<S, V>(spec, next_state, budget, sink)? == Demand::Stop {
                     return Ok(Demand::Stop);
                 }
             }
@@ -14016,12 +14058,16 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
             if kind == LoopKind::While && sink.push(state.emit()) == Demand::Stop {
                 return Ok(Demand::Stop);
             }
+            if let Some(_level) = crate::jq::eval::loop_enter_stream(spec.stream) {
+                // #3503: see the fast path above.
+                if loop_update_streaming::<S, V>(spec, &state, budget, sink)? == Demand::Stop {
+                    return Ok(Demand::Stop);
+                }
+                continue;
+            }
             let (next, update_control) = state.fork::<S>(update, optional);
             for next_state in next {
-                if loop_step_generic::<S, V>(
-                    kind, cond, update, next_state, optional, budget, sink,
-                )? == Demand::Stop
-                {
+                if loop_step_generic::<S, V>(spec, next_state, budget, sink)? == Demand::Stop {
                     return Ok(Demand::Stop);
                 }
             }
@@ -14030,6 +14076,53 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
             }
         }
         return cond_control.map_or(Ok(Demand::Continue), Err);
+    }
+}
+
+/// [`loop_step_generic`]'s step for an `update` holding a `?//` (#3503): drive
+/// `update` over `state` through a live sink and run every output's subtree
+/// *inside* it, instead of collecting the outputs first.
+///
+/// jq retries a `?//` alternative when a failure raised downstream of it
+/// reaches it, and everything after `update` in the loop -- the rest of the
+/// round, every later round, and the consumer -- is downstream. Collecting the
+/// outputs first finished the `update` before the next round could fail, so
+/// `[.|while(length>0; U)]` made one attempt where jq makes two and the error
+/// escaped. The sink stashes the abort a subtree raised (or the consumer's
+/// stop) and answers [`Demand::Stop`]; a `?//` that retries past it supersedes
+/// the stash exactly as `recurse`'s walkers' does (#3293).
+fn loop_update_streaming<S: EvalSemantics, V: DocumentValue>(
+    spec: LoopSpec<'_>,
+    state: &LoopState<V>,
+    budget: &mut usize,
+    sink: &mut dyn Sink<V>,
+) -> Result<Demand, Control> {
+    let abort: StashedVerdict<LoopAbort> = StashedVerdict::new();
+    let stash = |end: LoopAbort| {
+        if let LoopAbort::Escaped(control) = &end {
+            crate::jq::eval::mark_nonretryable_escape(control);
+        }
+        abort.stash(end);
+        Demand::Stop
+    };
+    let flow = state.each::<S>(spec.update, spec.optional, &mut |item| {
+        abort.begin();
+        let next = match LoopState::<V>::from_item::<S>(item) {
+            Ok(next) => next,
+            Err(control) => return stash(LoopAbort::Escaped(control)),
+        };
+        match loop_step_generic::<S, V>(spec, next, budget, sink) {
+            Ok(Demand::Continue) => Demand::Continue,
+            Ok(Demand::Stop) => stash(LoopAbort::Stopped),
+            Err(control) => stash(LoopAbort::Escaped(control)),
+        }
+    });
+    let direct_retry = crate::jq::eval::direct_pattern_retry(spec.update);
+    let abort = abort.take_unless(|at| crate::jq::eval::retry_superseded(&flow, at, direct_retry));
+    match (abort, flow) {
+        (Some(LoopAbort::Escaped(control)), _) | (None, Flow::Escaped(control)) => Err(control),
+        (Some(LoopAbort::Stopped), _) | (None, Flow::Stopped { .. }) => Ok(Demand::Stop),
+        (None, Flow::Exhausted) => Ok(Demand::Continue),
     }
 }
 
