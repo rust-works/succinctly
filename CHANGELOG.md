@@ -450,6 +450,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zone's standard offset and name, an hour off the fields, and prints `+0000` for `%z` on glibc;
   jq 1.8.2 prints the values succinctly does. Recorded in `docs/compliance/jq/limitations.md`.
 
+- **jq: `and`/`or`/unary minus in path position check every operand's navigation against
+  the register jq holds** (#3428, #3456). An operand jq navigates inside but this resolver
+  evaluates by value -- `first`, `last`, `any`, `nth(n)`, `isempty(g)`, a `try`, a `//`, an `if`,
+  a `def` -- kept an eager route that never checked the other operand against the register it
+  moved, so `del((first and .b?))` on `[true]` returned `[true]` and `path((first and .b?))`
+  printed nothing where jq exits 5 near element `"b"`. Each operand now says what became of the
+  register and the other operand runs from that; where the resolver cannot tell, the refusal is
+  loud and a `try` or `?` around it does not swallow it -- even where jq catches its own error
+  and carries on (`del(try (any and .a))` on `{"a":true}` leaves the document in jq and exits 5
+  here). `range`, `paths`, `has`, `add`,
+  `map(f)` and a result-deciding `any`/`all`/`isempty` keep jq's answers
+  (`del(all and .a)` on `{"a":true,"b":true}` is `{"b":true}`, as in jq). On the 310,095-row
+  sweep against jq 1.7.1: 304,142 rows match (293,013 before), 36 accept where jq
+  refuses (883), 5,915 refuse where jq accepts (16,102). A builtin jq leaves in place that the
+  allowlist does not name (`sort`, `to_entries`) is refused where it used to be answered by
+  accident; see the limitations entry. yq mode is unchanged.
+
 - **yq: a whole-number JSON float is an integer, as in yq** (#3577). yq's JSON decoder types `2.0`,
   `1e2`, `-0.0` and `9223372036854775808.0` as `!!int`, and keeps `2.5`, `1e19`, `1e20` and `1e300`
   `!!float`. The cursor route typed every one of them a float, so `.p | tag`, `type`,

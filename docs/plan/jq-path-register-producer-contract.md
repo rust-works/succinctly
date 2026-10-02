@@ -1,12 +1,14 @@
 # The producer contract for jq's path register (#3456)
 
-**Status: proposed (A2 of [#3456](https://github.com/rust-works/succinctly/issues/3456)).** This
-note is the design review gate before B1 (the type change). It re-confirms the inventory on
-`main` at `ea2fcd19c`, settles the questions the issue left open, and lists what B1/B2/B3 must
-keep green. Functions are cited by name, not line: `src/jq/eval.rs` moves too fast for line
-numbers to survive a review round. The doc comments on `PathBranch`, `Frame`,
-`cannot_move_register`, `register_after` and `reestablishes_register` are the primary source;
-this note is the connective tissue between them.
+**Status: B1, B2, B2b and B3 landed ([#3456](https://github.com/rust-works/succinctly/issues/3456),
+[#3428](https://github.com/rust-works/succinctly/issues/3428)); the promotions in section 10 are
+open.** This note began as the design review gate before B1 (the type change). It re-confirms the
+inventory on `main` at `ea2fcd19c`, settles the questions the issue left open, and lists what
+B1/B2/B3 had to keep green; sections 3, 6 and 10 record what was built. Functions are cited by
+name, not line: `src/jq/eval.rs` moves too fast for line numbers to survive a review round. The
+doc comments on `PathBranch`, `Frame`, `cannot_move_register`, `register_after` and
+`reestablishes_register` are the primary source; this note is the connective tissue between
+them.
 
 ## 1. The defect
 
@@ -215,6 +217,16 @@ right operand runs after backtracking to the fork, so it sees the **entry** stat
 left operand's. `wrap_optional_branch` currently takes the field by destructure and puts it
 back; the helper exists so a future wrapper cannot do otherwise.
 
+**As built (B2b): no helper.** Reading the arms showed every wrapper and compound node (`,`,
+`//`, `if`, `try`, `?`, `label`, a `def` call, `Paren`, `Shared`) already forwards each
+sub-branch's register unchanged, and those states are already truthful leaf-locally: jq
+backtracks to the fork, so each leaf's register is its own. What was conservative was the
+*consumers* (`register_after`'s allowlist, `place_step`'s stage rule). A node-level verdict at
+the `resolve_node_sink` boundary would have re-implemented the stage rule at every compound
+node, cost a sink wrapper per node, and still left `register_after` unable to collapse exactly
+(a checked `[E]` is `Unmoved` for `place_step` and was lost for `register_after`). So B2b made
+`register_after` read the branch instead (section 10).
+
 ### D7. `FoldRegister`
 
 SOURCE can move the register: `foreach .[] as $k (.; getpath(["a"]); .b)` (#2896). The
@@ -223,6 +235,11 @@ Rule: a SOURCE branch that is not `Unmoved` makes UPDATE's frame lost
 (`RegisterLoss::LostAt` / `LostSomewhere`). `FoldRegister::enter` currently reads INIT's
 trackability and `self.value` only. The pinned row
 `test_path_register_fold_source_that_navigates_moves_the_register_3456` already covers it.
+
+**Retired (B2b).** `FoldRegister::enter`, `resolve` and `relocate` never read
+`PathBranch::register`, so there is no producer-side state for SOURCE to hand over and nothing
+the refactor could flip; the pinned row passes on its own account (#2896's `getpath` mark). It
+comes back only if a later change makes SOURCE's branch matter.
 
 ### D8. The default for lost is refuse, uncatchably
 
@@ -277,9 +294,18 @@ Consequences:
 - `isempty(g)` is per-branch: it moves the register only when `g` emits (it breaks out of a
   `label` before backtracking). That is D4.4 and is the reason a static `Unmoved` cannot be
   used for it.
-- `range(n)` and `paths` are not navigation, yet `cannot_move_register` says `false` for both
-  (a builtin allowlist, deliberately; "add a variant only with an oracle row"). Both would be
-  safe `Unmoved` promotions and are listed here so a later step can do them with rows.
+- `range(n)` and `paths` are not navigation, yet `cannot_move_register` said `false` for both
+  (a builtin allowlist, deliberately; "add a variant only with an oracle row"). **Promoted in B3**
+  with the rows in `test_path_register_range_and_paths_do_not_move_it_3456`. The two-argument
+  `range(a; b)` is C-coded with closure arguments run unwrapped, so a navigating argument moves
+  the register (`range(0; .a)` refuses, `range(.a)` and the three-argument form do not); the
+  parser spells `range(n)` as `range(0; n)`, so `range(.a)` keeps the conservative answer.
+- `any`, `all` and `isempty(g)` are D4.4's "did it" case and **are decided per value in B3**:
+  jq 1.7.1 defines `isempty(g)` as `first((g | false), true)`, `any(g; c)` as
+  `isempty(g | (c or empty)) | not` and `all(g; c)` as `isempty(g | (c and empty))` (read off
+  `--debug-dump-disasm`), so each moves the register exactly when the generator inside emitted, which the result says -- `any` is
+  `false`, `all` is `true` and `isempty` is `true` when it did not (`register_stays_on_result`).
+  The other result stays `LostAt`.
 
 ## 6. Delivery
 
@@ -307,12 +333,17 @@ Each step is safe to land on `main` by itself.
   producers (`if`, `try`, `//`, `def`, `first` ... under an untracked ambient) are not truthful
   (it would accept where it answers `None` today); D6's pass-through and D7's `FoldRegister`
   read of SOURCE's branch both need that too. They are **B2b**, ahead of B3.
-- **B3 -- close #3428.** With `LostAt(entry)` truthful on `first` / `last` / `any` / `nth` /
-  `range` / `paths` / `try` / `//` / `if` / `def` operands, drop the
-  `register_movement_tracked` precondition from `and_or_negate_resolves_live`. Expected: the
-  accept-where-jq-refuses rows flip to refuse. **Gate:** the sweep must show no row where jq
-  accepts and B3 newly refuses (`del(first and .[0])` is the one the old gate existed to
-  avoid). If it does, B3 stops and reports rather than widening the gate again.
+- **B2b -- `register_after` reads the branch (landed).** Not the node-level verdict this section
+  first planned (D6, above); see section 10. `register_after` takes a trackable branch's value, a
+  stated `Unmoved` as given, the stage's carried register for an operand that cannot move it, and
+  loses everything else. `resolve_from_restored_input` no longer takes a lost register at the root
+  for an `Unmoved` one, and marks a lost seed on a trackable entry so its refusals are classed as
+  guesses. No behaviour change on `main`: the sweep is identical to `main` over 310,095 rows.
+- **B3 -- close #3428 (landed).** `and_or_negate_resolves_live` drops its `trackable` argument and
+  the `register_movement_tracked` precondition. The promotions it needed (section 10) went in the
+  commit before it. **Gate** (the rev. 4 text kept for the record): no row where jq accepts and B3
+  newly refuses, no new accept. It was met for the accepts and not for the refusals, which section
+  10 accounts for.
 
 ## 7. Acceptance for B1 and B2
 
@@ -373,3 +404,90 @@ Each step is safe to land on `main` by itself.
 3. The `Try` negative test in D4.3: where does a lost-frame refusal under `try` get caught
    today, if at all? B2 writes the test first; if it fails on `main`, that is a separate
    Severity-High issue, not folded into this one.
+
+## 10. What B2b and B3 found
+
+Revision 4 of the plan had B2b as a node-level verdict and B3 as one line. Trying B3 first, on
+`main` with nothing else changed (the gate dropped, a release build, the sweep over the 94,887-row
+grid of the time), showed what it needs. Revision 5 of #3456 has the whole record; the findings,
+in the order they appeared:
+
+1. **`resolve_from_restored_input` trusted depth 0 over a lost register.** A by-value operand jq
+   navigates inside is emitted at the root *and* lost; the arm resolved `R` live as though `L` had
+   not run, and `del(any and .a)` on `{"a":true}` returned `{}` where jq exits 5. 72 rows. The
+   shortcut now needs an `Unmoved` register on a trackable entry.
+2. **A lost seed's refusals were classed exact, so `try`/`?` swallowed them.**
+   `could_be_lost_register` counts only a frozen snapshot or `null`, on the premise that a computed
+   value is never jq's register. `R`'s input is not computed: it is the node the register entered
+   on, which jq still holds if `L` did not move it. `del(try (any or .b?))` printed the document
+   where jq exits 5. The seed is marked (`Snapshot::register_entry`, positional provenance that
+   never certifies), and the mark is read where a step is pruned instead of refused: a
+   `?`-wrapped first step in `resolve_static_tail` (`(.a)?`, `(.a | .b)?`) and a bare optional
+   primitive in `resolve_optional_sink` (`.a?` is jq's `INDEX_OPT`, which suppresses a type error
+   but not a path error), both found by review, not by the sweep. Without the mark, 24 rows over the boundary operands `sort` and `to_entries`
+   turn into silent no-ops or echoed documents (measured with a throwaway mutant).
+3. **A static `LostAt` is too coarse for operands jq leaves in place.** `range`/`paths`/`has` are
+   static `Unmoved`; `add` and `map(f)` are `Unmoved` for the by-value leaf only
+   (`leaves_register_in_place`), because `cannot_move_register` also means "checks nothing" and an
+   `R` of `add` checks its `.[]` against a register it is not on (a first cut that put them in
+   `cannot_move_register` accepted 49 rows jq refuses); `any`/`all`/`isempty` decide per value
+   (section 5).
+4. **The compound producers were already truthful** (D6, above); the conservative parts were the
+   consumers.
+
+The grid grew from 31 to 54 operands for this: `has`, `keys`, `add`, `map(.)`, `sort`,
+`to_entries`, `flatten` and four compound stages with a by-value leaf, because a by-value
+operand that loses its eager route and cannot say "unmoved" is a lost match and the old grid
+could not see it; then, once `register_after` read an operand's stated `Unmoved` as given,
+twelve producers a wrong `Unmoved` would hurt most (`reduce`, `foreach`, `label`, `limit`,
+`first(f)`, `nth`, `recurse`, a comma, a `try` with a handler, two pipes that navigate and then
+compute, a `//`). A review of the branch then found a hole the grid could not reach, a lost
+`L` followed by a `?`-wrapped right operand, so it also grew three right operands (`(.a)?`,
+`(.a | .b)?`, `(.. | .a?)`) and an input with an object below the root (`[{"a":1}]`), without
+which "no new accepts" had been true and meaningless. Final state, `main` against the branch,
+310,095 rows, jq 1.7.1 as the oracle:
+
+| Build                         |  MATCH | ACCEPT_WRONG | REFUSE_WRONG | DIFF |
+|-------------------------------|-------:|-------------:|-------------:|-----:|
+| `main`                        | 293013 |          883 |        16102 |   97 |
+| B2b only (gate in place)      | 293013 |          883 |        16102 |   97 |
+| B3                            | 304142 |           36 |         5915 |    2 |
+
+B3 moves 11,907 rows to a match and loses 778 that matched: 467 over `sort`, `to_entries` and
+`flatten` (builtins jq leaves in place that the allowlist does not name, so `R`'s navigation is
+refused where jq accepts); 182 over `any`/`all`/`isempty`, where jq catches its own error under
+a `try` or a `?` and this resolver's guess is uncatchable; 91 over a `foreach` operand, whose
+fold branches state no register, so the operand is read as a loss (a fold is where D7 would
+have changed that); and 38 over a by-value or compound right operand after a navigating left
+one on a `null` input (`del(. as $x | (.b? or isempty(.[]?)) | $x)` on `null`), where the
+earlier match was luck: the eager route answered the root path where jq answers `["b"]`, `del`
+of either leaves the same document, and #3579's rule now refuses a terminal `null` after a
+navigation. All are refuse-only. No row is newly accepted wrongly, and none newly differs; the
+36 that still accept are `.[0:] and R` and `.[0:0] and R` on `[]`, #3494's empty-slice rule, the
+same rows `main` accepts, and the 2 `DIFF` rows are `main`'s too (jq prints a path before it
+errors). The promotions commit on its own, measured on the 162,207-row
+grid of the time, moved 498 rows to a match and none the other way.
+
+Reach, each a throwaway mutant against the final build over the operands it touches (measured
+when the grid had 41 operands): the depth-0
+guard removed flips 164 rows (136 worse); the seed mark removed, 60 on the grid as it was (all in the
+safe direction, so the grid could not see the mark) and 40 (24 worse) once `sort` and
+`to_entries` were in it; the per-result verdict ignored, 117 (103 worse);
+`register_after` ignoring a stated `Unmoved`, 1,145; `add` and `map` out of
+`leaves_register_in_place`, 265.
+
+### Open promotions
+
+Each turns a refusal into an answer and needs its own oracle rows:
+
+- `last(f)` to `Unmoved` (section 5).
+- The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
+  turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`
+  into jq's `[]`. Cheap now, because the producers already say it.
+- `LostAt(entry)` for an unchecked `[E]`, and passing `LostAt`'s position through `register_after`
+  instead of `LostSomewhere`.
+- Widening `array_contents_are_checked` past `register_movement_tracked`.
+- Static `Unmoved` for the other builtins jq leaves in place (`sort`, `to_entries`, ...), one oracle
+  row each; today each is a refusal where jq accepts.
+- A register-position-aware `try` for the guess a lost `and`/`or` operand raises, so a refusal jq
+  catches can be caught here too (the `var-rebind-nav` rows).
