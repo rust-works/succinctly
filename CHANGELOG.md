@@ -450,7 +450,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own `Error: aborted` (exit 1) for `error(select(false))`, `error(.c[])` and `.a |= error(select(false))`,
   where it said `Error: no value`. `result_to_owned` and `result_to_owned_ctrl`, whose "empty means
   `no value`" rule this was the last caller of, are removed; `result_to_owned_full` carries their
-  documentation. `error((1, halt))` still halts where jq raises `1`; that predates this change.
+  documentation. A message that makes a value and then halts raises the value, as jq does
+  (`error((1, halt))` is `1` at exit 5, `try error((1, halt)) catch .` prints `1`; it halted at
+  exit 0, #3612); a message that halts first still halts.
 
 - **yq: `length` of a JSON number is the width of the number yq decodes** (#3597). yq measures
   what its JSON decoder produced, rendered the way it prints: `2.0` is the integer `2` (width 1),
