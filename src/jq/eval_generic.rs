@@ -1787,11 +1787,82 @@ pub enum CommentTree {
     /// alongside each comment is whether the deferred value materialized as
     /// nothing at all (a sibling key follows, or EOF) - see
     /// [`Self::key_comment_if_value_absent`].
-    Object(
-        NodeMeta,
-        IndexMap<String, Self>,
-        IndexMap<String, (String, bool)>,
-    ),
+    Object(NodeMeta, IndexMap<String, Self>, IndexMap<String, KeyMeta>),
+}
+
+/// How a mapping *key* was written in the source: the key-side counterpart of
+/// [`NodeMeta`], kept in [`CommentTree::Object`]'s per-key map (#3601).
+///
+/// An entry exists only for a key that has something to say - a trailing
+/// comment (#765) or a quoted spelling - so the common plain, comment-free key
+/// costs nothing, and the map is the same one that already carried the comment
+/// (`NodeMeta`'s own doc records a stack overflow from widening it, and a new
+/// `CommentTree::Object` field would widen every node the same way).
+#[derive(Debug, Clone, Default)]
+pub struct KeyMeta {
+    /// A comment trailing the key's own line, when its value is deferred to
+    /// a following line (issue #765), `#` and all.
+    comment: Option<String>,
+    /// Whether the deferred value materialized as nothing at all - see
+    /// [`CommentTree::key_comment_if_value_absent`]. Meaningless without a
+    /// `comment`.
+    value_absent: bool,
+    /// How the key was quoted: `"single"` or `"double"` as written in the
+    /// source, [`KEY_STYLE_STRING`] once `-P` has stripped the quoting but the
+    /// key is still known to be a string, or `""` for a plain key.
+    style: &'static str,
+}
+
+/// The key style (see [`CommentTree::key_style`]) for a key whose quoting `-P` stripped.
+///
+/// How it was quoted no longer matters, but that it is a string does, since a
+/// string spelled `1` or `true` must stay quoted to read back as a string
+/// (`yq -P` keeps `"1": 3`, where a plain key `1: 3` is an integer).
+pub const KEY_STYLE_STRING: &str = "string";
+
+impl KeyMeta {
+    /// A key with a trailing comment and/or a quoted style, or `None` for a
+    /// key with neither - the one place that decides whether a key earns an
+    /// entry in the per-key map.
+    pub fn new(comment: Option<String>, value_absent: bool, style: &'static str) -> Option<Self> {
+        let style = match style {
+            "single" | "double" | KEY_STYLE_STRING => style,
+            _ => "",
+        };
+        if comment.is_none() && style.is_empty() {
+            return None;
+        }
+        Some(Self {
+            comment,
+            value_absent,
+            style,
+        })
+    }
+
+    /// This entry with `value_absent` re-derived and, when `keep_style` is
+    /// false, its style dropped - what a write does to a key it carried over.
+    /// `None` once nothing is left to say.
+    #[must_use]
+    pub fn carried_over(&self, value_absent: bool, keep_style: bool) -> Option<Self> {
+        Self::new(
+            self.comment.clone(),
+            value_absent,
+            if keep_style { self.style } else { "" },
+        )
+    }
+
+    /// This entry with its quoting stripped to [`KEY_STYLE_STRING`] (`-P`).
+    #[must_use]
+    pub fn with_style_stripped(&self) -> Self {
+        Self {
+            style: if self.style.is_empty() {
+                ""
+            } else {
+                KEY_STYLE_STRING
+            },
+            ..self.clone()
+        }
+    }
 }
 
 impl CommentTree {
@@ -1880,8 +1951,19 @@ impl CommentTree {
     /// trailing comment (issue #710).
     pub fn key_comment(&self, key: &str) -> Option<&str> {
         match self {
-            Self::Object(_, _, key_comments) => key_comments.get(key).map(|(c, _)| c.as_str()),
+            Self::Object(_, _, keys) => keys.get(key).and_then(|k| k.comment.as_deref()),
             _ => None,
+        }
+    }
+
+    /// How object field `key`'s *key* was quoted in the source (`"single"`,
+    /// `"double"`, [`KEY_STYLE_STRING`] after `-P`), or `""` for a plain key,
+    /// one this isn't an `Object` for, or one with no entry (#3601). Distinct
+    /// from `field(key).style()`, which is the *value's* style (#739).
+    pub fn key_style(&self, key: &str) -> &'static str {
+        match self {
+            Self::Object(_, _, keys) => keys.get(key).map_or("", |k| k.style),
+            _ => "",
         }
     }
 
@@ -1897,10 +1979,10 @@ impl CommentTree {
     /// the key, a different, unhandled case).
     pub fn key_comment_if_value_absent(&self, key: &str) -> Option<&str> {
         match self {
-            Self::Object(_, _, key_comments) => key_comments
+            Self::Object(_, _, keys) => keys
                 .get(key)
-                .filter(|(_, absent)| *absent)
-                .map(|(c, _)| c.as_str()),
+                .filter(|k| k.value_absent)
+                .and_then(|k| k.comment.as_deref()),
             _ => None,
         }
     }
@@ -2121,10 +2203,16 @@ fn to_owned_with_comments_at_depth<V: DocumentValue, S: EvalSemantics>(
             // alone can't tell apart from true absence - both collapse
             // through the same semantic check `to_owned` uses - so this
             // also checks the raw text is empty, not just null-ish.
-            if let Some(kc) = field.key_cursor.line_comment_raw() {
-                let value_absent =
-                    field.value.is_null() && field.value.as_str().map_or(true, |s| s.is_empty());
-                key_comment_map.insert(key, (kc, value_absent));
+            //
+            // #3601: the same entry also records how the key was quoted, so a
+            // write that leaves the key alone does not turn `"1": a` into the
+            // integer key `1: a`.
+            let key_comment = field.key_cursor.line_comment_raw();
+            let value_absent = key_comment.is_some()
+                && field.value.is_null()
+                && field.value.as_str().map_or(true, |s| s.is_empty());
+            if let Some(meta) = KeyMeta::new(key_comment, value_absent, field.key_cursor.style()) {
+                key_comment_map.insert(key, meta);
             }
             last_field = Some(field.value_cursor);
             f = rest;
@@ -39617,6 +39705,79 @@ mod tests {
             "{comment_map:?}"
         );
         assert!(key_comment_map.is_empty(), "{key_comment_map:?}");
+    }
+
+    /// #3601: the per-key map records how each key was quoted, only for a key
+    /// that was quoted, and alongside (not instead of) a trailing key comment.
+    #[test]
+    fn test_to_owned_with_comments_records_key_style_3601() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"\"a\": 1\n'b c': 2\nplain: 3\n\"k\": # on the key\n  x: 4\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+        let (_, comments) = to_owned_with_comments::<_, YqSemantics>(&value, Some(&mapping_cursor))
+            .expect("conversion succeeds");
+
+        assert_eq!(comments.key_style("a"), "double");
+        assert_eq!(comments.key_style("b c"), "single");
+        assert_eq!(comments.key_style("plain"), "");
+        assert_eq!(comments.key_style("missing"), "");
+        // A key with a comment and a style keeps both on the one entry.
+        assert_eq!(comments.key_style("k"), "double");
+        assert_eq!(comments.key_comment("k"), Some("# on the key"));
+        // A quoted key without a comment has a style but no comment.
+        assert_eq!(comments.key_comment("a"), None);
+        // `key_style` is the key's, not the value's.
+        assert_eq!(comments.field("a").style(), "");
+        // Only an `Object` has keys.
+        assert_eq!(CommentTree::empty().key_style("a"), "");
+    }
+
+    /// #3601: `KeyMeta` holds an entry only for a key with something to say,
+    /// and the three ways a write reshapes one keep that rule.
+    #[test]
+    fn test_key_meta_entry_rules_3601() {
+        // Nothing to say: no entry.
+        assert!(KeyMeta::new(None, false, "").is_none());
+        // A style the writer does not reproduce is nothing to say either.
+        assert!(KeyMeta::new(None, false, "flow").is_none());
+        assert!(KeyMeta::new(None, true, "literal").is_none());
+
+        let quoted = KeyMeta::new(None, false, "single").expect("quoted key has an entry");
+        assert_eq!(quoted.style, "single");
+        let commented = KeyMeta::new(Some("# c".to_string()), true, "").expect("comment entry");
+        assert_eq!(commented.style, "");
+
+        // A carried-over key re-derives `value_absent` and may drop its style.
+        let both = KeyMeta::new(Some("# c".to_string()), true, "double").unwrap();
+        let kept = both.carried_over(false, true).unwrap();
+        assert_eq!((kept.style, kept.value_absent), ("double", false));
+        let unquoted = both.carried_over(false, false).unwrap();
+        assert_eq!(unquoted.style, "");
+        assert_eq!(unquoted.comment.as_deref(), Some("# c"));
+        // Dropping the style of a style-only entry leaves nothing.
+        assert!(quoted.carried_over(false, false).is_none());
+
+        // `-P` keeps that the key is a string, but not how it was quoted.
+        assert_eq!(quoted.with_style_stripped().style, KEY_STYLE_STRING);
+        assert_eq!(
+            both.with_style_stripped().comment.as_deref(),
+            Some("# c"),
+            "stripping the style leaves the comment"
+        );
+        assert_eq!(commented.with_style_stripped().style, "");
+        // A stripped entry survives a further strip and a carry-over.
+        let stripped = quoted.with_style_stripped();
+        assert_eq!(stripped.with_style_stripped().style, KEY_STYLE_STRING);
+        assert_eq!(
+            stripped.carried_over(false, true).unwrap().style,
+            KEY_STYLE_STRING
+        );
     }
 
     /// The value-side sibling of the test above: a field whose *value* (not
