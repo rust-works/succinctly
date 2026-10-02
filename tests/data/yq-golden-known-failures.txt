@@ -32,3 +32,5 @@ seq_item_double_outdent_rejected  yaml_parser  a block sequence continuation tha
 # carry an expected.empty marker (see tests/yq_golden_tests.rs).
 
 path_ctx_path_with_arg      yq_gating      `path(.a)` answers `["a"]` and exits 0; real yq has no `path(f)` at all (only bare `path`) and rejects it with "bad expression, please check expression syntax" — #1512
+json_string_style_line_break_3587      yaml_output    a JSON string with a line break is written as an escaped double-quoted scalar where yq writes a literal block (`a: |-`), or double-quoted for `\r` and U+0085 and a folded single-quoted scalar for U+2028 — #3587
+json_string_style_line_break_key_3587  yaml_output    a JSON key with a line break is written as an escaped double-quoted key where yq writes `? |-` explicit-key syntax — #3587

@@ -530,6 +530,19 @@ mod tests {
             "-x1",
             "_1",
             "_",
+            // Underscores are only a digit separator between two digits.
+            "._5",
+            ".5_",
+            ".5__0",
+            // Shaped like a date and not one.
+            "2001-12",
+            "2001-1x-1",
+            "2001-1/2",
+            "1900-02-29",
+            "2100-02-29",
+            "2001-02-29",
+            "2004-02-30",
+            "2001-04-31",
         ] {
             assert_eq!(go_yaml_string_style(s), Some(Plain), "{s:?}");
         }
@@ -594,6 +607,10 @@ mod tests {
             "1_",
             "1__0",
             "0_",
+            // A real date: 2004 and 2000 are leap years, April has 30 days.
+            "2004-02-29",
+            "2000-02-29",
+            "2001-04-30",
             "2001-12-14T1:2:3+24:60",
             ".5_0",
             "1_0.5",
