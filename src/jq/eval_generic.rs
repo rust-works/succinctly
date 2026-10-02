@@ -4032,7 +4032,7 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     // `Some` once an item that is not a node arrived: `nodes` was built into
     // it then, and the answer is this owned array.
     let mut owned: Option<Vec<OwnedValue>> = None;
-    for expr in exprs {
+    for expr in CommaBranches::new(exprs) {
         let mut result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
         if !tail.is_empty() {
             // The `Expr::Pipe` arm's own staged fold, which is all a pipe of
@@ -4097,6 +4097,55 @@ fn comma_array_generic<S: EvalSemantics, V: DocumentValue>(
     GenericResult::Owned(OwnedValue::array_from(owned_or_err!(
         to_owned_all_cursors::<S, _>(&nodes)
     )))
+}
+
+/// The branches of a `,` body in order, with a `,` nested inside it (through
+/// parentheses) spliced in (#3500).
+///
+/// `[(., .), .]` is `[., ., .]` for an array's purposes: a comma is
+/// associative, so the items and their order are the same, but the nested
+/// `Expr::Comma` answered one owned tree per item where each is a document
+/// node. Only a bare or parenthesised `,` is spliced: `(a, b)?` is not the
+/// same branches, since the `?` covers the whole group.
+///
+/// Built only when a nested comma exists, so the common flat body pays one
+/// scan of its branches and no allocation.
+enum CommaBranches<'a> {
+    Flat(core::slice::Iter<'a, Expr>),
+    Nested(alloc::vec::IntoIter<&'a Expr>),
+}
+
+impl<'a> CommaBranches<'a> {
+    fn new(exprs: &'a [Expr]) -> Self {
+        if !exprs
+            .iter()
+            .any(|e| matches!(unwrap_paren(e), Expr::Comma(_)))
+        {
+            return Self::Flat(exprs.iter());
+        }
+        fn splice<'a>(exprs: &'a [Expr], out: &mut Vec<&'a Expr>) {
+            for expr in exprs {
+                match unwrap_paren(expr) {
+                    Expr::Comma(inner) => splice(inner, out),
+                    _ => out.push(expr),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        splice(exprs, &mut out);
+        Self::Nested(out.into_iter())
+    }
+}
+
+impl<'a> Iterator for CommaBranches<'a> {
+    type Item = &'a Expr;
+
+    fn next(&mut self) -> Option<&'a Expr> {
+        match self {
+            Self::Flat(it) => it.next(),
+            Self::Nested(it) => it.next(),
+        }
+    }
 }
 
 /// `(a, b, ...) | rest`, split into its `,` branches and the tail each one
@@ -40977,6 +41026,108 @@ mod tests {
                     || path_expr_is_cursor_navigable(&expr),
                 "{query}"
             );
+        }
+    }
+
+    /// #3500: a `,` nested inside an array's comma (through parentheses) is
+    /// spliced into its branches, so the nodes stay cursors instead of one
+    /// owned tree each; a `?` over the group, a non-navigation branch and an
+    /// all-scalar body keep the routes they had. Outputs are jq 1.7.1's.
+    #[test]
+    fn test_nested_comma_array_keeps_cursors_3500() {
+        let doc = r#"{"a":{"x":1},"b":[2,3],"c":"s","d":null}"#;
+        for query in [
+            "[(., .), .]",
+            "[((., .), .)]",
+            "[(.a, (.b, .a)), .b]",
+            "[((., .), .) | .a]",
+            "[(., (., .)) | .b]",
+            "[((.a, .b), (.c, .d)), .]",
+        ] {
+            assert_eq!(
+                comma_array_route::<JqSemantics>(query, doc),
+                "prevalidated",
+                "{query}"
+            );
+        }
+        for query in [
+            // The `?` covers the whole group, which is not the same branches.
+            "[(., .)?, .]",
+            // A literal branch is computed, so the array ends up owned.
+            "[(., 1), .]",
+            // Every item a scalar: a small array is cheaper than a sequence.
+            "[(.c, .c), .c]",
+        ] {
+            assert_eq!(
+                comma_array_route::<JqSemantics>(query, doc),
+                "owned",
+                "{query}"
+            );
+        }
+        for (query, want) in [
+            ("[(., .), .] | length", "3"),
+            ("[((., .), .) | .a]", r#"[{"x":1},{"x":1},{"x":1}]"#),
+            ("[(.a, .b), .c]", r#"[{"x":1},[2,3],"s"]"#),
+            (
+                "[((.a, .b), (.c, .d)), .]",
+                r#"[{"x":1},[2,3],"s",null,{"a":{"x":1},"b":[2,3],"c":"s","d":null}]"#,
+            ),
+            ("[(.a, (.b, .c)), .d] | .[1]", "[2,3]"),
+            ("[(.a, .nosuch), .c]", r#"[{"x":1},null,"s"]"#),
+            ("[((.a, .b), .c) | .[]?]", "[1,2,3]"),
+            ("[(.a, .b)?, .c]", r#"[{"x":1},[2,3],"s"]"#),
+            (
+                "[.[]?, (.b, .b)]",
+                r#"[{"x":1},[2,3],"s",null,[2,3],[2,3]]"#,
+            ),
+        ] {
+            let (out, _) = outputs_and_reindexes(doc, query);
+            assert_eq!(out, vec![want.to_string()], "{query}");
+        }
+        // yq never enters this route: its answer is what it was.
+        assert_ne!(
+            comma_array_route::<YqSemantics>("[(., .), .]", doc),
+            "prevalidated"
+        );
+    }
+
+    /// #3500: a spliced array fails exactly as the flat spelling of the same
+    /// branches does -- the first failure in branch order, and nothing
+    /// printed -- whether the raise is a branch's own (`.c.x` on a string) or
+    /// an earlier pending node's undecodable string, and behind a piped tail.
+    #[test]
+    fn test_nested_comma_array_fails_like_the_flat_spelling_3500() {
+        let run = |doc: &str, query: &str| {
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), query);
+            (out, format!("{control:?}"))
+        };
+        for (doc, nested, flat) in [
+            (r#"{"a":1,"c":"s"}"#, "[(.c.x, .a), .a]", "[.c.x, .a, .a]"),
+            (
+                r#"{"a":1,"c":"s"}"#,
+                "[((.a, .c.x), .a), .c.y]",
+                "[.a, .c.x, .a, .c.y]",
+            ),
+            // An undecodable string in an earlier node wins over a later
+            // nested branch's own error.
+            (
+                r#"{"a":"\q","c":"s"}"#,
+                "[(.a, (.c.x, .a)), .a]",
+                "[.a, .c.x, .a, .a]",
+            ),
+            // Behind a piped tail.
+            (
+                r#"{"a":{"x":"s"},"b":{"x":1}}"#,
+                "[((.a, .b), .a) | .x.y]",
+                "[(.a | .x.y), (.b | .x.y), (.a | .x.y)]",
+            ),
+            // A malformed document.
+            (r#"{"a":1,"b":xyz}"#, "[(., .), .]", "[., ., .]"),
+        ] {
+            let (out, control) = run(doc, nested);
+            assert!(out.is_empty(), "{nested}: {out:?}");
+            assert!(control.contains("Error"), "{nested}: {control}");
+            assert_eq!(run(doc, flat), (out, control), "{nested} vs {flat}");
         }
     }
 
