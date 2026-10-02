@@ -477,6 +477,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexer error), which is tracked in #3551. Bare `nth(n)` is the same gap and is
   fixed in the entry below (#3550).
 
+- **jq: `paths(filter)`'s root pre-check retries a `?//` like every other site** (#3366). The
+  pre-check evaluated the filter eagerly, which never asked a `?//` inside it for its next
+  alternative, so `[paths(if ([1] as $q ?// $b | $q) then error("E") else true end)]` raised
+  `E` on `{"a":{"a":1}}` where jq returns `[["a"],["a","a"]]`, and `-([1] as $a ?// $b | ...)`
+  raised its first alternative's negation error where jq answers the second. It now drains the
+  filter through the streaming evaluator. A root error or `break` still escapes before any path.
+  `paths(f)` under a stopping `first`/`limit` is the remaining shape, tracked in #3567.
+
 - **yq: bare `first` writes where real yq's does** (#3551). `first = 9`, `first |= 5`,
   `first += 1` and `del(first)` on `[1,2]` are `[9,2]`, `[5,2]`, `[2,2]` and `[2]` as in yq
   v4.53.3; `first = 9` used to leave `[1,2]` unchanged (exit 0) and `del(first)` raised. On an

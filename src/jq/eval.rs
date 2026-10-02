@@ -50538,43 +50538,12 @@ fn eval_owned_pure_boolean<S: EvalSemantics>(
     Some(Ok(OwnedValue::Bool(r.is_truthy())))
 }
 
-/// Same evaluator as `eval_owned_expr`, but keeps a `break` distinguishable
-/// from a real error via [`Control`] instead of collapsing it into a
-/// synthetic "break $label not in label" [`EvalError`] — needed by any
-/// caller that must let a `break $label` inside its operand reach its
-/// enclosing `label` (#575) but can't (or, for a caller needing every
-/// output rather than one collapsed value, shouldn't) use
-/// [`eval_owned_expr_fork`] directly. Direct caller today: `builtin_paths_filter`'s
-/// root-node check (only ever cares whether the root escaped, not what it
-/// produced) -- `resolve_limit` used to be a second caller, but its own
-/// zero-output bound turned out to be exactly the collapsing this function
-/// exists to do, which was the bug (#1313); it now calls
-/// [`eval_owned_expr_full`] directly instead. `while`/`until`/`repeat`/`reduce`/`foreach`/`walk` all use
-/// `eval_owned_expr_fork` directly instead, since each needs the full
-/// `(Vec<OwnedValue>, Option<Control>)` shape to avoid silently dropping a
-/// trailing error/break behind values already produced (#855). Same fix
-/// [`each_slice_bound`] already applies to slice bounds.
-///
-/// #1559 (code review): a thin wrapper over [`eval_owned_expr_opt`] rather
-/// than its own copy of that function's own trailing-`Control` fix -- see its
-/// doc comment for the bug this closed here (the sole caller,
-/// `each_paths_filter`'s root pre-check, was independently confirmed
-/// affected). `?` performs the `EvalEscape` -> `Control` conversion via the
-/// existing lossless `From` impl (`error.rs`).
-fn eval_owned_expr_ctrl<S: EvalSemantics>(
-    expr: &Expr,
-    input: &OwnedValue,
-    optional: bool,
-) -> Result<OwnedValue, Control> {
-    Ok(eval_owned_expr_opt::<S>(expr, input, optional)?.unwrap_or(OwnedValue::Null))
-}
-
-/// Like [`eval_owned_expr_ctrl`], but also returns whether the result
-/// carried a trailing [`Control`] after its first/only value -- a
-/// `QueryResult::Partial`'s own control, which `eval_owned_expr_ctrl` (#1559)
-/// now propagates as an `Err` rather than dropping; this function keeps it
-/// distinguishable instead, for a caller (`builtin_envvar`) that needs to
-/// inspect it itself rather than have it auto-converted. See
+/// Evaluate `expr` against an owned `input` to exactly one value, and also
+/// return whether the result carried a trailing [`Control`] after its
+/// first/only value -- a `QueryResult::Partial`'s own control, kept
+/// distinguishable here rather than dropped (#1559), for a caller
+/// (`builtin_envvar`) that needs to inspect it itself rather than have it
+/// auto-converted. See
 /// [`result_to_owned_ctrl`]'s doc comment for the live-verified jq semantics
 /// this preserves for a caller that can re-wrap its own successful final
 /// result via [`partial`]/[`finish_result`] when this is `Some`.
@@ -50692,9 +50661,8 @@ fn eval_owned_expr_full<S: EvalSemantics>(
         // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
         // above (unchanged, #1937 round 2); the trailing `Error`/`Break` is
         // exposed via the second tuple element instead of silently dropped
-        // (#1164) -- a caller using this function (rather than the plain
-        // `eval_owned_expr_ctrl` above) is expected to apply it to its own
-        // final result.
+        // (#1164) -- a caller using this function is expected to apply it to
+        // its own final result.
         QueryResult::Partial(vs, control) => {
             if vs.len() == 1 {
                 Ok(Some((vs.into_iter().next().unwrap(), Some(control))))
@@ -50702,56 +50670,6 @@ fn eval_owned_expr_full<S: EvalSemantics>(
                 Ok(Some((OwnedValue::array_from(vs), Some(control))))
             }
         }
-    }
-}
-
-/// Evaluate an expression with an OwnedValue as input, keeping a genuinely
-/// empty result -- a `?`-swallowed type mismatch, or a builtin's own
-/// zero-output result -- distinguishable from a real `null` value (#1280),
-/// via [`eval_owned_expr_full`]. Used by the deleted eager path-context evaluator's
-/// `Builtin`/`Object`/`Array`/`Literal`/generic-fallback arms and `ParentN`'s
-/// own `n` argument, so a comma/pipe branch that legitimately produces
-/// nothing (`(has("x"))?` on the wrong type, matching real jq's own `.a?`
-/// semantics) contributes zero outputs rather than a spurious `null`.
-///
-/// #1559: a `QueryResult::Partial`'s own trailing `Control` -- an
-/// error/break/halt that arrived *after* `expr` had already produced its one
-/// (or collapsed) value -- must still propagate, not be silently dropped
-/// behind the value that preceded it. Live-verified this was reachable
-/// through a real call site (the `Expr::Builtin(_)` arm below, `.a |
-/// ltrimstr(("x", error("boom"))) | key`): the "boom" error vanished
-/// entirely and evaluation continued into `key` as though `ltrimstr` had
-/// returned cleanly. Same "a control signal that already fired must still
-/// surface" rule as `#791`/`#987`/`#1832`/`#1897` elsewhere in this file --
-/// only the discovery point differs (here, `eval_owned_expr_full`'s own
-/// `Partial` arm rather than a checked `to_owned_lossy`).
-///
-/// `eval_owned_expr_ctrl`, the sibling this doc comment used to describe as
-/// sharing this exact gap, does too -- code review (#1559) caught that the
-/// probe cited in an earlier draft of this comment, `[1] | [paths(true,
-/// error("boom"))]`, only raised correctly because `[1]` has a non-root path
-/// (`[0]`) independently re-checked by `each_paths_filter`'s own per-node
-/// fan-out loop, masking the root pre-check's own bug. A root with *no*
-/// non-root paths isolates it: `1 | [paths(true, error("boom"))]` and `{} |
-/// [paths(true, error("boom"))]` both silently returned `[]` here instead of
-/// raising, where jq 1.7.1 raises `boom` for both. Fixed alongside this
-/// function below.
-fn eval_owned_expr_opt<S: EvalSemantics>(
-    expr: &Expr,
-    input: &OwnedValue,
-    optional: bool,
-) -> Result<Option<OwnedValue>, EvalEscape> {
-    // A *bare* break (no prior output from the argument) propagates instead
-    // of being collapsed into a synthetic "not in label" error (#833) -- see
-    // `result_to_owned`'s identical fix for the full rationale. The same
-    // conversion applies whether the break arrived before any output (the
-    // outer `Err` below) or after some (the trailing `Some(control)` case
-    // above it) -- either way it already fired and must still escape.
-    match eval_owned_expr_full::<S>(expr, input, optional) {
-        Ok(None) => Ok(None),
-        Ok(Some((_, Some(control)))) => Err(control.into()),
-        Ok(Some((v, None))) => Ok(Some(v)),
-        Err(control) => Err(control.into()),
     }
 }
 
@@ -55455,15 +55373,19 @@ fn builtin_paths<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// root pre-check, `paths(node_filter)` on a scalar/null/empty container
 /// never runs `filter` at all -- and (#850) even on a non-empty root, an
 /// error/break on the root itself must abort before any non-root path is
-/// produced, not just be missed. **This pre-check stays eager and
-/// unconditional even for a demand-driven sink**: nothing has been pushed
+/// produced, not just be missed. **This pre-check stays unconditional
+/// even for a demand-driven sink** (it runs the filter to exhaustion, ahead of
+/// any consumer's stop): nothing has been pushed
 /// yet at this point, so it is a bare `Error`/`Break`/`Halt`, never a
 /// `Partial`, and jq itself always runs it before any consumer could stop
 /// — confirmed against jq 1.7.1: `[1] | path(paths(stderr))` writes `[1]`
 /// to stderr even though `path()` stops the moment the first (root-excluded)
-/// path arrives. Uses `eval_owned_expr_ctrl` rather than its
-/// `eval_owned_expr` twin because this call site needs a `Control`-typed
-/// error, not `EvalEscape`. Confirmed against jq 1.7.1: `{"a":1} |
+/// path arrives. Drains the filter through [`eval_each_owned`] rather than
+/// evaluating it eagerly to one value, so a `?//` inside it is asked to retry
+/// as it would be anywhere else (#3366): the eager evaluator never forwarded
+/// the downstream error to the alternative, so `[paths(if ([1] as $q ?// $b |
+/// $q) then error("E") else true end)]` raised `E` where jq returns the
+/// paths. Confirmed against jq 1.7.1: `{"a":1} |
 /// paths(if type=="object" then error("x") else true end)` raises
 /// immediately with no output (not `["a"]`), and `label $out |
 /// [paths(break $out)]` on `1` produces no output and exits 0.
@@ -55526,7 +55448,16 @@ fn each_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
 
-    if let Err(control) = eval_owned_expr_ctrl::<S>(filter, &owned, optional) {
+    // #3366: the root pre-check drains the filter through the streaming
+    // evaluator rather than `eval_owned_expr_ctrl`, whose eager operand
+    // evaluation never forwards a consumer's stop to a `?//` inside it, so
+    // `-([1] as $a ?// $b | ...)` raised its first alternative's negation
+    // error where jq retries the second.
+    if let Flow::Escaped(control) =
+        eval_each_owned::<S>(filter, &owned, optional, Reentry::REBUILT, &mut |_| {
+            Demand::Continue
+        })
+    {
         return Flow::Escaped(control);
     }
 
@@ -91903,7 +91834,8 @@ mod tests {
     }
 
     /// #1559: `each_paths_filter`'s root `node_filter` pre-check
-    /// (`eval_owned_expr_ctrl`) silently swallowed a trailing error for any
+    /// (then an eager `eval_owned_expr_ctrl`, now a drain through
+    /// `eval_each_owned`, #3366) silently swallowed a trailing error for any
     /// root with *no* non-root paths -- a scalar or an empty container --
     /// since only a non-root path gets independently re-checked by the
     /// per-node fan-out loop below the pre-check. Live-verified against jq
@@ -107072,93 +107004,65 @@ mod tests {
         }
     }
 
-    /// #1559: `eval_owned_expr_opt` must propagate a `QueryResult::Partial`'s
-    /// trailing `Control` instead of silently dropping it behind the value
-    /// that preceded it -- the bug this test pins was reachable live via
-    /// `.a | ltrimstr(("x", error("boom"))) | key` (the `Expr::Builtin(_)`
-    /// arm in the deleted eager path-context evaluator), which printed nothing
-    /// and continued into `key` instead of raising `boom`.
+    /// #1559: `eval_owned_expr_full` keeps a `QueryResult::Partial`'s trailing
+    /// `Control` next to the value that preceded it instead of silently
+    /// dropping it -- the bug this test pins was reachable live via `.a |
+    /// ltrimstr(("x", error("boom"))) | key` (the `Expr::Builtin(_)` arm in the
+    /// deleted eager path-context evaluator), which printed nothing and
+    /// continued into `key` instead of raising `boom`.
     #[test]
-    fn eval_owned_expr_opt_propagates_trailing_control_after_partial_output_1559() {
-        // Trailing error wins over the one value already produced.
+    fn eval_owned_expr_full_keeps_trailing_control_after_partial_output_1559() {
+        // The trailing error comes back with the one value already produced.
         let expr = parse("(1, error(\"boom\"))").unwrap();
-        match eval_owned_expr_opt::<JqSemantics>(&expr, &OwnedValue::Null, false) {
-            Err(EvalEscape::Error(e)) => assert_eq!(e.message, "boom"),
+        match eval_owned_expr_full::<JqSemantics>(&expr, &OwnedValue::Null, false) {
+            Ok(Some((v, Some(Control::Error(e))))) => {
+                assert_eq!(v.to_json(), "1");
+                assert_eq!(e.message, "boom");
+            }
             other => panic!("unexpected result: {other:?}"),
         }
 
-        // Trailing break propagates as a bare break, same as a break with no
-        // prior output (#833) -- not collapsed into a synthetic error, and
-        // not silently dropped either.
+        // A trailing break is a bare break, same as a break with no prior
+        // output (#833) -- not collapsed into a synthetic error, and not
+        // silently dropped either.
         let expr = parse("(1, break $out)").unwrap();
-        match eval_owned_expr_opt::<JqSemantics>(&expr, &OwnedValue::Null, false) {
-            Err(EvalEscape::Break(label)) => assert_eq!(label, "out"),
+        match eval_owned_expr_full::<JqSemantics>(&expr, &OwnedValue::Null, false) {
+            Ok(Some((v, Some(Control::Break(label))))) => {
+                assert_eq!(v.to_json(), "1");
+                assert_eq!(label, "out");
+            }
             other => panic!("unexpected result: {other:?}"),
         }
 
-        // Trailing halt propagates too (#791).
+        // A trailing halt propagates as an `Err` (#791): it must reach the
+        // process exit, not sit beside a value a caller might return.
         let expr = parse("(1, halt)").unwrap();
-        match eval_owned_expr_opt::<JqSemantics>(&expr, &OwnedValue::Null, false) {
-            Err(EvalEscape::Halt(0)) => {}
+        match eval_owned_expr_full::<JqSemantics>(&expr, &OwnedValue::Null, false) {
+            Err(Control::Halt(0)) => {}
             other => panic!("unexpected result: {other:?}"),
         }
 
         // #1559 (code review): `optional: true` catches the trailing error
         // *upstream* of this function, inside `eval_single`'s own Comma
         // dispatch (matching real jq: `jq -cn '(1, error("boom"))?'` is `1`,
-        // confirmed live) -- `eval_owned_expr_full` never even sees a
-        // `Partial` here, since the interior error was already caught before
-        // reaching it. Pins that this function's own new match arms don't
-        // additionally interfere with (or duplicate) that upstream catch.
+        // confirmed live) -- this function never even sees a `Partial` here,
+        // since the interior error was already caught before reaching it.
         let expr = parse("(1, error(\"boom\"))").unwrap();
-        match eval_owned_expr_opt::<JqSemantics>(&expr, &OwnedValue::Null, true) {
-            Ok(Some(v)) => assert_eq!(v.to_json(), "1"),
+        match eval_owned_expr_full::<JqSemantics>(&expr, &OwnedValue::Null, true) {
+            Ok(Some((v, None))) => assert_eq!(v.to_json(), "1"),
             other => panic!("unexpected result: {other:?}"),
         }
     }
 
-    /// #1559 positive control: an expression with no trailing control still
-    /// returns its single value normally.
+    /// #1559 positive control: an expression with no trailing control returns
+    /// its single value with no control beside it.
     #[test]
-    fn eval_owned_expr_opt_no_trailing_control_unaffected_1559() {
+    fn eval_owned_expr_full_no_trailing_control_unaffected_1559() {
         let input =
             OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]).into());
         let expr = parse(".a").unwrap();
-        match eval_owned_expr_opt::<JqSemantics>(&expr, &input, false) {
-            Ok(Some(OwnedValue::Int(1))) => {}
-            other => panic!("unexpected result: {other:?}"),
-        }
-    }
-
-    /// #1559 (code review): `eval_owned_expr_ctrl` had the identical
-    /// trailing-`Control`-drop bug `eval_owned_expr_opt` was fixed for above
-    /// -- caught only once a live probe used a root with *no* non-root paths
-    /// (a scalar or empty container), since `each_paths_filter`'s per-node
-    /// fan-out loop independently re-checks any non-root path and had been
-    /// masking the root pre-check's own bug in an earlier, insufficiently
-    /// probed draft of this fix. Now a pure pass-through to
-    /// `eval_owned_expr_opt` (whose own test above already exhaustively pins
-    /// all three escape kinds), so one assertion here is enough to pin the
-    /// wrapper's own `EvalEscape` -> `Control` conversion rather than
-    /// re-deriving escape-handling logic that lives entirely upstream.
-    #[test]
-    fn eval_owned_expr_ctrl_propagates_trailing_control_after_partial_output_1559() {
-        let expr = parse("(1, error(\"boom\"))").unwrap();
-        match eval_owned_expr_ctrl::<JqSemantics>(&expr, &OwnedValue::Null, false) {
-            Err(Control::Error(e)) => assert_eq!(e.message, "boom"),
-            other => panic!("unexpected result: {other:?}"),
-        }
-    }
-
-    /// #1559 positive control for `eval_owned_expr_ctrl`: an expression with
-    /// no trailing control still returns its single value normally.
-    #[test]
-    fn eval_owned_expr_ctrl_no_trailing_control_unaffected_1559() {
-        let input =
-            OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]).into());
-        let expr = parse(".a").unwrap();
-        match eval_owned_expr_ctrl::<JqSemantics>(&expr, &input, false) {
-            Ok(OwnedValue::Int(1)) => {}
+        match eval_owned_expr_full::<JqSemantics>(&expr, &input, false) {
+            Ok(Some((v, None))) => assert_eq!(v.to_json(), "1"),
             other => panic!("unexpected result: {other:?}"),
         }
     }

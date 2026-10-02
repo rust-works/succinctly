@@ -594,9 +594,10 @@ IX_ENTRIES=(
   'ix-reduce::::path(reduce 1 as $x (.; .[__X__]))'
   'ix-recurse::::[path(recurse(if type == "object" then .[__X__] else empty end))]'
   'ix-walk-paths::::path(.. | select(type == "object") | .[__X__])'
-  # `paths(f)` evaluates `f` once per path and never retries (#3366), whatever
-  # `f` is; the index is only the failing operation.
-  'ix-paths::#3366::paths(.[__X__])'
+  # `paths(f)` does not run the retry a stopping consumer causes inside `f`
+  # (#3567); the index is only the failing operation. Its root pre-check streams
+  # `f`, so the no-consumer endings agree (#3366).
+  'ix-paths::#3567::paths(.[__X__])'
 )
 # Path-mode `foreach` evaluates its UPDATE before a consumer can stop it
 # (#3507), so a `?//` in the UPDATE is never asked to retry on a stop: only the

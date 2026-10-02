@@ -663,8 +663,12 @@ follows too. What it leaves:
   `[first(path(foreach 1 as $x (.; .[K]))), 9]` with a key whose retry raises after a satisfied
   first alternative is `[["a"],9]` after a single attempt here and an error in jq. Not a stale
   slot: no retry happens at all.
-- **`paths(f)` evaluates `f` once per path, with no retry** (#3366): `paths(.[K])` is jq's
-  `["a"]` and an error here.
+- **`paths(f)` does not run the `?//` retry a stopping consumer causes inside `f`** (#3567):
+  under `first(paths(.[K]))` or `limit(1; paths(.[K]))` jq asks the `?//` in the key for its next
+  alternative on the stop and the retry can raise, where this answers `["a"]` with no error.
+  Without a stopping consumer the two agree, and so does the root pre-check, which drains `f`
+  through the streaming evaluator (#3366): `[paths(if ([1] as $q ?// $b | $q) then error("E")
+  else true end)]` is `[["a"],["a","a"]]` here too.
 - **`getpath(K)` in path mode evaluates `K` once, with no retry** (the #3487 "arguments
   evaluated eagerly" family, not the index sink): `path(getpath(([["a"]] as [$q] ?// [[$q]] |
   [$q])))` on `{"a":{"a":1}}` is `["a"]` in jq after two attempts and "Cannot index object with
@@ -719,9 +723,6 @@ and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` 
   array it had collected after the error its body raises (#3512); and on the cursor route
   `limit(1; .[] | <retrying body>) | key` runs the `?//` retry past `limit`'s own stop (#3514).
   None is a stale slot.
-- **`paths(f)` evaluates `f` once per path, with no retry**: `[paths(if ([1] as $q ?// $b |
-  $q) then error("E") else true end)]` is `[["a"],["a","a"]]` in jq 1.7.1 and `E` here after a
-  single attempt (#3366, a second shape of its root-probe divergence).
 - **`limit` raises its own error for a non-number count, at the count** (#3486): `path(limit(([1]
   as $q ?// $b | $q); .a))` is `["a"]` in jq 1.7.1 -- its `$n - 1` fails downstream of the count,
   so the `?//` retries to a `null` (unlimited) count -- and "limit requires non-negative
@@ -7288,7 +7289,7 @@ gap properly for 3 of the 4 sites**, without take-first's regression: the
 issue's own `/code-review`, after a finder disproved the "not known to be
 live-reachable" claim below) the `Expr::Object`/`Array`/`Literal` arm now
 route through `eval_owned_input` (which preserves `Many`/`ManyOwned`)
-instead of `eval_owned_expr_opt` (which collapsed to one value).
+instead of `eval_owned_expr_opt` (which collapsed to one value; removed with its last caller, #3366).
 `continue_rest_with_context`/`accumulate_path_context_step` -- the functions
 that actually fan a `Comma` branch's output back out into the enclosing
 computation -- already handled `ManyOwned` correctly; they just never used

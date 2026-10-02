@@ -69005,6 +69005,100 @@ fn test_bare_nth_is_the_index_step_in_yq_extensions_3550() -> Result<()> {
 }
 
 // ============================================================================
+// #3366: `paths(filter)`'s root pre-check retries a `?//` like every other site
+// ============================================================================
+
+/// `paths(f)` evaluates `f` against the root before any path is produced, so a
+/// root error aborts the whole call (#1559). That pre-check evaluated `f` to one
+/// value eagerly, which never asks a `?//` inside it to retry: `-([1] as $a ?//
+/// $b | ...)` raised the first alternative's negation error where jq answers
+/// the second, and `if (<?//>) then error(\"E\") ...` raised `E` where jq
+/// returns the paths. It now drains `f` through the streaming evaluator. The
+/// rows that must not change -- a root error, a root break, a `try` -- are
+/// pinned beside it. Every row was captured from `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_paths_filter_root_probe_retries_an_alternative_3366() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            "{}",
+            "[paths(1 | -([1] as $a ?// $b | if $a == null then 1 else $a end) | false)]",
+            "[]",
+        ),
+        (
+            "{\"a\":{\"a\":1}}",
+            "[paths(1 | -([1] as $a ?// $b | if $a == null then 1 else $a end) | false)]",
+            "[]",
+        ),
+        (
+            "{}",
+            "[paths(if ([1] as $q ?// $b | $q) then error(\"E\") else true end)]",
+            "[]",
+        ),
+        (
+            "{\"a\":{\"a\":1}}",
+            "[paths(if ([1] as $q ?// $b | $q) then error(\"E\") else true end)]",
+            "[[\"a\"],[\"a\",\"a\"]]",
+        ),
+        (
+            "1",
+            "[paths(if ([1] as $q ?// $b | $q) then error(\"E\") else true end)]",
+            "[]",
+        ),
+        (
+            "{\"a\":{\"a\":1}}",
+            "[paths(-([1] as $a ?// $b | 1))]",
+            "[[\"a\"],[\"a\",\"a\"]]",
+        ),
+        (
+            "{\"a\":1}",
+            "[paths(([1] as [$q] ?// $q | $q) | if . == 1 then true else error(\"no\") end)]",
+            "[[\"a\"]]",
+        ),
+        ("1", "label $out | [paths(break $out)]", ""),
+        ("[1]", "[paths(. == 1)]", "[[0]]"),
+        (
+            "{\"a\":[1,2]}",
+            "[paths(type == \"number\")]",
+            "[[\"a\",0],[\"a\",1]]",
+        ),
+        ("{\"a\":1}", "try paths(error(\"e\")) catch .", "\"e\""),
+        ("1", "[paths(error(\"x\"))?]", "[]"),
+        ("{}", "[paths(1, error(\"boom\"))?]", "[]"),
+        ("{\"a\":1}", "[paths(1, error(\"boom\"))?]", "[]"),
+        (
+            "{}",
+            "try ([paths(1, error(\"boom\"))]) catch .",
+            "\"boom\"",
+        ),
+        ("[1]", "[paths(true, empty)]", "[[0]]"),
+        ("1", "[paths(empty)]", "[]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3366: `{filter}` on {input}: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "#3366: `{filter}` on {input}");
+    }
+    for (input, filter, message) in [
+        ("1", "[paths(true, error(\"boom\"))]", "boom"),
+        ("{}", "[paths(true, error(\"boom\"))]", "boom"),
+        ("[1]", "[paths(true, error(\"boom\"))]", "boom"),
+        (
+            "{\"a\":1}",
+            "paths(if type==\"object\" then error(\"x\") else true end)",
+            "x",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "#3366: `{filter}` on {input}: {stdout:?}");
+        assert!(stdout.is_empty(), "#3366: `{filter}`: {stdout:?}");
+        assert!(
+            stderr.contains(message),
+            "#3366: `{filter}` on {input}: wanted {message:?}, got {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
 // #3279: a `try`-wrapped `if` as a bind source keeps the path register
 // ============================================================================
 
