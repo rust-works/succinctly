@@ -599,9 +599,6 @@ replaces the mapping. `-P` strips the quoting but keeps that the key is a string
 `"a": 1` becomes `a: 1`). Pinned by the `yaml_key_style_*_3601` goldens. What is still open, each
 separate from this:
 
-- **`-P` and a key or value that YAML 1.1 reads as a bool** (`"yes"`, `'on'`, `"y"`). yq keeps these
-  quoted under `-P` and this writer prints them bare; the same is true of a value (`a: "yes"`), so it is
-  not specific to keys.
 - **A filter that rebuilds the tree** (`with_entries`, `to_entries | from_entries`, `keys`, `*`, `+`)
   carries no `CommentTree` at all, so every key *and value* on that route loses its quoting. yq keeps both,
   because it keeps the node.
@@ -610,6 +607,18 @@ separate from this:
   (`a: "x" # cm`), so this is the existing key-matching approximation (#870), not a new one.
 - **Two keys with the same text** (`y: 1` and `"y": 4`). The DOM is keyed by text, so they collapse to one
   entry; yq keeps both.
+
+`-P` and the quoting of a string ([#3614](https://github.com/rust-works/succinctly/issues/3614)) is
+closed. yq's `-P` strips a quoted string to plain unless its encoder would misread it, and the
+DOM writer got two cases wrong: a YAML 1.1 bool spelling (`"yes"`, `'on'`, `"nO"`: `y`, `yes`, `n`,
+`no`, `on`, `off`, in any case) keeps its source quote style under yq and was written bare here,
+and a quoted string spelled like a timestamp, `1_000` or `0b11` was written bare (so it read back
+as another type) where yq writes it double-quoted. The strip pass now walks the value beside the
+tree: a quoted bool spelling, key or value, keeps its style, and every other quoted string is
+remembered as a string (`VALUE_STYLE_STRING`, `KEY_STYLE_STRING`), written as go-yaml writes any
+string. Plain scalars are untouched (`off: 8` stays plain). A node a write *copies* from elsewhere (`.c = .a`, `.l[1] = .l[0]`) has no tree entry of its own, so it loses its quoting with or without `-P`, and an explicit `!!str` tag is dropped on this route (`a: !!str "yes"` becomes `a: "yes"`). Pinned by the
+`yaml_pretty_old_bool_*_3614` and `yaml_pretty_quoted_typed_strings_3614` goldens; a randomized
+sweep of 720 documents over the spellings, block and flow, matches yq.
 
 The fourth gap first listed here, a JSON surrogate-pair escape
 (`"\ud83d\ude00"`), used to fail with `invalid escape sequence` on every route and is closed: it is
