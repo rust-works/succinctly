@@ -11787,6 +11787,20 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             each_recurse_generic::<S, V>(f, Some(cond), value, cursor, sink)
         }
 
+        // #3567: `paths(f)` streams its paths from `eval.rs`'s `eval_each`
+        // (`each_paths_filter`, whose loop forwards the sink's stop into `f`),
+        // so a consumer that stops after the first path -- `first`, `limit`,
+        // `label`/`break` -- reaches a `?//` inside `f` and runs the retry jq
+        // runs there. Without an arm here it fell to the `eval_single` wildcard
+        // below, which collected every path first: `paths` visited a node jq
+        // never reaches (`f` ran there, printing its `stderr` markers a second
+        // time) and the retry's error, computed after the stop, was a trailing
+        // escape the consumer dropped. Same demand-forwarding bridge as
+        // `Builtin::Path`'s non-navigational arm above and the arm below.
+        Expr::Builtin(Builtin::PathsFilter(_)) => {
+            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        }
+
         // #3448: jq's `=`/`op=`/`//=` run their right side as the outer
         // generator, so a consumer that stops after one document must stop
         // the RHS -- `first(.a = (1, input))` never reads the second input. The
