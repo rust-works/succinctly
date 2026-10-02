@@ -13926,6 +13926,7 @@ fn each_loop_generic<S: EvalSemantics, V: DocumentValue>(
         update,
         optional,
         stream: crate::jq::eval::loop_stream_budget(update),
+        cond_stream: crate::jq::eval::loop_stream_budget(cond),
     };
     match loop_step_generic::<S, V>(spec, state, &mut budget, sink) {
         Ok(Demand::Continue) => Flow::Exhausted,
@@ -13937,8 +13938,8 @@ fn each_loop_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// What [`loop_step_generic`] reads of the loop it runs, fixed for the whole
 /// tree: which loop, its two operands and the ambient `optional`, plus the
-/// native-stack budget a `?//`-holding `update` streams under (#3503, see
-/// [`crate::jq::eval::loop_stream_budget`]).
+/// native-stack budgets a `?//`-holding `update` (#3503) and `cond` (#3617)
+/// stream under (see [`crate::jq::eval::loop_stream_budget`]).
 #[derive(Clone, Copy)]
 struct LoopSpec<'e> {
     kind: LoopKind,
@@ -13946,10 +13947,11 @@ struct LoopSpec<'e> {
     update: &'e Expr,
     optional: bool,
     stream: Option<crate::jq::eval::RecurseNativeBudget>,
+    cond_stream: Option<crate::jq::eval::RecurseNativeBudget>,
 }
 
-/// Why one branch of a streamed `update`'s subtree ended early (#3503), the
-/// [`StashedVerdict`] payload of [`loop_update_streaming`].
+/// Why one branch of a streamed operand's subtree ended early (#3503, #3617), the
+/// [`StashedVerdict`] payload of [`stream_loop_branches`].
 enum LoopAbort {
     /// The sink answered [`Demand::Stop`].
     Stopped,
@@ -13995,6 +13997,13 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
             ))));
         }
         *budget -= 1;
+
+        // #3617: a `cond` holding a `?//` runs the branch each of its outputs
+        // chooses inside its sink, so the retry can follow a failure that branch
+        // (the update, a later round, the consumer) raises.
+        if let Some(_level) = crate::jq::eval::loop_enter_stream(spec.cond_stream) {
+            return loop_cond_streaming::<S, V>(spec, &state, budget, sink);
+        }
 
         let (bits, cond_control) = state.cond_bits::<S>(cond, optional);
 
@@ -14047,55 +14056,105 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
         }
 
         for bit in bits {
-            if bit != continues_on {
-                // `until`'s truthy branch emits the state and stops there;
-                // `while`'s falsy branch is `empty`.
-                if kind == LoopKind::Until && sink.push(state.emit()) == Demand::Stop {
-                    return Ok(Demand::Stop);
-                }
-                continue;
-            }
-            if kind == LoopKind::While && sink.push(state.emit()) == Demand::Stop {
+            if loop_decided_generic::<S, V>(spec, &state, bit, budget, sink)? == Demand::Stop {
                 return Ok(Demand::Stop);
-            }
-            if let Some(_level) = crate::jq::eval::loop_enter_stream(spec.stream) {
-                // #3503: see the fast path above.
-                if loop_update_streaming::<S, V>(spec, &state, budget, sink)? == Demand::Stop {
-                    return Ok(Demand::Stop);
-                }
-                continue;
-            }
-            let (next, update_control) = state.fork::<S>(update, optional);
-            for next_state in next {
-                if loop_step_generic::<S, V>(spec, next_state, budget, sink)? == Demand::Stop {
-                    return Ok(Demand::Stop);
-                }
-            }
-            if let Some(control) = update_control {
-                return Err(control);
             }
         }
         return cond_control.map_or(Ok(Demand::Continue), Err);
     }
 }
 
+/// One branch of [`loop_step_generic`] once a `cond` output has chosen it
+/// (`bit`): the branch that does not continue emits `state` for `until` and is
+/// `empty` for `while`; the one that does emits it for `while`, then steps
+/// `update` and runs the rest of the loop from each output. Shared by the
+/// collected `cond` and the streamed one ([`loop_cond_streaming`], #3617).
+fn loop_decided_generic<S: EvalSemantics, V: DocumentValue>(
+    spec: LoopSpec<'_>,
+    state: &LoopState<V>,
+    bit: bool,
+    budget: &mut usize,
+    sink: &mut dyn Sink<V>,
+) -> Result<Demand, Control> {
+    let continues_on = spec.kind == LoopKind::While;
+    if bit != continues_on {
+        // `until`'s truthy branch emits the state and stops there;
+        // `while`'s falsy branch is `empty`.
+        if spec.kind == LoopKind::Until && sink.push(state.emit()) == Demand::Stop {
+            return Ok(Demand::Stop);
+        }
+        return Ok(Demand::Continue);
+    }
+    if spec.kind == LoopKind::While && sink.push(state.emit()) == Demand::Stop {
+        return Ok(Demand::Stop);
+    }
+    if let Some(_level) = crate::jq::eval::loop_enter_stream(spec.stream) {
+        // #3503: see [`loop_update_streaming`].
+        return loop_update_streaming::<S, V>(spec, state, budget, sink);
+    }
+    let (next, update_control) = state.fork::<S>(spec.update, spec.optional);
+    for next_state in next {
+        if loop_step_generic::<S, V>(spec, next_state, budget, sink)? == Demand::Stop {
+            return Ok(Demand::Stop);
+        }
+    }
+    update_control.map_or(Ok(Demand::Continue), Err)
+}
+
 /// [`loop_step_generic`]'s step for an `update` holding a `?//` (#3503): drive
 /// `update` over `state` through a live sink and run every output's subtree
-/// *inside* it, instead of collecting the outputs first.
+/// *inside* it, instead of collecting the outputs first. A `cond` holding one
+/// takes [`loop_cond_streaming`], and when both do a round nests two native levels.
 ///
 /// jq retries a `?//` alternative when a failure raised downstream of it
 /// reaches it, and everything after `update` in the loop -- the rest of the
 /// round, every later round, and the consumer -- is downstream. Collecting the
 /// outputs first finished the `update` before the next round could fail, so
 /// `[.|while(length>0; U)]` made one attempt where jq makes two and the error
-/// escaped. The sink stashes the abort a subtree raised (or the consumer's
-/// stop) and answers [`Demand::Stop`]; a `?//` that retries past it supersedes
-/// the stash exactly as `recurse`'s walkers' does (#3293).
+/// escaped.
 fn loop_update_streaming<S: EvalSemantics, V: DocumentValue>(
     spec: LoopSpec<'_>,
     state: &LoopState<V>,
     budget: &mut usize,
     sink: &mut dyn Sink<V>,
+) -> Result<Demand, Control> {
+    stream_loop_branches::<V>(
+        spec.update,
+        |each_sink| state.each::<S>(spec.update, spec.optional, each_sink),
+        &mut |item| {
+            let next = LoopState::<V>::from_item::<S>(item)?;
+            loop_step_generic::<S, V>(spec, next, budget, sink)
+        },
+    )
+}
+
+/// [`loop_update_streaming`] for a `cond` holding a `?//` (#3617): each `cond`
+/// output chooses its branch ([`loop_decided_generic`]) inside the sink, so the
+/// emission, the update and every later round are downstream of the bind.
+fn loop_cond_streaming<S: EvalSemantics, V: DocumentValue>(
+    spec: LoopSpec<'_>,
+    state: &LoopState<V>,
+    budget: &mut usize,
+    sink: &mut dyn Sink<V>,
+) -> Result<Demand, Control> {
+    stream_loop_branches::<V>(
+        spec.cond,
+        |each_sink| state.each::<S>(spec.cond, spec.optional, each_sink),
+        &mut |item| {
+            let bit = generic_item_truthiness::<_, S>(item)?;
+            loop_decided_generic::<S, V>(spec, state, bit, budget, sink)
+        },
+    )
+}
+
+/// Drive `generator` (via `each`) into a sink that runs `step` on every output
+/// and stashes the abort it raises, or the consumer's stop, answering
+/// [`Demand::Stop`]; a `?//` inside `generator` that retries past it supersedes
+/// the stash exactly as `recurse`'s walkers' does (#3293).
+fn stream_loop_branches<V: DocumentValue>(
+    generator: &Expr,
+    each: impl FnOnce(&mut dyn Sink<V>) -> Flow,
+    step: &mut dyn FnMut(GenericItem<V>) -> Result<Demand, Control>,
 ) -> Result<Demand, Control> {
     let abort: StashedVerdict<LoopAbort> = StashedVerdict::new();
     let stash = |end: LoopAbort| {
@@ -14105,19 +14164,15 @@ fn loop_update_streaming<S: EvalSemantics, V: DocumentValue>(
         abort.stash(end);
         Demand::Stop
     };
-    let flow = state.each::<S>(spec.update, spec.optional, &mut |item| {
+    let flow = each(&mut |item| {
         abort.begin();
-        let next = match LoopState::<V>::from_item::<S>(item) {
-            Ok(next) => next,
-            Err(control) => return stash(LoopAbort::Escaped(control)),
-        };
-        match loop_step_generic::<S, V>(spec, next, budget, sink) {
+        match step(item) {
             Ok(Demand::Continue) => Demand::Continue,
             Ok(Demand::Stop) => stash(LoopAbort::Stopped),
             Err(control) => stash(LoopAbort::Escaped(control)),
         }
     });
-    let direct_retry = crate::jq::eval::direct_pattern_retry(spec.update);
+    let direct_retry = crate::jq::eval::direct_pattern_retry(generator);
     let abort = abort.take_unless(|at| crate::jq::eval::retry_superseded(&flow, at, direct_retry));
     match (abort, flow) {
         (Some(LoopAbort::Escaped(control)), _) | (None, Flow::Escaped(control)) => Err(control),
