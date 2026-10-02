@@ -435,6 +435,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measures the text (#3604); and an integer past `2^53` keeps its exact digits where yq rounds it
   through `float64`, so its width differs (#3605, which differs in the printed value too).
 
+- **jq: `localtime`, `mktime` of a local time and `strflocaltime` resolve the system zone** (#3054).
+  They read only a POSIX `TZ` offset string, so `TZ=Asia/Tokyo`, `TZ=America/New_York` and an unset
+  `TZ` (the usual case) all silently meant UTC, and the offset was taken at the moment of the call
+  rather than at the timestamp. They now ask the system zone through `jiff` (the `local-zone`
+  feature, on in `cli`): an IANA name, a `:name`, a path or a POSIX string, otherwise `/etc/localtime`,
+  with the offset *at the timestamp*, so daylight time follows the date (`TZ=Asia/Tokyo`,
+  `0 | localtime` is `[1970,0,1,9,0,0,4,0]`; `TZ=America/New_York`, `1720000000 | localtime[3]` is
+  `5`). `localtime` and `localtime | mktime` agree with jq 1.7.1 and 1.8.2 on every row tried on macOS. A POSIX
+  string with a daylight-time name and no rule (`EST5EDT`) gets the US rule when no tz file carries
+  the name, so it keeps working on distributions that no longer ship the legacy files. Windows keeps
+  the previous behaviour. **`strflocaltime`'s `%z`, `%Z` and `%s` are now the zone's own** (`-0400
+  EDT` and the true epoch in July in New York): jq 1.7.1 labels a daylight-time instant with the
+  zone's standard offset and name, an hour off the fields, and prints `+0000` for `%z` on glibc;
+  jq 1.8.2 prints the values succinctly does. Recorded in `docs/compliance/jq/limitations.md`.
+
 - **yq: a whole-number JSON float is an integer, as in yq** (#3577). yq's JSON decoder types `2.0`,
   `1e2`, `-0.0` and `9223372036854775808.0` as `!!int`, and keeps `2.5`, `1e19`, `1e20` and `1e300`
   `!!float`. The cursor route typed every one of them a float, so `.p | tag`, `type`,
