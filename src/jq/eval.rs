@@ -35286,6 +35286,18 @@ impl Keep {
         }
     }
 
+    /// This bound, widened by `extra` outputs: a consumer that drops its first
+    /// `extra` outputs (`skip`) needs that many more of a single leaf's before
+    /// the one it delivers, and [`Keep::at_most`] only ever narrows, so a
+    /// `First` cap would cut the leaf before the dropped prefix was past (#3611).
+    fn widened_by(self, extra: usize) -> Self {
+        match (self, extra) {
+            (keep, 0) => keep,
+            (Self::First, extra) => Self::AtMost(extra.saturating_add(1)),
+            (Self::AtMost(k), extra) => Self::AtMost(k.saturating_add(extra)),
+        }
+    }
+
     /// The output count at which the leaf's sink answers [`Demand::Stop`].
     fn limit(self) -> usize {
         match self {
@@ -35986,6 +35998,69 @@ fn resolve_nth_sink<'a, S: EvalSemantics>(
         match flow {
             ResolveFlow::Exhausted => {}
             ResolveFlow::Stopped if !downstream_stopped => {}
+            other => return other,
+        }
+    }
+    flow_result(escape)
+}
+
+/// `path(skip(n; expr))` (#3611) -- `limit`'s twin: `n` is the OUTER loop, one
+/// resolution of `expr` per `n` output, the first `n` of its branches dropped
+/// and the rest forwarded. Nothing bounds the body but the caller's own cap,
+/// widened by the dropped count ([`Keep::widened_by`]): every dropped position
+/// still has to be produced, and an error it raises there surfaces, so a leaf
+/// that makes many values (`skip(1; paths)`) has to be asked for the dropped
+/// ones as well as the one that is delivered.
+///
+/// jq 1.8 defines it as `def skip($n; f): if $n > 0 then foreach f as $item
+/// ($n; .-1; if . < 0 then $item else empty end) elif $n == 0 then f else
+/// error("skip doesn't support negative count") end;`, which the pinned jq
+/// 1.7.1 does not have, so the rows are captured from jq 1.8.2:
+///
+/// ```console
+/// $ echo '{"a":{"b":[1,2]}}' | jq -c 'path(.a | skip(1; .b[]))'
+/// ["a","b",1]
+/// $ echo '[1,2,3]' | jq -c 'del(skip(1; .[]))'
+/// [1]
+/// ```
+///
+/// `classify_skip_n` is shared with value mode's `skip`, for the same
+/// anti-drift reason [`resolve_limit_sink`] shares `classify_limit_n`.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `frame` (#2042) joins `trackable`/`snapshot` as the resolver's third threaded ambient
+fn resolve_skip_sink<'a, S: EvalSemantics>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let (n_values, escape) = eval_owned_multi_keep_partial::<S>(n_expr, value);
+    for n_value in n_values {
+        let drop = match classify_skip_n(n_value) {
+            Ok(drop) => drop,
+            Err(e) => return ResolveFlow::Escaped(e.into()),
+        };
+        let mut skipped = 0usize;
+        let flow = resolve_node_sink::<S>(
+            expr,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep.widened_by(drop),
+            &mut |branch| {
+                if skipped < drop {
+                    skipped += 1;
+                    return Demand::Continue;
+                }
+                sink(branch)
+            },
+        );
+        match flow {
+            ResolveFlow::Exhausted => {}
             other => return other,
         }
     }
@@ -36819,6 +36894,13 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // by `eval_generic`'s own rewrites, so both spell the same arm.
         Expr::NthExpr { n, expr } | Expr::Builtin(Builtin::NthStream(n, expr)) => {
             resolve_nth_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
+        }
+
+        // `skip(n; f)` (#3611): `limit`'s twin in the resolver -- it had no arm
+        // at all, so its outputs fell to the value-producing default and were
+        // rejected as "Invalid path expression".
+        Expr::Builtin(Builtin::Skip(n, expr)) => {
+            resolve_skip_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
         }
 
         // #2746: `last(f)`, `isempty(f)` and `INDEX(stream; idx_expr)` all
