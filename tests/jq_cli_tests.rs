@@ -61230,11 +61230,12 @@ fn assert_rows_3579(rows: &[(&str, &str, &str, &str, i32)]) -> Result<()> {
 /// the root where jq writes `{"a":9}` (exit 0, nothing refused). It now refuses
 /// once the pipe has navigated, as it always did on `{"a":null}`.
 ///
-/// jq answers every one of these rows (`["a"]`, `{"a":9}`, `null` for `del`);
-/// the rows pin this resolver's *current refusal*, which must be loud
-/// everywhere. All 19 answered silently before, 15 of them wrongly. The refusal
-/// is the resolver's guess, not jq's verdict, so no `try`, `?` or `catch` turns
-/// it into a dropped write (#3267, ADR-0018 rule 4).
+/// jq answers every one of these rows (`["a"]`, `{"a":9}`, `null` for `del`)
+/// except `del(... $x, .b)`, which it refuses too, at `.b`, with a different
+/// message. The rows pin this resolver's *current refusal*, which must be loud
+/// everywhere. The first 19 answered silently on `main`, 15 of them wrongly. The
+/// refusal is the resolver's guess, not jq's verdict, so no `try`, `?` or
+/// `catch` turns it into a dropped write (#3267, ADR-0018 rule 4).
 #[test]
 fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
     assert_rows_3579(&[
@@ -61373,15 +61374,53 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
+        // in a ?// chain, and a refusal that pre-empts jq's own later error (jq refuses too, at .b: both exit 5, the wording differs)
+        (
+            r"null",
+            r"[path(. as [$q] ?// $q | .a as $x | .a | 5 | first(7) | $x)]",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"del(.a as $x | .a | 5 | first(7) | $x, .b)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        // more register-dropping stages between the navigation and the terminal
+        (
+            r"null",
+            r#"path(.a|ltrimstr("x")|null)"#,
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"path(.a|walk(.)|null)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"path(.a|reduce 1 as $i (.;5)|null)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
     ])
 }
 
 /// #3579, must-not-change: the carve-out keeps every answer it had while the
 /// register provably sits at the root, and a stage that can vouch for the
 /// register after a navigation still re-establishes it. Expectations are jq
-/// 1.7.1's, except the last three rows: a document that is not `null`/`true`/
-/// `false` never reached the carve-out, and the same shape refuses there
-/// exactly as before.
+/// 1.7.1's, except the three `{"a":null}`/`[null]` rows: a document that is not
+/// `null`/`true`/`false` never reached the carve-out, and the same shape
+/// refuses there exactly as before. `true` and `false` cannot be navigated at
+/// all, so no pipe on them reaches the carve-out after a navigation.
 #[test]
 fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
     assert_rows_3579(&[
@@ -61455,6 +61494,17 @@ fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
+        // computed values after a navigation that jq and this resolver both answer
+        (r"null", r"path(.a | tostring | null)", "[\"a\"]\n", "", 0),
+        (r"null", r"path(.a | length | null)", "[\"a\"]\n", "", 0),
+        (r"null", r"path(.a | [.] | .[0] | null)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element 0 of [null]\n", 5),
+        // true and false cannot be navigated at all, so nothing reaches the carve-out after a navigation: both tools agree
+        (r"true", r"path(.a | null)", "", "jq: error (at <stdin>:1): Cannot index boolean with string \"a\"\n", 5),
+        (r"false", r"path(.a | null)", "", "jq: error (at <stdin>:1): Cannot index boolean with string \"a\"\n", 5),
+        (r"true", r#"try path(.a | null) catch "C""#, "\"C\"\n", "", 0),
+        (r"false", r"path(.[]? | null)", "", "", 0),
+        (r"true", r"path(first | null)", "", "jq: error (at <stdin>:1): Cannot index boolean with number\n", 5),
+        (r"false", r"del(false)", "null\n", "", 0),
     ])
 }
 

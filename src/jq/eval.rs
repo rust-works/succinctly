@@ -48285,10 +48285,8 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                 // navigated, this resolver cannot say where the register is
                 // (a stage between may have dropped it), so it refuses, as it
                 // already does on `{"a":null}`.
-                if S::TAG == EvalTag::Jq
-                    && branch.path.depth() == 0
-                    && null_bool_identical(&branch.value, input)
-                {
+                let identical = S::TAG == EvalTag::Jq && null_bool_identical(&branch.value, input);
+                if identical && branch.path.depth() == 0 {
                     // emission: mirror the navigation family's identical
                     // seed (#2691) -- the identical literal carried through
                     // the *root* (empty) path answers `[]` in real jq 1.7.1.
@@ -48309,17 +48307,16 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                         true,
                     ));
                 }
-                // #3579: declining the carve-out above after a navigation is
-                // this resolver's guess, not jq's verdict. Navigating a `null`
-                // (or `true`/`false`) document only ever reaches an equal
-                // `null` (or an error), so jq holds the register at a node
-                // *identical* to this terminal and answers. Caught, the guess
-                // silently lost the write jq makes, so it is uncatchable, as
-                // every other guessed refusal is (#3267, ADR-0018 rule 4).
-                let guessed = S::TAG == EvalTag::Jq
-                    && branch.path.depth() > 0
-                    && null_bool_identical(&branch.value, input);
-                violation = Some(if !guessed {
+                // #3579: an `identical` terminal that got past the carve-out
+                // above has a non-empty path, i.e. it was declined *because*
+                // the pipe navigated. That refusal is this resolver's guess,
+                // not jq's verdict. Navigating a `null` (or `true`/`false`)
+                // document only ever reaches an equal `null` (or an error), so
+                // jq holds the register at a node *identical* to this terminal
+                // and answers. Caught, the guess silently lost the write jq
+                // makes, so it is uncatchable, as every other guessed refusal
+                // is (#3267, ADR-0018 rule 4).
+                violation = Some(if !identical {
                     refusal()
                 } else if near_iterate {
                     EvalError::invalid_path_expression_near_iterate(&branch.value)

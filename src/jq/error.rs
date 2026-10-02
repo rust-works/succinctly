@@ -1135,7 +1135,9 @@ impl EvalError {
     /// `del(. as $x | has("a") | try ($x | .a))` echoing the document where
     /// jq deletes `.a`, or `[del(...)?]` dropping the output altogether.
     /// Uncaught, it is a loud refusal instead: ADR-0018's rule 4. Any other
-    /// error is returned unchanged.
+    /// error is returned unchanged -- including the terminal "with result"
+    /// refusal, which a resolver guess of that kind raises guessed directly
+    /// through [`Self::invalid_path_expression_guessed`] (#3579).
     pub(crate) fn into_guessed_path_refusal(self) -> Self {
         if self.is_untracked_navigation_error() {
             Self::with_kind(self.message, ErrorKind::GuessedPathRefusal)

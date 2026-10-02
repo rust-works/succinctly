@@ -2654,7 +2654,10 @@ answers `["b"]` — and classified the two residuals appended below):
   it refuses with jq's own wording, as it always did on `{"a":null}` and `[null]`. The refusal is the
   resolver's guess, not jq's verdict (navigating a `null` document only ever reaches an equal
   `null`), so it is uncatchable by `try`, `?` and `catch` like every other guessed refusal (#3267):
-  `try ((.a as $x | .a | 5 | first(7) | $x) = 9) catch "C"` exits 5 where jq writes `{"a":9}`.
+  `try ((.a as $x | .a | 5 | first(7) | $x) = 9) catch "C"` exits 5 where jq writes `{"a":9}`. A
+  refusal here can also pre-empt a later error jq raises itself: `del(.a as $x | .a | 5 | first(7) |
+  $x, .b)` on `null` refuses in both, but jq's message is `near attempt to access element "b" of 7`
+  (it accepted the first branch) and this resolver's is `with result null` (exit 5 either way).
   `path(.a | null)`, `path(.a | 5 | null)`, `path(.a as $x | .a | 5 | $x)` and the rest of the
   carve-out's own cases are unchanged and still match jq. Pinned by
   `test_terminal_null_after_a_navigation_refuses_loudly_3579` and
