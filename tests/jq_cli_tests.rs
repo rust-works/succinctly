@@ -61207,6 +61207,312 @@ fn test_jq_mode_del_identical_null_bool_literal_deletes_root_3207() -> Result<()
     Ok(())
 }
 
+/// Runs each `(document, filter, stdout, stderr, exit code)` row of the #3579
+/// tests below. The document is fed with a trailing newline, so errors read
+/// `<stdin>:1`.
+fn assert_rows_3579(rows: &[(&str, &str, &str, &str, i32)]) -> Result<()> {
+    for &(doc, filter, stdout, stderr, code) in rows {
+        let (out, err, got) = run_jq_full(&["-c", filter], Some(&format!("{doc}\n")))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), got),
+            (stdout, stderr, code),
+            "{filter} on {doc}"
+        );
+    }
+    Ok(())
+}
+
+/// #3579: #3125's terminal `null`/`true`/`false` carve-out answers the *root*
+/// path `[]`, which is right only while the register never left the root. After
+/// a navigation it is not: on a `null` document `.a` is `null` too, so a
+/// terminal `null` is equal by value to the register and says nothing about
+/// *which* node, and `(.a as $x | .a | 5 | first(7) | $x) = 9` wrote `9` over
+/// the root where jq writes `{"a":9}` (exit 0, nothing refused). It now refuses
+/// once the pipe has navigated, as it always did on `{"a":null}`.
+///
+/// jq answers every one of these rows (`["a"]`, `{"a":9}`, `null` for `del`)
+/// except `del(... $x, .b)`, which it refuses too, at `.b`, with a different
+/// message. The rows pin this resolver's *current refusal*, which must be loud
+/// everywhere. The first 19 answered silently on `main`, 15 of them wrongly. The
+/// refusal is the resolver's guess, not jq's verdict, so no `try`, `?` or
+/// `catch` turns it into a dropped write (#3267, ADR-0018 rule 4).
+#[test]
+fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
+    assert_rows_3579(&[
+        // the issue's rows: jq answers `["a"]` / `{"a":9}` / `null`; this resolver cannot say where its register is
+        (
+            r"null",
+            r"path(.a as $x | .a | 5 | first(7) | $x)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | first(7) | $x) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | first(7) | $x) |= 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"del(.a as $x | .a | 5 | first(7) | $x)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | limit(1; 7) | $x) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | first(range(3)) | $x) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | first(..) | $x) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | try (.., 1) catch 7 | $x) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | first(7) | $x) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | [first(7)] | $x) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a | 5 | select(true) | null) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a | 5 | select(true) | null) |= 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"path(.a | 5 | select(true) | null)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"(.a.b | 5 | select(true) | null) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        // a guess, not jq's verdict, so no `try`, `?` or `catch` turns it into a dropped write (jq writes there)
+        (
+            r"null",
+            r#"try ((.a as $x | .a | 5 | first(7) | $x) = 9) catch "CAUGHT""#,
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"[path(.a as $x | .a | 5 | first(7) | $x)?]",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r#"try path(.a as $x | .a | 5 | first(7) | $x) catch "C""#,
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"del((.a | 5 | select(true) | null)?)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"[(.a as $x | .a | 5 | first(7) | $x) = 9?]",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        // in a ?// chain, and a refusal that pre-empts jq's own later error (jq refuses too, at .b: both exit 5, the wording differs)
+        (
+            r"null",
+            r"[path(. as [$q] ?// $q | .a as $x | .a | 5 | first(7) | $x)]",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"del(.a as $x | .a | 5 | first(7) | $x, .b)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        // more register-dropping stages between the navigation and the terminal
+        (
+            r"null",
+            r#"path(.a|ltrimstr("x")|null)"#,
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"path(.a|walk(.)|null)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"null",
+            r"path(.a|reduce 1 as $i (.;5)|null)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+    ])
+}
+
+/// #3579, must-not-change: the carve-out keeps every answer it had while the
+/// register provably sits at the root, and a stage that can vouch for the
+/// register after a navigation still re-establishes it. Expectations are jq
+/// 1.7.1's, except the three `{"a":null}`/`[null]` rows: a document that is not
+/// `null`/`true`/`false` never reached the carve-out, and the same shape
+/// refuses there exactly as before. `true` and `false` cannot be navigated at
+/// all, so no pipe on them reaches the carve-out after a navigation.
+#[test]
+fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
+    assert_rows_3579(&[
+        // #3125's own cases: nothing before the terminal navigated, so the register is at the root
+        (r"null", r"path(null)", "[]\n", "", 0),
+        (r"null", r"[path(null)?]", "[[]]\n", "", 0),
+        (r"null", r"path(5 | null)", "[]\n", "", 0),
+        (r"null", r"path(select(true) | null)", "[]\n", "", 0),
+        (r"null", r"path(first(.a) | 5 | null)", "[\"a\"]\n", "", 0),
+        (r"null", r"path((.a | empty), null)", "[]\n", "", 0),
+        (r"null", r"del(null)", "null\n", "", 0),
+        (r"true", r"path(true)", "[]\n", "", 0),
+        (r"true", r"del(true)", "null\n", "", 0),
+        (r"false", r"path(false)", "[]\n", "", 0),
+        (r"false", r"del(false)", "null\n", "", 0),
+        (r"null", r#"try path(5 | null) catch "C""#, "[]\n", "", 0),
+        // after a navigation a stage that can vouch for the register still re-establishes it
+        (r"null", r"path(.a | null)", "[\"a\"]\n", "", 0),
+        (r"null", r"path(.a | 5 | null)", "[\"a\"]\n", "", 0),
+        (
+            r"null",
+            r"path(.a | select(true) | null)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (r"null", r"path(.a.b | null)", "[\"a\",\"b\"]\n", "", 0),
+        (r"null", r"path(.a, null)", "[\"a\"]\n[]\n", "", 0),
+        (r"null", r"path(.a as $x | null)", "[]\n", "", 0),
+        (r"null", r"path(.a as $x | .a | 5 | $x)", "[\"a\"]\n", "", 0),
+        (
+            r"null",
+            r"path(.a as $x | .a | 5 | try $x)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"(.a as $x | .a | 5 | $x) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(.a as $x | .a | select(true) | $x)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // a non-null document never reached the carve-out: the same shape refuses loudly, as before
+        (
+            r#"{"a":null}"#,
+            r"path(.a as $x | .a | 5 | first(7) | $x)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"(.a as $x | .a | 5 | first(7) | $x) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        (
+            r"[null]",
+            r"path(.[0] as $x | .[0] | 5 | first(7) | $x)",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
+            5,
+        ),
+        // computed values after a navigation that jq and this resolver both answer
+        (r"null", r"path(.a | tostring | null)", "[\"a\"]\n", "", 0),
+        (r"null", r"path(.a | length | null)", "[\"a\"]\n", "", 0),
+        (r"null", r"path(.a | [.] | .[0] | null)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element 0 of [null]\n", 5),
+        // true and false cannot be navigated at all, so nothing reaches the carve-out after a navigation: both tools agree
+        (r"true", r"path(.a | null)", "", "jq: error (at <stdin>:1): Cannot index boolean with string \"a\"\n", 5),
+        (r"false", r"path(.a | null)", "", "jq: error (at <stdin>:1): Cannot index boolean with string \"a\"\n", 5),
+        (r"true", r#"try path(.a | null) catch "C""#, "\"C\"\n", "", 0),
+        (r"false", r"path(.[]? | null)", "", "", 0),
+        (r"true", r"path(first | null)", "", "jq: error (at <stdin>:1): Cannot index boolean with number\n", 5),
+        (r"false", r"del(false)", "null\n", "", 0),
+        // a deferred trailing iterate after an identical terminal: iterating null never yields, so the path in front of it cannot matter and jq's own (catchable) error or empty result stands
+        (r"null", r"path(.a | 5 | select(true) | null | .[])", "", "jq: error (at <stdin>:1): Cannot iterate over null (null)\n", 5),
+        (r"null", r"path(.a | 5 | select(true) | null | .[]?)", "", "", 0),
+        (r"null", r"[path(.a | 5 | select(true) | null | .[])?]", "[]\n", "", 0),
+        (r"null", r#"try path(.a | 5 | select(true) | null | .[]) catch "C""#, "\"C\"\n", "", 0),
+    ])
+}
+
 /// #2484: yq mode's new "leave the target untouched" rule for a zero-output
 /// `|=` filter (`update_path`'s terminal `Expr::Identity` arm) must not
 /// leak into jq mode -- jq 1.7.1 (since 1.7) deletes the key/element

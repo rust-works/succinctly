@@ -2636,6 +2636,45 @@ answers `["b"]` — and classified the two residuals appended below):
     untracked-navigation refusal did not move the register", a separate rule;
   - a recursion in a fold's UPDATE or EXTRACT, which consults only the static predicate:
     `path(. as $x | reduce (1,2) as $i (1; try ..) | $x)` is `[]` in jq.
+- **A terminal `null`/`true`/`false` is the root path only while nothing navigated
+  ([#3579](https://github.com/rust-works/succinctly/issues/3579)).** jq accepts a computed
+  `null`, `true` or `false` as a path when it is `jv_identical` to the register, by value alone, so
+  `null | path(null)` is `[]` (#3125) and `del(null)` deletes the root (#3207). That answer names the
+  *root*, which is right only while jq's register still sits there. After a navigation it does not:
+  on a `null` document `.a` is `null` too, the two are equal by value, and the path is `["a"]`:
+  ```
+  $ echo null | jq -c 'path(.a as $x | .a | 5 | select(true) | $x)'
+  ["a"]
+  $ echo null | jq -c '(.a as $x | .a | 5 | first(7) | $x) = 9'
+  {"a":9}
+  ```
+  succinctly answered `[]` and `9` (nothing refused, exit 0), a silent write over the root, 15 of the 19
+  rows probed. The carve-out now applies only when the branch's path is empty; once the pipe has
+  navigated, this resolver cannot say where the register is (a stage between may have dropped it), so
+  it refuses with jq's own wording, as it always did on `{"a":null}` and `[null]`. The refusal is the
+  resolver's guess, not jq's verdict (navigating a `null` document only ever reaches an equal
+  `null`), so it is uncatchable by `try`, `?` and `catch` like every other guessed refusal (#3267):
+  `try ((.a as $x | .a | 5 | first(7) | $x) = 9) catch "C"` exits 5 where jq writes `{"a":9}`. A
+  refusal here can also pre-empt a later error jq raises itself: `del(.a as $x | .a | 5 | first(7) |
+  $x, .b)` on `null` refuses in both, but jq's message is `near attempt to access element "b" of 7`
+  (it accepted the first branch) and this resolver's is `with result null` (exit 5 either way).
+  `path(.a | null)`, `path(.a | 5 | null)`, `path(.a as $x | .a | 5 | $x)` and the rest of the
+  carve-out's own cases are unchanged and still match jq. So is a path that ends in a bare iterate
+  after such a terminal (`path(.a | 5 | select(true) | null | .[])`): `.[]` on `null` never yields, it
+  raises jq's own catchable `Cannot iterate over null` (or nothing, under `?`), so the path in front of
+  it cannot reach any output and the carve-out still applies. Pinned by
+  `test_terminal_null_after_a_navigation_refuses_loudly_3579` and
+  `test_terminal_null_carve_out_keeps_its_answers_3579`.
+
+  The rule leans on one fact worth stating: on a `null`, `true` or `false` document the only
+  navigations that succeed are `.a`, `.[n]`, `first`, `last` and `nth`, and this resolver resolves all
+  of them natively, so a pipe that moved jq's register always leaves a non-empty path behind. A fuzz of
+  1,350 programs (chains of up to four navigating, computed and register-dropping stages ending in a
+  `null`/`true`/`false` terminal, read and write forms) found no row where this build still answers a
+  root path that jq does not; every difference from jq is a loud refusal.
+  (`first(.a) | 5 | select(true) | null` is one: `first(.a)` extends the path, so it refuses.)
+  Should a stage ever move the register without extending the path, the answer would again be the
+  root, and the register-loss state (`Frame::register_loss`) would have to reach the terminal sink.
 - **`getpath` is transparent to the path register, and succinctly now models it
   ([#2896](https://github.com/rust-works/succinctly/issues/2896),
   [#2978](https://github.com/rust-works/succinctly/issues/2978)).** The mechanism recorded
