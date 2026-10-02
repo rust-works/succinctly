@@ -39257,19 +39257,12 @@ fn recurse_family_root_seed<'a>(
 /// tree size — `[path(..)] | length` must equal jq's true count even past
 /// [`RECURSE_MAX_ITEMS`] nodes.
 ///
-/// **What this does not close**: a popped node's *entire* set of direct
-/// children is pushed onto `stack` before the loop ever asks `sink` again —
-/// laziness holds *between* levels (an unvisited subtree's own descendants
-/// are never built) but not *within* one node's own fan-out. `path(limit(2;
-/// ..))` against a document whose root is a single wide `Array`/`Object`
-/// still allocates a `PathPrefix`/`PathBranch` for every one of that
-/// root's children before the second one is ever popped, even though only
-/// one is asked for. `path(limit(1; ..))` is unaffected (the very first
-/// `sink` call already stops the walk, before any child is ever pushed),
-/// which is the shape this function's own benchmark measures — see
-/// [#2895](https://github.com/rust-works/succinctly/issues/2895) for
-/// closing the general case via a per-node child cursor instead of an
-/// eagerly-expanded push.
+/// **Lazy within a node's fan-out too** (#2895): a node's children are a
+/// [`RecursiveChildren`] cursor on a [`DescentFrame`], pulled one at a time,
+/// so `path(limit(2; ..))` over a root that is a single wide `Array`/`Object`
+/// builds one child's `PathPrefix`/`PathBranch` past the root, not one per
+/// child. Until #2895 every child of a popped node was pushed before the
+/// loop asked `sink` again, which made that query O(width).
 ///
 /// Every value this function ever visits is a live sub-part of the original
 /// top-level `value`, so every branch can borrow directly (`Cow::Borrowed`)
@@ -39292,13 +39285,13 @@ fn recurse_family_root_seed<'a>(
 /// breaks the mark regardless of ambient (plain [`PathBranch::new`], same as
 /// the collecting version's own "only the root gets patched" rule).
 ///
-/// Children are collected in encounter order, then pushed onto an explicit
-/// `stack` reversed — same shape [`resolve_recurse_sink`] uses — so the
-/// first child popped is the next one visited, and its whole subtree
-/// completes before the second child is even reached. An explicit stack
-/// rather than native recursion caps native stack use at O(depth ×
-/// fan-out) instead of O(depth) call frames each holding a full sibling
-/// iterator; `assert_value_tree_depth(prefix.depth())` still panics past
+/// Children are visited in encounter order: a frame yields its next child
+/// only once the previous child's whole subtree has completed, the order the
+/// reversed push this replaced gave. An explicit stack of frames rather than
+/// native recursion keeps native stack use at O(1) and the walk's memory at
+/// one small frame per level of depth (it was one `PathBranch` per
+/// *sibling* of every ancestor);
+/// `assert_value_tree_depth(prefix.depth())` still panics past
 /// [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH) levels of
 /// nesting (#1021, following #1005's precedent) exactly as the collecting
 /// version did — `prefix` still grows by exactly one component per descent
@@ -39327,9 +39320,26 @@ fn resolve_recursive_descent_sink<'a>(
         "resolve_recursive_descent_sink called with trackable=false, snapshot=false; the \
          untracked recurse-family guard in resolve_node_sink should have caught this first"
     );
-    let mut stack: Vec<PathBranch<'a>> = vec![recurse_family_root_seed(value, trackable, snapshot)];
+    // The branch to deliver next: the root seed first, then whatever the
+    // innermost frame with a child left yields.
+    let mut next: Option<PathBranch<'a>> =
+        Some(recurse_family_root_seed(value, trackable, snapshot));
+    let mut stack: Vec<DescentFrame<'a>> = Vec::new();
 
-    while let Some(popped) = stack.pop() {
+    loop {
+        let popped = match next.take() {
+            Some(branch) => branch,
+            None => {
+                let Some(frame) = stack.last_mut() else { break };
+                match frame.next_child() {
+                    Some(child) => child,
+                    None => {
+                        stack.pop();
+                        continue;
+                    }
+                }
+            }
+        };
         let PathBranch {
             path: prefix,
             value: current,
@@ -39360,29 +39370,74 @@ fn resolve_recursive_descent_sink<'a>(
                 unreachable!("resolve_recursive_descent_sink never produces an owned value")
             }
         };
-        match current {
-            OwnedValue::Array(items) => {
-                for (i, item) in items.iter().enumerate().rev() {
-                    let path = PathPrefix::extend(
-                        &prefix,
-                        Expr::Index {
-                            idx: i as i64,
-                            key: None,
-                        },
-                    );
-                    stack.push(PathBranch::new(path, Cow::Borrowed(item), node_trackable));
-                }
-            }
-            OwnedValue::Object(map) => {
-                for (k, v) in map.iter().rev() {
-                    let path = PathPrefix::extend(&prefix, Expr::Field(k.clone()));
-                    stack.push(PathBranch::new(path, Cow::Borrowed(v), node_trackable));
-                }
-            }
-            _ => {}
+        if let Some(children) = RecursiveChildren::of(current) {
+            stack.push(DescentFrame {
+                prefix,
+                trackable: node_trackable,
+                children,
+            });
         }
     }
     ResolveFlow::Exhausted
+}
+
+/// A container's direct children, in encounter order, pulled one at a time
+/// ([`resolve_recursive_descent_sink`], #2895).
+enum RecursiveChildren<'a> {
+    Array(core::iter::Enumerate<core::slice::Iter<'a, OwnedValue>>),
+    Object(indexmap::map::Iter<'a, String, OwnedValue>),
+}
+
+impl<'a> RecursiveChildren<'a> {
+    /// `value`'s children, or `None` for a scalar or an empty container
+    /// (nothing to descend into, so no frame is kept for it).
+    fn of(value: &'a OwnedValue) -> Option<Self> {
+        match value {
+            OwnedValue::Array(items) if !items.is_empty() => {
+                Some(Self::Array(items.iter().enumerate()))
+            }
+            OwnedValue::Object(map) if !map.is_empty() => Some(Self::Object(map.iter())),
+            _ => None,
+        }
+    }
+}
+
+/// One node's remaining children on [`resolve_recursive_descent_sink`]'s
+/// stack: its path prefix, whether its descendants are trackable, and the
+/// children not yet visited.
+struct DescentFrame<'a> {
+    prefix: Rc<PathPrefix>,
+    trackable: bool,
+    children: RecursiveChildren<'a>,
+}
+
+impl<'a> DescentFrame<'a> {
+    /// The next child as a branch, extending the node's prefix by exactly one
+    /// component (so the prefix's depth is still the walk's depth), or `None`
+    /// once this node's children are exhausted.
+    fn next_child(&mut self) -> Option<PathBranch<'a>> {
+        let (component, child) = match &mut self.children {
+            RecursiveChildren::Array(items) => {
+                let (i, item) = items.next()?;
+                (
+                    Expr::Index {
+                        idx: i as i64,
+                        key: None,
+                    },
+                    item,
+                )
+            }
+            RecursiveChildren::Object(fields) => {
+                let (k, v) = fields.next()?;
+                (Expr::Field(k.clone()), v)
+            }
+        };
+        Some(PathBranch::new(
+            PathPrefix::extend(&self.prefix, component),
+            Cow::Borrowed(child),
+            self.trackable,
+        ))
+    }
 }
 
 /// Resolve `expr` against a value that may be borrowed from the original
@@ -108210,6 +108265,131 @@ mod tests {
         });
         assert!(matches!(flow, ResolveFlow::Stopped), "{flow:?}");
         assert_eq!(calls, 1);
+    }
+
+    /// #2895: a node's children are pulled one at a time, not all pushed
+    /// before the walk asks the sink again. A sink that stops at the second
+    /// branch -- the first child of a 10,000-element root -- is called while
+    /// no other child exists yet; every child branch holds a reference to the
+    /// root's path prefix, so the root prefix's strong count is the number of
+    /// child branches alive at that moment (it was the whole fan-out, 10,000).
+    #[test]
+    fn resolve_recursive_descent_sink_builds_children_lazily_2895() {
+        for value in [
+            OwnedValue::array_from((0..10_000).map(OwnedValue::Int).collect()),
+            OwnedValue::Object(
+                (0..10_000)
+                    .map(|i| (format!("k{i}"), OwnedValue::Int(i)))
+                    .collect::<IndexMap<_, _>>()
+                    .into(),
+            ),
+        ] {
+            let mut root_prefix = None;
+            let mut calls = 0usize;
+            let mut alive_at_second = 0usize;
+            let flow = resolve_recursive_descent_sink(&value, true, &Snapshot::No, &mut |branch| {
+                calls += 1;
+                if calls == 1 {
+                    root_prefix = Some(Rc::clone(&branch.path));
+                    Demand::Continue
+                } else {
+                    // The root prefix itself, the seed's reference, and this
+                    // child's own: anything past a handful is a sibling.
+                    alive_at_second = Rc::strong_count(root_prefix.as_ref().unwrap());
+                    Demand::Stop
+                }
+            });
+            assert!(matches!(flow, ResolveFlow::Stopped), "{flow:?}");
+            assert_eq!(calls, 2);
+            assert!(
+                alive_at_second <= 4,
+                "{alive_at_second} child branches existed at the second delivery"
+            );
+        }
+    }
+
+    /// #2895: pulling children lazily keeps the pre-order the eager push
+    /// gave -- each child's whole subtree before the next sibling -- for
+    /// arrays, objects, empty containers and scalars alike.
+    #[test]
+    fn resolve_recursive_descent_sink_visits_in_pre_order_2895() {
+        let obj = |fields: Vec<(&str, OwnedValue)>| {
+            OwnedValue::Object(
+                fields
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect::<IndexMap<_, _>>()
+                    .into(),
+            )
+        };
+        // {"a":{"x":[1,{"y":null,"z":[]}],"w":{}},"b":[[],[[1]],{"k":"v"}],"c":"s"}
+        let value = obj(vec![
+            (
+                "a",
+                obj(vec![
+                    (
+                        "x",
+                        OwnedValue::array_from(vec![
+                            OwnedValue::Int(1),
+                            obj(vec![
+                                ("y", OwnedValue::Null),
+                                ("z", OwnedValue::array_from(vec![])),
+                            ]),
+                        ]),
+                    ),
+                    ("w", obj(vec![])),
+                ]),
+            ),
+            (
+                "b",
+                OwnedValue::array_from(vec![
+                    OwnedValue::array_from(vec![]),
+                    OwnedValue::array_from(vec![OwnedValue::array_from(vec![OwnedValue::Int(1)])]),
+                    obj(vec![("k", OwnedValue::String("v".into()))]),
+                ]),
+            ),
+            ("c", OwnedValue::String("s".into())),
+        ]);
+        let mut paths = Vec::new();
+        let flow = resolve_recursive_descent_sink(&value, true, &Snapshot::No, &mut |branch| {
+            paths.push(
+                branch
+                    .path
+                    .to_vec()
+                    .iter()
+                    .map(|c| match c {
+                        Expr::Field(k) => format!("\"{k}\""),
+                        Expr::Index { idx, .. } => idx.to_string(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            Demand::Continue
+        });
+        assert!(matches!(flow, ResolveFlow::Exhausted), "{flow:?}");
+        // jq 1.7.1: `[path(..)]` on the same document.
+        assert_eq!(
+            paths,
+            [
+                "",
+                "\"a\"",
+                "\"a\",\"x\"",
+                "\"a\",\"x\",0",
+                "\"a\",\"x\",1",
+                "\"a\",\"x\",1,\"y\"",
+                "\"a\",\"x\",1,\"z\"",
+                "\"a\",\"w\"",
+                "\"b\"",
+                "\"b\",0",
+                "\"b\",1",
+                "\"b\",1,0",
+                "\"b\",1,0,0",
+                "\"b\",2",
+                "\"b\",2,\"k\"",
+                "\"c\"",
+            ]
+        );
     }
 
     /// #1021: `walk_impl` (backs `walk(f)`) had no depth guard at all
