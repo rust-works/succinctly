@@ -3074,12 +3074,12 @@ fn test_yq_streaming_routes_keep_both_colliding_complex_keys_2519() -> Result<()
             &["-o", "json"],
             "{\n  \"\": \"v1\",\n  \"\": \"v2\"\n}\n",
         ),
-        (TWO, "keys", &[], "- ''\n- ''\n"),
+        (TWO, "keys", &[], "- \"\"\n- \"\"\n"),
         (
             TWO,
             "to_entries",
             &[],
-            "- key: ''\n  value: v1\n- key: ''\n  value: v2\n",
+            "- key: \"\"\n  value: v1\n- key: \"\"\n  value: v2\n",
         ),
         (TWO, "length", &[], "2\n"),
         (TWO, "has(\"\")", &[], "true\n"),
@@ -3203,14 +3203,14 @@ const TWO_ALIASES_NAMING_EQUAL_SCALARS: &str =
 fn test_yq_merge_keys_keep_colliding_complex_keys_in_streams_3467() -> Result<()> {
     let rows: &[(&str, &str, &str)] = &[
         (MERGED_VS_LOCAL_COMPLEX, ".b | length", "2\n"),
-        (MERGED_VS_LOCAL_COMPLEX, ".b | keys", "- ''\n- ''\n"),
+        (MERGED_VS_LOCAL_COMPLEX, ".b | keys", "- \"\"\n- \"\"\n"),
         (
             MERGED_VS_LOCAL_COMPLEX,
             ".b | to_entries",
-            "- key: ''\n  value: x\n- key: ''\n  value: y\n",
+            "- key: \"\"\n  value: x\n- key: \"\"\n  value: y\n",
         ),
         (TWO_MERGE_SOURCES_COMPLEX, ".b | length", "2\n"),
-        (TWO_MERGE_SOURCES_COMPLEX, ".b | keys", "- ''\n- ''\n"),
+        (TWO_MERGE_SOURCES_COMPLEX, ".b | keys", "- \"\"\n- \"\"\n"),
         (MERGED_COMPLEX_VS_GENUINE_EMPTY, ".b | length", "2\n"),
         // Keys that only *look* alike stay two entries: `[1]` against `["1"]`
         // (a number and a string), two different mapping keys, and two equal
@@ -3316,7 +3316,7 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
         (
             MERGED_VS_LOCAL_IDENTICAL_COMPLEX,
             ".b | to_entries",
-            "- key: ''\n  value: y\n",
+            "- key: \"\"\n  value: y\n",
         ),
         (
             MERGED_VS_LOCAL_IDENTICAL_COMPLEX,
@@ -3372,7 +3372,11 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
         (ORDINARY, ".b | keys", "- p\n- q\n- r\n"),
         (ORDINARY, ".b.p", "2\n"),
         (GENUINE_EMPTY, ".b | length", "1\n"),
-        (GENUINE_EMPTY, ".b | to_entries", "- key: ''\n  value: 2\n"),
+        (
+            GENUINE_EMPTY,
+            ".b | to_entries",
+            "- key: \"\"\n  value: 2\n",
+        ),
         (
             GENUINE_EMPTY,
             ".b.z = 1",
@@ -5924,13 +5928,32 @@ fn test_nul_output_dom_path_no_separator_leak_on_later_doc_failure_1709() -> Res
 /// Since #2427 `--eval-all` evaluates over the document *list*, so `.`
 /// already yields each whole document as its own result (`a: 1`, not `1`);
 /// `.[]` would iterate each document's members instead.
+///
+/// The failing document is a root *scalar* string, which `-0` writes unwrapped and
+/// so with a raw NUL byte. It used to be `b: "x\0y"`, whose mapping value only
+/// reached the NUL check because the DOM writer's old quoting heuristic left the
+/// NUL unescaped (invalid YAML); go-yaml, and so this writer since #3588, writes
+/// that as `"x\0y"` with an escaped `\0`, and there is nothing left to refuse.
 #[test]
 fn test_nul_output_eval_all_no_separator_leak_on_later_doc_failure_1709() -> Result<()> {
-    let input = "a: 1\n---\nb: \"x\\0y\"\n";
+    let input = "a: 1\n---\n\"x\\0y\"\n";
     let (output, stderr, code) = run_yq_stdin_with_stderr(".", input, &["--eval-all", "-0"])?;
     assert_eq!(code, 1);
     assert_eq!(output, "a: 1\0");
     assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// #3588: a NUL inside a mapping value is *escaped* (`\0`), never written raw, so `-0`
+/// has nothing to refuse and the only NUL bytes in the output are its own separators.
+/// The old DOM heuristic wrote the byte raw, which is invalid YAML.
+#[test]
+fn test_nul_in_a_mapping_value_is_escaped_not_raw_under_nul_output_3588() -> Result<()> {
+    let input = "a: 1\n---\nb: \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".", input, &["--eval-all", "-0"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(output.matches('\0').count(), 2, "{output:?}");
+    assert!(output.contains("b: \"x\\0y\""), "{output:?}");
     Ok(())
 }
 
@@ -48516,7 +48539,9 @@ mod typed_key_node_2785 {
             assert_eq!(code, 0, "{args:?}");
             assert_eq!(
                 out,
-                "- \"!!int\"\n- \"!!bool\"\n- \"!!null\"\n- \"!!float\"\n- \"!!str\"\n- \"!!null\"\n",
+                // Single quotes: a string starting with `!` is a tag indicator, so go-yaml
+                // writes it `'!!int'` (checked against yq v4.53.3, #3588).
+                "- '!!int'\n- '!!bool'\n- '!!null'\n- '!!float'\n- '!!str'\n- '!!null'\n",
                 "{args:?}"
             );
             let (out, code) = run_yq_stdin(".[] | select(key == 1)", TYPED, &args)?;

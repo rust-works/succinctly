@@ -25,6 +25,8 @@
 //! single-line writer can produce. The same goes for a key longer than 128
 //! bytes, which go-yaml also writes with `? `.
 
+use super::scalar::{resolve_plain, ResolvedScalar};
+
 #[cfg(not(test))]
 use alloc::{borrow::Cow, string::String};
 #[cfg(test)]
@@ -45,10 +47,15 @@ pub(crate) enum EncodedStringStyle {
     DoubleQuoted,
 }
 
-/// The style go-yaml's encoder gives `s` in block context, or `None` for a
+/// The style go-yaml's encoder gives `s`, in flow context (inside `[...]` or
+/// `{...}`) when `flow` is set and in block context otherwise, or `None` for a
 /// string with a line break (see the module docs).
+///
+/// Flow context quotes more: a `,`, `[`, `]`, `{`, `}` or `?` anywhere, and a `:`
+/// anywhere (not only before a blank), because each can end or restructure a flow
+/// collection (`{v: ['a:b', 'x,y']}`), where block context leaves them bare.
 #[must_use]
-pub(crate) fn go_yaml_string_style(s: &str) -> Option<EncodedStringStyle> {
+pub(crate) fn go_yaml_string_style(s: &str, flow: bool) -> Option<EncodedStringStyle> {
     if has_break(s) {
         return None;
     }
@@ -60,7 +67,9 @@ pub(crate) fn go_yaml_string_style(s: &str) -> Option<EncodedStringStyle> {
     // The emitter's `yaml_emitter_analyze_scalar`, for block context and a
     // string with no line break.
     let mut special = false;
-    let mut block_indicators = s.starts_with("---") || s.starts_with("...");
+    let document_marker = s.starts_with("---") || s.starts_with("...");
+    let mut block_indicators = document_marker;
+    let mut flow_indicators = document_marker;
     let mut preceded_by_blank = true;
     let mut chars = s.chars().peekable();
     let mut first = true;
@@ -70,14 +79,31 @@ pub(crate) fn go_yaml_string_style(s: &str) -> Option<EncodedStringStyle> {
         if first {
             match c {
                 '#' | ',' | '[' | ']' | '{' | '}' | '&' | '*' | '!' | '|' | '>' | '\'' | '"'
-                | '%' | '@' | '`' => block_indicators = true,
-                '?' | ':' | '-' if followed_by_blank => block_indicators = true,
+                | '%' | '@' | '`' => {
+                    block_indicators = true;
+                    flow_indicators = true;
+                }
+                '?' | ':' => {
+                    flow_indicators = true;
+                    block_indicators |= followed_by_blank;
+                }
+                '-' if followed_by_blank => {
+                    block_indicators = true;
+                    flow_indicators = true;
+                }
                 _ => {}
             }
         } else {
             match c {
-                ':' if followed_by_blank => block_indicators = true,
-                '#' if preceded_by_blank => block_indicators = true,
+                ',' | '?' | '[' | ']' | '{' | '}' => flow_indicators = true,
+                ':' => {
+                    flow_indicators = true;
+                    block_indicators |= followed_by_blank;
+                }
+                '#' if preceded_by_blank => {
+                    block_indicators = true;
+                    flow_indicators = true;
+                }
                 _ => {}
             }
         }
@@ -87,11 +113,74 @@ pub(crate) fn go_yaml_string_style(s: &str) -> Option<EncodedStringStyle> {
     }
     if special {
         Some(EncodedStringStyle::DoubleQuoted)
-    } else if block_indicators || s.starts_with(' ') || s.ends_with(' ') {
+    } else if (if flow {
+        flow_indicators
+    } else {
+        block_indicators
+    }) || s.starts_with(' ')
+        || s.ends_with(' ')
+    {
         Some(EncodedStringStyle::SingleQuoted)
     } else {
         Some(EncodedStringStyle::Plain)
     }
+}
+
+/// Writes `s` in the style go-yaml's encoder picks, or returns `None` for a line break.
+///
+/// The one place a [`EncodedStringStyle`] becomes text, so the streaming route, the
+/// computed-value streamer and [`go_yaml_string_scalar`] cannot drift apart. `None` is
+/// [`go_yaml_string_style`]'s own (see the module docs) and writes nothing.
+pub(crate) fn write_go_yaml_string<Out: core::fmt::Write>(
+    out: &mut Out,
+    s: &str,
+    flow: bool,
+) -> Option<core::fmt::Result> {
+    Some(match go_yaml_string_style(s, flow)? {
+        EncodedStringStyle::Plain => out.write_str(s),
+        EncodedStringStyle::SingleQuoted => write_go_yaml_single_quoted(out, s),
+        EncodedStringStyle::DoubleQuoted => write_go_yaml_double_quoted(out, s),
+    })
+}
+
+/// `s` as the YAML scalar go-yaml's encoder writes, or `None` for a line break.
+#[must_use]
+pub(crate) fn go_yaml_string_scalar(s: &str, flow: bool) -> Option<String> {
+    let mut out = String::new();
+    write_go_yaml_string(&mut out, s, flow)?.ok()?;
+    Some(out)
+}
+
+/// The scalar the yq command line's DOM writer should print for a string that has no
+/// style of its own to preserve, or `None` to leave it to that writer's older rule.
+///
+/// A string with no recorded style is either decoded from JSON, computed by a filter,
+/// or a *plain* scalar of a YAML document, and the DOM holds only its text, so which
+/// it was is the `json_sourced` flag and a guess:
+///
+/// - **JSON** (`json_sourced`): always a real string, so it takes go-yaml's choice
+///   (`"1"`, `'- x'`, `a b`).
+/// - **A YAML document**: a spelling yq reads as another type is most likely a plain
+///   scalar of that type, which must be echoed or its type would change on any write.
+///   A *key* (`200: ok`, `~: v`, `2001-12-14T01:02:03Z: a`) is echoed as it is, except
+///   the empty one, which is left to the caller. A *value* is left to the caller when
+///   the YAML 1.2 core schema calls it a string and yq does not (a timestamp, `1_000`,
+///   `0b11`, `<<`); one the core schema also types (`true`, `1`, `null`) can only be a
+///   string that was quoted or computed, and is quoted.
+///
+/// `flow` is whether the scalar sits inside `[...]` or `{...}`. A string with a line
+/// break is `None`.
+#[must_use]
+pub fn go_yaml_dom_scalar(s: &str, flow: bool, json_sourced: bool, is_key: bool) -> Option<String> {
+    if !json_sourced && resolves_to_non_str(s) {
+        if is_key {
+            return (!s.is_empty()).then(|| String::from(s));
+        }
+        if matches!(resolve_plain(s), ResolvedScalar::Str) {
+            return None;
+        }
+    }
+    go_yaml_string_scalar(s, flow)
 }
 
 /// `s` as go-yaml's emitter writes a double-quoted scalar, quotes included.
@@ -565,7 +654,7 @@ mod tests {
             "2004-02-30",
             "2001-04-31",
         ] {
-            assert_eq!(go_yaml_string_style(s), Some(Plain), "{s:?}");
+            assert_eq!(go_yaml_string_style(s, false), Some(Plain), "{s:?}");
         }
     }
 
@@ -636,7 +725,7 @@ mod tests {
             ".5_0",
             "1_0.5",
         ] {
-            assert_eq!(go_yaml_string_style(s), Some(DoubleQuoted), "{s:?}");
+            assert_eq!(go_yaml_string_style(s, false), Some(DoubleQuoted), "{s:?}");
         }
     }
 
@@ -644,17 +733,20 @@ mod tests {
     fn plain_where_a_number_shaped_string_does_not_resolve() {
         // Out of range, so go-yaml leaves them strings.
         assert_eq!(
-            go_yaml_string_style("0xFFFFFFFFFFFFFFFFF"),
+            go_yaml_string_style("0xFFFFFFFFFFFFFFFFF", false),
             Some(Plain),
             "a hex literal past u64 is not an int"
         );
-        assert_eq!(go_yaml_string_style("-0x8000000000000001"), Some(Plain));
         assert_eq!(
-            go_yaml_string_style("+9223372036854775808"),
+            go_yaml_string_style("-0x8000000000000001", false),
+            Some(Plain)
+        );
+        assert_eq!(
+            go_yaml_string_style("+9223372036854775808", false),
             Some(DoubleQuoted)
         );
         assert_eq!(
-            go_yaml_string_style(&format!("1{}", "0".repeat(400))),
+            go_yaml_string_style(&format!("1{}", "0".repeat(400)), false),
             Some(Plain),
             "a decimal that overflows to infinity is a string"
         );
@@ -674,7 +766,7 @@ mod tests {
             "01-12-14",
             "20011-12-14",
         ] {
-            assert_ne!(go_yaml_string_style(s), Some(DoubleQuoted), "{s:?}");
+            assert_ne!(go_yaml_string_style(s, false), Some(DoubleQuoted), "{s:?}");
         }
     }
 
@@ -747,7 +839,7 @@ mod tests {
             "---x",
             "...x",
         ] {
-            assert_eq!(go_yaml_string_style(s), Some(SingleQuoted), "{s:?}");
+            assert_eq!(go_yaml_string_style(s, false), Some(SingleQuoted), "{s:?}");
         }
     }
 
@@ -767,7 +859,7 @@ mod tests {
             "a😀b",
             "\u{10000}",
         ] {
-            assert_eq!(go_yaml_string_style(s), Some(DoubleQuoted), "{s:?}");
+            assert_eq!(go_yaml_string_style(s, false), Some(DoubleQuoted), "{s:?}");
         }
     }
 
@@ -783,7 +875,7 @@ mod tests {
             "a\u{2028}b",
             "a\u{2029}b",
         ] {
-            assert_eq!(go_yaml_string_style(s), None, "{s:?}");
+            assert_eq!(go_yaml_string_style(s, false), None, "{s:?}");
         }
     }
 
@@ -877,5 +969,200 @@ mod tests {
         ] {
             assert!(!matches_yaml_float(s), "{s:?}");
         }
+    }
+    /// Flow context (inside `[...]` or `{...}`) quotes what could end or restructure
+    /// the collection: `,`, `[`, `]`, `{`, `}` and `?` anywhere, and a `:` anywhere,
+    /// not only before a blank. Each row is a string yq v4.53.3 writes bare in a
+    /// block sequence and single-quoted in `{v: ['...']}` (#3588).
+    #[test]
+    fn flow_context_quotes_what_block_context_leaves_bare() {
+        for s in [
+            "a,b",
+            "a[b",
+            "a]b",
+            "a{b",
+            "a}b",
+            "a?b",
+            "12:30:45",
+            "1:2",
+            "1,000",
+            "?x",
+            ":x",
+            "a:b",
+            "a :b",
+            "a, b",
+            "http://x.y/z?q=1#f",
+            "C:\\path",
+            "${x}",
+        ] {
+            assert_eq!(
+                go_yaml_string_style(s, false),
+                Some(Plain),
+                "{s:?} in block"
+            );
+            assert_eq!(
+                go_yaml_string_style(s, true),
+                Some(SingleQuoted),
+                "{s:?} in flow"
+            );
+        }
+        // Everything else answers the same in both contexts.
+        for s in [
+            "a", "a b", "a-b", "a.b", "a#b", "é", "yes", "-x", "a'b", "a\"b",
+        ] {
+            assert_eq!(go_yaml_string_style(s, true), Some(Plain), "{s:?}");
+        }
+        for s in ["1", "true", "", "a\tb", "2001-12-14", "\u{1F600}"] {
+            assert_eq!(go_yaml_string_style(s, true), Some(DoubleQuoted), "{s:?}");
+        }
+        for s in ["- x", "a: b", "x ", " x", "#x", "---", "!x", "&x"] {
+            assert_eq!(go_yaml_string_style(s, true), Some(SingleQuoted), "{s:?}");
+            assert_eq!(go_yaml_string_style(s, false), Some(SingleQuoted), "{s:?}");
+        }
+        assert_eq!(go_yaml_string_style("a\nb", true), None);
+    }
+
+    #[test]
+    fn the_scalar_function_renders_each_style_and_declines_a_line_break() {
+        assert_eq!(go_yaml_string_scalar("abc", false).as_deref(), Some("abc"));
+        assert_eq!(go_yaml_string_scalar("1", false).as_deref(), Some("\"1\""));
+        assert_eq!(go_yaml_string_scalar("", false).as_deref(), Some("\"\""));
+        assert_eq!(
+            go_yaml_string_scalar("- x", false).as_deref(),
+            Some("'- x'")
+        );
+        assert_eq!(
+            go_yaml_string_scalar("it's: x", false).as_deref(),
+            Some("'it''s: x'")
+        );
+        assert_eq!(
+            go_yaml_string_scalar("a\tb", false).as_deref(),
+            Some("\"a\\tb\"")
+        );
+        assert_eq!(
+            go_yaml_string_scalar("\u{1F600}", true).as_deref(),
+            Some("\"\\U0001F600\"")
+        );
+        assert_eq!(go_yaml_string_scalar("a,b", false).as_deref(), Some("a,b"));
+        assert_eq!(go_yaml_string_scalar("a,b", true).as_deref(), Some("'a,b'"));
+        assert_eq!(go_yaml_string_scalar("a\nb", false), None);
+        assert_eq!(go_yaml_string_scalar("a\u{2028}b", true), None);
+        let mut out = String::from("k: ");
+        assert!(write_go_yaml_string(&mut out, "1", false).unwrap().is_ok());
+        assert_eq!(out, "k: \"1\"");
+        assert!(write_go_yaml_string(&mut out, "a\nb", false).is_none());
+        assert_eq!(out, "k: \"1\"", "a declined string writes nothing");
+    }
+
+    /// A JSON string is always a string, so it takes go-yaml's choice whatever it is
+    /// spelled like: `"1"` is `"1"`, a date is `"2001-12-14"`, a key `~` is `"~"`.
+    #[test]
+    fn dom_scalar_for_json_is_the_encoders_choice_for_keys_and_values() {
+        for (s, expected) in [
+            ("abc", "abc"),
+            ("1", "\"1\""),
+            ("true", "\"true\""),
+            ("~", "\"~\""),
+            ("2001-12-14", "\"2001-12-14\""),
+            ("1_000", "\"1_000\""),
+            ("<<", "\"<<\""),
+            ("", "\"\""),
+            ("- x", "'- x'"),
+        ] {
+            for is_key in [false, true] {
+                assert_eq!(
+                    go_yaml_dom_scalar(s, false, true, is_key).as_deref(),
+                    Some(expected),
+                    "{s:?} key={is_key}"
+                );
+            }
+        }
+        assert_eq!(go_yaml_dom_scalar("a\nb", false, true, false), None);
+    }
+
+    /// A YAML document's key spelled like another type is a typed key: echoed as
+    /// it is (the empty one is left to the caller), never quoted into a string key.
+    #[test]
+    fn dom_scalar_for_a_yaml_key_echoes_a_typed_spelling() {
+        for s in [
+            "200",
+            "-1",
+            "~",
+            "null",
+            "true",
+            "1.5",
+            "0x1f",
+            "1_000",
+            "2001-12-14",
+            "2001-12-14T01:02:03Z",
+            "2001-12-14 21:59:43",
+        ] {
+            assert_eq!(
+                go_yaml_dom_scalar(s, false, false, true).as_deref(),
+                Some(s),
+                "{s:?}"
+            );
+            assert_eq!(
+                go_yaml_dom_scalar(s, true, false, true).as_deref(),
+                Some(s),
+                "{s:?} flow"
+            );
+        }
+        assert_eq!(go_yaml_dom_scalar("", false, false, true), None);
+        // Anything that is a string takes the encoder's choice.
+        assert_eq!(
+            go_yaml_dom_scalar("a b", false, false, true).as_deref(),
+            Some("a b")
+        );
+        assert_eq!(
+            go_yaml_dom_scalar("x: y", false, false, true).as_deref(),
+            Some("'x: y'")
+        );
+        assert_eq!(
+            go_yaml_dom_scalar("- x", false, false, true).as_deref(),
+            Some("'- x'")
+        );
+        assert_eq!(
+            go_yaml_dom_scalar("a,b", true, false, true).as_deref(),
+            Some("'a,b'")
+        );
+    }
+
+    /// A YAML document's string value with no style: a spelling the core schema calls a
+    /// string but yq types (a timestamp, `1_000`, `0b11`, `<<`) is a plain scalar of that
+    /// type and is left to the caller to echo; one the core schema types too can only be a
+    /// string that was quoted or computed, and is quoted.
+    #[test]
+    fn dom_scalar_for_a_yaml_value_leaves_a_yq_typed_plain_scalar_alone() {
+        for s in [
+            "2001-12-14",
+            "2001-12-14T01:02:03Z",
+            "1_000",
+            "0b11",
+            "0X1F",
+            "<<",
+        ] {
+            assert_eq!(go_yaml_dom_scalar(s, false, false, false), None, "{s:?}");
+        }
+        for (s, expected) in [
+            ("true", "\"true\""),
+            ("1", "\"1\""),
+            ("null", "\"null\""),
+            ("~", "\"~\""),
+            (".inf", "\".inf\""),
+            ("+.inf", "\"+.inf\""),
+            ("", "\"\""),
+            ("abc", "abc"),
+            ("a b", "a b"),
+            ("- x", "'- x'"),
+            ("yes", "yes"),
+        ] {
+            assert_eq!(
+                go_yaml_dom_scalar(s, false, false, false).as_deref(),
+                Some(expected),
+                "{s:?}"
+            );
+        }
+        assert_eq!(go_yaml_dom_scalar("a\nb", false, false, false), None);
     }
 }

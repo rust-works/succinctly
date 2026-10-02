@@ -1,0 +1,3 @@
+-P
+-p=json
+-o=yaml
