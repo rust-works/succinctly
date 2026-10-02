@@ -7552,21 +7552,16 @@ mod tests {
             "9223372036854775807",
         ] {
             let dom = OwnedValue::from_number_literal_plain(literal);
-            let cursor = match resolve_plain_sourced(literal, true) {
-                ResolvedScalar::Int(i) => OwnedValue::Int(i),
-                ResolvedScalar::Float(f) => OwnedValue::Float(f),
-                other => panic!("{literal} resolved to {other:?}"), // omni-dev: coverage tolerate-line reason="failure message for the assertion the test makes"
-            };
+            let cursor = resolve_plain_sourced(literal, true);
+            // Both print as `Int(n)` or `Float(f)`.
             assert_eq!(format!("{dom:?}"), format!("{cursor:?}"), "{literal}");
         }
         for literal in ["2.0", "1e2", "-0.0", "9223372036854775808.0"] {
-            assert!(
-                matches!(
-                    resolve_plain_sourced(literal, false),
-                    ResolvedScalar::Float(_)
-                ),
-                "{literal} is a float in a YAML document"
+            let is_float = matches!(
+                resolve_plain_sourced(literal, false),
+                ResolvedScalar::Float(_)
             );
+            assert!(is_float, "{literal} is a float in a YAML document");
         }
     }
 
