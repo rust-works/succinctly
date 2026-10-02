@@ -60439,6 +60439,175 @@ fn test_path_register_by_value_operand_refusals_stay_refused_3456() -> Result<()
     ])
 }
 
+/// #3428 (closed by #3456's B3): an `and`/`or` operand jq navigates inside
+/// but the resolver evaluates by value -- `first`, `last`, `any`, `all`,
+/// `nth(n)`, `isempty(g)`, a `//`, an `if`, a `try`, a `def` -- used to keep
+/// the eager by-value route on a trackable input, which never checked `R`'s
+/// navigation against the register `L` moved. Every operand's branch now says
+/// what became of the register, and `R` runs from that. Every row is captured
+/// from jq 1.7.1.
+#[test]
+fn test_and_or_path_by_value_operands_track_the_register_3428() -> Result<()> {
+    let near_b = r#"Invalid path expression near attempt to access element "b" of [true]"#;
+    let near_0 = "Invalid path expression near attempt to access element 0 of [true]";
+    assert_path_rows_3289(&[
+        // The issue's own table: these wrote or answered where jq exits 5.
+        (r"[true]", r"del((first and .b?))", "", near_b, 5),
+        (r"[true]", r"del((last and .b?))", "", near_b, 5),
+        (r"[true]", r"del((any and .b?))", "", near_b, 5),
+        (r"[true]", r"path((first and .b?))", "", near_b, 5),
+        (r"[true]", r"del((nth(0) and .b?))", "", near_b, 5),
+        // The same family, refused with jq's own wording instead of "with result".
+        (r"[true]", r"del(first and .[0])", "", near_0, 5),
+        (
+            r#"{"a":[true]}"#,
+            r"del(.a | (first(.[]) and .[0]))",
+            "",
+            near_0,
+            5,
+        ),
+        (
+            r"[1]",
+            r"del((.[0] // 1) and .[0])",
+            "",
+            "Invalid path expression near attempt to access element 0 of [1]",
+            5,
+        ),
+        // jq answers these, and a by-value operand that leaves the register
+        // alone must let `R` navigate it: `main` refused every one.
+        (
+            r"[true]",
+            r"del((if . then 1 else .b end) and .[0])",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"[true]", r"del((try 1 catch .b) and .[0])", "[]\n", "", 0),
+        (r"[true]", r"del((def f: 5; f) and .[0])", "[]\n", "", 0),
+        (r"[true]", r"del(try ([.[]?] and .[0]))", "[]\n", "", 0),
+        // `any`/`all` move the register exactly when they emit: a result that
+        // says nothing was emitted leaves `R` a register it can navigate.
+        (r"[true]", r"del(all and .[0])", "[]\n", "", 0),
+        (
+            r#"{"a":true,"b":true}"#,
+            r"del(all and .a)",
+            "{\"b\":true}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del(try (any or .a))",
+            "{\"b\":null}\n",
+            "",
+            0,
+        ),
+        // The resolver's guess is uncatchable (#3267): jq catches its own
+        // error inside `try` and leaves the document, this refuses -- loudly,
+        // and never by writing.
+        (
+            r#"{"a":true}"#,
+            r"del(try (any and .a))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // `add` and `map(f)` navigate their source and backtrack it before they
+        // emit, so as `L` they leave `R` a register it can navigate; as `R`
+        // (run on an input that is not the register) their `.[]` is checked.
+        (r"[true]", r"del(add and .b?)", "[true]\n", "", 0),
+        (r"[[]]", r"del(add and .b?)", "[[]]\n", "", 0),
+        (r"[]", r"path(map(.) and .b?)", "", "", 0),
+        (
+            r#"{"a":true}"#,
+            r"del(.a and add)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[true]",
+            r"del(.[0] and map(.))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // A right operand wrapped in `?` -- a bare `(.a)?`, or a group of steps
+        // (`(.a | .b)?`) -- is pruned, not refused, when its first step fails on
+        // an untracked input: jq's `?` catches its own path error. On a value that
+        // may be the lost register that prune is a guess, and a guess is loud
+        // (found by the second review of #3456's PR: these printed the document).
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(flatten and (.a | .b)?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(flatten and (.a)?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"{}",
+            r"path(flatten and (.a | .b)?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(to_entries and (.a | .b)?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // A bare optional primitive (`.a?`, `.[]?`) is jq's `INDEX_OPT`, which
+        // suppresses a type error but not a path error, so on a value that may
+        // be the lost register its refusal is a guess even when the step could
+        // never succeed -- and a generator after it (`..`) goes on to a child
+        // where `.a?` succeeds, which is what a swallowing `try` or `?` hid.
+        (
+            r#"[{"a":1}]"#,
+            r"del(try (flatten and (.. | .a?)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del(try (sort and (.. | .a?)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del((flatten and (.. | .a?))?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // A builtin that leaves the register alone and is in
+        // `cannot_move_register`'s allowlist lets `R` navigate it (`has` is
+        // C-coded, its argument a subexp).
+        (r#"{"a":true}"#, r#"del(has("a") and .a)"#, "{}\n", "", 0),
+        // The boundary: `sort` is C-coded too and jq answers `[]`, but it is
+        // not in the allowlist, so `R`'s navigation is refused -- as `main`
+        // refused it, with "result true" -- until it gets its own oracle row.
+        (
+            r"[true]",
+            r"del(sort and .[0])",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+    ])
+}
+
 /// #3456: `range` and `paths` generate values without navigating, so jq's
 /// register stays where it entered and a later `$x` frozen there is still
 /// the register -- `path(. as $x | range(2) | $x)` is `[] []` and writes

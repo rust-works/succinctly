@@ -37142,7 +37142,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // so its `-E == E * -1` extension (docs/compliance/yq/limitations.md)
         // must keep both spellings on the same path.
         Expr::And(left, right) | Expr::Or(left, right)
-            if and_or_negate_resolves_live::<S>(expr, trackable) =>
+            if and_or_negate_resolves_live::<S>(expr) =>
         {
             // `and` short-circuits on a falsy `L`, `or` on a truthy one; in
             // both cases the short-circuit value *is* `L`'s truthiness.
@@ -37215,7 +37215,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // each branch: `?//` can retry after a failed alternative and resolve
         // a later one. A final `arith_negate` error still escapes through the
         // shared stop classifier so `?//` sees its proper retryability.
-        Expr::Negate(inner) if and_or_negate_resolves_live::<S>(expr, trackable) => {
+        Expr::Negate(inner) if and_or_negate_resolves_live::<S>(expr) => {
             let mut negate_escape: Option<(EvalEscape, u64)> = None;
             let flow = resolve_node_sink::<S>(
                 inner,
@@ -39069,28 +39069,28 @@ impl<'a> LeafRegister<'a> {
 }
 
 /// Whether `and`/`or`/unary minus `expr` resolves its operands live in path
-/// position (#2760, #3289) -- the one definition both the resolver's arms
-/// and [`resolve_seq_stage`]'s trust in their register read, so the two
+/// position (#2760, #3289, #3428) -- the one definition both the resolver's
+/// arms and [`resolve_seq_stage`]'s trust in their register read, so the two
 /// cannot disagree.
 ///
-/// jq mode only (see the arms' own comment for yq). On an untracked input
-/// always (#2760: the eager catch-all never checked navigation there at all).
-/// On a trackable one only when the resolver follows every move of jq's
-/// register inside the operands ([`register_movement_tracked`]): an operand
-/// jq navigates inside but the resolver evaluates by value -- `first`,
-/// `any`, `nth(0)`, a user `def` -- would otherwise be read as having left
-/// the register where it entered, and `del(first and .[0])` on `[true]`
-/// deleted where jq refuses near element 0. Such operands keep the eager
-/// by-value catch-all they had before #3289.
-fn and_or_negate_resolves_live<S: EvalSemantics>(expr: &Expr, trackable: bool) -> bool {
+/// jq mode only (see the arms' own comment for yq), on a trackable input and
+/// an untracked one alike. The arm used to decline on a trackable input
+/// unless the resolver followed every move of jq's register inside the
+/// operands ([`register_movement_tracked`]): an operand jq navigates inside
+/// but the resolver evaluates by value -- `any`, `isempty(g)`, a user `def` --
+/// would otherwise be read as having left the register where it entered, and
+/// `del(first and .[0])` on `[true]` deleted where jq refuses near element 0.
+/// Such operands kept the eager by-value catch-all, which accepted shapes jq
+/// refuses (#3428). They no longer need to: each operand's branch says what
+/// became of the register ([`BranchRegister`]), an operand that may have
+/// moved it states a loss, and `R` then resolves from a lost seed whose
+/// refusals are the resolver's guess and so are loud ([`resolve_from_restored_input`]).
+fn and_or_negate_resolves_live<S: EvalSemantics>(expr: &Expr) -> bool {
     S::TAG == EvalTag::Jq
-        && match unwrap_paren(expr) {
-            Expr::And(l, r) | Expr::Or(l, r) => {
-                !trackable || (register_movement_tracked(l) && register_movement_tracked(r))
-            }
-            Expr::Negate(e) => !trackable || register_movement_tracked(e),
-            _ => false,
-        }
+        && matches!(
+            unwrap_paren(expr),
+            Expr::And(..) | Expr::Or(..) | Expr::Negate(_)
+        )
 }
 
 /// Whether the resolver follows every move jq's path register makes inside
@@ -39101,6 +39101,13 @@ fn and_or_negate_resolves_live<S: EvalSemantics>(expr: &Expr, trackable: bool) -
 /// refuses, so everything else -- every builtin jq defines by navigating
 /// (`first` is `.[0]`), a `def`, `try`, `if` (whose untaken branch drops the
 /// register statically) -- answers `false`.
+///
+/// Read only by [`array_contents_are_checked`] since #3428: the `and`/`or`
+/// arms no longer decline an operand this rejects, because each operand's
+/// branch states its own register ([`register_after`]). An `[E]` still needs
+/// the allowlist, because its claim is that the resolver checks everything
+/// jq checks inside the brackets -- a stronger statement than "the register
+/// is known afterwards" -- and widening it is a separate promotion.
 ///
 /// Unlike [`array_contents_are_checked`], which admits a bare `first`
 /// because it cannot *fail* against a tracked input, this asks whether the
@@ -39761,10 +39768,13 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         Expr::Paren(e) => array_contents_are_checked(e),
         // #3289: `resolve_node_sink` resolves `and`/`or`/unary minus live in
         // jq mode, checking each operand's navigation against the register
-        // as jq does -- but only when it follows every register move inside
-        // them ([`register_movement_tracked`]), which a bare `first` fails
-        // even though `array_contents_are_checked` admits it: `[first and
-        // .[0]]` on `[true]` is refused by jq near element 0.
+        // as jq does. Since #3428 it does so for every operand; this claim
+        // keeps the narrower allowlist ([`register_movement_tracked`]) it was
+        // written against, which a bare `first` fails even though
+        // `array_contents_are_checked` admits it: `[first and .[0]]` on
+        // `[true]` is refused by jq near element 0. Widening an `[E]` claim
+        // is a promotion with oracle rows of its own (#3456, section 10 of
+        // the design note), not part of closing #3428.
         // Confirmed live against jq 1.7.1: `path(. as $x | [.a and 5] | $x)`
         // and `path(. as $x | [-.a] | $x)` on `{"a":1}` are `[]`, while
         // `path([.a and .b] | empty)` still refuses near `"b"`.
@@ -47883,7 +47893,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // a result against the register the stage entered with even when `L`
     // had moved it (#3289 review: `del(.a | [true] | (nth(0) and true))`
     // re-established on `.a`'s `true` and deleted where jq refuses).
-    let stage_reports_register = and_or_negate_resolves_live::<S>(element, branch_trackable);
+    let stage_reports_register = and_or_negate_resolves_live::<S>(element);
     let stage_preserves_register = cannot_move_register(element)
         // #3263: an array resolved live whose contents the resolver checks as
         // jq does, and jq's collect backtracks the register to where it began.
