@@ -305,7 +305,7 @@ fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) ->
 /// as it is printed: yq rounds it through `float64` first, which changes the
 /// printed digits and so the width (#3605).
 fn is_json_sourced_number<V: DocumentValue>(value: &V, cursor: Option<&V::Cursor>) -> bool {
-    cursor.is_some_and(|c| c.canonicalize_numbers()) && value.as_f64().is_some()
+    cursor.is_some_and(DocumentCursor::canonicalize_numbers) && value.as_f64().is_some()
 }
 
 /// [`OwnedValue::from_document_float`] for a double read from `value`, except
