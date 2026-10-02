@@ -729,12 +729,16 @@ and now here). The cursor route's `key`/`parent` walk (`if`, `limit` and `skip` 
 - **An owned-input `[... | key]` collector prints the array it had collected after the error its
   body raises** (#3512), and on the cursor route `limit(1; .[] | <retrying body>) | key` runs the
   `?//` retry past `limit`'s own stop (#3514). Neither is a stale slot.
-- **`limit` raises its own error for a non-number count, at the count** (#3486): `path(limit(([1]
-  as $q ?// $b | $q); .a))` is `["a"]` in jq 1.7.1 -- its `$n - 1` fails downstream of the count,
-  so the `?//` retries to a `null` (unlimited) count -- and "limit requires non-negative
-  integer" after a single attempt here. Without a `?//` both raise, with different wording. The
-  cursor route's value-mode `limit` already retries. jq 1.7.1 has no `skip`, so its rows follow
-  `limit`'s.
+- **`limit` with a string, array or object count raises on the body's first output, as jq's
+  does** (#3486). jq 1.7.1's `limit` is `foreach f as $item ($n; .-1; ...)`, and such a count sorts
+  above every number, so `$n - 1` raises `array ([1]) and number (1) cannot be subtracted` on
+  `f`'s first output -- nothing when `f` is empty -- which is downstream of the count, so a `?//`
+  in it retries: `path(limit(([1] as $q ?// $b | $q); .a))` is `["a"]` in jq. Value mode, `first`,
+  the path resolver, `del` and `|=` now run `f | error(message)` for such a count and drive the
+  count one output at a time. The `key`/`path` walk over an owned input (the `Expr::Limit` arm of
+  `path_context_step` and `OutputWindow::limit`) still raises jq's message *at the count*, so it
+  also raises for an empty `f`, where jq produces nothing. jq 1.7.1 has no `skip`, so its rows
+  follow `limit`'s; `skip`'s own non-number count is unchanged.
 
 ## `recurse` and a `?//` retry in `f` or `cond` (#3293)
 
