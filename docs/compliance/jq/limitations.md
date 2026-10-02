@@ -9098,12 +9098,35 @@ collected errors by that walk (`ModuleLoader::error_report_rank`, `jq_report_ord
 Pinned in `test_module_errors_follow_jq_walk_order_3313` and
 `test_home_jq_errors_follow_module_errors_3313`.
 
-**Still open: a main-body error suppresses def-body errors in jq
-([#3391](https://github.com/rust-works/succinctly/issues/3391)).** When the main program's
-body has an undefined name, jq 1.7.1 reports only the body's errors and drops every
-def-body error, a module's or the main program's own (`def t: topmissing; t, bodymissing`
-reports `bodymissing` alone, `1 compile error`). succinctly reports all of them. The exit
-code is the same.
+**A compile unit with an error hides the units beneath it — closed
+([#3391](https://github.com/rust-works/succinctly/issues/3391)).** jq 1.7.1 reports a block's
+own unresolved calls, `$variable`s and `break`s first and compiles the closures the block
+owns, each `def` body and each argument of a call to a jq-defined function, only when it
+raised none. `def t: topmissing; t, bodymissing` reports `bodymissing` alone, `1 compile
+error`, a module's def errors included. Units beside each other are all reported:
+`def a: x; def b: y; a, b` is two errors, `def t: topmissing; [t] | map(bodymissing)` is two
+(the `map` argument is a unit, not part of the body), and a unit nested inside an erroring
+one is hidden in turn. `resolve::check` now records the unit each diagnostic was found in
+(`Blocks`), and the jq runner reports through `resolve_all_jq`, which drops every error with
+an erroring ancestor unit.
+
+What counts as a unit follows how jq itself builds the construct, captured argument by
+argument against 1.7.1 for every roster builtin of arity one or more: the C-implemented ones
+(`has`, `ltrimstr`, `getpath`, `setpath`, `strftime`, the libm functions, ...) take inline
+operands that belong to the calling block, and everything else (`map`, `select`, `path`,
+`first`, `limit`, `test`, `sub`, `range`, `JOIN`, ...) takes closures. So do `=` and `|=`
+(`_assign`/`_modify`) and the *left* side of `+=` and `//=`, while their right side, `reduce`,
+`foreach`, `try`, `if`, `?//`, `label`, string interpolation and object constructors are
+inline. Pinned in the `jq_reported` tests of `resolve.rs` (including the whole-roster
+`builtin_operand_kinds_match_the_pinned_capture`) and `test_main_body_error_hides_module_def_error_3391`.
+`succinctly yq` is unchanged: it keeps the first error from the full list
+(`resolve_func_calls_all`), and yq has no such rule to match.
+
+**Still open: the *order* of errors among closures.** The surviving errors keep source order.
+jq reports a block's children in the order of its compiled instructions, which differs from
+source order for a few constructs: `a op= b` visits `b` before `a`, and `reduce`/`foreach`
+visit `init` before the source. The set and count of errors now match jq on all of them; only
+the order within one block differs, and it did before this change too.
 
 The stubs point *into* the linked run, not the other way round, because that run is wrapped
 outermost and so is visible from every stub whatever order the directives are declared in.
@@ -9166,8 +9189,9 @@ named the module's own canonical file, exactly as jq does, but not jq's trailing
 `, line N:` or its echo of the offending source line. Closed by
 [#2991](https://github.com/rust-works/succinctly/issues/2991). Two further pre-existing
 divergences in the same reporter are unmeasured and unfiled as their own oracle matrices:
-jq reports module errors in *reverse* include order, and a main-*body* error suppresses
-def errors entirely.
+jq reports module errors in *reverse* include order (closed by
+[#3313](https://github.com/rust-works/succinctly/issues/3313)), and a main-*body* error
+suppresses def errors entirely (closed by [#3391](https://github.com/rust-works/succinctly/issues/3391)).
 
 ### `--slurpfile`'s malformed-JSON detail text is succinctly's own, not jq's (#3051) — accepted divergence
 
