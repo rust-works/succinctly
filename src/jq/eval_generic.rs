@@ -12403,14 +12403,11 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    let mut lazy_fault: Option<Control> = None;
+    let lazy_fault = StashedEscape::new();
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
-        match check_lazy_item_for_try::<_, S>(item) {
-            Ok(item) => sink.push(item),
-            Err(control) => stop_with_escape(&mut lazy_fault, control),
-        }
+        push_checked_lazy_item::<V, S>(&lazy_fault, item, sink)
     });
-    let flow = match lazy_fault {
+    let flow = match lazy_fault.take(&flow, crate::jq::eval::direct_pattern_retry(expr)) {
         Some(control) => Flow::Escaped(control),
         None => flow,
     };
@@ -12537,6 +12534,36 @@ fn check_lazy_item_for_try<V: DocumentValue, S: EvalSemantics>(
             .map_err(Control::Error),
         GenericItem::LazySeq(seq) => seq.materialize_atomic::<S>().map(GenericItem::Owned),
         other => Ok(other),
+    }
+}
+
+/// One item of a drive whose generator a `?//` can retry and whose lazy items
+/// must be checked before the boundary closes: [`check_lazy_item_for_try`]'s
+/// verdict is pushed to `sink`, or, for a fault, parked in `lazy_fault` with a
+/// [`Demand::Stop`] (#3518). Shared by [`each_try_generic`] and
+/// [`each_pattern_alternatives_generic`]'s attempt, so the rule has one
+/// definition.
+///
+/// A re-invocation after a stop can only be a `?//` retry inside the generator
+/// being driven, and it supersedes the fault the retried-past invocation
+/// parked: [`StashedEscape::begin`] drops that stash, and the driver reads the
+/// slot back with [`StashedEscape::take`] or [`StashedEscape::resume`] so a
+/// retry that ends the drive without reaching this function again is
+/// recognised too. Left in a bare `Option<Control>`, the stale fault outranked
+/// the retry's own verdict -- a `Stopped` from a fold update that had since
+/// halted -- so the `try` reported an escape it then caught and read as
+/// finished, or the alternatives driver handed it back and cleared the
+/// nonretryable mark the halt carried, and the caller ran on past the halt (a
+/// fold's source then fed its update a second time).
+fn push_checked_lazy_item<V: DocumentValue, S: EvalSemantics>(
+    lazy_fault: &StashedEscape,
+    item: GenericItem<V>,
+    sink: &mut dyn Sink<V>,
+) -> Demand {
+    lazy_fault.begin();
+    match check_lazy_item_for_try::<_, S>(item) {
+        Ok(item) => sink.push(item),
+        Err(control) => lazy_fault.stop(control),
     }
 }
 
@@ -12911,7 +12938,7 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
                     },
                 );
 
-                let mut lazy_fault: Option<Control> = None;
+                let lazy_fault = StashedEscape::new();
                 // #2180 WP3 review: one attempt, one clear -- see
                 // `eval::each_pattern_alternatives`'s identical call and
                 // `eval::nonretryable_stop`.
@@ -12921,12 +12948,12 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
                     value.clone(),
                     optional,
                     cursor,
-                    &mut |item| match check_lazy_item_for_try::<_, S>(item) {
-                        Ok(item) => sink.push(item),
-                        Err(control) => stop_with_escape(&mut lazy_fault, control),
-                    },
+                    &mut |item| push_checked_lazy_item::<V, S>(&lazy_fault, item, sink),
                 );
-                match resume_from_escape(lazy_fault, flow) {
+                match lazy_fault.resume(
+                    flow,
+                    crate::jq::eval::direct_pattern_retry(&substituted_body),
+                ) {
                     Flow::Exhausted => Demand::Continue,
                     // #1519: a satisfied consumer is jq's escaping `break`, so it
                     // retries the next alternative just like `Control::Break`.

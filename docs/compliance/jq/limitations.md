@@ -587,14 +587,17 @@ regressed. What it leaves:
   wrapped in `first`, `limit`, `//`, a pipe or a `def` keeps the previous answer there
   (`reduce (([[1]] as [$a] ?// $b | $a) // empty) as $x (0; .+$x)` errors); the `std` build
   fixes every shape.
+- **`no_std` and a `try`'s lazy fault (#3518).** A `halt` a fold's update raises on an item the
+  SOURCE's `try` delivered after a `?//` retry now stops the source (`H` is written once, as in
+  jq). The `try` driver and the `?//` alternatives driver drop the fault a retried-past attempt
+  parked by the retry generation, which `no_std` has no thread-local for, so there they drop it
+  only when the `?//` bind *is* the generator they drive (`direct_pattern_retry`); a bind wrapped
+  in a pipe, `first` or a `def` keeps the previous answer, by construction as for the stashes
+  above.
 - **`repeat` in SOURCE or INIT drives the fold eagerly** (`streams_unbounded`, even for a
   bounded or dead `repeat`): the operand, `?//` included, runs to completion before the
   first step, so the retry cannot happen. `reduce ([[1]] as [$a] ?// $b | limit(1; repeat($a))
   // empty) as $x (0; .+$x)` is `null` in jq and an error here, before and after #3293.
-- **A `halt` inside a `try` in SOURCE runs twice.** `reduce ((try (...)), 5) as $x (0;
-  "H"|halt_error(3))` writes `H` twice where jq writes it once (exit code 3 both); the
-  `try` driver's own unstamped slot lets the source continue past a stashed halt. Unchanged
-  by #3293.
 - **Path-mode folds** (`resolve_reduce`/`resolve_foreach`, under `path`/`del`/`|=`) were
   untouched by this slice; see the next section.
 

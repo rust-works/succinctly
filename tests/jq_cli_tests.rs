@@ -84726,6 +84726,134 @@ fn test_fold_retry_never_supersedes_a_halt_3293() -> Result<()> {
     Ok(())
 }
 
+/// #3518: a `halt` that a fold's update raises on an item the source's `try`
+/// delivered after a `?//` retry must stop the source. The item is a lazy `map`
+/// whose `error("M")` fires when the `try` forces it, so the retry of the
+/// inner `?//` is what makes it deliverable. Two out-of-band `lazy_fault` slots
+/// (the `try` driver's and the `?//` alternatives driver's) kept the retried-past
+/// fault, which then outranked the retry's own verdict -- the halt's `Stopped`
+/// -- and the second one cleared the nonretryable mark the halt carried, so the
+/// source went on to its next element and ran the update again: `H` was written
+/// twice where jq writes it once (exit 3 both, which is why the exit code alone
+/// never caught it). The stderr bytes are pinned. Every value captured from jq
+/// 1.7.1; each filter is one of the two shapes (an outer `?//` around the `try`,
+/// and a bare `try`) the two slots needed fixing for.
+#[test]
+fn test_halt_after_a_retried_lazy_fault_in_a_fold_source_writes_once_3518() -> Result<()> {
+    let doc = r#"{"m":[1]}"#;
+    let retry = r#"(1 as $a ?// $b | $a) as $v | .m | map(if $v then error("M") else . end)"#;
+    for template in [
+        // an outer `?//` around the `try`
+        r#"reduce ((try (1 as $p ?// {(empty): $q} | (RETRY))), 5) as $x (0; "H"|halt_error(3))"#,
+        r#"reduce ((try (1 as $p ?// {(empty): $q} | (RETRY)) catch 7), 5, 6) as $x (0; "H"|halt_error(3))"#,
+        // a bare `try`
+        r#"reduce ((try (RETRY)), 5) as $x (0; "H"|halt_error(3))"#,
+        r#"reduce ((try (RETRY) catch 7), 5) as $x (0; "H"|halt_error(3))"#,
+        r#"[foreach ((try (RETRY)), 5) as $x (0; 1; "H"|halt_error(3))]"#,
+        r#"[foreach ((try (RETRY)), 5) as $x (0; "H"|halt_error(3); .)]"#,
+        r#"reduce limit(3; (try (RETRY)), 5) as $x (0; "H"|halt_error(3))"#,
+        r#"reduce first((try (RETRY)), 5) as $x (0; "H"|halt_error(3))"#,
+    ] {
+        let filter = template.replace("RETRY", retry);
+        let owned = format!("{doc} | {filter}");
+        for ((out, err, code), route) in [
+            (run_jq_full(&["-c", "--", &filter], Some(doc))?, "cursor"),
+            (run_jq_full(&["-nc", "--", &owned], None)?, "owned"),
+        ] {
+            assert_eq!(
+                (out.as_str(), err.as_str(), code),
+                ("", "H", 3),
+                "`{filter}` ({route} route): `H` must be written once"
+            );
+        }
+    }
+    // A genuine lazy fault with no retry is still caught, with and without
+    // `catch`, and an unrelated `?//` bind before, after or inside the `try`
+    // does not change that.
+    let fault = r#".m | map(if . then error("M") else . end)"#;
+    for (template, expected) in [
+        ("[try (FAULT)]", "[]\n"),
+        ("[try (FAULT) catch .]", "[\"M\"]\n"),
+        (
+            r"[(1 as $a ?// $b | $a), (try (FAULT) catch .)]",
+            "[1,\"M\"]\n",
+        ),
+        (
+            r"[(try (FAULT) catch .), (1 as $a ?// $b | $a)]",
+            "[\"M\",1]\n",
+        ),
+        (r"[try ((FAULT), (1 as $a ?// $b | $a))]", "[]\n"),
+        (
+            r"[try ((FAULT), (1 as $a ?// $b | $a)) catch .]",
+            "[\"M\"]\n",
+        ),
+        (r"[(1 as $a ?// $b | try (FAULT) catch .)]", "[\"M\"]\n"),
+        (
+            r#"reduce ((try (FAULT) catch "c"), 5) as $x (""; . + ($x|tostring))"#,
+            "\"c5\"\n",
+        ),
+        ("[first(try (FAULT) catch .)]", "[\"M\"]\n"),
+        ("[limit(2; (try (FAULT) catch .), 5)]", "[\"M\",5]\n"),
+    ] {
+        let filter = template.replace("FAULT", fault);
+        let (out, err, code) = run_jq_full(&["-c", "--", &filter], Some(doc))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (expected, 0),
+            "`{filter}`: stderr {err:?}"
+        );
+    }
+    // Without a halt the retry still delivers the item the fold sees.
+    for (template, expected) in [
+        (r"reduce ((try (RETRY)), 5) as $x (0; . + 1)", "2\n"),
+        (r"[foreach ((try (RETRY)), 5) as $x (0; . + 1)]", "[1,2]\n"),
+        (r"[(try (RETRY)), 5]", "[[1],5]\n"),
+    ] {
+        let filter = template.replace("RETRY", retry);
+        let (out, err, code) = run_jq_full(&["-c", "--", &filter], Some(doc))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (expected, 0),
+            "`{filter}`: stderr {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3518, yq mode: the `try` and `?//` drivers are shared with `succinctly yq`,
+/// which has no `?//` (yq v4.53.3's lexer rejects it), so the double write cannot
+/// arise there. Real yq has neither `reduce` nor `halt_error` either, so this has no
+/// oracle; it pins that the shared drivers still write the halt once and stop.
+#[test]
+fn test_halt_in_a_fold_source_try_writes_once_in_yq_mode_3518() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args([
+            "yq",
+            "-o",
+            "json",
+            "-I",
+            "0",
+            r#"reduce ((try (.m | map(.))), 5) as $x (0; "H"|halt_error(3))"#,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().expect("piped").write_all(b"m: [1]\n")?;
+            child.wait_with_output()
+        })?;
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&output.stdout).as_ref(),
+            String::from_utf8_lossy(&output.stderr).as_ref(),
+            output.status.code()
+        ),
+        ("", "H", Some(3))
+    );
+    Ok(())
+}
+
 /// #3293 slice 4 and #2163: a `?//` retry that supersedes a consumer's stop
 /// lets the fold go on to its next INIT fork, and there the source runs
 /// against the real `.` where jq gives it a synthetic `null` -- #2163's open
