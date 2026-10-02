@@ -9376,19 +9376,34 @@ parse as JSON. jq's own message comes from its C parser (`Invalid numeric litera
 line 1, column 4`); succinctly's is its own JSON reader's wording, the same fidelity limit
 already recorded above for a module body's own parse failures.
 
-Every top-level data import's read/parse failure is reported, and in jq's order
-([#3327](https://github.com/rust-works/succinctly/issues/3327)). jq walks the directives
-last-declared first: a data-file failure is printed and the walk goes on (and counts), while
-a missing module stops it. So a data import declared *before* the stopping directive is never
-read (`import "bad" as $d; include "missing"; $d` prints only `module not found: missing`),
-one declared after it is reported ahead of it under the module's own `1 compile error`
-(`include "missing"; import "bad" as $d; $d`), and with no missing module the trailer counts
-every failure (`2 compile errors`). A module's own *syntax error* is not handled this way yet:
-jq goes on past it and counts it (`include "synerr"; import "bad" as $d; $d` is
-`2 compile errors`, data error first), where succinctly still reports the syntax error alone.
-A module cycle keeps #2865's divergence. A data import declared after either is not
-reported in those two cases (the output is what it was before #3327), and a *module's own*
-data imports are still reported one at a time, the first failure only.
+Every directive failure is reported, in jq's order and with jq's count
+([#3327](https://github.com/rust-works/succinctly/issues/3327),
+[#3573](https://github.com/rust-works/succinctly/issues/3573)). jq walks a program's
+directives last-declared first, and a module's own directives the same way one level down.
+A data file that cannot be read or parsed and a module that does not parse are printed and
+**counted** while the walk goes on, and a module that does not parse skips its own directives
+(`include "synerr"; import "bad" as $d; $d` is `bad`, then `synerr`, `2 compile errors`;
+`import "bad" as $d; include "synerr"; $d` the reverse). A data file is never deduplicated
+(imported three times it is reported three times), but a module is reached once, failed or
+not, so a second path to it prints and counts nothing. A **missing module** stops its level
+and returns `1` for it, discarding what that level had counted, and the level above adds that
+`1` to its own count and goes on: `include "missing"; import "bad" as $d; $d` is `bad`,
+`missing`, `1 compile error` (the stop is the program's own), and `import "bad" as $d;
+import "missing" as m; $d` prints only `missing`, while a *module* that includes `missing`,
+included beside the same data import (`include "modmiss"; import "bad" as $d; $d`), is `bad`,
+`missing`, `2 compile errors`, because the stop was inside the module. A module's own data
+imports and syntax errors are part of the same walk, so `import "modbad2" as m; 1`, where
+`modbad2.jq` imports two data files that do not parse, reports both. Every row was captured
+from jq 1.7.1, and a 1,500-program random sweep of directive combinations over fifteen module
+and four data fixtures agrees with it on the kind, order and count of every failure. The
+wording of a syntax error and of a data file's parse failure is succinctly's own, as above,
+so those comparisons are of kind and order.
+
+A module cycle keeps #2865's divergence: jq runs out of stack (exit 139) and prints only what
+its walk reached first. succinctly ends its walk at the cycle the way a missing module ends
+its level, so it prints what jq printed before it died, in jq's order, then the cycle and
+`1 compile error` (`include "cyc1"; import "bad" as $d; $d` prints `bad`, then the cycle). A
+module that exists but cannot be read stays the loader's own `module error`.
 
 **A module body seeing names it should not** — `~/.jq`'s defs, and sibling `include`d and
 `import`ed modules' defs in a declaration-order-dependent way — **is closed**

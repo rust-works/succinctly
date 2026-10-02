@@ -213,11 +213,47 @@ enum ModuleReach {
 /// the distinction [`report_module_load_error`] needs.
 #[derive(Debug)]
 pub(crate) enum ModuleLoadError {
-    /// No `{module_path}.jq` was found anywhere in the search path. jq's own
-    /// shape has no source location to show for this case: `module not
-    /// found: {module_path}`, a blank line standing in for the missing echo,
-    /// then the usual `jq: 1 compile error` trailer. Confirmed live against
-    /// jq 1.7.1, byte-for-byte.
+    /// One or more `include`/`import` directives could not be honoured, in the
+    /// order jq prints them, with the trailer's count (#3573).
+    ///
+    /// A single failure reaches the loader's callers as a one-entry report
+    /// (see [`Self::single`]); the two entry points that report to the user
+    /// ([`ModuleLoader::unqualified_def_names`] and
+    /// [`ModuleLoader::process_program`]) replace it with the whole program's
+    /// report, because jq prints every failure its walk reaches and the loader
+    /// stops at the first (see [`ModuleLoader::failure_report`]).
+    Report {
+        entries: Vec<ReportEntry>,
+        /// The trailer's `N compile errors`. Not always `entries.len()`: a
+        /// missing module returns `1` for the level it stops, discarding what
+        /// that level had counted, and the level that loaded a module adds
+        /// that `1` to its own count.
+        errors: usize,
+    },
+    /// The module could not be read (as opposed to parsed). A *parse*
+    /// failure is [`ReportEntry::Syntax`]; this is the residue of the
+    /// pre-#2703 opaque `anyhow::Error`.
+    Other(anyhow::Error),
+}
+
+impl ModuleLoadError {
+    /// A single directive failure, counted once.
+    fn single(entry: ReportEntry) -> Self {
+        Self::Report {
+            entries: vec![entry],
+            errors: 1,
+        }
+    }
+}
+
+/// One failure in jq's compile-error report ([`ModuleLoadError::Report`]).
+#[derive(Debug)]
+pub(crate) enum ReportEntry {
+    /// No `{module_path}.jq` (or, for a data import, `.json`) was found
+    /// anywhere in the search path. jq's own shape has no source location to
+    /// show for this case: `module not found: {module_path}`, a blank line
+    /// standing in for the missing echo, then the usual trailer. Confirmed
+    /// live against jq 1.7.1, byte-for-byte.
     NotFound { module_path: String },
     /// A module's own `include`/`import` chain leads back to a module already
     /// being loaded (`ca` includes `cb` includes `ca`, or a module including
@@ -229,8 +265,9 @@ pub(crate) enum ModuleLoadError {
     /// `jq -L . -n 'include "ca"; a'` exits **139** (SIGSEGV) with no output on
     /// either stream, and a self-including module does the same. Reproducing
     /// that faithfully is not an option, so succinctly reports the cycle and
-    /// leaves through the same `jq: 1 compile error` / exit 3 door as the other
-    /// two compile-error kinds.
+    /// ends its walk there, through the same `jq: 1 compile error` / exit 3
+    /// door as the other kinds. What jq printed *before* it died is still
+    /// printed, in jq's order (#3573).
     ///
     /// `chain` is the module paths **as written in the `include`/`import`
     /// directives**, from the outermost module in the cycle through to the
@@ -247,45 +284,25 @@ pub(crate) enum ModuleLoadError {
     /// per-parse-state -- see [`report_syntax_error`]), and jq's source-echo
     /// padding is not a fixed formula (the issue's own follow-up note), so
     /// the padding reuses the same column rule the undefined-name path uses.
-    Parse {
+    Syntax {
         path: PathBuf,
         contents: String,
         error: jq::ParseError,
     },
-    /// The module could not be read (as opposed to parsed). A *parse*
-    /// failure now has its own [`Self::Parse`] variant; this is the residue
-    /// of the pre-#2703 opaque `anyhow::Error`.
-    Other(anyhow::Error),
-    /// One or more **data** imports' files (`import "f" as $d;`, resolving to
-    /// `{path}.json`) exist -- [`Self::NotFound`] is what covers a missing
-    /// one -- but could not be read or parsed as JSON (#2956), plus the
-    /// `module not found` that stopped the walk past them, if one did (#3327).
-    ///
-    /// jq walks a program's directives last-declared first. A data-file
-    /// failure is printed and the walk goes on, so every one is reported, the
-    /// last-declared first; a missing module stops it, so a data import
-    /// declared *before* the stopping directive is never read, and the one
-    /// declared after it is reported ahead of it. The trailer counts the data
-    /// failures (`2 compile errors`) unless a module stopped the walk, when it
-    /// is the module's own `1 compile error`. All captured live against jq
-    /// 1.7.1; see [`directive_failure`].
+    /// A data import's file exists but could not be read or parsed (#2956).
     ///
     /// **Wording is succinctly's own** past the `error loading data file
-    /// {path}:` prefix, the same fidelity limit [`Self::Parse`] already
+    /// {path}:` prefix, the same fidelity limit [`Self::Syntax`] already
     /// documents: jq's own message text comes from its C JSON parser
     /// (confirmed live: `Invalid numeric literal at line 1, column 4` for
     /// `not json`), which this crate's own reader cannot reproduce
-    /// byte-for-byte. Each `path` is the resolved file, matching
-    /// `Self::Parse`'s own by-path naming.
-    DataFiles {
-        failures: Vec<DataFileFailure>,
-        /// The module path of the `module not found` that stopped the walk.
-        stopped_by: Option<String>,
-    },
+    /// byte-for-byte. `path` is the resolved file, matching
+    /// [`Self::Syntax`]'s own by-path naming.
+    Data(DataFileFailure),
 }
 
 /// A data import's file that exists but could not be read or parsed
-/// ([`ModuleLoadError::DataFiles`]).
+/// ([`ReportEntry::Data`]).
 #[derive(Debug)]
 pub(crate) struct DataFileFailure {
     path: PathBuf,
@@ -335,6 +352,17 @@ fn report_syntax_error(
     location: &str,
     blank_line: bool,
 ) {
+    print_syntax_error(message, source, offset, location);
+    if blank_line {
+        eprintln!();
+    }
+    eprintln!("jq: 1 compile error");
+}
+
+/// The position-and-echo part of [`report_syntax_error`], without the
+/// trailer, so a module's syntax error can sit among other entries in one
+/// report (#3573).
+fn print_syntax_error(message: &str, source: &str, offset: usize, location: &str) {
     let (line_no, line_text, column) = line_at_offset(source, offset);
     print_position_error(
         format_args!("{message}"),
@@ -343,10 +371,6 @@ fn report_syntax_error(
         &line_text,
         column,
     );
-    if blank_line {
-        eprintln!();
-    }
-    eprintln!("jq: 1 compile error");
 }
 
 /// Print `"{message} at {location}, line {line_no}:"` followed by the
@@ -375,12 +399,40 @@ impl From<anyhow::Error> for ModuleLoadError {
     }
 }
 
-/// jq's report for a module it cannot find: the message, a blank line standing
-/// in for the missing source echo, then the trailer.
-fn report_module_not_found(module_path: &str) {
-    eprintln!("jq: error: module not found: {module_path}");
-    eprintln!();
-    eprintln!("jq: 1 compile error");
+/// Print one [`ReportEntry`] the way jq prints it (#2703, #2956, #3573).
+fn print_report_entry(entry: &ReportEntry) {
+    match entry {
+        // jq's own shape for a module it cannot find: the message, then a blank
+        // line standing in for the missing source echo.
+        ReportEntry::NotFound { module_path } => {
+            eprintln!("jq: error: module not found: {module_path}");
+            eprintln!();
+        }
+        ReportEntry::Cycle { chain } => {
+            eprintln!("jq: error: module cycle detected: {}", chain.join(" -> "));
+            eprintln!();
+        }
+        // jq 1.7.1 names the module by its resolved *absolute* path and
+        // leaves a blank line after the echoed source; both measured live
+        // (see [`report_syntax_error`]).
+        ReportEntry::Syntax {
+            path,
+            contents,
+            error,
+        } => {
+            print_syntax_error(
+                &error.message,
+                contents,
+                error.position,
+                &path.display().to_string(),
+            );
+            eprintln!();
+        }
+        ReportEntry::Data(DataFileFailure { path, detail }) => {
+            eprintln!("jq: error loading data file {}: {detail}", path.display());
+            eprintln!();
+        }
+    }
 }
 
 /// Print a [`ModuleLoadError`] the way `run_jq`'s two call sites both need
@@ -389,49 +441,17 @@ fn report_module_not_found(module_path: &str) {
 /// {e}")` sites used to have to be kept in step by hand.
 fn report_module_load_error(e: &ModuleLoadError) {
     match e {
-        ModuleLoadError::NotFound { module_path } => report_module_not_found(module_path),
-        ModuleLoadError::Cycle { chain } => {
-            eprintln!("jq: error: module cycle detected: {}", chain.join(" -> "));
-            eprintln!();
-            eprintln!("jq: 1 compile error");
-        }
-        ModuleLoadError::Parse {
-            path,
-            contents,
-            error,
-        } => {
-            // jq 1.7.1 names the module by its resolved *absolute* path and
-            // leaves a blank line between the echoed source and the trailer;
-            // both measured live (see [`report_syntax_error`]).
-            report_syntax_error(
-                &error.message,
-                contents,
-                error.position,
-                &path.display().to_string(),
-                true,
+        ModuleLoadError::Report { entries, errors } => {
+            for entry in entries {
+                print_report_entry(entry);
+            }
+            eprintln!(
+                "jq: {errors} compile error{}",
+                if *errors == 1 { "" } else { "s" }
             );
         }
         ModuleLoadError::Other(inner) => {
             eprintln!("jq: module error: {inner}");
-        }
-        ModuleLoadError::DataFiles {
-            failures,
-            stopped_by,
-        } => {
-            for DataFileFailure { path, detail } in failures {
-                eprintln!("jq: error loading data file {}: {detail}", path.display());
-                eprintln!();
-            }
-            match stopped_by {
-                // The module's own trailer: jq counts the one that stopped
-                // it, not the data failures before it.
-                Some(module_path) => report_module_not_found(module_path),
-                None => eprintln!(
-                    "jq: {} compile error{}",
-                    failures.len(),
-                    if failures.len() == 1 { "" } else { "s" }
-                ),
-            }
         }
     }
 }
@@ -556,29 +576,32 @@ fn resolve_data_file_in(search_path: &[PathBuf], module_path: &str) -> Option<Pa
 /// (`[1,2,3]` imports as `[[1,2,3]]`) -- the array is always the *stream*
 /// wrapper, never unwrapped even when the lone value is itself an array.
 ///
-/// Distinguishes [`ModuleLoadError::NotFound`] (no such file -- reported
-/// identically to a missing module import) from
-/// [`ModuleLoadError::DataFiles`] (the file exists but a read or parse
-/// failed), matching jq's own two-way split confirmed live: `module not
-/// found: nope` for the former, `error loading data file <path>: <detail>`
-/// for the latter.
+/// Distinguishes [`ReportEntry::NotFound`] (no such file -- reported
+/// identically to a missing module import) from [`ReportEntry::Data`] (the
+/// file exists but a read or parse failed), matching jq's own two-way split
+/// confirmed live: `module not found: nope` for the former, `error loading
+/// data file <path>: <detail>` for the latter.
 fn load_data_import(
     search_path: &[PathBuf],
     module_path: &str,
 ) -> Result<OwnedValue, ModuleLoadError> {
     let Some(path) = resolve_data_file_in(search_path, module_path) else {
-        return Err(ModuleLoadError::NotFound {
+        return Err(ModuleLoadError::single(ReportEntry::NotFound {
             module_path: module_path.to_string(),
-        });
+        }));
     };
-    let unreadable = |detail: String| ModuleLoadError::DataFiles {
-        failures: vec![DataFileFailure {
-            path: canonical_or_self(&path),
-            detail,
-        }],
-        stopped_by: None,
+    read_data_file(&path).map_err(|failure| ModuleLoadError::single(ReportEntry::Data(failure)))
+}
+
+/// Read and parse one resolved data file ([`load_data_import`]'s second half),
+/// so the failure report's walk reads a data import exactly as the loader does
+/// (#3573).
+fn read_data_file(path: &Path) -> Result<OwnedValue, DataFileFailure> {
+    let unreadable = |detail: String| DataFileFailure {
+        path: canonical_or_self(path),
+        detail,
     };
-    let contents = std::fs::read_to_string(&path).map_err(|e| unreadable(strerror_only(&e)))?;
+    let contents = std::fs::read_to_string(path).map_err(|e| unreadable(strerror_only(&e)))?;
     let values = parse_json_stream(&contents).map_err(|e| unreadable(format!("{e:#}")))?;
     Ok(OwnedValue::array_from(values))
 }
@@ -611,87 +634,6 @@ fn dedup_bindings_last_wins(bindings: Vec<(String, OwnedValue)>) -> Vec<(String,
 /// same closure inline.
 fn as_var_refs(bindings: &[(String, OwnedValue)]) -> impl Iterator<Item = (&str, &OwnedValue)> {
     bindings.iter().map(|(n, v)| (n.as_str(), v))
-}
-
-/// Merge one directive's load failure into a "last failing directive"
-/// selection, keeping whichever carries the higher [`Import::decl_index`]
-/// (#2857).
-///
-/// jq's module resolution reports the *last* `include`/`import` directive
-/// (in true source order) that it cannot honour, not the first: with all of
-/// `AAA`, `BBB`, `CCC` missing, `include "AAA"; include "BBB"; include
-/// "CCC"` reports `module not found: CCC`. The loader stores the two kinds
-/// in separate lists, so the only way to compare an `include` failure
-/// against an `import` failure is the shared `decl_index` both carry from
-/// the parser. Each load pass feeds every failure it hits through here and
-/// returns the survivor at the end, rather than bailing on the first one.
-fn keep_last_decl_failure(
-    last: &mut Option<(usize, ModuleLoadError)>,
-    decl_index: usize,
-    e: ModuleLoadError,
-) {
-    if last.as_ref().map_or(true, |(i, _)| decl_index >= *i) {
-        *last = Some((decl_index, e));
-    }
-}
-
-/// What jq reports for the top-level directives that failed to load, given
-/// the stopping failure [`keep_last_decl_failure`] kept and every data-file
-/// failure seen (#3327), each with its `decl_index`.
-///
-/// jq walks the directives last-declared first (captured live against jq
-/// 1.7.1, `bad.json` and `bad2.json` holding `not json`, `m1` and `m2`
-/// absent):
-///
-/// - a data file that cannot be read or parsed is printed and the walk goes
-///   on, so `import "bad" as $d; import "bad2" as $e; $d` prints `bad2`, then
-///   `bad`, and counts `2 compile errors`;
-/// - a missing module stops it, so a data import declared *before* it is never
-///   read -- `import "bad" as $d; include "m1"; $d` prints only `m1` -- while
-///   one declared *after* it is reported first: `include "m1"; import "bad"
-///   as $d; $d` prints `bad`, then `m1`, and counts `1 compile error`.
-///
-/// A module's own syntax error or a cycle is not one jq's walk stops at the
-/// same way (a syntax error counts and goes on; a cycle is #2865's
-/// divergence), and those keep the single report they had before #3327.
-fn directive_failure(
-    stop: Option<(usize, ModuleLoadError)>,
-    data_failures: Vec<(usize, DataFileFailure)>,
-) -> Option<ModuleLoadError> {
-    if let Some(stop) = stop {
-        return Some(stopped_directive_failure(stop, data_failures));
-    }
-    if data_failures.is_empty() {
-        return None;
-    }
-    Some(ModuleLoadError::DataFiles {
-        failures: last_declared_first(data_failures),
-        stopped_by: None,
-    })
-}
-
-/// [`directive_failure`] when a directive stopped the walk at `decl_index`.
-fn stopped_directive_failure(
-    (stopped_at, stop): (usize, ModuleLoadError),
-    mut data_failures: Vec<(usize, DataFileFailure)>,
-) -> ModuleLoadError {
-    let ModuleLoadError::NotFound { module_path } = stop else {
-        return stop;
-    };
-    data_failures.retain(|(index, _)| *index > stopped_at);
-    if data_failures.is_empty() {
-        return ModuleLoadError::NotFound { module_path };
-    }
-    ModuleLoadError::DataFiles {
-        failures: last_declared_first(data_failures),
-        stopped_by: Some(module_path),
-    }
-}
-
-/// `failures` in jq's report order: last-declared first.
-fn last_declared_first(mut failures: Vec<(usize, DataFileFailure)>) -> Vec<DataFileFailure> {
-    failures.sort_by_key(|(index, _)| core::cmp::Reverse(*index));
-    failures.into_iter().map(|(_, failure)| failure).collect()
 }
 
 /// Extract a module's function definitions and stamp every `$__loc__` in
@@ -984,6 +926,137 @@ fn canonical_or_self(path: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// One `include`/`import` directive, flattened out of a [`Program`] so the two
+/// kinds can be walked in one order (#3573).
+struct Directive<'a> {
+    decl_index: usize,
+    /// The module path, exactly as written.
+    path: &'a str,
+    /// A data import (`import "f" as $d;`), read from `{path}.json` rather
+    /// than loaded as a module.
+    data: bool,
+}
+
+/// `program`'s directives in jq's walk order: last-declared first.
+fn directives_of(program: &Program) -> Vec<Directive<'_>> {
+    let mut directives: Vec<Directive<'_>> = program
+        .includes
+        .iter()
+        .map(|include| Directive {
+            decl_index: include.decl_index,
+            path: &include.path,
+            data: false,
+        })
+        .chain(program.imports.iter().map(|import| Directive {
+            decl_index: import.decl_index,
+            path: &import.path,
+            data: import.data,
+        }))
+        .collect();
+    directives.sort_by_key(|directive| core::cmp::Reverse(directive.decl_index));
+    directives
+}
+
+/// jq's walk over a program's directives, collecting every failure it reaches
+/// (#3573). [`ModuleLoader::failure_report`] documents the rules this follows.
+struct FailureWalk<'a> {
+    search_path: &'a [PathBuf],
+    /// The modules already reached, by canonical file, whether or not they
+    /// failed: jq loads a module once, so a second path to it reports and
+    /// counts nothing. Recorded when a module is finished, not when it starts,
+    /// so a module still being walked is a cycle, not a repeat.
+    visited: BTreeSet<PathBuf>,
+    /// The modules whose own directives are being walked, outermost first:
+    /// `(canonical file, path as written)`.
+    chain: Vec<(PathBuf, String)>,
+    entries: Vec<ReportEntry>,
+    /// A module cycle ends the walk everywhere (jq dies there, #2865).
+    halted: bool,
+}
+
+impl FailureWalk<'_> {
+    /// jq's `process_dependencies` for one level: the failures reported and
+    /// the count this level returns, `directives` already in walk order.
+    ///
+    /// `Err` is a module that exists but cannot be read, which is the loader's
+    /// own error and not a directive's.
+    fn directives(&mut self, directives: &[Directive<'_>]) -> anyhow::Result<usize> {
+        let mut errors = 0;
+        for directive in directives {
+            let resolved = if directive.data {
+                resolve_data_file_in(self.search_path, directive.path)
+            } else {
+                resolve_module_in(self.search_path, directive.path)
+            };
+            let Some(resolved) = resolved else {
+                // A missing module stops this level and returns `1` for it,
+                // whatever the level had counted.
+                self.entries.push(ReportEntry::NotFound {
+                    module_path: directive.path.to_string(),
+                });
+                return Ok(1);
+            };
+            if directive.data {
+                // Counted, and never deduplicated: the same file imported
+                // twice is reported twice.
+                if let Err(failure) = read_data_file(&resolved) {
+                    self.entries.push(ReportEntry::Data(failure));
+                    errors += 1;
+                }
+                continue;
+            }
+            errors += self.module(directive.path, &resolved)?;
+            if self.halted {
+                return Ok(1);
+            }
+        }
+        Ok(errors)
+    }
+
+    /// jq's `load_library` for one module: what it adds to its includer's
+    /// count.
+    fn module(&mut self, as_written: &str, file: &Path) -> anyhow::Result<usize> {
+        let canonical = canonical_or_self(file);
+        if let Some(at) = self.chain.iter().position(|(seen, _)| *seen == canonical) {
+            // From the repeat, as the loader names it (see
+            // `ModuleLoader::load_and_bind_module`).
+            let mut chain: Vec<String> = self.chain[at..]
+                .iter()
+                .map(|(_, written)| written.clone())
+                .collect();
+            chain.push(as_written.to_string());
+            self.entries.push(ReportEntry::Cycle { chain });
+            self.halted = true;
+            return Ok(1);
+        }
+        if self.visited.contains(&canonical) {
+            return Ok(0);
+        }
+        let contents = std::fs::read_to_string(file)
+            .with_context(|| format!("failed to read module: {}", file.display()))?;
+        let errors = match jq::parse_program(&contents) {
+            // A module that does not parse counts once, and its own directives
+            // are never reached.
+            Err(error) => {
+                self.entries.push(ReportEntry::Syntax {
+                    path: canonical.clone(),
+                    contents,
+                    error,
+                });
+                1
+            }
+            Ok(program) => {
+                self.chain.push((canonical.clone(), as_written.to_string()));
+                let errors = self.directives(&directives_of(&program));
+                self.chain.pop();
+                errors?
+            }
+        };
+        self.visited.insert(canonical);
+        Ok(errors)
+    }
+}
+
 impl ModuleLoader {
     /// Create a new module loader with the given search paths.
     pub fn new(library_paths: &[PathBuf]) -> Self {
@@ -1177,9 +1250,9 @@ impl ModuleLoader {
     ) -> Result<(FuncDefList, Vec<BTreeSet<String>>), ModuleLoadError> {
         // Resolve the module path
         let file_path = resolve_module_in(&self.search_path, module_path).ok_or_else(|| {
-            ModuleLoadError::NotFound {
+            ModuleLoadError::single(ReportEntry::NotFound {
                 module_path: module_path.to_string(),
-            }
+            })
         })?;
 
         let canonical = canonical_or_self(&file_path);
@@ -1194,17 +1267,19 @@ impl ModuleLoader {
                 .map(|(_, as_written)| as_written.clone())
                 .collect();
             chain.push(module_path.to_string());
-            return Err(ModuleLoadError::Cycle { chain });
+            return Err(ModuleLoadError::single(ReportEntry::Cycle { chain }));
         }
 
         // Read and parse the module
         let contents = std::fs::read_to_string(&file_path)
             .with_context(|| format!("failed to read module: {}", file_path.display()))?;
 
-        let program = jq::parse_program(&contents).map_err(|e| ModuleLoadError::Parse {
-            path: canonical.clone(),
-            contents: contents.clone(),
-            error: e,
+        let program = jq::parse_program(&contents).map_err(|e| {
+            ModuleLoadError::single(ReportEntry::Syntax {
+                path: canonical.clone(),
+                contents: contents.clone(),
+                error: e,
+            })
         })?;
 
         let own_id = self.run_id_for(module_path);
@@ -1552,85 +1627,97 @@ impl ModuleLoader {
             .map(|(name, _, _)| name.clone())
             .collect();
 
-        // #2857: a failing directive must not short-circuit the pass here --
-        // jq reports the *last* unresolvable `include`/`import` in source
-        // order, so every directive gets a chance to load (into the
-        // `loaded_modules` memo, which `process_program` then reuses) and the
-        // failures are kept only if they are the latest seen. Only
+        // The first directive that fails to load ends this pass: jq prints every
+        // failure its walk reaches, in its own order, and the loader stops at
+        // the first, so [`Self::failure_report`] re-walks the whole program
+        // for the report (#3573; before it, #2857 kept the last failing
+        // directive and #3327 the data-file failures after it). Only
         // `includes` contribute *names*; `imports` are probed purely for
-        // their failures so the whole program, not just the include block,
-        // decides what gets reported.
-        let mut last_err: Option<(usize, ModuleLoadError)> = None;
+        // their failures.
         for include in &program.includes {
             match self.ensure_module_loaded(&include.path) {
                 Ok(defs) => names.extend(defs.iter().map(|(name, _, _)| name.clone())),
-                Err(e) => keep_last_decl_failure(&mut last_err, include.decl_index, e),
+                Err(e) => return Err(self.failure_report(program, e)),
             }
         }
         for import in &program.imports {
             // Same data-import split the real loading path uses (#2865):
-            // a data import reads `{path}.json`, not `{path}.jq`.
+            // a data import reads `{path}.json`, not `{path}.jq`. Reading it
+            // is `process_program`'s job; a missing file is found here.
             if import.data {
                 if resolve_data_file_in(&self.search_path, &import.path).is_none() {
-                    keep_last_decl_failure(
-                        &mut last_err,
-                        import.decl_index,
-                        ModuleLoadError::NotFound {
-                            module_path: import.path.clone(),
-                        },
-                    );
+                    let missing = ModuleLoadError::single(ReportEntry::NotFound {
+                        module_path: import.path.clone(),
+                    });
+                    return Err(self.failure_report(program, missing));
                 }
                 continue;
             }
             if let Err(e) = self.ensure_module_loaded(&import.path) {
-                keep_last_decl_failure(&mut last_err, import.decl_index, e);
+                return Err(self.failure_report(program, e));
             }
         }
-
-        match last_err {
-            // `process_program` never runs after this error, so the data
-            // imports declared after the stopping directive are read here --
-            // jq reports their failures ahead of it (#3327).
-            Some((stopped_at, e)) => {
-                let data_failures = self.data_failures_after(program, stopped_at);
-                Err(stopped_directive_failure((stopped_at, e), data_failures))
-            }
-            None => Ok(names),
-        }
+        Ok(names)
     }
 
-    /// Every top-level data import declared after `decl_index` whose file
-    /// exists but cannot be read or parsed (#3327).
-    fn data_failures_after(
-        &self,
-        program: &Program,
-        decl_index: usize,
-    ) -> Vec<(usize, DataFileFailure)> {
-        let mut failures = Vec::new();
-        for import in &program.imports {
-            if !import.data || import.decl_index <= decl_index {
-                continue;
-            }
-            if let Err(ModuleLoadError::DataFiles {
-                failures: found, ..
-            }) = load_data_import(&self.search_path, &import.path)
-            {
-                failures.extend(found.into_iter().map(|f| (import.decl_index, f)));
-            }
+    /// What jq reports for a program whose directives do not all load, given
+    /// the failure `first` the loader stopped at (#3573).
+    ///
+    /// The loader stops at the first failure; jq's `process_dependencies` does
+    /// not, so this walks the program the way jq does and reports what it
+    /// would. Captured live against jq 1.7.1 (`bad.json`/`bad2.json` hold `not
+    /// json`, `synerr.jq` is `def f: 1 +;`, `m1` is absent):
+    ///
+    /// - directives are walked **last-declared first**, and a module's own
+    ///   directives the same way, one level down;
+    /// - a data file that cannot be read or parsed is printed and **counted**
+    ///   (`import "bad" as $d; import "bad2" as $e` prints `bad2`, `bad`,
+    ///   `2 compile errors`) -- and is never deduplicated, so the same file
+    ///   imported twice is printed twice;
+    /// - a module that does not parse is printed and counted, and **its own
+    ///   directives are skipped**; the walk goes on (`include "synerr"; include
+    ///   "synerr2"` prints both, `2 compile errors`);
+    /// - a **missing module** stops its level and returns `1` for it,
+    ///   discarding what the level had counted; the level above adds that `1`
+    ///   to its own count and goes on (`include "m1"; import "bad" as $d` is
+    ///   `bad`, `m1`, `1 compile error`, but a *module* that includes `m1`,
+    ///   included beside the same data import, is `bad`, `m1`, `2 compile
+    ///   errors`);
+    /// - a module is reached **once**, whether or not it failed: a second
+    ///   `include` of it, or a second path to it, prints nothing and counts
+    ///   nothing.
+    ///
+    /// A module cycle is #2865's divergence (jq runs out of stack). It ends the
+    /// walk the way a missing module does, after what jq printed before it
+    /// died. The one failure that is not a directive's -- a module that cannot
+    /// be read -- is the loader's own error, unchanged.
+    fn failure_report(&self, program: &Program, first: ModuleLoadError) -> ModuleLoadError {
+        let ModuleLoadError::Report { .. } = first else {
+            return first;
+        };
+        let mut walk = FailureWalk {
+            search_path: &self.search_path,
+            visited: BTreeSet::new(),
+            chain: Vec::new(),
+            entries: Vec::new(),
+            halted: false,
+        };
+        match walk.directives(&directives_of(program)) {
+            Ok(errors) => ModuleLoadError::Report {
+                entries: walk.entries,
+                errors,
+            },
+            Err(unreadable) => ModuleLoadError::Other(unreadable),
         }
-        failures
     }
 
     /// Process imports and includes, returning the modified expression with all functions defined.
     pub fn process_program(&mut self, program: &Program) -> Result<Expr, ModuleLoadError> {
         let mut expr = program.expr.clone();
 
-        // #2857: as in `unqualified_def_names`, a failing directive must not
-        // short-circuit here -- jq reports the *last* unresolvable directive
-        // in source order, across both kinds. Every directive is still given
-        // its turn to load (the ones that fail simply wrap nothing), failures
-        // are merged against the running last via `decl_index`, and the
-        // survivor is returned after both loops.
+        // As in `unqualified_def_names`, the first directive that fails to load
+        // ends the pass, and [`Self::failure_report`] walks the whole program
+        // for what jq reports (#3573).
         //
         // Loading is a pass of its own, ahead of any wrapping (#3153): which
         // top-level runs carry bodies and which carry forwarding stubs
@@ -1638,10 +1725,6 @@ impl ModuleLoader {
         // every directive -- and so every module's own dependencies -- has
         // loaded. The wrapping order below is bit-for-bit what it was before.
 
-        let mut last_err: Option<(usize, ModuleLoadError)> = None;
-        // Every data import's read/parse failure, with its `decl_index`
-        // (#3327); see [`directive_failure`].
-        let mut data_failures: Vec<(usize, DataFileFailure)> = Vec::new();
         // Every top-level `include`/non-data `import`'s (decl_index, run id),
         // collected as each is resolved below so `hoist_order` can place them
         // without re-resolving the same paths through the filesystem a second
@@ -1681,8 +1764,7 @@ impl ModuleLoader {
         // the `~/.jq` block that follows it.
         for include in program.includes.iter().rev() {
             if let Err(e) = self.ensure_module_loaded(&include.path) {
-                keep_last_decl_failure(&mut last_err, include.decl_index, e);
-                continue;
+                return Err(self.failure_report(program, e));
             }
             let id = self.run_id_for(&include.path);
             top_ids.push((include.decl_index, id));
@@ -1696,35 +1778,20 @@ impl ModuleLoader {
             // its binding is recorded in `data_bindings` above instead, for
             // substitution into `expr` once every other wrap below is done
             // (#2956). A load failure (missing file, unreadable, bad JSON)
-            // joins the same "last failing directive wins" merge every other
-            // directive's failure already goes through (#2857): jq's own
-            // resolution order has no notion of failure *kind*, only source
-            // position.
+            // ends the pass like any other directive's.
             if import.data {
                 match load_data_import(&self.search_path, &import.path) {
                     Ok(value) => data_bindings.push((import.alias.clone(), value)),
-                    // Kept apart from the stopping failure (#3327): jq reports
-                    // every one of these, not just the last.
-                    Err(ModuleLoadError::DataFiles { failures, .. }) => data_failures.extend(
-                        failures
-                            .into_iter()
-                            .map(|failure| (import.decl_index, failure)),
-                    ),
-                    Err(e) => keep_last_decl_failure(&mut last_err, import.decl_index, e),
+                    Err(e) => return Err(self.failure_report(program, e)),
                 }
                 continue;
             }
             if let Err(e) = self.ensure_module_loaded(&import.path) {
-                keep_last_decl_failure(&mut last_err, import.decl_index, e);
-                continue;
+                return Err(self.failure_report(program, e));
             }
             let id = self.run_id_for(&import.path);
             top_ids.push((import.decl_index, id));
             import_runs.push((id, import.alias.as_str()));
-        }
-
-        if let Some(e) = directive_failure(last_err, data_failures) {
-            return Err(e);
         }
 
         // Top-level data imports' bindings (#2956), substituted into the
