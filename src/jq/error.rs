@@ -132,7 +132,7 @@ pub enum Control {
 /// to some enclosing `label` (#824), or a `halt` that nothing may catch
 /// (#791).
 ///
-/// This is the error type of `result_to_owned`, `eval_owned_multi` and the
+/// This is the error type of `result_to_owned_full`, `eval_owned_multi` and the
 /// other `eval.rs` helpers that evaluate a sub-expression to owned values. An
 /// earlier design smuggled a halt through [`EvalError`] behind a marker field,
 /// which made correctness opt-in at every call site: the natural

@@ -4517,7 +4517,7 @@ fn borrowed_vec_to_result<W>(vs: Vec<StandardJson<'_, W>>) -> QueryResult<'_, W>
 /// If `result` itself escapes (its own `Error`/`Break`/`Halt`/`Partial`, not
 /// the argument's), that escape wins outright and `trailing` is discarded --
 /// same "the computation that actually ran and escaped supersedes an
-/// earlier, never-revisited argument escape" rule `result_to_owned_ctrl`'s
+/// earlier, never-revisited argument escape" rule `result_to_owned_full`'s
 /// own doc comment describes and `has()`/`contains()`'s error paths already
 /// follow. Its caller cannot make `result` its own `Partial` (it delegates to
 /// `std::env::var`, which has no generator-argument evaluation of its own) --
@@ -5468,21 +5468,9 @@ fn prepend<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Convert a QueryResult to an OwnedValue for use in computations.
-///
-/// Drops a `Partial`'s trailing `Break`/`Error` (see [`result_to_owned_ctrl`]
-/// for why, and for the variant that exposes it) -- callers that can re-wrap
-/// their own final result via [`partial`] when that trailing control exists
-/// should use `result_to_owned_ctrl` instead (#1164).
-fn result_to_owned<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    result: QueryResult<'_, W>,
-) -> Result<OwnedValue, EvalEscape> {
-    result_to_owned_ctrl::<_, S>(result).map(|(v, _trailing)| v)
-}
-
-/// Like [`result_to_owned`], but also returns whether the result carried a
-/// trailing [`Control`] after its first value -- a `Partial`'s own
-/// `control`, which `result_to_owned` silently drops (#1164).
+/// Reduce a builtin argument's [`QueryResult`] to its first output, for a
+/// caller that computes with it: `Ok(Some((value, trailing)))`, or `Ok(None)`
+/// when the argument produced **zero outputs at all** (#1045).
 ///
 /// Real jq's own generator-argument semantics (`f(x)` desugars roughly to
 /// `x as $b | ...body using $b...`) use the *first* output of `x` to run
@@ -5491,37 +5479,27 @@ fn result_to_owned<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `has(("a", break $out))` on a non-iterable input reports `has`'s own
 /// "cannot check ... key" error, the trailing `break` is never even
 /// observed) -- and only *after* a successful computation does the escape
-/// from `x`'s second (never fully consumed) output actually fire. So a
-/// caller using this function should wrap its own **successful** final
-/// result via `partial(vec![result], trailing)` when `trailing` is
-/// `Some`, and leave any of its own error paths alone (#833's `ltrimstr(("a",
-/// break $out))` repro: `ltrimstr` computes and returns `"bcabc"`, *then*
-/// unwinds to `$out` -- `"after"` never prints).
-fn result_to_owned_ctrl<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    result: QueryResult<'_, W>,
-) -> Result<(OwnedValue, Option<Control>), EvalEscape> {
-    result_to_owned_full::<_, S>(result)?.ok_or_else(|| EvalError::new("no value").into())
-}
-
-/// Like [`result_to_owned_ctrl`], but distinguishes "the argument produced
-/// zero outputs at all" (`Ok(None)`) from every other case, instead of
-/// collapsing it into the same `Err("no value")` `result_to_owned_ctrl`
-/// still returns for its own (unmigrated) callers (#1045).
+/// from `x`'s second (never fully consumed) output actually fire. So
+/// `trailing`, a `Partial`'s own `control` after its first value (#1164), is
+/// there for a caller to wrap its own **successful** final result via
+/// `partial(vec![result], trailing)` when it is `Some`; a caller leaves any of
+/// its own error paths alone (#833's `ltrimstr(("a", break $out))` repro:
+/// `ltrimstr` computes and returns `"bcabc"`, *then* unwinds to `$out` --
+/// `"after"` never prints). A caller that has no result to wrap, because it
+/// raises (`error(msg)`), drops it.
 ///
-/// Real jq desugars a generator-argument builtin call `f(x)` roughly as `x
-/// as $b | ...body using $b...` (see `result_to_owned_ctrl`'s own doc
-/// comment) -- and jq's `as` binding runs its body *once per output* `x`
-/// produces, zero times if `x` produces none. So `x` producing no output at
-/// all makes the *whole* enclosing computation produce no output, not an
-/// error: confirmed live across a broad, unrelated sample of builtins
-/// (`has`, `ltrimstr`, `rtrimstr`, `startswith`, `endswith`, `split`,
-/// `join`, `contains`, `inside`, `nth`, `flatten(depth)`, `getpath`,
-/// `strftime`, `strptime`, `test`, and even `error` itself -- `1 |
-/// error(empty)` exits 0 with no output in real jq, not "no value") with no
-/// exceptions found, unlike the narrower, escape-specific exceptions
-/// `result_to_owned_ctrl`'s own doc comment documents for the *trailing*
-/// case. A caller migrating to this function must return `QueryResult::None`
-/// on `Ok(None)` instead of treating it as an error.
+/// jq's `as` binding also runs its body *once per output* `x` produces, zero
+/// times if `x` produces none. So `x` producing no output at all makes the
+/// *whole* enclosing computation produce no output, not an error: confirmed
+/// live across a broad, unrelated sample of builtins (`has`, `ltrimstr`,
+/// `rtrimstr`, `startswith`, `endswith`, `split`, `join`, `contains`,
+/// `inside`, `nth`, `flatten(depth)`, `getpath`, `strftime`, `strptime`,
+/// `test`, and `error` itself -- `1 | error(empty)` exits 0 with no output in
+/// real jq, not "no value") with no exceptions found, unlike the narrower,
+/// escape-specific exceptions above for the *trailing* case. A caller must
+/// return `QueryResult::None` on `Ok(None)` instead of treating it as an
+/// error. `error(msg)` was the last caller that raised "no value" here, until
+/// #3488.
 fn result_to_owned_full<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> Result<Option<(OwnedValue, Option<Control>)>, EvalEscape> {
@@ -5658,7 +5636,7 @@ fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(bools: Vec<bool>) -> QueryResult
 
 /// The `OwnedValue`-collecting analog of [`push_truthiness`]: pushes every
 /// output `result` produced into `out`, returning any terminating `Control`
-/// instead of collapsing to the first output the way [`result_to_owned`]
+/// instead of collapsing to the first output the way [`result_to_owned_full`]
 /// does.
 ///
 /// #768 introduced this for [`eval_binary_fanout`]'s own arithmetic/
@@ -10752,8 +10730,8 @@ pub(crate) fn select_emits<S: EvalSemantics>(truthy: bool, already_emitted: &mut
 /// is `11,12,21,22` (right=10 held fixed while left runs 1,2; then right=20).
 /// Shared by [`eval_arithmetic`] and [`eval_compare`], which differ only in
 /// how they combine one pairing — the fallible `combine` closure — since
-/// both used to fork through [`result_to_owned`], which collapses a
-/// multi-output operand to its first value (correct for `result_to_owned`'s
+/// both used to fork through `result_to_owned_full`'s first-output reduction,
+/// which collapses a multi-output operand to its first value (correct for its
 /// other single-value callers, wrong here).
 ///
 /// This is the opposite nesting from `and`/`or` ([`eval_boolean`],
@@ -13074,10 +13052,10 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let payload = match msg {
         // #1907: `to_owned` on the materialized `One`/`OneCursor`
         // case and on `Many`'s first element, not the plain `to_owned_lossy`
-        // `result_to_owned` uses internally -- the same asymmetry the `None`
+        // `result_to_owned_full` uses internally -- the same asymmetry the `None`
         // arm below was already fixed for by #1820.
-        // `result_to_owned`/`result_to_owned_ctrl`/`result_to_owned_full`
-        // back ~47 other call sites across this file, each with its own
+        // `result_to_owned_full` backs ~47 other call sites across this file
+        // (the one such helper left, #3488), each with its own
         // optional/catchability contract, so this fixes only `error(msg)`'s
         // own materialization here rather than touching the shared helper
         // (#1907's own "Category 2 territory" scope note). `Owned`/`ManyOwned`
@@ -13087,7 +13065,7 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // values (e.g. `error((.a, .b))`'s comma keeps both operands
         // borrowed when neither forces owned promotion), so only its first
         // element (the one a generator-argument caller actually consumes,
-        // per `result_to_owned_ctrl`'s own doc comment) is checked here,
+        // per `result_to_owned_full`'s own doc comment) is checked here,
         // mirroring `result_to_owned_full`'s own `vs.first()` semantics.
         //
         // Not reachable via any query this CLI can currently parse:
@@ -13124,8 +13102,15 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => return suppress_or_raise(e, optional),
                 }
             } else {
-                match result_to_owned::<_, S>(msg_result) {
-                    Ok(v) => v,
+                match result_to_owned_full::<_, S>(msg_result) {
+                    // Only the first output is raised; a trailing control after
+                    // it never runs, as `error((1, break $out))` raises `1`.
+                    Ok(Some((v, _trailing))) => v,
+                    // jq's `error(msg)` is `msg | error`, which runs `error`
+                    // once per output of `msg`: a message that produces
+                    // nothing raises nothing and the call yields nothing
+                    // (#3488), where this used to raise "no value".
+                    Ok(None) => return QueryResult::None,
                     // `?` swallows only a genuine, catchable error in the
                     // message expression; a halt inside it always escapes
                     // (#791) -- `isvalid(error(halt_error(3)))` must still
@@ -22152,9 +22137,9 @@ fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
 /// multi-output filter, which — unlike here, where the immediate caller can
 /// only accept a `String` — would turn this into a hard type-mismatch error,
 /// a regression from the pre-#826 code's behavior on this same input): it
-/// uses [`result_to_owned`]'s "take the first output" policy instead
+/// uses [`result_to_owned_full`]'s "take the first output" policy instead
 /// (`eval_owned_input`, not `eval_owned_expr`, so the stream survives long
-/// enough for `result_to_owned` to see more than one element), matching what
+/// enough for `result_to_owned_full` to see more than one element), matching what
 /// the pre-#826 code already did when it pre-evaluated the whole replacement
 /// once via `result_to_owned::<_, S>(eval_single(...))`. Non-fatal, if not fully
 /// jq-correct, is the stopgap this function commits to until the follow-up
@@ -50747,7 +50732,7 @@ fn eval_owned_pure_boolean<S: EvalSemantics>(
 /// distinguishable here rather than dropped (#1559), for a caller
 /// (`builtin_envvar`) that needs to inspect it itself rather than have it
 /// auto-converted. See
-/// [`result_to_owned_ctrl`]'s doc comment for the live-verified jq semantics
+/// [`result_to_owned_full`]'s doc comment for the live-verified jq semantics
 /// this preserves for a caller that can re-wrap its own successful final
 /// result via [`partial`]/[`finish_result`] when this is `Some`.
 ///
@@ -107146,20 +107131,20 @@ mod tests {
         }
     }
 
-    /// #1164: `result_to_owned_ctrl` (backs 16 of this fix's builtins) is
+    /// #1164: `result_to_owned_full` (backs 16 of this fix's builtins) is
     /// exercised by every CLI-level `..._1164` test above only via shapes
     /// that land in its `Owned`/`One`/`Partial` arms -- a builtin argument
     /// with 2+ *borrowed* outputs and no escape (`Many`) never happened to
     /// come up. Covered directly here instead.
     #[test]
-    fn result_to_owned_ctrl_many_arm_takes_first_borrowed_value_1164() {
+    fn result_to_owned_full_many_arm_takes_first_borrowed_value_1164() {
         let json: &[u8] = br#"{"a":"x","b":"y"}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a, .b").unwrap();
         let result = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
-        match result_to_owned_ctrl::<_, JqSemantics>(result) {
-            Ok((OwnedValue::String(s), None)) => assert_eq!(s, "x"),
+        match result_to_owned_full::<_, JqSemantics>(result) {
+            Ok(Some((OwnedValue::String(s), None))) => assert_eq!(s, "x"),
             other => panic!("unexpected result: {other:?}"),
         }
     }
@@ -107167,7 +107152,7 @@ mod tests {
     /// #1279: `fanout_arg`'s loop over a *borrowed* multi-output argument
     /// (`QueryResult::Many`).
     ///
-    /// Same coverage gap as `result_to_owned_ctrl_many_arm_takes_first_borrowed_value_1164`
+    /// Same coverage gap as `result_to_owned_full_many_arm_takes_first_borrowed_value_1164`
     /// right above, and for the same reason: a builtin argument whose outputs
     /// come straight from document cursors is hard to reach from the CLI,
     /// because almost every generator a filter can write (`(1,2)`, arithmetic,
