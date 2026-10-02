@@ -22,6 +22,10 @@ use std::rc::Rc;
 #[cfg(test)]
 use std::string::ToString;
 
+use super::encode_style::{
+    go_yaml_string_style, write_go_yaml_double_quoted, write_go_yaml_single_quoted,
+    EncodedStringStyle,
+};
 use super::index::YamlIndex;
 use super::line_break::{is_line_break, line_break_len, line_break_len_before};
 use super::scalar::{
@@ -8402,15 +8406,17 @@ fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
         {
             out.write_str("!!merge ")?;
         }
-        // `false` unconditionally, not `field.key_cursor().index.canonicalize_numbers()`
-        // (available, but deliberately not read): a JSON object key
-        // always parses as `YamlString::DoubleQuoted`/`SingleQuoted`,
-        // never `Unquoted` -- the only variant `stream_yaml_string_value`'s
-        // canonicalize branch touches -- so the real flag would be a
-        // provable no-op here. Hardcoding `false` documents that as an
-        // invariant of the call site rather than leaving a live (if inert)
-        // flag read to explain.
-        stream_yaml_string_value(out, s, false, Undecodable::PreserveEmpty)
+        // The index's own flag, so a JSON object key is written the way yq
+        // writes a string it decoded from JSON (#3575). A JSON key always
+        // parses as `YamlString::DoubleQuoted`, which is the variant that flag
+        // now changes; it used to be hardcoded `false` because the only variant
+        // it touched was `Unquoted`, which a JSON key never is.
+        stream_yaml_string_value(
+            out,
+            s,
+            field.key_cursor().index.canonicalize_numbers(),
+            Undecodable::PreserveEmpty,
+        )
     } else {
         Ok(stream_yaml_nonstring_key(out, &key)?)
     }
@@ -9383,6 +9389,20 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
 
     // For quoted strings, preserve the quoting style
     match s {
+        // #3575: a JSON string has no YAML style of its own to preserve, so
+        // `canonicalize` (a JSON-sourced index, see above) hands the choice to
+        // the encoder yq itself uses. A string it declines to decide (one with a
+        // line break) keeps the escaped double-quoted form it always had.
+        YamlString::DoubleQuoted { .. } if canonicalize => match go_yaml_string_style(&str_val) {
+            Some(EncodedStringStyle::Plain) => Ok(out.write_str(&str_val)?),
+            Some(EncodedStringStyle::SingleQuoted) => {
+                Ok(write_go_yaml_single_quoted(out, &str_val)?)
+            }
+            Some(EncodedStringStyle::DoubleQuoted) => {
+                Ok(write_go_yaml_double_quoted(out, &str_val)?)
+            }
+            None => Ok(stream_yaml_double_quoted(out, &str_val)?),
+        },
         YamlString::DoubleQuoted { .. } => Ok(stream_yaml_double_quoted(out, &str_val)?),
         YamlString::SingleQuoted { .. } => Ok(stream_yaml_single_quoted(out, &str_val)?),
         YamlString::Unquoted { .. } => {
