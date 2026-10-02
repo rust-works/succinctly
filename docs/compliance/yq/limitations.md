@@ -578,11 +578,17 @@ string computed by a filter used their own quoting heuristics (`yaml_quote_strin
 `{v: ['a,b']}`), and the heuristics only remain for a string with a line break. Checked against
 about 18,000 random strings, values and keys, through `-P`, a write, `del`, `sort_keys`,
 `map_values`, `with_entries` and `to_entries | map(.key)`, with no difference, plus the 215-string
-battery in flow style. A key is the one place the rule is guarded: in a YAML document a key spelled
-like a number, a bool, a null or a timestamp (`200: ok`, `~: v`) is a typed key that the DOM holds
-only as text, so it is still echoed bare rather than quoted into a string key; a JSON key is always a
-string and takes the encoder's choice. Pinned by the `json_string_style_dom_*_3588` and
-`json_string_style_flow_*_3588` goldens and `yaml_typed_keys_dom_write_3588`.
+battery in flow style.
+
+The one place the rule is guarded is a YAML *document*, where the DOM holds a key or a plain scalar
+only as text with no record of whether it was a string. A spelling yq reads as another type is most
+likely a plain scalar of that type, and quoting it would change its type on any write, so
+`yaml::go_yaml_dom_scalar` echoes it: a key (`200: ok`, `~: v`, `2001-12-14T01:02:03Z: a`, `-1: b`),
+and a value the YAML 1.2 core schema calls a string but yq types (`2001-12-14`, `1_000`, `0b11`).
+A value the core schema types too (`true`, `1`, `null`) can only be a quoted or computed string,
+and is quoted. A JSON key or value is always a string and takes the encoder's choice. The empty key
+of a YAML document keeps its old `''`. Pinned by the `json_string_style_dom_*_3588` and
+`json_string_style_flow_*_3588` goldens and the `yaml_typed_{keys,values}_dom_*_3588` ones.
 
 The fourth gap first listed here, a JSON surrogate-pair escape
 (`"\ud83d\ude00"`), used to fail with `invalid escape sequence` on every route and is closed: it is
