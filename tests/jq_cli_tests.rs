@@ -69108,39 +69108,38 @@ fn test_paths_filter_root_probe_retries_an_alternative_3366() -> Result<()> {
 /// retry's error, computed after the stop, as a trailing escape the consumer
 /// dropped. It now streams like `path(f)` does, so the stop reaches a `?//`
 /// inside `f`. `K` marks its first alternative `A` and its retry `B` on
-/// stderr, which is how the extra visit shows. The stdout, exit code, the
-/// marker sequence and the message were captured from `/usr/bin/jq` 1.7.1.
+/// stderr, which is how the extra visit shows, so the whole stderr is compared
+/// exactly: an extra trailing marker is the symptom. Stdout, exit code and
+/// stderr were captured from `/usr/bin/jq` 1.7.1; the last row is jq's own
+/// `break` error for `input` inside `paths`.
 #[test]
 fn test_paths_filter_stop_reaches_a_retry_in_the_filter_3567() -> Result<()> {
-    for (input, filter, stdout_expected, code_expected, markers, message) in [
-        ("{\"a\":{\"a\":1}}", "first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))", "[\"a\"]", 5, "AAB", "E2"),
-        ("{\"a\":{\"a\":1}}", "[limit(1;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))]", "", 5, "AAB", "E2"),
-        ("{\"a\":{\"a\":1}}", "[first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))]", "", 5, "AAB", "E2"),
-        ("{\"a\":{\"a\":1}}", "try first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)])) catch \"caught\"", "[\"a\"]\n\"caught\"", 0, "AAB", ""),
-        ("{\"a\":{\"a\":1}}", "[paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)])]", "", 5, "AAAB", "E2"),
-        ("{\"a\":{\"a\":1}}", "[limit(2;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))]", "", 5, "AAAB", "E2"),
-        ("{\"a\":{\"a\":1}}", "first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))", "[\"a\"]", 5, "AAB", "Cannot index object with array"),
-        ("{\"a\":{\"a\":1}}", "[limit(1;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))]", "", 5, "AAB", "Cannot index object with array"),
-        ("{\"a\":{\"a\":1}}", "[first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))]", "", 5, "AAB", "Cannot index object with array"),
-        ("{\"a\":{\"a\":1}}", "try first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)])) catch \"caught\"", "[\"a\"]\n\"caught\"", 0, "AAB", ""),
-        ("{\"a\":{\"a\":1}}", "[paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)])]", "", 5, "AAAB", "Cannot index number with array"),
-        ("{\"a\":{\"a\":1}}", "[limit(2;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))]", "", 5, "AAAB", "Cannot index number with array"),
-        ("{\"a\":{\"a\":1}}", "first(paths(type==\"number\"))", "[\"a\",\"a\"]", 0, "", ""),
-        ("{\"a\":{\"a\":1}}", "[limit(1;paths(.a?))]", "[[\"a\"]]", 0, "", ""),
-        ("[1,[2,3]]", "first(paths(type==\"array\"))", "[1]", 0, "", ""),
-        ("1", "first(paths(true))", "", 0, "", ""),
+    for (input, filter, stdout_expected, code_expected, stderr_expected) in [
+        ("{\"a\":{\"a\":1}}", "first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))", "[\"a\"]", 5, "AABjq: error (at <stdin>:0): E2\n"),
+        ("{\"a\":{\"a\":1}}", "[limit(1;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))]", "", 5, "AABjq: error (at <stdin>:0): E2\n"),
+        ("{\"a\":{\"a\":1}}", "[first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))]", "", 5, "AABjq: error (at <stdin>:0): E2\n"),
+        ("{\"a\":{\"a\":1}}", "try first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)])) catch \"caught\"", "[\"a\"]\n\"caught\"", 0, "AAB"),
+        ("{\"a\":{\"a\":1}}", "[paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)])]", "", 5, "AAABjq: error (at <stdin>:0): E2\n"),
+        ("{\"a\":{\"a\":1}}", "[limit(2;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))]", "", 5, "AAABjq: error (at <stdin>:0): E2\n"),
+        ("{\"a\":{\"a\":1}}", "first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))", "[\"a\"]", 5, "AABjq: error (at <stdin>:0): Cannot index object with array\n"),
+        ("{\"a\":{\"a\":1}}", "[limit(1;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))]", "", 5, "AABjq: error (at <stdin>:0): Cannot index object with array\n"),
+        ("{\"a\":{\"a\":1}}", "[first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))]", "", 5, "AABjq: error (at <stdin>:0): Cannot index object with array\n"),
+        ("{\"a\":{\"a\":1}}", "try first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)])) catch \"caught\"", "[\"a\"]\n\"caught\"", 0, "AAB"),
+        ("{\"a\":{\"a\":1}}", "[paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)])]", "", 5, "AAABjq: error (at <stdin>:0): Cannot index number with array\n"),
+        ("{\"a\":{\"a\":1}}", "[limit(2;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))]", "", 5, "AAABjq: error (at <stdin>:0): Cannot index number with array\n"),
+        ("{\"a\":{\"a\":1}}", "first(paths(type==\"number\"))", "[\"a\",\"a\"]", 0, ""),
+        ("{\"a\":{\"a\":1}}", "[limit(1;paths(.a?))]", "[[\"a\"]]", 0, ""),
+        ("[1,[2,3]]", "first(paths(type==\"array\"))", "[1]", 0, ""),
+        ("1", "first(paths(true))", "", 0, ""),
+        ("{\"a\":1,\"b\":2}", "first(paths(true))", "[\"a\"]", 0, ""),
+        ("{\"a\":1,\"b\":2}", "[limit(2;paths(.))]", "[[\"a\"],[\"b\"]]", 0, ""),
+        ("{\"a\":[1,{\"b\":2}]}", "[limit(1;paths(type==\"number\"))]", "[[\"a\",0]]", 0, ""),
+        ("{\"a\":1,\"b\":2}", "first(paths(input))", "", 5, "jq: error (at <stdin>:0): break\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(stdout.trim_end(), stdout_expected, "#3567: `{filter}` on {input}");
         assert_eq!(code, code_expected, "#3567: `{filter}` on {input}: {stderr:?}");
-        assert!(
-            stderr.starts_with(markers),
-            "#3567: `{filter}` on {input}: markers {markers:?}, got {stderr:?}"
-        );
-        assert!(
-            stderr.contains(message),
-            "#3567: `{filter}` on {input}: wanted {message:?}, got {stderr:?}"
-        );
+        assert_eq!(stderr, stderr_expected, "#3567: `{filter}` on {input}");
     }
     // The literal-input route (`-n`) was already right; pin it with the document
     // route so a change to only one of them cannot drift.

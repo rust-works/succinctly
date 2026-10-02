@@ -490,7 +490,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `E` on `{"a":{"a":1}}` where jq returns `[["a"],["a","a"]]`, and `-([1] as $a ?// $b | ...)`
   raised its first alternative's negation error where jq answers the second. It now drains the
   filter through the streaming evaluator. A root error or `break` still escapes before any path.
-  `paths(f)` under a stopping `first`/`limit` is the remaining shape, tracked in #3567.
+  `paths(f)` under a stopping `first`/`limit` was the remaining shape, fixed in #3567 above.
 
 - **yq: bare `first` writes where real yq's does** (#3551). `first = 9`, `first |= 5`,
   `first += 1` and `del(first)` on `[1,2]` are `[9,2]`, `[5,2]`, `[2,2]` and `[2]` as in yq
