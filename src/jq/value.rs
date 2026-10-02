@@ -3329,7 +3329,10 @@ impl OwnedValue {
     /// and reparsed it as an integer literal.
     pub fn from_number_literal_plain(literal: &str) -> Self {
         match parse_i64_or_f64(literal) {
-            Some(NumberRepr::Float(f)) if f.is_finite() && (f as i64) as f64 == f => {
+            // The rule is shared with the cursor route's JSON scalars
+            // (`resolve_plain_sourced`), which typed these as floats until
+            // #3577.
+            Some(NumberRepr::Float(f)) if crate::yaml::whole_float_as_int(f).is_some() => {
                 Self::Int(f as i64)
             }
             repr => Self::plain_number_from_repr(repr),
@@ -7517,6 +7520,52 @@ mod tests {
         ] {
             let got = OwnedValue::from_number_literal_plain(literal);
             assert_eq!(format!("{got:?}"), format!("{want:?}"), "{literal}");
+        }
+    }
+
+    /// #3577: the cursor route's JSON scalars (`resolve_plain_sourced` with the
+    /// JSON flag) and the DOM route's (`from_number_literal_plain`) type every
+    /// literal alike -- they shared one rule in spirit and two copies in code
+    /// until the cursor route typed `2.0`, `1e2` and `-0.0` as floats -- and a
+    /// YAML document's whole float stays a float, as go-yaml has it.
+    #[test]
+    fn test_cursor_and_dom_routes_type_a_json_number_alike_3577() {
+        use crate::yaml::{resolve_plain_sourced, ResolvedScalar};
+        for literal in [
+            "2.0",
+            "-0.0",
+            "0.0",
+            "1e2",
+            "-5.0",
+            "20000000000.0",
+            "9223372036854775808.0",
+            "-9223372036854775808.0",
+            "1e19",
+            "1e20",
+            "1e300",
+            "2.5",
+            "-0.5",
+            "0",
+            "-0",
+            "3",
+            "9223372036854775807",
+        ] {
+            let dom = OwnedValue::from_number_literal_plain(literal);
+            let cursor = match resolve_plain_sourced(literal, true) {
+                ResolvedScalar::Int(i) => OwnedValue::Int(i),
+                ResolvedScalar::Float(f) => OwnedValue::Float(f),
+                other => panic!("{literal} resolved to {other:?}"), // omni-dev: coverage tolerate-line reason="failure message for the assertion the test makes"
+            };
+            assert_eq!(format!("{dom:?}"), format!("{cursor:?}"), "{literal}");
+        }
+        for literal in ["2.0", "1e2", "-0.0", "9223372036854775808.0"] {
+            assert!(
+                matches!(
+                    resolve_plain_sourced(literal, false),
+                    ResolvedScalar::Float(_)
+                ),
+                "{literal} is a float in a YAML document"
+            );
         }
     }
 
