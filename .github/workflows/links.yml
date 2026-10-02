@@ -24,14 +24,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Two exclusions that keep the job about link rot, not GitHub's web tier:
-      # a permalink pinned to a tag or a commit SHA is immutable, so it cannot
-      # rot, and GitHub serves those HTML pages with intermittent 503/504s for
-      # hours at a time (#3594), which the 1d cache below used to hide until its
-      # entries expired. `lychee/out.md` is the first attempt's own report,
-      # which the retry step would otherwise rescan and fail on again. Both
-      # invocations below carry the same lists; keep them in step.
-      #
       # Successful results are reused across runs (max-cache-age 1d), so a
       # retry or re-run only re-checks links that actually failed. lychee
       # never caches failures, so a flake can't stick.
@@ -48,6 +40,14 @@ jobs:
         with:
           # Don't fail yet; the retry step below decides the job outcome.
           fail: false
+          # A link pinned to a tag or a commit SHA cannot rot, but GitHub's web
+          # tier serves those HTML pages with 503/504s for hours at a time
+          # (#3594), which the 1d cache below hid until its entries expired. So a
+          # pinned `blob/` link is checked at `raw.githubusercontent.com` instead
+          # (still a 404 for a mistyped path, ref or repo), and a pinned `commit/`
+          # page, which has no raw form, is skipped. Branch, issue and PR links are
+          # checked as before. The retry step carries the same two lines; keep
+          # them in step.
           args: >-
             --verbose
             --no-progress
@@ -71,8 +71,8 @@ jobs:
             --exclude '^https://no-color\.org/'
             --exclude '^https://www\.reddit\.com/'
             --exclude '^https://vigna\.di\.unimi\.it/'
-            --exclude '^https://github\.com/[^/]+/[^/]+/(blob|tree|commit)/([0-9a-f]{7,40}|v[0-9][^/]*)(/|$)'
-            --exclude-path ./lychee
+            --exclude '^https://github\.com/[^/]+/[^/]+/commit/[0-9a-f]{7,40}([/?#.]|$)'
+            --remap '^https://github\.com/([^/]+)/([^/]+)/blob/([0-9a-f]{7,40}|v[0-9][^/]*)/ https://raw.githubusercontent.com/$1/$2/$3/'
             '**/*.md'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,6 +85,8 @@ jobs:
         if: steps.lychee.outputs.exit_code != '0'
         uses: lycheeverse/lychee-action@v2
         with:
+          # The first attempt's own report (`lychee/out.md`) is in the workspace
+          # by now and lists every failing URL as a link, so this step skips it.
           args: >-
             --verbose
             --no-progress
@@ -108,8 +110,9 @@ jobs:
             --exclude '^https://no-color\.org/'
             --exclude '^https://www\.reddit\.com/'
             --exclude '^https://vigna\.di\.unimi\.it/'
-            --exclude '^https://github\.com/[^/]+/[^/]+/(blob|tree|commit)/([0-9a-f]{7,40}|v[0-9][^/]*)(/|$)'
-            --exclude-path ./lychee
+            --exclude '^https://github\.com/[^/]+/[^/]+/commit/[0-9a-f]{7,40}([/?#.]|$)'
+            --remap '^https://github\.com/([^/]+)/([^/]+)/blob/([0-9a-f]{7,40}|v[0-9][^/]*)/ https://raw.githubusercontent.com/$1/$2/$3/'
+            --exclude-path '(^|/)lychee/out\.md$'
             '**/*.md'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
