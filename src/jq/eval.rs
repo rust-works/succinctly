@@ -13119,13 +13119,10 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // (`result_to_owned_full` returns it as an escape, #791).
                     Ok(Some((v, _trailing))) => v,
                     // yq raises `aborted` for a message that produces nothing,
-                    // and `?` suppresses it as it does any raised error.
+                    // through the same tail as any other payload, so `?`
+                    // suppresses it as it does any raised error.
                     Ok(None) if S::ERROR_OF_EMPTY_MESSAGE_ABORTS => {
-                        return if optional {
-                            QueryResult::None
-                        } else {
-                            QueryResult::Error(EvalError::new("aborted"))
-                        };
+                        OwnedValue::String("aborted".into())
                     }
                     // jq's `error(msg)` is `msg | error`, which runs `error`
                     // once per output of `msg`: a message that produces
