@@ -84070,6 +84070,218 @@ fn test_nth_laziness_and_error_placement_3610() -> Result<()> {
     Ok(())
 }
 
+/// #3611: `skip(n; f)` as a path expression. The path resolver had an arm for
+/// `limit` and for `nth` and none for `skip`, so its outputs fell to the
+/// value-producing default and `path`, `del`, `=`, `|=`, `+=` and `pick`
+/// over it raised "Invalid path expression with result ..." on both routes.
+/// jq 1.7.1 has no `skip`, so every row is jq 1.8.2's (`/opt/homebrew/bin/jq`).
+/// Each row runs on both routes -- `-n` with the document as a prefix builds an
+/// owned value, the document on stdin keeps the cursor.
+#[test]
+fn test_skip_is_a_path_expression_on_both_routes_3611() -> Result<()> {
+    let doc = r#"{"a":{"b":[10,20,30,40],"c":{"x":1,"y":2,"z":3}},"d":[1,[2,3],4]}"#;
+    for (filter, expected) in [
+        (
+            r"[path(.a | skip(1; .b[]))]",
+            r#"[["a","b",1],["a","b",2],["a","b",3]]"#,
+        ),
+        (
+            r"[path(.a | skip(0; .b[]))]",
+            r#"[["a","b",0],["a","b",1],["a","b",2],["a","b",3]]"#,
+        ),
+        (r"[path(.a | skip(9; .b[]))]", r"[]"),
+        (
+            r"[path(.a | skip(0, 1; .b[]))]",
+            r#"[["a","b",0],["a","b",1],["a","b",2],["a","b",3],["a","b",1],["a","b",2],["a","b",3]]"#,
+        ),
+        (
+            r"[path(.a | skip(1.5; .b[]))]",
+            r#"[["a","b",1],["a","b",2],["a","b",3]]"#,
+        ),
+        (
+            r"[path(.a | skip(1; .c[]))]",
+            r#"[["a","c","y"],["a","c","z"]]"#,
+        ),
+        (r"[path(.d | skip(1; .[1][]))]", r#"[["d",1,1]]"#),
+        (
+            r"[path(.a | skip(1; .b[], .c[]))]",
+            r#"[["a","b",1],["a","b",2],["a","b",3],["a","c","x"],["a","c","y"],["a","c","z"]]"#,
+        ),
+        (
+            r"[path(.a | limit(2; skip(1; .b[])))]",
+            r#"[["a","b",1],["a","b",2]]"#,
+        ),
+        (
+            r"[path(.a | skip(1; limit(3; .b[])))]",
+            r#"[["a","b",1],["a","b",2]]"#,
+        ),
+        (
+            r"[path(.a | skip(1; skip(1; .b[])))]",
+            r#"[["a","b",2],["a","b",3]]"#,
+        ),
+        (r"[path(.a | nth(1; skip(1; .b[])))]", r#"[["a","b",2]]"#),
+        (
+            r"del(.a.b | skip(1; .[]))",
+            r#"{"a":{"b":[10],"c":{"x":1,"y":2,"z":3}},"d":[1,[2,3],4]}"#,
+        ),
+        (
+            r"del(.a | skip(9; .b[]))",
+            r#"{"a":{"b":[10,20,30,40],"c":{"x":1,"y":2,"z":3}},"d":[1,[2,3],4]}"#,
+        ),
+        (
+            r"del(.a | skip(1; .c[]))",
+            r#"{"a":{"b":[10,20,30,40],"c":{"x":1}},"d":[1,[2,3],4]}"#,
+        ),
+        (
+            r"(.a | skip(1; .b[])) |= . + 1",
+            r#"{"a":{"b":[10,21,31,41],"c":{"x":1,"y":2,"z":3}},"d":[1,[2,3],4]}"#,
+        ),
+        (
+            r"(.a | skip(2; .b[])) = 0",
+            r#"{"a":{"b":[10,20,0,0],"c":{"x":1,"y":2,"z":3}},"d":[1,[2,3],4]}"#,
+        ),
+        (
+            r"(.a | skip(1; .c[])) += 100",
+            r#"{"a":{"b":[10,20,30,40],"c":{"x":1,"y":102,"z":103}},"d":[1,[2,3],4]}"#,
+        ),
+        (
+            r"pick(.a | skip(1; .b[]))",
+            r#"{"a":{"b":[null,20,30,40]}}"#,
+        ),
+        (r"[path(.a | skip(1; empty))]", r"[]"),
+        (r"[path(skip(1; .a, .d))]", r#"[["d"]]"#),
+        // a leaf that makes many non-path values is asked for the dropped ones
+        // too, and the delivered one is never reached when the consumer drops it
+        (r"[path(skip(1; paths) | empty)]", r"[]"),
+        // laziness: the body is not pulled past what the consumer needs
+        (r#"first(path(skip(1; .a, .d, error("x"))))"#, r#"["d"]"#),
+        (r"reduce path(skip(1; .a, .d)) as $p (0; . + 1)", r"1"),
+        // a halt in the body stops the program at exit 0 with nothing printed
+        (
+            r"[path(skip(1; (range(3) | if . == 1 then halt else . end)))]",
+            r"",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{filter}` (cursor route): stderr {stderr:?}"
+        );
+        let owned = format!("{doc} | {filter}");
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &owned], None)?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "`{owned}` (owned route): stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3611: the counts and errors `skip` raises under `path`/`del` are the ones
+/// jq 1.8.2 raises -- a negative or NaN count, and an error the body raises at
+/// a dropped position -- on both routes. A non-number count also raises, with
+/// succinctly's own wording (`classify_skip_n`'s, as in value mode), so only
+/// the exit code is pinned for it.
+#[test]
+fn test_skip_path_errors_match_jq_on_both_routes_3611() -> Result<()> {
+    let doc = r#"{"a":{"b":[10,20,30,40]}}"#;
+    for (filter, expected_error) in [
+        (
+            "[path(.a | skip(-1; .b[]))]",
+            "skip doesn't support negative count",
+        ),
+        (
+            "[path(.a | skip(nan; .b[]))]",
+            "skip doesn't support negative count",
+        ),
+        (
+            "del(.a | skip(-1; .b[]))",
+            "skip doesn't support negative count",
+        ),
+        (r#"[path(.a | skip(1; .b[0], error("E"), .b[1]))]"#, ": E"),
+        // a leaf producing many non-path values: the dropped prefix has to be
+        // produced for the delivered one to be reached, and that one is not a path
+        (
+            "[path(skip(1; paths))]",
+            r#"Invalid path expression with result ["a","b"]"#,
+        ),
+        (
+            "del(skip(1; paths))",
+            r#"Invalid path expression with result ["a","b"]"#,
+        ),
+        (
+            "[path(skip(1; range(3)))]",
+            "Invalid path expression with result 1",
+        ),
+        // a generator count: the first value's prefix is produced, then the
+        // second raises
+        (r#"[path(skip(0, error("x"); .a))]"#, ": x"),
+        (r#"[path(.a | skip("x"; .b[]))]"#, ""),
+    ] {
+        let owned = format!("{doc} | {filter}");
+        for ((stdout, stderr, code), route) in [
+            (run_jq_full(&["-nc", &owned], None)?, "owned"),
+            (run_jq_full(&["-c", filter], Some(doc))?, "cursor"),
+        ] {
+            assert_eq!(
+                (stdout.as_str(), code),
+                ("", 5),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains(expected_error),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3611, yq mode: `skip` is not yq syntax (yq v4.53.3's lexer rejects it;
+/// `--jq-extensions` opts into succinctly's jq surface), so there is no yq
+/// oracle for it and the rule is `limit`'s -- a write through `skip` reaches
+/// the elements it delivers. The resolver is shared with jq mode.
+#[test]
+fn test_skip_writes_in_yq_mode_3611() -> Result<()> {
+    let input = "a:\n  b: [1, 2, 3]\nc: x\n";
+    for (filter, expected) in [
+        (
+            "(.a | skip(1; .b[])) |= 10",
+            r#"{"a":{"b":[1,10,10]},"c":"x"}"#,
+        ),
+        ("del(.a | skip(1; .b[]))", r#"{"a":{"b":[1]},"c":"x"}"#),
+        (
+            r#"(.a | skip(1; .b[])) = "z""#,
+            r#"{"a":{"b":[1,"z","z"]},"c":"x"}"#,
+        ),
+        ("[path(.a | skip(1; .b[]))]", r#"[["a","b",1],["a","b",2]]"#),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            expected,
+            "#3611 (yq): `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3610, yq mode: `nth` is not yq syntax (yq v4.53.3's lexer rejects it;
 /// `--jq-extensions` opts into succinctly's jq surface), so there is no yq
 /// oracle for it and the rule is `limit`'s and `skip`'s -- an output keeps
