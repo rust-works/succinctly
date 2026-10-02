@@ -542,7 +542,7 @@ at all. The justification is the spec target, which is why the case belongs here
 Representative cases, each live-verified. These are gaps to close, listed here so they are
 not rediscovered from scratch.
 
-### String style of JSON-sourced output — closed on the streaming route (#3575); three gaps remain
+### String style of output — closed on every route (#3575, #3588); the gaps below remain
 
 `yq -p json -o yaml` writes every string and key in go-yaml's own style, not the JSON text's:
 `{"name":"a","n":["x","1"]}` is `name: a` / `n:` / `- x` / `- "1"`, where this route used to echo
@@ -565,16 +565,24 @@ Still open, each separate from this fix:
   `-P`, writes the escaped double-quoted form (`"a\nb"`). The style function declines these
   (`None`) so the old text is unchanged.
 - **A key over 128 bytes** (also #3587). yq writes `? key` / `: value`; this route writes an ordinary key.
-- **The DOM route** ([#3588](https://github.com/rust-works/succinctly/issues/3588)): `-P`, every
-  write or reshaping filter (`del(.a)`, `.a = "1"`, `sort_keys(.)`, `with_entries(.)`, a slice,
-  `. *= {...}`, `style="flow"`), and a string computed by a filter (`{"k": (.k + "")}`) quote
-  with their own heuristics (`yaml_quote_string` and `yaml_quote_key` in `yq_runner.rs`,
-  `needs_yaml_quoting` in `jq/stream.rs`), so the same string is styled one way under an identity
-  filter and another under `del(.a)`. On the 223-string battery they agree with yq on 132
-  (`-P`) and 133 (computed) of the values, and `-P` on 88 of the keys: single against double
-  quotes, base-prefixed numbers, bare `inf`/`nan`, and a date or a number-shaped key written bare
-  (`d: 2001-12-14` and `1: "2"` read back as a timestamp and an integer key, where yq quotes
-  both). They could take `go_yaml_string_style` as it is.
+- **A JSON object key `<<` on the DOM route** ([#3600](https://github.com/rust-works/succinctly/issues/3600)). yq keeps it in YAML output as the string key `"<<": 1`; a write, `del`, `sort_keys` or `-P` here drops the entry.
+- **A YAML key's quote style on the DOM route** ([#3601](https://github.com/rust-works/succinctly/issues/3601)). The DOM holds a key as its display text, so any write writes `"a": 1` as `a: 1`, and `"1": 3` as the integer key `1: 3`; yq keeps the key as written.
+
+The DOM route ([#3588](https://github.com/rust-works/succinctly/issues/3588)) is closed. `-P`, every write
+or reshaping filter (`del(.a)`, `.a = "1"`, `sort_keys(.)`, `with_entries(.)`, `style="flow"`) and a
+string computed by a filter used their own quoting heuristics (`yaml_quote_string` and
+`yaml_quote_key` in `yq_runner.rs`, `needs_yaml_quoting` in `jq/stream.rs`), which agreed with yq on
+132 and 133 of 223 values and wrote a date or a number-shaped key bare (`d: 2001-12-14` and
+`1: "2"` read back as a timestamp and an integer key). A string with no style to preserve now takes
+`go_yaml_string_style` there too, in block or flow context (flow quotes `,[]{}?` and any `:`:
+`{v: ['a,b']}`), and the heuristics only remain for a string with a line break. Checked against
+about 18,000 random strings, values and keys, through `-P`, a write, `del`, `sort_keys`,
+`map_values`, `with_entries` and `to_entries | map(.key)`, with no difference, plus the 215-string
+battery in flow style. A key is the one place the rule is guarded: in a YAML document a key spelled
+like a number, a bool, a null or a timestamp (`200: ok`, `~: v`) is a typed key that the DOM holds
+only as text, so it is still echoed bare rather than quoted into a string key; a JSON key is always a
+string and takes the encoder's choice. Pinned by the `json_string_style_dom_*_3588` and
+`json_string_style_flow_*_3588` goldens and `yaml_typed_keys_dom_write_3588`.
 
 The fourth gap first listed here, a JSON surrogate-pair escape
 (`"\ud83d\ude00"`), used to fail with `invalid escape sequence` on every route and is closed: it is
