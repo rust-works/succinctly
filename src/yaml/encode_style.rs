@@ -26,9 +26,9 @@
 //! bytes, which go-yaml also writes with `? `.
 
 #[cfg(not(test))]
-use alloc::string::String;
+use alloc::{borrow::Cow, string::String};
 #[cfg(test)]
-use std::string::String;
+use std::{borrow::Cow, string::String};
 
 /// The style go-yaml's encoder gives a single-line string scalar in block
 /// context.
@@ -49,7 +49,7 @@ pub(crate) enum EncodedStringStyle {
 /// string with a line break (see the module docs).
 #[must_use]
 pub(crate) fn go_yaml_string_style(s: &str) -> Option<EncodedStringStyle> {
-    if s.chars().any(is_break) {
+    if has_break(s) {
         return None;
     }
     // yaml.v3 `stringv`: a string that would resolve to another tag when
@@ -66,7 +66,7 @@ pub(crate) fn go_yaml_string_style(s: &str) -> Option<EncodedStringStyle> {
     let mut first = true;
     while let Some(c) = chars.next() {
         // `is_blankz` of the next character: a blank, or the end of the string.
-        let followed_by_blank = chars.peek().map_or(true, |&n| is_blank(n));
+        let followed_by_blank = chars.peek().map_or(true, |&n| is_blankz(n));
         if first {
             match c {
                 '#' | ',' | '[' | ']' | '{' | '}' | '&' | '*' | '!' | '|' | '>' | '\'' | '"'
@@ -82,7 +82,7 @@ pub(crate) fn go_yaml_string_style(s: &str) -> Option<EncodedStringStyle> {
             }
         }
         special |= !is_printable(c);
-        preceded_by_blank = is_blank(c);
+        preceded_by_blank = is_blankz(c);
         first = false;
     }
     if special {
@@ -160,13 +160,23 @@ pub(crate) fn write_go_yaml_single_quoted<Out: core::fmt::Write>(
     out.write_char('\'')
 }
 
+/// Whether `s` holds a line break. The ASCII breaks are a byte scan, and the
+/// three that are not ASCII (U+0085, U+2028, U+2029) are only looked for in a
+/// string that has a non-ASCII character at all, so the common string costs one
+/// pass of byte compares.
+fn has_break(s: &str) -> bool {
+    s.bytes().any(|b| matches!(b, b'\n' | b'\r')) || (!s.is_ascii() && s.chars().any(is_break))
+}
+
 /// go-yaml's `is_break`: the characters it treats as a line break.
 fn is_break(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}')
 }
 
-/// go-yaml's `is_blank`: a space or a tab.
-fn is_blank(c: char) -> bool {
+/// go-yaml's `is_blankz` for a character: a space, a tab or a line break. (The
+/// `z` is the end of the string, which the one caller that can see it, in
+/// [`go_yaml_string_style`], counts as blank itself.)
+fn is_blankz(c: char) -> bool {
     matches!(c, ' ' | '\t') || is_break(c)
 }
 
@@ -220,10 +230,21 @@ fn resolves_to_non_str(s: &str) -> bool {
             }
             // yaml.v3 strips every underscore before it tries an integer or a
             // float, so `1_000` and `0x1_f` are numbers.
-            let plain: String = s.chars().filter(|&c| c != '_').collect();
+            let plain = without_underscores(s);
             is_go_int(&plain) || (matches_yaml_float(&plain) && is_finite_float(&plain))
         }
         _ => false,
+    }
+}
+
+/// `s` without its underscores, borrowed when it has none (the common case, a
+/// number, a date or a version, so a string that starts like one allocates
+/// nothing).
+fn without_underscores(s: &str) -> Cow<'_, str> {
+    if s.contains('_') {
+        Cow::Owned(s.chars().filter(|&c| c != '_').collect::<String>())
+    } else {
+        Cow::Borrowed(s)
     }
 }
 
@@ -329,7 +350,7 @@ fn is_go_float(s: &str) -> bool {
     if !underscores_ok {
         return false;
     }
-    let plain: String = s.chars().filter(|&c| c != '_').collect();
+    let plain = without_underscores(s);
     matches_yaml_float(&plain) && is_finite_float(&plain)
 }
 

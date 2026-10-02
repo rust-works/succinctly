@@ -9360,7 +9360,11 @@ fn widen_folded_breaks(decoded: &str, explicit_indent_used: bool) -> Cow<'_, str
 ///
 /// `canonicalize` (#996) is
 /// [`YamlIndex::canonicalize_numbers`](super::index::YamlIndex::canonicalize_numbers)
-/// -- see [`json_sourced_canonical_float`] for what this means. Only the
+/// -- see [`json_sourced_canonical_float`] for what this means. It is also the
+/// index's "this text is JSON" flag, so it selects the `DoubleQuoted` arm's
+/// JSON-sourced style too (#3575): a JSON string has no YAML style to preserve,
+/// and is written the way yq's encoder writes one
+/// ([`go_yaml_string_style`]). Beyond that arm, only the
 /// `Unquoted` arm is affected: a JSON-sourced plain scalar's own source
 /// spelling is what's wrong for a `Float` (real yq re-serializes it
 /// through `f64`, e.g. `1.50` -> `1.5`), the same way it's wrong for JSON
