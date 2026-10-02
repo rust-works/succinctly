@@ -77157,6 +77157,118 @@ fn test_array_admits_optional_and_recurse_2764() -> Result<()> {
     ])
 }
 
+/// #3272: a recursion on an untracked input delivers its seed (`.`, no
+/// navigation) before anything indexes, so jq's path register is untouched for
+/// that one output and a later `$x` frozen from it re-establishes. Only the
+/// *next* output navigates and raises -- with jq's own "near attempt" wording,
+/// catchably. The whole stage used to lose the register instead, which refused
+/// `$x` at the seed with a guessed "with result" error before the recursion's
+/// own navigation error was reached. Every expectation was captured from
+/// `/usr/bin/jq` 1.7.1, stdout, stderr and exit code, in the read and the write
+/// direction and with `try` inside, around and after the recursion.
+#[test]
+fn test_recurse_seed_keeps_register_3272() -> Result<()> {
+    assert_rows_2764(&[
+        // the issue's own rows: the seed re-establishes the register, only the later output raises
+        (r"path(. as $x | 1 | .. | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(.a as $y | .a | 5 | .. | $y)", "[\"a\"]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 5\n", 5),
+        (r"path(. as $x | 1 | recurse(.[]?) | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(. as $x | 1 | recurse(.a; true) | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(. as $x | 1 | recurse(.a; false) | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(. as $x | 1 | recurse(.a) | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(. as $x | 1 | recurse | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(. as $x | 1 | (..) | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(. as $x | null | .. | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through null\n", 5),
+        (r"path(. as $x | {} | .. | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through {}\n", 5),
+        (r"path(. as $x | [] | .. | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through []\n", 5),
+        // a caught or optional recursion never reaches its navigation error
+        (r"path(. as $x | 1 | try recurse(.a) | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | recurse(.a)? | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | try .. | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | try (try ..) | $x)", "[]\n", "", 0),
+        (r"[path(. as $x | 1 | try (.. | $x))]", "[[]]\n", "", 0),
+        (r#"path(. as $x | 1 | try recurse(.a) catch "C" | $x | empty)"#, "", "", 0),
+        // the register entering the recursion is a navigated one
+        (r"path(.a as $y | .a | 5 | try .. | $y)", "[\"a\"]\n", "", 0),
+        (r"path(.a as $y | .c | try .. | $y)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"b\":{\"b\":null}}\n", 5),
+        // write forms: the register survives the seed, so the write is made where jq makes it
+        (r"del(. as $x | 1 | try recurse(.a) | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"del((. as $x | 1 | .. | $x | .c)?)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"del(. as $x | 1 | try (.. | $x | .c))", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"del(. as $x | 1 | .. | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"del(. as $x | 1 | try .. | try ($x | .c))", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"del(. as $x | 1 | recurse(.a)? | try ($x | .c))", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"del(. as $x | 1 | (.. | try $x) | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"(. as $x | 1 | try recurse(.a) | $x | .c) |= 9", "{\"a\":{\"b\":{\"b\":null}},\"c\":9}\n", "", 0),
+        (r"(. as $x | 1 | .. | $x | .c) |= 9", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"(. as $x | 1 | try .. | try ($x | .c)) |= 9", "{\"a\":{\"b\":{\"b\":null}},\"c\":9}\n", "", 0),
+        (r"del(.a as $y | .a | 5 | try .. | $y | .b)", "{\"a\":{},\"c\":2}\n", "", 0),
+        (r"(.a as $y | .a | 5 | try .. | $y | .b) |= 9", "{\"a\":{\"b\":9},\"c\":2}\n", "", 0),
+        // a closure parameter is transparent to the seed rule
+        (r"def f(g): . as $x | 1 | g | $x; path(f(..))", "[]\n", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"def f(g): . as $x | 1 | try g | $x; path(f(recurse(.a)))", "[]\n", "", 0),
+        // the later navigation error keeps jq's wording and stays catchable
+        (r"try (path(. as $x | 1 | .. | $x)) catch .", "[]\n\"Invalid path expression near attempt to iterate through 1\"\n", "", 0),
+        (r"try (path(. as $x | 1 | recurse(.a) | $x)) catch .", "[]\n\"Invalid path expression near attempt to access element \\\"a\\\" of 1\"\n", "", 0),
+        (r"[path(. as $x | 1 | recurse(.a; false) | $x)?]", "[[]]\n", "", 0),
+        (r"[(. as $x | 1 | .. | $x | .c)?]", "[2]\n", "", 0),
+    ])
+}
+
+/// #3272, must-not-change: the seed rule is only for a recursion stage's *first*
+/// output on an untracked input. A recursion that is not the register's own
+/// seed -- a trackable branch, a literal downstream of `..`, a non-navigating
+/// `f` (#2764) -- reads exactly as it did.
+#[test]
+fn test_recurse_seed_rule_leaves_other_shapes_unchanged_3272() -> Result<()> {
+    assert_rows_2764(&[
+        // the seed exemption does not touch a recursion that is not the register's own first output
+        (r"path(. as $x | 1 | .. | 5)", "", "jq: error (at <stdin>:1): Invalid path expression with result 5\n", 5),
+        (r"path(1 | ..)", "", "jq: error (at <stdin>:1): Invalid path expression with result 1\n", 5),
+        (r"[path(1 | ..)?]", "[]\n", "", 0),
+        (r"path(..)", "[]\n[\"a\"]\n[\"a\",\"b\"]\n[\"a\",\"b\",\"b\"]\n[\"c\"]\n", "", 0),
+        (r"[path(..)]", "[[],[\"a\"],[\"a\",\"b\"],[\"a\",\"b\",\"b\"],[\"c\"]]\n", "", 0),
+        (r"[path(recurse(.[]?))]", "[[],[\"a\"],[\"a\",\"b\"],[\"a\",\"b\",\"b\"],[\"c\"]]\n", "", 0),
+        (r"path(. as $x | 1 | recurse(empty) | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | recurse(.+1; .<3) | $x)", "[]\n[]\n", "", 0),
+        (r"path(.a as $y | .a | 5 | recurse(.+1; . < 7) | $y)", "[\"a\"]\n[\"a\"]\n", "", 0),
+        (r"path(. as $x | .c | recurse(.+1; .<4) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"path(. as $x | .a | .. | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"path(. as $x | .a | try .. | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"path(. as $x | .. | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"path(.a as $y | .. | $y)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"b\":{\"b\":null}}\n", 5),
+        (r"path(.a as $y | .c | .. | $y)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"b\":{\"b\":null}}\n", 5),
+    ])
+}
+
+/// #3272, residuals: shapes whose first output is not *provably* the recursion's
+/// seed stay refuse-only (`first(..)`, `limit(n; ..)`, a fork, a nested pipe,
+/// `//`: naming a call's body is what `cannot_move_register` declines to do),
+/// and so does the output a `catch` handler adds after the seed. jq answers
+/// each read form; the rows pin the *current* refusal, and every write form
+/// must exit non-zero -- never 0 with the document unchanged, which is the
+/// silent write loss #3267 closed.
+#[test]
+fn test_recurse_seed_residuals_stay_loud_3272() -> Result<()> {
+    assert_rows_2764(&[
+        // jq: [] where the recursion's first output is not provably its seed (a call, a fork, a nested pipe)
+        (r"path(. as $x | 1 | first(..) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"path(. as $x | 1 | limit(2; ..) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"path(. as $x | 1 | (., ..) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"path(. as $x | 1 | if true then .. else 1 end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"path(. as $x | 1 | (.. | select(true)) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"path(. as $x | 1 | (try ..) // 3 | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        // jq: [] twice -- the handler's output is a second one, and that one still refuses
+        (r"path(. as $x | 1 | try recurse(.a) catch 7 | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        // the write forms of every residual stay loud: never exit 0 with the document unchanged
+        (r"del(. as $x | 1 | first(..) | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"del(. as $x | 1 | first(..) | try ($x | .c))", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"del(. as $x | 1 | try recurse(.a) catch 7 | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"del((. as $x | 1 | try recurse(.a) catch 7 | $x | .c)?)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"(. as $x | 1 | try recurse(.a) catch 7 | $x | .c) |= 9", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+    ])
+}
+
 /// #3297: `resolve_node_sink` had no `Expr::FuncDef` arm, so a `def`
 /// declared *inside* `path(...)` fell to the eager fallback -- which
 /// evaluates the whole `FuncDef` (definition and `then` alike) as a plain
