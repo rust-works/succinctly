@@ -1,0 +1,59 @@
+# The options of both lychee passes in .github/workflows/links.yml (the first
+# attempt and the retry that follows it), so an exclude added here reaches both
+# (#3620). Both steps run `lychee --config lychee.toml '**/*.md'`.
+#
+# lychee reads ./lychee.toml by default, so a bare `lychee '**/*.md'` from the
+# repository root uses these too, including the one-day cache of successful
+# links (`lychee --cache=false` skips it).
+
+# `--verbose` was one -v, which lychee 0.24 calls "warn": the excluded and
+# failing links, not every successful one ("info" prints all of them).
+verbose = "warn"
+no_progress = true
+cache = true
+max_cache_age = "1d"
+max_retries = 3
+retry_wait_time = 2
+accept = ["100..=399"]
+
+# These are regular expressions, not paths, and `.` matches any character, so
+# they skip any path with a character before `/target` or `/data`: not a
+# top-level `target/` or `data/` (which the glob spells without a leading `./`)
+# but, by accident, docs/optimizations/targets.md and
+# tests/data/bench-corpus/*.md. Carried over unchanged from the arguments this
+# file replaced; anchoring them would start checking those files (#3632).
+#
+# The last entry is the first attempt's own report, which lists every failing
+# URL as a link, so the retry skips it (it does not exist yet during the first
+# attempt).
+exclude_path = ["./target", "./data", '(^|/)lychee/out\.md$']
+
+exclude = [
+  '^https://crates\.io/crates/',
+  '^https://docs\.rs/',
+  '^https://www\.intel\.com/',
+  '^https://dl\.acm\.org/',
+  '^https://lib\.rs/',
+  '^https://developer\.arm\.com/',
+  '^https://www\.agner\.org/',
+  '^https://github\.com/rust-works/succinctly/compare/v',
+  '^https://www\.cs\.cmu\.edu/',
+  '^https://doi\.org/',
+  '^https://no-color\.org/',
+  '^https://www\.reddit\.com/',
+  '^https://vigna\.di\.unimi\.it/',
+  # A PDF under drops.dagstuhl.de/storage/ answers slowly enough to time out
+  # from the runner on every retry (#3616); the host's landing pages are still
+  # checked. Drop this once the server recovers.
+  '^https://drops\.dagstuhl\.de/storage/',
+  # A link pinned to a commit SHA cannot rot, but GitHub's web tier serves those
+  # HTML pages with 503/504s for hours at a time (#3594), and a `commit/` page
+  # has no raw form to check instead.
+  '^https://github\.com/[^/]+/[^/]+/commit/[0-9a-f]{7,40}([/?#.]|$)',
+]
+
+# A pinned `blob/` link is checked at raw.githubusercontent.com instead (still a
+# 404 for a mistyped path, ref or repo).
+remap = [
+  '^https://github\.com/([^/]+)/([^/]+)/blob/([0-9a-f]{7,40}|v[0-9][^/]*)/ https://raw.githubusercontent.com/$1/$2/$3/',
+]
