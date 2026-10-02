@@ -3380,7 +3380,8 @@ fn test_yq_merge_keys_still_override_ordinary_and_genuine_empty_keys_3467() -> R
         (
             GENUINE_EMPTY,
             ".b.z = 1",
-            "a: &a\n  '': 1\nb:\n  '': 2\n  z: 1\n",
+            // The source quoted the empty key, so a write keeps it as `""` (#3601), as yq does.
+            "a: &a\n  \"\": 1\nb:\n  \"\": 2\n  z: 1\n",
         ),
     ];
     for &(yaml, filter, expected) in rows {
@@ -34624,7 +34625,8 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
         exit_code, 0,
         "single bad key should still succeed, stderr: {stderr}"
     );
-    assert_eq!(output.trim(), "'': 1\nc: 2");
+    // The key's own double quotes survive the write (#3601).
+    assert_eq!(output.trim(), "\"\": 1\n\"c\": 2");
 
     // An ordinary repeated key -- no decode failure on either side -- still
     // collapses to the last value, matching yq's normal duplicate handling;
@@ -35136,7 +35138,8 @@ fn test_streamed_key_decode_failure_still_preserved_1615() -> Result<()> {
         // so the very behaviour it claimed to pin went unexercised, confirmed
         // by that line reading zero hits in `cargo llvm-cov`.
         (&[][..], "\"\": 1\nb: 2"),
-        (&["--arg", "z", "y"][..], "'': 1\nb: 2"),
+        // The DOM route keeps the key's double quotes now (#3601), as the streaming route does.
+        (&["--arg", "z", "y"][..], "\"\": 1\nb: 2"),
         (&["-o", "json", "-I", "0"][..], r#"{"":1,"b":2}"#),
         (
             &["-o", "json", "-I", "0", "--arg", "z", "y"][..],

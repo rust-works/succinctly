@@ -566,7 +566,6 @@ Still open, each separate from this fix:
   (`None`) so the old text is unchanged.
 - **A key over 128 bytes** (also #3587). yq writes `? key` / `: value`; this route writes an ordinary key.
 - **A JSON object key `<<` on the DOM route** ([#3600](https://github.com/rust-works/succinctly/issues/3600)). yq keeps it in YAML output as the string key `"<<": 1`; a write, `del`, `sort_keys` or `-P` here drops the entry.
-- **A YAML key's quote style on the DOM route** ([#3601](https://github.com/rust-works/succinctly/issues/3601)). The DOM holds a key as its display text, so any write writes `"a": 1` as `a: 1`, and `"1": 3` as the integer key `1: 3`; yq keeps the key as written.
 
 The DOM route ([#3588](https://github.com/rust-works/succinctly/issues/3588)) is closed. `-P`, every write
 or reshaping filter (`del(.a)`, `.a = "1"`, `sort_keys(.)`, `with_entries(.)`, `style="flow"`) and a
@@ -589,6 +588,28 @@ A value the core schema types too (`true`, `1`, `null`) can only be a quoted or 
 and is quoted. A JSON key or value is always a string and takes the encoder's choice. The empty key
 of a YAML document keeps its old `''`. Pinned by the `json_string_style_dom_*_3588` and
 `json_string_style_flow_*_3588` goldens and the `yaml_typed_{keys,values}_dom_*_3588` ones.
+
+A YAML key's quote style on the DOM route ([#3601](https://github.com/rust-works/succinctly/issues/3601))
+is closed. The DOM held a key only as its display text, so any write turned `"a": 1` into `a: 1` and
+`"1": 3` into the integer key `1: 3`. A key the source quoted now records `single` or `double` in the
+`CommentTree`'s per-key map (`KeyMeta`, beside the key's trailing comment, so the tree is no wider), and
+`yaml_quote_key` writes it as it was written and knows it is a string. It survives a write elsewhere,
+`del`, `sort_keys` and a write to the key's own value, and is dropped with a closed-literal `=` that
+replaces the mapping. `-P` strips the quoting but keeps that the key is a string (`"1": 3` stays quoted,
+`"a": 1` becomes `a: 1`). Pinned by the `yaml_key_style_*_3601` goldens. What is still open, each
+separate from this:
+
+- **`-P` and a key or value that YAML 1.1 reads as a bool** (`"yes"`, `'on'`, `"y"`). yq keeps these
+  quoted under `-P` and this writer prints them bare; the same is true of a value (`a: "yes"`), so it is
+  not specific to keys.
+- **A filter that rebuilds the tree** (`with_entries`, `to_entries | from_entries`, `keys`, `*`, `+`)
+  carries no `CommentTree` at all, so every key *and value* on that route loses its quoting. yq keeps both,
+  because it keeps the node.
+- **`|=` with a constructed mapping** (`.m |= {"a": 7}`) matches pristine metadata by key, so the key
+  keeps its quoting where yq's fresh node has none. A value's quoting and comment are carried the same way
+  (`a: "x" # cm`), so this is the existing key-matching approximation (#870), not a new one.
+- **Two keys with the same text** (`y: 1` and `"y": 4`). The DOM is keyed by text, so they collapse to one
+  entry; yq keeps both.
 
 The fourth gap first listed here, a JSON surrogate-pair escape
 (`"\ud83d\ude00"`), used to fail with `invalid escape sequence` on every route and is closed: it is

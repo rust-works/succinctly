@@ -20,7 +20,7 @@ use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
     check_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
     to_owned_cursor as generic_to_owned_cursor, to_owned_with_comments, AnchorMark, CommentTree,
-    GenericResult, NodeMeta,
+    GenericResult, NodeMeta, KEY_STYLE_STRING,
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
@@ -2704,10 +2704,17 @@ fn reconcile_presentation_at_depth(
                 // (`emit_yaml_value`'s block-mapping arm) renders only the
                 // key and comment, silently dropping the write's value
                 // entirely (found in review).
-                if let CommentTree::Object(_, _, pristine_key_comments) = pristine_tree {
-                    if let Some((kc, _)) = pristine_key_comments.get(k).filter(|_| !fresh_write) {
-                        let value_absent = matches!(r_v, OwnedValue::Null);
-                        key_comments.insert(k.clone(), (kc.clone(), value_absent));
+                //
+                // #3601: how the key was quoted rides the same entry and
+                // survives the same way - `.zz = 1` leaves `"1": 3` alone -
+                // and is dropped on the same terms (`fresh_write`).
+                if let CommentTree::Object(_, _, pristine_keys) = pristine_tree {
+                    let carried = pristine_keys
+                        .get(k)
+                        .filter(|_| !fresh_write)
+                        .and_then(|meta| meta.carried_over(matches!(r_v, OwnedValue::Null), true));
+                    if let Some(meta) = carried {
+                        key_comments.insert(k.clone(), meta);
                     }
                 }
             }
@@ -4271,7 +4278,10 @@ fn strip_presentation_style_at_depth(tree: &CommentTree, depth: usize) -> Commen
                 .iter()
                 .map(|(k, v)| (k.clone(), strip_presentation_style_at_depth(v, depth + 1)))
                 .collect(),
-            key_comments.clone(),
+            key_comments
+                .iter()
+                .map(|(k, meta)| (k.clone(), meta.with_style_stripped()))
+                .collect(),
         ),
     }
 }
@@ -5125,7 +5135,12 @@ fn emit_yaml_value_at_depth(
                 let entries: Vec<_> = obj
                     .iter()
                     .map(|(k, v)| {
-                        let key = yaml_quote_key(k, true, config.json_sourced_floats);
+                        let key = yaml_quote_key(
+                            k,
+                            comments.key_style(k),
+                            true,
+                            config.json_sourced_floats,
+                        );
                         let field_comments = comments.field(k);
                         let val = emit_yaml_value_at_depth(
                             v,
@@ -5155,7 +5170,12 @@ fn emit_yaml_value_at_depth(
                 let items: Vec<(String, bool)> = entries
                     .iter()
                     .map(|(k, v)| {
-                        let key = yaml_quote_key(k, false, config.json_sourced_floats);
+                        let key = yaml_quote_key(
+                            k,
+                            comments.key_style(k),
+                            false,
+                            config.json_sourced_floats,
+                        );
                         let field_comments = comments.field(k);
                         let comment_suffix = trailing_comment_suffix(field_comments, indent);
                         // #1485: steps from `recursion_base`, not `indent`
@@ -5395,7 +5415,26 @@ fn yaml_quote_string_with_style(s: &str, style: &str, in_flow: bool, json_source
 /// record of whether it was a string, so in a YAML document one spelled like a number, a
 /// bool, a null or a timestamp (`200: ok`, `~: v`) is echoed as it is rather than quoted
 /// into a string key; `json_sourced` lifts that, since a JSON key is always a string.
-fn yaml_quote_key(s: &str, flow: bool, json_sourced: bool) -> String {
+///
+/// #3601: a key the source quoted carries that `style` and is written as it was, and is
+/// known to be a string - see [`CommentTree::key_style`].
+fn yaml_quote_key(s: &str, style: &str, flow: bool, json_sourced: bool) -> String {
+    // #3601: a key that was quoted in the source keeps its quoting, as a value does
+    // (`yaml_quote_string_with_style`) - and it is known to be a string, which the
+    // typed-key guard below cannot tell, so `"1": 3` stays a string key.
+    match style {
+        "single" if can_single_quote(s) => return yaml_single_quote_escaped(s),
+        "double" => return yaml_double_quote_escaped(s),
+        // `-P` stripped the quoting but not the fact that the key is a string, so it
+        // is written the way go-yaml writes any string: plain unless that would read
+        // back as another type.
+        KEY_STYLE_STRING => {
+            if let Some(scalar) = go_yaml_dom_scalar(s, flow, true, true) {
+                return scalar;
+            }
+        }
+        _ => {}
+    }
     if let Some(scalar) = go_yaml_dom_scalar(s, flow, json_sourced, true) {
         return scalar;
     }
@@ -10016,5 +10055,39 @@ mod tests {
             assert_eq!(of(&refused), None, "{refused:?}");
             assert!(!succinctly::jq::is_alias_sensitive_assign(&refused));
         }
+    }
+
+    /// #3601: a key the source quoted is written as it was, a key whose quoting
+    /// `-P` stripped is still a string, and every other key takes the old path.
+    #[test]
+    fn yaml_quote_key_honors_the_source_style_3601() {
+        // Quoted keys keep their quoting, including one that would otherwise read
+        // back as another type.
+        assert_eq!(yaml_quote_key("a", "double", false, false), "\"a\"");
+        assert_eq!(yaml_quote_key("1", "double", false, false), "\"1\"");
+        assert_eq!(yaml_quote_key("b c", "single", false, false), "'b c'");
+        assert_eq!(yaml_quote_key("it's", "single", true, false), "'it''s'");
+        // A single-quoted style cannot hold a control character, so it falls back.
+        assert_eq!(
+            yaml_quote_key("a\tb", "single", false, false),
+            yaml_quote_key("a\tb", "", false, false)
+        );
+        // `-P`: plain where plain reads back as a string, quoted where it would not,
+        // even for a YAML key (a plain `1` there is an integer).
+        assert_eq!(yaml_quote_key("a", KEY_STYLE_STRING, false, false), "a");
+        assert_eq!(yaml_quote_key("1", KEY_STYLE_STRING, false, false), "\"1\"");
+        assert_eq!(
+            yaml_quote_key("true", KEY_STYLE_STRING, true, false),
+            "\"true\""
+        );
+        // The `-P` string key that the encoder declines (a line break) falls through
+        // to the heuristic, as an unstyled key does.
+        assert_eq!(
+            yaml_quote_key("a\nb", KEY_STYLE_STRING, false, false),
+            yaml_quote_key("a\nb", "", false, false)
+        );
+        // No style: a YAML key spelled like a number is a typed key and stays bare.
+        assert_eq!(yaml_quote_key("1", "", false, false), "1");
+        assert_eq!(yaml_quote_key("1", "", false, true), "\"1\"");
     }
 }
