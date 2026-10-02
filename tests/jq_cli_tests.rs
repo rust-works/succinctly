@@ -28420,6 +28420,59 @@ fn test_data_import_failures_are_reported_around_a_missing_module_3327() -> Resu
     Ok(())
 }
 
+/// #3327 scope guard: a stop that is not a missing module keeps the single
+/// report it had. jq goes on past a module's own syntax error and counts it
+/// (`include "synerr"; import "bad" as $d; $d` prints the data error, then the
+/// syntax error, `2 compile errors`), and its module cycle is #2865's
+/// divergence, so a data import declared after either is not reported yet --
+/// recorded in `limitations.md`, pinned here so it changes on purpose.
+#[test]
+fn test_data_import_failure_after_a_syntax_error_or_cycle_is_not_reported_yet_3327() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("bad.json"), "not json")?;
+    std::fs::write(temp_dir.path().join("synerr.jq"), "def f: 1 +;\n")?;
+    std::fs::write(
+        temp_dir.path().join("cyc1.jq"),
+        "include \"cyc2\"; def a: 1;\n",
+    )?;
+    std::fs::write(
+        temp_dir.path().join("cyc2.jq"),
+        "include \"cyc1\"; def b: 1;\n",
+    )?;
+
+    for (filter, reported) in [
+        (r#"include "synerr"; import "bad" as $d; $d"#, "synerr.jq"),
+        (
+            r#"include "cyc1"; import "bad" as $d; $d"#,
+            "module cycle detected: cyc1 -> cyc2 -> cyc1",
+        ),
+    ] {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command
+                    .args(["jq", "-L"])
+                    .arg(temp_dir.path())
+                    .args(["-nc", filter]);
+                command
+            },
+            None,
+        )?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(code, 3, "{filter}: stderr {stderr:?}");
+        assert!(stderr.contains(reported), "{filter}: stderr {stderr:?}");
+        assert!(
+            !stderr.contains("error loading data file"),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert!(
+            stderr.ends_with("jq: 1 compile error\n"),
+            "{filter}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2857 guard: the error-selection refactor must not change what happens when
 /// *every* directive resolves -- `process_program`'s wrapping order (last
 /// include innermost, then `~/.jq`, then imports) is load-order-sensitive and

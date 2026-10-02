@@ -9142,7 +9142,7 @@ parse as JSON. jq's own message comes from its C parser (`Invalid numeric litera
 line 1, column 4`); succinctly's is its own JSON reader's wording, the same fidelity limit
 already recorded above for a module body's own parse failures.
 
-Every data import's read/parse failure is reported, and in jq's order
+Every top-level data import's read/parse failure is reported, and in jq's order
 ([#3327](https://github.com/rust-works/succinctly/issues/3327)). jq walks the directives
 last-declared first: a data-file failure is printed and the walk goes on (and counts), while
 a missing module stops it. So a data import declared *before* the stopping directive is never
@@ -9152,7 +9152,9 @@ one declared after it is reported ahead of it under the module's own `1 compile 
 every failure (`2 compile errors`). A module's own *syntax error* is not handled this way yet:
 jq goes on past it and counts it (`include "synerr"; import "bad" as $d; $d` is
 `2 compile errors`, data error first), where succinctly still reports the syntax error alone.
-A module cycle keeps #2865's divergence.
+A module cycle keeps #2865's divergence. A data import declared after either is not
+reported in those two cases (the output is what it was before #3327), and a *module's own*
+data imports are still reported one at a time, the first failure only.
 
 **A module body seeing names it should not** — `~/.jq`'s defs, and sibling `include`d and
 `import`ed modules' defs in a declaration-order-dependent way — **is closed**

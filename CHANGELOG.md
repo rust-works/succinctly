@@ -423,13 +423,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **jq: a data import's read/parse failure is no longer dropped behind a missing module,
-  and every one is reported** (#3327). `include "missing"; import "bad" as $d; $d` printed
+  and every top-level one is reported** (#3327). `include "missing"; import "bad" as $d; $d` printed
   only `module not found: missing`, where jq prints the data-file error first, and two bad
   data imports printed one error and `1 compile error` where jq prints both and
   `2 compile errors`. jq walks the directives last-declared first, printing a data-file
   failure and going on but stopping at a missing module, so a data import declared before
   the missing module is still never read. A module's own syntax error, which jq also goes on
-  past, still reports alone.
+  past, and a module's own data imports still report as before.
 
 - **jq: a `?//` in a compound assignment's right-hand side no longer raises the first
   alternative's error after its retry succeeded** (#3417). With

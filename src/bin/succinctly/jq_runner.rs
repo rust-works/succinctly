@@ -279,7 +279,8 @@ pub(crate) enum ModuleLoadError {
     /// `Self::Parse`'s own by-path naming.
     DataFiles {
         failures: Vec<DataFileFailure>,
-        stopped_by: Option<Box<Self>>,
+        /// The module path of the `module not found` that stopped the walk.
+        stopped_by: Option<String>,
     },
 }
 
@@ -374,17 +375,21 @@ impl From<anyhow::Error> for ModuleLoadError {
     }
 }
 
+/// jq's report for a module it cannot find: the message, a blank line standing
+/// in for the missing source echo, then the trailer.
+fn report_module_not_found(module_path: &str) {
+    eprintln!("jq: error: module not found: {module_path}");
+    eprintln!();
+    eprintln!("jq: 1 compile error");
+}
+
 /// Print a [`ModuleLoadError`] the way `run_jq`'s two call sites both need
 /// to (#2703): one shared place so the not-found case's jq-matching shape
 /// can't drift between them the way the two `eprintln!("jq: module error:
 /// {e}")` sites used to have to be kept in step by hand.
 fn report_module_load_error(e: &ModuleLoadError) {
     match e {
-        ModuleLoadError::NotFound { module_path } => {
-            eprintln!("jq: error: module not found: {module_path}");
-            eprintln!();
-            eprintln!("jq: 1 compile error");
-        }
+        ModuleLoadError::NotFound { module_path } => report_module_not_found(module_path),
         ModuleLoadError::Cycle { chain } => {
             eprintln!("jq: error: module cycle detected: {}", chain.join(" -> "));
             eprintln!();
@@ -418,9 +423,9 @@ fn report_module_load_error(e: &ModuleLoadError) {
                 eprintln!();
             }
             match stopped_by {
-                // The module's own report carries the trailer: jq counts the
-                // one that stopped it, not the data failures before it.
-                Some(stop) => report_module_load_error(stop),
+                // The module's own trailer: jq counts the one that stopped
+                // it, not the data failures before it.
+                Some(module_path) => report_module_not_found(module_path),
                 None => eprintln!(
                     "jq: {} compile error{}",
                     failures.len(),
@@ -670,16 +675,16 @@ fn stopped_directive_failure(
     (stopped_at, stop): (usize, ModuleLoadError),
     mut data_failures: Vec<(usize, DataFileFailure)>,
 ) -> ModuleLoadError {
-    if !matches!(stop, ModuleLoadError::NotFound { .. }) {
+    let ModuleLoadError::NotFound { module_path } = stop else {
         return stop;
-    }
+    };
     data_failures.retain(|(index, _)| *index > stopped_at);
     if data_failures.is_empty() {
-        return stop;
+        return ModuleLoadError::NotFound { module_path };
     }
     ModuleLoadError::DataFiles {
         failures: last_declared_first(data_failures),
-        stopped_by: Some(Box::new(stop)),
+        stopped_by: Some(module_path),
     }
 }
 
