@@ -1443,7 +1443,7 @@ pub fn resolve_all(expr: &mut Expr) -> Vec<ResolveError> {
 /// jq's compiler hides every error beneath a compile unit that has one of its
 /// own -- `def t: topmissing; t, bodymissing` is `1 compile error` (only
 /// `bodymissing`), not two -- where [`resolve_all`] reports every error in the
-/// tree. The rule is in [`Blocks`]. jq mode only: yq has no such rule to
+/// tree. The rule is documented on the private `Blocks`. jq mode only: yq has no such rule to
 /// match, and `resolve_func_calls_all` (which yq mode filters) keeps the
 /// full list.
 pub fn resolve_all_jq(expr: &mut Expr) -> Vec<ResolveError> {
@@ -1567,11 +1567,11 @@ impl CheckCtx {
     /// The diagnostics real jq reports: those of every block with no
     /// ancestor block that raised one of its own (#3391).
     fn into_jq_reported(self) -> Vec<ResolveError> {
-        let mut has_error = vec![false; self.blocks.parents.len() + 1];
+        let mut has_error = alloc::vec![false; self.blocks.parents.len() + 1];
         for &block in &self.error_blocks {
             has_error[block] = true;
         }
-        let mut hidden = vec![false; has_error.len()];
+        let mut hidden = alloc::vec![false; has_error.len()];
         for (child, &parent) in self.blocks.parents.iter().enumerate() {
             hidden[child + 1] = hidden[parent] || has_error[parent];
         }
@@ -4129,6 +4129,7 @@ mod tests {
             assert_eq!(resolve_func_calls_all(&mut expr), Vec::new());
         }
     }
+
     /// #3391: which diagnostics real jq reports -- an error in a compile unit
     /// hides every error in the units beneath it ([`Blocks`]). Every
     /// expectation below was captured from the pinned oracle (`/usr/bin/jq`,

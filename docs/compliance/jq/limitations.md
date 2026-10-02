@@ -9122,11 +9122,15 @@ inline. Pinned in the `jq_reported` tests of `resolve.rs` (including the whole-r
 `succinctly yq` is unchanged: it keeps the first error from the full list
 (`resolve_func_calls_all`), and yq has no such rule to match.
 
-**Still open: the *order* of errors among closures.** The surviving errors keep source order.
-jq reports a block's children in the order of its compiled instructions, which differs from
-source order for a few constructs: `a op= b` visits `b` before `a`, and `reduce`/`foreach`
-visit `init` before the source. The set and count of errors now match jq on all of them; only
-the order within one block differs, and it did before this change too.
+**Still open: the *order* of errors among closures** ([#3583](https://github.com/rust-works/succinctly/issues/3583)).
+The surviving errors keep source order. A block's own errors come out in source order in jq
+too, but it reports the closures it owns in the order of its compiled instructions, which
+differs from source order for some constructs: `a op= b` visits `b` before `a`, `reduce`/`foreach`
+visit `init` before the source, and the operands of a binary operator (`+`, `==`, ...) or of a
+C-implemented builtin with several arguments (`pow`, `setpath`, ...) come out right to left
+when they hold closures (`map(ua) + map(ub)` is `ub`, `ua`). The set and count of errors now
+match jq on all of them; only the order of the closures differs, and it did before this change
+too.
 
 The stubs point *into* the linked run, not the other way round, because that run is wrapped
 outermost and so is visible from every stub whatever order the directives are declared in.
