@@ -45,6 +45,7 @@ use super::document::{
     DocumentElements, DocumentFields,
 };
 use super::glob::yq_match_key;
+use super::local_zone::{self, LocalZone};
 use super::math;
 use super::slice::{self, SliceBounds};
 use super::walk::{any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs};
@@ -60110,42 +60111,12 @@ fn builtin_localtime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(r) => return r,
         };
 
-        // Get local timezone offset using chrono if available, otherwise fall back to gmtime
-        // For now, we'll compute it manually using the libc-style approach
-        // This is a simplified implementation that uses a heuristic for timezone offset
-
-        // Get the current local time offset by comparing system time with UTC
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now_utc = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-
-        // We need to compute the local offset. A simple approach is to use environment TZ,
-        // but that's complex. For simplicity, we'll compute gmtime and apply a local offset.
-        // This implementation uses the system's local time approximation.
-
-        // For a proper implementation, we'd need platform-specific code or a crate like chrono.
-        // For now, we'll approximate by using a simple offset calculation.
-
-        // Actually, let's just use gmtime logic with an offset.
-        // Try to get the timezone offset from the system.
-
-        // Simplified: compute based on the offset from UTC
-        // In practice, this should use libc::localtime_r or similar
-        // For now, we'll attempt to detect offset using the current time
-
-        // Get offset: (local_now - utc_now) rounded to nearest minute
-        // This is a hack - proper implementation needs platform time APIs
-
-        // Fallback: Use UTC for now (same as gmtime)
-        // A proper implementation would use platform-specific APIs or chrono crate
+        // The zone in effect *at the timestamp* (so DST follows the date), from
+        // the one module that knows where the local zone comes from (#3054).
         let secs = timestamp.trunc() as i64;
-
-        // Try to estimate local offset by looking at current system time
-        // This gives us the offset at the current moment (may differ from timestamp's offset due to DST)
-        let local_offset = estimate_local_offset(now_utc);
+        let offset_secs = local_zone::offset_at(secs);
         let local_secs = match ok_or_result::<W, _>(
-            secs.checked_add(local_offset)
+            secs.checked_add(offset_secs)
                 .ok_or_else(EvalError::datetime_out_of_range),
             optional,
         ) {
@@ -60160,11 +60131,11 @@ fn builtin_localtime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // `timestamp`, not `local_secs`: the fraction added back is the
         // input's own fractional part, unaffected by the whole-second
-        // `local_offset` shift already folded into `local_secs` above --
+        // `offset_secs` shift already folded into `local_secs` above --
         // mirrors gmtime's identical `timestamp`-not-`t.second`-alone use
-        // (#3071). Relies on `local_offset` always being a whole number of
-        // seconds (true today -- `parse_simple_tz_offset` only ever parses
-        // one); a sub-second offset would need this re-derived.
+        // (#3071). Relies on `offset_secs` always being a whole number of
+        // seconds (true of every backend -- an offset is a `i64` count of
+        // seconds); a sub-second offset would need this re-derived.
         let result = vec![
             OwnedValue::Int(t.year),
             OwnedValue::Int(t.month - 1),
@@ -60183,62 +60154,6 @@ fn builtin_localtime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // In no_std, fall back to gmtime (UTC)
         builtin_gmtime::<W, S>(value, optional)
     }
-}
-
-/// Estimate local timezone offset in seconds from UTC
-#[cfg(feature = "std")]
-fn estimate_local_offset(utc_secs: i64) -> i64 {
-    // This is a simplified estimation that works for most common cases
-    // A proper implementation would use platform-specific APIs
-
-    // Try to get TZ from environment
-    if let Ok(tz) = std::env::var("TZ") {
-        // Parse simple TZ formats like "EST5EDT" or "PST8PDT"
-        // Format: STDoffset[DST[offset][,rule]]
-        if let Some(offset) = parse_simple_tz_offset(&tz) {
-            return offset;
-        }
-    }
-
-    // Fallback: try to detect from system
-    // On many systems, we can compute the offset by comparing local and UTC representations
-    // For a portable solution without external crates, we'll return 0 (UTC)
-    // Users needing accurate local time should ensure TZ is set correctly
-    let _ = utc_secs; // silence unused warning
-    0
-}
-
-/// Parse a simple TZ offset like "EST5" or "PST8" and return offset in seconds
-#[cfg(feature = "std")]
-fn parse_simple_tz_offset(tz: &str) -> Option<i64> {
-    // Skip the timezone name (letters)
-    let offset_start = tz.find(|c: char| c.is_ascii_digit() || c == '-' || c == '+')?;
-    let offset_part = &tz[offset_start..];
-
-    // Find where the offset ends (at DST name or end of string)
-    let offset_end = offset_part
-        .find(|c: char| c.is_ascii_alphabetic())
-        .unwrap_or(offset_part.len());
-    let offset_str = &offset_part[..offset_end];
-
-    // Parse the offset (hours, optionally minutes)
-    let negative = offset_str.starts_with('-');
-    let offset_str = offset_str.trim_start_matches(['+', '-']);
-
-    let parts: Vec<&str> = offset_str.split(':').collect();
-    let hours: i64 = parts.first()?.parse().ok()?;
-    let minutes: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-
-    // TZ offset is positive for west of UTC, but we want seconds to add.
-    // `hours`/`minutes` are parsed straight out of the `TZ` env var with no
-    // bound (#894) — checked throughout so a malformed/adversarial `TZ`
-    // falls back to the existing `None` -> UTC path instead of panicking.
-    let hour_secs = hours.checked_mul(3600)?;
-    let minute_secs = minutes.checked_mul(60)?;
-    let offset_secs = hour_secs
-        .checked_add(minute_secs)?
-        .checked_mul(if negative { 1 } else { -1 })?;
-    Some(offset_secs)
 }
 
 /// jq stores broken-down-time array elements in C `struct tm` integer fields.
@@ -60501,7 +60416,7 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    strftime_in_zone::<W, S>(fmt_expr, value, optional, None)
+    strftime_in_zone::<W, S>(fmt_expr, value, optional, false)
 }
 
 /// Builtin: `strflocaltime(fmt)` (#3046) -- `strftime` in the local zone.
@@ -60511,10 +60426,9 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// the local zone describing it. `%z`/`%Z` name the local zone (jq 1.7.1:
 /// `TZ=EST5EDT`, `0 | strflocaltime("%z %Z %H")` is `"-0500 EST 19"`).
 ///
-/// The local zone is the one `localtime` already uses, so the two cannot
-/// disagree: a POSIX `TZ` offset string, otherwise UTC. An IANA zone name
-/// (`TZ=Asia/Tokyo`) is not resolved by either, a pre-existing gap recorded
-/// in `limitations.md`.
+/// The local zone is the one `localtime` uses -- both ask `local_zone` for it
+/// -- so the two cannot disagree; where it comes from is that module's
+/// business (#3054).
 ///
 /// A non-string format raises, where jq 1.7.1 aborts on an assertion (`0 |
 /// strflocaltime(1)`, exit 134) -- ADR-0018's "would take the host process
@@ -60524,48 +60438,13 @@ fn builtin_strflocaltime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    strftime_in_zone::<W, S>(fmt_expr, value, optional, Some(local_zone()))
-}
-
-/// The zone `localtime` converts into: its UTC offset in seconds and the
-/// abbreviation `%Z` prints (#3046).
-struct LocalZone {
-    offset_secs: i64,
-    name: String,
-}
-
-/// The local zone, as `localtime` determines it: a POSIX `TZ` string's
-/// offset and standard-time abbreviation (`EST5EDT` is `-18000`, `EST`), or
-/// UTC when `TZ` is unset or not in that form.
-fn local_zone() -> LocalZone {
-    #[cfg(feature = "std")]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-        if let Ok(tz) = std::env::var("TZ") {
-            if parse_simple_tz_offset(&tz).is_some() {
-                let name: String = tz.chars().take_while(char::is_ascii_alphabetic).collect();
-                if !name.is_empty() {
-                    return LocalZone {
-                        offset_secs: estimate_local_offset(now),
-                        name,
-                    };
-                }
-            }
-        }
-    }
-    LocalZone {
-        offset_secs: 0,
-        name: String::from("UTC"),
-    }
+    strftime_in_zone::<W, S>(fmt_expr, value, optional, true)
 }
 
 /// Parse a value into broken-down-time fields (`year, month, day, hour,
 /// minute, second, weekday, yearday`), accepting either a raw Unix
 /// timestamp number (auto-converted the same way `gmtime`/`localtime`
-/// convert one, shifted into `zone` when given) or an 8-element
+/// convert one, shifted into the local zone when `local`) or an 8-element
 /// broken-down-time array -- the two input shapes `strftime` itself
 /// accepts. Shared by `strftime_in_zone` and `builtin_todate` (#3068):
 /// `todate`/`todateiso8601` are literally `strftime(fixed fmt)` in jq, so
@@ -60576,16 +60455,20 @@ fn local_zone() -> LocalZone {
 ///
 /// Returns the same [`BrokenDownTime`] `broken_down_time_from_unix_secs`
 /// itself returns (by field name, not position, so a future reorder of one
-/// can't silently mismatch the other), or the `QueryResult` an early exit
+/// can't silently mismatch the other) with the [`LocalZone`] that labels it
+/// when `local` (`None` otherwise, and `None` for a broken-down array unless
+/// `labelled`: resolving the zone of a wall-clock reading is only worth doing
+/// for a format that prints `%z`, `%Z` or `%s`), or the `QueryResult` an early exit
 /// (`None`/`Error`) should return -- each caller's own `match .. { Ok(t) =>
 /// .., Err(r) => return r }` reads as a single step rather than the large
 /// inline match this replaced.
 fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     optional: bool,
-    zone: &Option<LocalZone>,
+    local: bool,
+    labelled: bool,
     name: &str,
-) -> Result<BrokenDownTime, QueryResult<'a, W>> {
+) -> Result<(BrokenDownTime, Option<LocalZone>), QueryResult<'a, W>> {
     match value {
         StandardJson::Number(n) => {
             // Extracted directly rather than via `get_float_value_with`:
@@ -60608,17 +60491,21 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Auto-converted the same way `gmtime` converts a raw
-            // number -- or `localtime`, shifted into `zone`.
+            // number -- or `localtime`, shifted into the zone in effect at
+            // that instant.
             let secs = timestamp.trunc() as i64;
-            let secs = match zone {
+            let zone = local.then(|| local_zone::at_instant(secs));
+            let shifted = match &zone {
                 None => Some(secs),
                 Some(zone) => secs.checked_add(zone.offset_secs),
             };
-            ok_or_result::<W, _>(
-                secs.ok_or_else(EvalError::datetime_out_of_range)
+            let t = ok_or_result::<W, _>(
+                shifted
+                    .ok_or_else(EvalError::datetime_out_of_range)
                     .and_then(broken_down_time_from_unix_secs),
                 optional,
-            )
+            )?;
+            Ok((t, zone))
         }
         // #1820: `scalar_decode_failure` first, same shape as
         // `builtin_mktime`'s own fix above -- and for the same
@@ -60664,7 +60551,7 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
                     let month = jq_month_index(get_int(1));
 
-                    Ok(BrokenDownTime {
+                    let t = BrokenDownTime {
                         year: jq_tm_year(get_int(0)),
                         month,
                         day: jq_tm_field(get_int(2)),
@@ -60673,7 +60560,22 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         second: jq_tm_field(get_int(5)),
                         weekday: jq_tm_field(get_int(6)),
                         yearday: jq_tm_field(get_int(7)),
-                    })
+                    };
+                    // The fields already are local wall-clock time; the zone
+                    // only labels them (`%z`, `%Z`, `%s`). `jq_month_for_time`:
+                    // the month as the C time conversion sees it, not the
+                    // wrapped formatter value.
+                    let zone = (local && labelled).then(|| {
+                        local_zone::for_wall_clock(
+                            t.year,
+                            jq_month_for_time(t.month),
+                            t.day,
+                            t.hour,
+                            t.minute,
+                            t.second,
+                        )
+                    });
+                    Ok((t, zone))
                 }
                 _ if optional => Err(QueryResult::None), // omni-dev: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the array-length check above (#3068)"
                 _ => Err(QueryResult::Error(
@@ -60684,18 +60586,15 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// `strftime`'s body, in UTC (`zone: None`) or in `zone` (`strflocaltime`).
+/// `strftime`'s body, in UTC (`local: false`) or in the local zone
+/// (`strflocaltime`).
 fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     fmt_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
-    zone: Option<LocalZone>,
+    local: bool,
 ) -> QueryResult<'a, W> {
-    let name = if zone.is_some() {
-        "strflocaltime"
-    } else {
-        "strftime"
-    };
+    let name = if local { "strflocaltime" } else { "strftime" };
     fanout_arg::<W, S, _>(
         fmt_expr,
         value.clone(),
@@ -60714,10 +60613,14 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             };
 
-            let t = match broken_down_time_fields::<W, S>(&value, optional, &zone, name) {
-                Ok(t) => t,
-                Err(r) => return r,
-            };
+            // Only these specifiers read the zone's labels; `E`/`O` modifiers
+            // precede one of them, so the letters alone decide.
+            let labelled = fmt.bytes().any(|b| matches!(b, b'z' | b'Z' | b's'));
+            let (t, zone) =
+                match broken_down_time_fields::<W, S>(&value, optional, local, labelled, name) {
+                    Ok(tz) => tz,
+                    Err(r) => return r,
+                };
 
             let (zone_offset, zone_name) = match &zone {
                 None => (0, "UTC"),
@@ -61463,8 +61366,8 @@ fn builtin_todate<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // numeric-timestamp arm reads a document number through
     // `json_number_f64::<S>` (#2936), same as every other cursor-level
     // reader in this family.
-    let t = match broken_down_time_fields::<W, S>(&value, optional, &None, "strftime") {
-        Ok(t) => t,
+    let t = match broken_down_time_fields::<W, S>(&value, optional, false, false, "strftime") {
+        Ok((t, _)) => t,
         Err(r) => return r,
     };
 
@@ -96707,32 +96610,6 @@ mod tests {
             error.message,
             "mktime/strftime: broken-down time value out of representable range"
         );
-    }
-
-    // `#[cfg(feature = "std")]`: `parse_simple_tz_offset` itself is
-    // `std`-only (it exists solely to parse `std::env::var("TZ")`), so
-    // this test cannot compile under `no_std` at all.
-    #[test]
-    #[cfg(feature = "std")]
-    fn test_parse_simple_tz_offset_errors_gracefully_on_overflow_894() {
-        // #894: `hours * 3600`/`minutes * 60`/the final sign multiply were
-        // unchecked, panicking on a malformed/adversarial `TZ` env var
-        // (reachable independently of the timestamp being converted, since
-        // `TZ` parsing happens before any timestamp arithmetic runs). Tested
-        // directly against the private helper rather than through the `TZ`
-        // env var + `localtime` builtin, since mutating process-global env
-        // vars in a parallel test binary is inherently racy.
-        assert_eq!(parse_simple_tz_offset("EST9999999999999999"), None); // hours overflow
-        assert_eq!(parse_simple_tz_offset("EST-9999999999999999"), None); // hours overflow, negative
-        assert_eq!(
-            parse_simple_tz_offset("EST1:999999999999999999"),
-            None // minutes overflow (hours alone is in range)
-        );
-
-        // Normal input still resolves correctly (positive TZ = west of UTC
-        // = negative offset applied, per this function's own doc comment).
-        assert_eq!(parse_simple_tz_offset("EST5EDT"), Some(-5 * 3600));
-        assert_eq!(parse_simple_tz_offset("EST-5EDT"), Some(5 * 3600));
     }
 
     #[test]
