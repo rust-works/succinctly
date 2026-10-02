@@ -48274,7 +48274,21 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                 // to the callers. Before #3207 this carve-out turned yq's
                 // `null | del(null)` into the root path, i.e. yq's
                 // bare-`del(.)` rule (#1702), which prints nothing.
-                if S::TAG == EvalTag::Jq && null_bool_identical(&branch.value, input) {
+                //
+                // #3579: the carve-out is the register *at the root*, so it
+                // holds only while nothing before the terminal navigated
+                // (`branch.path` is empty). After `.a` jq's register sits at
+                // `["a"]`, and on a `null` document `.a` is `null` too, so
+                // equal-by-value says nothing about *which* node: `(.a as $x |
+                // .a | 5 | first(7) | $x) = 9` on `null` wrote `9` over the
+                // root where jq writes `{"a":9}`. Once the pipe has
+                // navigated, this resolver cannot say where the register is
+                // (a stage between may have dropped it), so it refuses, as it
+                // already does on `{"a":null}`.
+                if S::TAG == EvalTag::Jq
+                    && branch.path.depth() == 0
+                    && null_bool_identical(&branch.value, input)
+                {
                     // emission: mirror the navigation family's identical
                     // seed (#2691) -- the identical literal carried through
                     // the *root* (empty) path answers `[]` in real jq 1.7.1.
@@ -48295,7 +48309,25 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                         true,
                     ));
                 }
-                violation = Some(refusal());
+                // #3579: declining the carve-out above after a navigation is
+                // this resolver's guess, not jq's verdict. Navigating a `null`
+                // (or `true`/`false`) document only ever reaches an equal
+                // `null` (or an error), so jq holds the register at a node
+                // *identical* to this terminal and answers. Caught, the guess
+                // silently lost the write jq makes, so it is uncatchable, as
+                // every other guessed refusal is (#3267, ADR-0018 rule 4).
+                let guessed = S::TAG == EvalTag::Jq
+                    && branch.path.depth() > 0
+                    && null_bool_identical(&branch.value, input);
+                violation = Some(if !guessed {
+                    refusal()
+                } else if near_iterate {
+                    EvalError::invalid_path_expression_near_iterate(&branch.value)
+                        .into_guessed_path_refusal()
+                        .into()
+                } else {
+                    EvalError::invalid_path_expression_guessed(&branch.value).into()
+                });
                 refused_at = Some(terminal_retry::current());
                 return Demand::Stop;
             }

@@ -1108,6 +1108,22 @@ impl EvalError {
 
     const INVALID_PATH_EXPRESSION_PREFIX: &'static str = "Invalid path expression with result ";
 
+    /// [`Self::invalid_path_expression`], raised as the path resolver's
+    /// *guess* (#3579, #3267): the same message, so the user still reads jq's
+    /// own wording, but [`ErrorKind::GuessedPathRefusal`], which no `?`,
+    /// `try` or `catch` suppresses, in path or value position.
+    ///
+    /// [`Self::into_guessed_path_refusal`] cannot do this for the terminal
+    /// "with result" refusal: it reclassifies only the "near attempt to ..."
+    /// family ([`Self::is_untracked_navigation_error`]) and returns anything
+    /// else unchanged.
+    pub(crate) fn invalid_path_expression_guessed(value: &OwnedValue) -> Self {
+        Self::with_kind(
+            Self::invalid_path_expression(value).message,
+            ErrorKind::GuessedPathRefusal,
+        )
+    }
+
     /// This [`Self::is_untracked_navigation_error`] refusal, reclassified as
     /// the path resolver's *guess* (#3267): same message, so the user still
     /// reads jq's own wording, but [`ErrorKind::GuessedPathRefusal`], which
@@ -2204,6 +2220,36 @@ mod tests {
             user.message
         );
         assert!(!user.into_guessed_path_refusal().is_uncatchable());
+    }
+
+    /// #3579: the terminal "with result" refusal raised as a guess keeps jq's
+    /// wording and is uncatchable at both predicates. The reclassifier above
+    /// cannot do this one -- it converts only the "near attempt to ..." family
+    /// -- and a caught guess is a write jq makes, silently dropped.
+    #[test]
+    fn guessed_terminal_refusal_is_uncatchable_and_keeps_its_wording_3579() {
+        let genuine = EvalError::invalid_path_expression(&OwnedValue::Null);
+        assert!(genuine.is_invalid_path_expression());
+        assert!(!genuine.is_guessed_path_refusal());
+        assert!(
+            !genuine.is_uncatchable_at_value_position(),
+            "jq's own terminal refusal is an ordinary error at value position"
+        );
+        // The reclassifier leaves it alone, which is why the constructor exists.
+        assert!(!genuine
+            .clone()
+            .into_guessed_path_refusal()
+            .is_guessed_path_refusal());
+
+        let guessed = EvalError::invalid_path_expression_guessed(&OwnedValue::Null);
+        assert!(guessed.is_guessed_path_refusal());
+        assert!(guessed.is_uncatchable());
+        assert!(guessed.is_uncatchable_at_value_position());
+        assert_eq!(
+            guessed.message, genuine.message,
+            "jq's own wording survives"
+        );
+        assert_eq!(guessed.message, "Invalid path expression with result null");
     }
 
     /// #2132: a resource-limit raise is uncatchable at both predicates, and
