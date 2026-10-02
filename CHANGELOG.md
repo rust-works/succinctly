@@ -477,6 +477,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexer error), which is tracked in #3551. Bare `nth(n)` is the same gap and is
   fixed in the entry below (#3550).
 
+- **jq: `paths(filter)` on a document runs the `?//` retry a stopping consumer causes** (#3567).
+  Under `first`, `limit` or `label`/`break`, `paths(f)` over input read from a document collected
+  every path before the consumer could stop it, so it ran `f` at a node jq never reaches and the
+  retry's error, which jq raises on the stop, was dropped: `first(paths(.[K]))` with a `?//` key
+  printed `["a"]` and exited 0 where jq raises. It now streams like `path(f)`. Literal input
+  (`-n`) was already right. This removes the last divergence recorded under #3366.
+
 - **jq: `paths(filter)`'s root pre-check retries a `?//` like every other site** (#3366). The
   pre-check evaluated the filter eagerly, which never asked a `?//` inside it for its next
   alternative, so `[paths(if ([1] as $q ?// $b | $q) then error("E") else true end)]` raised

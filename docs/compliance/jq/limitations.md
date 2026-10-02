@@ -663,12 +663,6 @@ follows too. What it leaves:
   `[first(path(foreach 1 as $x (.; .[K]))), 9]` with a key whose retry raises after a satisfied
   first alternative is `[["a"],9]` after a single attempt here and an error in jq. Not a stale
   slot: no retry happens at all.
-- **`paths(f)` does not run the `?//` retry a stopping consumer causes inside `f`** (#3567):
-  under `first(paths(.[K]))` or `limit(1; paths(.[K]))` jq asks the `?//` in the key for its next
-  alternative on the stop and the retry can raise, where this answers `["a"]` with no error.
-  Without a stopping consumer the two agree, and so does the root pre-check, which drains `f`
-  through the streaming evaluator (#3366): `[paths(if ([1] as $q ?// $b | $q) then error("E")
-  else true end)]` is `[["a"],["a","a"]]` here too.
 - **`getpath(K)` in path mode evaluates `K` once, with no retry** (the #3487 "arguments
   evaluated eagerly" family, not the index sink): `path(getpath(([["a"]] as [$q] ?// [[$q]] |
   [$q])))` on `{"a":{"a":1}}` is `["a"]` in jq after two attempts and "Cannot index object with

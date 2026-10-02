@@ -69099,6 +69099,62 @@ fn test_paths_filter_root_probe_retries_an_alternative_3366() -> Result<()> {
 }
 
 // ============================================================================
+// #3567: `paths(filter)` under a stopping consumer runs the `?//` retry
+// ============================================================================
+
+/// `paths(f)` on a *document* went through the generic evaluator's eager bridge,
+/// which collected every path before a `first`/`limit` could stop it. That ran
+/// `f` at a node jq never reaches (the extra `A` marker below) and left the
+/// retry's error, computed after the stop, as a trailing escape the consumer
+/// dropped. It now streams like `path(f)` does, so the stop reaches a `?//`
+/// inside `f`. `K` marks its first alternative `A` and its retry `B` on
+/// stderr, which is how the extra visit shows. The stdout, exit code, the
+/// marker sequence and the message were captured from `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_paths_filter_stop_reaches_a_retry_in_the_filter_3567() -> Result<()> {
+    for (input, filter, stdout_expected, code_expected, markers, message) in [
+        ("{\"a\":{\"a\":1}}", "first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))", "[\"a\"]", 5, "AAB", "E2"),
+        ("{\"a\":{\"a\":1}}", "[limit(1;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))]", "", 5, "AAB", "E2"),
+        ("{\"a\":{\"a\":1}}", "[first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))]", "", 5, "AAB", "E2"),
+        ("{\"a\":{\"a\":1}}", "try first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)])) catch \"caught\"", "[\"a\"]\n\"caught\"", 0, "AAB", ""),
+        ("{\"a\":{\"a\":1}}", "[paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)])]", "", 5, "AAAB", "E2"),
+        ("{\"a\":{\"a\":1}}", "[limit(2;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else error(\"E2\") end)]))]", "", 5, "AAAB", "E2"),
+        ("{\"a\":{\"a\":1}}", "first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))", "[\"a\"]", 5, "AAB", "Cannot index object with array"),
+        ("{\"a\":{\"a\":1}}", "[limit(1;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))]", "", 5, "AAB", "Cannot index object with array"),
+        ("{\"a\":{\"a\":1}}", "[first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))]", "", 5, "AAB", "Cannot index object with array"),
+        ("{\"a\":{\"a\":1}}", "try first(paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)])) catch \"caught\"", "[\"a\"]\n\"caught\"", 0, "AAB", ""),
+        ("{\"a\":{\"a\":1}}", "[paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)])]", "", 5, "AAAB", "Cannot index number with array"),
+        ("{\"a\":{\"a\":1}}", "[limit(2;paths(.[([[\"a\"]] as [$q] ?// $b | (if $q then (\"A\"|stderr) else (\"B\"|stderr) end) | if $q then \"a\" else [\"x\"] end)]))]", "", 5, "AAAB", "Cannot index number with array"),
+        ("{\"a\":{\"a\":1}}", "first(paths(type==\"number\"))", "[\"a\",\"a\"]", 0, "", ""),
+        ("{\"a\":{\"a\":1}}", "[limit(1;paths(.a?))]", "[[\"a\"]]", 0, "", ""),
+        ("[1,[2,3]]", "first(paths(type==\"array\"))", "[1]", 0, "", ""),
+        ("1", "first(paths(true))", "", 0, "", ""),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(stdout.trim_end(), stdout_expected, "#3567: `{filter}` on {input}");
+        assert_eq!(code, code_expected, "#3567: `{filter}` on {input}: {stderr:?}");
+        assert!(
+            stderr.starts_with(markers),
+            "#3567: `{filter}` on {input}: markers {markers:?}, got {stderr:?}"
+        );
+        assert!(
+            stderr.contains(message),
+            "#3567: `{filter}` on {input}: wanted {message:?}, got {stderr:?}"
+        );
+    }
+    // The literal-input route (`-n`) was already right; pin it with the document
+    // route so a change to only one of them cannot drift.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", "{\"a\":{\"a\":1}} | first(paths(.[(([[\"a\"]] as [$q] ?// $b | if $q then \"a\" else error(\"E2\") end))]))"],
+        None,
+    )?;
+    assert_eq!(stdout.trim_end(), "[\"a\"]", "#3567 (-n)");
+    assert_eq!(code, 5, "#3567 (-n): {stderr:?}");
+    assert!(stderr.contains("E2"), "#3567 (-n): {stderr:?}");
+    Ok(())
+}
+
+// ============================================================================
 // #3279: a `try`-wrapped `if` as a bind source keeps the path register
 // ============================================================================
 
