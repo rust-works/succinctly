@@ -82190,6 +82190,616 @@ fn test_recurse_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some("[10,20,30]"), "", RETRY_ROWS_RECURSE_3293)
 }
 
+/// #3487: a builtin's single argument is bound once per value, as jq's `as` (a `$param`
+/// of a jq-defined builtin) or its backtracking sub-expression (a C-coded one) does, so a
+/// failure raised after the call -- by the builtin, the rest of the pipe, or a
+/// consumer's stop (jq retries a `?//` past `first`'s `break`) -- reaches a `?//` in the
+/// argument. The parser binds such an argument with `K as $v | B($v)`. `bg` rows have the
+/// first alternative yield a value the builtin rejects (retried to the second); `vv` rows
+/// have both alternatives valid, so only a stop or a later failure retries them. Covers
+/// `startswith`, `endswith`, `ltrimstr`, `rtrimstr`, `split`, `join`, `contains`,
+/// `inside`, `has`, `test`, `index`, `indices`, `flatten`, `getpath` and `splits`, and
+/// `error(msg)`, bare, under `first` and under `isempty`. Every value captured from jq
+/// 1.7.1 with `-c`.
+const RETRY_ROWS_VALUE_ARG_BUILTINS_3487: &[RetryRow3293] = &[
+    (
+        r#".s | startswith(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "a" end))"#,
+        "true\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.s | startswith(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "a" end))), 9]"#,
+        "[true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.s | startswith(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "a" end)))"#,
+        "false\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | startswith(([1] as [$a] ?// $b | ("A"|stderr) | "a"))"#,
+        "true\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.s | startswith(([1] as [$a] ?// $b | ("A"|stderr) | "a"))), 9]"#,
+        "[true,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.s | startswith(([1] as [$a] ?// $b | ("A"|stderr) | "a")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | endswith(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "c" end))"#,
+        "true\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | endswith(([1] as [$a] ?// $b | ("A"|stderr) | "c"))"#,
+        "true\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.s | endswith(([1] as [$a] ?// $b | ("A"|stderr) | "c"))), 9]"#,
+        "[true,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.s | endswith(([1] as [$a] ?// $b | ("A"|stderr) | "c")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | ltrimstr(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "a" end))"#,
+        "\"abc\"\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.s | ltrimstr(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "a" end))), 9]"#,
+        "[\"abc\",\"bc\",9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.s | ltrimstr(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "a" end)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | ltrimstr(([1] as [$a] ?// $b | ("A"|stderr) | "a"))"#,
+        "\"bc\"\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.s | ltrimstr(([1] as [$a] ?// $b | ("A"|stderr) | "a"))), 9]"#,
+        "[\"bc\",\"bc\",9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.s | ltrimstr(([1] as [$a] ?// $b | ("A"|stderr) | "a")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | rtrimstr(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "c" end))"#,
+        "\"abc\"\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#".s | rtrimstr(([1] as [$a] ?// $b | ("A"|stderr) | "c"))"#,
+        "\"ab\"\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.s | rtrimstr(([1] as [$a] ?// $b | ("A"|stderr) | "c"))), 9]"#,
+        "[\"ab\",\"ab\",9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.s | rtrimstr(([1] as [$a] ?// $b | ("A"|stderr) | "c")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".t | split(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "," end))"#,
+        "[\"a\",\"b\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".t | split(([1] as [$a] ?// $b | ("A"|stderr) | ","))"#,
+        "[\"a\",\"b\"]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.t | split(([1] as [$a] ?// $b | ("A"|stderr) | ","))), 9]"#,
+        "[[\"a\",\"b\"],[\"a\",\"b\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.t | split(([1] as [$a] ?// $b | ("A"|stderr) | ",")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".arr | join(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "," end))"#,
+        "\"a,b\"\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".arr | join(([1] as [$a] ?// $b | ("A"|stderr) | ","))"#,
+        "\"a,b\"\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.arr | join(([1] as [$a] ?// $b | ("A"|stderr) | ","))), 9]"#,
+        "[\"a,b\",\"a,b\",9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.arr | join(([1] as [$a] ?// $b | ("A"|stderr) | ",")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | contains(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "b" end))"#,
+        "true\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | contains(([1] as [$a] ?// $b | ("A"|stderr) | "b"))"#,
+        "true\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.s | contains(([1] as [$a] ?// $b | ("A"|stderr) | "b"))), 9]"#,
+        "[true,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.s | contains(([1] as [$a] ?// $b | ("A"|stderr) | "b")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#""b" | inside(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "abc" end))"#,
+        "true\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#""b" | inside(([1] as [$a] ?// $b | ("A"|stderr) | "abc"))"#,
+        "true\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first("b" | inside(([1] as [$a] ?// $b | ("A"|stderr) | "abc"))), 9]"#,
+        "[true,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty("b" | inside(([1] as [$a] ?// $b | ("A"|stderr) | "abc")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".o | has(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "a" end))"#,
+        "true\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.o | has(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "a" end))), 9]"#,
+        "[true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.o | has(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "a" end)))"#,
+        "false\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".o | has(([1] as [$a] ?// $b | ("A"|stderr) | "a"))"#,
+        "true\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.o | has(([1] as [$a] ?// $b | ("A"|stderr) | "a"))), 9]"#,
+        "[true,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.o | has(([1] as [$a] ?// $b | ("A"|stderr) | "a")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | test(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "b" end))"#,
+        "true\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | test(([1] as [$a] ?// $b | ("A"|stderr) | "b"))"#,
+        "true\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.s | test(([1] as [$a] ?// $b | ("A"|stderr) | "b"))), 9]"#,
+        "[true,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.s | test(([1] as [$a] ?// $b | ("A"|stderr) | "b")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | index(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "b" end))"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | index(([1] as [$a] ?// $b | ("A"|stderr) | "b"))"#,
+        "1\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.s | index(([1] as [$a] ?// $b | ("A"|stderr) | "b"))), 9]"#,
+        "[1,1,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.s | index(([1] as [$a] ?// $b | ("A"|stderr) | "b")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | indices(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "b" end))"#,
+        "[1]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".s | indices(([1] as [$a] ?// $b | ("A"|stderr) | "b"))"#,
+        "[1]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.s | indices(([1] as [$a] ?// $b | ("A"|stderr) | "b"))), 9]"#,
+        "[[1],[1],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.s | indices(([1] as [$a] ?// $b | ("A"|stderr) | "b")))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".n | flatten(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else 1 end))"#,
+        "[1,2]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#".n | flatten(([1] as [$a] ?// $b | ("A"|stderr) | 1))"#,
+        "[1,[2]]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.n | flatten(([1] as [$a] ?// $b | ("A"|stderr) | 1))), 9]"#,
+        "[[1,[2]],[1,[2]],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.n | flatten(([1] as [$a] ?// $b | ("A"|stderr) | 1)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".o | getpath(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else ["a"] end))"#,
+        "{\"a\":1}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".o | getpath(([1] as [$a] ?// $b | ("A"|stderr) | ["a"]))"#,
+        "{\"a\":1}\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.o | getpath(([1] as [$a] ?// $b | ("A"|stderr) | ["a"]))), 9]"#,
+        "[{\"a\":1},{\"a\":1},9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.o | getpath(([1] as [$a] ?// $b | ("A"|stderr) | ["a"])))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".t | [splits(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else "," end))]"#,
+        "[\"a\",\"b\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#".t | [splits(([1] as [$a] ?// $b | ("A"|stderr) | ","))]"#,
+        "[\"a\",\"b\"]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(.t | [splits(([1] as [$a] ?// $b | ("A"|stderr) | ","))]), 9]"#,
+        "[[\"a\",\"b\"],9]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(.t | [splits(([1] as [$a] ?// $b | ("A"|stderr) | ","))])"#,
+        "false\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"try error(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else 1 end)) catch ."#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(try error(([1] as [$a] ?// $b | ("A"|stderr) | 1)) catch .), 9]"#,
+        "[1,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"error(([1] as [$a] ?// $b | ("A"|stderr) | "E"))?"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[error(([{"x":0}] as [$a] ?// $b | ("A"|stderr) | if $a then 99 else 1 end))?]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+const RETRY_INPUT_VALUE_ARG_3487: &str =
+    r#"{"s":"abc","t":"a,b","arr":["a","b"],"o":{"a":{"a":1}},"n":[[1,[2]]]}"#;
+
+#[test]
+fn test_builtin_argument_retry_follows_a_failure_after_the_call_3487() -> Result<()> {
+    assert_retry_rows_3293(
+        Some(RETRY_INPUT_VALUE_ARG_3487),
+        "",
+        RETRY_ROWS_VALUE_ARG_BUILTINS_3487,
+    )
+}
+
+/// #3487: the rebinding leaves a call to a user definition that shadows a builtin's name
+/// alone (`def has(x): 1; has(K)` is `1`, not the builtin's `true`). jq 1.7.1: `1`, `1`, `1`.
+#[test]
+fn test_builtin_argument_rebinding_respects_shadowing_and_user_functions_3487() -> Result<()> {
+    for (filter, input, expected) in [
+        (
+            r#"def has(x): 1; has([1] as $q ?// $b | "a")"#,
+            r#"{"a":1}"#,
+            "1\n",
+        ),
+        (r#"def has(x): 1; has("a")"#, r#"{"a":1}"#, "1\n"),
+        (
+            r#"def error(x): 1; error([1] as $q ?// $b | "a")"#,
+            "null",
+            "1\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "`{filter}`: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3487, path mode: `getpath`'s argument reaches a `?//` in `path`, `del` and a
+/// consumer's stop, and a non-path builtin (`has`) still retries before it refuses.
+/// Input `{"a":{"a":1}}`; every value captured from jq 1.7.1 with `-c`.
+const RETRY_ROWS_VALUE_ARG_PATH_3487: &[RetryRow3293] = &[
+    (
+        r#"path(getpath(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | [$q])))"#,
+        "[\"a\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(getpath(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | [$q])))"#,
+        "{}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(getpath(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | [$q])))]"#,
+        "[[\"a\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(getpath(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | [$q])))), 9]"#,
+        "[[\"a\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(has(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | [$q])))?"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(getpath(([1] as [$a] ?// $b | ("A"|stderr) | ["a"])))"#,
+        "[\"a\"]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(getpath(([1] as [$a] ?// $b | ("A"|stderr) | ["a"])))), 9]"#,
+        "[[\"a\"],[\"a\"],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(getpath(([1] as [$a] ?// $b | ("A"|stderr) | ["a"])))"#,
+        "{}\n",
+        "A",
+        "",
+        0,
+    ),
+];
+
+#[test]
+fn test_builtin_argument_retry_in_path_mode_3487() -> Result<()> {
+    assert_retry_rows_3293(Some(r#"{"a":{"a":1}}"#), "", RETRY_ROWS_VALUE_ARG_PATH_3487)
+}
+
 /// #3486: `limit`'s count is the outer loop, and a string, array or object count
 /// sorts above every number, so jq 1.7.1's `foreach f as $item ($n; .-1; ...)` raises
 /// `<type> (<n>) and number (1) cannot be subtracted` on `f`'s *first output* -- nothing
@@ -85199,6 +85809,11 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         ("[10,20,30] | ", RETRY_ROWS_PATH_FOLD_3293),
         ("[10,20,30] | ", RETRY_ROWS_RECURSE_3293),
         ("[10,20,30] | ", RETRY_ROWS_LOOP_3503),
+        (
+            r#"{"s":"abc","t":"a,b","arr":["a","b"],"o":{"a":{"a":1}},"n":[[1,[2]]]} | "#,
+            RETRY_ROWS_VALUE_ARG_BUILTINS_3487,
+        ),
+        (r#"{"a":{"a":1}} | "#, RETRY_ROWS_VALUE_ARG_PATH_3487),
         (
             r#"{"a":1,"b":2} | "#,
             RETRY_ROWS_LIMIT_NON_NUMBER_COUNT_3486,

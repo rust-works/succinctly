@@ -34,8 +34,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::eval::{
-    arith_combine, compare_values, yq_scalar_text_eq, EvalError, EvalSemantics, JqSemantics,
-    YqSemantics,
+    arith_combine, compare_values, contains_retrying_pattern_bind, yq_scalar_text_eq, EvalError,
+    EvalSemantics, JqSemantics, YqSemantics,
 };
 use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include, Libm1,
@@ -955,6 +955,38 @@ const META_OP_KEYWORDS: &[(&str, MetaSlot)] = &[
     ("tag", MetaSlot::Tag),
     ("anchor", MetaSlot::Anchor),
 ];
+
+/// The variable [`bind_retrying_value_arg`] binds a builtin's argument to. Not spellable in
+/// source (no jq identifier starts with `%`), so it cannot capture or shadow a user's.
+const VALUE_ARG_VAR: &str = "%arg";
+
+/// `B(K)` as jq runs it, `K as $v | B($v)`, when `K` holds a `?//` bind (#3487).
+///
+/// jq evaluates a builtin's argument as a backtracking sub-expression, so a failure raised
+/// after the call -- by the builtin itself, by the rest of the pipe, or a consumer's stop
+/// (jq retries a `?//` past `first`'s `break`) -- backtracks into the argument's remaining
+/// alternatives. The evaluators run such a builtin's argument to completion before the
+/// builtin acts, so none of that reached the bind. Binding the value first makes the
+/// builtin's call an ordinary `as` body, which already drives its source through a live
+/// sink on every route. An argument with no `?//` is left alone: one load answers that for a
+/// program that never parsed one ([`contains_retrying_pattern_bind`]).
+fn bind_retrying_value_arg(builtin: Builtin) -> Expr {
+    let Some(arg) = builtin
+        .value_arg()
+        .filter(|arg| contains_retrying_pattern_bind(arg))
+    else {
+        return Expr::Builtin(builtin);
+    };
+    let source = arg.clone();
+    let bound = builtin
+        .with_value_arg(Expr::Var(VALUE_ARG_VAR.to_string()))
+        .expect("a builtin with a value argument can take another");
+    Expr::As {
+        expr: Box::new(source),
+        var: VALUE_ARG_VAR.to_string(),
+        body: Box::new(Expr::Builtin(bound)),
+    }
+}
 
 impl<'a> Parser<'a> {
     #[allow(dead_code)] // STYLE-0005: kept for tests and future use
@@ -3091,7 +3123,14 @@ impl<'a> Parser<'a> {
                             self.zero_arity_or_wrong_arity_call(
                                 keyword_start,
                                 shadow_candidate.then_some(name.as_str()),
-                                Expr::Builtin(builtin),
+                                // A shadowed name may resolve to the user's definition, which
+                                // `wrap_shadowable_call` reads back from the builtin's shape;
+                                // leave that call as written.
+                                if shadow_candidate {
+                                    Expr::Builtin(builtin)
+                                } else {
+                                    bind_retrying_value_arg(builtin)
+                                },
                             )
                         }
                         // Not recognized as any builtin at all -- ordinary
@@ -3397,7 +3436,19 @@ impl<'a> Parser<'a> {
             None
         };
 
-        Ok(Expr::Error(msg))
+        // #3487: jq's `def error(msg): msg|error;` -- a failure raised after `msg` reaches a
+        // `?//` in it, which an `Expr::Error` that evaluates `msg` once cannot see.
+        // A shadowed `error` is left as written, for the reason `try_parse_builtin`'s
+        // caller gives.
+        Ok(match msg {
+            Some(msg)
+                if !self.shadowable_defs.contains("error")
+                    && contains_retrying_pattern_bind(&msg) =>
+            {
+                Expr::Pipe(vec![*msg, Expr::Error(None)])
+            }
+            msg => Expr::Error(msg),
+        })
     }
 
     /// A `reduce`/`foreach` source. jq's grammar makes it a `Term` (`reduce
@@ -8959,6 +9010,63 @@ mod tests {
                 Literal::number_literal("1".to_string())
             )))))
         );
+    }
+
+    /// #3487: a builtin whose argument holds a `?//` bind is parsed as `K as $v | B($v)`, so
+    /// the evaluators drive the argument through the `as` machinery; one without, and a
+    /// closure parameter, are left as written.
+    #[test]
+    fn test_builtin_value_arg_with_an_alternative_bind_is_bound_first_3487() {
+        let bound = parse(r#""ab" | startswith([1] as $q ?// $b | "a")"#).unwrap();
+        let Expr::Pipe(stages) = bound else {
+            panic!("expected a pipe, got {bound:?}");
+        };
+        let Expr::As { expr, var, body } = &stages[1] else {
+            panic!("expected Expr::As, got {:?}", stages[1]);
+        };
+        assert!(matches!(expr.as_ref(), Expr::AsPattern { patterns, .. } if patterns.len() == 2));
+        assert_eq!(var, VALUE_ARG_VAR);
+        assert!(matches!(
+            body.as_ref(),
+            Expr::Builtin(Builtin::Startswith(arg)) if matches!(arg.as_ref(), Expr::Var(name) if name == VALUE_ARG_VAR)
+        ));
+
+        // A shadowing definition is left to `wrap_shadowable_call`: the call stays a builtin
+        // shape it can read back.
+        let shadowed = parse(r#"def has(x): 1; has([1] as $q ?// $b | "a")"#).unwrap();
+        assert!(
+            format!("{shadowed:?}").contains("Builtin(Has("),
+            "{shadowed:?}"
+        );
+
+        // No `?//` in the argument: untouched.
+        assert!(matches!(
+            parse(r#"startswith("a")"#).unwrap(),
+            Expr::Builtin(Builtin::Startswith(_))
+        ));
+        // A closure parameter is not bound once per value.
+        assert!(matches!(
+            parse("map([1] as $q ?// $b | $b)").unwrap(),
+            Expr::Builtin(Builtin::Map(_))
+        ));
+        // `error(msg)` is jq's `msg|error`.
+        assert!(matches!(
+            parse("error([1] as $q ?// $b | $b)").unwrap(),
+            Expr::Pipe(stages) if matches!(stages.as_slice(), [_, Expr::Error(None)])
+        ));
+        assert!(matches!(
+            parse(r#"error("x")"#).unwrap(),
+            Expr::Error(Some(_))
+        ));
+        // `value_arg`/`with_value_arg` agree on which builtins have one.
+        let has = Builtin::Has(Box::new(Expr::Identity));
+        assert!(matches!(has.value_arg(), Some(Expr::Identity)));
+        assert!(matches!(
+            has.with_value_arg(Expr::Var("x".to_string())),
+            Some(Builtin::Has(arg)) if matches!(*arg, Expr::Var(_))
+        ));
+        assert!(Builtin::Map(Box::new(Expr::Identity)).value_arg().is_none());
+        assert!(Builtin::Type.with_value_arg(Expr::Identity).is_none());
     }
 
     #[test]
