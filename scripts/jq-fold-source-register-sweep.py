@@ -22,12 +22,13 @@ pinned oracle and the built binary, then classified by direction:
     both-ok-differ    both answer, differently
     both-error-differ both refuse, with different stdout
 
-**The alphabet is part of the claim** (#2041): 117 source shapes -- every
+**The alphabet is part of the claim** (#2041): 124 source shapes -- every
 navigation x every non-navigating tail, the builtins that navigate without
-spelling an INDEX (`..`, `recurse`, `getpath`, `walk`), slices, and the shapes
-the fix must NOT change (a literal, an `as` source, an untaken navigating
-branch). Run
-`--self-test` to print the pools.
+spelling an INDEX (`..`, `recurse`, `getpath`, `walk`), slices, computed
+index/slice keys (`.[1+1]`), a nested fold, and the shapes the fix must NOT
+change (a literal, an `as` source, an untaken navigating branch). Every
+fold binds a bare `$k`: destructuring patterns and `?//` chains are not in
+the alphabet. Run `--self-test` to print the pools.
 
 Two-sided staleness gate, as the other oracle sweeps have: the run fails on
 any divergence outside `KNOWN_RESIDUALS` -- the (source, category) pairs whose
@@ -38,8 +39,9 @@ the observed table for regenerating it after a deliberate change.
 
 Usage:
     cargo build --release --features cli
-    ./scripts/jq-fold-source-register-sweep.py [--bin PATH] [--jq PATH] [--show K] [--self-test]
-    (60k cases, two process spawns each: minutes, not seconds -- not run in CI.)
+    ./scripts/jq-fold-source-register-sweep.py [--bin PATH] [--jq PATH] [--show K] [--jobs N] [--self-test]
+    (~80k cases, two process spawns each: tens of minutes at the default --jobs, not seconds --
+    not run in CI.)
 Exit 1 on any unexpected divergence or a stale residual entry.
 """
 import argparse, collections, concurrent.futures as cf, itertools, re, subprocess, sys
@@ -67,6 +69,15 @@ SRCS += [
     '.[0:1]|tostring', '.[0:]|tostring', '.a[0:1]?|length', '.[1:]|type', '.[0:2]',
     'range(2)|tostring', 'paths|tostring', 'keys|.[0]', 'to_entries|length', 'tojson|fromjson',
 ]
+# Computed spellings of an INDEX (`.[1+1]`, `.["a"|ascii_downcase]`, `.[0:(1+1)]`, `.[[1]]`)
+# move the register exactly as `.a`/`.[1]` do, but a key with no `.`/`.[]` of its own once
+# slipped past `drive_fold_source`'s navigation gate and was driven by value (#2159). And a
+# nested `foreach` emits its values off the resolver's root path whatever its own source
+# navigated, so the fold reads them as literals (a tracked residual, see KNOWN_RESIDUALS).
+SRCS += [
+    '.[1+1]|tostring', '.["a"|ascii_downcase]|tostring', '.[0:(1+1)]|tostring',
+    '.[[1]]|length', '.[1+1]', 'foreach .[]? as $x (0; .+1)', 'reduce .[]? as $x (0; .+1)',
+]
 UPDS = ['.', '.a', '.b', '.[0]', '$k', '1']
 INITS = ['.', '.b', '1', 'null']
 KINDS = ['foreach', 'reduce']
@@ -78,31 +89,31 @@ FORMS = ['path({k} ({s}) as $k ({i}; {u}))', '({k} ({s}) as $k ({i}; {u})) = 9']
 # the run instead of hiding behind the source's name. A pair that stops
 # occurring fails too, so the table cannot go stale.
 #
-#   `first`/`last`/`nth`/`map`/`add`, alone or after a navigation -- builtins
-#   that index inside themselves, so the register's position is unknowable
-#   here (#3459). Bare, they leave the resolver's path at the root and read as
-#   a literal: `first|tostring` still FABRICATEs (jq refuses), as it did
-#   before #2159.
-#   `.b|tostring`, `1, (.a|tostring)`, `..`, `recurse`, `.[0:]`, `.[0:2]` --
-#   jq's pointer identity: the accumulator carried across source elements, a
-#   `tostring` of a string, a full slice (#3460).
+#   `first`/`last`/`nth`/`map`/`add`, *bare* -- builtins that index inside
+#   themselves, so the register's position is unknowable here (#3459). They
+#   leave the resolver's path at the root and read as a literal:
+#   `first|tostring` still FABRICATEs (jq refuses), as it did before #2159.
+#   After a navigation `first`/`last`/`nth` are navigated natively and no
+#   longer diverge.
+#   `.b|tostring`, `1, (.a|tostring)`, `..`, `recurse`, `.[0:]`, `.[0:2]`,
+#   `.[0:(1+1)]` -- jq's pointer identity: the accumulator carried across
+#   source elements, a `tostring` of a string, a full slice (#3460).
+#   `foreach .[]? as $x (0; .+1)` -- a nested navigating `foreach`: its values
+#   come back off the resolver's root path, which `drive_fold_source` reads as
+#   a lost register, so it refuses where jq may answer (it used to read as a
+#   literal and FABRICATE).
 KNOWN_RESIDUALS = {
-    '(.a,.b)|first': ['REJECT', 'both-error-differ', 'both-ok-differ'],
     '..': ['both-error-differ'],
     '..|tostring': ['both-error-differ'],
+    '.[0:(1+1)]|tostring': ['REJECT'],
     '.[0:2]': ['REJECT'],
     '.[0:]|tostring': ['REJECT'],
-    '.[0]|first': ['REJECT', 'both-ok-differ'],
-    '.[]|first': ['REJECT', 'both-error-differ'],
-    '.a.c|first': ['REJECT', 'both-ok-differ'],
-    '.a?|first': ['REJECT', 'both-ok-differ'],
-    '.a|first': ['REJECT', 'both-ok-differ'],
-    '.b|first': ['REJECT', 'both-ok-differ'],
     '.b|tostring': ['REJECT'],
     '1, (.a|tostring)': ['REJECT'],
     'add?': ['REJECT', 'both-ok-differ'],
     'first': ['FABRICATE', 'REJECT', 'both-ok-differ'],
     'first|tostring': ['FABRICATE', 'both-ok-differ'],
+    'foreach .[]? as $x (0; .+1)': ['REJECT'],
     'last': ['FABRICATE', 'REJECT', 'both-ok-differ'],
     'last|tostring': ['FABRICATE', 'both-ok-differ'],
     'map(1)|length': ['FABRICATE'],
@@ -130,6 +141,7 @@ def main():
     ap.add_argument('--bin', default='./target/release/succinctly')
     ap.add_argument('--jq', default='/usr/bin/jq')
     ap.add_argument('--show', type=int, default=3)
+    ap.add_argument('--jobs', type=int, default=8, help='parallel case runners')
     ap.add_argument('--self-test', action='store_true')
     ap.add_argument('--print-residuals', action='store_true',
                     help='print the observed (source -> categories) table and exit 0')
@@ -162,8 +174,8 @@ def main():
         return ('both-error-differ' if j[0] != 0 else 'both-ok-differ'), f, inp, j, s
 
     counts, diffs = collections.Counter(), []
-    with cf.ThreadPoolExecutor(8) as ex:
-        for r in ex.map(one, cases, chunksize=32):
+    with cf.ThreadPoolExecutor(args.jobs) as ex:
+        for r in ex.map(one, cases):
             counts[r[0]] += 1
             if r[0] not in ('same', 'timeout'):
                 diffs.append(r)

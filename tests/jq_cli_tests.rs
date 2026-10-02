@@ -57771,6 +57771,181 @@ fn test_fold_source_that_never_navigates_leaves_register_alone_2159() -> Result<
     Ok(())
 }
 
+/// #2159: a *computed* spelling of an `INDEX` -- `.[1+1]`, `.["a"|ascii_downcase]`,
+/// `.[0:(1+1)]`, `.[[1]]` -- moves jq's register exactly as `.a`/`.[1]` do.
+/// `drive_fold_source`'s navigation gate matched only `Field`/`Index`/`Slice`/
+/// `Iterate` (and a computed key *containing* one of those), so a key that
+/// needs no `.` of its own drove the whole source by value as though the
+/// register never moved: the read twin answered a path jq refuses, and the
+/// write twins (`=`, `|=`, `del`) went through where jq leaves the document
+/// alone. Every row is a live jq 1.7.1 capture.
+#[test]
+fn test_foreach_computed_index_source_moves_register_2159() -> Result<()> {
+    const ARR: &str = "[1,2,3]";
+    let near_0 = "Invalid path expression near attempt to access element 0 of [1,2,3]";
+    for (filter, needle) in [
+        ("path(foreach (.[1+1]|tostring) as $k (.; .[0]))", near_0),
+        ("(foreach (.[1+1]|tostring) as $k (.; .[0])) = 9", near_0),
+        ("del(foreach (.[1+1]|tostring) as $k (.; .[0]))", near_0),
+        ("(foreach (.[0:(1+1)]|length) as $k (.; .[0])) |= 9", near_0),
+        ("path(foreach (.[[1]]|tostring) as $k (.; .[0]))", near_0),
+        (
+            "[path(foreach (.[1+1]|tostring) as $k (.; .))]",
+            "Invalid path expression with result [1,2,3]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(ARR))?;
+        assert_eq!(stdout, "", "`{filter}` must not emit: stderr: {stderr:?}");
+        assert!(stderr.contains(needle), "`{filter}`: stderr: {stderr:?}");
+        assert_eq!(code, 5, "`{filter}`: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(foreach (.["a"|ascii_downcase]|tostring) as $k (.; .a))"#,
+        ],
+        Some(r#"{"a":1,"b":{"c":2}}"#),
+    )?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(
+            r#"Invalid path expression near attempt to access element "a" of {"a":1,"b":{"c":2}}"#
+        ),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5);
+
+    // The positive face: on a `null` document the moved register is
+    // `jv_identical` to a `null` accumulator, so the answer is rooted at the
+    // computed key -- `[2]` / `["a"]` / a slice component, not the `[]` the
+    // by-value drive printed.
+    for (filter, expected) in [
+        ("path(foreach (.[1+1]|tostring) as $k (.; .))", "[2]"),
+        (
+            r#"path(foreach (.["a"|ascii_downcase]|tostring) as $k (.; .))"#,
+            r#"["a"]"#,
+        ),
+        (
+            "path(foreach (.[0:(1+1)]|tostring) as $k (null; .a?))",
+            r#"[{"start":0,"end":2},"a"]"#,
+        ),
+        (
+            r#"(foreach (.["a"|ascii_downcase]|tostring) as $k (.; .)) = 9"#,
+            r#"{"a":9}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 0, "`{filter}`: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2159: a nested `foreach` in the source moves jq's register through its own
+/// navigation (its source, INIT, UPDATE or EXTRACT) and then hands its values
+/// out. The resolver emits them off the root path, so they read as literals
+/// that never touched the register: `(foreach (foreach .[]? as $x (0; .+1)) as
+/// $k (.; .; .)) = 9` replaced the whole document with `9` where jq refuses.
+/// A nested `foreach` that never navigates, and a nested `reduce` (jq restores
+/// the register when it backtracks out of one), are unchanged. Every row is a
+/// live jq 1.7.1 capture.
+#[test]
+fn test_fold_source_nested_navigating_foreach_moves_register_2159() -> Result<()> {
+    const DOC: &str = r#"{"a":1,"b":{"c":2}}"#;
+    let near_b =
+        r#"Invalid path expression near attempt to access element "b" of {"a":1,"b":{"c":2}}"#;
+    for (input, filter, needle) in [
+        (
+            r#"{"a":{"a":1},"k":"a"}"#,
+            "(foreach (foreach .[]? as $x (0; .+1)) as $k (.; .; .)) = 9",
+            r#"Invalid path expression with result {"a":{"a":1},"k":"a"}"#,
+        ),
+        (
+            DOC,
+            "path(foreach (foreach .[]? as $x (0; .+1)) as $k (.; .b; .a))",
+            near_b,
+        ),
+        (
+            DOC,
+            "path(foreach (limit(1; foreach .[] as $x (0; .+1))) as $k (.; .b))",
+            near_b,
+        ),
+        (
+            DOC,
+            "path(foreach ((.a|tostring), foreach (1,2) as $x (0; .+1)) as $k (.; .))",
+            r#"Invalid path expression with result {"a":1,"b":{"c":2}}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(stdout, "", "`{filter}` must not emit: stderr: {stderr:?}");
+        assert!(stderr.contains(needle), "`{filter}`: stderr: {stderr:?}");
+        assert_eq!(code, 5, "`{filter}`: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+
+    // Must-not-change: a nested `reduce` restores the register, so UPDATE's
+    // `.b` still resolves.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "path(foreach (reduce .[]? as $x (0; .+1)) as $k (.; .b; .a))",
+        ],
+        Some(DOC),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"b\",\"a\"]\n");
+
+    // A nested `foreach` that never navigates leaves the register alone: its
+    // first step is jq's `["b"]`, and the second raises on the accumulator.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "path(foreach (foreach (1,2) as $x (0; .+1)) as $k (.; .b))",
+        ],
+        Some(DOC),
+    )?;
+    assert_eq!(stdout, "[\"b\"]\n", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"near attempt to access element "b" of {"c":2}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5);
+    Ok(())
+}
+
+/// #2159 must-not-change: a `?//` chain over a source that navigates and then
+/// runs a builtin the resolver cannot see inside (`startswith`, `ltrimstr`,
+/// `tostring`, `test`) still retries its next alternative. The element is a
+/// non-null scalar there, and no destructuring step on one can succeed in jq
+/// -- `true | .[0]` is an error whatever the register holds, and `?//`
+/// retries every error -- so a walk refusal is never a guess about
+/// `path_intact`. Treating the moved/lost register as unknowable stopped the
+/// chain instead, raising where jq (and the build before #2159) answers
+/// nothing at exit 0. Every row is a live jq 1.7.1 capture.
+#[test]
+fn test_foreach_alt_chain_retries_after_navigation_then_scalar_builtin_2159() -> Result<()> {
+    const DOC: &str = r#"{"a":"X","b":"Y"}"#;
+    for filter in [
+        r#"path(foreach (.[]|startswith("X")) as [$k] ?// $k (.; empty))"#,
+        r#"path(foreach (.[]|ltrimstr("z")) as {a:$k} ?// [$k] ?// $k (.; empty))"#,
+        r"path(foreach (.[]|tostring) as [$k] ?// $k (.; empty))",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(DOC))?;
+        assert_eq!(stdout, "", "`{filter}`: stderr: {stderr:?}");
+        assert_eq!(code, 0, "`{filter}`: stderr: {stderr:?}");
+    }
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"(foreach (.[]|test("X")) as [$k] ?// $k (.; empty)) = 9"#,
+        ],
+        Some(DOC),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), DOC);
+    Ok(())
+}
+
 /// #2031 positive companion to the primary repro: a trackable source
 /// element's own per-element binding (`$k`, bound from `.a`'s own navigated
 /// value) *does* carry the register through when UPDATE references it

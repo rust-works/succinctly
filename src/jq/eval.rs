@@ -41227,6 +41227,41 @@ impl FoldRegister {
     }
 }
 
+/// Whether `e` is a step whose evaluation moves jq's path register -- the test
+/// [`drive_fold_source`] gates the resolver on (#2159).
+///
+/// Besides the steps that spell an `INDEX` (`.a`, `.[0]`, `.[]`, a slice), the
+/// builtins that move the register without writing one -- `recurse`/`..`/`walk`
+/// iterate, `getpath` navigates -- count, or `..|tostring` would be driven by
+/// value as though the register never moved. So do the *computed* spellings of
+/// an `INDEX` (`.[1+1]`, `.["a"|ascii_downcase]`, `.[0:(1+1)]`, `.[[1]]`): only
+/// a computed key *containing* a `Field` or `Iterate` of its own reached the
+/// gate before, so the same navigation with a constant-folded key was driven by
+/// value and fabricated the path jq refuses. `first`/`last`/`nth`
+/// (`.[0]`/`.[-1]`/`.[n]`) do not count: nothing here can tell them from a
+/// computed value (#3459).
+fn is_fold_source_navigation(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Slice { .. }
+            | Expr::IndexExpr { .. }
+            | Expr::SliceExpr { .. }
+            | Expr::ArrayKey(_)
+            | Expr::Iterate
+            | Expr::RecursiveDescent
+            | Expr::Builtin(
+                Builtin::Recurse
+                    | Builtin::RecurseDown
+                    | Builtin::RecurseF(_)
+                    | Builtin::RecurseCond(..)
+                    | Builtin::Walk(_)
+                    | Builtin::GetPath(_)
+            )
+    )
+}
+
 /// Drive a `reduce`/`foreach` SOURCE **by demand** in path context,
 /// handing each element to `step` as the source produces it -- the fold
 /// loop runs *inside* `step`, so the next element is pulled only once the
@@ -41270,10 +41305,12 @@ impl FoldRegister {
 /// (`Expr::Alternative`'s unfiltered escape prefix was the one such arm,
 /// fixed alongside).
 ///
-/// **Gated on `any_subexpr` finding an actual navigation step
-/// (`Field`/`Index`/`Slice`/`Iterate`) anywhere in `source`** -- only such
-/// a step can ever reach one of the resolver's own raising arms, so a
-/// source with none (`range(n)`, `keys`, a literal, and critically
+/// **Gated on `any_subexpr` finding an actual navigation step anywhere in
+/// `source`** -- a `Field`/`Index`/`Slice`/`Iterate`, a computed
+/// `IndexExpr`/`SliceExpr`/`ArrayKey`, or (#2159) the `..`/`recurse`/`walk`/
+/// `getpath` spellings that move jq's register without writing an `INDEX`.
+/// Only such a step can ever reach one of the resolver's own raising arms, so
+/// a source with none (`range(n)`, `keys`, a literal, and critically
 /// `input`/`inputs`) is driven by value through [`eval_each_owned`] and
 /// never resolved here at all. `input`/`inputs` is why the gate is not just
 /// an optimisation: the resolver's leaf collects a generator before
@@ -41320,29 +41357,8 @@ fn drive_fold_source<S: EvalSemantics>(
     relocate_base: Option<&Rc<PathPrefix>>,
     step: &mut dyn FnMut(FoldSourceValue) -> Demand,
 ) -> Flow {
-    // #2159: the builtins that move jq's register without spelling an
-    // `INDEX` in the source -- `recurse`/`..`/`walk` iterate, `getpath`
-    // navigates -- count as navigation too, or `..|tostring` would be driven
-    // by value as though the register never moved. `first`/`last`/`nth`
-    // (`.[0]`/`.[-1]`/`.[n]`) do not: nothing here can tell them from a
-    // computed value (#3459).
-    let has_navigation = any_subexpr(source, &mut |e| {
-        matches!(
-            e,
-            Expr::Field(_)
-                | Expr::Index { .. }
-                | Expr::Slice { .. }
-                | Expr::Iterate
-                | Expr::RecursiveDescent
-                | Expr::Builtin(
-                    Builtin::Recurse
-                        | Builtin::RecurseF(_)
-                        | Builtin::RecurseCond(..)
-                        | Builtin::Walk(_)
-                        | Builtin::GetPath(_)
-                )
-        )
-    });
+    // #2159: see [`is_fold_source_navigation`] for what counts.
+    let has_navigation = any_subexpr(source, &mut is_fold_source_navigation);
     if !has_navigation {
         return drive_fold_source_by_value::<S>(source, ambient.value, ambient.trackable, step);
     }
@@ -41364,6 +41380,15 @@ fn drive_fold_source<S: EvalSemantics>(
             _ => drive_fold_source_by_value::<S>(source, ambient.value, ambient.trackable, step),
         };
     }
+    // #2159: a nested `foreach` hands its values to the resolver off the root
+    // path whatever its own source, INIT, UPDATE or EXTRACT navigated on the
+    // way (`PathBranch::demoted`), so its elements read as literals that never
+    // touched the register while jq's sits where the nested fold's last
+    // navigation left it. A nested `reduce` is no such case: jq restores the
+    // register when it backtracks out of the fold.
+    let nested_fold_navigates = any_subexpr(source, &mut |e| {
+        matches!(e, Expr::Foreach { .. }) && any_subexpr(e, &mut is_fold_source_navigation)
+    });
     let flow = resolve_node_sink::<S>(
         source,
         ambient.value,
@@ -41392,20 +41417,28 @@ fn drive_fold_source<S: EvalSemantics>(
             // output of `..`), so the register stayed put. Depth is a proxy
             // for "did an INDEX run" that an opaque stage defeats: a bare
             // `first|tostring` never grows the path, so it reads as
-            // unmoved and stays the by-value behaviour (#3459).
-            let moved = if branch.trackable || branch.path.depth() == 0 {
+            // unmoved and stays the by-value behaviour (#3459). A nested
+            // navigating `foreach` is the one such stage that can be named
+            // from the source's text, so a root branch that states no
+            // register while one is in the source is as lost as a navigated
+            // one.
+            let at_root = branch.path.depth() == 0;
+            let moved = if branch.trackable {
                 MovedRegister::Unmoved
             } else {
                 match branch.register.into_unmoved() {
+                    Some(_) if at_root => MovedRegister::Unmoved,
                     // Moved out, not cloned: `into_owned_value` already made
                     // it an owned `Cow`, so this is free unless it borrows.
                     Some(register) => MovedRegister::At {
                         path: rebase(&branch.path),
                         value: register.into_owned(),
                     },
+                    None if at_root && !nested_fold_navigates => MovedRegister::Unmoved,
                     // Navigated, then a stage the resolver cannot see
-                    // inside (`first`, `add`, a `def`): jq indexed within
-                    // it, so the register's position is unknowable here.
+                    // inside (`first`, `add`, a `def`, a navigating nested
+                    // `foreach`): jq indexed within it, so the register's
+                    // position is unknowable here.
                     // Refusing costs an answer; keeping the stale register
                     // fabricates a path.
                     None => MovedRegister::Lost,
@@ -41520,7 +41553,6 @@ struct FoldSourceValue {
 /// reads it only through the first two: its UPDATE is deliberately not
 /// re-seeded, because `reduce` restores the register when it backtracks its
 /// source and only its final accumulator is checked against it.
-#[derive(Clone)]
 enum MovedRegister {
     /// The source never navigated to this element (a literal, an `as`
     /// source, an untaken navigating branch): the fold's persistent
@@ -41533,8 +41565,9 @@ enum MovedRegister {
         value: OwnedValue,
     },
     /// The source navigated and then ran a stage the resolver cannot see
-    /// inside, so the register's position is unknown. Refusing costs an
-    /// answer; keeping the stale register would fabricate a path.
+    /// inside (or hands out the values of a navigating nested `foreach`), so
+    /// the register's position is unknown. Refusing costs an answer; keeping
+    /// the stale register would fabricate a path.
     Lost,
 }
 
@@ -41812,11 +41845,11 @@ struct PatternRegister {
 ///   wherever it already was — the fold's own persistent `reg` — which only
 ///   ever admits the walk through `PathPatternMode::step`'s `null`/`bool`
 ///   identity exception, never through `reg.value == elem.value` (a
-///   structural coincidence, not a real `jv_identical`). Confirmed live: `path(foreach (null) as {a:$x} (.; .;
-///   $x))` is `["a"]` on a `null` document (the ambient register is `null`
-///   too), but `path(foreach (5) as {a:$x} (.; .; .))` refuses on any
-///   document ("near attempt to access element \"a\" of 5") even though `$x`
-///   goes unused.
+///   structural coincidence, not a real `jv_identical`). Confirmed live:
+///   `path(foreach (null) as {a:$x} (.; .; $x))` is `["a"]` on a `null`
+///   document (the ambient register is `null` too), but `path(foreach (5) as
+///   {a:$x} (.; .; .))` refuses on any document ("near attempt to access
+///   element \"a\" of 5") even though `$x` goes unused.
 fn fold_pattern_seed(elem: &FoldSourceValue, reg: &FoldRegister) -> PatternRegister {
     match (&elem.register_path, &elem.moved) {
         (Some(path), _) => PatternRegister {
@@ -42964,6 +42997,23 @@ fn each_fold_bind<S: EvalSemantics>(
 /// give.
 fn fold_walk_refusal_is_guess(elem: &FoldSourceValue, reg: &FoldRegister) -> bool {
     if elem.register_path.is_some() {
+        return false;
+    }
+    // #2159: a destructuring step on a non-null scalar raises in jq whatever
+    // the register holds -- `"a" | .[0]`, `true | .a`, `1 | .[0]` are value
+    // errors where `path_intact` would have been the path error -- and `?//`
+    // retries either, so there is no verdict here for a lost or moved register
+    // to change. Without this, every `.[]|startswith("x")`-style source (a
+    // navigation, then a builtin the resolver cannot see inside) stopped a
+    // `?//` chain that jq, and the build before #2159, ran on.
+    if matches!(
+        elem.value,
+        OwnedValue::Bool(_)
+            | OwnedValue::Int(_)
+            | OwnedValue::Float(_)
+            | OwnedValue::NumberLiteral(..)
+            | OwnedValue::String(_)
+    ) {
         return false;
     }
     // #2159: the register the walk compared against is the moved one when

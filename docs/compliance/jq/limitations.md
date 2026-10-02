@@ -2525,7 +2525,10 @@ answers `["b"]` — and classified the two residuals appended below):
   that one row, and had a positive face: on a `null` document `path(foreach (.a|tostring) as $k
   (.; .))` is `["a"]` in jq (the `null` accumulator is `jv_identical` to the moved `null`
   register) and was `[]` here. It also covered the builtins that navigate without spelling an
-  index -- `..`, `recurse`, `getpath`, `walk`.
+  index -- `..`, `recurse`, `getpath`, `walk` -- and the *computed* spellings of one whose key
+  has no `.` of its own (`.[1+1]`, `.["a"|ascii_downcase]`, `.[0:(1+1)]`, `.[[1]]`): the
+  navigation gate matched only `Field`/`Index`/`Slice`/`Iterate`, so `(foreach (.[1+1]|tostring)
+  as $k (.; .[0])) = 9` on `[1,2,3]` wrote `[9,2,3]` where jq raises.
 
   An untracked branch that navigated keeps the register's own path and value
   (`carry_register`, #1573), and `drive_fold_source` now hands both to the fold as
@@ -2537,22 +2540,33 @@ answers `["b"]` — and classified the two residuals appended below):
   source, so only its final accumulator is checked and a moved register never reaches it. jq
   mode only: yq's arm still discards the branches (#1467's shape) and stays refuse-only.
 
-  Measured over the 78,624-case `path(...)`/`(...) = 9` sweep
-  (`scripts/jq-fold-source-register-sweep.py`), divergences from jq 1.7.1 fell from 3,651 to
-  570: "jq errors, succinctly succeeds" 1,469 to 88, "jq succeeds, succinctly errors" 612 to
-  263, "both succeed, differ" 1,391 to 208, "both error, differ" 179 to 11. Two rows
-  (`(foreach (.[0:]|tostring) as $k (.; .[0])) = 9`, a *full* slice, which is the same `jv` in
-  jq) went from matching to refusing -- the safe direction. What remains:
+  Measured over the 83,328-case `path(...)`/`(...) = 9` sweep
+  (`scripts/jq-fold-source-register-sweep.py`), divergences from jq 1.7.1 fell from 3,534 to
+  273: "jq errors, succinctly succeeds" 1,527 to 88, "jq succeeds, succinctly errors" 540 to 56,
+  "both succeed, differ" 1,293 to 124, "both error, differ" 174 to 5. A full slice
+  (`(foreach (.[0:]|tostring) as $k (.; .[0])) = 9` on `[1,2]`, which is the same `jv` in jq)
+  went from matching to refusing -- the safe direction. What remains:
 
-  - **An opaque builtin that indexes inside itself** (`first`, `last`, `nth`, `map`, `add`),
-    alone or after a navigation. jq moves the register through the builtin's own `.[0]`/`.[]`,
-    and the resolver cannot see that, so after a navigation the element is modelled as
-    `MovedRegister::Lost` (an untracked register: refuses where jq answers, and on a `null`
-    document writes at the wrong place -- `(foreach (.a|first) as $k (.; .)) = 9` writes `9`
-    where jq writes `{"a":[9]}`), and *bare* it leaves the resolver's path at the root and reads
-    as a literal, so `path(foreach (first|tostring) as $k (.; .))` on `[1,2,3]` still answers
-    `[]` where jq raises (**the dangerous direction; the 88 above, none of them new**). Tracked
-    as [#3459](https://github.com/rust-works/succinctly/issues/3459).
+  - **A stage the resolver cannot see inside.** jq moves the register through a builtin that
+    indexes inside itself (`first`, `last`, `nth`, `map`, `add`), and the resolver cannot follow
+    that. *Bare*, such a stage leaves the resolver's path at the root and reads as a literal, so
+    `path(foreach (first|tostring) as $k (.; .))` on `[1,2,3]` still answers `[]` where jq
+    raises (**the dangerous direction; the 88 above, none of them new**). After a navigation
+    `first`/`last`/`nth` are navigated natively; any other builtin outside
+    `cannot_move_register`'s allowlist (`reverse`, `ltrimstr`, `startswith`, ...) leaves the
+    element modelled as `MovedRegister::Lost`, an untracked register that refuses where jq
+    answers and, on a `null` document, still writes at the wrong place
+    (`(foreach (.a|reverse) as $k (.; .)) = 9` writes `9` where jq writes `{"a":9}`; identical
+    before #2159). A `?//` chain cannot tell a refusal on a `null` or container element of such a
+    stage from jq's own verdict, so it stops instead of retrying the next alternative:
+    `path(foreach (.a|reverse) as {a:$k} ?// [$k] ?// $k (1; empty))` on `null` raises where jq,
+    and the build before #2159, answer nothing at exit 0 (a non-null scalar element retries --
+    no destructuring step on one can succeed). A nested `foreach` that navigates is read the same
+    way: it hands its values out off the resolver's root path and used to read as a literal that
+    never touched the register (`(foreach (foreach .[]? as $x (0; .+1)) as $k (.; .; .)) = 9` on
+    `{"a":{"a":1},"k":"a"}` replaced the document with `9`; jq raises), and is now a lost
+    register -- a refusal where jq may answer. Tracked as
+    [#3459](https://github.com/rust-works/succinctly/issues/3459).
   - **jq's pointer identity**: the accumulator's node is not carried from one source element to
     the next (`path(foreach (1, .a) as $k (.; .a))`), `tostring` of a string is the same `jv`
     (`path(foreach (.b|tostring) as $k (.; $k))` on `{"b":"s"}` is `["b"]`), and a full slice
