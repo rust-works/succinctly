@@ -3133,8 +3133,9 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 /// It is trailing whitespace either way.
 ///
 /// Diagnostics are reported in `errors`' own order — [`jq::resolve_all_jq`]
-/// walks the tree in source order and only drops the errors jq itself never
-/// reports (those beneath a compile unit with an error of its own, #3391), and
+/// puts them in jq's own order (a block's closures in instruction order, not
+/// always source order, #3583) and drops the errors jq itself never reports
+/// (those beneath a compile unit with an error of its own, #3391), and
 /// real jq interleaves a program's undefined calls and undefined variables by
 /// position rather than grouping by kind (confirmed live: `$bar, foo, $baz`
 /// reports all three left to right), so this function must not re-sort or

@@ -52493,6 +52493,69 @@ fn test_main_body_error_hides_module_def_error_3391() -> Result<()> {
     Ok(())
 }
 
+/// #3583: jq compiles the closures a block owns in the order of its compiled
+/// instructions, not of its source: `a op= b` visits `b` first, `reduce` and
+/// `foreach` visit `init` before the source, and the operands of an operator,
+/// of a C-implemented builtin, of an interpolation and the target of an index
+/// or slice are visited last to first. A block's own errors follow the same
+/// rule only for `reduce`/`foreach` and for the index/slice target.
+///
+/// Compared on the `jq: ` lines, which carry each diagnostic's name,
+/// location, order and the count. Every row is a capture of jq 1.7.1; a name's
+/// digit-free spelling (`ua`, `ub`) is its position in the source.
+#[test]
+fn test_compile_errors_follow_jq_instruction_order_3583() -> Result<()> {
+    let rows: &[(&str, &[&str])] = &[
+        ("map(ua) + map(ub)", &["ub", "ua"]),
+        ("map(ua) + map(ub) + map(uc)", &["uc", "ub", "ua"]),
+        (
+            "[map(ua) + map(ub), map(uc) + map(ud)]",
+            &["ub", "ua", "ud", "uc"],
+        ),
+        ("(map(ua)) += (map(ub))", &["ub", "ua"]),
+        ("(map(ua)) |= (map(ub))", &["ua", "ub"]),
+        ("pow(map(ua); map(ub))", &["ub", "ua"]),
+        ("fma(map(ua); map(ub); map(uc))", &["uc", "ub", "ua"]),
+        ("\"\\(map(ua))\\(map(ub))\\(map(uc))\"", &["uc", "ub", "ua"]),
+        ("reduce ua as $x (ub; uc)", &["ub", "ua", "uc"]),
+        ("reduce ua as [$a, {(ub): $b}] (uc; .)", &["uc", "ua", "ub"]),
+        ("foreach (ua) as $x (ub; uc; ud)", &["ub", "ua", "uc", "ud"]),
+        ("(ua)[ub]", &["ub", "ua"]),
+        ("(ua)[ub:uc]", &["ub", "uc", "ua"]),
+        ("(map(ua))[map(ub):map(uc)]", &["ub", "uc", "ua"]),
+        // Unchanged: a block's own errors under an operator, a call to a
+        // jq-defined function, `and`/`//`, and `.[from:to]`.
+        ("ua + ub", &["ua", "ub"]),
+        ("sub(map(ua); map(ub))", &["ua", "ub"]),
+        ("map(ua) and map(ub)", &["ua", "ub"]),
+        (".[ua:ub]", &["ua", "ub"]),
+    ];
+
+    for (filter, names) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(
+            code, 3,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(
+            stdout, "",
+            "`{filter}` -- a compile error produces no output"
+        );
+        let mut want: Vec<String> = names
+            .iter()
+            .map(|n| format!("jq: error: {n}/0 is not defined at <top-level>, line 1:"))
+            .collect();
+        want.push(format!("jq: {} compile errors", names.len()));
+        let got: Vec<String> = stderr
+            .lines()
+            .filter(|l| l.starts_with("jq: "))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(got, want, "`{filter}` -- stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #2964 review finding, closed by #3085: a same-named `break` inside an
 /// unreferenced `def` used to take the failing break's slot in the
 /// position table, citing column 7. The resolver now counts the skipped
