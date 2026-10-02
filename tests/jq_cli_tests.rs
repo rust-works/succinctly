@@ -61505,6 +61505,11 @@ fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
         (r"false", r"path(.[]? | null)", "", "", 0),
         (r"true", r"path(first | null)", "", "jq: error (at <stdin>:1): Cannot index boolean with number\n", 5),
         (r"false", r"del(false)", "null\n", "", 0),
+        // a deferred trailing iterate after an identical terminal: iterating null never yields, so the path in front of it cannot matter and jq's own (catchable) error or empty result stands
+        (r"null", r"path(.a | 5 | select(true) | null | .[])", "", "jq: error (at <stdin>:1): Cannot iterate over null (null)\n", 5),
+        (r"null", r"path(.a | 5 | select(true) | null | .[]?)", "", "", 0),
+        (r"null", r"[path(.a | 5 | select(true) | null | .[])?]", "[]\n", "", 0),
+        (r"null", r#"try path(.a | 5 | select(true) | null | .[]) catch "C""#, "\"C\"\n", "", 0),
     ])
 }
 

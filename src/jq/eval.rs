@@ -48285,8 +48285,17 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                 // navigated, this resolver cannot say where the register is
                 // (a stage between may have dropped it), so it refuses, as it
                 // already does on `{"a":null}`.
+                //
+                // Except before a deferred trailing iterate (`near_iterate`,
+                // `path(... | null | .[])`): the value about to be iterated is
+                // `null`/`true`/`false`, which jq's `.[]` never yields from --
+                // it raises `Cannot iterate over null`, or yields nothing under
+                // `?` -- so the path in front of it cannot reach any output and
+                // the carve-out stays harmless. Refusing there would turn jq's
+                // own catchable error into an uncatchable one
+                // (`[path(.a | 5 | select(true) | null | .[])?]` is `[]` in jq).
                 let identical = S::TAG == EvalTag::Jq && null_bool_identical(&branch.value, input);
-                if identical && branch.path.depth() == 0 {
+                if identical && (near_iterate || branch.path.depth() == 0) {
                     // emission: mirror the navigation family's identical
                     // seed (#2691) -- the identical literal carried through
                     // the *root* (empty) path answers `[]` in real jq 1.7.1.
@@ -48308,22 +48317,18 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                     ));
                 }
                 // #3579: an `identical` terminal that got past the carve-out
-                // above has a non-empty path, i.e. it was declined *because*
-                // the pipe navigated. That refusal is this resolver's guess,
-                // not jq's verdict. Navigating a `null` (or `true`/`false`)
-                // document only ever reaches an equal `null` (or an error), so
-                // jq holds the register at a node *identical* to this terminal
-                // and answers. Caught, the guess silently lost the write jq
-                // makes, so it is uncatchable, as every other guessed refusal
-                // is (#3267, ADR-0018 rule 4).
-                violation = Some(if !identical {
-                    refusal()
-                } else if near_iterate {
-                    EvalError::invalid_path_expression_near_iterate(&branch.value)
-                        .into_guessed_path_refusal()
-                        .into()
-                } else {
+                // above has a non-empty path and no deferred iterate, i.e. it
+                // was declined *because* the pipe navigated. That refusal is
+                // this resolver's guess, not jq's verdict. Navigating a `null`
+                // (or `true`/`false`) document only ever reaches an equal
+                // `null` (or an error), so jq holds the register at a node
+                // *identical* to this terminal and answers. Caught, the guess
+                // silently lost the write jq makes, so it is uncatchable, as
+                // every other guessed refusal is (#3267, ADR-0018 rule 4).
+                violation = Some(if identical {
                     EvalError::invalid_path_expression_guessed(&branch.value).into()
+                } else {
+                    refusal()
                 });
                 refused_at = Some(terminal_retry::current());
                 return Demand::Stop;

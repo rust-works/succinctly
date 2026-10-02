@@ -2659,7 +2659,10 @@ answers `["b"]` — and classified the two residuals appended below):
   $x, .b)` on `null` refuses in both, but jq's message is `near attempt to access element "b" of 7`
   (it accepted the first branch) and this resolver's is `with result null` (exit 5 either way).
   `path(.a | null)`, `path(.a | 5 | null)`, `path(.a as $x | .a | 5 | $x)` and the rest of the
-  carve-out's own cases are unchanged and still match jq. Pinned by
+  carve-out's own cases are unchanged and still match jq. So is a path that ends in a bare iterate
+  after such a terminal (`path(.a | 5 | select(true) | null | .[])`): `.[]` on `null` never yields, it
+  raises jq's own catchable `Cannot iterate over null` (or nothing, under `?`), so the path in front of
+  it cannot reach any output and the carve-out still applies. Pinned by
   `test_terminal_null_after_a_navigation_refuses_loudly_3579` and
   `test_terminal_null_carve_out_keeps_its_answers_3579`.
 
