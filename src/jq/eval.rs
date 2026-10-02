@@ -40274,11 +40274,13 @@ fn getpath_preserves_register<S: EvalSemantics>(
 /// - **An untracked branch.** A trackable one is its own register, so there
 ///   is nothing to carry.
 /// - **The element is a recurse-family node**, seen through `Paren`,
-///   `Shared`, `Optional` and `try` (with or without a handler -- the handler
-///   only ever runs *after* the seed). Not through `Pipe`, `Comma`, `If` or a
-///   call (`first(..)`, `limit(n; ..)`): their first output is not provably
-///   the seed, and naming a call's body is what [`cannot_move_register`]
-///   refuses to do. Those stay refuse-only.
+///   `Shared` (resolved exactly as a paren is, #3149), `Optional` and `try`.
+///   A `try`'s handler only ever runs *after* the seed, so the seed is covered
+///   with or without one -- the handler's own output is not, and still
+///   refuses (#3580). Not through `Pipe`, `Comma`, `If` or a call
+///   (`first(..)`, `limit(n; ..)`): their first output is not provably the
+///   seed, and naming a call's body is what [`cannot_move_register`] refuses
+///   to do. Those stay refuse-only.
 ///
 /// The caller consumes this on the **first** step the stage delivers only.
 /// That step is always the seed: `resolve_node_sink`'s jq untracked arm,
@@ -47683,7 +47685,10 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // navigation -- which leaves jq's register where it was, whatever the later
     // outputs do ([`recurse_seed_keeps_register`]). Consumed by the first step
     // delivered, so only the seed can use it.
-    let mut seed_pending = recurse_seed_keeps_register::<S>(element, branch_trackable);
+    // Only asked when the stage would otherwise drop the register: a stage
+    // that already preserves it has nothing for the seed to add.
+    let mut seed_pending =
+        !stage_preserves_register && recurse_seed_keeps_register::<S>(element, branch_trackable);
     let mut place_step = |step: PathBranch<'a>| -> Demand {
         // #3293: only a `?//` retry re-invokes this after a stop.
         downstream.begin();
@@ -109550,6 +109555,14 @@ mod tests {
             &shared("1"),
             false
         ));
+        // ... but only as transparent as one: a parameter that wraps a pipe, a
+        // fork or a call is not provably the seed either.
+        for filter in [".. | .", "(.., 1)", "first(..)", "(.. | select(true))"] {
+            assert!(
+                !recurse_seed_keeps_register::<JqSemantics>(&shared(filter), false),
+                "{filter}"
+            );
+        }
         // A trackable branch is its own register, so there is nothing to carry.
         let recursion = parse("..").unwrap();
         assert!(!recurse_seed_keeps_register::<JqSemantics>(
@@ -109598,13 +109611,67 @@ mod tests {
     /// removed.
     #[test]
     fn test_yq_mode_recurse_seed_register_unchanged_3272() {
-        yq_query!(
-            br#"{"a":{"b":{"b":null}},"c":2}"#,
+        for filter in [
             r"path(. as $x | 1 | .. | $x)",
-            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
-                assert_eq!(e.message, "Invalid path expression with result 1");
+            r"path(. as $x | 1 | recurse | $x)",
+            r"path(. as $x | 1 | recurse(.a) | $x)",
+            r"path(. as $x | 1 | recurse(.a; true) | $x)",
+            r"[path(. as $x | 1 | try (.. | $x))]",
+        ] {
+            yq_query!(
+                br#"{"a":{"b":{"b":null}},"c":2}"#,
+                filter,
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    assert_eq!(e.message, "Invalid path expression with result 1", "{filter}");
+                }
+            );
+        }
+    }
+
+    /// The contract the seed exemption rests on: every recurse-family producer
+    /// delivers its seed first -- a zero-component passthrough of its input,
+    /// still untracked -- before anything that navigates. `resolve_seq_stage`
+    /// spends the exemption on the first step a stage delivers, so a producer
+    /// that emitted anything ahead of its seed would carry jq's register onto a
+    /// navigated or computed value. Read from three producers by hand when the
+    /// rule was added (`resolve_node_sink`'s jq untracked arm,
+    /// [`resolve_recursive_descent_sink`], [`resolve_recurse_sink`]); this makes
+    /// that reading a test.
+    #[test]
+    fn test_recurse_producers_deliver_their_seed_first_3272() {
+        let nested = OwnedValue::array_from(vec![
+            OwnedValue::Int(1),
+            OwnedValue::array_from(vec![OwnedValue::Int(2)]),
+        ]);
+        for value in [OwnedValue::Int(1), OwnedValue::Null, nested] {
+            for filter in [
+                "..",
+                "recurse",
+                "recurse(.[]?)",
+                "recurse(.[]?; true)",
+                "recurse(empty)",
+            ] {
+                let expr = parse(filter).unwrap();
+                let frame = Frame::enter(&expr);
+                let mut delivered = Vec::new();
+                let flow = resolve_node_sink::<JqSemantics>(
+                    &expr,
+                    &value,
+                    false,
+                    &Snapshot::No,
+                    &frame,
+                    Keep::AtMost(usize::MAX),
+                    &mut |branch| {
+                        delivered.push((branch.path.depth(), (*branch.value).clone()));
+                        assert!(!branch.trackable, "{filter}");
+                        Demand::Stop
+                    },
+                );
+                assert!(matches!(flow, ResolveFlow::Stopped), "{filter}: {flow:?}");
+                // Stopped at the first delivery, which is the seed itself.
+                assert_eq!(delivered, [(0, value.clone())], "{filter}");
             }
-        );
+        }
     }
 
     /// The register resets between source elements, `getpath` or not: the

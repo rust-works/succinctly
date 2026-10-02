@@ -2617,9 +2617,13 @@ answers `["b"]` — and classified the two residuals appended below):
   `del`/`=`/`|=` over the `try` form refused where jq writes. `resolve_seq_stage` now keeps the
   register across the stage's **first delivered step only**, which every recurse producer emits
   as `recurse_family_root_seed` (`recurse_seed_keeps_register`: jq mode, an untracked branch, and
-  a recurse-family node seen through `Paren`, a closure parameter, `?` or `try`). It is the same
-  per-branch shape as `getpath` below, and a debug assertion trips if a producer ever emits
-  something ahead of its seed. yq mode keeps its eager guard.
+  a recurse-family node seen through `Paren`, a closure parameter, `?` or `try`). It is
+  `getpath`'s per-branch rule (below) taken one step finer, **per output**: it covers the seed
+  and nothing after it, so it cannot be folded into the per-stage `stage_preserves_register`
+  verdict, which would carry the register across every output of the recursion and fabricate
+  paths. A debug assertion trips if a producer ever emits something ahead of its seed, and
+  `test_recurse_producers_deliver_their_seed_first_3272` pins that each producer delivers it
+  first. yq mode keeps its eager guard.
 
   **What still refuses**, each loudly (an exit 5, never a write that is silently lost) and
   pinned by `test_recurse_seed_residuals_stay_loud_3272`:
