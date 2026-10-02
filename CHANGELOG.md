@@ -428,8 +428,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The cursor route measured the source spelling instead (3, 4, 3, 4), and so did every program
   that reached the number through a cursor (`[.arr[] | length]`, `.. | length`, `as $v | $v`).
   The width now comes from the same rendering the owned-number path already used
-  (`numeric_length_owned`), so the two cannot disagree. A YAML document is untouched: go-yaml
-  keeps a scalar's source text as its value, and `a: 2.0` is width 3 in yq and here.
+  (`numeric_length_owned`), so the two cannot disagree. A YAML document read directly is
+  untouched: go-yaml keeps a scalar's source text as its value, and `a: 2.0` is width 3 in yq and
+  here. Two differences remain, both filed: a YAML number that reaches `length` as an owned value
+  (`load()`, `to_entries`, `map_values`) is still measured by its rendered value, where yq
+  measures the text (#3604); and an integer past `2^53` keeps its exact digits where yq rounds it
+  through `float64`, so its width differs (#3605, which differs in the printed value too).
 
 - **yq: a whole-number JSON float is an integer, as in yq** (#3577). yq's JSON decoder types `2.0`,
   `1e2`, `-0.0` and `9223372036854775808.0` as `!!int`, and keeps `2.5`, `1e19`, `1e20` and `1e300`
