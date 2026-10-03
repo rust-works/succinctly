@@ -469,6 +469,15 @@ REBUILDS = [
     # handler) runs through `eval.rs`'s owned-value evaluator instead, which
     # stays refuse-only until Stage B (docs/plan/jq-bind-origin-frame.md).
     "({} + .)", "(. + {a:1})", "([.[]])", "map(.)", "({k:{a:1}} | .k)",
+    # #3241: a fold whose UPDATE is an owned assignment runs on the owned
+    # state while the embed table is live. Writing into the accumulator copies
+    # a registered container first, so the bound document itself stops being
+    # the node (`reduce ... (.; .z = 1)` must keep refusing for `$x` at the
+    # root), while a child the write left alone is still the binding's own
+    # (`{w: .}` wrapped, `[.]` wrapped, a `//=` that keeps the old value).
+    "(reduce (1) as $i (.; .z = 1))", "(reduce (1) as $i ({w: .}; .z = 1) | .w)",
+    "(reduce (1,2) as $i ([.]; .[$i] = $i) | .[0])",
+    "(reduce (1) as $i ({w: .}; .w //= 1) | .w)",
 ]
 # Writes and reads through the root marker; every key is present in `doc`.
 ROOT_USES = [

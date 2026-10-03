@@ -75813,6 +75813,242 @@ fn test_owned_embed_peel_and_fold_arms_refuse_cleanly_2889() -> Result<()> {
 }
 
 // ============================================================================
+// #3241: a fold's owned assignment step runs while a bind's embed table is live
+// ============================================================================
+
+/// A fold inside an `as` binding that holds a document node used to skip the
+/// owned assignment step and re-index its accumulator on every step (O(n²)).
+/// The step now runs under the #2889 embed table, which it can because it
+/// reads no marker and a write to a registered container copies it first --
+/// so what the write left alone is still the binding's own node, as in jq's
+/// `jv_setpath`. Every row is captured from `/usr/bin/jq` 1.7.1 and
+/// byte-identical to it; `main` refused the `//=` one (`alt-keeps-child`).
+///
+/// Rows that rest on storage identity hold only in the shipped, shared-
+/// container build: under `unshared-containers` (the #2999 A/B holdout) a
+/// clone deep-copies, so those answer by refusing instead (the safe
+/// direction), and the known bind-origin failure list there is unchanged.
+#[test]
+#[cfg(not(feature = "unshared-containers"))]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_fold_assign_under_embed_table_matches_jq_3241() -> Result<()> {
+    let input = r#"{"a":{"k":1},"b":2}"#;
+    for (filter, want) in [
+        // child-path
+        (
+            r".a as $u | reduce (1) as $i (.; .z = 1) | .a | path($u)",
+            r"[]",
+        ),
+        // child-write
+        (
+            r".a as $u | reduce (1) as $i (.; .z = 1) | .a | ($u.k) = 9",
+            r#"{"k":9}"#,
+        ),
+        // child-key-path
+        (
+            r".a as $u | reduce (1) as $i (.; .z = 1) | .a | path($u.k)",
+            r#"["k"]"#,
+        ),
+        // wrapped-root-write
+        (
+            r". as $d | reduce (1) as $i ({w: $d}; .z = 1) | .w | ($d.b) = 9",
+            r#"{"a":{"k":1},"b":9}"#,
+        ),
+        // array-acc-element
+        (
+            r". as $d | reduce (1,2) as $i ([$d]; .[$i] = $i) | .[0] | path($d)",
+            r"[]",
+        ),
+        // alt-keeps-child
+        (
+            r".a as $u | reduce (1) as $i ({w:$u}; .w //= 5) | .w | path($u)",
+            r"[]",
+        ),
+        // add-object-keeps-child
+        (
+            r".a as $u | reduce (1) as $i ({w:$u}; .w += {}) | .w | path($u)",
+            r"[]",
+        ),
+        // add-null-keeps-child
+        (
+            r".a as $u | reduce (1) as $i ({w:$u}; .w += null) | .w | path($u)",
+            r"[]",
+        ),
+        // update-add-null-keeps-child
+        (
+            r".a as $u | reduce (1) as $i ({w:$u}; .w |= . + null) | .w | path($u)",
+            r"[]",
+        ),
+        // mul-object-keeps-child
+        (
+            r".a as $u | reduce (1) as $i ({w:$u}; .w *= {}) | .w | path($u)",
+            r"[]",
+        ),
+        // del-write-through
+        (
+            r".a as $u | reduce (1) as $i ({w:$u}; .x = 1) | .w | del($u.k)",
+            r"{}",
+        ),
+        // update-write-through
+        (
+            r".a as $u | reduce (1) as $i ({w:$u}; .x = 1) | .w | ($u.k) |= 7",
+            r#"{"k":7}"#,
+        ),
+        // multi-step
+        (
+            r".a as $u | reduce (1,2) as $i ({w:$u}; .[$i|tostring] = $i) | .w | path($u)",
+            r"[]",
+        ),
+        // loc
+        (
+            r". as $d | reduce (1) as $i (.; .[$__loc__.line|tostring] = 1) | keys",
+            r#"["1","a","b"]"#,
+        ),
+        // first
+        (
+            r". as $d | first(reduce (1,2) as $i ({}; .x[$i] = 1))",
+            r#"{"x":[null,1,1]}"#,
+        ),
+        // limit-foreach
+        (
+            r". as $d | [limit(1; foreach (1,2,3) as $i ({}; .[$i|tostring] = $i))]",
+            r#"[{"1":1}]"#,
+        ),
+        // try-catch
+        (
+            r#". as $d | try (reduce (1,2) as $i ({}; .[$i|tostring] = $i, error("x"))) catch ."#,
+            r#""x""#,
+        ),
+        // multi-output-rhs
+        (r". as $d | reduce (1) as $i ({}; .a = (1,2))", r#"{"a":2}"#),
+        // init-doc-nested-write
+        (
+            r#". as $d | reduce ("a") as $k (.; .[$k].k = 5) | .a"#,
+            r#"{"k":5}"#,
+        ),
+        // rhs-document-field
+        (
+            r". as $d | reduce (1,2) as $i ([]; .[$i] = $d.b)",
+            r"[null,2,2]",
+        ),
+        // rhs-marker-bind
+        (
+            r#". as $d | reduce ("a") as $k ({}; .[$k] = $d) | .a | path($d)"#,
+            r"[]",
+        ),
+        // wrapped-acc-field
+        (
+            r". as $d | reduce range(5) as $i ({d: $d}; .n = $i) | .n",
+            r"4",
+        ),
+        // compound-keys
+        (
+            r#". as $d | reduce ("x","y") as $k (.; .[$k] += 1) | keys"#,
+            r#"["a","b","x","y"]"#,
+        ),
+        // compound-sum
+        (r". as $d | reduce (1,2,3) as $i ({}; .a += $i) | .a", r"6"),
+        // alt-first-wins
+        (r". as $d | reduce (1,2,3) as $i ({}; .a //= $i) | .a", r"1"),
+        // update-add
+        (
+            r". as $d | reduce (1,2,3) as $i (.; .b |= . + $i) | .b",
+            r"8",
+        ),
+        // deep-field
+        (r". as $d | reduce (1,2) as $i (.; .a.k = $i) | .a.k", r"2"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (want, 0),
+            "#3241: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The refusing half of [`test_fold_assign_under_embed_table_matches_jq_3241`]:
+/// every shape jq itself refuses must still exit 5 with jq's own text, which
+/// is what pins that lifting the guard does not fabricate an identity the
+/// write destroyed (the accumulator being the bound document itself, a child
+/// reached through a node the write replaced, a combine that allocates in jq
+/// too) or swallow an error raised mid-fold.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_fold_assign_under_embed_table_still_refuses_3241() -> Result<()> {
+    let input = r#"{"a":{"k":1},"b":2}"#;
+    for (filter, want_stderr) in [
+        // add-array-errors
+        (
+            r".a as $u | reduce (1) as $i ({w:$u}; .w += []) | .w | path($u)",
+            r#"object ({"k":1}) and array ([]) cannot be added"#,
+        ),
+        // del-scalar-refuses
+        (
+            r".b as $u | reduce (1) as $i ({w:$u}; .x = 1) | .w | del($u.k)",
+            r#"Cannot index number with string "k""#,
+        ),
+        // init-root-refuses
+        (
+            r". as $d | reduce (1) as $i ($d; .z = 1) | path($d)",
+            r#"Invalid path expression with result {"a":{"k":1},"b":2}"#,
+        ),
+        // init-root-child-refuses
+        (
+            r". as $d | reduce (1) as $i ($d; .z = 1) | .a | path($d.a)",
+            r#"Invalid path expression near attempt to access element "a" of {"a":{"k":1},"b":2}"#,
+        ),
+        // wrapped-child-refuses
+        (
+            r". as $d | reduce (1) as $i ({w:$d}; .w.z = 1) | .w.a | path($d.a)",
+            r#"Invalid path expression near attempt to access element "a" of {"a":{"k":1},"b":2}"#,
+        ),
+        // sub-array-refuses
+        (
+            r".a as $u | reduce (1) as $i ({w:$u}; .w -= []) | .w | path($u)",
+            r#"object ({"k":1}) and array ([]) cannot be subtracted"#,
+        ),
+        // fold-then-write-refuses
+        (
+            r". as $x | reduce (1) as $i (.; .q = 1 | ($x.a) = 9)",
+            r#"Invalid path expression near attempt to access element "a" of {"a":{"k":1},"b":2}"#,
+        ),
+        // write-after-fold-refuses
+        (
+            r". as $x | reduce (1) as $i (.; .q = 1) | ($x.a) = 9",
+            r#"Invalid path expression near attempt to access element "a" of {"a":{"k":1},"b":2}"#,
+        ),
+        // foreach-extract-refuses
+        (
+            r". as $x | [foreach (1,2) as $i (.; .[$i|tostring] = $i; path($x))]",
+            r#"Invalid path expression with result {"a":{"k":1},"b":2}"#,
+        ),
+        // error-mid-fold
+        (
+            r#". as $d | reduce (1,2) as $i ({}; .x[$i|tostring] = ($i | if . == 2 then error("boom") else . end))"#,
+            r"boom",
+        ),
+        // path-mode-fold
+        (
+            r". as $d | path(reduce (1) as $i (.; .a = 1))",
+            r#"Invalid path expression with result {"a":1,"b":2}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3241: `{filter}` must refuse, got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(want_stderr),
+            "#3241: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
 // #2978: an identity-passthrough bind (`. as $x`) inside a resolver
 // invocation carries the position `.` was frozen at, so `getpath` can
 // compose one from it
