@@ -10132,19 +10132,36 @@ pub(crate) enum OwnedStep {
 /// Consume a unique computed state when an eligible update can reuse its
 /// copy-on-write container. A decline returns the untouched original so the
 /// caller can take its existing evaluator route exactly once.
-pub(crate) fn try_eval_owned_step<S: EvalSemantics>(
-    expr: &Expr,
-    mut state: OwnedValue,
-) -> OwnedStep {
+pub(crate) fn try_eval_owned_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
     if is_owned_assign(expr) {
-        return match owned_assign_step::<S>(expr, &mut state) {
-            Some(Ok(())) => OwnedStep::Handled(Ok(state)),
-            Some(Err(error)) => OwnedStep::Handled(Err(error)), // omni-dev: coverage tolerate-line reason="reachable only on a genuine allocation failure: owned_assign_step's single-step arms map every non-allocation error to unreachable_owned_assign_write (provably impossible, see its own doc comment), and its Chain arm's set_path call walks exactly the steps owned_assign_step_child already validated as Field-into-Object/Null or Index-in-[0,len]-into-Array/Null with no mutation in between, so the only way set_path/set_field/set_index/pad_with_nulls can still fail is the same try_reserve-fails-under-OOM branch the codebase already tolerates elsewhere (#2267) (#3138)"
-            None => OwnedStep::Declined(state),
-        };
+        return try_owned_assign_step::<S>(expr, state);
     }
     match eval_owned_reindex_free::<S>(expr, &state) {
         Some(result) => OwnedStep::Handled(result),
+        None => OwnedStep::Declined(state),
+    }
+}
+
+/// The assignment half of [`try_eval_owned_step`]: [`owned_assign_step`] over
+/// a consumed state, declining (the untouched state handed back) for anything
+/// that is not one of [`is_owned_assign`]'s four operators.
+///
+/// Split out so a caller that must stay off [`eval_owned_reindex_free`]'s
+/// other arms -- `to_entries`/`from_entries` and the pipes of them, which
+/// [`eval_owned_relocating_fold`] answers under the #2889 embed table -- can
+/// still take the assignment step (#3241). That scope is then structural: a
+/// later arm added to `try_eval_owned_step` cannot silently start running
+/// under the table.
+pub(crate) fn try_owned_assign_step<S: EvalSemantics>(
+    expr: &Expr,
+    mut state: OwnedValue,
+) -> OwnedStep {
+    if !is_owned_assign(expr) {
+        return OwnedStep::Declined(state);
+    }
+    match owned_assign_step::<S>(expr, &mut state) {
+        Some(Ok(())) => OwnedStep::Handled(Ok(state)),
+        Some(Err(error)) => OwnedStep::Handled(Err(error)), // omni-dev: coverage tolerate-line reason="reachable only on a genuine allocation failure: owned_assign_step's single-step arms map every non-allocation error to unreachable_owned_assign_write (provably impossible, see its own doc comment), and its Chain arm's set_path call walks exactly the steps owned_assign_step_child already validated as Field-into-Object/Null or Index-in-[0,len]-into-Array/Null with no mutation in between, so the only way set_path/set_field/set_index/pad_with_nulls can still fail is the same try_reserve-fails-under-OOM branch the codebase already tolerates elsewhere (#2267) (#3138)"
         None => OwnedStep::Declined(state),
     }
 }
@@ -10423,6 +10440,12 @@ enum OwnedAssignRhs {
 /// Not only the fold loops reach this: [`eval_owned_reindex_free`] answers
 /// the same shapes for any owned input (`map(.k = 1)` over a constructed
 /// array), on a copy-on-write clone of it.
+///
+/// It runs while the #2889 embed table is live too (#3241): it reads no
+/// marker and no table entry, and a write to a container the table registered
+/// copies it first (see [`fold_step_each`] for the argument in full). Only the
+/// fold loops take it there; [`eval_owned_reindex_free`]'s other callers stay
+/// off it under the table.
 fn owned_assign_step<S: EvalSemantics>(
     expr: &Expr,
     state: &mut OwnedValue,
@@ -51109,20 +51132,41 @@ fn fold_step_each<S: EvalSemantics>(
         // `may_enter_resolver_node`'s shapes, so the per-element copy needs
         // no walk of its own (that walk was +3% on a tight `reduce` over 24k
         // elements, 7950X).
-        None if super::eval_generic::embed_table_active() => {
-            eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
-        }
-        None => match try_eval_owned_step::<S>(expr, state) {
-            OwnedStep::Handled(Ok(value)) => match on_update(value) {
-                Demand::Continue => Flow::Exhausted,
-                Demand::Stop => Flow::Stopped { pending: None },
-            },
-            OwnedStep::Handled(Err(_)) if optional => Flow::Exhausted,
-            OwnedStep::Handled(Err(error)) => Flow::Escaped(Control::Error(error)),
-            OwnedStep::Declined(state) => {
-                eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
+        //
+        // #3241: while the #2889 embed table is live (the fold runs inside an
+        // `as` binding that holds a document node) only the assignment half of
+        // the owned step runs; `to_entries`/`from_entries` stay on the bridge,
+        // where [`eval_owned_relocating_fold`] owns them. The assignment step
+        // is sound under the table because it reads neither the table nor a
+        // marker (its right side and keys must be [`closed_expr_to_owned`],
+        // and an `Expr::TrackedVar` is never closed -- so #3181's witnessed
+        // UPDATE, which always carries one, declines to the route above), and
+        // it never writes a container the table registered in place: a
+        // registered container has at least two strong references (the
+        // table's own and the binding's), so `Rc::make_mut` copies it first
+        // and the entry keeps witnessing the unmodified original. The copy
+        // shares its untouched children, as jq's `jv_setpath` does, so a later
+        // `path()`/write through the binding can still see them as that
+        // binding's nodes -- a refusal on the bridge, an answer here. yq mode
+        // never populates the table, so this arm is a no-op there.
+        None => {
+            let step = if super::eval_generic::embed_table_active() {
+                try_owned_assign_step::<S>(expr, state)
+            } else {
+                try_eval_owned_step::<S>(expr, state)
+            };
+            match step {
+                OwnedStep::Handled(Ok(value)) => match on_update(value) {
+                    Demand::Continue => Flow::Exhausted,
+                    Demand::Stop => Flow::Stopped { pending: None },
+                },
+                OwnedStep::Handled(Err(_)) if optional => Flow::Exhausted,
+                OwnedStep::Handled(Err(error)) => Flow::Escaped(Control::Error(error)),
+                OwnedStep::Declined(state) => {
+                    eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
+                }
             }
-        },
+        }
     }
 }
 
@@ -70320,8 +70364,9 @@ mod tests {
 
     /// #3138: the fold loops' own wiring around [`owned_assign_step`] --
     /// `reduce`, `foreach`, `until`, the `?//` alternative retry, and a fold
-    /// under an `as` binding (the #2889 embed table, which skips the owned
-    /// step) -- end to end. Every expected output is captured from jq 1.7.1.
+    /// under an `as` binding (the #2889 embed table, where #3241 lets the
+    /// assignment step run; its own tests are the `_3241` ones) -- end to end.
+    /// Every expected output is captured from jq 1.7.1.
     #[test]
     fn owned_assign_step_fold_rows_match_jq_3138() {
         let records =
@@ -70413,6 +70458,296 @@ mod tests {
             unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this arm only fires if `state` stopped being an Object, which every write in the loop above preserves (#3138)"
         };
         assert_eq!(fields.len(), 65);
+    }
+
+    /// #3241: a fold step takes the owned assignment while the #2889 embed
+    /// table is live -- a fold running inside `. as $d | ...` -- where it used
+    /// to take the reindex bridge on every step and stay O(n²).
+    ///
+    /// The unchanged sibling's text is the same allocation after every step
+    /// (the bridge re-materializes the whole accumulator, so the pointer would
+    /// move), and the table is asserted live first so this cannot pass by
+    /// running the route it replaced.
+    ///
+    /// `unshared-containers` is the measurement holdout where a clone
+    /// deep-copies, which the table's entry (a clone of the bound value)
+    /// relies on; the shipped sharing is what this is about, so it does not
+    /// run there. Nor without `std`, where the table is a stub that is never
+    /// live.
+    #[test]
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    fn fold_step_each_takes_owned_assign_under_embed_table_3241() {
+        use crate::jq::eval_generic::{embed_table_active, embed_table_push};
+
+        let bound = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 1,
+        };
+        let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound.clone());
+        assert!(embed_table_active(), "the table must be live");
+
+        let literal = "x".repeat(100_000);
+        let mut state =
+            OwnedValue::object_from([("keep".to_string(), OwnedValue::string(&literal))]);
+        let text_ptr = |state: &OwnedValue| match state {
+            OwnedValue::Object(fields) => match fields.get("keep") {
+                Some(OwnedValue::String(text)) => text.as_ptr(),
+                other => panic!("missing sibling: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if the tracked \"keep\" field stopped being a String, which nothing in this test ever touches (#3241)"
+            },
+            other => panic!("expected object: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if `state` stopped being an Object, which every owned_assign_step write in the loop below preserves (#3241)"
+        };
+        let before = text_ptr(&state);
+        for i in 0..64 {
+            let key = OwnedValue::string(alloc::format!("k{i}"));
+            let expr = substitute_vars(&parse(".[$k] = $k").unwrap(), [("k", &key)]);
+            let mut produced = Vec::new();
+            let flow =
+                fold_step_each::<JqSemantics>(&expr, state, false, Reentry::Proven, &mut |value| {
+                    produced.push(value);
+                    Demand::Continue
+                });
+            assert!(matches!(flow, Flow::Exhausted), "step {i}");
+            assert_eq!(produced.len(), 1, "step {i} reports exactly one update");
+            state = produced.pop().expect("one update");
+        }
+        assert_eq!(text_ptr(&state), before, "the unchanged sibling was copied");
+        let OwnedValue::Object(fields) = &state else {
+            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this arm only fires if `state` stopped being an Object, which every write in the loop above preserves (#3241)"
+        };
+        assert_eq!(fields.len(), 65);
+
+        // `to_entries` is the other arm of `try_eval_owned_step`; under the
+        // table it stays on the bridge (`eval_owned_relocating_fold` owns it),
+        // so the step that reaches `fold_step_each` as a decline is handed to
+        // `eval_each_owned` and still answers.
+        let entries = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let mut produced = Vec::new();
+        let flow = fold_step_each::<JqSemantics>(
+            &parse("to_entries").unwrap(),
+            entries,
+            false,
+            Reentry::Proven,
+            &mut |value| {
+                produced.push(value);
+                Demand::Continue
+            },
+        );
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(
+            produced,
+            [OwnedValue::array_from(vec![OwnedValue::object_from([
+                ("key".to_string(), OwnedValue::string("a")),
+                ("value".to_string(), OwnedValue::Int(1)),
+            ])])]
+        );
+        assert!(matches!(
+            try_owned_assign_step::<JqSemantics>(
+                &parse("to_entries").unwrap(),
+                OwnedValue::object_from([])
+            ),
+            OwnedStep::Declined(_)
+        ));
+    }
+
+    /// #3241: the owned assignment never writes a container the embed table
+    /// registered in place. The state *is* the bound value here (the worst
+    /// case: INIT `$d`), so it and the table's entry share storage; the write
+    /// has to copy first, leaving the entry witnessing the unmodified
+    /// original, while the copy keeps sharing the children it did not touch --
+    /// as jq's `jv_setpath` does.
+    #[test]
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    fn owned_assign_step_copies_a_registered_container_3241() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let build = || {
+            OwnedValue::object_from([
+                (
+                    "a".to_string(),
+                    OwnedValue::object_from([("k".to_string(), OwnedValue::Int(1))]),
+                ),
+                ("b".to_string(), OwnedValue::Int(2)),
+            ])
+        };
+        let bound = build();
+        let origin = BindOrigin::Node {
+            node: 7,
+            document: 42,
+        };
+        let witness = RootWitness::Node {
+            node: 7,
+            document: 42,
+        };
+        let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound.clone());
+        assert_eq!(
+            RootWitness::of_owned::<JqSemantics>(&bound),
+            witness,
+            "the bound value is the registered node"
+        );
+
+        let state = bound.clone();
+        let OwnedStep::Handled(Ok(written)) =
+            try_owned_assign_step::<JqSemantics>(&parse(".z = 1").unwrap(), state)
+        else {
+            panic!("the assignment was not handled"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined or errored on the single closed assignment this test drives (#3241)"
+        };
+
+        assert_eq!(bound, build(), "the bound value was written through");
+        assert_eq!(
+            RootWitness::of_owned::<JqSemantics>(&bound),
+            witness,
+            "the entry still witnesses the original"
+        );
+        assert_eq!(
+            RootWitness::of_owned::<JqSemantics>(&written),
+            RootWitness::Owned,
+            "the write copied off the registered storage"
+        );
+        let (OwnedValue::Object(before), OwnedValue::Object(after)) = (&bound, &written) else {
+            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- both values are built as objects above and an object assignment keeps its kind (#3241)"
+        };
+        assert!(
+            after
+                .get("a")
+                .expect("kept child")
+                .shares_storage_with(before.get("a").expect("original child")),
+            "an untouched child is still the bound node's own"
+        );
+        assert_eq!(after.get("z"), Some(&OwnedValue::Int(1)));
+    }
+
+    /// #3241: an UPDATE holding a marker is never closed, so the owned
+    /// assignment declines it and the step takes the evaluator route with the
+    /// witness #3181 gives it. A marker is how a binding's node reaches the
+    /// UPDATE, so a step that answered one here could not keep the identity
+    /// it names. Every position a marker can sit in -- the right side, a
+    /// computed key, a parenthesised target -- and both origins.
+    #[test]
+    fn owned_assign_step_declines_markers_3241() {
+        let value = OwnedValue::object_from([("k".to_string(), OwnedValue::Int(1))]);
+        let state = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(0))]);
+        let untracked = Expr::TrackedVar(Rc::new(Tracked {
+            value: value.clone(),
+            origin: Origin::Untracked,
+            node: None,
+        }));
+        let mut exprs = Vec::new();
+        for src in [
+            ".a = $m",
+            ".[$m.k | tostring] = 1",
+            "($m.k) = 9",
+            ".a += $m",
+        ] {
+            exprs.push((
+                src,
+                substitute_var_tracked(&parse(src).unwrap(), "m", &value),
+            ));
+        }
+        exprs.push((
+            "demoted marker",
+            Expr::Assign {
+                path: Box::new(Expr::Field("a".to_string())),
+                value: Box::new(untracked),
+            },
+        ));
+        for (src, expr) in exprs {
+            let OwnedStep::Declined(returned) =
+                try_owned_assign_step::<JqSemantics>(&expr, state.clone())
+            else {
+                panic!("a marker-bearing UPDATE was handled: {src}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step answered an UPDATE holding an Expr::TrackedVar, which closed_expr_to_owned rejects (#3241)"
+            };
+            assert_eq!(returned, state, "{src}: the declined state is untouched");
+        }
+    }
+
+    /// #3241: the fold loops' value output is the same with the embed table
+    /// live as it is on the reindex bridge the guard used to force -- the
+    /// differential of `owned_assign_step_agrees_with_forced_bridge_3138`,
+    /// re-run through `fold_step_each` with an entry registered.
+    #[test]
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    fn fold_step_each_embed_active_matches_forced_bridge_3241() {
+        use crate::jq::eval_generic::{embed_table_active, embed_table_push};
+
+        let bound = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 1,
+        };
+        let _guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound.clone());
+        assert!(embed_table_active(), "the table must be live");
+
+        let key = OwnedValue::string("User7");
+        let score = OwnedValue::from_number_literal::<JqSemantics>("70");
+        let object = OwnedValue::object_from([
+            ("User7".to_string(), OwnedValue::Int(1)),
+            ("a".to_string(), OwnedValue::Bool(false)),
+        ]);
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(0), OwnedValue::Int(1)]);
+        for (src, input) in [
+            (".[$k] = $s", object.clone()),
+            (".[$k] |= . + $s", object.clone()),
+            (".[$k] += $s", object.clone()),
+            (".[$k] //= $s", object.clone()),
+            (".a //= $s", object.clone()),
+            (".x[$k] = [$s]", object.clone()),
+            (".[$k] = $s", OwnedValue::Null),
+            (".[2] = 9", array.clone()),
+            // Declines and errors take the evaluator's route unchanged.
+            (".[$k] -= \"s\"", object.clone()),
+            (".[$k] = (1, 2)", object.clone()),
+            (".[$k] |= empty", object.clone()),
+            (".[5] = 1", array.clone()),
+            (".a[$k] = 1", object.clone()),
+        ] {
+            let expr = substitute_vars(&parse(src).unwrap(), [("k", &key), ("s", &score)]);
+            let mut live = Vec::new();
+            let flow = fold_step_each::<JqSemantics>(
+                &expr,
+                input.clone(),
+                false,
+                Reentry::Proven,
+                &mut |value| {
+                    live.push(value);
+                    Demand::Continue
+                },
+            );
+            let mut forced = Vec::new();
+            let forced_flow = eval_each_owned::<JqSemantics>(
+                &expr,
+                &input,
+                false,
+                Reentry::Proven,
+                &mut |value| {
+                    forced.push(value);
+                    Demand::Continue
+                },
+            );
+            assert_eq!(live, forced, "{src}: outputs");
+            assert_eq!(
+                core::mem::discriminant(&flow),
+                core::mem::discriminant(&forced_flow),
+                "{src}: flow"
+            );
+        }
+    }
+
+    /// #3241: yq mode never registers an embed entry, so the guard this issue
+    /// relaxed could not have fired there and the change cannot reach it.
+    #[test]
+    #[cfg(feature = "std")]
+    fn embed_table_never_registers_in_yq_mode_3241() {
+        use crate::jq::eval_generic::{embed_table_active, embed_table_push};
+
+        let bound = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 1,
+        };
+        let guard = embed_table_push::<YqSemantics>(Some(&origin), &mut bound.clone());
+        assert!(guard.is_none(), "yq mode registers nothing");
+        assert!(!embed_table_active());
     }
 
     #[test]
