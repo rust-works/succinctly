@@ -422,6 +422,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: an `and`/`or` whose left operand is a full or empty slice of `[]` no longer accepts an optional
+  index on its right in path position** (#3647, a #3494 residual). `[] | del(.[0:0] and .b?)`,
+  `path(.[0:] and .b?)`, `(.[0:0] and .b?) = 9` and `del(.[0:] and (.. | .a?))` were accepted where jq
+  raises `Invalid path expression near attempt to access element "b" of []`. The slice of `[]` is a fresh
+  `[]`, not the register, so the right operand navigates off a register that is not the input and raises
+  jq's path error, which `INDEX_OPT` (`.b?`) does not suppress; the resolver took an array register equal
+  to the input by value for the input itself, which holds for `[]`, and `?` swallowed the type error
+  instead. The non-optional spelling (`del(.[0:0] and .b)`) now carries jq's wording too. On
+  `scripts/jq-path-register-sweep.py --operand '.[0:]' --operand '.[0:0]'` (11,511 rows) the 36
+  accepted-where-jq-refuses rows are gone and nothing regressed.
+
 - **jq: a path-mode `foreach` drives its UPDATE and EXTRACT by demand** (#3507).
   `first(path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))` wrote `ab` where jq writes `a`: the
   fold collected UPDATE (and the three-argument form's EXTRACT) before its consumer could answer, so every
