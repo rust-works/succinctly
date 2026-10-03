@@ -39413,12 +39413,17 @@ fn computed_at_register(
 /// the driven operand superseded an outcome stashed at generation `at`
 /// (#3293's rule, in `ResolveFlow` terms).
 fn resolve_retry_superseded(flow: &ResolveFlow, at: u64, direct_retry: bool) -> bool {
-    let flow = match flow {
+    retry_superseded(&resolve_flow_as_flow(flow), at, direct_retry)
+}
+
+/// A resolver's verdict in [`Flow`] terms, for the #3293 stash helpers that
+/// speak `Flow` ([`resolve_retry_superseded`], [`StashedVerdict::settle`]).
+fn resolve_flow_as_flow(flow: &ResolveFlow) -> Flow {
+    match flow {
         ResolveFlow::Exhausted => Flow::Exhausted,
         ResolveFlow::Stopped => Flow::Stopped { pending: None },
         ResolveFlow::Escaped(escape) => Flow::Escaped(Control::from(escape.clone())),
-    };
-    retry_superseded(&flow, at, direct_retry)
+    }
 }
 
 /// Resolve `expr` against the *original* input `value` with jq's register at
@@ -41123,7 +41128,7 @@ impl FoldRegister {
     /// reopening #1466's bug class through this second call site.
     ///
     /// **#2046**: when `expr` is (under any wrapping `Paren`) an
-    /// `Expr::Pipe`, this dispatches straight to [`resolve_seq`] with
+    /// `Expr::Pipe`, this dispatches straight to [`resolve_seq_sink`] with
     /// `self.value` threaded in as its externally-known register — rather
     /// than through the ordinary `resolve_against_cow`/`resolve_node`
     /// route, which has no parameter for one at all. That register is what
@@ -41135,7 +41140,7 @@ impl FoldRegister {
     /// describe. `tr` alone cannot express this: it says whether the
     /// accumulator *itself* is currently sitting at the register, which
     /// `INIT = 0` here already answered `false` — exactly the case
-    /// [`resolve_seq`]'s own carried-register mechanism (#1573/#2041)
+    /// [`resolve_seq_sink`]'s own carried-register mechanism (#1573/#2041)
     /// exists to recover from, just never wired to a fold's register until
     /// now. A bare `$var` (no chain after it) needs none of this: it
     /// resolves to a single untracked, snapshot-marked branch that
@@ -41154,6 +41159,33 @@ impl FoldRegister {
         snapshot: &Snapshot,
         keep: Keep,
     ) -> PathResolveResult<'a> {
+        collect_resolved(|sink| {
+            self.resolve_sink::<S>(expr, input, at_register, snapshot, keep, sink)
+        })
+    }
+
+    /// [`FoldRegister::resolve`] by demand (#3507): each relocated branch goes
+    /// to `sink` as `expr` produces it, so a consumer that answers
+    /// [`Demand::Stop`] reaches the generator before it is asked for the next
+    /// output -- and a `?//` inside `expr` is asked to retry at that stop, as
+    /// jq's is. `resolve` collects what this delivers and keeps the
+    /// all-at-once answer for `resolve_reduce`, whose UPDATE jq does evaluate
+    /// to completion; `foreach`'s UPDATE and EXTRACT, which jq drives one
+    /// output at a time, call this.
+    ///
+    /// Everything `resolve`'s own doc comment says holds here unchanged: this
+    /// *is* that body, with the final `collect`/`relocate` pass moved into the
+    /// sink wrapper, so the two cannot disagree on what a branch is. An escape
+    /// is reported once everything produced before it has been delivered.
+    fn resolve_sink<'a, S: EvalSemantics>(
+        &self,
+        expr: &Expr,
+        input: OwnedValue,
+        at_register: bool,
+        snapshot: &Snapshot,
+        keep: Keep,
+        sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+    ) -> ResolveFlow {
         let tr = self.trackable && at_register;
         // #2042: the register's own position is what a navigated marker in
         // UPDATE/EXTRACT is certified against -- whether or not the
@@ -41193,43 +41225,6 @@ impl FoldRegister {
         } else {
             self.frame.unknown()
         };
-        let resolved = if let Expr::Pipe(exprs) = unwrap_paren(expr) {
-            // The register goes in as the explicit argument here, which
-            // `resolve_seq_sink` prefers over the frame's and every later
-            // stage overwrites from `carried_register` -- so the frame does
-            // not carry it too (that copy would never be read).
-            resolve_seq::<S>(
-                exprs,
-                &input,
-                tr,
-                snapshot,
-                &update_frame,
-                keep,
-                self.trackable.then_some(&self.value),
-            )
-        } else {
-            let update_frame = update_frame.with_register(
-                if S::TAG == EvalTag::Jq && self.trackable && !tr && !fans_out(expr) {
-                    Some(&self.value)
-                } else {
-                    None
-                },
-            );
-            resolve_node::<S>(expr, &input, tr, snapshot, &update_frame, keep)
-        };
-        let owned = match resolved {
-            Ok(branches) => Ok(branches
-                .into_iter()
-                .map(PathBranch::into_owned_value)
-                .collect()),
-            Err((prefix, e)) => Err((
-                prefix
-                    .into_iter()
-                    .map(PathBranch::into_owned_value)
-                    .collect(),
-                e,
-            )),
-        };
         // #2860: `relocate`'s own `identical()` fallback re-derives
         // trackability from this call's *entry-time* register
         // (`self.value`/`self.frame`), which `resolve_seq`/`resolve_node`
@@ -41241,9 +41236,43 @@ impl FoldRegister {
         // `relocate`'s own doc comment for why a value-equality check
         // alone (`identical()`'s whole job) cannot substitute for this.
         let identical_eligible = cannot_move_register(expr);
-        match owned {
-            Ok(branches) => Ok(self.relocate::<S>(branches, identical_eligible)),
-            Err((prefix, e)) => Err((self.relocate::<S>(prefix, identical_eligible), e)),
+        // Each branch is owned before it leaves, which is what lets `sink`
+        // keep it past `input`'s own scope.
+        let mut deliver = |branch: PathBranch<'_>| {
+            sink(self.relocate_one::<S>(branch.into_owned_value(), identical_eligible))
+        };
+        if let Expr::Pipe(exprs) = unwrap_paren(expr) {
+            // The register goes in as the explicit argument here, which
+            // `resolve_seq_sink` prefers over the frame's and every later
+            // stage overwrites from `carried_register` -- so the frame does
+            // not carry it too (that copy would never be read).
+            resolve_seq_sink::<S>(
+                exprs,
+                &input,
+                tr,
+                snapshot,
+                &update_frame,
+                keep,
+                self.trackable.then_some(&self.value),
+                &mut deliver,
+            )
+        } else {
+            let update_frame = update_frame.with_register(
+                if S::TAG == EvalTag::Jq && self.trackable && !tr && !fans_out(expr) {
+                    Some(&self.value)
+                } else {
+                    None
+                },
+            );
+            resolve_node_sink::<S>(
+                expr,
+                &input,
+                tr,
+                snapshot,
+                &update_frame,
+                keep,
+                &mut deliver,
+            )
         }
     }
 
@@ -41320,47 +41349,57 @@ impl FoldRegister {
     ) -> Vec<PathBranch<'a>> {
         branches
             .into_iter()
-            .map(|b| {
-                if b.trackable {
-                    let path = PathPrefix::extend_many(&self.path, b.path.to_vec());
-                    PathBranch::new(path, b.value, true)
-                } else if self.identical::<S>(
-                    &b.value,
-                    &b.snapshot,
-                    // #2896: #2860's gate exists to stop *position-blind*
-                    // value equality from second-guessing a verdict
-                    // `resolve_seq`/`resolve_node` already reached with full
-                    // position awareness. A `Snapshot::At` mark is not
-                    // position-blind: it is an exact absolute-position proof,
-                    // minted by the `getpath` arm at the moment it produced
-                    // this very value, from the input's own proven position
-                    // composed with the keys it actually navigated. So it is
-                    // admitted even where `cannot_move_register(expr)` is
-                    // `false` -- which for `getpath` it always is.
-                    //
-                    // Deliberately *not* widened to `Marked(Origin::At)`,
-                    // which `Snapshot::position` also answers for: a `Marked`
-                    // origin names where a *variable* was bound, which says
-                    // nothing about where the expression that produced this
-                    // branch ended up, and admitting it here is exactly the
-                    // regression #2860 closed (`path(foreach .a as $v0 (.;
-                    // $v0; (.zzz | $v0)))` answered `["a"]` instead of
-                    // raising, and `del()` through it corrupted a document jq
-                    // refuses to touch).
-                    identical_eligible || b.snapshot.proves_position(),
-                ) {
-                    PathBranch::new(Rc::clone(&self.path), b.value, true)
-                } else {
-                    // Demoting must not erase the snapshot mark: a fold
-                    // nested inside another one has its own, untrackable
-                    // register, and the *outer* register is the one that can
-                    // still recognise the value (confirmed live,
-                    // `path(. as $x | reduce (1) as $i (0; reduce (1) as $j
-                    // (0; $x)))` is `[]`). #1466.
-                    PathBranch::demoted(b.snapshot, b.value)
-                }
-            })
+            .map(|b| self.relocate_one::<S>(b, identical_eligible))
             .collect()
+    }
+
+    /// [`FoldRegister::relocate`] for one branch, the form
+    /// [`FoldRegister::resolve_sink`] applies as each is delivered (#3507).
+    /// `relocate` maps over it, so the collecting and the streaming paths
+    /// cannot place a branch differently.
+    fn relocate_one<'a, S: EvalSemantics>(
+        &self,
+        b: PathBranch<'a>,
+        identical_eligible: bool,
+    ) -> PathBranch<'a> {
+        if b.trackable {
+            let path = PathPrefix::extend_many(&self.path, b.path.to_vec());
+            PathBranch::new(path, b.value, true)
+        } else if self.identical::<S>(
+            &b.value,
+            &b.snapshot,
+            // #2896: #2860's gate exists to stop *position-blind*
+            // value equality from second-guessing a verdict
+            // `resolve_seq`/`resolve_node` already reached with full
+            // position awareness. A `Snapshot::At` mark is not
+            // position-blind: it is an exact absolute-position proof,
+            // minted by the `getpath` arm at the moment it produced
+            // this very value, from the input's own proven position
+            // composed with the keys it actually navigated. So it is
+            // admitted even where `cannot_move_register(expr)` is
+            // `false` -- which for `getpath` it always is.
+            //
+            // Deliberately *not* widened to `Marked(Origin::At)`,
+            // which `Snapshot::position` also answers for: a `Marked`
+            // origin names where a *variable* was bound, which says
+            // nothing about where the expression that produced this
+            // branch ended up, and admitting it here is exactly the
+            // regression #2860 closed (`path(foreach .a as $v0 (.;
+            // $v0; (.zzz | $v0)))` answered `["a"]` instead of
+            // raising, and `del()` through it corrupted a document jq
+            // refuses to touch).
+            identical_eligible || b.snapshot.proves_position(),
+        ) {
+            PathBranch::new(Rc::clone(&self.path), b.value, true)
+        } else {
+            // Demoting must not erase the snapshot mark: a fold
+            // nested inside another one has its own, untrackable
+            // register, and the *outer* register is the one that can
+            // still recognise the value (confirmed live,
+            // `path(. as $x | reduce (1) as $i (0; reduce (1) as $j
+            // (0; $x)))` is `[]`). #1466.
+            PathBranch::demoted(b.snapshot, b.value)
+        }
     }
 
     /// Move to a trackable UPDATE branch, for resolving `foreach`'s EXTRACT
@@ -41403,7 +41442,7 @@ impl FoldRegister {
     /// `cannot_move_register(Select)` being `false`, but the fabrication
     /// originates one step earlier, at this function, independent of that).
     /// Reusing [`cannot_move_register`] — already the exact, oracle-verified
-    /// allowlist [`resolve_seq`]'s own stage-to-stage carrying uses for this
+    /// allowlist [`resolve_seq_sink`]'s own stage-to-stage carrying uses for this
     /// identical question — is what closes it: only a
     /// syntactically-provable-safe UPDATE (a literal, `$var`, arithmetic
     /// over safe operands, ...) still carries `self` forward; anything else
@@ -44415,31 +44454,36 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         // jq's generator does (`path(foreach (1) as $x (.; (.a,
                         // error("x"))))` prints `["a"]` before raising), and then
                         // either retries from the last of them or propagates.
-                        let (update_branches, update_escape) = match active_reg.resolve::<S>(
-                            &bound_update,
-                            core::mem::replace(&mut state, OwnedValue::Null),
-                            active_at_register,
-                            &state_snapshot,
-                            keep,
-                        ) {
-                            Ok(branches) => (branches, None),
-                            Err((prefix, e)) => (prefix, Some(e)),
-                        };
-                        // Each UPDATE output becomes the state *before* it is emitted --
-                        // jq stores it first, then runs EXTRACT/emits -- so the last one
-                        // carries forward as the next element's state (same rule as
-                        // `eval_foreach`), with its provenance (#1590, mirroring
-                        // `resolve_reduce`'s `acc_at_register`/`acc_snapshot`). The
-                        // ordering is observable once a stop is retried by a source
-                        // `?//`: the retried step re-enters from the refused output, not
-                        // from the state before it, which is how `path(foreach (1 as $x
-                        // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
-                        // then . else $v end))` names `1` in jq 1.7.1's second refusal.
-                        if update_branches.is_empty() {
-                            (state_at_register, state_snapshot) =
-                                reg.branch_provenance::<S>(None, frame);
-                        }
-                        for update_branch in &update_branches {
+                        //
+                        // #3507: UPDATE is driven by demand, one output at a time,
+                        // with that output's EXTRACT and emission run inside the sink
+                        // before the generator is asked for the next. Collecting it
+                        // first ran every later fork's side effects before a consumer
+                        // that stopped at the first output could say so, and a `?//`
+                        // inside UPDATE never saw the stop it retries at --
+                        // `first(path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))`
+                        // wrote `ab` where jq writes `a`. `resolve_reduce`'s UPDATE stays
+                        // collected: jq evaluates every one of its outputs.
+                        let entry_state = core::mem::replace(&mut state, OwnedValue::Null);
+                        let entry_snapshot = state_snapshot.clone();
+                        let mut delivered = false;
+                        let update_stop_at = core::cell::Cell::new(None::<u64>);
+                        let mut on_update = |update_branch: PathBranch<'a>| -> Demand {
+                            delivered = true;
+                            let update_branch = &update_branch;
+                            // Each UPDATE output becomes the state *before* it is
+                            // emitted -- jq stores it first, then runs EXTRACT/emits
+                            // -- so the last one carries forward as the next
+                            // element's state (same rule as `eval_foreach`), with its
+                            // provenance (#1590, mirroring `resolve_reduce`'s
+                            // `acc_at_register`/`acc_snapshot`). The ordering is
+                            // observable once a stop is retried by a source `?//`: the
+                            // retried step re-enters from the refused output, not from
+                            // the state before it, which is how `path(foreach (1 as $x
+                            // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
+                            // then . else $v end))` names `1` in jq 1.7.1's second
+                            // refusal.
+                            //
                             // Every output, not just the last: a review pass tried
                             // carrying only the last one (the others are read straight
                             // off `update_branch` for EXTRACT/emission, so the clone
@@ -44461,7 +44505,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 let extract_reg =
                                     active_reg.advance(update_branch, &bound_update, frame);
                                 // `update_branch` is itself already relocated (it's
-                                // `active_reg.resolve()`'s own output above), and
+                                // `active_reg.resolve_sink()`'s own output above), and
                                 // `advance()` built `extract_reg` from this same
                                 // branch, so `extract_reg`'s own `branch_provenance` of
                                 // it answers exactly `update_branch`'s `(trackable,
@@ -44469,14 +44513,15 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 // `identical()` check (#1590).
                                 let (extract_at_register, extract_snapshot) =
                                     extract_reg.branch_provenance::<S>(Some(update_branch), frame);
-                                match drain_path_result(
-                                    extract_reg.resolve::<S>(
-                                        ext_expr,
-                                        update_branch.value.clone().into_owned(),
-                                        extract_at_register,
-                                        &extract_snapshot,
-                                        keep,
-                                    ),
+                                // #3507: EXTRACT is driven by demand too, straight into
+                                // the outer sink, so `first(path(foreach 1 as $x (.; .;
+                                // .[("a"|stderr), ("b"|stderr)])))` stops after `a`.
+                                match extract_reg.resolve_sink::<S>(
+                                    ext_expr,
+                                    update_branch.value.clone().into_owned(),
+                                    extract_at_register,
+                                    &extract_snapshot,
+                                    keep,
                                     sink,
                                 ) {
                                     // #2979 rule 3: anything after `STOREV` that escapes --
@@ -44530,8 +44575,60 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                     return Demand::Stop;
                                 }
                             }
+                            Demand::Continue
+                        };
+                        let flow = active_reg.resolve_sink::<S>(
+                            &bound_update,
+                            entry_state,
+                            active_at_register,
+                            &entry_snapshot,
+                            keep,
+                            &mut |update_branch| {
+                                let demand = on_update(update_branch);
+                                if demand == Demand::Stop {
+                                    update_stop_at.set(Some(pipe_retry_generation()));
+                                }
+                                demand
+                            },
+                        );
+                        // The sink answered `Stop`: its own verdict is in `outcome`,
+                        // and a flow that merely ended early (a bounded consumer
+                        // *inside* UPDATE) is a success for this step.
+                        //
+                        // Unless a `?//` inside UPDATE retried past that stop (#3293,
+                        // the rule INIT's drive applies to its forks): a retry that then
+                        // produced nothing, or raised, is jq's answer, and the verdict
+                        // belongs to an alternative it abandoned. `foreach 1 as $x (.;
+                        // .[(["a"] as [$q] ?// $b | if $q then "a" else ["x"] end)])`
+                        // under `first(path(...))` raises the index error from the
+                        // second alternative once `first` has stopped the first.
+                        if outcome.is_some() {
+                            let update_direct_retry = direct_pattern_retry(&bound_update);
+                            // An escape stashed in `aborted` is dropped by `settle` only
+                            // when a retry consumed it and it is retryable; any other
+                            // verdict is a plain stop, superseded by the same rule.
+                            let stashed = aborted.is_set();
+                            if stashed {
+                                aborted.settle(&resolve_flow_as_flow(&flow), update_direct_retry);
+                            }
+                            let superseded = if stashed {
+                                !aborted.is_set()
+                            } else {
+                                update_stop_at.get().is_some_and(|at| {
+                                    resolve_retry_superseded(&flow, at, update_direct_retry)
+                                })
+                            };
+                            if !superseded {
+                                return Demand::Stop;
+                            }
+                            outcome = None;
+                            downstream_stopped = None;
                         }
-                        if let Some(e) = update_escape {
+                        if !delivered {
+                            (state_at_register, state_snapshot) =
+                                reg.branch_provenance::<S>(None, frame);
+                        }
+                        if let ResolveFlow::Escaped(e) = flow {
                             outcome = Some(if path_alternative_retries(&e, is_last) {
                                 FoldStepOutcome::Retry
                             } else {
@@ -48094,37 +48191,6 @@ fn resolve_seq_from_seed<'a, S: EvalSemantics>(
     };
 
     resolve_seq_stage::<S>(&flat, last_dynamic, 0, seed, frame, keep, sink)
-}
-
-/// Collecting adapter over [`resolve_seq_sink`], for the callers that still
-/// want a materialized `Vec<PathBranch>` ([`FoldRegister::resolve`]).
-fn resolve_seq<'a, S: EvalSemantics>(
-    exprs: &[Expr],
-    value: &'a OwnedValue,
-    trackable: bool,
-    snapshot: &Snapshot,
-    frame: &Frame,
-    keep: Keep,
-    register: Option<&'a OwnedValue>,
-) -> PathResolveResult<'a> {
-    let mut out = Vec::new();
-    let flow = resolve_seq_sink::<S>(
-        exprs,
-        value,
-        trackable,
-        snapshot,
-        frame,
-        keep,
-        register,
-        &mut |b| {
-            out.push(b);
-            Demand::Continue
-        },
-    );
-    match flow {
-        ResolveFlow::Exhausted | ResolveFlow::Stopped => Ok(out),
-        ResolveFlow::Escaped(e) => Err((out, e)),
-    }
 }
 
 /// Thread one branch through `flat[stage_index..]` and the static tail,

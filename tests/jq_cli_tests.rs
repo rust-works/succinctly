@@ -55148,6 +55148,215 @@ fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
     Ok(())
 }
 
+/// #3507: a path-mode `foreach` drives its UPDATE and EXTRACT **by demand**, one
+/// output at a time, with that output's EXTRACT and emission run before the
+/// generator is asked for the next.
+///
+/// `resolve_foreach` collected UPDATE (and EXTRACT) before its consumer could
+/// answer, so `first(path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))`
+/// wrote `ab` where jq writes `a`, and a `?//` inside UPDATE never saw the stop
+/// it retries at, so a retry that raises in jq (`E2`, an index error) was
+/// missed. #2668 gave value-mode `foreach` this and #2903 gave INIT it; these
+/// were the last two collecting sites in the path-mode fold. `reduce`'s UPDATE
+/// stays collected because jq evaluates every one of its outputs.
+///
+/// Every row is captured whole from jq 1.7.1, so the side-effect count is pinned
+/// exactly on stderr as well as stdout.
+#[test]
+fn path_mode_foreach_update_and_extract_resolve_by_demand_3507() -> Result<()> {
+    for (input, filter, want_out, want_err, want_code) in [
+        // UPDATE is driven by demand: the stop reaches the generator before it is
+        // asked for the output after the first, so `b` is never written.
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)]))), 9]"#,
+            "[[\"a\"],9]\n",
+            "a",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[limit(1; path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))]"#,
+            "[[\"a\"]]\n",
+            "a",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"isempty(path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))"#,
+            "false\n",
+            "a",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[label $o | path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])) | ., break $o]"#,
+            "[[\"a\"]]\n",
+            "a",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(foreach (1, 2) as $x (.; .[("a"|stderr), ("b"|stderr)])))]"#,
+            "[[\"a\"]]\n",
+            "a",
+            0,
+        ),
+        // EXTRACT (the three-argument form) is driven the same way.
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(foreach 1 as $x (.; .; .[("a"|stderr), ("b"|stderr)]))), 9]"#,
+            "[[\"a\"],9]\n",
+            "a",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[limit(1; path(foreach 1 as $x (.; .; .[("a"|stderr), ("b"|stderr)])))]"#,
+            "[[\"a\"]]\n",
+            "a",
+            0,
+        ),
+        // A bound that takes more than one output still takes exactly that many:
+        // demand, not suppression.
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[limit(2; path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr), ("c"|stderr)])))]"#,
+            "[[\"a\"],[\"b\"]]\n",
+            "ab",
+            0,
+        ),
+        // A `?//` inside UPDATE is asked to retry on the consumer's stop, and what the
+        // retry raises is the answer (`AA`, then the second alternative's own error);
+        // one that delivers again, or delivers nothing, is jq's answer as well.
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)]))), 9]"#,
+            "",
+            "AAjq: error (at <stdin>:0): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[limit(1; path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)]))), 9]"#,
+            "",
+            "AAjq: error (at <stdin>:0): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else ["x"] end)]))), 9]"#,
+            "",
+            "AAjq: error (at <stdin>:0): Cannot index object with array\n",
+            5,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(foreach 1 as $x (.; .; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)]))), 9]"#,
+            "",
+            "AAjq: error (at <stdin>:0): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else empty end)])))]"#,
+            "[[\"a\"]]\n",
+            "AA",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else "b" end)])))]"#,
+            "[[\"a\"],[\"b\"]]\n",
+            "AA",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else "b" end)]; .[("B"|stderr)])))]"#,
+            "[[\"a\",\"B\"],[\"b\",\"B\"]]\n",
+            "ABAB",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[limit(1; path(foreach (1,2) as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)])))]"#,
+            "",
+            "AAjq: error (at <stdin>:0): E2\n",
+            5,
+        ),
+        // The same retry on an escape raised downstream of UPDATE, in EXTRACT.
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else "b" end)]; error("X")))]"#,
+            "",
+            "AAjq: error (at <stdin>:0): X\n",
+            5,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else "b" end)]; error("X"))))]"#,
+            "",
+            "AAjq: error (at <stdin>:0): X\n",
+            5,
+        ),
+        // Must not change: nothing stops an unbounded fold, so every output and every
+        // side effect still arrives, a retry inside UPDATE is never asked for, an
+        // UPDATE escape still follows the outputs before it, and path-mode `reduce`
+        // still evaluates every UPDATE output before it raises (jq does).
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)]))]"#,
+            "[[\"a\"],[\"b\"]]\n",
+            "ab",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[path(foreach 1 as $x (.; .; .[("a"|stderr), ("b"|stderr)]))]"#,
+            "[[\"a\"],[\"b\"]]\n",
+            "ab",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"first(path(foreach 1 as $x (.; (.a, error("x")))))"#,
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"[path(foreach 1 as $x (.; (.a, error("x"))))]"#,
+            "",
+            "jq: error (at <stdin>:0): x\n",
+            5,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else error("E2") end)]))]"#,
+            "[[\"a\"]]\n",
+            "A",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"[first(path(reduce 1 as $x (.; .[("a"|stderr), ("b"|stderr)]))), 9]"#,
+            "",
+            "abjq: error (at <stdin>:0): Invalid path expression with result null\n",
+            5,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #2908: `path(f)` is a generator, so a consumer *outside* it can stop `f`.
 ///
 /// Both evaluators collected every path before their consumer saw one, so a
