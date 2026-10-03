@@ -406,18 +406,18 @@ DEFAULT_THRESHOLD = 5.0
 # `main` (#3679); the entry was removed once the row read ~0% again against a
 # merge-base that already included it.
 #
-# `users_yq_del_select` (#2640) carries an override of the same one-off kind:
+# `users_yq_del_select` (#2640) carried an override of the same one-off kind:
 # YAML has no delimiter checks to run, but `element_gap_ok`,
 # `value_delimiter_ok` and the free `trailing_element_gap_ok` resolved a
 # position or decoded a value before consulting the always-true default;
 # `DocumentCursor::HAS_DELIMITER_CHECKS` (false for YAML) now skips that, and
 # the yq-mode `del(.users[] | select(...))` row walks the document through
 # those helpers (-7.8% x86_64 / -5.8% ARM64-Linux against the PR's own
-# merge-base, outputs byte-identical). No other row moves by more than 0.7%.
-# Remove it once `main` carries the change and the row reads ~0% again.
+# merge-base, outputs byte-identical). Now in `main` (#3691); the entry was
+# removed (#3693) once the row read ~0% again against a merge-base that
+# already included it.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
-    "users_yq_del_select": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
