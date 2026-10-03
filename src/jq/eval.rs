@@ -37072,9 +37072,10 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // argument with a *discarding* inner sink -- the outer `sink` only
         // ever sees the builtin's own derived result, mirroring the `Array`
         // arm's `items.push(...)` shape rather than `FirstExpr`'s pass-through.
-        // The register carries forward exactly as `[f]` does when its
-        // contents are checked (here, unconditionally, since every branch is
-        // always resolved live): `. as $x | last(.[]) | $x` does not move `.`.
+        // What each says about jq's register differs. `last(f)` leaves it where
+        // it entered in jq mode (#3643; the arm's own comment below), while
+        // `isempty` states it per branch and `INDEX` and `last` in yq mode lose
+        // it ([`drained_register`]).
         //
         // `last`/`INDEX` need every one of the argument's outputs regardless
         // of what the *outer* consumer wants (`last` cannot know which output
@@ -37111,7 +37112,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             // is where it entered even when `f` navigates (`path(. as $x |
             // last(.a) | $x)` is `[]`). `first(f)`/`nth`/`limit` emit from
             // inside the generator and do move it, so they are not this arm.
-            let register = if trackable && S::TAG == EvalTag::Jq {
+            let register = if trackable && last_register_unmoved::<S>() {
                 BranchRegister::Unmoved(Cow::Borrowed(value))
             } else {
                 drained_register::<S>(trackable, value)
@@ -39193,11 +39194,19 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// the register, so they are not admitted. jq mode only, like every admission
 /// here (ADR-0018): yq has no oracle for it.
 fn last_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
-    S::TAG == EvalTag::Jq
+    last_register_unmoved::<S>()
         && matches!(
             unwrap_paren(expr),
             Expr::LastExpr(_) | Expr::Builtin(Builtin::LastStream(_))
         )
+}
+
+/// The one place the mode half of `last(f)`'s register promotion is stated
+/// (#3643), read by the drain arm (the leaf) and by
+/// [`last_leaves_register_in_place`] (the stage) so the two cannot disagree:
+/// jq mode only, since yq has no oracle for it (ADR-0018).
+fn last_register_unmoved<S: EvalSemantics>() -> bool {
+    S::TAG == EvalTag::Jq
 }
 
 /// [`BranchRegister::LostAt`] `value` in jq mode, where the position is read

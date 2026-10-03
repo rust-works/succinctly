@@ -61415,9 +61415,10 @@ fn test_path_register_drain_producers_lose_the_register_uncatchably_3456() -> Re
 }
 
 /// #3456 (B2): what the drain producers *do* know is where the register was
-/// when they ran -- `last`/`isempty`/`INDEX` record it (`LostAt`), so a `$x`
+/// when they ran -- `isempty`/`INDEX` record it (`LostAt`), so a `$x`
 /// frozen outside that node cannot be it and jq's own refusal stays
-/// catchable, exactly as jq 1.7.1 has it. A checked `[E]` keeps the register
+/// catchable, exactly as jq 1.7.1 has it. (`last` states the register
+/// outright since #3643, so its row here is an unchanged-document control.) A checked `[E]` keeps the register
 /// outright (#3263). All exit 0 and byte-identical to jq.
 #[test]
 fn test_path_register_drain_producers_keep_where_they_lost_it_3456() -> Result<()> {
