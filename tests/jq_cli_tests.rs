@@ -62417,6 +62417,56 @@ fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()>
             bad,
             5,
         ),
+        // The bare `flatten` is refused by `builtin_navigation` before it is
+        // evaluated and `flatten(n)` by `iterates_untracked_input` after, two
+        // mechanisms for one family: on the same untracked input they agree.
+        (
+            "{}",
+            r"path(. as $x | [[1],[2]] | flatten | $x)",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "{}",
+            r"path(. as $x | [[1],[2]] | flatten(0) | $x)",
+            "",
+            bad,
+            5,
+        ),
+        // The new group inside a compound stage is read as a loss, like the
+        // #3361 group (`test_path_register_by_value_builtin_stages_do_not_move_it_3361`):
+        // jq answers each of these, so they are pinned as today's refuse-only
+        // behaviour. A `try` or `?` around an untracked iteration does not catch
+        // the refusal either, as for `add` and `flatten`.
+        (
+            r#"{"a":["x"]}"#,
+            r"path(.a | . as $x | (flatten(1), reverse) | $x[0])",
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#"{"a":["x"]}"#,
+            r#"path(.a | . as $x | [join(",")] | $x[0])"#,
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#"{"a":["x"]}"#,
+            r"path(.a | . as $x | limit(1; reverse) | $x[0])",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "{}",
+            r#"path(. as $x | ["a"] | try join(",") catch . | $x)"#,
+            "",
+            bad,
+            5,
+        ),
         // `unique_by` iterates a computed array in jq and raises there.
         ("[1,[2]]", r"path(. as $x | unique_by(.) | $x)", "", bad, 5),
         // #3712.

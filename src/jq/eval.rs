@@ -38714,7 +38714,12 @@ fn builtin_navigation<S: EvalSemantics>(
         // `$`-parameter runs before the iteration, so an argument that raises
         // must win, and this table is consulted before anything is evaluated.
         // Their iteration is refused once the call has produced a value
-        // instead ([`iterates_untracked_input`], #3711).
+        // instead ([`iterates_untracked_input`], #3711). So the family has two
+        // mechanisms -- this table for the argument-free `flatten`, `add` and
+        // `map`, that one for the `$param` forms -- and
+        // `test_path_register_more_by_value_builtins_do_not_move_it_3711` pins
+        // `flatten` against `flatten(0)` on the same untracked input: move one
+        // and that test says whether the other still agrees.
         | Builtin::Flatten
         | Builtin::Map(_)
         | Builtin::FromEntries => Ok(Some(BuiltinNavigation::Iterate)),
