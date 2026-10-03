@@ -45,6 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   position resolve is worth it, was measured and answered no: the repeat is a cache hit worth
   at most ~2.9% of instructions on the worst shape. Details in `docs/parsing/yaml.md` (O8).
 
+- **jq: an `until`/`while` that updates a computed state is flat in its step count** (#3674).
+  `{i:0, d:.} | until(.i >= 100; .i += 1)` ran every round's `update` through the re-index bridge,
+  serializing and re-indexing the whole state each time: O(|state|) per round, 1.56 s for 100 steps over
+  a 7 MB state on an M4 Pro (2.62 s on a 7950X) against jq 1.7.1's 0.065 s, and linear in the step
+  count. The loops now take the same owned step as `reduce`/`foreach`, in both `eval.rs` and the
+  generic driver, so the update edits the state in place: 0.096 s and 0.18 s, the process floor,
+  and the same at 200 steps (86-97% faster on every affected row of both chips, identity gate clean on
+  all 18 configurations each). Also covers a loop that starts on the document under an `as` binding
+  (`. as $d | until(.users[0].age >= 125; .users[0].age += 1)`), `. + [x]`/`. + "x"` accumulators, and
+  the relocating folds. Unchanged: a `length` condition, a right side that reads the state
+  (`.i = .i + 1`) and a pipe holding one, which still bridge per round (#3697). Output is identical on
+  1,120 generated loop queries and 61 hand-written ones, and to jq 1.7.1 on every row that terminates.
+
 - **jq: a `reduce`/`foreach` that assigns into its accumulator is linear inside an `as` binding
   too** (#3241). `. as $d | reduce $d.users[] as $r ({}; .[$r.name] = $r.score)` (and the same with
   `|=`, `op=`, `//=`, a `.x[$k]` chain, or an `INIT` of `$d` itself) skipped the owned step while the
