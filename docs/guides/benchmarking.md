@@ -750,7 +750,10 @@ system_profiler SPHardwareDataType
 
 ### Automated Benchmarks
 
-The CI workflow (`.github/workflows/ci.yml`) runs benchmarks on every push/PR:
+The scheduled workflow (`.github/workflows/scheduled.yml`) runs benchmarks daily on `main` and on
+demand (`workflow_dispatch`). They no longer run on every push/PR (#3649): the job uploads artifacts
+nobody compares against a baseline and used about 40% of CI's macOS-minutes. The deterministic
+regression signal is `perf-guard` in `ci.yml`.
 
 **Test Matrix**:
 - x86_64 (ubuntu-latest)
@@ -778,7 +781,7 @@ These must be run **manually before releases**.
 
 ### Adding Benchmarks to CI
 
-To add a benchmark to CI, edit `.github/workflows/ci.yml`:
+To add a benchmark to CI, edit `.github/workflows/scheduled.yml`:
 
 ```yaml
 - name: Run benchmarks (new_bench)
