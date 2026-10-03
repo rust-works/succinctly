@@ -111401,6 +111401,58 @@ mod tests {
         }
     }
 
+    /// #3689: the shortcut's own gate, which no output can show. It is taken for
+    /// a bare `.[]` (under a `Paren` too) with no handler or `catch empty`, over
+    /// a scalar, in jq mode -- and not in yq mode, where the `Iterate` arm never
+    /// built the message, so the shortcut only added the arm's own value probes
+    /// (an alias-to-mapping resolve in YAML, #3709's review measured +107% on
+    /// `.k0?` over 30,000 aliases). The AST shape is tested before the value is
+    /// touched, so a body that is not `.[]` costs nothing.
+    #[test]
+    fn swallowed_scalar_iteration_gate_3689() {
+        use crate::jq::eval_generic::swallowed_scalar_iteration as settle;
+        let scalar_json: &[u8] = b"5";
+        let scalar_index = JsonIndex::build(scalar_json);
+        let scalar = scalar_index.root(scalar_json).value();
+        let container_json: &[u8] = b"[1]";
+        let container_index = JsonIndex::build(container_json);
+        let container = container_index.root(container_json).value();
+        let undecodable_json: &[u8] = br#""\ud800""#;
+        let undecodable_index = JsonIndex::build(undecodable_json);
+        let undecodable = undecodable_index.root(undecodable_json).value();
+
+        let iterate = Expr::Iterate;
+        let parenthesised = Expr::Paren(Box::new(Expr::Iterate));
+        let empty = parse("empty").unwrap();
+        let handler = parse(r#""c""#).unwrap();
+        let field = parse(".a").unwrap();
+
+        // Taken: nothing to catch but the scalar's own error.
+        for body in [&iterate, &parenthesised] {
+            assert!(matches!(
+                settle::<JqSemantics, _>(body, None, &scalar),
+                Some(Ok(()))
+            ));
+            assert!(matches!(
+                settle::<JqSemantics, _>(body, Some(&empty), &scalar),
+                Some(Ok(()))
+            ));
+        }
+        // What `?` never swallows still escapes the shortcut as the same failure.
+        match settle::<JqSemantics, _>(&iterate, None, &undecodable) {
+            Some(Err(e)) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure, got {other:?}"),
+        }
+        // Not taken in yq mode, whatever the value.
+        assert!(settle::<YqSemantics, _>(&iterate, None, &scalar).is_none());
+        assert!(settle::<YqSemantics, _>(&iterate, None, &undecodable).is_none());
+        // Not taken: a handler that runs, a body that is not a bare `.[]`, a
+        // container, which has members to list.
+        assert!(settle::<JqSemantics, _>(&iterate, Some(&handler), &scalar).is_none());
+        assert!(settle::<JqSemantics, _>(&field, None, &scalar).is_none());
+        assert!(settle::<JqSemantics, _>(&iterate, None, &container).is_none());
+    }
+
     /// #3689: a bare `.[]?` over a scalar settles in `eval_try` and `each_try`
     /// without evaluating the `.[]` whose `Cannot iterate` message the boundary
     /// would drop -- and still raises what `?` never swallows.
