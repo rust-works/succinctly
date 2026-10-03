@@ -63984,9 +63984,13 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
+        // (`walk(.)` was one of these until #3361: it backtracks its source, so
+        // it keeps the register and answers `["a"]` as jq does, pinned in
+        // `test_terminal_null_carve_out_keeps_its_answers_3579`; `reverse` is
+        // jq-defined over a collect too and is still read as a loss)
         (
             r"null",
-            r"path(.a|walk(.)|null)",
+            r"path(.a|reverse|null)",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -64017,6 +64021,9 @@ fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
         (r"null", r"path(5 | null)", "[]\n", "", 0),
         (r"null", r"path(select(true) | null)", "[]\n", "", 0),
         (r"null", r"path(first(.a) | 5 | null)", "[\"a\"]\n", "", 0),
+        // #3361: `walk(.)` leaves the register on `.a`, so the terminal `null`
+        // is at `["a"]`, not a guess.
+        (r"null", r"path(.a|walk(.)|null)", "[\"a\"]\n", "", 0),
         (r"null", r"path((.a | empty), null)", "[]\n", "", 0),
         (r"null", r"del(null)", "null\n", "", 0),
         (r"true", r"path(true)", "[]\n", "", 0),
