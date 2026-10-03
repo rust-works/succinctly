@@ -45499,7 +45499,9 @@ fn eval_recurse_cond<S: EvalSemantics>(
 /// (`resolve_recurse_sink`, `builtin_recurse_f`, `builtin_recurse_cond`) — a
 /// single definition so a future retuning can't silently miss one of the
 /// three copies it used to be (#1023 review of #1021, echoing #106's
-/// "duplicated predicates diverge silently").
+/// "duplicated predicates diverge silently"). Not applied to
+/// [`is_structural_descent`]'s `f`: the value walker hands that to
+/// [`walk_descendants`], and the path walker takes [`recurse_item_cap`].
 const RECURSE_MAX_ITEMS: usize = 10000;
 
 /// Whether `recurse(f)` / `recurse(f; cond)` is bare `recurse` (#3703).
@@ -45561,14 +45563,11 @@ fn walk_descendants(
 ) -> RecurseWalkEnd {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if sink(node.clone()) == Demand::Stop {
-            return RecurseWalkEnd {
-                drained: false,
-                pending_error: None,
-                stopped: true,
-            };
-        }
-        // Pushed last-first, so the first child is the next node popped.
+        // Children go on the stack before the node is delivered, so the node
+        // can be moved into `sink` instead of cloned for it; each node is
+        // then cloned once, when its parent pushes it. A stop wastes one
+        // node's pushes at most. Pushed last-first, so the first child is the
+        // next node popped.
         let first_child = stack.len();
         match &node {
             OwnedValue::Array(items) => stack.extend(items.iter().cloned()),
@@ -45576,6 +45575,13 @@ fn walk_descendants(
             _ => {}
         }
         stack[first_child..].reverse();
+        if sink(node) == Demand::Stop {
+            return RecurseWalkEnd {
+                drained: false,
+                pending_error: None,
+                stopped: true,
+            };
+        }
     }
     RecurseWalkEnd {
         drained: true,
@@ -45633,6 +45639,10 @@ pub(crate) struct RecurseWalkEnd {
 /// abort-on-`f`-error, #842/#854's deferred escapes and
 /// [`RECURSE_MAX_ITEMS`]' silent cap, and a lazy copy of it would be a
 /// second place every one of those has to be maintained.
+///
+/// **`.[]?` with no `cond` takes none of that** (#3703): it is jq's bare
+/// `recurse`, a walk over a finite tree that can neither raise nor run away,
+/// so [`walk_descendants`] delivers the tree's nodes directly, uncapped.
 ///
 /// **`f` runs only if the sink still wants more.** That is the whole point
 /// of the sink: jq's `def r: ., (f | r); r;` emits `.` *before* `f` is
@@ -46081,7 +46091,9 @@ struct ValueRecurseWalk<'e, 'd, 's, S> {
     demoted_f: &'d Expr,
     demoted_cond: Option<&'d Expr>,
     sink: &'s mut dyn FnMut(OwnedValue) -> Demand,
-    /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`].
+    /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`]. Never reached
+    /// by [`is_structural_descent`]'s `f`, which [`each_recurse_walk`] hands
+    /// to [`walk_descendants`] before building this walk.
     emitted: usize,
     budget: RecurseNativeBudget,
     _semantics: PhantomData<S>,
@@ -55967,7 +55979,10 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // The traversal itself lives in `each_recurse_walk` (#2693), shared with
     // `builtin_recurse_cond` and with `eval_each`'s lazy arm. This sink
     // never stops, so the walk is exactly what it always was: every node
-    // visited, `f` run at each, up to `RECURSE_MAX_ITEMS`.
+    // visited, `f` run at each, up to `RECURSE_MAX_ITEMS` -- except for
+    // `.[]?` with no `cond` (bare `recurse`, which this function is for when
+    // `builtin_recurse` calls it), which `each_recurse_walk` hands to
+    // `walk_descendants` and which has no cap (#3703).
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let end = each_recurse_walk::<S>(f, None, root, Reentry::Proven, &mut |v| {
         outputs.push(v);

@@ -55868,6 +55868,15 @@ fn test_recurse_of_each_optional_has_no_node_cap_3703() -> Result<()> {
         ("[recurse] | length", "12001\n"),
         ("[path(recurse(.[]?))] | length", "12001\n"),
         ("[limit(12000; recurse(.[]?))] | length", "12000\n"),
+        // A consumer stops the walk, over a document past the cap: at the first
+        // node, at the third, and exactly at, and past, the last.
+        ("first(recurse(.[]?)) | length", "6000\n"),
+        ("[limit(3; recurse(.[]?))] | length", "3\n"),
+        ("[limit(12001; recurse(.[]?))] | length", "12001\n"),
+        ("[limit(12002; recurse(.[]?))] | length", "12001\n"),
+        ("isempty(recurse(.[]?))", "false\n"),
+        ("[nth(12000; recurse(.[]?))]", "[1]\n"),
+        ("[limit(2; path(recurse(.[]?)))]", "[[],[0]]\n"),
         (
             r#"(recurse(.[]?) | select(type == "number")) |= . + 1 | [.. | numbers] | add"#,
             "12000\n",
@@ -55891,6 +55900,37 @@ fn test_recurse_of_each_optional_has_no_node_cap_3703() -> Result<()> {
         (
             "[range(12000) | {key: tostring, value: 1}] | from_entries | [recurse(.[]?)] == [..]",
             "true\n",
+        ),
+        // An object-heavy write past the cap: every one of the 12,000 values.
+        (
+            r#"[range(12000) | {key: tostring, value: 1}] | from_entries | (recurse(.[]?) | select(type == "number")) |= . + 1 | [.. | numbers] | add"#,
+            "24000\n",
+        ),
+        (
+            r#"[range(12000) | {key: tostring, value: 1}] | from_entries | del(recurse(.[]?) | select(type == "number")) | length"#,
+            "0\n",
+        ),
+        (
+            "[range(6000) | [1]] | first(recurse(.[]?)) | length",
+            "6000\n",
+        ),
+        (
+            "[range(6000) | [1]] | [limit(12001; recurse(.[]?))] | length",
+            "12001\n",
+        ),
+        // 300 levels deep is past the native stack budget a recursing `f`
+        // spends, where the path walker falls back to its explicit stack.
+        (
+            "reduce range(300) as $i (1; [.]) | [path(recurse(.[]?))] | length",
+            "301\n",
+        ),
+        (
+            r#"reduce range(300) as $i (1; [.]) | (recurse(.[]?) | select(type == "number")) |= . + 1 | [.. | numbers]"#,
+            "[2]\n",
+        ),
+        (
+            r#"reduce range(300) as $i (1; [.]) | del(recurse(.[]?) | select(type == "number")) | [..] | length"#,
+            "300\n",
         ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;

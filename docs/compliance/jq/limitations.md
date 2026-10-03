@@ -777,6 +777,18 @@ The path walker still runs `.[]?` at every node, so `path(recurse(.[]?))` takes 
 `path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes of a `users` document,
 [#3717](https://github.com/rust-works/succinctly/issues/3717)).
 
+**Alias fan-out is walked in full.** A YAML document whose aliases expand to N nodes is delivered
+node by node by `..`, `path(..)`, and, since #3703, `recurse(.[]?)` and `path(recurse(.[]?))`; no work
+budget applies to a walk's output. Measured with `memcap.py --report` on a 458-byte document whose
+nine-way alias ladder expands to 5.4 million nodes at six levels: `[path(recurse(.[]?))] | length`
+peaks at 1.95 GB, the same as `[path(..)]`'s 1.95 GB, where it peaked at 0.41 GB capped at 10,000;
+`del(recurse(.[]?) | select(type == "string"))` peaks at 3.70 GB with or without the cap, because
+the expanded document dominates; `[recurse(.[]?)] | length` 1.06 GB against `[..]`'s 0.46 GB. The
+explicit spelling also materializes the whole expanded document before it walks, so
+`first(recurse(.[]?))` costs 0.40 GB there and exhausts a 3 GB cap on a nine-level document where
+`first(..)` and `first(recurse)` answer from nothing
+([#3719](https://github.com/rust-works/succinctly/issues/3719)).
+
 ## A builtin's argument and a `?//` retry (#3487)
 
 jq binds a builtin's argument once per value: a `$param` of a jq-defined builtin (`flatten($x)`,

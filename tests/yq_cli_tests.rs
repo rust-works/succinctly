@@ -147,6 +147,29 @@ fn test_recurse_of_each_optional_has_no_node_cap_3703() -> Result<()> {
     let (stdout, code) = run_yq_stdin("[recurse(.[]?) | numbers] | length", &doc, &args)?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "6000\n");
+    // The path walker and the writes through it, each against the same filter
+    // spelled `..`: every number incremented, every one deleted, and the same
+    // count of paths. A consumer stops the walk past the cap, too.
+    for (filter, want) in [
+        ("[path(recurse(.[]?))] | length", "12001\n"),
+        ("[path(..)] | length", "12001\n"),
+        (
+            "(recurse(.[]?) | numbers) |= . + 1 | [.. | numbers] | add",
+            "12000\n",
+        ),
+        ("(.. | numbers) |= . + 1 | [.. | numbers] | add", "12000\n"),
+        (
+            "del(recurse(.[]?) | numbers) | [.. | numbers] | length",
+            "0\n",
+        ),
+        ("[limit(3; recurse(.[]?))] | length", "3\n"),
+        ("[limit(12002; recurse(.[]?))] | length", "12001\n"),
+        ("first(recurse(.[]?)) | length", "6000\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, &doc, &args)?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, want, "`{filter}`");
+    }
     Ok(())
 }
 
