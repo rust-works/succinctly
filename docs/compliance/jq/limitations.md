@@ -1024,22 +1024,32 @@ is the revert that established what the other one costs.
    resolver's guess about where jq's register went (#3267), and a `try` or `?` around the
    `and` must not swallow a guess. Residuals:
 
-   - **An operand jq leaves in place that this resolver cannot prove it leaves** (`sort`,
-     `to_entries`, any builtin outside `cannot_move_register`'s allowlist) is read as a loss, so a
-     navigation in `R` is refused where jq accepts: `del(sort and .[0])` on `[true]` is `[]` in
-     jq. Before #3428 the by-value route answered some of these by accident and accepted others
-     jq refuses (`path((first and .b?))` on `[true]` was empty there and refuses near `"b"` in
-     jq), so the boundary moved from "accepts, sometimes wrongly" to "refuses, loudly". The
-     allowlist grows only with an oracle row.
+   - **An operand jq leaves in place that this resolver cannot prove it leaves** (`reverse`,
+     `min`/`max`, `group_by(f)`/`sort_by(f)`, `flatten(n)`, `join`, any builtin outside
+     `cannot_move_register`'s allowlist and `leaves_register_in_place`) is read as a loss, so a
+     navigation in `R` is refused where jq accepts: `del(reverse and .[0])` on `[true]` is `[]`
+     in jq. Before #3428 the by-value route answered some of these by accident and accepted
+     others jq refuses (`path((first and .b?))` on `[true]` was empty there and refuses near
+     `"b"` in jq), so the boundary moved from "accepts, sometimes wrongly" to "refuses, loudly".
+     The allowlist grows only with an oracle row: #3361 gave `sort`, `to_entries`, `flatten`,
+     `add`, `map(f)` and `walk(f)` theirs (an `f` that navigates stays refused, see below),
+     which also lifts the same refusal for each of them as a bare pipe stage --
+     `path(. as $x | to_entries | $x)` is `[]` in jq, and a write through the re-established
+     `$x` lands.
    - **A refusal jq makes and catches is loud here.** jq catches its own path error inside a
      `try`: `del(try (any and .a))` on `{"a":true}` leaves the document. Where an operand may have
      moved the register this resolver cannot tell which error jq would raise, so its refusal is a
      guess, uncatchable by design (#3267), and the row exits 5. The same holds for a right operand
      wrapped in `?`: a bare `.a?` is jq's `INDEX_OPT`, which suppresses a type error but not a
      path error, so on the node the register may still be on its refusal is a guess even when the
-     step could never succeed (`del(try (flatten and .a?))` on `[{"a":1}]` is the document in jq),
+     step could never succeed (`del(try (any and .a?))` on `{"a":true}` is the document in jq),
      and a `(.a)?`/`(.a | .b)?` first step is no longer pruned silently there. Refuse-only, and
      pinned (`test_and_or_path_by_value_operands_track_the_register_3428`).
+   - **`map(f)` and `walk(f)` with an `f` that navigates** are refused as a stage and as an
+     operand where jq answers (`path(. as $x | map(.a) | $x)` on `[{"a":1}]` is `[]` in jq):
+     jq path-checks `f` against every element, a by-value stage does not, so only an `f` that
+     navigates nothing (`map(.)`, `map(tostring)`, `walk(.)`) leaves the register provably in
+     place. Refuse-only, pinned (`test_path_register_by_value_builtin_stages_do_not_move_it_3361`).
    - **A refusal inside a `?//` body is not retried** (`path_alternative_retries`), so
      `del(. as $x ?// $y \| if $x then (.a and .b) else .c end)` on `{"a":1,"c":2}` refuses
      where jq retries past its own path error and answers `{"a":1}`. Before #3289 the by-value

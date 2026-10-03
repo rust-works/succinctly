@@ -496,7 +496,10 @@ Each turns a refusal into an answer and needs its own oracle rows:
 - `LostAt(entry)` for an unchecked `[E]`, and passing `LostAt`'s position through `register_after`
   instead of `LostSomewhere`.
 - Widening `array_contents_are_checked` past `register_movement_tracked`.
-- Static `Unmoved` for the other builtins jq leaves in place (`sort`, `to_entries`, ...), one oracle
-  row each; today each is a refusal where jq accepts.
+- ~~Static `Unmoved` for the other builtins jq leaves in place (`sort`, `to_entries`, ...), one oracle
+  row each.~~ Done for `sort`, `to_entries`, `flatten`, `add`, `map(f)` and `walk(f)` by #3361, at the
+  leaf (`leaves_register_in_place`) and as a stage (`resolve_seq_stage`'s `stage_preserves_register`).
+  Still refused, each needing its own row: `reverse`, `min`/`max`, `group_by(f)`/`sort_by(f)`,
+  `flatten(n)`, `join`, and a `map(f)`/`walk(f)` whose `f` navigates.
 - A register-position-aware `try` for the guess a lost `and`/`or` operand raises, so a refusal jq
   catches can be caught here too (the `var-rebind-nav` rows).
