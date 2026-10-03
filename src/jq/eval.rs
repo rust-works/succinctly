@@ -33548,7 +33548,8 @@ impl Frame {
     /// comparison, which yq has no counterpart of, so yq keeps the by-value
     /// rule it always had.
     fn certifies_value<S: EvalSemantics>(&self, origin: &Origin, value: &OwnedValue) -> bool {
-        if S::TAG != EvalTag::Jq || !matches!(value, OwnedValue::Array(items) if items.is_empty()) {
+        let empty_array = matches!(value, OwnedValue::Array(_)) && !slice_is_same_array(value);
+        if S::TAG != EvalTag::Jq || !empty_array {
             return self.certifies(origin);
         }
         match origin {
@@ -39506,8 +39507,9 @@ fn resolve_flow_as_flow(flow: &ResolveFlow) -> Flow {
 ///   builds for a body whose pattern moved the register -- so a navigation
 ///   in `expr` refuses with jq's own "near attempt to access" whenever the
 ///   input is not the register. The input can be identical to a non-root
-///   register only by `null`/`true`/`false` kind, or as an array's full
-///   slice. An unknown register means jq's is somewhere this resolver cannot see,
+///   register only by `null`/`true`/`false` kind, or as a *non-empty* array's
+///   full slice ([`restored_register_is_input`]; the slice of `[]` is a fresh
+///   `[]`, #3647). An unknown register means jq's is somewhere this resolver cannot see,
 ///   so the seed carries the lost-register frame (#3267): a refusal there
 ///   is a guess, loud rather than catchable. On a trackable entry the input
 ///   *is* the node the register entered on, which jq still holds if `L` did
@@ -39542,24 +39544,12 @@ fn resolve_from_restored_input<'a, S: EvalSemantics>(
     // the seed carries a register or nothing.
     let lost = register.unmoved_value().is_none();
     let seed = match register.into_unmoved() {
-        // `null`/`true`/`false` are identical by kind. A *non-empty* array
-        // register structurally equal to the input at a non-root path can only
-        // be a full slice (a strict subtree of a finite document never equals
-        // the whole), and jq's `.[0:]` hands back the very same array: live
-        // against jq 1.7.1, `path((.[0:] and .[1]) | empty)` on `[1,2]`
-        // passes while `.[1:]`/`.[:1]` refuse, and a full *string* slice is
-        // a copy that refuses too. An *empty* array is the exception, as it is
-        // for [`Frame::certifies_value`] and [`slice_witnesses_node`]: the
-        // slice of `[]` is a fresh `[]`, equal by value and not identical, so
-        // `.b?` after `.[0:0] and` on `[]` meets a register that is not the
-        // input and raises jq's path error, which `?` does not suppress
-        // (#3647). Seeding it as the register let the type error `.b` raises
-        // on `[]` be suppressed instead.
-        Some(reg)
-            if null_bool_identical(value, &reg)
-                || (matches!(value, OwnedValue::Array(items) if !items.is_empty())
-                    && *value == *reg) =>
-        {
+        // [`restored_register_is_input`]: `null`/`true`/`false` by kind, or the
+        // full slice of a non-empty array. Live against jq 1.7.1,
+        // `path((.[0:] and .[1]) | empty)` on `[1,2]` passes while `.[1:]`/
+        // `.[:1]` refuse, a full *string* slice is a copy that refuses too, and
+        // `[] | path(.[0:] and .b?)` refuses (#3647).
+        Some(reg) if restored_register_is_input(value, &reg) => {
             PathBranch::new(path, Cow::Borrowed(value), true)
         }
         register => PathBranch::passthrough(
@@ -40878,6 +40868,27 @@ fn register_identical<S: EvalSemantics>(
 /// instead of hand-inlining the same `matches!` + `==` a third time.
 fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
     matches!(a, OwnedValue::Null | OwnedValue::Bool(_)) && a == b
+}
+
+/// Whether `value` is an array jq's slice hands back as *the same node*: a
+/// non-empty one, whose `.[0:]` shares its buffer (`jv_identical`). The slice
+/// of `[]` is a fresh `jv_array()`, equal by value and not identical, and a
+/// string slice is a copy (#3494). One definition for the places that apply
+/// the rule -- [`Frame::certifies_value`], [`slice_witnesses_node`] and
+/// [`restored_register_is_input`] -- so a refinement (nested empties, say)
+/// cannot reach one and miss the others.
+fn slice_is_same_array(value: &OwnedValue) -> bool {
+    matches!(value, OwnedValue::Array(items) if !items.is_empty())
+}
+
+/// Whether the register `reg` an `and`/`or`'s left operand left at a non-root
+/// path *is* the input `value` the right operand navigates: `null`/`true`/
+/// `false` by kind, or a full slice of a non-empty array (a strict subtree of
+/// a finite document never equals the whole, so an equal array there can only
+/// be that slice). Never an empty array (#3647): `.[0:0] and .b?` on `[]` meets
+/// a register that is not the input.
+fn restored_register_is_input(value: &OwnedValue, reg: &OwnedValue) -> bool {
+    null_bool_identical(value, reg) || (slice_is_same_array(value) && *value == *reg)
 }
 
 /// Whether `marker` certifies against `target` -- storage identity (jq
@@ -42943,9 +42954,7 @@ fn marker_headed(source: &Expr) -> Option<(&Rc<Tracked>, Vec<Expr>)> {
 /// (`null` needs no origin -- it is admitted by value everywhere).
 fn slice_witnesses_node(path: &PathPrefix, value: &OwnedValue) -> bool {
     match path.last() {
-        Some(Expr::Slice { .. } | Expr::SliceExpr { .. }) => {
-            matches!(value, OwnedValue::Array(items) if !items.is_empty())
-        }
+        Some(Expr::Slice { .. } | Expr::SliceExpr { .. }) => slice_is_same_array(value),
         _ => true,
     }
 }
@@ -114093,6 +114102,62 @@ mod tests {
         ));
         assert!(register_identical::<YqSemantics>(
             &empty, &at_slice, &fresh, &mark
+        ));
+    }
+
+    /// #3647: the three places that apply jq's "a slice is the same node only
+    /// for a non-empty array" rule agree, and `restored_register_is_input` -- the
+    /// seed an `and`/`or`'s right operand gets -- never takes `[]` for the input.
+    #[test]
+    fn slice_identity_rule_agrees_across_its_sites_3647() {
+        let empty = OwnedValue::array();
+        let one = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let nested_empty = OwnedValue::array_from(vec![OwnedValue::array()]);
+        let slice_path = PathPrefix::extend(&PathPrefix::root(), Expr::slice(None, None));
+        let field_path = PathPrefix::extend(&PathPrefix::root(), Expr::Field("a".to_string()));
+        for (value, same) in [
+            (&empty, false),
+            (&one, true),
+            // Only the outer array's emptiness matters: a full slice of `[[]]` is `[[]]`.
+            (&nested_empty, true),
+            (&OwnedValue::Null, false),
+            (&OwnedValue::String("".into()), false),
+            (&OwnedValue::Int(0), false),
+        ] {
+            assert_eq!(slice_is_same_array(value), same, "{value:?}");
+            assert_eq!(slice_witnesses_node(&slice_path, value), same, "{value:?}");
+            // A non-slice position names its node whatever the value is.
+            assert!(slice_witnesses_node(&field_path, value), "{value:?}");
+            // Only an empty *array* needs a position in `certifies_value`.
+            let at = Frame::at(1, PathPrefix::root());
+            let origin = Origin::Untracked;
+            let needs_position = matches!(value, OwnedValue::Array(_)) && !same;
+            assert_eq!(
+                at.certifies_value::<JqSemantics>(&origin, value),
+                !needs_position && at.certifies(&origin),
+                "{value:?}"
+            );
+        }
+        // The seed: by-kind scalars and a non-empty full slice are the input,
+        // `[]` never is, and unequal arrays never are.
+        assert!(restored_register_is_input(
+            &OwnedValue::Null,
+            &OwnedValue::Null
+        ));
+        assert!(restored_register_is_input(
+            &OwnedValue::Bool(true),
+            &OwnedValue::Bool(true)
+        ));
+        assert!(restored_register_is_input(&one, &one.clone()));
+        assert!(restored_register_is_input(
+            &nested_empty,
+            &nested_empty.clone()
+        ));
+        assert!(!restored_register_is_input(&empty, &OwnedValue::array()));
+        assert!(!restored_register_is_input(&one, &nested_empty));
+        assert!(!restored_register_is_input(
+            &OwnedValue::Int(0),
+            &OwnedValue::Int(0)
         ));
     }
 
