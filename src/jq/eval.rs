@@ -39542,16 +39542,23 @@ fn resolve_from_restored_input<'a, S: EvalSemantics>(
     // the seed carries a register or nothing.
     let lost = register.unmoved_value().is_none();
     let seed = match register.into_unmoved() {
-        // `null`/`true`/`false` are identical by kind. An *array* register
-        // structurally equal to the input at a non-root path can only be a
-        // full slice (a strict subtree of a finite document never equals the
-        // whole), and jq's `.[0:]` hands back the very same array: live
+        // `null`/`true`/`false` are identical by kind. A *non-empty* array
+        // register structurally equal to the input at a non-root path can only
+        // be a full slice (a strict subtree of a finite document never equals
+        // the whole), and jq's `.[0:]` hands back the very same array: live
         // against jq 1.7.1, `path((.[0:] and .[1]) | empty)` on `[1,2]`
         // passes while `.[1:]`/`.[:1]` refuse, and a full *string* slice is
-        // a copy that refuses too.
+        // a copy that refuses too. An *empty* array is the exception, as it is
+        // for [`Frame::certifies_value`] and [`slice_witnesses_node`]: the
+        // slice of `[]` is a fresh `[]`, equal by value and not identical, so
+        // `.b?` after `.[0:0] and` on `[]` meets a register that is not the
+        // input and raises jq's path error, which `?` does not suppress
+        // (#3647). Seeding it as the register let the type error `.b` raises
+        // on `[]` be suppressed instead.
         Some(reg)
             if null_bool_identical(value, &reg)
-                || (matches!(value, OwnedValue::Array(_)) && *value == *reg) =>
+                || (matches!(value, OwnedValue::Array(items) if !items.is_empty())
+                    && *value == *reg) =>
         {
             PathBranch::new(path, Cow::Borrowed(value), true)
         }
