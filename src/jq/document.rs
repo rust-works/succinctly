@@ -427,6 +427,32 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// classification through a single site.
     fn doc_text(&self) -> &[u8];
 
+    /// Whether this format has delimiter checks to run at all (#2640).
+    ///
+    /// `true` for a format that overrides any of
+    /// [`preceding_delimiter_ok`](Self::preceding_delimiter_ok),
+    /// [`container_gap_ok`](Self::container_gap_ok),
+    /// [`trailing_element_gap_ok`](Self::trailing_element_gap_ok) or
+    /// [`following_colon_ok`](Self::following_colon_ok) -- JSON, whose
+    /// semi-index treats `:` and `,` as interchangeable gap bytes. `false`
+    /// for a format whose parser validates delimiters itself, where every
+    /// one of those is the `true`-returning default.
+    ///
+    /// The helpers that feed a check ([`element_gap_ok`](Self::element_gap_ok),
+    /// [`value_delimiter_ok`], the free [`trailing_element_gap_ok`]) return
+    /// `true` at once when it is `false`, instead of first resolving a position
+    /// or decoding a value that only the check would have read. That resolve is
+    /// not free: YAML's touches a shared sequential cursor, and skipping it
+    /// saves 13-32% of the instructions of a scalar-sequence walk and 9-14% of a
+    /// record sort (#2640). [`key_delimiter_ok`] needs no guard: it reads the
+    /// key's `text_start`, which is the trait default `None` for YAML.
+    ///
+    /// The default is `true`, so a new format keeps checking until it opts
+    /// out. A format that sets it `false` must leave every check above at its
+    /// default; `yaml::light`'s `yaml_has_no_delimiter_checks_2640` pins that
+    /// for YAML.
+    const HAS_DELIMITER_CHECKS: bool = true;
+
     /// Whether this node, already known to sit at `text_pos`, is preceded
     /// by the delimiter its position in the document requires: nothing if
     /// `expected` is `None` (a container's first child), otherwise exactly
@@ -463,6 +489,9 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// into two independent copies of this exact check before this
     /// extraction).
     fn element_gap_ok(&self, is_first: bool) -> bool {
+        if !Self::HAS_DELIMITER_CHECKS {
+            return true;
+        }
         match self.text_position() {
             Some(pos) => self.element_gap_ok_at(pos, is_first),
             None => true,
@@ -2045,6 +2074,9 @@ pub fn value_delimiter_ok<F: DocumentFields>(
     value: Option<&F::Value>,
     value_cursor: &F::Cursor,
 ) -> bool {
+    if !<F::Cursor as DocumentCursor>::HAS_DELIMITER_CHECKS {
+        return true;
+    }
     let pos = value
         .and_then(DocumentValue::text_start)
         .or_else(|| value_cursor.text_position());
@@ -2078,7 +2110,7 @@ pub fn value_delimiter_ok<F: DocumentFields>(
 /// `true` (nothing to flag), the same "can't determine, skip" convention
 /// every sibling gap check in this module already follows.
 pub fn trailing_element_gap_ok<C: DocumentCursor>(last_cursor: &C, close_char: u8) -> bool {
-    if last_cursor.is_container() {
+    if !C::HAS_DELIMITER_CHECKS || last_cursor.is_container() {
         return true;
     }
     match last_cursor.text_position() {
@@ -4235,7 +4267,11 @@ mod key_hash_tests {
 
 #[cfg(test)]
 mod object_keys_repeat_tests {
-    use super::{census, object_keys_repeat, DocumentFields, DocumentValue};
+    use super::{
+        census, object_keys_repeat, trailing_element_gap_ok, DocumentCursor, DocumentFields,
+        DocumentValue,
+    };
+    use crate::json::light::StandardJson;
     use crate::json::JsonIndex;
 
     /// [`object_keys_repeat`] is the batch escape hatch a saturated
@@ -4284,6 +4320,64 @@ mod object_keys_repeat_tests {
             );
             assert_eq!(census(&fields).repeated, repeated, "census on {document}");
         }
+    }
+
+    /// #2640: JSON is the format the delimiter checks exist for, so it must
+    /// keep running them. The flag stays at its `true` default, and every
+    /// helper that now consults it still refuses what it refused before: a
+    /// doubled `,` before an element or a key, and a stray `,` after the last
+    /// child.
+    #[test]
+    fn json_keeps_its_delimiter_checks_2640() {
+        fn has_checks<C: DocumentCursor>(_: &C) -> bool {
+            C::HAS_DELIMITER_CHECKS
+        }
+        let json = br#"[1,,2]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        assert!(has_checks(&root), "JSON declares delimiter checks");
+        let mut elems = root.value().as_array().expect("an array");
+        let mut verdicts = Vec::new();
+        let mut is_first = true;
+        let mut last = None;
+        while let Some((cursor, rest)) = elems.uncons_cursor() {
+            verdicts.push(cursor.element_gap_ok(is_first));
+            last = Some(cursor);
+            elems = rest;
+            is_first = false;
+        }
+        assert_eq!(
+            verdicts,
+            [true, false],
+            "`[1,,2]`: the second gap is doubled"
+        );
+        assert!(last.is_some());
+
+        let json = br#"[1,]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let (only, _) = root
+            .value()
+            .as_array()
+            .expect("an array")
+            .uncons_cursor()
+            .expect("one element");
+        assert!(
+            !trailing_element_gap_ok(&only, b']'),
+            "`[1,]`: a stray comma after the last element"
+        );
+
+        let json = br#"{"a":1,,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let fields = root.value().as_object().expect("an object");
+        let (first, _, rest) = fields.uncons_key().expect("a first field");
+        let _ = first;
+        let (second, _) = DocumentFields::uncons(&rest).expect("a second field");
+        assert!(
+            !second.delimiters_ok::<<StandardJson<'_, Vec<u64>> as DocumentValue>::Fields>(false),
+            "`{{\"a\":1,,\"b\":2}}`: the second key's gap is doubled"
+        );
     }
 }
 

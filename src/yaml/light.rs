@@ -7312,6 +7312,14 @@ const MAX_ALIAS_CHAIN_DEPTH: usize = 65_536;
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     type Value = YamlValue<'a, W>;
 
+    /// The YAML parser validates delimiters while it builds the index, and
+    /// this impl overrides none of the delimiter checks, so each is the
+    /// `true`-returning default; saying so lets the generic walk skip
+    /// resolving the position and decoding the key or value that only a check
+    /// would have read (#2640). `yaml_has_no_delimiter_checks_2640` pins the
+    /// two staying in step.
+    const HAS_DELIMITER_CHECKS: bool = false;
+
     #[inline]
     fn value(&self) -> Self::Value {
         YamlCursor::value(self)
@@ -15387,6 +15395,96 @@ mod tests {
             }
         }
         panic!("Could not find value");
+    }
+
+    /// #2640: YAML declares it has no delimiter checks, and that claim is
+    /// only sound while every one of them is the `true`-returning default --
+    /// so this checks both halves. The defaults first, over a spread of
+    /// arguments; then that the helpers which feed a check no longer resolve
+    /// a position or decode a key or value for it.
+    ///
+    /// The second half reads the shared index's sequential-cursor cache
+    /// through `Debug` (it prints the whole index, cache included -- see the
+    /// project note on why comparing `Debug` across *routes* is unsound; here
+    /// it is the same cursor before and after, which is the point). The cache
+    /// is first moved onto a different element, and a control asserts that a
+    /// real `text_position()` does change it, so the equality below cannot
+    /// pass vacuously.
+    #[test]
+    fn yaml_has_no_delimiter_checks_2640() {
+        fn has_checks<C: DocumentCursor>(_: &C) -> bool {
+            C::HAS_DELIMITER_CHECKS
+        }
+        let yaml = b"- 1\n- 2\n- 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let docs = first_doc(index.root(yaml));
+        let YamlValue::Sequence(elements) = docs else {
+            panic!("expected a sequence"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixture above is a block sequence (#2640)"
+        };
+        let (first, rest) = elements.uncons_cursor().expect("first");
+        let (second, rest) = rest.uncons_cursor().expect("second");
+        let (third, _) = rest.uncons_cursor().expect("third");
+
+        assert!(!has_checks(&first), "YAML declares no delimiter checks");
+        for expected in [None, Some(b','), Some(b':'), Some(b'x')] {
+            for pos in [0, 1, usize::MAX] {
+                assert!(first.preceding_delimiter_ok(pos, expected));
+            }
+        }
+        assert!(first.container_gap_ok(b']'));
+        assert!(first.container_gap_ok(b'}'));
+        assert!(first.trailing_element_gap_ok(0, b']'));
+        assert!(first.following_colon_ok(0));
+
+        // Park the cache on the last element, then run the checks on the
+        // others: they must leave it exactly where it was.
+        let _ = third.text_position();
+        let parked = alloc::format!("{first:?}");
+        // The sequence ends on `second`, not `third`, so a check that did
+        // resolve a position would leave the cache somewhere else.
+        assert!(first.element_gap_ok(true));
+        assert!(second.element_gap_ok(false));
+        assert!(crate::jq::document::trailing_element_gap_ok(&second, b']'));
+        assert_eq!(
+            alloc::format!("{first:?}"),
+            parked,
+            "a delimiter check resolved a position it never reads"
+        );
+        let _ = second.text_position();
+        assert_ne!(
+            alloc::format!("{first:?}"),
+            parked,
+            "control: resolving a position does move the cache"
+        );
+
+        // The object arm: a member's value feeds `value_delimiter_ok` through
+        // `delimiters_ok`, which falls back to the value cursor's
+        // `text_position()` when the value carries no text start (YAML's never
+        // does). Same method: park the cache on the last member, run the
+        // others, end somewhere else.
+        let yaml = b"a: 1\nb: 2\nc: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let YamlValue::Mapping(fields) = first_doc(index.root(yaml)) else {
+            panic!("expected a mapping"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixture above is a block mapping (#2640)"
+        };
+        let (a, rest) = DocumentFields::uncons(&fields).expect("a");
+        let (b, rest) = DocumentFields::uncons(&rest).expect("b");
+        let (c, _) = DocumentFields::uncons(&rest).expect("c");
+        let _ = c.value_cursor.text_position();
+        let parked = alloc::format!("{:?}", a.key_cursor);
+        assert!(a.delimiters_ok::<YamlFields<'_, Vec<u64>>>(true));
+        assert!(b.delimiters_ok::<YamlFields<'_, Vec<u64>>>(false));
+        assert_eq!(
+            alloc::format!("{:?}", a.key_cursor),
+            parked,
+            "a member's delimiter check resolved a position it never reads"
+        );
+        let _ = b.value_cursor.text_position();
+        assert_ne!(
+            alloc::format!("{:?}", a.key_cursor),
+            parked,
+            "control: resolving a member's position does move the cache"
+        );
     }
 
     /// Direct coverage for the stripped `line_comment` getter (issue #710)
