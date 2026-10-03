@@ -41889,8 +41889,11 @@ mod tests {
     }
 
     /// #3673: a rest the owned front doors answer from its one plain stage
-    /// never builds the owned `Expr::Pipe`; a rest they leave to the bridge
-    /// (another stage, a nested pipe, a shape no door knows) builds it, once.
+    /// never builds the owned `Expr::Pipe`. #3692: nor does one they decline,
+    /// since the stage goes on past them as itself; a rest that is not one
+    /// plain stage (another stage, a nested pipe) builds it, once.
+    /// `test_declined_lone_stage_agrees_with_the_wrapped_pipe_3692` covers the
+    /// stages that do keep the copy.
     #[test]
     fn test_rest_pipe_builds_no_owned_pipe_for_a_door_answered_stage_3673() {
         let two = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
@@ -41902,8 +41905,8 @@ mod tests {
             (". == 3", OwnedValue::Int(3), "true", false),
             ("not", OwnedValue::Int(3), "false", false),
             ("length", two.clone(), "2", false),
-            ("(. + 1)", OwnedValue::Int(3), "4", true),
-            ("floor", OwnedValue::Float(2.5), "2", true),
+            ("(. + 1)", OwnedValue::Int(3), "4", false),
+            ("floor", OwnedValue::Float(2.5), "2", false),
             (". | length", two.clone(), "2", true),
             (". + 1 | . * 2", OwnedValue::Int(3), "8", true),
         ] {
@@ -41920,7 +41923,7 @@ mod tests {
             });
             assert!(matches!(flow, Flow::Exhausted), "{src}");
             assert_eq!(out, [want], "{src}");
-            assert_eq!(rest.owned.is_some(), builds, "{src}: owned pipe built");
+            assert_eq!(rest.built_copy(), builds, "{src}: owned pipe built");
         }
     }
 
