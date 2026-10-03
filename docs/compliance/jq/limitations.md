@@ -1212,8 +1212,8 @@ is the revert that established what the other one costs.
    whether its body is otherwise checked — a *handler* still has to stay checked, since a
    handler jq itself never reaches when the body only fails *here* would fabricate `[]`); and,
    through that `try`-admission, #3271's own construct set (`with_entries`/`map_values`/an
-   object-input `walk`/`unique`/`unique_by`/`sub`/`gsub`/every update assignment) whenever
-   wrapped in one. So `path(. as $x \| [.a] \| $x)`, `path(. as $x \| [first] \| $x)`,
+   object-input `walk`/`unique`/`unique_by`/`sub`/`gsub`/every update assignment, and
+   `from_entries` since #3360) whenever wrapped in one. So `path(. as $x \| [.a] \| $x)`, `path(. as $x \| [first] \| $x)`,
    `path(. as $x \| (.a = 3) \| $x.a)` and `path(. as $x \| [try with_entries(.)] \| $x.a)`
    are all `[]`/a real path in both tools. Any other array carries no register. Where it holds
    navigation this resolver can't see (a builtin jq defines in jq, such as `with_entries` or
@@ -1223,11 +1223,10 @@ is the revert that established what the other one costs.
    resolver still evaluates by value (`getpath`:
    `path(. as $x \| [.a \| getpath(["b"])] \| $x)`), one it resolves but does not count as
    checked (`//`, `first(f)`: `path(. as $x \| [first(.a)] \| $x)` — note the *argument* form,
-   distinct from the bare `first` just admitted above), `from_entries` (jq's own `map(...) |
-   add` always iterates the constructed array, so jq itself always raises — admitting it here
-   would fabricate `[]`), or a `map`/`any`/`all`/`walk` argument that navigates but stays
-   tracked (`[map(.a)]`, `[all(.a)]`, `[map(first)]`, all `[]` in jq — needs its own
-   navigates-only-the-register predicate, a follow-up). The second is an array nested in
+   distinct from the bare `first` just admitted above), or a `map`/`any`/`all`/`walk` argument
+   that navigates but stays tracked (`[map(.a)]`, `[all(.a)]`, `[map(first)]`, all `[]` in jq —
+   needs its own navigates-only-the-register predicate,
+   [#3724](https://github.com/rust-works/succinctly/issues/3724)). The second is an array nested in
    another stage's expression (`if true then [.a] else 1 end`, `([.a], [.k])`). The third is a
    `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call
    to its body is not something a syntactic predicate can do from a name).
@@ -1893,9 +1892,14 @@ is the revert that established what the other one costs.
    on `{"a":1}`): its object arm is `map_values`, which raises once it runs at all, but the check
    only ran on a value the call produced. **Still accepted wrongly:** a `walk(f)` whose `f`
    navigates the computed array it is applied to (`path(walk(.a?))` on `[1]`, `path(walk(.[]?))`
-   on `[]`): jq raises there, even through a `?`, and a by-value `walk` never checks `f`'s
-   navigation ([#3723](https://github.com/rust-works/succinctly/issues/3723)). Both rules are
-   jq mode only, like the rest of the table.
+   on `[]`, a nested `path(walk(walk(empty)))` on `[]`): jq raises there, even through a `?`,
+   and a by-value `walk` never checks `f`'s navigation
+   ([#3723](https://github.com/rust-works/succinctly/issues/3723)). And the always-raises group
+   (`from_entries`, `unique`, `with_entries`, ...) is still accepted as a `reduce`/`foreach`
+   *source* (`path(reduce unique as $x (.; .))` on `[1]` answers `[]`; jq exits 5), which
+   predates #3360 and covers the whole group
+   ([#3726](https://github.com/rust-works/succinctly/issues/3726)). Both rules are jq mode
+   only, like the rest of the table.
 
    **#2746's own fix introduced one further, separate divergence, on the register rather
    than on navigation**: `INDEX(gen;f)` (and, until

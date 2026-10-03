@@ -39019,8 +39019,8 @@ fn iterates_untracked_input<S: EvalSemantics>(
     }
 }
 
-/// [`always_refuses_as_live_path`]'s sibling for the one shape that fell
-/// through it entirely: `match`/`scan`/`capture` (plus their `Flags` forms)
+/// [`always_refuses_as_live_path`]'s sibling for the shapes that fell through
+/// it entirely: `match`/`scan`/`capture` (plus their `Flags` forms)
 /// produce **zero** values when the pattern never matches, and
 /// [`always_refuses_as_live_path`] only runs on a value `expr` already
 /// produced -- so a zero-output run never calls it at all, and the
@@ -39052,7 +39052,6 @@ fn iterates_untracked_input<S: EvalSemantics>(
 /// of #3271, recorded in `limitations.md`).
 fn always_refuses_when_empty<S: EvalSemantics>(
     expr: &Expr,
-    walk_input_reaches_object: bool,
     input: &OwnedValue,
 ) -> Option<EvalError> {
     if S::TAG != EvalTag::Jq {
@@ -39069,7 +39068,9 @@ fn always_refuses_when_empty<S: EvalSemantics>(
         ) => Some(EvalError::invalid_path_expression_near_iterate(
             &OwnedValue::Array(Vec::new().into()),
         )),
-        Expr::Builtin(Builtin::Walk(_)) if walk_input_reaches_object => Some(
+        // Only called once, for a call that produced nothing, so the walk of
+        // `input` is not worth hoisting the way the per-value check's is.
+        Expr::Builtin(Builtin::Walk(_)) if array_reaches_object(input) => Some(
             EvalError::invalid_path_expression_near_access(&OwnedValue::Int(0), input),
         ),
         _ => None,
@@ -39219,7 +39220,7 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     // argument's own type error/`error(...)` must still come first, same
     // ordering rule as `always_refuses_as_live_path`).
     if delivered == 0 && matches!(flow, Flow::Exhausted) {
-        if let Some(e) = always_refuses_when_empty::<S>(expr, walk_input_reaches_object, value) {
+        if let Some(e) = always_refuses_when_empty::<S>(expr, value) {
             return ResolveFlow::Escaped(EvalEscape::Error(e));
         }
     }
@@ -39565,8 +39566,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // must still win first, which a bare-shape pre-check would not
         // respect).
         if matches!(flow, Flow::Exhausted) {
-            if let Some(e) = always_refuses_when_empty::<S>(expr, walk_input_reaches_object, value)
-            {
+            if let Some(e) = always_refuses_when_empty::<S>(expr, value) {
                 return Err((Vec::new(), EvalEscape::Error(e)));
             }
         }
@@ -40595,10 +40595,11 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // **With a handler, the body must stay checked.** If jq's body
         // raises where this resolver's by-value evaluation of it would not,
         // jq runs the handler and this resolver never does -- admitting the
-        // array unconditionally there would fabricate `[]` for e.g. `[try
-        // from_entries catch .zz] | $x` and `[try from_entries catch
-        // error] | $x` on `[{"key":"a","value":1}]`, both of which jq
-        // itself raises through. A handler that runs live against the
+        // array unconditionally there would fabricate `[]` for a body that
+        // raises in jq and succeeds by value here, and jq itself raises
+        // through the handler. (`from_entries` was the example until #3360
+        // gave it a `live_path_refusal` arm: its body now raises here too,
+        // so the handler really runs, as in jq.) A handler that runs live against the
         // error message is checked the same as any other operand --
         // `path(. as $x | [try .a catch .k] | $x)` is `[]` in jq 1.7.1.
         Expr::Try { catch: None, .. } => true,
