@@ -9973,6 +9973,26 @@ pub(crate) mod lone_pipe_entries {
     }
 }
 
+/// Test-only observable (#3715): how many times [`eval_owned_pipe`] copied the
+/// rest of its pipe on this thread. A stateless lone stage makes none; a lone
+/// stage holding a `def`, and a rest of two or more stages, make one.
+#[cfg(test)]
+pub(crate) mod owned_pipe_copies {
+    use core::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
 /// The stages after the current one, plus the owned `Expr::Pipe` copy that
 /// [`eval_each_owned`] needs of them -- built at most once, and only if the
 /// rest cannot be answered without it (#1598, #3673, #3682).
@@ -24454,6 +24474,27 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // For owned values, we need to serialize and re-evaluate
     // This is less efficient but ensures correctness
+    //
+    // A lone stage is already evaluated bare below (a copy of it, not a pipe of
+    // one), so handing the program's own node on instead is the same evaluation
+    // without the copy (#3715): the copy is 30 ns and one allocator call for
+    // `.a`, 232 ns for a regex `test`, 780 ns for a `select(.a > 3 and .a <
+    // 100000)`, against the 3 to 22 ns that [`lone_stage_can_go_bare`] (which
+    // walks the stage twice; [`holds_evaluation_state`] is one of the walks)
+    // takes to decide. The copy has to stay for a stage that holds a `def`: a node
+    // remembers what evaluation did to it (#3148), a copy starts empty, and a
+    // recursive `def` reached as a lone rest kept its whole call tree on its
+    // own node (`test_declined_lone_def_call_keeps_its_copy_and_the_3148_retention_3692`
+    // runs this very path). A rest of two or more stages still needs an owned
+    // `Expr::Pipe` to hand on, which `RestPipe` builds once per drive; here each
+    // element is its own call and the AST has no slot to cache one in.
+    if let [stage] = exprs {
+        if !holds_evaluation_state(stage) {
+            return eval_owned_input::<W, S>(stage, &value, optional, Reentry::REBUILT);
+        }
+    }
+    #[cfg(test)]
+    owned_pipe_copies::bump();
     let rest_expr = if exprs.len() == 1 {
         exprs[0].clone()
     } else {
@@ -82072,6 +82113,76 @@ mod tests {
             "map(. + 1)",
         ] {
             assert!(!holds_evaluation_state(&parse(src).unwrap()), "{src}");
+        }
+    }
+
+    /// #3715: `eval_owned_pipe` makes no copy of a lone stage that holds no `def`.
+    ///
+    /// A lone stage is evaluated bare either way (the old code copied it and
+    /// handed on the copy), so such a stage is handed on as it stands, and the
+    /// answer is the old path's: each case is compared with the copy evaluated
+    /// through the same entry. A lone stage that holds a `def` keeps its copy
+    /// (#3148; the retention itself is
+    /// `test_declined_lone_def_call_keeps_its_copy_and_the_3148_retention_3692`),
+    /// and a rest of two or more stages needs an owned pipe to hand on. The
+    /// counter spans the whole evaluation, which re-enters `eval_owned_pipe`
+    /// once per owned intermediate, so those cases pin "at least one copy",
+    /// not how many.
+    #[test]
+    fn test_eval_owned_pipe_copies_no_stateless_lone_stage_3715() {
+        let input = || OwnedValue::object_from([("a".to_string(), OwnedValue::Int(3))]);
+        let show = |r: QueryResult<'_, Vec<u64>>| -> Vec<String> {
+            r.collect_owned::<JqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect()
+        };
+        for (src, copies_expected) in [
+            // A lone stage that holds no `def`: handed on, no copy at all.
+            (".a", Some(0)),
+            (".a + 1", Some(0)),
+            ("tostring", Some(0)),
+            ("select(.a > 3 and .a < 100000)", Some(0)),
+            ("[.a, .a]", Some(0)),
+            ("to_entries", Some(0)),
+            ("map_values(. + 1)", Some(0)),
+            // A lone stage that holds a `def` keeps its copy.
+            ("def f: .a + 1; f", None),
+            ("[def f: .a; f]", None),
+            // Two or more stages: an owned pipe, at least once.
+            (".a | tostring", None),
+            (".a | . + 1 | tostring | length", None),
+            (r#"[.a, .a] | map(. + 1)"#, None),
+        ] {
+            let parsed = parse(src).unwrap();
+            let rest: Vec<Expr> = match parsed.clone() {
+                Expr::Pipe(stages) => stages,
+                other => vec![other],
+            };
+            let before = owned_pipe_copies::get();
+            let got = show(eval_owned_pipe::<Vec<u64>, JqSemantics>(
+                &rest,
+                input(),
+                false,
+            ));
+            let copies = owned_pipe_copies::get() - before;
+            match copies_expected {
+                Some(n) => assert_eq!(copies, n, "copies made for `{src}`"),
+                None => assert!(copies >= 1, "`{src}` must keep its copy"),
+            }
+            // The old path: a copy of the rest, evaluated through the same entry.
+            let copied = if rest.len() == 1 {
+                rest[0].clone()
+            } else {
+                Expr::Pipe(rest.clone())
+            };
+            let want = show(eval_owned_input::<Vec<u64>, JqSemantics>(
+                &copied,
+                &input(),
+                false,
+                Reentry::REBUILT,
+            ));
+            assert_eq!(got, want, "`{src}`");
         }
     }
 
