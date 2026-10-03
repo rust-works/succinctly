@@ -140,6 +140,12 @@ jobs:
           test "${{ needs.test-x86-matrix.result }}" = "success" \
             || { echo "::error::a Test (x86_64) matrix leg did not succeed (${{ needs.test-x86-matrix.result }})"; exit 1; }
 
+  # No `actions/cache` on the three test matrices (#3649). Measured on PR #3669's
+  # run: all 16 sampled legs missed (the cache is scoped per ref and `main` no
+  # longer re-runs these legs on push), and a hit would have saved only the
+  # 9-19 s the dependencies take to compile -- the crate itself (40-80 s)
+  # recompiles on every change either way. A miss still paid ~40 s to save a
+  # 0.6-0.9 GB `target/` that evicted everything else from the 10 GB cap.
   test-x86-matrix:
     name: Test (x86_64) (${{ matrix.name }})
     needs: gate
@@ -240,18 +246,6 @@ jobs:
       - name: Install Rust
         if: needs.gate.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        if: needs.gate.outputs.code == 'true'
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
 
       # The x86 SIMD tests (BMI2, AVX2) self-skip when the feature is absent,
       # which reads as a silent pass. Fail loudly if this runner can't actually
@@ -408,18 +402,6 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo
-        if: needs.gate.outputs.code == 'true'
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-arm64-cargo-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
-
       # The aarch64 SVE2 tests self-skip (emitting a `SKIPPED: SIMD test` marker
       # via note_simd_skip) when sve2-bitperm is absent. The ubuntu-24.04-arm
       # runner (Neoverse-N2) provides it, so require it here: an all-skipped SVE2
@@ -541,18 +523,6 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        if: needs.gate.outputs.code == 'true'
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
-
       - name: Build CLI (for integration tests)
         if: needs.gate.outputs.code == 'true' && matrix.buildCli
         run: cargo build --features cli --bin succinctly
@@ -612,8 +582,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      # Restore-only on everything but `main` (#3649): a PR- or merge-queue-scoped
+      # cache can only ever be read by that one ref, so saving from them filled
+      # the repository's 10 GB cap with entries nobody could use and evicted
+      # `main`'s. The save step after the release build writes it from `main`.
+      - name: Restore cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/bin/
@@ -689,6 +664,18 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --features cli
+
+      - name: Save cargo cache
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Run perf guard
         run: |
