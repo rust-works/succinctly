@@ -15,10 +15,19 @@
 //! that stopped counting would otherwise pass every comparison with
 //! `0 < 0 + N/4`.
 //!
-//! Both entry points are measured. The collecting one
-//! (`eval_with_cursor_using`) answers a `[...] | length`; the streaming one
-//! (`eval_each_with_cursor_using`, what `succinctly jq` drives) reaches the
-//! same boundary through `each_try_generic`, a different function.
+//! Three routes are measured, each reaching a different copy of the boundary.
+//! The collecting entry (`eval_with_cursor_using`) answers a `[...] | length`
+//! through `try_single_generic`; the streaming one
+//! (`eval_each_with_cursor_using`, what `succinctly jq` drives) through
+//! `each_try_generic`; and `eval_full`, the value evaluator, through `eval_try`
+//! and `each_try` in `eval.rs`, which the other two never reach for a document
+//! cursor, so only a row here fails if those shortcuts are deleted.
+//!
+//! A string with a backslash in it is the one scalar that costs something: it
+//! has to be decoded to be validated, which allocates once per member (twice in
+//! `.. | path`, whose leaf check decodes it for `scalar_iteration_precheck`
+//! and again for `validate_cursor`). Those fixtures carry that allowance; the
+//! rest must cost nothing per member.
 //!
 //! Counting is gated to the calling thread, so the harness's other threads, and
 //! other tests in this file, cannot add to the window.
@@ -29,7 +38,7 @@ use std::cell::Cell;
 use succinctly::jq::eval_generic::{
     eval_each_with_cursor_using, eval_with_cursor_using, GenericResult,
 };
-use succinctly::jq::{parse, JqSemantics, OwnedValue};
+use succinctly::jq::{eval_full, parse, JqSemantics, OwnedValue, QueryResult};
 use succinctly::json::JsonIndex;
 
 thread_local! {
@@ -163,26 +172,41 @@ fn allocations_streaming(query: &str, json: &str) -> (usize, usize) {
 
 const N: usize = 2_000;
 
-/// (name, document): every member a scalar the swallowing step must leave
-/// alone.
-fn fixtures() -> Vec<(&'static str, String)> {
+/// A document of `N` scalar members, and what its scalars cost to validate.
+struct Fixture {
+    name: &'static str,
+    json: String,
+    /// Allocations per member the swallowing boundary may keep: 0, or 1 for a
+    /// string that has to be decoded (an escape).
+    boundary_allowance: usize,
+    /// The same for `.. | path`, whose leaf check decodes a string twice.
+    walk_allowance: usize,
+}
+
+fn fixtures() -> Vec<Fixture> {
     let join = |parts: Vec<String>| parts.join(",");
+    let plain = |name, json| Fixture {
+        name,
+        json,
+        boundary_allowance: 0,
+        walk_allowance: 0,
+    };
     vec![
         // The keyed twin: an owned key `String` per member beside the scalar.
-        (
+        plain(
             "object of integers",
             format!(
                 "{{{}}}",
                 join((0..N).map(|i| format!("\"key{i}\":{i}")).collect())
             ),
         ),
-        (
+        plain(
             "array of integers",
             format!("[{}]", join((0..N).map(|i| i.to_string()).collect())),
         ),
-        // A string scalar is read to be validated; that must not allocate
-        // either, since the boundary throws the result away.
-        (
+        // A string scalar is read to be validated; without an escape that must
+        // not allocate either, since the boundary throws the result away.
+        plain(
             "object of strings",
             format!(
                 "{{{}}}",
@@ -194,7 +218,7 @@ fn fixtures() -> Vec<(&'static str, String)> {
             ),
         ),
         // Booleans and `null` are the other scalar kinds a message quotes.
-        (
+        plain(
             "array of booleans and nulls",
             format!(
                 "[{}]",
@@ -205,23 +229,43 @@ fn fixtures() -> Vec<(&'static str, String)> {
                 )
             ),
         ),
+        // An escape makes the string decode to be validated: one allocation per
+        // member, not the eight the message cost.
+        Fixture {
+            name: "object of escaped strings",
+            json: format!(
+                "{{{}}}",
+                join(
+                    (0..N)
+                        .map(|i| format!("\"key{i}\":\"line\\nbreak {i}\""))
+                        .collect()
+                )
+            ),
+            boundary_allowance: 1,
+            walk_allowance: 2,
+        },
     ]
 }
 
 /// `swallowed` must cost what `twin` does, within a quarter of one allocation
-/// per member -- a per-member allocation in the swallowing step would add at
-/// least `N`.
+/// per member plus `allowance` per member -- a per-member allocation in the
+/// swallowing step would add at least `N`.
 ///
 /// The twin may legitimately make none (a streamed `.[]` over an array walks
 /// it without allocating), so this is only an upper bound; that the counter
 /// counts at all is [`assert_counting`]'s job.
 #[track_caller]
-fn assert_costs_like_twin(name: &str, swallowed: (&str, usize), twin: (&str, usize)) {
+fn assert_costs_like_twin(
+    name: &str,
+    swallowed: (&str, usize),
+    twin: (&str, usize),
+    allowance: usize,
+) {
     assert!(
-        swallowed.1 < twin.1 + N / 4,
+        swallowed.1 < twin.1 + allowance * N + N / 4,
         "{name}: `{}` made {} allocator calls against `{}`'s {} over the same \
-         members; a per-member allocation in the swallowed `.[]` would add at \
-         least {N}",
+         members (allowing {allowance} per member); a per-member allocation in the \
+         swallowed `.[]` would add at least {N} more",
         swallowed.0,
         swallowed.1,
         twin.0,
@@ -241,9 +285,41 @@ fn assert_counting(name: &str, (query, allocations): (&str, usize)) {
     );
 }
 
+/// Allocator calls one evaluation of `query` makes through `eval_full`, the
+/// value evaluator, and the number it answered. The only entry that reaches
+/// `eval.rs`'s `eval_try`/`each_try` for a document.
+fn allocations_value_route(query: &str, json: &str) -> (usize, i64) {
+    let bytes = json.as_bytes();
+    let index = JsonIndex::build(bytes);
+    let expr = parse(query).expect("parse");
+
+    let answer = |result: QueryResult<'_, Vec<u64>>| match result {
+        QueryResult::Owned(OwnedValue::Int(n)) => n,
+        _ => panic!("`{query}` did not settle to one number"),
+    };
+
+    // Warm-up, as above.
+    let expected = answer(eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(bytes)));
+
+    ALLOCATIONS.with(|count| count.set(Some(0)));
+    let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(bytes));
+    let counted = ALLOCATIONS
+        .with(|count| count.replace(None))
+        .expect("the window was opened above");
+
+    assert_eq!(answer(result), expected, "a repeat evaluation must agree");
+    (counted, expected)
+}
+
 #[test]
 fn a_swallowed_iteration_over_a_scalar_allocates_no_more_than_its_twin_3689() {
-    for (name, json) in fixtures() {
+    for Fixture {
+        name,
+        json,
+        boundary_allowance,
+        walk_allowance,
+    } in fixtures()
+    {
         let (twin, answered) = allocations_collecting("[.[]] | length", &json);
         assert_eq!(answered, N as i64, "{name}: the twin's answer");
 
@@ -254,13 +330,21 @@ fn a_swallowed_iteration_over_a_scalar_allocates_no_more_than_its_twin_3689() {
             "[.[] | try .[] catch empty] | length",
             // Parenthesised: the same boundary under a `Paren`.
             "[.[] | (.[])?] | length",
+            // A closure argument reaches the boundary as `Expr::Shared`.
+            "def opt(f): f?; [.[] | opt(.[])] | length",
+            "def safe(f): try f catch empty; [.[] | safe(.[])] | length",
         ] {
             let (swallowed, answered) = allocations_collecting(query, &json);
             assert_eq!(
                 answered, 0,
                 "{name}: `{query}` iterates scalars, so yields nothing"
             );
-            assert_costs_like_twin(name, (query, swallowed), ("[.[]] | length", twin));
+            assert_costs_like_twin(
+                name,
+                (query, swallowed),
+                ("[.[]] | length", twin),
+                boundary_allowance,
+            );
         }
 
         // `.. | path` steps every node through that same `.[]?`; its twin does
@@ -274,23 +358,55 @@ fn a_swallowed_iteration_over_a_scalar_allocates_no_more_than_its_twin_3689() {
             name,
             ("[.. | path] | length", walked),
             ("[.[] | path] | length", path_twin),
+            walk_allowance,
         );
+
+        // The same `.[]?` written out in front of a path-context read: nothing
+        // flows past it, so it costs what visiting the members' positions does
+        // (the path twin), and no more.
+        for query in [
+            "[.[] | .[]? | key] | length",
+            "[.[] | try .[] catch empty | path] | length",
+        ] {
+            let (swallowed, answered) = allocations_collecting(query, &json);
+            assert_eq!(answered, 0, "{name}: `{query}` yields nothing");
+            assert_costs_like_twin(
+                name,
+                (query, swallowed),
+                ("[.[] | path] | length", path_twin),
+                boundary_allowance,
+            );
+        }
     }
 }
 
 #[test]
 fn a_swallowed_iteration_over_a_scalar_allocates_no_more_than_its_twin_when_streamed_3689() {
-    for (name, json) in fixtures() {
+    for Fixture {
+        name,
+        json,
+        boundary_allowance,
+        walk_allowance,
+    } in fixtures()
+    {
         let (twin, outputs) = allocations_streaming(".[]", &json);
         assert_eq!(outputs, N, "{name}: the twin's outputs");
 
-        for query in [".[] | .[]?", ".[] | try .[]", ".[] | try .[] catch empty"] {
+        for query in [
+            ".[] | .[]?",
+            ".[] | try .[]",
+            ".[] | try .[] catch empty",
+            // The parenthesised boundary reaches `each_try_generic` as a
+            // `Paren`, a different dispatch from the collecting entry's.
+            ".[] | (.[])?",
+            "def opt(f): f?; .[] | opt(.[])",
+        ] {
             let (swallowed, outputs) = allocations_streaming(query, &json);
             assert_eq!(
                 outputs, 0,
                 "{name}: `{query}` iterates scalars, so yields nothing"
             );
-            assert_costs_like_twin(name, (query, swallowed), (".[]", twin));
+            assert_costs_like_twin(name, (query, swallowed), (".[]", twin), boundary_allowance);
         }
 
         let (path_twin, outputs) = allocations_streaming(".[] | path", &json);
@@ -298,7 +414,49 @@ fn a_swallowed_iteration_over_a_scalar_allocates_no_more_than_its_twin_when_stre
         assert_counting(name, (".[] | path", path_twin));
         let (walked, outputs) = allocations_streaming(".. | path", &json);
         assert_eq!(outputs, N + 1, "{name}: the nodes `..` visits");
-        assert_costs_like_twin(name, (".. | path", walked), (".[] | path", path_twin));
+        assert_costs_like_twin(
+            name,
+            (".. | path", walked),
+            (".[] | path", path_twin),
+            walk_allowance,
+        );
+    }
+}
+
+/// `eval_full` is the value evaluator, whose `eval_try`/`each_try` carry their
+/// own copy of the shortcut. Nothing else in this file reaches them for a
+/// document cursor, so deleting either shortcut would leave every other row
+/// green and the output unchanged; this is the row that fails.
+#[test]
+fn a_swallowed_iteration_over_a_scalar_allocates_no_more_than_its_twin_on_the_value_route_3689() {
+    for Fixture {
+        name,
+        json,
+        boundary_allowance,
+        ..
+    } in fixtures()
+    {
+        let (twin, answered) = allocations_value_route("[.[]] | length", &json);
+        assert_eq!(answered, N as i64, "{name}: the twin's answer");
+        // The twin may make next to nothing here; `tostring` builds a string per
+        // member, so the counter is shown to count on this route.
+        let (live, _) = allocations_value_route("[.[] | tostring] | length", &json);
+        assert_counting(name, ("[.[] | tostring] | length", live));
+
+        for query in [
+            "[.[] | .[]?] | length",
+            "[.[] | try .[] catch empty] | length",
+            "[.[] | (.[])?] | length",
+        ] {
+            let (swallowed, answered) = allocations_value_route(query, &json);
+            assert_eq!(answered, 0, "{name}: `{query}` iterates scalars");
+            assert_costs_like_twin(
+                name,
+                (query, swallowed),
+                ("[.[]] | length", twin),
+                boundary_allowance,
+            );
+        }
     }
 }
 
@@ -308,16 +466,19 @@ fn a_swallowed_iteration_over_a_scalar_allocates_no_more_than_its_twin_when_stre
 /// being counted rather than because nothing was being built.
 #[test]
 fn a_handler_that_reads_the_error_still_builds_it_3689() {
-    let (name, json) = &fixtures()[0];
-    let (twin, _) = allocations_collecting("[.[]] | length", json);
-    let (observed, answered) = allocations_collecting("[.[] | try .[] catch .] | length", json);
+    let fixture = &fixtures()[0];
+    let (twin, _) = allocations_collecting("[.[]] | length", &fixture.json);
+    let (observed, answered) =
+        allocations_collecting("[.[] | try .[] catch .] | length", &fixture.json);
     assert_eq!(
         answered, N as i64,
-        "{name}: `catch .` yields one message per scalar"
+        "{}: `catch .` yields one message per scalar",
+        fixture.name
     );
     assert!(
         observed >= twin + N,
-        "{name}: `try .[] catch .` made {observed} allocator calls against the twin's {twin}; \
-         formatting each message must cost at least one allocation per member"
+        "{}: `try .[] catch .` made {observed} allocator calls against the twin's {twin}; \
+         formatting each message must cost at least one allocation per member",
+        fixture.name
     );
 }

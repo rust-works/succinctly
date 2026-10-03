@@ -5340,18 +5340,24 @@ pub(crate) fn suppresses(e: &EvalError, optional: bool) -> bool {
 /// discard it. Most nodes of a document are scalars. The answer is the one the
 /// `Iterate` scalar arm gives under an ambient `optional`; it is not reached
 /// by passing one, because `eval_generic::eval_single`'s own contract is that
-/// `optional = true` is unreachable for every shape but four (#2368).
+/// `optional = true` is unreachable for every shape but four (#2368). This is
+/// the shape half of the test; `eval_generic::swallowed_scalar_iteration` adds
+/// the value half and is what the boundaries call.
 ///
 /// `catch empty` qualifies because the handler yields nothing for any payload
 /// (a `break` runs it over `null`, which is the same nothing), so it is the
 /// same boundary as no handler. A `def empty:` in scope makes the handler a
-/// `DefCall`, not `Builtin::Empty`, and the shape no longer matches.
+/// `DefCall`, not `Builtin::Empty`, and the shape no longer matches. A closure
+/// argument reaches the boundary as `Expr::Shared` (`def opt(f): f?;` called as
+/// `opt(.[])`), so both operands are peeled by [`unwrap_bind_source`]: the
+/// shortcut evaluates nothing, so no `Shared` read is skipped that a stack
+/// check (ADR-0025) would have guarded.
 ///
 /// Not `Option::is_none_or`: the crate's MSRV is 1.73 and that is 1.82.
 pub(crate) fn try_swallows_scalar_iteration(expr: &Expr, catch: Option<&Expr>) -> bool {
-    matches!(unwrap_paren(expr), Expr::Iterate)
+    matches!(unwrap_bind_source(expr), Expr::Iterate)
         && catch.map_or(true, |c| {
-            matches!(unwrap_paren(c), Expr::Builtin(Builtin::Empty))
+            matches!(unwrap_bind_source(c), Expr::Builtin(Builtin::Empty))
         })
 }
 
@@ -6664,11 +6670,12 @@ fn each_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     // #3689: as in `eval_try`, a bare `.[]?` over a scalar settles here.
-    if !matches!(value, StandardJson::Array(_) | StandardJson::Object(_))
-        && try_swallows_scalar_iteration(expr, catch)
+    if let Some(settled) = crate::jq::eval_generic::swallowed_scalar_iteration::<
+        S,
+        StandardJson<'a, W>,
+    >(expr, catch, &value)
     {
-        return scalar_decode_failure(&value)
-            .map_or(Flow::Exhausted, |e| Flow::Escaped(Control::Error(e)));
+        return settled.map_or_else(|e| Flow::Escaped(Control::Error(e)), |()| Flow::Exhausted);
     }
 
     match eval_each::<W, S>(expr, value, optional, sink) {
@@ -13362,10 +13369,12 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #3689: a bare `.[]?` over a scalar settles here, without evaluating the
     // `.[]` that would build the error this boundary drops (see
     // `try_swallows_scalar_iteration`).
-    if !matches!(value, StandardJson::Array(_) | StandardJson::Object(_))
-        && try_swallows_scalar_iteration(expr, catch)
+    if let Some(settled) = crate::jq::eval_generic::swallowed_scalar_iteration::<
+        S,
+        StandardJson<'a, W>,
+    >(expr, catch, &value)
     {
-        return scalar_decode_failure(&value).map_or(QueryResult::None, QueryResult::Error);
+        return settled.map_or_else(QueryResult::Error, |()| QueryResult::None);
     }
 
     // Evaluate the expression
