@@ -56,6 +56,12 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
+**Size.** The full grid is 427,680 rows (72 operands, each also swept as a bare pipe
+stage since #3361), which takes hours on a loaded machine. Judge a change with
+`--operand` over the operands it touches (83,187 rows for 14 of them took about
+22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
+the whole grid only when the change reaches every operand.
+
 This is a verification tool, not a CI gate. The pinned `*_3456` rows in
 `tests/jq_cli_tests.rs` are what CI enforces (one per round-2 category); run
 this after touching `PathBranch::register`, `Frame::register_loss`, or any

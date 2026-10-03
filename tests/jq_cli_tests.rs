@@ -62142,6 +62142,91 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
             "Invalid path expression",
             5,
         ),
+        // An `f` outside `cannot_move_register`'s allowlist is judged the same
+        // way even where it navigates nothing in jq's sense (`sort` is C-coded,
+        // `add` iterates the element, which is the register): jq answers `[]`,
+        // this resolver refuses. Refuse-only, pinned so lifting it is a
+        // deliberate change.
+        (
+            "[[3],[1]]",
+            r"path(. as $x | map(sort) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[[1],[2]]",
+            r"path(. as $x | map(add) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // The same builtins inside a compound stage (a collect, a generator
+        // consumer, a comma, an `if`, a `try`) are read as a loss: the stage is
+        // judged as a whole (`test_path_register_compound_stage_is_refused_as_a_whole_3456`),
+        // and jq answers `[]` for each. Refuse-only, and the open promotions in
+        // `docs/plan/jq-path-register-producer-contract.md` section 10.
+        (
+            "[1,2]",
+            r"path(. as $x | limit(1; sort) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[1,2]",
+            r"path(. as $x | [sort] | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[1,2]",
+            r"path(. as $x | (sort, add) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[1,2]",
+            r"path(. as $x | if true then sort else . end | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[1,2]",
+            r"path(. as $x | try sort | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // A multi-output or empty `f` and an empty input keep the register where
+        // the stage entered it too, and so does a stage run once per element
+        // of a fan-out.
+        (
+            "[1,[2]]",
+            r"path(. as $x | walk(1,2) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        ("[1,[2]]", r"path(. as $x | map(1,2) | $x)", "[]\n", "", 0),
+        ("[1,[2]]", r"path(. as $x | walk(empty) | $x)", "", "", 0),
+        (
+            "[[3,1],[2]]",
+            r"path(.[] | . as $x | sort | $x)",
+            "[0]\n[1]\n",
+            "",
+            0,
+        ),
+        ("[]", r"path(. as $x | sort | $x)", "[]\n", "", 0),
+        ("[]", r"path(. as $x | add | $x)", "[]\n", "", 0),
+        ("[]", r"path(. as $x | flatten | $x)", "[]\n", "", 0),
+        ("[]", r"path(. as $x | map(.) | $x)", "[]\n", "", 0),
+        ("[]", r"path(. as $x | walk(.) | $x)", "[]\n", "", 0),
+        ("{}", r"path(. as $x | to_entries | $x)", "[]\n", "", 0),
+        ("{}", r"path(. as $x | map(.) | $x)", "[]\n", "", 0),
     ])
 }
 

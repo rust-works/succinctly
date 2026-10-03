@@ -1045,11 +1045,20 @@ is the revert that established what the other one costs.
      step could never succeed (`del(try (any and .a?))` on `{"a":true}` is the document in jq),
      and a `(.a)?`/`(.a | .b)?` first step is no longer pruned silently there. Refuse-only, and
      pinned (`test_and_or_path_by_value_operands_track_the_register_3428`).
-   - **`map(f)` and `walk(f)` with an `f` that navigates** are refused as a stage and as an
-     operand where jq answers (`path(. as $x | map(.a) | $x)` on `[{"a":1}]` is `[]` in jq):
-     jq path-checks `f` against every element, a by-value stage does not, so only an `f` that
-     navigates nothing (`map(.)`, `map(tostring)`, `walk(.)`) leaves the register provably in
-     place. Refuse-only, pinned (`test_path_register_by_value_builtin_stages_do_not_move_it_3361`).
+   - **`map(f)` and `walk(f)` with an `f` outside `cannot_move_register`'s allowlist** are
+     refused as a stage and as an operand where jq answers (`path(. as $x | map(.a) | $x)` on
+     `[{"a":1}]` is `[]` in jq, and so is `map(sort)` on `[[3],[1]]`): jq path-checks `f` against
+     every element, a by-value stage does not, so only an `f` that provably navigates nothing
+     (`map(.)`, `map(tostring)`, `walk(.)`) leaves the register in place. That excludes an `f`
+     that navigates and also an `f` that is itself one of the promoted builtins (`map(sort)`,
+     `map(add)`): `add` iterates the element, which is the register for `map` but a computed
+     array for the trailing `| f` of `walk`, so one rule cannot cover both.
+   - **The promoted builtins inside a compound stage** (`[sort]`, `limit(1; sort)`,
+     `(sort, add)`, `if`/`try` around them) are read as a loss: the stage is judged as a whole,
+     and jq answers `[]` for each (the stage-level downgrade and `array_contents_are_checked`
+     promotions in `docs/plan/jq-path-register-producer-contract.md`, section 10).
+     Refuse-only. Both rows are pinned
+     (`test_path_register_by_value_builtin_stages_do_not_move_it_3361`).
    - **A refusal inside a `?//` body is not retried** (`path_alternative_retries`), so
      `del(. as $x ?// $y \| if $x then (.a and .b) else .c end)` on `{"a":1,"c":2}` refuses
      where jq retries past its own path error and answers `{"a":1}`. Before #3289 the by-value
@@ -1079,6 +1088,12 @@ is the revert that established what the other one costs.
    `has`/`range`/`paths`/`add`/`map`/`any` and friends in write contexts (610 succeed, the rest
    fail identically) answer the same before and after; five of them are pinned
    (`test_yq_by_value_stages_keep_no_path_register_3456`).
+
+   #3361 extended that sweep to 72 operands and added the operand alone as a bare pipe-stage
+   shape (427,680 rows; the full grid is slow, so judge a change by `--operand` runs over what it
+   touches plus a seeded `--sample`). For the promoted builtins, over the 83,187 rows of the 14
+   operands it touches: 79,767 rows matched jq before and 81,133 after, 0 regressions, and
+   ACCEPT_WRONG unchanged at 10 (all `flatten(1)` in a `foreach` source, which predates it).
 
    The register is also carried **only across stages this resolver can prove did not move
    it** (`cannot_move_register`, `src/jq/eval.rs`) — the same allowlist now gates both
