@@ -42102,6 +42102,18 @@ mod tests {
                 ". as $d | [] | until(length >= 50; . + [1]) | length",
                 vec!["50"],
             ),
+            // A loop that starts on the document and turns computed after its
+            // first round is `loop_step_generic`'s own (`LoopState::cond_bits`),
+            // where the constant starts above are `eval.rs`'s.
+            (
+                ". as $d | until(.i >= 50 and length == 3; .i += 1) | .i",
+                vec!["50"],
+            ),
+            (
+                ". as $d | [while(length < 3 or .i < 50; .i += 1)] | length",
+                vec!["50"],
+            ),
+            ("until(length >= 3 and .i >= 50; .i += 1) | .i", vec!["50"]),
         ] {
             let (got, reindexes) = outputs_and_reindexes(doc, query);
             assert_eq!(got, want, "{query}");
@@ -42189,6 +42201,38 @@ mod tests {
         ] {
             let (got, _) = outputs_and_reindexes(doc, query);
             assert_eq!(got, want, "{query}");
+        }
+        // A condition the verdict itself raises on, with no `try` around the loop
+        // (which would route it elsewhere): jq's text, as the loop's own escape.
+        for (query, message) in [
+            (
+                "[1] | until(length > 1 and .a; . + [1])",
+                "Cannot index array with string \"a\"",
+            ),
+            (
+                "{i:0} | until(length == 1 and .i.x; .i += 1)",
+                "Cannot index number with string \"x\"",
+            ),
+            (
+                "{i:0} | [while(length == 1 and .i.x; .i += 1)]",
+                "Cannot index number with string \"x\"",
+            ),
+            // The same on a loop that starts on the document (`cond_bits`).
+            (
+                ". as $d | until(length >= 3 and .a.b; .i += 1)",
+                "Cannot index array with string \"b\"",
+            ),
+            (
+                ". as $d | [while(length < 3 or .a.b; .i += 1)]",
+                "Cannot index array with string \"b\"",
+            ),
+        ] {
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), query);
+            assert!(out.is_empty(), "{query}: {out:?}");
+            assert!(
+                matches!(&control, Some(Control::Error(e)) if e.message == message),
+                "{query}: {control:?}"
+            );
         }
     }
 

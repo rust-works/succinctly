@@ -98783,10 +98783,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let update = parse(". + [1]").unwrap();
-        let array_len = |value: &OwnedValue| match value {
-            OwnedValue::Array(items) => items.len(),
-            other => panic!("not an array: {other:?}"),
-        };
+        let is_array_of = |value: &OwnedValue, n: usize| matches!(value, OwnedValue::Array(items) if items.len() == n);
         for src in [
             "length >= 50",
             "length == 50",
@@ -98804,7 +98801,7 @@ mod tests {
             let reindexes = reindex_count::get() - before;
             assert_eq!(tag, "ok", "until({src})");
             assert_eq!(out.len(), 1, "until({src})");
-            assert_eq!(array_len(&out[0]), 50, "until({src})");
+            assert!(is_array_of(&out[0], 50), "until({src}): {:?}", out[0]);
             assert!(reindexes <= 3, "until({src}): {reindexes} reindexes");
         }
         let cond = parse("length < 50").unwrap();
@@ -98818,7 +98815,7 @@ mod tests {
         let reindexes = reindex_count::get() - before;
         assert_eq!(tag, "ok");
         assert_eq!(out.len(), 50);
-        assert_eq!(array_len(&out[49]), 49);
+        assert!(is_array_of(&out[49], 49), "{:?}", out[49]);
         assert!(reindexes <= 3, "while: {reindexes} reindexes");
         // Under a `?` the bridge keeps answering, and the answer is the same.
         let cond = parse("length >= 5").unwrap();
@@ -98829,7 +98826,7 @@ mod tests {
             true,
         ));
         assert_eq!(tag, "ok");
-        assert_eq!(array_len(&out[0]), 5);
+        assert!(is_array_of(&out[0], 5), "{:?}", out[0]);
     }
 
     /// #3697: a `length` condition that raises keeps the bridge's error (the
