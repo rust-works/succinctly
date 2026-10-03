@@ -980,12 +980,12 @@ is the revert that established what the other one costs.
    [#1573](https://github.com/rust-works/succinctly/issues/1573) established that jq carries
    a `(path, value_at_path)` **register** which only navigation advances — a literal never
    moves it, so a `$var` frozen from where it still points steps back onto it — and
-   `resolve_seq` threads that register (`PathBranch::register`,
+   `resolve_seq_sink` threads that register (`PathBranch::register`,
    `reestablishes_register`, `src/jq/eval.rs`). `path(. as $x \| 5 \| $x.a)` on `{"a":1}`
    answers `["a"]` like jq. [`FoldRegister`](../../../src/jq/eval.rs) (the fold's *own*
    register) had no way to reach that same mechanism, because it is seeded from *outside*
-   any one `resolve_seq` call — `FoldRegister::resolve` had nothing to hand `resolve_seq` to
-   seed its first stage from. #2046 added exactly that: `resolve_seq` takes an extra
+   any one `resolve_seq_sink` call — `FoldRegister::resolve` had nothing to hand `resolve_seq_sink` to
+   seed its first stage from. #2046 added exactly that: `resolve_seq_sink` takes an extra
    `register: Option<&'a OwnedValue>` parameter, consulted only when seeding its own fan-out
    loop's first branch (mirroring how it already seeds `trackable`/`snapshot`), and
    `FoldRegister::resolve` supplies `self.value` there whenever `UPDATE`/`EXTRACT` is (under
@@ -994,10 +994,10 @@ is the revert that established what the other one costs.
    carrying (`reestablishes_register` and the carry in `resolve_seq_stage`, both from #1573/#2041/#2044) takes
    over unchanged — #2046 adds a new *source* for the carried register, not a new rule for
    recognising it. A bare `$var` with nothing chained after it needed none of this: it was
-   already reestablishing directly through `FoldRegister::relocate`'s own `identical()` check.
+   already reestablishing directly through `FoldRegister::relocate_one`'s own `identical()` check.
 
    **Scope limit, deliberately not closed**: the register is threaded only as far as
-   `resolve_seq`'s own seed — a `$var` reference nested *inside* `if`/`try`/`select`/an
+   `resolve_seq_sink`'s own seed — a `$var` reference nested *inside* `if`/`try`/`select`/an
    alternative/a construction at UPDATE or EXTRACT's own top level still refuses, because
    `resolve_node`'s own recursive dispatch (the ~20-call-site graph the original design note
    here estimated threading through) was deliberately left untouched. Confirmed live:
@@ -1075,7 +1075,7 @@ is the revert that established what the other one costs.
 
    The register is also carried **only across stages this resolver can prove did not move
    it** (`cannot_move_register`, `src/jq/eval.rs`) — the same allowlist now gates both
-   `resolve_seq`'s plain-pipe carrying *and* #2046's fold-seeded carrying, since both reach
+   `resolve_seq_sink`'s plain-pipe carrying *and* #2046's fold-seeded carrying, since both reach
    the identical stage-to-stage machinery. jq's register advances on any `INDEX` its own
    bytecode executes, which includes the ones hidden inside a jq-*defined* builtin (`first`
    is `.[0]`, `add` is `reduce .[] as $x ...`) or a user function body — stages that reach
@@ -1254,7 +1254,7 @@ is the revert that established what the other one costs.
    per-step `EXTRACT` register from `UPDATE`'s own output — carried its *pre-UPDATE* register
    forward unconditionally whenever `UPDATE`'s own branch ended untracked, without checking
    whether `UPDATE`'s own expression could have moved jq's real register along the way. That
-   was already live on `main`, reachable through `FoldRegister::relocate`'s pre-existing
+   was already live on `main`, reachable through `FoldRegister::relocate_one`'s pre-existing
    `identical()` check without needing #2046's own new register-seeding at all — differential
    fuzzing found it independently on a pre-#2046 build (1, 3 and 4 fabrications across three
    4,000-shape seeds, always the same shape): `path(. as $x \| foreach (1,2,3) as $k (null;
@@ -1272,7 +1272,7 @@ is the revert that established what the other one costs.
    **[#2860](https://github.com/rust-works/succinctly/issues/2860), also closed**: the
    `identical()` check itself (not `advance`'s carry-forward above) had its own, separate
    instance of the same class. `FoldRegister::resolve`'s epilogue calls `self.relocate(..)`
-   unconditionally on every branch `resolve_seq`/`resolve_node` returns for UPDATE/EXTRACT,
+   unconditionally on every branch `resolve_seq_sink`/`resolve_node` returns for UPDATE/EXTRACT,
    and `relocate`'s `identical()` fallback re-derives trackability from `resolve()`'s own
    *entry-time* register (`self.value`/`self.frame`) by nothing more than a value-equality
    check — a tautology whenever the branch's final value is the loop variable itself, which it
@@ -1281,19 +1281,19 @@ is the revert that established what the other one costs.
    expression with result {\"b\":1}", and `=`/`\|=`/`del()` through the identical filter wrote
    to (`{"a":999}`) or deleted from (`{}`) a document jq refuses to touch at all — because
    `.zzz` (a missing-key access, a genuine navigation step to `null`) already, correctly, left
-   the branch untracked one layer in, in `resolve_seq`'s own finer-grained tracking; `relocate`
+   the branch untracked one layer in, in `resolve_seq_sink`'s own finer-grained tracking; `relocate`
    asked the identical question again with only the stale, pre-navigation register available
    and answered wrong. Fixed the same way as `advance` above: `identical()` is now gated on
    `cannot_move_register(expr)` for `expr` the expression just resolved, so it stays available
    only for the bare-`$var`/arithmetic/construction shapes it exists for, and defers entirely
-   to `resolve_seq`/`resolve_node`'s own already-correct verdict whenever `expr` could have
+   to `resolve_seq_sink`/`resolve_node`'s own already-correct verdict whenever `expr` could have
    navigated. `resolve_reduce`'s own final-emission call site (which builds its branch directly
    from the fold's accumulator, not from a `resolve()` call over one expression) keeps
    `identical()` unconditionally available, unaffected by this gate.
 
    **Known residual of #2860's own fix, refuse-only**: `cannot_move_register` is a *syntactic*
    allowlist — for `if`/`try` it requires every branch to be navigation-free, not only the one
-   actually taken (deliberately conservative for its two pre-existing callers, `resolve_seq`'s
+   actually taken (deliberately conservative for its two pre-existing callers, `resolve_seq_sink`'s
    own carrying and `advance`'s above, where a wrong `false` only ever costs a refusal there
    too). Gating `identical()` on it inherits that same conservatism, so a navigating branch
    sitting *unreached* alongside a safe one now also costs a refusal here, even when the
@@ -2183,7 +2183,7 @@ is the revert that established what the other one costs.
    its own origin, and a `null`/`bool` `.` loses nothing since `jv_identical` admits those by
    value. [#3145](https://github.com/rust-works/succinctly/issues/3145) extends the same
    carrying to a fold's UPDATE/EXTRACT body, whose own route (`FoldRegister::resolve`) passed
-   its register to `resolve_seq` explicitly under a frame that carried none: `del(foreach .a as
+   its register to `resolve_seq_sink` explicitly under a frame that carried none: `del(foreach .a as
    $v (.; try ($v \| .b); .))` on `{"a":{"b":1}}` echoed the document and now writes
    `{"a":{}}`, as jq does. It does not reach a fold whose INIT is untracked *after a literal
    stage* — that fold re-seeds its register from the ambient value, so the marker is not
@@ -2322,7 +2322,7 @@ on it first — confirmed with a **bare `$var` pattern, no destructuring**, repr
 byte-for-byte on a pre-#2676 build: `path(foreach .a as $v0 (.; $v0; (.zzz \| $v0)))` on
 `{"a":{"b":1}}` is `["a"]` here, "Invalid path expression with result `{"b":1}`" in jq. The
 defect lives entirely in `FoldRegister`'s pre-existing UPDATE→EXTRACT chain
-(`FoldRegister::advance`/`resolve`, `resolve_seq`'s #2046 carried-register mechanism) — #2676
+(`FoldRegister::advance`/`resolve`, `resolve_seq_sink`'s #2046 carried-register mechanism) — #2676
 does not touch that machinery, only gives a destructured loop variable a tracked marker
 (`apply_pattern_bindings`) for the first time, which inherits this pre-existing defect the same
 splice already had for a bare `$var`. Not fixed here: the root cause needs tracing
