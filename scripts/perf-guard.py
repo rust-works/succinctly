@@ -395,8 +395,20 @@ DEFAULT_THRESHOLD = 5.0
 # (-31.7% ARM64-Linux / -28.5% x86_64 against the PR's own merge-base). Now in
 # `main`; the entry was removed once the row read ~0% again against a
 # merge-base that already included it.
+#
+# `users_yq_raw_concat` (#3479) carries an override of the same one-off kind:
+# `evaluate_input` asks `eval_owned_scalar_fast` before indexing a scalar
+# `succinctly yq -R` line, so `. + "x"` is answered by the owned fast path
+# without serializing and indexing the line at all (-85.4% x86_64 / -84.6%
+# ARM64-Linux against the PR's own merge-base; the answers are pinned by
+# `registered_document_scalar_door_agrees_with_the_index_route_3479` and
+# `test_dom_route_scalar_door_answers_like_the_cursor_route_3479`). The other
+# two `-R` rows read within -0.3% on both architectures and stay on the
+# default. Remove it once `main` carries the change and the row reads ~0%
+# again.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
+    "users_yq_raw_concat": 90.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
