@@ -362,20 +362,22 @@ DEFAULT_THRESHOLD = 5.0
 # merge-base that already included it.
 #
 # `users_del_select` / `users_del_bound_select` / `users_update_select` /
-# `users_assign_scores` (#3069) carry overrides of the same one-off kind:
+# `users_assign_scores` (#3069) carried overrides of the same one-off kind:
 # the reindex bridge now hands a container back out as the storage that
 # went in (`bridge_provenance`), so these write shapes stop rebuilding the
 # bridged document they resolve over (-25.9% / -25.2% / -25.2% / -17.9% on
-# x86_64 against the PR's own merge-base, outputs byte-identical). Remove
-# all four once `main` carries #3069 and the rows read ~0% again.
+# x86_64 against the PR's own merge-base, outputs byte-identical). Now in
+# `main`; the entries were removed together once every row read ~0% again
+# against a merge-base that already included it.
 #
-# `users_yq_del_select` (#3479) carries an override of the same one-off kind:
+# `users_yq_del_select` (#3479) carried an override of the same one-off kind:
 # `OwnedValue::to_json_for_reindex` writes one buffer instead of a `String`
 # per node joined together, and `succinctly yq`'s DOM route reuses its
 # document's index across a bridge, so the yq-mode write row stops paying for
 # the bridge's reserialization (-5.9% x86_64 / -7.4% ARM64-Linux against the
-# PR's own merge-base, outputs byte-identical). Remove it once `main` carries
-# #3479 and the row reads ~0% again.
+# PR's own merge-base, outputs byte-identical). Now in `main`; the entry was
+# removed once the row read ~0% again against a merge-base that already
+# included it.
 #
 # `users_yq_raw_slice` (#3479) carried an override of the same one-off kind:
 # `eval_single`'s catch-all arm evaluates a partial slice over the DOM document
@@ -395,11 +397,6 @@ DEFAULT_THRESHOLD = 5.0
 # merge-base that already included it.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
-    "users_del_select": 30.0,
-    "users_del_bound_select": 30.0,
-    "users_update_select": 30.0,
-    "users_assign_scores": 30.0,
-    "users_yq_del_select": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
