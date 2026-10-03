@@ -118,6 +118,37 @@ fn test_dom_route_union_over_a_generator_follows_yq_3479() -> Result<()> {
     Ok(())
 }
 
+/// #3690: `numbers`, `strings`, `arrays`, `objects` (jq-only builtins in yq,
+/// behind `--jq-extensions`) hand the node itself on, as `select(type == ...)`
+/// does, instead of materializing it first. The materializing route threw
+/// away what a YAML node carries beyond its value -- an explicit tag, a
+/// repeated mapping key, the spelling a number was written with -- so every
+/// row below answered differently from real yq's own spelling of the same
+/// selection (`select(tag == "!!int")` and its kin, captured from yq v4.53.3),
+/// and now answers the same.
+#[test]
+fn test_type_selectors_keep_what_the_owned_round_trip_lost_3690() -> Result<()> {
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    for (filter, input, want) in [
+        // An explicit tag decides the type a selected string reports.
+        (
+            "[.. | strings | type]",
+            "a: !!str 1\nb: !!binary aGk=\nc: !custom x\nd: !!str null\ne: !!str true\n",
+            r#"["!!str","!!binary","!custom","!!str","!!str"]"#,
+        ),
+        // yq keeps both occurrences of a repeated key.
+        ("[.. | objects | length]", "a: 1\na: x\nb: ~\n", "[3]"),
+        // `length` of a scalar is the length of the text it was written with.
+        ("[.. | numbers | length]", "- 01\n- 2\n", "[2,1]"),
+        ("[.. | numbers | length]", "- 1e3\n", "[3]"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, input, &args)?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "{filter} on {input:?}");
+    }
+    Ok(())
+}
+
 /// #3479: `--jq-extensions`' `path(.a)` over a string answers nothing on every
 /// route: in yq a field of a scalar is an empty result, not jq's error. The
 /// previous DOM route (`-R`, `--slurp`) raised `Cannot index string with

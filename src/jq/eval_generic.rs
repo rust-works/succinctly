@@ -1406,6 +1406,21 @@ fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &
         .map_or_else(|| value.type_name(), crate::yaml::ResolvedScalar::type_name)
 }
 
+/// `numbers`, `strings`, `nulls`, `booleans`, `arrays` and `objects` (#3690):
+/// the input itself when its jq type (tag-aware, like `type`) is `want`,
+/// nothing otherwise.
+fn select_by_type_generic<V: DocumentValue>(
+    value: V,
+    cursor: Option<V::Cursor>,
+    want: &str,
+) -> GenericResult<V> {
+    if tagged_type_name(&value, cursor) == want {
+        cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
+    } else {
+        GenericResult::None
+    }
+}
+
 /// Whether the node at `cursor` is null, an applicable explicit YAML tag
 /// deciding before the text does (`!!null foo` is null, `!!str null` is not
 /// -- #2639). A bare `value.is_null()` is not tag-aware (a `YamlValue` has no
@@ -26265,6 +26280,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         | Builtin::IsString
         | Builtin::IsArray
         | Builtin::IsObject
+        | Builtin::Nulls
+        | Builtin::Booleans
+        | Builtin::Numbers
+        | Builtin::Strings
+        | Builtin::Arrays
+        | Builtin::Objects
         | Builtin::Iterables
         | Builtin::Scalars
             if value.is_error() =>
@@ -26315,6 +26336,22 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::None
             }
         }
+
+        // #3690: the other six selectors answer from the node's own type,
+        // as `iterables`/`scalars` above do. They used to fall through to
+        // the materializing `_` arm below, which decodes the whole value and
+        // re-enters the owned evaluator for what jq defines as
+        // `select(type == "number")` -- 13-16 allocator calls per element, three
+        // times what that definition costs here. Same type test as `type` and
+        // the `is*` family (`tagged_type_name`, so an explicit YAML tag decides
+        // before the text does); the input itself is handed on, so a cursor
+        // keeps its position for a later `path`/`key`.
+        Builtin::Nulls => select_by_type_generic(value, cursor, "null"),
+        Builtin::Booleans => select_by_type_generic(value, cursor, "boolean"),
+        Builtin::Numbers => select_by_type_generic(value, cursor, "number"),
+        Builtin::Strings => select_by_type_generic(value, cursor, "string"),
+        Builtin::Arrays => select_by_type_generic(value, cursor, "array"),
+        Builtin::Objects => select_by_type_generic(value, cursor, "object"),
 
         Builtin::First => {
             // jq: first == .[0], so [] and null both yield null
@@ -41898,6 +41935,37 @@ mod tests {
             before,
             "yq reindexed"
         );
+    }
+
+    /// #3690: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and
+    /// `objects` answer from the node's own type. They used to fall through to
+    /// the materializing fallback, which decoded each element and re-entered
+    /// the owned evaluator -- a reindex-bridge round trip per element -- for
+    /// what is `select(type == "...")`. `scalars` and `iterables` never did.
+    #[test]
+    fn test_type_selectors_do_not_reindex_3690() {
+        let doc = r#"{"a":1,"b":"x","c":null,"d":[1,2],"e":{"f":true},"g":false}"#;
+        for (selector, kept) in [
+            ("nulls", "1"),
+            ("booleans", "1"),
+            ("numbers", "1"),
+            ("strings", "1"),
+            ("arrays", "1"),
+            ("objects", "1"),
+        ] {
+            for filter in [
+                format!("[.[] | {selector}] | length"),
+                format!("[.. | {selector}] | length"),
+                format!("first(.. | {selector}) | type"),
+            ] {
+                let (out, reindexes) = outputs_and_reindexes(doc, &filter);
+                assert_eq!(out.len(), 1, "{filter}: {out:?}");
+                assert_eq!(reindexes, 0, "{filter} reindexed");
+                if filter.ends_with("length") && filter.starts_with("[.[]") {
+                    assert_eq!(out, [kept], "{filter}");
+                }
+            }
+        }
     }
 
     /// #3477: a comma sequence that names a container node twice builds it
