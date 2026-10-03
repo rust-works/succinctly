@@ -50786,6 +50786,19 @@ fn test_yq_by_value_stages_keep_no_path_register_3456() -> Result<()> {
         // The refused one: a `$x` frozen from the root is not re-established
         // after a stage in yq, and `del` raises rather than writing.
         (r#"del(. as $x | has("a") | $x)"#, &["-o", "json"][..], None),
+        // #3361: `to_entries` and `map(f)` leave the register in place in jq
+        // 1.7.1 and are admitted in jq mode only; yq keeps refusing each.
+        (
+            "del(. as $x | to_entries | $x.a)",
+            &["-o", "json"][..],
+            None,
+        ),
+        (
+            "(. as $x | to_entries | $x.a) = 5",
+            &["-o", "json"][..],
+            None,
+        ),
+        ("(. as $x | map(.) | $x.a) = 5", &["-o", "json"][..], None),
     ] {
         let (stdout, code) = run_yq_stdin(filter, doc, extra)?;
         match expected {

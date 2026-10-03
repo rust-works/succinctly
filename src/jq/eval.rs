@@ -39422,21 +39422,36 @@ fn leaf_register<'a, S: EvalSemantics>(
 /// | add | $x)` is `[]` on `{"a":1,"b":2}`, `map(.+1)` on `[1]`). The extras
 /// are jq-only like every admission here (ADR-0018): yq has no oracle for them.
 ///
+/// #3361 adds the rest of that family, each captured from jq 1.7.1 with
+/// `path(. as $x | OP | $x)`: `flatten` is `reduce .[] as $i ([]; ...)` and
+/// backtracks like `add`; `to_entries` is `[keys_unsorted[] as $k | {key: $k,
+/// value: .[$k]}]`, every step of it inside an `as` source or an object
+/// construction (subexps), so it checks and moves nothing; `sort` is C-coded
+/// and touches no path state at all. `walk(f)` is `def w: if type == "object"
+/// then map_values(w) elif type == "array" then map(w) else . end | f; w`: its
+/// array arm backtracks like `map`, its scalar arm navigates nothing, and its
+/// object arm raises ([`always_refuses_as_live_path`]) before a register is
+/// ever asked about. The trailing `| f` runs on the computed result, which is
+/// not the register, so like `map(f)` it qualifies only for an `f` that
+/// navigates nothing (`walk(.a)` is a path error in jq).
+///
 /// Not part of [`cannot_move_register`], because that predicate also stands
 /// for "navigates nothing, so a register that is not on this expression's
 /// input is never checked": [`resolve_from_restored_input`] runs `R` on an
-/// input that is *not* the register, and an `R` of `add` or `map(.)` does
-/// check its `.[]` there. It is sound *here* because a leaf's input is the
-/// register itself on a trackable entry, so what it navigates passes. `map`
-/// qualifies only for an `f` that navigates nothing: jq path-checks `f` against
-/// every element and a by-value `map` does not (`map({a:1} | .a)` is a path
-/// error in jq and `[1]` here).
+/// input that is *not* the register, and an `R` of `add`, `flatten` or `map(.)`
+/// does check its `.[]` there ([`builtin_navigation`] raises for it). It is
+/// sound *here* because a leaf's input is the register itself on a trackable
+/// entry, so what it navigates passes. `map` qualifies only for an `f` that
+/// navigates nothing: jq path-checks `f` against every element and a by-value
+/// `map` does not (`map({a:1} | .a)` is a path error in jq and `[1]` here).
 fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
     cannot_move_register(expr)
         || (S::TAG == EvalTag::Jq
-            && match expr {
-                Expr::Builtin(Builtin::Add) => true,
-                Expr::Builtin(Builtin::Map(f)) => cannot_move_register(f),
+            && match unwrap_paren(expr) {
+                Expr::Builtin(
+                    Builtin::Add | Builtin::Flatten | Builtin::Sort | Builtin::ToEntries,
+                ) => true,
+                Expr::Builtin(Builtin::Map(f) | Builtin::Walk(f)) => cannot_move_register(f),
                 _ => false,
             })
 }
@@ -48792,6 +48807,12 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // #3643: `last(f)` backtracks its source, so the register is where the
         // stage entered even though `f` navigates.
         || last_leaves_register_in_place::<S>(element)
+        // #3361: a by-value stage jq defines over a backtracked source (`add`,
+        // `flatten`, `map(f)`, `walk(f)`) or never lets touch the register
+        // (`sort`, `to_entries`). The leaf states the same verdict
+        // ([`leaves_register_in_place`]), and what such a stage navigates on an
+        // input the register is not on is refused by [`builtin_navigation`].
+        || leaves_register_in_place::<S>(element)
         // #3263: an array resolved live whose contents the resolver checks as
         // jq does, and jq's collect backtracks the register to where it began.
         || matches!(element, Expr::Array(inner)

@@ -56,6 +56,12 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
+**Size.** The full grid is 427,680 rows (72 operands, each also swept as a bare pipe
+stage since #3361), which takes hours on a loaded machine. Judge a change with
+`--operand` over the operands it touches (83,187 rows for 14 of them took about
+22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
+the whole grid only when the change reaches every operand.
+
 This is a verification tool, not a CI gate. The pinned `*_3456` rows in
 `tests/jq_cli_tests.rs` are what CI enforces (one per round-2 category); run
 this after touching `PathBranch::register`, `Frame::register_loss`, or any
@@ -179,6 +185,21 @@ OPERANDS = [
     "first(.a)",
     "nth(0; .a)",
     "limit(1; .a)",
+    # (#3361) the rest of the by-value builtins jq defines over a backtracked
+    # source or never lets touch the register: `walk(f)` and `map(f)` qualify
+    # only for an `f` that navigates nothing (`walk(.a)` and `map(.a)` are the
+    # contrasts: jq path-checks `f` against the elements, a by-value stage does
+    # not). The last four are builtins jq also leaves in place that stay refused
+    # until each has an oracle row of its own.
+    "walk(.)",
+    "walk(tostring)",
+    "walk(.a)",
+    "map(tostring)",
+    "map(.a)",
+    "reverse",
+    "min",
+    "flatten(1)",
+    "group_by(.)",
 ]
 
 # The other side of a two-operand shape. Chosen so that, against the inputs
@@ -245,6 +266,9 @@ CHAIN_CONTEXTS = ["path", "del", "update"]
 
 def shapes_for(operand):
     """Every combinator shape an operand takes part in."""
+    # (#3361) the operand alone, as a bare pipe stage: `. as $x | OP | $x` is
+    # what the `var-rebind` context makes of it.
+    yield f"({operand})"
     yield f"-({operand})"
     for c in COMPANIONS:
         yield f"{operand} and {c}"

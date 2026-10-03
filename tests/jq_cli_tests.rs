@@ -61911,6 +61911,325 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
     ])
 }
 
+/// #3361: `add`, `flatten`, `map(f)` and `walk(f)` are jq-defined over a
+/// source they backtrack (`reduce .[] as $x ...`, `[.[] | f]`), `to_entries`
+/// keeps every step inside an `as` source or an object construction, and `sort`
+/// is C-coded: none of them leaves jq's path register anywhere but where the
+/// stage entered it, so a `$x` frozen there re-establishes it after the stage
+/// and a write through it lands. Every row captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | add | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | to_entries | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        ("[1,[2]]", r"path(. as $x | sort | $x)", "[]\n", "", 0),
+        ("[1,[2]]", r"path(. as $x | flatten | $x)", "[]\n", "", 0),
+        ("[1,[2]]", r"path(. as $x | walk(.) | $x)", "[]\n", "", 0),
+        (
+            "[1,[2]]",
+            r"path(. as $x | walk(tostring) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A scalar `walk` navigates nothing at all.
+        ("5", r"path(. as $x | walk(.) | $x)", "[]\n", "", 0),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | map(.) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | map(tostring) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | (add) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // The re-established register is the root, so the path off `$x` is.
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | add | $x.a)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "[[1],[2]]",
+            r"path(. as $x | to_entries | sort | $x[0])",
+            "[0]\n",
+            "",
+            0,
+        ),
+        // A node below the root: the register stays on `.k`.
+        (
+            r#"{"a":{"b":1},"k":[3,4]}"#,
+            r"path(.k | . as $x | sort | $x)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":[3,4]}"#,
+            r"path(.k | . as $x | add | $x)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        // The writes go through `$x`, and a `try` around it has no guess to
+        // swallow.
+        (
+            r#"{"a":1,"k":2}"#,
+            r"del(. as $x | add | $x.k)",
+            "{\"a\":1}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"k":2}"#,
+            r"(. as $x | to_entries | $x.k) = 9",
+            "{\"a\":1,\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"k":2}"#,
+            r"(. as $x | map(.) | $x.k) |= 9",
+            "{\"a\":1,\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            "[3,1,[2]]",
+            r"del(. as $x | sort | $x[0])",
+            "[1,[2]]\n",
+            "",
+            0,
+        ),
+        (
+            "[3,1,[2]]",
+            r"(. as $x | flatten | $x[0]) = 9",
+            "[9,1,[2]]\n",
+            "",
+            0,
+        ),
+        (
+            "[3,[1]]",
+            r"del(. as $x | walk(.) | $x[0])",
+            "[[1]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"k":2}"#,
+            r"del(. as $x | add | try ($x | .k))",
+            "{\"a\":1}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"k":2}"#,
+            r"del(. as $x | to_entries | try ($x | .k))",
+            "{\"a\":1}\n",
+            "",
+            0,
+        ),
+        // As an `and` operand: the boundary #3456 pinned as a refusal until
+        // `sort` and `to_entries` got oracle rows of their own.
+        ("[true]", r"del(sort and .[0])", "[]\n", "", 0),
+        (r#"{"a":true}"#, r"del(to_entries and .a)", "{}\n", "", 0),
+        // What jq refuses stays refused. The stage navigates on a computed
+        // array the register is not on ...
+        (
+            r#"{"a":[1]}"#,
+            r"path(. as $x | .a | map(.) | add | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[[1]]}"#,
+            r"path(. as $x | .a | map(.) | flatten | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // ... a navigation off the stage's own (by-value) result is checked
+        // against a register that is not on it ...
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | add | .a)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[[1],[2]]",
+            r"path(. as $x | sort | .[0])",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // ... the register left the root for `.a` before the stage ran, so a
+        // `$x` frozen at the root is not it ...
+        (
+            r#"{"a":[1,2],"k":1}"#,
+            r"path(. as $x | .a | add | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1}"#,
+            r"path(. as $x | .a | to_entries | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // ... and `walk` over an object raises in jq before a register is
+        // asked about.
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(. as $x | walk(.) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"path(. as $x | walk(tostring) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // `walk(f)` and `map(f)` with an `f` that navigates are judged
+        // conservatively: jq path-checks `f` against every element and a
+        // by-value stage does not, so `map(.a)` (jq answers `[]` on `[{"a":1}]`)
+        // and `walk(.a)` stay refused. Pinned as today's refuse-only behaviour
+        // so lifting it is a deliberate change.
+        (
+            r#"[{"a":1}]"#,
+            r"path(. as $x | map(.a) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[[1]]",
+            r"path(. as $x | map(.[0]) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // An `f` outside `cannot_move_register`'s allowlist is judged the same
+        // way even where it navigates nothing in jq's sense (`sort` is C-coded,
+        // `add` iterates the element, which is the register): jq answers `[]`,
+        // this resolver refuses. Refuse-only, pinned so lifting it is a
+        // deliberate change.
+        (
+            "[[3],[1]]",
+            r"path(. as $x | map(sort) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[[1],[2]]",
+            r"path(. as $x | map(add) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // The same builtins inside a compound stage (a collect, a generator
+        // consumer, a comma, an `if`, a `try`) are read as a loss: the stage is
+        // judged as a whole (`test_path_register_compound_stage_is_refused_as_a_whole_3456`),
+        // and jq answers `[]` for each. Refuse-only, and the open promotions in
+        // `docs/plan/jq-path-register-producer-contract.md` section 10.
+        (
+            "[1,2]",
+            r"path(. as $x | limit(1; sort) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[1,2]",
+            r"path(. as $x | [sort] | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[1,2]",
+            r"path(. as $x | (sort, add) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[1,2]",
+            r"path(. as $x | if true then sort else . end | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            "[1,2]",
+            r"path(. as $x | try sort | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // A multi-output or empty `f` and an empty input keep the register where
+        // the stage entered it too, and so does a stage run once per element
+        // of a fan-out.
+        (
+            "[1,[2]]",
+            r"path(. as $x | walk(1,2) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        ("[1,[2]]", r"path(. as $x | map(1,2) | $x)", "[]\n", "", 0),
+        ("[1,[2]]", r"path(. as $x | walk(empty) | $x)", "", "", 0),
+        (
+            "[[3,1],[2]]",
+            r"path(.[] | . as $x | sort | $x)",
+            "[0]\n[1]\n",
+            "",
+            0,
+        ),
+        ("[]", r"path(. as $x | sort | $x)", "[]\n", "", 0),
+        ("[]", r"path(. as $x | add | $x)", "[]\n", "", 0),
+        ("[]", r"path(. as $x | flatten | $x)", "[]\n", "", 0),
+        ("[]", r"path(. as $x | map(.) | $x)", "[]\n", "", 0),
+        ("[]", r"path(. as $x | walk(.) | $x)", "[]\n", "", 0),
+        ("{}", r"path(. as $x | to_entries | $x)", "[]\n", "", 0),
+        ("{}", r"path(. as $x | map(.) | $x)", "[]\n", "", 0),
+    ])
+}
+
 /// #3456 (B2): the survival rule is decided per *stage*, not per leaf. A
 /// compound stage that mixes a leaf that navigates with one that does not
 /// loses the register as a whole, so these refuse where jq 1.7.1 answers `[]`
@@ -62204,41 +62523,35 @@ fn test_and_or_path_by_value_operands_track_the_register_3428() -> Result<()> {
             "Invalid path expression",
             5,
         ),
-        // The boundary: with nothing after the `?` step jq answers, because
-        // `flatten` leaves the register where `.a?` can fail on a type error
-        // and be suppressed. The resolver cannot tell that from the register
-        // having moved, which jq refuses (the rows above), so it refuses --
-        // under `try` too. `main`'s by-value route answered these; the cost is
-        // the second residual in `limitations.md` (#3428), and lifting it needs
-        // `flatten` in `cannot_move_register`'s allowlist with its own rows.
+        // With nothing after the `?` step jq answers, because `flatten` leaves
+        // the register where `.a?` can fail on a type error and be suppressed.
+        // These were the boundary of #3428: the resolver could not tell that
+        // from the register having moved, which jq refuses (the rows above), so
+        // it refused -- under `try` too. #3361 gave `flatten` its own oracle
+        // rows (`leaves_register_in_place`), so the register is now known to be
+        // where it entered and both answer as jq does.
         (
             r"[1]",
             r"del(try (flatten and (.a?, empty)))",
+            "[1]\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
         (
             r#"{"a":1}"#,
             r"del(try (flatten and (.[0]?, empty)))",
+            "{\"a\":1}\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
         // A builtin that leaves the register alone and is in
         // `cannot_move_register`'s allowlist lets `R` navigate it (`has` is
         // C-coded, its argument a subexp).
         (r#"{"a":true}"#, r#"del(has("a") and .a)"#, "{}\n", "", 0),
-        // The boundary: `sort` is C-coded too and jq answers `[]`, but it is
-        // not in the allowlist, so `R`'s navigation is refused -- as `main`
-        // refused it, with "result true" -- until it gets its own oracle row.
-        (
-            r"[true]",
-            r"del(sort and .[0])",
-            "",
-            "Invalid path expression",
-            5,
-        ),
+        // `sort` is C-coded too and jq answers `[]`. It was the boundary until
+        // #3361 gave it its own oracle rows (`leaves_register_in_place`), so
+        // `R`'s navigation is no longer refused.
+        (r"[true]", r"del(sort and .[0])", "[]\n", "", 0),
     ])
 }
 
@@ -63756,9 +64069,13 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
+        // (`walk(.)` was one of these until #3361: it backtracks its source, so
+        // it keeps the register and answers `["a"]` as jq does, pinned in
+        // `test_terminal_null_carve_out_keeps_its_answers_3579`; `reverse` is
+        // jq-defined over a collect too and is still read as a loss)
         (
             r"null",
-            r"path(.a|walk(.)|null)",
+            r"path(.a|reverse|null)",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -63789,6 +64106,9 @@ fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
         (r"null", r"path(5 | null)", "[]\n", "", 0),
         (r"null", r"path(select(true) | null)", "[]\n", "", 0),
         (r"null", r"path(first(.a) | 5 | null)", "[\"a\"]\n", "", 0),
+        // #3361: `walk(.)` leaves the register on `.a`, so the terminal `null`
+        // is at `["a"]`, not a guess.
+        (r"null", r"path(.a|walk(.)|null)", "[\"a\"]\n", "", 0),
         (r"null", r"path((.a | empty), null)", "[]\n", "", 0),
         (r"null", r"del(null)", "null\n", "", 0),
         (r"true", r"path(true)", "[]\n", "", 0),
