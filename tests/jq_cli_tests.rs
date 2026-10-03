@@ -61284,6 +61284,179 @@ fn test_and_or_path_empty_array_slice_is_not_the_register_3494() -> Result<()> {
     ])
 }
 
+/// #3647 (a #3494 residual): an `and`/`or` whose left operand is a full or empty
+/// slice of `[]` and whose right operand is an optional index (`.b?`, or `.a?`
+/// under `..`) refused in jq and was accepted here. The slice of `[]` is a fresh
+/// `[]`, not the register, so the right operand navigates off a register that
+/// is not the input and raises jq's *path* error, which `INDEX_OPT` does not
+/// suppress; the resolver seeded the right operand as sitting at the register
+/// whenever an array register equalled the input by value, which holds for `[]`,
+/// and `?` then swallowed the type error `.b` raises on `[]`. Every row is
+/// captured from jq 1.7.1.
+#[test]
+fn test_and_or_path_empty_slice_then_optional_index_refuses_3647() -> Result<()> {
+    assert_path_rows_3289(&[
+        // The slice of `[]` is a fresh `[]`, so the register is not the input and `.b?`
+        // (jq's `INDEX_OPT`, which suppresses a type error and not a path error) raises.
+        // Accepted before the fix.
+        (
+            r"[]",
+            r"del(.[0:0] and .b?)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"del(.[0:] and .b?)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"path(.[0:0] and .b?)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"(.[0:0] and .b?) = 9",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"(.[0:] and .b?) |= 9",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"[path(.[0:] and .b?)]",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"del(.[0:] and (.. | .a?))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"del(.[0:0] and (.. | .a?))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of []"#,
+            5,
+        ),
+        // Refused already, with the wrong message (`Cannot index array with string`).
+        (
+            r"[]",
+            r"del(.[0:0] and .b)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        // Must not change: `or`, a non-empty input (whose full slice *is* the input and
+        // whose empty slice is not), and a `try` that catches jq's own path error.
+        (
+            r"[]",
+            r"del(.[0:0] or .b?)",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (r"[1]", r"del(.[0:] and .b?)", "[1]\n", "", 0),
+        (r"[1]", r"(.[0:] and .b?) |= 9", "[1]\n", "", 0),
+        (r"[1]", r"del(.[0:] and (.. | .a?))", "[1]\n", "", 0),
+        (r"[1]", r"[path(.[0:] and .b?)]", "[]\n", "", 0),
+        (
+            r"[1]",
+            r"del(.[0:0] and .b?)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of [1"#,
+            5,
+        ),
+        (r"[]", r"del(try (.[0:0] and .b?))", "[]\n", "", 0),
+        (r"[1]", r"del(try (.[0:0] and .b?))", "[1]\n", "", 0),
+        // Non-root and nested shapes take the same seed: an empty array at a path, and
+        // a string or `null` input, refuse; a non-empty array whose element is empty has a
+        // full slice that *is* the input, so it is still accepted.
+        (
+            r#"{"a":[]}"#,
+            r"del(.a | (.[0:] and .b?))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(.a[0:] and .b?)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of {"a":[]}"#,
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(.a[0:0] and .b?)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of {"a":[]}"#,
+            5,
+        ),
+        (
+            r#""""#,
+            r"path(.[0:] and .b?)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of """#,
+            5,
+        ),
+        (
+            r"null",
+            r"path(.[0:] and .b?)",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (r"[[]]", r"path(.[0:] and .b?)", "", "", 0),
+        (r"[[]]", r"del(.[0:] and .b?)", "[[]]\n", "", 0),
+        (
+            r"[[]]",
+            r"path(.[0] | (.[0:] and .b?))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        // A bounded consumer or `label` in front changes nothing.
+        (
+            r"[]",
+            r"first(path(.[0:] and .b?))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"[limit(1; path(.[0:] and .b?))]",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"label $o | path(.[0:] and .b?), break $o",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+    ])
+}
+
 /// #3456 (round 2: wrappers dropping a correctly reported register). `?`,
 /// `try` and `first(..)` around an `and` must hand the register on as it
 /// stands, so the later navigation refuses -- or, where jq's own no-write
