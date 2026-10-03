@@ -114345,24 +114345,50 @@ mod tests {
             ),
             [r"{}"]
         );
+        // #3360: `from_entries` always raises once it runs (it had no
+        // `live_path_refusal` arm before, so the body *succeeded* here and
+        // these two rows were the negative case below), so the handler is now
+        // really reached and runs by value, as in jq 1.7.1: `catch .` answers
+        // `[]`, `catch .zz` raises on the error *message* (a string), and
+        // `catch error` re-raises it (the message names the input where jq
+        // names the derived array, the approximate-container tradeoff of #3271).
+        assert_eq!(
+            outputs(
+                br#"[{"key":"a","value":1}]"#,
+                r"path(. as $x | [try from_entries catch .] | $x)"
+            ),
+            [r"[]"]
+        );
+        query!(
+            br#"[{"key":"a","value":1}]"#,
+            r"path(. as $x | [try from_entries catch .zz] | $x)",
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains(r#"near attempt to access element "zz""#),
+                    "{}",
+                    e.message
+                );
+            }
+        );
+        query!(
+            br#"[{"key":"a","value":1}]"#,
+            r"path(. as $x | [try from_entries catch error] | $x)",
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains("near attempt to iterate through"),
+                    "{}",
+                    e.message
+                );
+            }
+        );
         // Negative rows: a handler jq never actually reaches (because the
         // body succeeds here where jq's own path-check would raise through
         // it) must not be trusted -- admitting it would fabricate `[]`
         // where jq raises through the handler.
-        for (doc, filter) in [
-            (
-                r#"[{"key":"a","value":1}]"#,
-                r"path(. as $x | [try from_entries catch .zz] | $x)",
-            ),
-            (
-                r#"[{"key":"a","value":1}]"#,
-                r"path(. as $x | [try from_entries catch error] | $x)",
-            ),
-            (
-                r#"{"a":1}"#,
-                r"path(. as $x | [try with_entries(.) catch .zz] | $x.a)",
-            ),
-        ] {
+        for (doc, filter) in [(
+            r#"{"a":1}"#,
+            r"path(. as $x | [try with_entries(.) catch .zz] | $x.a)",
+        )] {
             query!(doc.as_bytes(), filter,
                 QueryResult::Error(e) => {
                     assert!(is_resolver_refusal(&e), "{filter}: {}", e.message);
