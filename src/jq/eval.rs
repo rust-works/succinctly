@@ -70714,6 +70714,43 @@ mod tests {
         }
     }
 
+    /// #3241: a step the owned route answers with an error reports it the way
+    /// the evaluator's route would -- an escape, or nothing at all when the
+    /// UPDATE is `?`-suppressed -- and never calls `on_update`. `from_entries`
+    /// over an entry whose key is an array is the shape (`Cannot use array
+    /// ([]) as object key`); the table is not live here, so this is the
+    /// `try_eval_owned_step` arm of the fold step.
+    #[test]
+    fn fold_step_each_reports_a_failing_owned_step_3241() {
+        let entry = OwnedValue::object_from([
+            ("key".to_string(), OwnedValue::array()),
+            ("value".to_string(), OwnedValue::Int(1)),
+        ]);
+        let state = OwnedValue::array_from(vec![entry]);
+        let expr = parse("from_entries").unwrap();
+        for optional in [false, true] {
+            let mut produced = Vec::new();
+            let flow = fold_step_each::<JqSemantics>(
+                &expr,
+                state.clone(),
+                optional,
+                Reentry::Proven,
+                &mut |value| {
+                    produced.push(value);
+                    Demand::Continue
+                },
+            );
+            assert!(produced.is_empty(), "optional={optional}: on_update ran");
+            match (optional, flow) {
+                (false, Flow::Escaped(Control::Error(error))) => {
+                    assert!(error.message.contains("as object key"), "{}", error.message);
+                }
+                (true, Flow::Exhausted) => {}
+                (_, _) => panic!("optional={optional}: unexpected flow"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if fold_step_each reported anything but an escape (not optional) or exhaustion (optional) for a failing owned step (#3241)"
+            }
+        }
+    }
+
     /// #3241: an UPDATE holding a marker is never closed, so the owned
     /// assignment declines it and the step takes the evaluator route with the
     /// witness #3181 gives it. A marker is how a binding's node reaches the
