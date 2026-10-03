@@ -41171,9 +41171,45 @@ impl FoldRegister {
         branch: Option<&PathBranch<'_>>,
         fold_frame: &Frame,
     ) -> (bool, Snapshot) {
-        let at_register = branch.is_some_and(|b| b.trackable && b.path == self.path);
+        let at_register = branch.is_some_and(|b| {
+            b.trackable
+                && (b.path == self.path
+                    || (S::TAG == EvalTag::Jq && self.whole_array_slice_of_register(b)))
+        });
         let snapshot = branch.map_or(Snapshot::No, |b| accumulator_provenance::<S>(b, fold_frame));
         (at_register, snapshot)
+    }
+
+    /// Whether `b` is the register's own array seen through one or more
+    /// slices that kept every element (#3504). jq's array slice shares its
+    /// parent's buffer, adjusting only offset and size, so `.[0:]` or
+    /// `.[null:]` of a non-empty array is `jv_identical` to the input and the
+    /// accumulator stays on the register (`path(reduce 1 as $x (.; .[0:]))`
+    /// is `[]`). A slice can only shrink an array, so a chain of slices whose
+    /// result still equals the register's value kept every element; an empty
+    /// array is a fresh `jv_array()` and a string slice a fresh string, so
+    /// neither qualifies ([`slice_witnesses_node`]).
+    fn whole_array_slice_of_register(&self, b: &PathBranch<'_>) -> bool {
+        if !slice_witnesses_node(&b.path, &b.value)
+            || !matches!(&self.value, OwnedValue::Array(items) if !items.is_empty())
+            || *b.value != self.value
+        {
+            return false;
+        }
+        let mut cur: &PathPrefix = &b.path;
+        while let PathPrefix::Node {
+            parent, component, ..
+        } = cur
+        {
+            if !matches!(component, Expr::Slice { .. } | Expr::SliceExpr { .. }) {
+                return false;
+            }
+            if Rc::ptr_eq(parent, &self.path) || **parent == *self.path {
+                return true;
+            }
+            cur = parent;
+        }
+        false
     }
 
     /// Resolve `expr` (`UPDATE` or `EXTRACT`) against one fold step's own

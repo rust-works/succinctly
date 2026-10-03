@@ -92159,3 +92159,78 @@ fn test_array_collector_over_a_raising_path_context_body_is_atomic_3512() -> Res
     }
     Ok(())
 }
+
+/// #3504: a slice that keeps every element of a non-empty array shares the
+/// parent's buffer in jq (`jv_identical`), so a `reduce` accumulator stepped
+/// through `.[0:]`/`.[null:]` is still the register's own node. A partial
+/// slice, an empty array and a string slice are fresh values and still refuse.
+/// Every row captured from jq 1.7.1.
+#[test]
+fn test_reduce_whole_array_slice_is_the_register_3504() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[0:]))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[null:]))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[0:3]))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[0:] | .[0:]))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"del(reduce 1 as $x (.; .[0:]))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"(reduce 1 as $x (.; .[0:])) |= length",
+            "3\n",
+            "",
+            0,
+        ),
+        // Partial slices, empty arrays and strings stay refused.
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[null:1]))",
+            "",
+            "Invalid path expression with result [10]",
+            5,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[1:]))",
+            "",
+            "Invalid path expression with result [20,30]",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(reduce 1 as $x (.; .[0:]))",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+    ])
+}
