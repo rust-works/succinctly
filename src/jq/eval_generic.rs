@@ -12178,28 +12178,57 @@ fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
         if matches!(sink.push(GenericItem::OneCursor(cursor)), Demand::Stop) {
             return Flow::Stopped { pending: None };
         }
-        let mut children: Vec<(Rc<PathTrail>, PathNode<V>)> = Vec::new();
-        let stepped = path_step_generic::<S, V, _>(
-            &Expr::Iterate,
-            &PathNode::At(cursor),
-            &PathTrail::root(),
-            S::COLLAPSE_DUPLICATE_KEYS,
-            &mut children,
-        );
-        match stepped {
-            Ok(()) => {}
-            Err(e) if e.is_uncatchable_at_value_position() => {
-                return Flow::Escaped(Control::Error(e))
+        // #3023: a scalar has no members, and `.[]?` swallows the error
+        // iterating it raises -- but not a failure that escapes `?` (an
+        // undecodable string, a scalar the cursor cannot read). Those are
+        // reported exactly as the step reports them: [`scalar_iteration_precheck`]
+        // for the first, [`validate_cursor`] for the second. Not stepping a leaf
+        // spares the `Cannot iterate` message the step would format and drop,
+        // and most nodes are leaves.
+        let node = cursor.value();
+        if node.as_object().is_none() && node.as_array().is_none() {
+            let read = scalar_iteration_precheck::<S, V>(&node).and_then(|reads| {
+                if reads {
+                    validate_cursor::<S, _>(&cursor)
+                } else {
+                    Ok(())
+                }
+            });
+            match read {
+                Err(e) if e.is_uncatchable_at_value_position() => {
+                    return Flow::Escaped(Control::Error(e))
+                }
+                _ => continue,
             }
-            // `.[]?`: a scalar, or a malformed container, ends the branch.
-            Err(_) => {}
         }
-        for (_, child) in children.into_iter().rev() {
-            let PathNode::At(c) = child else {
-                unreachable!("a step from a live node reaches live children")
-            };
-            pending.push(c);
+        // The children go straight onto the work stack, in document order,
+        // and the span just pushed is reversed in place so they pop in that
+        // order -- no per-node buffer, and a [`NoTrail`] so the step builds
+        // neither a trail link nor an owned key for a path this walk never
+        // reads.
+        let first_child = pending.len();
+        let stepped = path_iterate_step_generic::<S, V, NoTrail>(
+            &PathNode::At(cursor),
+            &NoTrail,
+            S::COLLAPSE_DUPLICATE_KEYS,
+            &mut |_, child| {
+                match child {
+                    PathNode::At(c) => pending.push(c),
+                    PathNode::Absent | PathNode::Owned(_) => unreachable!("live children only"), // omni-dev: coverage tolerate-line reason="unreachable: a step from a live node emits only live children (#3023)"
+                }
+                Demand::Continue
+            },
+        );
+        // A container whose members cannot be listed (a stray comma, #2261)
+        // raises a decode failure, which `?` never swallows. Anything else
+        // would end the branch, as `.[]?` does; listing raises nothing else
+        // today.
+        if let Err(e) = stepped {
+            if e.is_uncatchable_at_value_position() {
+                return Flow::Escaped(Control::Error(e));
+            }
         }
+        pending[first_child..].reverse();
     }
     Flow::Exhausted
 }
@@ -19641,7 +19670,8 @@ fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
 }
 
 /// The trail one navigation step extends (#2572): `path()`'s own
-/// [`PathTrail`], or the path-context walk's [`PathContextTrail`].
+/// [`PathTrail`], the path-context walk's [`PathContextTrail`], or [`NoTrail`]
+/// for the one walk that reads neither (#3023).
 ///
 /// [`path_step_generic`] is the one definition of a navigation step both
 /// walks share, and each needs a different record of where the step came
@@ -19666,6 +19696,15 @@ trait StepTrail<V: DocumentValue>: Clone {
     /// The trail one `component` below this one, taken from `from` -- the
     /// node standing at `self`.
     fn extend_from(&self, component: OwnedValue, from: &PathNode<V>) -> Self;
+
+    /// [`extend_from`](Self::extend_from) with a component that is built only
+    /// if this trail keeps it (#3023). A step whose component costs an
+    /// allocation (an object key becomes an owned `String`) spells it as a
+    /// closure, so a trail that records nothing ([`NoTrail`]) never pays.
+    #[inline]
+    fn extend_with(&self, component: impl FnOnce() -> OwnedValue, from: &PathNode<V>) -> Self {
+        self.extend_from(component(), from)
+    }
 }
 
 impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
@@ -19675,6 +19714,35 @@ impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
 
     fn extend_from(&self, component: OwnedValue, _from: &PathNode<V>) -> Self {
         PathTrail::extend(self, component)
+    }
+}
+
+/// The trail of a walk that reads the positions a step reaches and never the
+/// path to them (#3023): `..`, which delivers each node as a cursor and
+/// discards where it stood. A zero-sized no-op, so a step allocates neither a
+/// link nor the component it would have named.
+///
+/// Its depth is always 0, which is what the walk it replaces reported too: it
+/// restarted from [`PathTrail::root`] at every node. [`guard_nesting_depth`]
+/// therefore never has anything to refuse here, and the walk is iterative
+/// (#3457), so no native recursion is left for it to bound.
+#[derive(Clone, Copy)]
+struct NoTrail;
+
+impl<V: DocumentValue> StepTrail<V> for NoTrail {
+    #[inline]
+    fn recursion_depth(&self) -> usize {
+        0
+    }
+
+    #[inline]
+    fn extend_from(&self, _component: OwnedValue, _from: &PathNode<V>) -> Self {
+        Self
+    }
+
+    #[inline]
+    fn extend_with(&self, _component: impl FnOnce() -> OwnedValue, _from: &PathNode<V>) -> Self {
+        Self
     }
 }
 
@@ -20238,7 +20306,9 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
                     };
                     if matches!(
                         emit(
-                            path.extend_from(OwnedValue::String(key.into_owned().into()), node),
+                            // #3023: the owned key is only built for a trail
+                            // that keeps it.
+                            path.extend_with(|| OwnedValue::String(key.into_owned().into()), node),
                             PathNode::At(field.value_cursor),
                         ),
                         Demand::Stop
@@ -20270,35 +20340,7 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
                     }
                 }
                 Ok(Demand::Continue)
-            } else if let Some(reason) = v.string_decode_error() {
-                // #1247/#1620: an undecodable-string scalar must raise
-                // its own decode failure unconditionally, never
-                // suppressed by the yq-mode no-op below -- same
-                // priority order as `scalar_fallback`/
-                // `decode_failure_or` elsewhere in this fix.
-                //
-                // Live since #2168 (direction 2). This arm was written
-                // defensively and documented as unreachable, because
-                // every caller ran `push_generic_document_validation_
-                // error` over the whole document first and raised the
-                // identical `decode_failure` before the walk started.
-                // That pre-walk is gone; this is now the place
-                // `path(.a[])`/`.a[] | key` on `{"a":"\ud800"}` raise,
-                // and the reason `[path(.[][])]` still rejects a
-                // document whose undecodable scalar the iteration
-                // reaches while `path(.d)` no longer rejects one it
-                // never touches. A single-level `[path(.[])]` does not
-                // reach this arm at all -- iterating an object/array
-                // only decodes keys and yields child cursors, it never
-                // decodes a child scalar's own string content.
-                Err(EvalError::decode_failure(reason))
-            } else if S::TAG == EvalTag::Yq {
-                // #2346: see this arm's `PathNode::Absent` sibling
-                // above for the full live-oracle evidence -- a
-                // genuinely-resolved non-container scalar gets the
-                // same silent no-op here.
-                Ok(Demand::Continue)
-            } else {
+            } else if scalar_iteration_precheck::<S, V>(&v)? {
                 // `to_owned_cursor`, not `to_owned`: only the cursor
                 // resolves an explicit YAML tag (#747), and the
                 // materializing resolver quotes the *tagged* value back.
@@ -20306,14 +20348,63 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
                 // "Cannot iterate over number (5)" where every other
                 // route says `string ("5")` -- the sibling
                 // `path_node_type_name` above already goes through the
-                // cursor for exactly this reason.
+                // cursor for exactly this reason. Reading the scalar can
+                // itself fail, and that failure escapes first.
                 Err(EvalError::cannot_iterate_with(
                     EvalTag::Jq,
                     &to_owned_cursor::<S, _>(c)?,
                 ))
+            } else {
+                Ok(Demand::Continue)
             }
         }
     }
+}
+
+/// What `.[]` over a node that is neither an object nor an array settles
+/// before it reads the scalar (#3023).
+///
+/// `Err` is the undecodable-string failure, which escapes `?`. `Ok(false)` is
+/// yq's silent no-op. `Ok(true)` is jq: the caller goes on to read the scalar
+/// -- which can itself fail, and that failure escapes too -- and raises
+/// `Cannot iterate over ...`.
+///
+/// The read is left to each caller because they want different things from it.
+/// [`path_iterate_step_generic`] needs the value to name in the message, so it
+/// reads with [`to_owned_cursor`]. [`each_recurse_cursor_generic`] throws the
+/// message away (`..` is `recurse(.[]?)`), so it only asks whether the read
+/// would succeed, with [`validate_cursor`], which answers `to_owned_cursor`'s
+/// `Ok`/`Err` by construction without building the value. Formatting a message
+/// that is dropped was most of what `..` allocated; reading a scalar twice is
+/// what a shared "validate, then read" helper would have cost every other
+/// caller on its raising path.
+///
+/// Both callers adjudicate the `Err` themselves: the step propagates it, and the
+/// walk escapes it when it is uncatchable.
+fn scalar_iteration_precheck<S: EvalSemantics, V: DocumentValue>(v: &V) -> Result<bool, EvalError> {
+    if let Some(reason) = v.string_decode_error() {
+        // #1247/#1620: an undecodable-string scalar must raise its own decode
+        // failure unconditionally, never suppressed by the yq-mode no-op
+        // below -- same priority order as `scalar_fallback`/
+        // `decode_failure_or` elsewhere in this fix.
+        //
+        // Live since #2168 (direction 2). This check was written defensively
+        // and documented as unreachable, because every caller ran
+        // `push_generic_document_validation_error` over the whole document
+        // first and raised the identical `decode_failure` before the walk
+        // started. That pre-walk is gone; this is now the place
+        // `path(.a[])`/`.a[] | key` on `{"a":"\ud800"}` raise, and the reason
+        // `[path(.[][])]` still rejects a document whose undecodable scalar the
+        // iteration reaches while `path(.d)` no longer rejects one it never
+        // touches. A single-level `[path(.[])]` does not reach it at all --
+        // iterating an object/array only decodes keys and yields child cursors,
+        // it never decodes a child scalar's own string content.
+        return Err(EvalError::decode_failure(reason));
+    }
+    // #2346: see `path_iterate_step_generic`'s `PathNode::Absent` arm for the
+    // full live-oracle evidence -- a genuinely-resolved non-container scalar is
+    // a silent no-op in yq.
+    Ok(S::TAG != EvalTag::Yq)
 }
 
 /// The navigational steps -- `Field`, `Index`, `Iterate`, on live, absent or
