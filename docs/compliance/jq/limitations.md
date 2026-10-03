@@ -662,10 +662,6 @@ follows too. What it leaves:
 - **`first(.[K] | key)` on the cursor route** collects the walk's positions before the
   consumer can stop it, so a retry that only a stop would trigger is never made -- the #2180
   "materialized before the consumer" family, with #3470.
-- **Path-mode `foreach` evaluates its UPDATE before a consumer can stop it** (#3507):
-  `[first(path(foreach 1 as $x (.; .[K]))), 9]` with a key whose retry raises after a satisfied
-  first alternative is `[["a"],9]` after a single attempt here and an error in jq. Not a stale
-  slot: no retry happens at all.
 - **An array key on an array** (#3506, #3453, #2429): jq's `.[[2]]` is a subarray search, and
   here too, in value, path and write position alike. `.[[2]]`, `indices`/`index`/`rindex` with
   an array needle and `getpath([[2]])` answer it (including past a `null` reached mid-path,
@@ -5877,6 +5873,20 @@ not name. Fixing one and not the other would have left the two path-mode folds i
 each other — the very complaint #2903 makes about path versus value mode. Pinned in
 `path_mode_fold_resolves_init_by_demand_2903` (`tests/jq_cli_tests.rs`), with the moved rows in
 `test_short_circuit_side_effect_shapes_already_match_jq_820`.
+
+**Path-mode `foreach`'s UPDATE and EXTRACT are driven by demand too — closed by
+[#3507](https://github.com/rust-works/succinctly/issues/3507).** They were the last two collecting
+sites in the path-mode fold: `first(path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))`
+wrote `ab` where jq writes `a`, and a `?//` inside UPDATE or EXTRACT never saw the consumer's stop
+it retries at, so a retry that raises in jq (`E2`, an index error) was missed. `FoldRegister::resolve_sink`
+delivers each relocated UPDATE output to the step as it is produced, and the step stores it, runs
+EXTRACT and emits before UPDATE's generator is asked for the next; a `?//` retry that goes on
+past the consumer's stop and produces nothing, or raises, supersedes the stop (#3293's rule, as INIT's
+drive applies it). `resolve_reduce`'s UPDATE stays collected on purpose: jq evaluates every one of
+its outputs (`first(path(reduce 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))` writes `ab` and raises
+`Invalid path expression with result null`, in jq and here). Pinned in
+`path_mode_foreach_update_and_extract_resolve_by_demand_3507` (`tests/jq_cli_tests.rs`); the `ix-foreach-stop`
+family in `scripts/jq-alt-retry-oracle-sweep.sh` is no longer a known divergence.
 
 Value-mode `reduce`'s INIT (#2899 above) is untouched and still collects — it needs a native
 `Expr::Reduce` dispatch arm before a stop has anywhere to land, which is a different change.
