@@ -5,8 +5,20 @@
 //! drivers this issue is about are only reached through the former. Parsing,
 //! indexing and one warm-up evaluation happen outside the counted window.
 //!
+//! The warm-up matters for a query that defines a function: a `def` call node
+//! remembers what evaluation did to it (#3148), so the counted run sees nodes
+//! the warm-up already reached. The rows this probe was written for define
+//! none.
+//!
+//! A standalone copy of `alloc_probe_3022`'s allocator rather than a mode of
+//! it, so one file can be copied into a base worktree and built there.
+//!
 //!     cargo run --example alloc_probe_3692 -- <file.json> <query>
 
+// A counting global allocator is the whole point of this example, and
+// `GlobalAlloc` is an unsafe trait. The crate's own `unsafe_code = "deny"`
+// policy (Cargo.toml) asks for a localized, reasoned opt-in; nothing here
+// ships in the library.
 #![allow(unsafe_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -21,11 +33,15 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 
 struct Counting;
 
+// SAFETY: every method forwards its arguments unchanged to `System`, which
+// upholds `GlobalAlloc`'s contract; the only addition is a counter bump that
+// neither allocates nor touches the pointer.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if ARMED.load(Ordering::Relaxed) {
             COUNT.fetch_add(1, Ordering::Relaxed);
         }
+        // SAFETY: `layout` is the caller's, passed straight to `System`.
         unsafe { System.alloc(layout) }
     }
 
@@ -33,6 +49,7 @@ unsafe impl GlobalAlloc for Counting {
         if ARMED.load(Ordering::Relaxed) {
             COUNT.fetch_add(1, Ordering::Relaxed);
         }
+        // SAFETY: `layout` is the caller's, passed straight to `System`.
         unsafe { System.alloc_zeroed(layout) }
     }
 
@@ -40,10 +57,16 @@ unsafe impl GlobalAlloc for Counting {
         if ARMED.load(Ordering::Relaxed) {
             COUNT.fetch_add(1, Ordering::Relaxed);
         }
+        // SAFETY: `ptr`, `layout` and `new_size` are the caller's, passed
+        // straight to `System`, and `ptr` came from `System` through this
+        // allocator's `alloc`.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` and `layout` are the caller's, passed straight to
+        // `System`, and `ptr` came from `System` through this allocator's
+        // `alloc`.
         unsafe { System.dealloc(ptr, layout) }
     }
 }
