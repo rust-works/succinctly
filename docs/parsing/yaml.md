@@ -5243,6 +5243,126 @@ directly against a before/after binary pair, not just plausible-looking output).
 
 ---
 
+## O8: Skip the Delimiter Checks YAML Cannot Fail — Accepted ✅
+
+**Issue**: #2640 (the double position-resolve in the cursor walk, re-measured).
+
+### What was claimed, and what the measurement found
+
+#2168 found the cursor walk resolving each node's `text_position` two to three
+times. #2578 made the repeats cheap for JSON (an exact-repeat fast path), and
+#2604/#2692 moved `path`, `key`, `parent`, `getpath`, `select` and `if` off the
+walk. #2640 asked whether what was left was worth a fusion pass that resolves
+once and threads the position down.
+
+The re-measurement says **no for JSON, and points somewhere else for YAML.**
+
+**JSON, no fusion.** Line-level cachegrind on `[.[]] | length` over a 2 MB
+array-of-arrays (97,765 elements) puts `JsonCursor::text_position` at 3.8% of
+instructions and `BalancedParens::rank1` at 2.1%, for *both* calls per element
+(the gap check, then `value()`). The second call is the cache hit, so removing it
+is worth at most about 2.9% on the most resolve-dense shape measured, and
+0.1-0.5% on `sort`/`sort_by`. The whole JSON check family (resolve plus the
+byte-level gap scan, which any fusion must keep) is -3.1% on record `sort_by`,
+-1.3% on `sort`, -4.7% on `[.users[]] | length` and -12.3% on `[.[]] | length`
+when stubbed out entirely, which is the ceiling and is not reachable by fusing.
+Under the 3% threshold on every realistic row: closed as not worth it.
+
+**YAML, the checks are dead code that still costs.** YAML validates delimiters
+while it parses, so every delimiter check on `DocumentCursor` is the
+`true`-returning default. The helpers that *feed* a check did not know that:
+
+- `DocumentCursor::element_gap_ok` resolved the element's `text_position()`
+  (touching the shared sequential cursor) and then asked a check that cannot fail;
+- `value_delimiter_ok` fell back to the value cursor's `text_position()`, because
+  YAML's values carry no `text_start()`, once per field (`key_delimiter_ok` reads the
+  key's `text_start()`, which is the trait default `None` for YAML, so it was
+  already free);
+- the free `trailing_element_gap_ok` resolved the last child's position and decoded
+  its value, once per container.
+
+The trait's own documentation said these cost non-JSON formats nothing. They did
+not.
+
+### The change
+
+`DocumentCursor::HAS_DELIMITER_CHECKS`, `true` by default (a new format keeps
+checking until it opts out) and `false` for `YamlCursor`. The three helpers that pay
+(`element_gap_ok`, `value_delimiter_ok`, the free `trailing_element_gap_ok`) return
+`true` at once when it is `false`. For JSON the constant is `true`, the branch folds
+away at compile time, and its code is unchanged.
+
+The flag is a second statement of a fact the check overrides already encode, so it
+could drift. `yaml_has_no_delimiter_checks_2640` pins both halves: each YAML check is
+still the default over a spread of arguments, and the helpers leave the shared
+sequential-cursor cache alone (read through `Debug`; a control shows a real
+`text_position()` does move it, and the test was mutation-checked against removing
+each of the three guards separately). `json_keeps_its_delimiter_checks_2640` pins that JSON still refuses
+`[1,,2]`, `[1,]` and `{"a":1,,"b":2}`.
+
+### Results
+
+Interleaved A/B, release builds, output identity gated (0 differences on all 36
+configurations), the YAML fixtures from `succinctly yaml generate -p users|sequences
+-s 20260101`:
+
+| Query (10 MB fixture, min of 11 interleaved reps) | M4 Pro before | M4 Pro after | 7950X before | 7950X after |
+|---------------------------------------------------|---------------|--------------|--------------|-------------|
+| `.sequences \| length`                            |       72.6 ms |      59.5 ms |     113.6 ms |     90.6 ms |
+| `[.sequences[]] \| length`                        |       88.4 ms |      73.4 ms |     137.8 ms |    113.2 ms |
+| `.sequences \| sort \| length`                    |      227.5 ms |     214.2 ms |     327.5 ms |    304.3 ms |
+| `.users \| sort_by(.score) \| length` (records)   |      246.9 ms |     223.5 ms |     376.3 ms |    336.5 ms |
+| `.users \| sort \| length` (records)              |      535.2 ms |     510.7 ms |     747.1 ms |    720.8 ms |
+| `[.users[]] \| length` (records)                  |       35.6 ms |      35.2 ms |      52.2 ms |     51.8 ms |
+| `.` (holdout: never reaches a check)              |      129.6 ms |     129.3 ms |     163.3 ms |    164.3 ms |
+
+Instruction counts (cachegrind, deterministic):
+
+| Query (2 MB fixture, 7950X)                    |       base Ir |       head Ir |    delta |
+|------------------------------------------------|---------------|---------------|----------|
+| `.sequences \| length`                         |   482,240,263 |   325,905,805 | -32.418% |
+| `[.sequences[]] \| length`                     |   535,100,273 |   379,400,809 | -29.097% |
+| `.sequences \| sort \| length`                 | 1,169,596,794 | 1,014,056,446 | -13.299% |
+| `.users \| sort_by(.score) \| length`          | 1,442,121,980 | 1,245,892,700 | -13.607% |
+| `.users \| sort \| length`                     | 2,279,909,734 | 2,081,900,856 |  -8.685% |
+| `[.users[]] \| length`                         |   185,781,187 |   182,251,859 |  -1.900% |
+| `.` (holdout)                                  |   761,168,507 |   761,168,629 |  +0.000% |
+| every JSON row (9 queries, `users` + `arrays`) |        (same) |        (same) |  +0.000% |
+
+Reading them:
+
+- The scalar-sequence shapes gain most because a scalar element does almost nothing
+  else per node: the wasted resolve was a third of the work (-29% to -32% of
+  instructions, -17% to -20% of wall-clock). Record shapes spend their time decoding
+  fields, so `sort_by` over records gains -9.5% to -10.6% wall-clock.
+- Instruction counts and wall-clock disagree in size, as they do elsewhere in this
+  repo: `[.users[]] | length` is -1.9% in instructions and -0.8% to -1.2% in wall-clock
+  at 10 MB.
+- The JSON rows execute the same instructions (+0.000% on every row), so their
+  wall-clock spread is not cost. On the M4 Pro it is within the harness's noise
+  floor (control run, a copy of the base against itself: -0.45% YAML, -1.09% JSON; the
+  JSON rows' median is +0.03% and +0.15%). On the 7950X (noise floor -1.06% YAML,
+  -0.65% JSON) the JSON `users` rows read +0.6% to +3.7% slower at 10 MB with identical
+  instruction counts, so there is no instruction-level cause: the code-placement band
+  [benchmarking.md](../guides/benchmarking.md) § 9 describes.
+
+### Memory
+
+Peak resident size of `succinctly` on the 10 MB fixtures was at most 290 MB
+(`jq 'sort | length'` over the array-of-arrays) on both machines, and base and head
+agree to within sampling error. Every benchmark and instruction-count run was made
+under a process-group memory watchdog (4 GB on the 24 GB Mac mini, 6 GB plus a
+kernel `RLIMIT_AS` on the 30 GB Linux box, 14 GB for valgrind); the largest whole
+run peaked at 317 MB.
+
+### Files Modified
+
+- `src/jq/document.rs` — `DocumentCursor::HAS_DELIMITER_CHECKS`; guards in
+  `element_gap_ok`, `value_delimiter_ok`, `trailing_element_gap_ok`
+- `src/yaml/light.rs` — `HAS_DELIMITER_CHECKS = false` for `YamlCursor`
+
+---
+
 ## See Also
 
 - [YamlIndex wiki page](yaml-index.md) — concept overview, dependencies, and academic references
