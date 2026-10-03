@@ -13995,7 +13995,7 @@ impl<V: DocumentValue> LoopState<V> {
     ) -> (Vec<bool>, Option<Control>) {
         if let Self::Owned(owned) = self {
             match crate::jq::eval::owned_cond_verdict::<S>(cond, owned, optional) {
-                Some(Ok(verdict)) => return (vec![verdict.is_truthy()], None),
+                Some(Ok(truthy)) => return (vec![truthy], None),
                 Some(Err(error)) => return (Vec::new(), Some(Control::Error(error))),
                 None => {}
             }
@@ -42109,6 +42109,30 @@ mod tests {
                 reindexes <= 3,
                 "{query}: {reindexes} reindexes over 50 rounds"
             );
+        }
+        // A condition that names the bound value: the marker reads as its value,
+        // as the bridge's demotion would, and the answers are jq's.
+        for (query, want) in [
+            (
+                ". as $d | [] | until(length > ($d | length); . + [1])",
+                vec!["[1,1,1]"],
+            ),
+            (
+                ". as $d | {i:0, d:$d} | until(length == ($d | length) and .i >= 50; .i += 1) | .i",
+                vec!["50"],
+            ),
+            (
+                ". as $d | [] | [while(length <= ($d | length); . + [1])] | length",
+                vec!["3"],
+            ),
+            (
+                ". as $d | {i:0} | until(($d | length) == 2 and .i >= 50; .i += 1) | .i",
+                vec!["50"],
+            ),
+        ] {
+            let (got, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+            assert!(reindexes <= 3, "{query}: {reindexes} reindexes");
         }
         // yq's bridge is a different entry point; the verdict must not reindex there either.
         let before = crate::jq::value::reindex_count::get();

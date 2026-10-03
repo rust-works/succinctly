@@ -10107,7 +10107,8 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
 /// cost (`range_values_generic` appends in place once its sink lets go of the
 /// value), the bridge was.
 ///
-/// The condition is answered by [`eval_owned_pure_in`] with `lengths` on, the
+/// The condition is answered by [`owned_cond_verdict`] -- [`eval_owned_pure_in`]
+/// with `lengths` on, shared with `until`/`while` (#3697) -- the
 /// grammar [`eval_owned_pure`] already pins against the bridge (comparisons,
 /// `and`/`or`/`not`, `type`, navigation as an operand) plus `length` over a
 /// container. `select` yields its input unchanged, so a truthy answer emits
@@ -10164,13 +10165,14 @@ fn owned_select_door<S: EvalSemantics>(
         let Expr::Builtin(Builtin::Select(cond)) = unwrap_paren(first) else {
             break;
         };
-        let Some(verdict) = eval_owned_pure_in::<S>(cond, input, ResultPosition::Operand, true)
-        else {
+        // `optional` is gated at the top, so the verdict is the shared one
+        // ([`owned_cond_verdict`], #3697) and the two doors cannot drift.
+        let Some(verdict) = owned_cond_verdict::<S>(cond, input, false) else {
             break;
         };
         match verdict {
-            Ok(verdict) if verdict.is_truthy() => {}
-            Ok(_) => return Some(Flow::Exhausted),
+            Ok(true) => {}
+            Ok(false) => return Some(Flow::Exhausted),
             Err(error) => return Some(Flow::Escaped(Control::Error(error))),
         }
         peeled = true;
@@ -54494,7 +54496,7 @@ impl<'e> LoopOperand<'e> {
     ) -> (Vec<OwnedValue>, Option<Control>) {
         let expr = if ambient { self.expr } else { self.demoted };
         match owned_cond_verdict::<S>(expr, input, optional) {
-            Some(Ok(verdict)) => (vec![verdict], None),
+            Some(Ok(truthy)) => (vec![OwnedValue::Bool(truthy)], None),
             Some(Err(error)) => (Vec::new(), Some(Control::Error(error))),
             None => eval_owned_expr_fork::<S>(expr, input, optional, Reentry::Proven),
         }
@@ -54525,6 +54527,11 @@ impl<'e> LoopOperand<'e> {
 /// one gate kept, as [`eval_owned_fast_path`] keeps it for the same grammar --
 /// the `?`-suppression rules an erroring operand meets stay the bridge's.
 ///
+/// The verdict is returned as its truthiness, not as the value: `Operand`
+/// position admits a navigated subvalue (`.a.b`), whose representation may
+/// differ from the bridge's and which must not escape as an expression's own
+/// result, so the type is what keeps it from doing so.
+///
 /// `None` when the condition is outside the pure grammar, or `length` of
 /// anything but an array or an object, so the bridge keeps its diagnostics and
 /// its per-mode rules. Because every accepted shape is pure, a walk that ends in
@@ -54533,11 +54540,12 @@ pub(crate) fn owned_cond_verdict<S: EvalSemantics>(
     cond: &Expr,
     state: &OwnedValue,
     optional: bool,
-) -> Option<Result<OwnedValue, EvalError>> {
+) -> Option<Result<bool, EvalError>> {
     if optional {
         return None;
     }
     eval_owned_pure_in::<S>(cond, state, ResultPosition::Operand, true)
+        .map(|verdict| verdict.map(|value| value.is_truthy()))
 }
 
 /// Recursive step for [`eval_until`] (#534): `E(s) = if cond(s) is truthy:
@@ -98703,7 +98711,7 @@ mod tests {
                             assert_eq!(bridge.1, "ok", "{mode}: {src:?} on {value:?}");
                             assert_eq!(bridge.0.len(), 1, "{mode}: {src:?} on {value:?}");
                             assert_eq!(
-                                verdict.is_truthy(),
+                                verdict,
                                 bridge.0[0].is_truthy(),
                                 "{mode}: {src:?} on {value:?} disagrees with the reindex bridge"
                             );
@@ -98822,6 +98830,70 @@ mod tests {
         ));
         assert_eq!(tag, "ok");
         assert_eq!(array_len(&out[0]), 5);
+    }
+
+    /// #3697: a `length` condition that raises keeps the bridge's error (the
+    /// text jq 1.7.1 gives), a `?` on the loop suppresses it as before, and a
+    /// condition that names a bound value (`$d`, under the embed table) answers
+    /// what jq does -- all on the `eval.rs` route (`until_step`/`while_step`),
+    /// where [`LoopOperand::fork_cond`] turns the verdict's `Err` into the loop's
+    /// escape.
+    #[test]
+    fn until_while_length_condition_raises_and_reads_bound_values_3697() {
+        let one: &[u8] = b"[1]";
+        let index = JsonIndex::build(one);
+        let cursor = index.root(one);
+        let update = parse(". + [1]").unwrap();
+        let raised = "error:Cannot index array with string \"a\"";
+        for (is_until, cond_src) in [(true, "length > 1 and .a"), (false, "length > 0 and .a")] {
+            let cond = parse(cond_src).unwrap();
+            let run = |optional| {
+                normalize(if is_until {
+                    eval_until::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), optional)
+                } else {
+                    eval_while::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), optional)
+                })
+            };
+            let (out, tag) = run(false);
+            assert!(out.is_empty(), "{cond_src}: {out:?}");
+            assert_eq!(tag, raised, "{cond_src}");
+            // Under a `?` the same error is suppressed and the loop ends empty.
+            let (out, tag) = run(true);
+            assert!(out.is_empty(), "{cond_src}: {out:?}");
+            assert_eq!(tag, "ok", "{cond_src}");
+        }
+
+        // Bound values: the answers are jq 1.7.1's (captured live).
+        let json: &[u8] = br#"{"a":[1,2,3],"o":{"p":1}}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        for (filter, want) in [
+            (
+                ". as $d | [] | until(length > ($d | length); . + [1])",
+                "[1,1,1]",
+            ),
+            (
+                ". as $d | {i:0, d:$d} | until(length == ($d | length) and .i >= 50; .i += 1) | .i",
+                "50",
+            ),
+            (
+                ". as $d | [] | [while(length <= ($d | length); . + [1])] | length",
+                "3",
+            ),
+            (
+                ". as $d | {i:0} | until(($d | length) == 2 and .i >= 50; .i += 1) | .i",
+                "50",
+            ),
+        ] {
+            let expr = parse(filter).unwrap();
+            let out =
+                eval_full::<Vec<u64>, JqSemantics>(&expr, cursor).collect_owned::<JqSemantics>();
+            assert_eq!(
+                out.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                [want],
+                "{filter}"
+            );
+        }
     }
 
     #[test]
