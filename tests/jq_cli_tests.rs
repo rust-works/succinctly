@@ -93521,3 +93521,159 @@ fn test_recurse_failures_escape_where_the_walk_reaches_them_3023() -> Result<()>
         ("[3,[1,2,]]", "[limit(3; ..)] | length", "3\n", "", 0),
     ])
 }
+
+/// #3689: a swallowed `.[]` over a scalar still answers what it answered, now
+/// without building the error it drops.
+///
+/// `.[]?`, `try .[]` and `try .[] catch empty` over a scalar settle in the
+/// `try` boundary (`try_single_generic`/`each_try_generic`) without evaluating
+/// the `.[]` whose `Cannot iterate over ...` message they would discard, and
+/// `.. | path` -- a walk each of whose steps is `.[]?` -- asks a live scalar
+/// `scalar_iteration_precheck`/`validate_cursor` instead of stepping it. What
+/// must not change:
+///
+/// - a handler that is anything but `empty` still sees the message (`catch .`),
+///   and a `def empty:` in scope makes `catch empty` an ordinary handler;
+/// - a failure `?` never swallows -- an undecodable string, a scalar the cursor
+///   cannot read, a container whose members cannot be listed -- escapes through
+///   every boundary, as the same message;
+/// - the walk stays lazy: a consumer that stops first never reaches the failure,
+///   and one that asks for one node more does.
+///
+/// The valid-JSON `.[]?` rows are jq 1.7.1's own. jq cannot read the other
+/// documents and has no `.. | path` or `.. | key`, so those rows were captured
+/// from the binary built from the parent commit and are identical on this one.
+#[test]
+fn test_swallowed_scalar_iteration_answers_what_it_did_3689() -> Result<()> {
+    const MIXED: &str = r#"[1,"a",null,true,[2],{"k":3}]"#;
+    assert_path_rows_3289(&[
+        (MIXED, "[.[] | .[]?]", "[2,3]\n", "", 0),
+        (MIXED, "[.[] | (.[])?]", "[2,3]\n", "", 0),
+        (MIXED, "[.[] | try .[]]", "[2,3]\n", "", 0),
+        (MIXED, "[.[] | try .[] catch empty]", "[2,3]\n", "", 0),
+        (
+            MIXED,
+            "[.[] | try (.[], 1) catch empty]",
+            "[2,1,3,1]\n",
+            "",
+            0,
+        ),
+        // A handler that is not `empty` runs, and reads the message.
+        (
+            MIXED,
+            r#"[.[] | try .[] catch "c"]"#,
+            "[\"c\",\"c\",\"c\",\"c\",2,3]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | try .[] catch .]",
+            "[\"Cannot iterate over number (1)\",\"Cannot iterate over string (\\\"a\\\")\",\
+             \"Cannot iterate over null (null)\",\"Cannot iterate over boolean (true)\",2,3]\n",
+            "",
+            0,
+        ),
+        // `empty` is the user's here, so the handler runs.
+        (
+            MIXED,
+            "def empty: 7; [.[] | try .[] catch empty]",
+            "[7,7,7,7,2,3]\n",
+            "",
+            0,
+        ),
+        // The root itself a scalar.
+        (r#""abc""#, "[.[]?]", "[]\n", "", 0),
+        (r#""abc""#, "try .[] catch empty", "", "", 0),
+        // The walk: every node, a scalar's `.[]?` ending its branch.
+        (
+            MIXED,
+            "[.. | path]",
+            "[[],[0],[1],[2],[3],[4],[4,0],[5],[5,\"k\"]]\n",
+            "",
+            0,
+        ),
+        (r#""abc""#, "[.. | path]", "[[]]\n", "", 0),
+    ])?;
+
+    // What `?` never swallows escapes through every boundary: an undecodable
+    // string, a scalar the cursor cannot read, a container that cannot be
+    // listed.
+    for (doc, fragment) in [
+        (r#"["\ud800"]"#, "invalid unicode escape sequence"),
+        (
+            r#"{"a":"\ud800","b":[1]}"#,
+            "invalid unicode escape sequence",
+        ),
+        ("[1.2.3,[4]]", "invalid numeric literal"),
+        ("[tru]", "invalid boolean"),
+        ("[1,2,]", "Invalid JSON text"),
+    ] {
+        for filter in [
+            "[.[] | .[]?]",
+            "[.[] | try .[] catch empty]",
+            "[.. | path]",
+            "[.. | key]",
+        ] {
+            assert_path_rows_3289(&[(doc, filter, "", fragment, 5)])?;
+        }
+    }
+
+    assert_path_rows_3289(&[
+        // The leaf is read when the walk steps it, not when it is delivered:
+        // `limit` stops on the leaf it has just received.
+        ("[1.2.3,[4]]", "[limit(2; .. | path)]", "[[],[0]]\n", "", 0),
+        (
+            r#"["\ud800"]"#,
+            "[limit(2; .. | path)]",
+            "[[],[0]]\n",
+            "",
+            0,
+        ),
+        (
+            "[[4],1.2.3]",
+            "[limit(4; .. | path)]",
+            "[[],[0],[0,0],[1]]\n",
+            "",
+            0,
+        ),
+        // One node more and the walk reads it.
+        (
+            "[1.2.3,[4]]",
+            "[limit(3; .. | path)]",
+            "",
+            "invalid numeric literal",
+            5,
+        ),
+        (
+            "[[4],1.2.3]",
+            "[limit(5; .. | path)]",
+            "",
+            "invalid numeric literal",
+            5,
+        ),
+        // A container is listed only once it has been delivered.
+        ("[1,2,]", "[limit(1; .. | path)]", "[[]]\n", "", 0),
+        (
+            "[1,2,]",
+            "[limit(2; .. | path)]",
+            "",
+            "Invalid JSON text",
+            5,
+        ),
+        (
+            r#"{"a":[1,]}"#,
+            "[limit(2; .. | path)]",
+            "[[],[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1,]}"#,
+            "[limit(3; .. | path)]",
+            "",
+            "Invalid JSON text",
+            5,
+        ),
+    ])
+}
