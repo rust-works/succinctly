@@ -1,0 +1,153 @@
+name: Scheduled
+
+# Work that used to run on every `pull_request` and every `main` push in
+# ci.yml, moved here by #3649 because it gates nothing and was the main source
+# of macOS-runner saturation (the Team plan caps concurrent macOS jobs at 5):
+#
+#   * `upstream` -- the beta/nightly toolchain legs (#203). Upcoming-compiler
+#     breakage does not depend on the PR that happens to meet it first, so a
+#     daily run on `main` catches it just as well as ~125 runs a day did.
+#   * `bench` -- `cargo bench --bench rank_select`. It uploads artifacts nobody
+#     compares against a baseline; the deterministic regression signal is
+#     ci.yml's `perf-guard` job.
+#
+# Neither is a required status check (the ruleset requires only Test x86_64 /
+# ARM64 / macOS ARM64, Clippy, Format, Do Not Merge, Documentation and Skill
+# manifest casing), so moving them off the PR path cannot hang a merge.
+#
+# `schedule` runs only on the default branch. `workflow_dispatch` runs either
+# job on demand, e.g. to bisect a bench movement or to check a PR against the
+# upcoming compilers before merging.
+on:
+  schedule:
+    - cron: '17 4 * * *'      # daily, 04:17 UTC -- off the hour, outside peak merge hours
+  workflow_dispatch:
+
+# A manual run must not cancel the scheduled one (or the reverse); two runs of
+# the same ref queue behind each other instead.
+concurrency:
+  group: scheduled-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# No `actions/cache` anywhere in this file, on purpose (#3649): each leg would
+# save a ~0.5 GB `target/` cache per `Cargo.lock` hash, against a repository
+# cap of 10 GB that ci.yml's PR-scoped caches already overrun, and a daily job
+# gains almost nothing from a warm cache (the CLI build is ~30 s).
+jobs:
+  # Upstream-toolchain leg (#203). Runs the x86_64 test suite on beta and nightly
+  # to catch upcoming-compiler breakage (lint changes, soundness fixes, stdlib
+  # deprecations) before it reaches a release. x86_64 only. `nightly` is
+  # advisory (`continue-on-error`) because it is the flakiest; `beta` failing
+  # fails the run.
+  # #3059: the 6 feature-flag `cargo test` invocations per toolchain leg are
+  # mutually independent, so they are matrix legs rather than chained steps.
+  upstream:
+    name: Test (x86_64) (${{ matrix.rust }}, ${{ matrix.variant.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false                                   # beta breakage must not cancel nightly
+      matrix:
+        rust: [beta, nightly]
+        variant:
+          - name: cli-gated
+            buildCli: true
+            testCmd: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
+          - name: bench-runner-gated
+            buildCli: true
+            testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
+          - name: default
+            buildCli: false
+            testCmd: cargo test --verbose
+          - name: simd
+            buildCli: false
+            testCmd: cargo test --verbose --features simd
+          - name: portable-popcount
+            buildCli: false
+            testCmd: cargo test --verbose --features portable-popcount
+          # Same no_std cargo-test rationale as ci.yml's test-x86 (#2114).
+          - name: no-std
+            buildCli: false
+            testCmd: cargo test --no-default-features --verbose
+    continue-on-error: ${{ matrix.rust == 'nightly' }}   # beta fails the run; nightly is advisory
+    env:
+      # Same x86 SIMD runner contract as ci.yml's test-x86 (#193).
+      SUCCINCTLY_EXPECT_SIMD: sse2,sse4.2,avx2,bmi2,popcnt
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Build CLI (for integration tests)
+        if: matrix.variant.buildCli
+        run: cargo build --features cli --bin succinctly
+
+      - name: Run tests
+        run: ${{ matrix.variant.testCmd }}
+
+  # #3059: the 3 `cargo bench` invocations per arch used to run back-to-back
+  # in one job; matrixed over both arch and feature variant so they run in
+  # parallel instead.
+  bench:
+    name: Bench (${{ matrix.platform.name }}, ${{ matrix.variant.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: x86_64
+            runner: ubuntu-latest
+            arch: x86_64
+          - name: ARM64-Linux
+            runner: ubuntu-24.04-arm
+            arch: arm64
+          - name: ARM64-macOS
+            runner: macos-latest
+            arch: arm64-macos
+        variant:
+          - name: default
+            args: ''
+          - name: simd
+            args: '--features simd'
+          - name: portable
+            args: '--features portable-popcount'
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Print CPU info
+        run: |
+          echo "=== CPU Info ==="
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            lscpu | grep -E "Model name|Architecture|CPU\(s\)|Flags" || true
+            # Check for specific features
+            echo "=== Feature Detection ==="
+            if grep -q avx2 /proc/cpuinfo 2>/dev/null; then echo "AVX2: supported"; else echo "AVX2: not detected"; fi
+            if grep -q popcnt /proc/cpuinfo 2>/dev/null; then echo "POPCNT: supported"; else echo "POPCNT: not detected"; fi
+            if grep -q sve2 /proc/cpuinfo 2>/dev/null; then echo "SVE2: supported"; else echo "SVE2: not detected"; fi
+            if grep -q svebitperm /proc/cpuinfo 2>/dev/null; then echo "SVE2-BITPERM: supported"; else echo "SVE2-BITPERM: not detected"; fi
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            sysctl -n machdep.cpu.brand_string || true
+            system_profiler SPHardwareDataType | grep -E "Chip|Cores" || true
+            echo "Note: Apple Silicon does not support SVE/SVE2"
+          fi
+
+      - name: Run benchmarks
+        run: cargo bench --bench rank_select ${{ matrix.variant.args }} -- --noplot | tee bench-${{ matrix.variant.name }}.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results-${{ matrix.platform.arch }}-${{ matrix.variant.name }}
+          path: bench-${{ matrix.variant.name }}.txt

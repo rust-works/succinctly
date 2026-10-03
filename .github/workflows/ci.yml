@@ -1,6 +1,12 @@
 name: CI
 
 on:
+  # `push` to `main` is the merge queue's own commit (merge method MERGE, so the
+  # push SHA *is* the merge-group SHA) and was re-running every check the queue
+  # had just passed. Since #3649 it runs only what later runs consume --
+  # `coverage` (the baseline artifact PRs diff against) and `perf-guard`
+  # (push-relative comparison, #2117) -- unless the SHA has no successful
+  # `merge_group` run, in which case it runs everything (see `gate` below).
   push:
     branches: [main]
   pull_request:
@@ -42,11 +48,24 @@ jobs:
   # `include_str!`-compiled here, but the doc set still scopes `*.md` to the repo
   # root only — never `**/*.md` — so anything not explicitly a doc runs full CI
   # (fail-safe).
+  #
+  # `retest` (#3649) is `false` only for a `push` whose SHA already has a
+  # successful `merge_group` run of this workflow: the merge queue tested that
+  # exact commit, so repeating the test matrices, Clippy, Format, docs and
+  # drift checks adds nothing (they are enforced on PRs and merge groups, never
+  # on pushes, so skipping them leaves the ruleset untouched). Jobs that skip
+  # on it test `!= 'false'`, so an unset output (the lookup failing) runs
+  # them: it fails towards testing. A push that bypassed the queue (an admin push) has no such run and gets the full suite.
   gate:
     name: Gate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read           # dorny/paths-filter lists the PR's files
+      actions: read                 # `retest` looks up the SHA's merge_group run
     outputs:
       code: ${{ steps.decide.outputs.code }}
+      retest: ${{ steps.dedupe.outputs.retest }}
     steps:
       - uses: actions/checkout@v7
 
@@ -69,10 +88,29 @@ jobs:
             echo "code=${{ steps.filter.outputs.code }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - id: dedupe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          retest=true
+          if [ "$EVENT" = "push" ]; then
+            # `status=success` filters on the run's conclusion. A failed lookup
+            # leaves `passed` empty, which keeps retest=true.
+            passed=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?event=merge_group&head_sha=$SHA&status=success&per_page=1" --jq '.total_count' || true)
+            if [ "${passed:-0}" -gt 0 ] 2>/dev/null; then
+              retest=false
+              echo "::notice::$SHA already passed this workflow as a merge_group run; skipping the duplicate test matrices, lints and drift checks (#3649)"
+            fi
+          fi
+          echo "retest=$retest" >> "$GITHUB_OUTPUT"
+
   # Required-context jobs (Test x86/ARM/macOS, Clippy, Format, Documentation)
   # always run so their contexts always report `success`; on the fast path every
   # step is skipped, which is a genuine passing job — not a `skipped` conclusion
-  # whose branch-protection semantics vary. Non-required jobs (bench, coverage,
+  # whose branch-protection semantics vary. Non-required jobs (coverage,
   # perf-guard) below skip wholesale via a job-level `if`.
   # #3059: the feature-flag `cargo test` invocations below are mutually
   # independent (no step consumes a prior step's output) and were previously
@@ -89,13 +127,13 @@ jobs:
   # contention.
   test-x86:
     name: Test (x86_64)
-    needs: test-x86-matrix
+    needs: [gate, test-x86-matrix]
     # `if: always()` + an explicit result check, not the bare `needs:` this replaced:
     # GitHub skips (not fails) a job whose `needs:` target failed, and a `skipped`
     # conclusion's branch-protection semantics vary -- so a broken leg wasn't
     # reliably blocking merge (#3084). `needs.test-x86-matrix.result` is `success`
     # only when every matrix leg succeeded.
-    if: always()
+    if: always() && needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - run: |
@@ -105,6 +143,8 @@ jobs:
   test-x86-matrix:
     name: Test (x86_64) (${{ matrix.name }})
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -253,10 +293,10 @@ jobs:
   # follow-up.
   test-arm:
     name: Test (ARM64)
-    needs: test-arm-matrix
+    needs: [gate, test-arm-matrix]
     # See test-x86 above for why this is `if: always()` + a result check rather
     # than a bare `needs:` (#3084).
-    if: always()
+    if: always() && needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - run: |
@@ -266,6 +306,8 @@ jobs:
   test-arm-matrix:
     name: Test (ARM64) (${{ matrix.name }})
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
@@ -420,10 +462,10 @@ jobs:
   # test-arm-matrix's clippy-all-variants leg below.
   test-macos-arm:
     name: Test (macOS ARM64)
-    needs: test-macos-arm-matrix
+    needs: [gate, test-macos-arm-matrix]
     # See test-x86 above for why this is `if: always()` + a result check rather
     # than a bare `needs:` (#3084).
-    if: always()
+    if: always() && needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - run: |
@@ -433,6 +475,8 @@ jobs:
   test-macos-arm-matrix:
     name: Test (macOS ARM64) (${{ matrix.name }})
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -499,162 +543,20 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: ${{ matrix.testCmd }}
 
-  # Upstream-toolchain leg (#203). Runs the x86_64 test suite on beta and nightly
-  # to catch upcoming-compiler breakage (lint changes, soundness fixes, stdlib
-  # deprecations) before it reaches a release. x86_64 only — the 3-arch fan-out
-  # above stays on `stable` so we don't triple CI minutes. `beta` gates CI;
-  # `nightly` is advisory (`continue-on-error`) because it is the flakiest. Not a
-  # required status context, so it skips wholesale on the docs-only fast path
-  # (job-level `if`, like bench/coverage/perf-guard) rather than run-and-skip-steps. Also
-  # skipped on `merge_group` (#310): it is advisory, not required, so running it
-  # per queue entry would just add latency to every merge without gating it.
-  # #3059: same rationale as test-x86-matrix above, applied to the second
-  # matrix dimension — the 6 feature-flag `cargo test` invocations per
-  # toolchain leg are mutually independent and were previously chained
-  # sequentially. Unlike test-x86/test-arm, this job isn't a required status
-  # check, so no thin aggregator is needed: the per-combination context names
-  # are free to vary.
-  test-x86-upstream:
-    name: Test (x86_64) (${{ matrix.rust }}, ${{ matrix.variant.name }})
-    needs: gate
-    if: needs.gate.outputs.code == 'true' && github.event_name != 'merge_group'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false                                   # beta breakage must not cancel nightly
-      matrix:
-        rust: [beta, nightly]
-        variant:
-          - name: cli-gated
-            buildCli: true
-            testCmd: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
-          - name: bench-runner-gated
-            buildCli: true
-            testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
-          - name: default
-            buildCli: false
-            testCmd: cargo test --verbose
-          - name: simd
-            buildCli: false
-            testCmd: cargo test --verbose --features simd
-          - name: portable-popcount
-            buildCli: false
-            testCmd: cargo test --verbose --features portable-popcount
-          # Same no_std cargo-test rationale as test-x86 (#2114).
-          - name: no-std
-            buildCli: false
-            testCmd: cargo test --no-default-features --verbose
-    continue-on-error: ${{ matrix.rust == 'nightly' }}   # beta gates CI; nightly is advisory
-    env:
-      # Same x86 SIMD runner contract as test-x86 (#193).
-      SUCCINCTLY_EXPECT_SIMD: sse2,sse4.2,avx2,bmi2,popcnt
-    steps:
-      - uses: actions/checkout@v7
+  # The beta/nightly upstream-toolchain legs (#203) and `bench` no longer run
+  # here (#3649): neither gates anything, and between them they were ~45% of the
+  # runner-minutes and ~40% of the macOS-minutes of every PR and `main` run. Both
+  # now run daily from scheduled.yml (and on demand via `workflow_dispatch`).
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-
-      - name: Cache cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ matrix.variant.name }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build CLI (for integration tests)
-        if: matrix.variant.buildCli
-        run: cargo build --features cli --bin succinctly
-
-      - name: Run tests
-        run: ${{ matrix.variant.testCmd }}
-
-  # Skipped on `merge_group` (#310): a 3-arch `cargo bench` fan-out is far too
-  # slow to run per queue entry, and it gates nothing.
-  #
-  # #3059: the 3 `cargo bench` invocations per arch used to run back-to-back
-  # in one job; matrixed over both arch and feature variant here so they run
-  # in parallel instead.
-  bench:
-    name: Bench (${{ matrix.platform.name }}, ${{ matrix.variant.name }})
-    needs: gate
-    if: needs.gate.outputs.code == 'true' && github.event_name != 'merge_group'
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - name: x86_64
-            runner: ubuntu-latest
-            arch: x86_64
-          - name: ARM64-Linux
-            runner: ubuntu-24.04-arm
-            arch: arm64
-          - name: ARM64-macOS
-            runner: macos-latest
-            arch: arm64-macos
-        variant:
-          - name: default
-            args: ''
-          - name: simd
-            args: '--features simd'
-          - name: portable
-            args: '--features portable-popcount'
-    runs-on: ${{ matrix.platform.runner }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-${{ matrix.platform.arch }}-bench-${{ matrix.variant.name }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Print CPU info
-        run: |
-          echo "=== CPU Info ==="
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            lscpu | grep -E "Model name|Architecture|CPU\(s\)|Flags" || true
-            # Check for specific features
-            echo "=== Feature Detection ==="
-            if grep -q avx2 /proc/cpuinfo 2>/dev/null; then echo "AVX2: supported"; else echo "AVX2: not detected"; fi
-            if grep -q popcnt /proc/cpuinfo 2>/dev/null; then echo "POPCNT: supported"; else echo "POPCNT: not detected"; fi
-            if grep -q sve2 /proc/cpuinfo 2>/dev/null; then echo "SVE2: supported"; else echo "SVE2: not detected"; fi
-            if grep -q svebitperm /proc/cpuinfo 2>/dev/null; then echo "SVE2-BITPERM: supported"; else echo "SVE2-BITPERM: not detected"; fi
-          elif [[ "$RUNNER_OS" == "macOS" ]]; then
-            sysctl -n machdep.cpu.brand_string || true
-            system_profiler SPHardwareDataType | grep -E "Chip|Cores" || true
-            echo "Note: Apple Silicon does not support SVE/SVE2"
-          fi
-
-      - name: Run benchmarks
-        run: cargo bench --bench rank_select ${{ matrix.variant.args }} -- --noplot | tee bench-${{ matrix.variant.name }}.txt
-
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v7
-        with:
-          name: benchmark-results-${{ matrix.platform.arch }}-${{ matrix.variant.name }}
-          path: bench-${{ matrix.variant.name }}.txt
-
-  # Instruction-count regression guard (#1523): `bench` above times
+  # Instruction-count regression guard (#1523): `bench` (scheduled.yml) times
   # `rank_select` and uploads artifacts nobody compares against a baseline --
   # #1385's 2-3x jq slowdown shipped through it unnoticed. Wall-clock timing
   # on a shared runner is the wrong mechanism (too noisy for a threshold
   # tight enough to matter); `valgrind --tool=cachegrind` counts instructions
   # instead, which is deterministic regardless of runner noise. Not run on
   # macOS: valgrind has no Apple Silicon support at all. Not run in the merge
-  # queue for the same reason `bench` isn't (see its own `if`, above).
+  # queue for the same reason `bench` isn't (a 3-arch `cargo bench` fan-out is far
+  # too slow to run per queue entry).
   #
   # On `pull_request` runs this also builds a binary from the PR's own
   # `git merge-base` and checks against *that* instead of the committed
@@ -784,6 +686,8 @@ jobs:
   clippy:
     name: Clippy
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -825,6 +729,8 @@ jobs:
   fmt:
     name: Format
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -842,6 +748,9 @@ jobs:
 
   skill-casing:
     name: Skill manifest casing
+    needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -858,6 +767,8 @@ jobs:
   docs:
     name: Documentation
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -978,6 +889,8 @@ jobs:
   yq-drift:
     name: yq golden drift check
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -1004,6 +917,8 @@ jobs:
   jq-drift:
     name: jq golden drift check
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -1041,6 +956,8 @@ jobs:
   corpus-shape-drift:
     name: corpus shape drift check
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -1068,6 +985,8 @@ jobs:
   json-suite-drift:
     name: JSONTestSuite corpus drift check
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -1092,6 +1011,8 @@ jobs:
   corpus-shape-full-drift:
     name: corpus shape drift check (full corpus)
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -1122,6 +1043,8 @@ jobs:
   fuzz-build:
     name: fuzz harness compile check
     needs: gate
+    # #3649: skipped on a `main` push the merge queue already tested (see `gate`).
+    if: needs.gate.outputs.retest != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
