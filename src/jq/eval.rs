@@ -38711,6 +38711,13 @@ fn builtin_navigation<S: EvalSemantics>(
         | Builtin::All
         | Builtin::AllF(_)
         | Builtin::Flatten
+        // #3711: `flatten(n)` is `if $x < 0 then error(...) else _flatten($x)
+        // end`, the same `reduce .[]` as `flatten`; `join(s)` is `reduce .[] as
+        // $i (null; ...)`. Both iterate a computed array the register is not
+        // on and so raise `near attempt to iterate through` in jq
+        // (`path([[1]] | flatten(1))`, `path(["a"] | join(","))`).
+        | Builtin::FlattenDepth(_)
+        | Builtin::Join(_)
         | Builtin::Map(_)
         | Builtin::FromEntries => Ok(Some(BuiltinNavigation::Iterate)),
         // The one entry whose answer depends on the *input*, because its
@@ -39588,12 +39595,39 @@ fn leaf_register<'a, S: EvalSemantics>(
 /// entry, so what it navigates passes. `map` qualifies only for an `f` that
 /// navigates nothing: jq path-checks `f` against every element and a by-value
 /// `map` does not (`map({a:1} | .a)` is a path error in jq and `[1]` here).
+///
+/// #3711 adds the next group, captured the same way. `min` and `max` are
+/// C-coded like `sort`. `min_by(f)`, `max_by(f)`, `group_by(f)` and `sort_by(f)`
+/// are `_IMPL(map([f]))`: the argument of a C function is a subexp, so the
+/// `map([f])` that iterates the input and runs `f` on every element neither
+/// moves the register nor path-checks anything, **whatever `f` navigates**
+/// (`path(. as $x | sort_by(.a) | $x)` is `[]` on `[{"a":1}]`), and on an input
+/// the register is not on they raise nothing at all (`path(. as $x | [[1]] |
+/// group_by(.) | $x)` is `[]`), so unlike `map(f)` they need neither a
+/// restriction on `f` nor a [`builtin_navigation`] entry. `reverse` is
+/// `[.[length - 1 - range(0; length)]]`, a collect that backtracks; it is
+/// already in [`builtin_navigation`] for the access it makes. `flatten(n)` and
+/// `join(s)` are `reduce .[] as $i (...)` like `add`, with the depth or
+/// separator a `$param` binding (a subexp), so their one navigation is the
+/// `.[]` that [`builtin_navigation`] now names for them.
 fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
     cannot_move_register(expr)
         || (S::TAG == EvalTag::Jq
             && match unwrap_paren(expr) {
                 Expr::Builtin(
-                    Builtin::Add | Builtin::Flatten | Builtin::Sort | Builtin::ToEntries,
+                    Builtin::Add
+                    | Builtin::Flatten
+                    | Builtin::FlattenDepth(_)
+                    | Builtin::GroupBy(_)
+                    | Builtin::Join(_)
+                    | Builtin::Max
+                    | Builtin::MaxBy(_)
+                    | Builtin::Min
+                    | Builtin::MinBy(_)
+                    | Builtin::Reverse
+                    | Builtin::Sort
+                    | Builtin::SortBy(_)
+                    | Builtin::ToEntries,
                 ) => true,
                 Expr::Builtin(Builtin::Map(f) | Builtin::Walk(f)) => cannot_move_register(f),
                 _ => false,
