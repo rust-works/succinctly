@@ -200,6 +200,19 @@ OPERANDS = [
     "min",
     "flatten(1)",
     "group_by(.)",
+    # (#3711) promoted: `min`/`max`/`min_by`/`max_by`/`group_by`/`sort_by` are C
+    # calls over a `map([f])` argument (a subexp, so any `f` is fine), `flatten(n)`
+    # and `join(s)` are `reduce .[]` like `add`. `unique_by` is the contrast jq
+    # raises on (it iterates a computed array), which must stay refused.
+    "max",
+    "min_by(.)",
+    "max_by(.)",
+    "group_by(.a)",
+    "sort_by(.)",
+    "sort_by(.a)",
+    "flatten(0)",
+    "join(\",\")",
+    "unique_by(.)",
 ]
 
 # The other side of a two-operand shape. Chosen so that, against the inputs
