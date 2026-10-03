@@ -2,9 +2,15 @@
 """Interleaved A/B timing for two `succinctly` binaries.
 
 Implements the method in docs/guides/benchmarking.md § A/B Benchmarking Method:
-the two binaries alternate *within* each repetition (rule 1), output identity is
-gated before any timing is believed (rule 4), inputs below 1 MB are called out
-(rule 2), and the machine is checked for idleness and mains power (rule 6).
+the two binaries alternate *within* each repetition (rule 1), output identity and
+exit status are gated before any timing is believed (rule 4), inputs below 1 MB
+are called out (rule 2), and the machine is checked for idleness and mains power
+(rule 6).
+
+A command that exits non-zero is refused, not timed: when both binaries fail the
+same way their output is identical, and the table would otherwise print a delta for
+a parse error (#2626, #3479). `--allow-nonzero` is for a run whose point is an
+error path.
 
     scripts/ab-cli.py --before /path/succ-base --after /path/succ-head \\
         --corpus ~/wrk/bench-scratch/mycorpus
@@ -68,7 +74,12 @@ def parse_args(argv=None):
     p.add_argument("--control", action="store_true",
                    help="time --before against a copy of itself (noise floor)")
     p.add_argument("--no-identity", action="store_true",
-                   help="skip the output identity gate (rule 4) — for control runs")
+                   help="skip the output identity gate (rule 4) — for control runs; the "
+                        "exit status gate still runs")
+    p.add_argument("--allow-nonzero", action="store_true",
+                   help="time commands that exit non-zero (an error path is the point of "
+                        "the run); without it such a command is refused, because both "
+                        "binaries failing the same way passes the identity gate (#3687)")
     p.add_argument("--force", action="store_true",
                    help="run even if the machine looks CPU-busy or has build/benchmark "
                         "processes running (does NOT waive the battery check)")
@@ -193,36 +204,96 @@ def command(binary, args, query, path):
     return [binary, args.tool, *extra, query, path]
 
 
+HEAD_BYTES = 512  # enough for the first line of any error message this tool prints
+
+
 def digest(binary, args, query, path):
-    """Hash stdout+stderr in a pipe; capturing 10 MB into memory costs more than the run."""
+    """Hash stdout+stderr in a pipe; capturing 10 MB into memory costs more than the run.
+
+    Returns `(exit status, hex digest, first line of output)`. The first line is kept only
+    to name a failure, and comes from the merged stream: for a command that fails before it
+    prints anything (a parse error) it is the stderr message."""
     h = hashlib.blake2b(digest_size=16)
+    head = b""
     proc = subprocess.Popen(command(binary, args, query, path),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     for chunk in iter(lambda: proc.stdout.read(1 << 16), b""):
         h.update(chunk)
+        if len(head) < HEAD_BYTES:
+            head += chunk[:HEAD_BYTES - len(head)]
     proc.stdout.close()
-    proc.wait()
-    return h.hexdigest()
+    status = proc.wait()
+    lines = head.decode("utf-8", "replace").splitlines()
+    return status, h.hexdigest(), next((ln for ln in lines if ln.strip()), "")
 
 
-def gate_identity(args, inputs):
-    """Rule 4: a faster binary that changed behaviour is not a win."""
-    checked = differences = 0
+def gate_commands(args, inputs):
+    """Rule 4: a faster binary that changed behaviour is not a win, and a command that
+    fails is not a benchmark.
+
+    Runs every configuration once per binary and checks two things. Output identity
+    (skipped under `--no-identity`): the merged stdout+stderr must hash the same. And exit
+    status (skipped for a command under `--allow-nonzero`): the two binaries must agree, and
+    neither may be non-zero. The second is not implied by the first: two binaries that
+    fail the same way hash the same, and the table would print a delta for the time each
+    took to say so (#2626 timed a 3.5 ms parse error, #3479 a 2.8 ms one).
+
+    Under `--control` the "after" side is a copy of "before", so only "before" runs.
+
+    Returns None when every row may be timed, else the reason none may."""
+    identity = not args.no_identity
+    sides = [("before", args.before)]
+    if not args.control:
+        sides.append(("after", args.after))
+    checked = differences = failures = clean = 0
     for path in inputs:
         for query in args.queries:
             checked += 1
-            if digest(args.before, args, query, path) != digest(args.after, args, query, path):
+            results = {name: digest(binary, args, query, path) for name, binary in sides}
+            statuses = {name: r[0] for name, r in results.items()}
+            if len(set(statuses.values())) > 1:
+                differences += 1
+                shown = ", ".join(f"{name} {st}" for name, st in statuses.items())
+                print(f"  DIFF  {path}  query={query!r}  exit status differs: {shown}")
+                continue
+            if identity and len({r[1] for r in results.values()}) > 1:
                 differences += 1
                 print(f"  DIFF  {path}  query={query!r}")
-    print(f"  identity: {checked} configurations, {differences} differences")
-    return differences == 0
+                continue
+            status = next(iter(statuses.values()))
+            if status == 0:
+                clean += 1
+                continue
+            first = next(iter(results.values()))[2]
+            if args.allow_nonzero:
+                print(f"  NONZERO (allowed)  {path}  query={query!r}  exit {status}: {first}")
+            else:
+                failures += 1
+                print(f"  FAIL  {path}  query={query!r}  every binary exited {status}: {first}")
+    if identity:
+        print(f"  identity: {checked} configurations, {differences} differences")
+    print(f"  exit status: {clean} of {checked} configurations exited 0"
+          + (" (non-zero allowed)" if args.allow_nonzero else ""))
+    if differences:
+        return "outputs or exit statuses differ — fix that before believing any timing (rule 4)"
+    if failures:
+        return (f"{failures} configuration(s) exited non-zero, so the timing would be of an "
+                f"error path (rule 4); fix the query or the input, or pass --allow-nonzero "
+                f"if the error path is the point")
+    return None
 
 
 def time_once(binary, args, query, path):
     t0 = time.perf_counter()
-    subprocess.run(command(binary, args, query, path),
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    return (time.perf_counter() - t0) * 1000.0
+    done = subprocess.run(command(binary, args, query, path),
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    elapsed = (time.perf_counter() - t0) * 1000.0
+    if done.returncode != 0 and not args.allow_nonzero:
+        # The gate ran this command once and it passed; a later failure (an OOM kill, a
+        # flaky input) would otherwise enter min-of-N as a fast sample.
+        sys.exit(f"{binary} exited {done.returncode} while being timed on {path} "
+                 f"query={query!r}; the sample is not a measurement")
+    return elapsed
 
 
 def measure(args, query, path):
@@ -285,11 +356,12 @@ def main(argv=None):
     print(f"tool={args.tool} -o {args.output} extra-args={tool_extra_args(args)}")
     print()
 
-    if not args.no_identity:
-        print("output identity gate:")
-        if not gate_identity(args, inputs):
-            sys.exit("outputs differ — fix that before believing any timing (rule 4)")
-        print()
+    print("output identity gate:" if not args.no_identity
+          else "exit status gate (identity skipped):")
+    refusal = gate_commands(args, inputs)
+    if refusal:
+        sys.exit(refusal)
+    print()
 
     header = (f"{'workload':<44} {'before min':>11} {'after min':>11} {'min d':>7} "
               f"{'before med':>11} {'after med':>11} {'med d':>7}")
