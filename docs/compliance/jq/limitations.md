@@ -8682,8 +8682,9 @@ plain `eval` it measured slower (7950X, interleaved, 9 reps, the `users` documen
 10 MB of `-R` lines: `select(test("age"))` +30%, `tojson` +41%, `sub` +32%, `fromjson | .id`
 +129%), because the generic evaluator answers a builtin it has no native arm for by decoding the
 value, writing it out again and indexing it again on every call, and `-R` makes one call per
-line. Three changes close that; the first and third are scoped to the DOM route (no cursor on the
-`succinctly jq` route is ever registered), and the second is a plain speedup everywhere:
+line. Three changes narrow that (#3535) and a fourth (#3642) closes a hole the first left; the
+first, third and fourth are scoped to the DOM route (no cursor on the `succinctly jq` route is
+ever registered), and the second is a plain speedup everywhere:
 
 - The route calls the hidden `jq::eval_reindexed_document`, which is `eval` plus a registration
   of the document it was handed. A bridge whose value is that document's root evaluates over its
@@ -8694,11 +8695,54 @@ line. Three changes close that; the first and third are scoped to the DOM route 
   Every reindex bridge in both modes pays this, so it also speeds the `succinctly jq` bridge.
 - While a document is registered, the stage after a bridge (`fromjson | .id`) answers the shapes
   `eval_owned_fast_path` already answers against an owned tree without writing it out again.
+- `eval_single`'s catch-all arm, which a partial slice (`.[0:3]`, `.[2:]`, `.[:2]`) reaches because
+  it has no native arm, asks the same question the bridges above it do and evaluates over the
+  registered root's existing cursor (#3642). #3535 shipped without it: that arm bridged without
+  asking, and `.[0:3]` paid a second serialize-and-index on every line.
 
-Result against the pre-#3479 route (7950X, same method; the control's own range on that run was
--4.6%..+7.0%): every `-R` row within +6.0% (`. + "x"` +4.5% median), and the rows the generic
-evaluator answers natively faster, `[match("a";"g")] | length` -41%, `split(",")` -45%,
-`fromjson | to_entries | length` -67%, because the old route had no native arm for them.
+Result against the pre-#3479 route. #3535 first recorded "every `-R` row within +6%", which does
+not hold: it was measured against `c850a0683`, 15 commits before the PR's real merge-base
+(`98e7631a4`), over a row list without a partial slice. Re-measured from the real merge-base
+(interleaved `scripts/ab-cli.py`, 9 reps, the `users` document as 1 MB and 10 MB of `-R` lines,
+output identity and exit status gated, two controls and the base rebuilt with 0-112 bytes of inert
+padding as the layout holdout), the rows that still pay a per-line cost (a bridge, or only the
+registration) are slower than the old route's, and the ones the generic evaluator answers natively
+are faster (#3535 as merged, before #3642):
+
+| Row (10 MB of `-R` lines, median wall-clock) | M4 Pro | 7950X |
+|----------------------------------------------|--------|-------|
+| `.[0:3]` (a partial slice, fixed by #3642)   | +80%   | +74%  |
+| `startswith("{")` (`--jq-extensions`)        | +19%   | +13%  |
+| `ltrimstr("{")` (`--jq-extensions`)          | +13%   | +16%  |
+| `. + "x"`                                    | +12%   | +9%   |
+| `@base64 \| length`                          | +9%    | +4%   |
+| `sub("User";"U")`                            | +8%    | +6%   |
+| `test("age")`                                | +7%    | +1%   |
+| `tojson \| length`                           | +7%    | +4%   |
+| `length`                                     | +6%    | 0%    |
+| `.`                                          | +6%    | +1%   |
+| `[match("a";"g")] \| length`                 | -47%   | -41%  |
+| `split(",") \| length`                       | -50%   | -44%  |
+| `fromjson \| to_entries \| length`           | -66%   | -66%  |
+
+The controls read -5%..+3% on the M4 Pro and -4%..+3% on the 7950X. The holdout band is wider on
+x86 than on ARM (one 1 MB row moved +32% at one pad size), which is why instruction counts decide
+it: under cachegrind (7950X, 20 000 lines) the padded builds execute the base's instructions to
+within 0.002%, and the moved rows differ by logic, `. + "x"` +7.2%, `test("age")` +4.9%,
+`sub` +4.5%, `tojson` +3.6%, `fromjson | .id` +3.5%, `length` +1.9% and `.` 0.0%. After #3642 a
+partial slice costs +1.8% (`.[2:]`) to +3.6% (`.[0:3]`) instructions against the pre-#3535 base
+(a base 221 commits older, so the figure is indicative) where #3535 as merged cost +61.6% to
++83.7%.
+
+Rows that do not use `-R` moved the other way: writes (`.users[0].name = "x"`, `.users[].age += 1`,
+`del(.users[0])`, a `select` update) are 8% to 29% faster and `--slurp` 28% to 40%; `-P`, `--arg`
+and `-ea` are unchanged.
+
+What stays open is that per-line cost, which a native generic arm for the builtin removes. The gate
+#3479 set, no `-R` row outside the old route's noise floor, is not met: `. + "x"`, the string
+builtins and `@base64`/`tojson`/`sub` stay above it on at least one chip. This section records the
+residual rather than closing it; the issue keeps the decision between a native arm per hot builtin
+and a stated ceiling.
 
 Cursor metadata on that route is **not** read from the document it evaluates: the text is
 throwaway serialization, so `line`, `column`, `document_index`, `anchor`, `style`, the comment

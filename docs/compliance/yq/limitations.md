@@ -2950,10 +2950,12 @@ from no position at all).
 cursor, not from a path, and no cursor reaches the filter. `.a | .b |= line` is `2` in real
 yq and `0` in succinctly — a separate, pre-existing gap, not one #2522 touches.
 
-The same gap shows on everything downstream of a write, and on `-R`, `--slurp` and `--arg`:
-those evaluate a value succinctly has re-indexed into throwaway text, whose positions are
-not the user's file's, so the cursor-metadata builtins answer their fixed defaults there
-(#3479). Against yq v4.53.3 on `a: 1` / `c: 2`:
+The same gap shows on everything downstream of a write, and on `-R` and `--slurp`: those
+evaluate a value succinctly has re-indexed into throwaway text, whose positions are not the
+user's file's, so the cursor-metadata builtins answer their fixed defaults there (#3479).
+`--arg` alone does not: a filter that only reads stays on the cursor route (`--arg v x '.c |
+line'` is `2`), and it joins the gap only through a write (`--arg v x '.c = $v | .c | line'`
+is `0`). Against yq v4.53.3 on `a: 1` / `c: 2`:
 
 | query                        | yq | succinctly yq    |
 |------------------------------|----|------------------|
@@ -2966,7 +2968,10 @@ not the user's file's, so the cursor-metadata builtins answer their fixed defaul
 
 `0` is deliberate rather than the position in the re-indexed text (`1` for all of them), which
 would look right and be wrong; `test_dom_route_cursor_metadata_is_positionless_3479` pins it.
-Carrying the original node's position through a write is a separate, larger change.
+Carrying the original node's position through a write is a separate, larger change, filed as
+[#3641](https://github.com/rust-works/succinctly/issues/3641). The loss is not only
+position: after `.c = 3`, yq still answers `.c | anchor` and `.c | line_comment` from the
+overwritten node (`x` and `t` on `c: &x 2 # t`), and succinctly answers an empty string.
 
 ### An `and`/`or` operand's evaluation context -- resolved as precedence ([#2506](https://github.com/rust-works/succinctly/issues/2506)); a literal against an empty context remains a residual gap
 
