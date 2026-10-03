@@ -9937,11 +9937,13 @@ impl<'a> RestPipe<'a> {
     /// the lone stage they decline `Pipe([stage])` with it, so the fallback
     /// enters past them rather than asking twice; both halves of that are
     /// pinned against the pipe-wrapped form by
-    /// `test_single_stage_front_doors_agree_with_the_wrapped_pipe_3673`. A
-    /// rest of two or more stages is not offered bare: the later doors
-    /// ([`embed_peel_step`], [`owned_path_door`], ...) are keyed on the whole
-    /// `&Expr`, and the bridge they usually fall to costs far more than the
-    /// clone.
+    /// `test_single_stage_front_doors_agree_with_the_wrapped_pipe_3673`. It
+    /// enters with the stage itself when [`lone_stage_agrees_with_its_pipe`]
+    /// says the later doors cannot tell the two spellings apart (#3692), and
+    /// with the owned pipe otherwise. A rest of two or more stages is not
+    /// offered bare: the later doors ([`embed_peel_step`], [`owned_path_door`],
+    /// ...) are keyed on the whole `&Expr`, and the bridge they usually fall
+    /// to costs far more than the clone.
     pub(crate) fn run_owned<S: EvalSemantics>(
         &mut self,
         input: &OwnedValue,
@@ -9955,6 +9957,9 @@ impl<'a> RestPipe<'a> {
             if let Some(flow) = eval_each_owned_front_doors::<S>(only, input, optional, sink) {
                 return flow;
             }
+            if lone_stage_agrees_with_its_pipe(only) {
+                return eval_each_owned_past_front_doors::<S>(only, input, optional, reentry, sink);
+            }
         }
         let whole = self
             .owned
@@ -9965,6 +9970,42 @@ impl<'a> RestPipe<'a> {
             eval_each_owned::<S>(whole, input, optional, reentry, sink)
         }
     }
+}
+
+/// Whether a lone plain stage the front doors declined can go on past them as
+/// itself, with no `Expr::Pipe` built around it (#3692).
+///
+/// Every later door in [`eval_each_owned_past_front_doors`] is asked the same
+/// question of a bare stage as of `Pipe([stage])`, bar two that are asked a
+/// different one. A stage either of them reads differently keeps the copy, as
+/// it did before:
+///
+/// - [`eval_each_pipe`], the bridge's last step, diverts the whole pipe to the
+///   eager path-context evaluator when any stage [`needs_path_context`];
+///   [`eval_each`] on the bare stage has no such diversion.
+/// - [`eval_owned_reindex_free`] answers a one-stage pipe only when
+///   [`owned_step_shape`] holds for its stage. For an assignment that is
+///   [`owned_assign_shape`], the structural half of [`owned_assign_step`]'s own
+///   eligibility, so a shaped assignment runs the same step in both spellings
+///   and an unshaped one is the case where the pipe skips an attempt the bare
+///   stage would make.
+///
+/// The rest -- [`embed_peel_step`], [`owned_path_door`], [`owned_write_door`],
+/// [`owned_select_door`] and the #3135 identity-bind door -- take a non-pipe
+/// as `core::slice::from_ref(stage)`, [`projection_peel`] declines both
+/// spellings (a bare stage is not a pipe, and a one-stage pipe has no stage
+/// after its first), and [`reroot_for_reentry`] walks the tree without regard
+/// to what wraps it.
+///
+/// Both exclusions come from reading those two functions, not from an observed
+/// divergence: with this predicate forced open,
+/// `test_declined_lone_stage_agrees_with_the_wrapped_pipe_3692`'s agreement
+/// assertions still hold over its whole matrix. What the test does pin is the
+/// predicate itself, through whether `run_owned` built the owned pipe, so the
+/// saving cannot widen to a stage that was excluded, or narrow, unnoticed.
+fn lone_stage_agrees_with_its_pipe(stage: &Expr) -> bool {
+    let bare = unwrap_paren(stage);
+    (!is_owned_assign(bare) || owned_assign_shape(bare)) && !needs_path_context(stage)
 }
 
 /// Owned-input twin of [`eval_each`], mirroring `eval_owned_input`.
@@ -79969,6 +80010,254 @@ mod tests {
                 relocated >= 10,
                 "the embed-table rows must reach the relocating folds: {relocated}"
             );
+        }
+    }
+
+    /// #3692: a lone plain stage the front doors decline goes on past them as
+    /// itself when [`lone_stage_agrees_with_its_pipe`] admits it, and as the
+    /// owned `Expr::Pipe` otherwise -- and either way [`RestPipe::run_owned`]
+    /// answers exactly as [`eval_each_owned`] answers the one-stage pipe: the
+    /// same outputs and the same way of ending (whole, stopped after the first
+    /// output, or escaped), `?` on and off, both modes, under both re-entries
+    /// that reach the later doors.
+    ///
+    /// [`RestPipe::owned`] is what the agreement cannot see, since the copy
+    /// never changed an answer, only the cost: it must be unset after an
+    /// admitted stage the doors declined, and set after an excluded one, so the
+    /// predicate cannot widen (and skip a copy a later door needed) or narrow
+    /// (and quietly lose the saving) without this failing.
+    ///
+    /// The sources are what the later doors read. Admitted: the leaf builtins
+    /// the doors leave to the bridge, constructions, `if`, binds the #3135
+    /// identity-bind door may take, `try`/`?`, generators, `select`, `path`,
+    /// `del`, parenthesised spellings, and the assignments
+    /// `owned_assign_shape` accepts. Excluded: a stage that needs path context,
+    /// and an assignment it declines -- the two shapes two of the later doors
+    /// read differently bare. Forcing the predicate open does not change an
+    /// answer on this matrix; the owned-pipe assertion is what holds it shut.
+    #[test]
+    fn test_declined_lone_stage_agrees_with_the_wrapped_pipe_3692() {
+        fn answer(
+            run: impl FnOnce(&mut dyn FnMut(OwnedValue) -> Demand) -> Flow,
+            stop_after_first: bool,
+        ) -> (Vec<String>, String) {
+            let mut outputs = Vec::new();
+            let flow = run(&mut |v| {
+                outputs.push(format!("{v:?}"));
+                if stop_after_first {
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            });
+            let ending = match flow {
+                Flow::Exhausted => "exhausted".to_string(),
+                Flow::Stopped { pending } => format!("stopped, pending={}", pending.is_some()),
+                Flow::Escaped(control) => format!("escaped {control:?}"),
+            };
+            (outputs, ending)
+        }
+        /// How many of the runs on `src` reached the fallback (the doors
+        /// declined), after asserting that each answered as the wrapped pipe
+        /// does and built the owned pipe only where it should have.
+        fn check<S: EvalSemantics>(
+            src: &str,
+            admitted: bool,
+            input: &OwnedValue,
+            reentry: Reentry,
+        ) -> usize {
+            let rest = [parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"))];
+            let wrapped = Expr::Pipe(rest.to_vec());
+            let only = lone_plain_stage(&rest).expect("every source is one plain stage");
+            let mut fallbacks = 0;
+            // `eval_single` asserts a path-context pipe is never evaluated
+            // under `?` (the parser cannot produce one), so the wrapped pipe
+            // this is compared with refuses it outright.
+            let optionals: &[bool] = if needs_path_context(only) {
+                &[false]
+            } else {
+                &[false, true]
+            };
+            for &optional in optionals {
+                // The doors answer or decline the same way whatever the sink does.
+                let doors_answer =
+                    eval_each_owned_front_doors::<S>(only, input, optional, &mut |_| {
+                        Demand::Continue
+                    })
+                    .is_some();
+                for stop in [false, true] {
+                    let context = format!(
+                        "{src} on {input:?} ({reentry:?}, optional={optional}, stop={stop})"
+                    );
+                    let mut pipe = RestPipe::new(&rest);
+                    let via_rest = answer(
+                        |sink| pipe.run_owned::<S>(input, optional, reentry, sink),
+                        stop,
+                    );
+                    let via_pipe = answer(
+                        |sink| eval_each_owned::<S>(&wrapped, input, optional, reentry, sink),
+                        stop,
+                    );
+                    assert_eq!(via_rest, via_pipe, "{context}");
+                    assert_eq!(
+                        pipe.owned.is_some(),
+                        !doors_answer && !admitted,
+                        "{context}: the owned pipe is built exactly when the doors decline a stage the later doors read differently bare"
+                    );
+                    fallbacks += usize::from(!doors_answer);
+                }
+            }
+            fallbacks
+        }
+        let admitted = [
+            // Left to the bridge, so the stage reaches every later door.
+            "floor",
+            "keys",
+            "tojson",
+            "ascii_downcase",
+            "(floor)",
+            "((tojson))",
+            // Constructions, the stages with the largest AST to copy.
+            "{b: ., c: [., 1]}",
+            "{a: .}",
+            "[., .]",
+            "[.[]?]",
+            r#"if . then "t" else "f" end"#,
+            "if . == 1 then . + 1 else . end",
+            "(.a, .b)",
+            // Binds, for the #3135 identity-bind door and the embed table.
+            ". as $x | [$x, $x]",
+            ".a as $x | [$x]",
+            ". as $x | path($x)",
+            ".a as $x | $x | path($x)",
+            ". as [$a] | $a",
+            ". as {a: $a} | $a",
+            // Error handling and generators.
+            "try error catch .",
+            "error",
+            r#"error("x")"#,
+            ".a?",
+            ".[]?",
+            ".[]",
+            "..",
+            "[..]",
+            "empty",
+            "first(.[])",
+            "limit(1; .[])",
+            "isempty(.[])",
+            "label $out | ., break $out",
+            "reduce .[] as $x (0; . + $x)",
+            "foreach .[] as $x (0; . + $x)",
+            "[.[] | . + 1]",
+            "map(. + 1)",
+            "with_entries(.)",
+            // The doors that take a non-pipe as `from_ref(stage)`.
+            "select(. == 1)",
+            "select(.a)",
+            "select(true)",
+            "path(.a)",
+            "path(..)",
+            "paths",
+            "del(.a)",
+            "del(.[0])",
+            // The doors' own stages, answered or declined per input.
+            "to_entries",
+            "length",
+            "max",
+            "sort",
+            r#"getpath(["a"])"#,
+            ". + 1",
+            "tostring",
+            // Assignments `owned_assign_shape` accepts: one step, closed key and value.
+            ".a = 1",
+            ".a |= . + 1",
+            ".a += 1",
+            ".a //= 2",
+            ".[0] = 1",
+            "(.a = 1)",
+            "((.a |= . + 1))",
+        ];
+        let excluded = [
+            // `eval_each_pipe` diverts a pipe whose stage needs path context.
+            "key",
+            "parent",
+            r#"select(key == "a")"#,
+            "(key // 99)",
+            "(key)",
+            // `eval_owned_reindex_free` gates a one-stage pipe on `owned_assign_shape`.
+            ".a = .b",
+            ".[.b] = 1",
+            "(.a, .b) = 1",
+            ".a |= empty",
+            "(.a = .b)",
+        ];
+        for src in admitted {
+            let stage = parse(src).unwrap();
+            assert!(lone_stage_agrees_with_its_pipe(&stage), "{src}");
+        }
+        for src in excluded {
+            let stage = parse(src).unwrap();
+            assert!(!lone_stage_agrees_with_its_pipe(&stage), "{src}");
+        }
+
+        let mut bare = 0;
+        let mut copied = 0;
+        for reentry in [Reentry::REBUILT, Reentry::Proven] {
+            for input in &pure_value_matrix() {
+                for src in admitted {
+                    bare += check::<JqSemantics>(src, true, input, reentry);
+                    bare += check::<YqSemantics>(src, true, input, reentry);
+                }
+                for src in excluded {
+                    copied += check::<JqSemantics>(src, false, input, reentry);
+                    copied += check::<YqSemantics>(src, false, input, reentry);
+                }
+            }
+        }
+        assert!(
+            bare > 5000 && copied > 1000,
+            "the matrix must reach both spellings: bare {bare}, copied {copied}"
+        );
+
+        // The later doors that only act while a binding is in scope: the peel
+        // (`embed_peel_step`) takes a stage standing on an embedded node, and
+        // `eval_owned_reindex_free` stands down.
+        #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+        {
+            use crate::jq::eval_generic::embed_table_push;
+            let bound = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+            let origin = BindOrigin::Node {
+                node: 5,
+                document: 9,
+            };
+            let guard = embed_table_push::<JqSemantics>(Some(&origin), &mut bound.clone());
+            assert!(guard.is_some(), "a container bind registers an entry");
+            let inputs = [
+                OwnedValue::array_from(vec![bound.clone(), OwnedValue::Int(0)]),
+                OwnedValue::array_from(vec![bound.clone(), bound.clone()]),
+                OwnedValue::array_from(vec![OwnedValue::array_from(vec![bound.clone()])]),
+                bound.clone(),
+            ];
+            for (src, is_admitted) in [
+                ("max", true),
+                ("sort", true),
+                ("floor", true),
+                ("keys", true),
+                ("{b: .}", true),
+                ("[., .]", true),
+                (". as $x | [$x]", true),
+                ("path(.a)", true),
+                ("del(.a)", true),
+                ("(sort)", true),
+                (".a = 1", true),
+                (".a = .b", false),
+                ("key", false),
+            ] {
+                for input in &inputs {
+                    check::<JqSemantics>(src, is_admitted, input, Reentry::REBUILT);
+                    check::<YqSemantics>(src, is_admitted, input, Reentry::REBUILT);
+                }
+            }
         }
     }
 
