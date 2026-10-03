@@ -9961,12 +9961,33 @@ impl<'a> RestPipe<'a> {
         reentry: Reentry,
         sink: &mut dyn FnMut(OwnedValue) -> Demand,
     ) -> Flow {
-        let stages = self.stages;
-        let lone = lone_plain_stage(stages);
+        let lone = lone_plain_stage(self.stages);
         if let Some(only) = lone {
             if let Some(flow) = eval_each_owned_front_doors::<S>(only, input, optional, sink) {
                 return flow;
             }
+        }
+        self.run_owned_past_front_doors::<S>(lone, input, optional, reentry, sink)
+    }
+
+    /// [`Self::run_owned`] once the front doors have declined (or, for a rest
+    /// of several stages, were never offered it).
+    ///
+    /// Out of line on purpose: a door-answered stage is the common case, and
+    /// putting this tail inline in `run_owned` costs that path instructions
+    /// it never runs (+0.2% to +1.3% retired on an M4 Pro, per record, before
+    /// it was split -- #3692).
+    #[inline(never)]
+    fn run_owned_past_front_doors<S: EvalSemantics>(
+        &mut self,
+        lone: Option<&'a Expr>,
+        input: &OwnedValue,
+        optional: bool,
+        reentry: Reentry,
+        sink: &mut dyn FnMut(OwnedValue) -> Demand,
+    ) -> Flow {
+        let stages = self.stages;
+        if let Some(only) = lone {
             if *self
                 .bare
                 .get_or_insert_with(|| lone_stage_can_go_bare(only))
