@@ -10251,6 +10251,43 @@ fn test_break_desugars_to_a_shadowable_error_call_2687() -> Result<()> {
     Ok(())
 }
 
+/// #2967: a computed value that leaves a `catch` handler still answers a
+/// position read after it, at every position, absent or present.
+///
+/// The absent route chooses between its constant route and the owned identity
+/// route, and `step_can_yield_absent` sends every `try` with a handler to the
+/// second. #2840's `label` rewrite writes such a handler (`try BODY catch
+/// error`) once a `def error:` is in scope, and the handler there looks inert
+/// (`def error: .` computes nothing). Treating it as inert, to keep the pipe on
+/// the constant route, lost the output at the one position that holds a real
+/// node (the second element, whose `.a.x` exists): the gate also made the tail
+/// cursor-native, so that position's tail ran on its cursor, where the handler's
+/// message is not the node. A base-versus-change grid found it: 12 differing
+/// rows of 8,988, all this shape.
+///
+/// No oracle exists for the rows -- jq has no `key` and yq's lexer rejects
+/// `def` and `label` -- so they pin the owned identity route's own answer, which
+/// the plain `try ... catch .` row (no `def`, no rewrite) shows is the intended
+/// one: the position's key survives the computed value, as for
+/// `.a | tostring | key`.
+#[test]
+fn test_a_handler_output_keeps_the_positions_key_2967() -> Result<()> {
+    let input = r#"[{"a":{"b":1}},{"a":{"b":2,"x":{"y":3}}},{"c":[1,2]},null]"#;
+    for filter in [
+        r#".[] | .a.x | select(true) | (try error("x") catch .) | select(key == "x")"#,
+        r#"def error: .; .[] | .a.x | select(true) | (label $o | error("x")) | select(key == "x")"#,
+        r#"def error: select(true); .[] | .a.x | select(true) | (label $o | error("x")) | select(key == "x")"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(
+            stdout, "\"x\"\n\"x\"\n\"x\"\n\"x\"\n",
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2687 review: the sentinel-payload divergence
 /// `docs/compliance/jq/limitations.md` records is not merely "sees null
 /// instead of `{"__jq":N}`" -- a shadowing `def error:` observes whatever

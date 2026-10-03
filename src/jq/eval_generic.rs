@@ -23503,6 +23503,19 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
         Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
             step_can_yield_absent(inner, incoming)
         }
+        // Every handler counts, however inert it looks (#2967). A handler's
+        // output is what it computes from the error message -- a detached
+        // value, not a node -- so the pipe may leave it with no live position.
+        // That includes the handler #2840's `label` rewrite writes once a
+        // `def error:` is in scope (`try BODY catch error`). Answering "no"
+        // for a call to a parameterless definition that calls nothing made
+        // `rest` cursor-native, so `try_path_context_absent_sink` ran a present
+        // position's tail on its cursor, where the handler's message is not
+        // that node, and the pipe lost an output
+        // (`test_a_handler_output_keeps_the_positions_key_2967`). The owned
+        // identity route carries the position through a computed value; this
+        // answer is what keeps a handler on it. That route's O(n^2) cost on a
+        // fan-out head is #3702's to fix, not this arm's.
         Expr::Try { expr, catch } => catch.is_some() || step_can_yield_absent(expr, incoming),
         Expr::Pipe(exprs) => exprs
             .iter()
@@ -43935,6 +43948,61 @@ mod tests {
         assert_eq!(
             split(".[]? | .k | select(key == \"k\")"),
             Some((2, 1, Constants))
+        );
+    }
+
+    /// #2967: a `try` handler keeps the absent route off the constant route,
+    /// and #2840's `label` rewrite writes one for every label once a
+    /// `def error:` is in scope. The handler's output is a detached value, so
+    /// only the owned identity route, which carries a position through a
+    /// computed value, can answer a position read after it. Reading the handler
+    /// as an inert call, which made `rest` cursor-native and so sent a present
+    /// position's tail down its cursor, lost an output
+    /// (`test_a_handler_output_keeps_the_positions_key_2967`).
+    ///
+    /// Built the way evaluation sees it: `resolve_func_calls` runs the `label`
+    /// rewrite, then `bind_def` installs each definition's calls. The stages
+    /// follow `select(true)` because a label directly after the navigation is
+    /// part of the walked head, which this gate never sees.
+    #[test]
+    fn absent_split_keeps_a_handler_off_the_constant_route_2967() {
+        let split = |f: &str| {
+            let mut expr = parse(f).unwrap();
+            crate::jq::resolve::resolve_func_calls(&mut expr).unwrap();
+            let mut bound = Rc::new(expr);
+            while let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = &*bound
+            {
+                let next = bind_def(name, params, body, then, &FuncDefBound::default());
+                bound = next;
+            }
+            let Expr::Pipe(stages) = &*bound else {
+                panic!("not a pipe: {f}")
+            };
+            path_context_absent_split(stages)
+                .map(|(head, rest, route)| (head.len(), rest.len(), route))
+        };
+        use AbsentRestRoute::{Constants, OwnedIdentity};
+        // The control: a label with no handler, so the constant route.
+        assert_eq!(
+            split("def g: 1; .a.b | select(true) | (label $o | .) | select(key == \"b\")"),
+            Some((1, 3, Constants))
+        );
+        // The same label with a `def error:` in scope is `try BODY catch error`.
+        // The handler is inert (`.` computes nothing), and still not admitted.
+        assert_eq!(
+            split("def error: .; .a.b | select(true) | (label $o | .) | select(key == \"b\")"),
+            Some((1, 3, OwnedIdentity))
+        );
+        // A handler written out is the same shape without the rewrite.
+        assert_eq!(
+            split(".a.b | select(true) | (try . catch .) | select(key == \"b\")"),
+            Some((1, 3, OwnedIdentity))
         );
     }
 
