@@ -55843,6 +55843,63 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
     Ok(())
 }
 
+/// #3703: `recurse(.[]?)` is bare `recurse`, and must visit every node.
+///
+/// jq defines `def recurse: recurse(.[]?);` (`jq --debug-dump-disasm` shows the
+/// lambda as `EACH_OPT`), so the walk is structural descent of a finite tree
+/// and its node count is the tree's own. `RECURSE_MAX_ITEMS` is there for a
+/// parameterised `f` that can be unbounded, and it answers silently short; it
+/// was applied to this `f` too, and to bare `recurse` on an owned input (`-n`),
+/// stopping at 10,000 nodes with exit 0. A write through the same walk lost
+/// what lay past the cap: on this 12,001-node document `recurse(.[]?) |= ...`
+/// left 1,001 numbers un-incremented and `del(recurse(.[]?) | ...)` left 1,001
+/// of them in place.
+///
+/// Every expectation is captured from jq 1.7.1. The `-n` rows build the document
+/// inside the filter, so they reach the owned evaluator rather than the cursor
+/// one; the object row covers the other container kind.
+#[test]
+fn test_recurse_of_each_optional_has_no_node_cap_3703() -> Result<()> {
+    // 6,000 one-element arrays: 1 root + 6,000 arrays + 6,000 numbers.
+    let doc = format!("[{}]", vec!["[1]"; 6000].join(","));
+    for (filter, want) in [
+        ("[recurse(.[]?)] | length", "12001\n"),
+        ("[recurse(.[]?) | numbers] | length", "6000\n"),
+        ("[recurse] | length", "12001\n"),
+        ("[path(recurse(.[]?))] | length", "12001\n"),
+        ("[limit(12000; recurse(.[]?))] | length", "12000\n"),
+        (
+            r#"(recurse(.[]?) | select(type == "number")) |= . + 1 | [.. | numbers] | add"#,
+            "12000\n",
+        ),
+        (
+            r#"del(recurse(.[]?) | select(type == "number")) | [.. | numbers] | length"#,
+            "0\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc.as_str()))?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout, want, "`{filter}` -- stderr: {stderr:?}");
+    }
+    for (filter, want) in [
+        ("[range(6000) | [1]] | [recurse(.[]?)] | length", "12001\n"),
+        ("[range(6000) | [1]] | [recurse] | length", "12001\n"),
+        (
+            "[range(6000) | [1]] | [path(recurse(.[]?))] | length",
+            "12001\n",
+        ),
+        (
+            "[range(12000) | {key: tostring, value: 1}] | from_entries | [recurse(.[]?)] == [..]",
+            "true\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout, want, "`{filter}` -- stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #2693: `recurse(f)`/`recurse(f; cond)` evaluate `f` at a node only if the
 /// consumer still wants more output.
 ///

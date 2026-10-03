@@ -122,6 +122,34 @@ fn test_dom_route_union_over_a_generator_follows_yq_3479() -> Result<()> {
 /// (`!!null foo`, `!!bool "yes"`, `!!int abc`, `!!str true`, `!!str null`).
 const TAGGED_KINDS: &str = "a: !!null foo\nb: !!bool \"yes\"\nc: !!seq [1]\nd: ~\ne: true\nf: [1, 2]\ng: !!str true\nh: !!str null\ni: !!int abc\nj: 5\nk: {m: !!bool \"false\"}\n";
 
+/// #3703: `recurse(.[]?)` visits every node in yq mode too.
+///
+/// No oracle exists: real yq's lexer rejects `recurse` outright (`Error: 1:2:
+/// lexer: invalid input text "recurse(.[]?)] | length"`, v4.53.3), so it is a
+/// succinctly extension behind `--jq-extensions` and follows jq's definition,
+/// `def recurse: recurse(.[]?);`. The pinned reference for the count is yq's
+/// own `..`, which is what a structural descent of the document must equal;
+/// a `RECURSE_MAX_ITEMS` cap stopped the explicit spelling at 10,000 nodes.
+#[test]
+fn test_recurse_of_each_optional_has_no_node_cap_3703() -> Result<()> {
+    // 6,000 one-element sequences: 1 root + 6,000 sequences + 6,000 numbers.
+    let doc = "- - 1\n".repeat(6000);
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    for filter in [
+        "[recurse(.[]?)] | length",
+        "[recurse] | length",
+        "[..] | length",
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, &doc, &args)?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, "12001\n", "`{filter}`");
+    }
+    let (stdout, code) = run_yq_stdin("[recurse(.[]?) | numbers] | length", &doc, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "6000\n");
+    Ok(())
+}
+
 /// #3690: a node a selector hands on keeps its style and its comments, as it
 /// does through yq's own `select`: `[a, b, c] # note` stays a flow sequence
 /// with its trailing comment, where the owned round trip it replaced printed

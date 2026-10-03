@@ -40110,7 +40110,9 @@ fn recurse_family_root_seed<'a>(
 /// spellings, whose queue can grow without bound from an arbitrary `f`, not
 /// to bare structural descent, whose node count is exactly `value`'s own
 /// tree size — `[path(..)] | length` must equal jq's true count even past
-/// [`RECURSE_MAX_ITEMS`] nodes.
+/// [`RECURSE_MAX_ITEMS`] nodes. `recurse(.[]?)` is that same bare walk spelled
+/// out (jq's `def recurse: recurse(.[]?);`), so [`resolve_recurse_sink`] lifts
+/// the cap for exactly that spelling ([`recurse_item_cap`], #3703).
 ///
 /// **Lazy within a node's fan-out too** (#2895): a node's children are a
 /// [`RecursiveChildren`] cursor on a [`DescentFrame`], pulled one at a time,
@@ -40124,8 +40126,9 @@ fn recurse_family_root_seed<'a>(
 /// The parameterised spellings ([`resolve_recurse_sink`], and the value-path
 /// `recurse(f)` evaluator) stay eager on purpose: their `f` can fan out and
 /// raise, so a node's children are the *output of running `f`*, not a slice
-/// already in hand, and they are capped by [`RECURSE_MAX_ITEMS`]. Bare `..`
-/// has no `f`, so its children are exactly the container's own.
+/// already in hand, and they are capped by [`RECURSE_MAX_ITEMS`] (but for
+/// `.[]?`, see [`recurse_item_cap`]). Bare `..` has no `f`, so its children are
+/// exactly the container's own.
 ///
 /// Every value this function ever visits is a live sub-part of the original
 /// top-level `value`, so every branch can borrow directly (`Cow::Borrowed`)
@@ -45499,6 +45502,34 @@ fn eval_recurse_cond<S: EvalSemantics>(
 /// "duplicated predicates diverge silently").
 const RECURSE_MAX_ITEMS: usize = 10000;
 
+/// How many nodes a value-mode `recurse` walk may deliver (#3703).
+///
+/// [`RECURSE_MAX_ITEMS`] exists because a parameterised `f` can be unbounded
+/// -- jq's own `recurse(.a)` on `null` never terminates -- so a collecting
+/// consumer would otherwise grow until the host runs out of memory. It
+/// answers silently short, which is a divergence of its own (still open for
+/// every `f` but the one below).
+///
+/// `.[]?` is not such an `f`. jq defines `def recurse: recurse(.[]?);`
+/// (`jq --debug-dump-disasm` shows the lambda as `EACH_OPT`), so the walk it
+/// drives is structural descent of a finite tree, and its node count is the
+/// tree's own: `[recurse(.[]?)] | length` must equal jq's past
+/// [`RECURSE_MAX_ITEMS`] nodes, as `..` and the path-mode bare walk already
+/// do. Judged on the caller's own `f`, before [`Reentry::reroot`] rewrites it,
+/// and only without a `cond`, which can reject children `..` would not.
+fn recurse_item_cap(f: &Expr, cond: Option<&Expr>) -> usize {
+    let mut f = f;
+    while let Expr::Paren(inner) = f {
+        f = inner;
+    }
+    let structural = matches!(f, Expr::Optional(inner) if matches!(**inner, Expr::Iterate));
+    if cond.is_none() && structural {
+        usize::MAX
+    } else {
+        RECURSE_MAX_ITEMS
+    }
+}
+
 /// Finalize `builtin_recurse_f`/`builtin_recurse_cond`'s collected
 /// `outputs` into a `QueryResult` — the two functions' identical tail
 /// (#1023 review of #897, echoing #106): a `pending_error` only surfaces
@@ -45610,6 +45641,7 @@ pub(crate) fn each_recurse_walk<S: EvalSemantics>(
     reentry: Reentry,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> RecurseWalkEnd {
+    let cap = recurse_item_cap(f, cond);
     let f = reentry.reroot::<S>(f);
     let demoted_f = demote_for_reentry(&f, &RootWitness::Owned);
     let demoted_cond = cond.map(|c| demote_for_reentry(c, &RootWitness::Owned));
@@ -45620,6 +45652,7 @@ pub(crate) fn each_recurse_walk<S: EvalSemantics>(
         demoted_cond: demoted_cond.as_deref(),
         sink,
         emitted: 0,
+        cap,
         budget: RecurseNativeBudget::start(),
         _semantics: PhantomData,
     };
@@ -45993,8 +46026,10 @@ struct ValueRecurseWalk<'e, 'd, 's, S> {
     demoted_f: &'d Expr,
     demoted_cond: Option<&'d Expr>,
     sink: &'s mut dyn FnMut(OwnedValue) -> Demand,
-    /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`].
+    /// Nodes delivered so far, against [`Self::cap`].
     emitted: usize,
+    /// How many nodes this walk may deliver: [`recurse_item_cap`].
+    cap: usize,
     budget: RecurseNativeBudget,
     _semantics: PhantomData<S>,
 }
@@ -46004,7 +46039,7 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
     /// levels are already live above it (see [`RecurseNativeBudget`]).
     fn visit(&mut self, node: OwnedValue, level: u32) -> Option<RecurseAbort> {
         let _scope = self.budget.scope();
-        if self.emitted >= RECURSE_MAX_ITEMS {
+        if self.emitted >= self.cap {
             return Some(RecurseAbort::Capped);
         }
         self.emitted += 1;
@@ -46077,7 +46112,7 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
         let mut pending_error: Option<EvalEscape> = None;
         self.queue_children(&node, &mut stack, &mut pending_error);
 
-        while !stack.is_empty() && self.emitted < RECURSE_MAX_ITEMS {
+        while !stack.is_empty() && self.emitted < self.cap {
             let current = stack.pop().expect("loop condition checked non-empty");
             self.emitted += 1;
             if (self.sink)(current.clone()) == Demand::Stop {
@@ -46352,6 +46387,7 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
         keep,
         sink,
         emitted: 0,
+        cap: recurse_item_cap(f, cond),
         budget: RecurseNativeBudget::start(),
         _semantics: PhantomData,
     };
@@ -46374,8 +46410,10 @@ struct PathRecurseWalk<'e, 'a, 's, S> {
     frame: &'e Frame,
     keep: Keep,
     sink: &'s mut dyn FnMut(PathBranch<'a>) -> Demand,
-    /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`].
+    /// Nodes delivered so far, against [`Self::cap`].
     emitted: usize,
+    /// How many nodes this walk may deliver: [`recurse_item_cap`].
+    cap: usize,
     budget: RecurseNativeBudget,
     _semantics: PhantomData<S>,
 }
@@ -46385,7 +46423,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
     /// levels are already live above it (see [`RecurseNativeBudget`]).
     fn visit(&mut self, node: PathBranch<'a>, level: u32) -> Option<RecurseAbort> {
         let _scope = self.budget.scope();
-        if self.emitted >= RECURSE_MAX_ITEMS {
+        if self.emitted >= self.cap {
             return Some(RecurseAbort::Capped);
         }
         self.emitted += 1;
@@ -46522,7 +46560,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
         let mut pending_error: Option<EvalEscape> = None;
         self.queue_children(node, &mut stack, &mut pending_error);
 
-        while !stack.is_empty() && self.emitted < RECURSE_MAX_ITEMS {
+        while !stack.is_empty() && self.emitted < self.cap {
             let current = stack.pop().expect("loop condition checked non-empty");
             self.emitted += 1;
             if (self.sink)(Self::delivered(&current)) == Demand::Stop {
@@ -108822,6 +108860,39 @@ mod tests {
                 (values, ""),
                 "`{filter}`"
             );
+        }
+    }
+
+    /// #3703: the node cap is lifted for structural descent and for nothing
+    /// else. `recurse(.[]?)` is jq's bare `recurse`, so its walk is bounded by
+    /// the tree it walks; any other `f` can be unbounded (`recurse(.a)` on
+    /// `null`), and a `cond` can reject children `..` would visit, so those
+    /// keep [`RECURSE_MAX_ITEMS`].
+    #[test]
+    fn recurse_item_cap_is_lifted_only_for_structural_descent_3703() {
+        let cap = |filter: &str| match parse(filter).unwrap() {
+            Expr::Builtin(Builtin::RecurseF(f)) => recurse_item_cap(&f, None),
+            Expr::Builtin(Builtin::RecurseCond(f, cond)) => recurse_item_cap(&f, Some(&cond)),
+            other => panic!("not a recurse: {filter} -> {other:?}"),
+        };
+        for filter in ["recurse(.[]?)", "recurse((.[]?))", "recurse(((.[]?)))"] {
+            assert_eq!(cap(filter), usize::MAX, "`{filter}`");
+        }
+        // `.[]` without `?` raises on a scalar; `.a?`, a pipe, a comma and a
+        // computed `f` are all a different walk.
+        for filter in [
+            "recurse(.[])",
+            "recurse(.a?)",
+            "recurse(.[]? | .)",
+            "recurse(.[]?, .[]?)",
+            "recurse(.)",
+            "recurse(if type == \"array\" then .[] else empty end)",
+        ] {
+            assert_eq!(cap(filter), RECURSE_MAX_ITEMS, "`{filter}`");
+        }
+        // A `cond` keeps the cap even over `.[]?`, `true` included.
+        for filter in ["recurse(.[]?; true)", "recurse(.[]?; . != null)"] {
+            assert_eq!(cap(filter), RECURSE_MAX_ITEMS, "`{filter}`");
         }
     }
 
