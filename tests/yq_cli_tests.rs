@@ -51,7 +51,7 @@ fn test_question_marks_in_yq_field_names_3356() -> Result<()> {
     Ok(())
 }
 
-/// #3479: after a write (or `-R`, `--slurp`, `--arg`) `succinctly yq` evaluates a
+/// #3479: after a write (or `-R`, `--slurp`) `succinctly yq` evaluates a
 /// value it re-indexed into throwaway JSON text, so `line`/`column` answer the
 /// fixed default `0` there, never a position inside that text. Real yq 4.53.3
 /// keeps the original node's position (`.c = 3 | .c | line` is `2`); the gap is
