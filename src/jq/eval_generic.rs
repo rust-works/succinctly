@@ -2954,9 +2954,9 @@ impl<V: DocumentValue> LazySeq<V> {
     /// top -- the lossless answer for a builtin that reorders or selects its
     /// input's own elements without computing new ones (#1687).
     ///
-    /// The instruction chain is deliberately empty: `fold_one` then folds
-    /// each element through zero stages and hands the cursor straight back,
-    /// so `stream_json`/`stream_yaml` render every element from its own live
+    /// The instruction chain is deliberately empty: `next` then hands each
+    /// element's cursor straight back (#2913; before that, `fold_one` folded
+    /// it through zero stages), so `stream_json`/`stream_yaml` render every element from its own live
     /// document position. That is the whole point -- it is what preserves a
     /// duplicate mapping key inside a moved element, which an
     /// `OwnedValue::Array` of `IndexMap`-backed objects cannot.
@@ -3119,8 +3119,9 @@ impl<V: DocumentValue> LazySeq<V> {
         // #2575 Phase 2b: an instruction-free `Cursors` source has no stage
         // to run and nothing buffered in `pending` (a stage is the only
         // thing that ever populates it), so `drain_atomic`'s own
-        // `Vec<LazyElem<V>>` -- one small `Vec` allocated and dropped per
-        // element inside `fold_one`, then a second full pass converting
+        // `Vec<LazyElem<V>>` -- one `Vec` of elements, then (before #2913,
+        // one small `Vec` per element inside `fold_one` too), and a second
+        // full pass converting
         // each to `OwnedValue` -- is pure overhead here. Map cursors
         // straight to `OwnedValue` in one pass instead.
         //
@@ -3212,12 +3213,14 @@ impl<V: DocumentValue> Iterator for LazySeq<V> {
                 Ok(None) => return None,
                 Err(e) => return Some(Err(Control::Error(e))),
             };
-            // No stage to run (`map(.)`'s bare identity, #724/#725; `[.[]]`
-            // printed directly, #2575): `fold_one` would wrap `elem` in a
-            // one-item `Vec` only for the pop above to take it straight
-            // back out (#2913). `instructions` is `None` until the first
-            // stage is pushed, never an empty `Some`.
-            if self.instructions.is_none() {
+            // No stage to run: `fold_one` would wrap `elem` in a one-item
+            // `Vec` only for the pop above to take it straight back out
+            // (#2913). Only the `Cursors` constructors build such a sequence
+            // (a directly printed `[.[]]` #2575, the reordering builtins
+            // #1687); `map(.)` pushes an identity stage and does not qualify.
+            // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV
+            // is 1.73 and `Option::is_none_or` is stable since 1.82.
+            if self.instructions.as_deref().map_or(true, Vec::is_empty) {
                 return Some(Ok(elem));
             }
             match self.fold_one(elem) {
@@ -33971,71 +33974,67 @@ mod tests {
         assert_eq!(out, "");
     }
 
-    /// #2913: an instruction-free `LazySeq` hands out its source's elements
-    /// without a per-element `fold_one` round trip. Every source kind drains
-    /// to the same elements, in the same order, as the same source behind a
-    /// stage that changes nothing (`map(.)` pushed on top), which still goes
-    /// through `fold_one`.
+    /// #2913: an instruction-free `LazySeq` (only the `Cursors` constructors
+    /// build one: a directly printed `[.[]]`, `[., .]`, the reordering
+    /// builtins) hands out its source's elements without a `fold_one` round
+    /// trip. It must drain to the same elements, in the same order, and fail
+    /// the same way, as the same sequence behind an identity stage (`map(.)`
+    /// pushed on top), which still goes through `fold_one`.
     #[test]
     fn test_instruction_free_lazy_seq_drains_like_an_identity_stage_2913() {
-        fn drained(json: &[u8], filter: &str) -> Vec<String> {
+        fn drained(json: &[u8], filter: &str) -> (bool, Result<Vec<String>, String>) {
             let index = JsonIndex::build(json);
-            let cursor = index.root(json);
             let expr = crate::jq::parse(filter).unwrap();
-            let GenericResult::LazySeq(seq) = eval(&expr, cursor.value()) else {
+            let GenericResult::LazySeq(seq) = eval_with_cursor(&expr, index.root(json)) else {
                 panic!("{filter}: not a LazySeq");
             };
-            seq.drain_atomic()
-                .unwrap()
-                .into_iter()
-                .map(|elem| match elem {
-                    LazyElem::Cursor(c) => to_owned_cursor::<JqSemantics, _>(&c).unwrap().to_json(),
-                    LazyElem::Owned(o) => o.to_json(),
+            let instruction_free = seq.instructions.is_none();
+            let items = seq
+                .drain_atomic()
+                .and_then(|elems| {
+                    elems
+                        .into_iter()
+                        .map(|elem| match elem {
+                            LazyElem::Cursor(c) => to_owned_cursor::<JqSemantics, _>(&c)
+                                .map(|v| v.to_json())
+                                .map_err(Control::Error),
+                            LazyElem::Owned(o) => Ok(o.to_json()),
+                        })
+                        .collect()
                 })
-                .collect()
+                .map_err(|control| format!("{control:?}"));
+            (instruction_free, items)
         }
-        for (json, bare, staged, want) in [
-            // `Elements`
-            (
-                &br#"[{"a":1},[2],"s",null]"#[..],
-                "map(.)",
-                "map(.) | map(.)",
-                vec![r#"{"a":1}"#, "[2]", r#""s""#, "null"],
-            ),
-            // `Values`
-            (
-                &br#"{"x":1,"y":[2]}"#[..],
-                "map(.)",
-                "map(.) | map(.)",
-                vec!["1", "[2]"],
-            ),
-            // `Values`, duplicate-key fallback (`Cursors`): first position, last value.
-            (
-                &br#"{"x":1,"y":2,"x":3}"#[..],
-                "map(.)",
-                "map(.) | map(.)",
-                vec!["3", "2"],
-            ),
-            // `Keys`
-            (
-                &br#"{"x":1,"y":2}"#[..],
-                "keys_unsorted | map(.)",
-                "keys_unsorted | map(.) | map(.)",
-                vec![r#""x""#, r#""y""#],
-            ),
-            // `IndexRange`
-            (
-                &br"[7,8,9]"[..],
-                "keys_unsorted | map(.)",
-                "keys_unsorted | map(.) | map(.)",
-                vec!["0", "1", "2"],
-            ),
-            // Empty.
-            (&br"[]"[..], "map(.)", "map(.) | map(.)", vec![]),
+        let doc = &br#"{"a":{"x":1},"b":[2],"n":"s"}"#[..];
+        for (json, filter, want) in [
+            (doc, "[., .]", vec![r#"{"a":{"x":1},"b":[2],"n":"s"}"#; 2]),
+            (doc, "[.a, .b]", vec![r#"{"x":1}"#, "[2]"]),
+            (doc, "[.b, .a, .b]", vec!["[2]", r#"{"x":1}"#, "[2]"]),
+            (&br"[[3],[1],[2]]"[..], "sort", vec!["[1]", "[2]", "[3]"]),
+            (&br"[[3],[1],[2]]"[..], "reverse", vec!["[2]", "[1]", "[3]"]),
+            (&br"[[1],[1],[2]]"[..], "unique", vec!["[1]", "[2]"]),
         ] {
-            let got = drained(json, bare);
-            assert_eq!(got, want, "{bare} over {}", String::from_utf8_lossy(json));
-            assert_eq!(drained(json, staged), want, "{staged}");
+            let (instruction_free, got) = drained(json, filter);
+            assert!(
+                instruction_free,
+                "{filter} must be instruction-free to reach the fast path"
+            );
+            assert_eq!(
+                got,
+                Ok(want.iter().map(ToString::to_string).collect()),
+                "{filter}"
+            );
+            let (staged_free, staged) = drained(json, &format!("({filter}) | map(.)"));
+            assert!(!staged_free, "{filter} | map(.) carries a stage");
+            assert_eq!(staged, got, "{filter}: bare vs behind an identity stage");
+        }
+        // An element the index cannot read raises through the same path, at the
+        // same point, with or without a stage.
+        for filter in ["[., .[]]", "[.[], .]"] {
+            let json = br"[1,tru,2]";
+            let (_, bare) = drained(json, filter);
+            let (_, staged) = drained(json, &format!("({filter}) | map(.)"));
+            assert_eq!(bare, staged, "{filter} over a malformed element");
         }
     }
 
