@@ -460,6 +460,43 @@ fn a_swallowed_iteration_over_a_scalar_allocates_no_more_than_its_twin_on_the_va
     }
 }
 
+/// `each_try` in `eval.rs` is the push-model twin of `eval_try`, and the only
+/// document-free way to reach it from here is a pipeline over an owned literal
+/// (`[range(N)] | .[] | .[]?`): the generic evaluator hands that to the value
+/// evaluator whole. The remaining cost there is the reindex bridge, which has no
+/// twin that does not also swallow, so this is a differential instead: the same
+/// pipeline with a boundary the shortcut does not match (`(.[] | empty)?` is a
+/// pipe, not a bare `.[]`) formats the message for every scalar, and must cost
+/// at least the message term more than the one it does. With the shortcut
+/// disabled the two cost the same and this fails.
+#[test]
+fn the_owned_streaming_route_saves_the_message_3689() {
+    for (matched, unmatched) in [
+        (
+            format!("[range({N})] | .[] | .[]?"),
+            format!("[range({N})] | .[] | (.[] | empty)?"),
+        ),
+        (
+            format!("[range({N})] | .[] | try .[] catch empty"),
+            format!("[range({N})] | .[] | try (.[] | empty) catch empty"),
+        ),
+    ] {
+        let (with_shortcut, outputs) = allocations_streaming(&matched, "[]");
+        assert_eq!(
+            outputs, 0,
+            "`{matched}` iterates scalars, so yields nothing"
+        );
+        let (without, outputs) = allocations_streaming(&unmatched, "[]");
+        assert_eq!(outputs, 0, "`{unmatched}` yields nothing");
+        assert!(
+            without >= with_shortcut + 4 * N,
+            "`{matched}` made {with_shortcut} allocator calls against `{unmatched}`'s {without}: \
+             the message the boundary drops cost at least {} more per scalar before the shortcut",
+            4
+        );
+    }
+}
+
 /// The counter can fail: a handler that reads the payload still has to see the
 /// `Cannot iterate` message, so `catch .` must keep paying for it. If this
 /// stopped holding, the proportion above could be passing because nothing was
