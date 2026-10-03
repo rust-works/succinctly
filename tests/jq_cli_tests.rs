@@ -55285,7 +55285,9 @@ fn path_mode_foreach_update_and_extract_resolve_by_demand_3507() -> Result<()> {
             "AAjq: error (at <stdin>:0): E2\n",
             5,
         ),
-        // The same retry on an escape raised downstream of UPDATE, in EXTRACT.
+        // The same retry on an escape raised downstream of UPDATE, in EXTRACT -- also
+        // when the retried alternative's own EXTRACT is what raises, which the stop
+        // the first alternative's EXTRACT answered must not outrank.
         (
             r#"{"a":{"a":1}}"#,
             r#"[path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else "b" end)]; error("X")))]"#,
@@ -55298,6 +55300,57 @@ fn path_mode_foreach_update_and_extract_resolve_by_demand_3507() -> Result<()> {
             r#"[first(path(foreach 1 as $x (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else "b" end)]; error("X"))))]"#,
             "",
             "AAjq: error (at <stdin>:0): X\n",
+            5,
+        ),
+        (
+            r#"{"a":null,"b":[]}"#,
+            r#"first(path(foreach 1 as $v (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else "b" end)]; .[([["a"]] as [$q] ?// $b | ("B"|stderr) | if $q then "a" else "b" end)])))"#,
+            "[\"a\",\"a\"]\n[\"a\",\"b\"]\n",
+            "ABBABBjq: error (at <stdin>:0): Cannot index array with string \"b\"\n",
+            5,
+        ),
+        (
+            r#"{"a":null,"b":[]}"#,
+            r#"try first(path(foreach 1 as $v (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else "b" end)]; .[([["a"]] as [$q] ?// $b | ("B"|stderr) | if $q then "a" else "b" end)]))) catch "caught""#,
+            "[\"a\",\"a\"]\n[\"a\",\"b\"]\n\"caught\"\n",
+            "ABBABB",
+            0,
+        ),
+        // Writes go through the same resolver: a consumer's stop ends UPDATE before the
+        // second key is written, and a refusal jq raises is raised.
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"first(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])) = 5"#,
+            "{\"a\":5}\n",
+            "a",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"del(first(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))"#,
+            "{}\n",
+            "a",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"limit(1; foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])) |= 7"#,
+            "{\"a\":7}\n",
+            "a",
+            0,
+        ),
+        (
+            r#"{"a":{"a":1}}"#,
+            r#"first(foreach 1 as $x (.; .; .[("a"|stderr), ("b"|stderr)])) = 5"#,
+            "{\"a\":5}\n",
+            "a",
+            0,
+        ),
+        (
+            r#"{"a":null,"b":[]}"#,
+            r#"first(foreach 1 as $v (.; .[([["a"]] as [$q] ?// $b | ("A"|stderr) | if $q then "a" else "b" end)]; .[([["a"]] as [$q] ?// $b | ("B"|stderr) | if $q then "a" else "b" end)])) = 5"#,
+            "",
+            "ABBABBjq: error (at <stdin>:0): Cannot index array with string \"b\"\n",
             5,
         ),
         // Must not change: nothing stops an unbounded fold, so every output and every
