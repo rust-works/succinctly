@@ -118,6 +118,93 @@ fn test_dom_route_union_over_a_generator_follows_yq_3479() -> Result<()> {
     Ok(())
 }
 
+/// A mapping whose scalars carry explicit tags that disagree with their text
+/// (`!!null foo`, `!!bool "yes"`, `!!int abc`, `!!str true`, `!!str null`).
+const TAGGED_KINDS: &str = "a: !!null foo\nb: !!bool \"yes\"\nc: !!seq [1]\nd: ~\ne: true\nf: [1, 2]\ng: !!str true\nh: !!str null\ni: !!int abc\nj: 5\nk: {m: !!bool \"false\"}\n";
+
+/// #3690: a node a selector hands on keeps its style and its comments, as it
+/// does through yq's own `select`: `[a, b, c] # note` stays a flow sequence
+/// with its trailing comment, where the owned round trip it replaced printed
+/// a block sequence and dropped the comment.
+#[test]
+fn test_type_selectors_keep_style_and_comments_3690() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        ".ad | arrays",
+        "# head\nad: [a, b, c] # note\nname: \"quoted\"\n",
+        &["--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(stdout, "[a, b, c] # note\n");
+    Ok(())
+}
+
+/// #3690: `numbers`, `strings`, `arrays`, `objects` (jq-only builtins in yq,
+/// behind `--jq-extensions`) hand the node itself on, as `select(type == ...)`
+/// does, instead of materializing it first. The materializing route threw
+/// away what a YAML node carries beyond its value -- an explicit tag, a
+/// repeated mapping key, the spelling a number was written with -- so every
+/// row below answered differently from real yq's own spelling of the same
+/// selection (`select(tag == "!!int")` and its kin, captured from yq v4.53.3),
+/// and now answers the same.
+#[test]
+fn test_type_selectors_keep_what_the_owned_round_trip_lost_3690() -> Result<()> {
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    for (filter, input, want) in [
+        // An explicit tag decides the type a selected string reports.
+        (
+            "[.. | strings | type]",
+            "a: !!str 1\nb: !!binary aGk=\nc: !custom x\nd: !!str null\ne: !!str true\n",
+            r#"["!!str","!!binary","!custom","!!str","!!str"]"#,
+        ),
+        // yq keeps both occurrences of a repeated key.
+        ("[.. | objects | length]", "a: 1\na: x\nb: ~\n", "[3]"),
+        // `length` of a scalar is the length of the text it was written with.
+        ("[.. | numbers | length]", "- 01\n- 2\n", "[2,1]"),
+        ("[.. | numbers | length]", "- 1e3\n", "[3]"),
+        // The tag-aware type test decides `nulls`, `booleans`, `arrays` and
+        // `objects` too, as it decides them in yq's own `select(tag == ...)`
+        // (the `!!null foo`, `!!bool "yes"` and `!!seq` nodes are selected by
+        // their tag, the text `!!str true` is not a boolean).
+        (
+            r#"[.. | nulls | path | map(tostring) | join(".")]"#,
+            TAGGED_KINDS,
+            r#"["a","d"]"#,
+        ),
+        (
+            r#"[.. | booleans | path | map(tostring) | join(".")]"#,
+            TAGGED_KINDS,
+            r#"["b","e","k.m"]"#,
+        ),
+        (
+            r#"[.. | arrays | path | map(tostring) | join(".")]"#,
+            TAGGED_KINDS,
+            r#"["c","f"]"#,
+        ),
+        (
+            r#"[.. | objects | path | map(tostring) | join(".")]"#,
+            TAGGED_KINDS,
+            r#"["","k"]"#,
+        ),
+        // A bare `!` is the non-specific tag: the type comes from the content,
+        // as in yq, whether the node is reached by navigation or selected.
+        (
+            "[.[] | tag]",
+            "- ! tagged\n- !\n- ! 1\n- ! true\n- ! null\n- ! \"q\"\n- ! [a]\n- ! {k: v}\n",
+            r#"["!!str","!!null","!!int","!!bool","!!null","!!str","!!seq","!!map"]"#,
+        ),
+        (
+            "[.[] | strings | tag]",
+            "- ! tagged\n- ! \"q\"\n- !!str 5\n- plain\n",
+            r#"["!!str","!!str","!!str","!!str"]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, input, &args)?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "{filter} on {input:?}");
+    }
+    Ok(())
+}
+
 /// #3479: `--jq-extensions`' `path(.a)` over a string answers nothing on every
 /// route: in yq a field of a scalar is an empty result, not jq's error. The
 /// previous DOM route (`-R`, `--slurp`) raised `Cannot index string with

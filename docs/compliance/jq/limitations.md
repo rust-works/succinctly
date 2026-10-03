@@ -9131,6 +9131,92 @@ whole document that a streaming arm never read, and the M2 path was gated to kee
 from disagreeing. The gate is gone; the entry under "Real-time stdout/stderr interleaving"
 records the 19 rows that moved away from jq and the spelling rule it left in place.
 
+### `nulls`/`booleans`/`numbers`/`strings`/`arrays`/`objects` test a node's type and read nothing else — recorded on the #2168 footing (#3690)
+
+These six used to fall through to the materializing fallback: the whole value they were
+handed was decoded and re-entered through the owned evaluator, 13-16 allocator calls per
+element for what jq defines as `select(type == "number")` and the neighbouring `scalars`,
+`values` and `iterables` answered with none. As of
+[#3690](https://github.com/rust-works/succinctly/issues/3690) they test the node's own type,
+as `type` and `select(type == ...)` always did, and hand the node itself on. Like the entry
+above, that means a corrupted value *under* the node they test, which they never read, no
+longer makes them raise:
+
+```console
+$ printf '%s' '{"a":"\ud800","d":5}' | succinctly jq -c '[.[] | numbers]'
+[5]
+$ printf '%s' '{"a":"\ud800","d":5}' | succinctly jq -c 'objects | .d'
+5
+$ printf '%s' '[1.2.3, 4]' | succinctly jq -c 'numbers'
+$
+```
+
+Measured against the pinned binaries, with real jq 1.7.1 rejecting every one of these
+documents while parsing it (exit 5), so **every answering row diverges from jq**, exactly as
+in #2168's table:
+
+| filter | document | jq 1.7.1 | before #3690 | after |
+|---|---|---|---|---|
+| `numbers`, `strings`, `nulls`, `booleans`, `arrays` | `{"a":"\ud800","d":5}` | rejects | raise | answers nothing |
+| `objects \| .d` | `{"a":"\ud800","d":5}` | rejects | raise | `5` |
+| `[.[] \| numbers]`, `[.[] \| numbers, objects]` | `{"a":"\ud800","d":5}` | rejects | raise | `[5]` |
+| `[.[] \| strings] \| length` | `{"a":"\ud800","d":5}` | rejects | raise | `1` |
+| `.a \| strings \| length` | `{"a":"\ud800","d":5}` | rejects | raise | raise — the selected string is read |
+| `[.[] \| numbers]`, `.[] \| strings` | `[1.2.3, 4]` | rejects | raise | raise — the selector is handed the unreadable value (`type`'s own rule, #3222) |
+| `numbers` | `[1.2.3, 4]` | rejects | raise | answers nothing |
+| `arrays \| length` | `[1.2.3, 4]` | rejects | raise | `2` — the selected container is read, but `length` of it reads no element |
+| `objects \| keys` | `{"a":1.2.3,"b":[1]}` | rejects | raise | `["a","b"]` |
+
+**Why it was taken: the same three reasons as #2168.** (1) *The agreement being given up was
+an accident of an implementation detail.* The materialization the fallback ran doubled as a
+validity check on everything under the node, for a different reason than jq has and only for
+the six names that happened to reach it; no one decided that `numbers` should validate.
+(2) *It made one read's answer depend on how it was spelled.* jq's own definition is
+`def numbers: select(type == "number");`, and succinctly answered `select(type == "number")`
+on a document and raised on `numbers` over the same one. (3) *It cost the query its
+runtime*: `[.[] | numbers]` over 2,000 members was 28,034 allocator calls, `scalars` 25.
+That makes the answer uniform, which is the shape
+[ADR-0018](../../adrs/adr-0018.md)'s #2103 amendment sanctions for a semi-index that
+deliberately does not validate up front. A user who wants jq's rejection has `--validate` and
+`succinctly json validate`.
+
+A string selected by `strings` stays a cursor, so counting what was selected reads nothing
+(`[.[] | strings] | length` above is `1`, as `[.[]] | length` is `2` since #2575) and printing
+it echoes its raw source bytes (#2103); the first thing that *reads* it raises, as before.
+
+**What else moved, in yq mode, and towards the reference.** The materializing route threw
+away what a YAML node carries beyond its value. The cursor route keeps it, so
+`--jq-extensions`' selectors now answer what yq's own spelling of the same selection
+(`select(tag == "...")`, captured from yq v4.53.3) answers:
+
+- an explicit tag decides the type a selected string reports (`!!binary`, `!custom`);
+- a repeated mapping key counts twice (`{a: 1, a: x, b: ~}` has three entries, not two);
+- `length` of a scalar is the length of the text it was written with (`01` is `2`, `1e3` is `3`);
+- the node's style and comments ride along: `.ad | arrays` over `ad: [a, b, c] # note` prints
+  `[a, b, c] # note`, where the owned route printed a block sequence and dropped the comment, and
+  anchors and head/foot comments survive the same way;
+- `line`, `column` and `document_index` come from the node's position instead of answering `0`;
+- `type` of a selected *alias* prints `""`, which is yq's own answer (`.d | type` on a document
+  whose `d` is `*s`) and what `scalars` and `values` already printed.
+
+Rendering to JSON (`-o=json`) is unaffected by the style, comment and anchor rows. A user diffing
+YAML output across the upgrade will see them.
+
+**A bare `!` is no tag.** Selecting a node by type made one older bug reachable further: a
+node written with YAML's non-specific tag (`! tagged`, `!`, `! 1`, `! [a]`) reported `!` as its
+`tag` and `type`, because `yq_type_tag` returned the explicit tag text unconditionally. Real yq
+(go-yaml) resolves such a node from its content as if it had no tag: `!!str`, `!!null`, `!!int`,
+`!!seq`. That was wrong on plain navigation (`.[0] | tag`) before #3690 and is fixed with it, so
+a selected node no longer differs from the one the selector received. A custom tag
+(`!custom x`) is still reported as written.
+
+Pinned by `test_type_selectors_validate_only_what_they_read_3690` (the table above),
+`test_type_selectors_equal_their_definition_3690` (the six against `select(type == ...)`,
+768 combinations over valid, undecodable and malformed documents, same output and exit status)
+in `tests/jq_cli_tests.rs`, `test_type_selectors_keep_what_the_owned_round_trip_lost_3690` in
+`tests/yq_cli_tests.rs`, and `test_type_selectors_do_not_reindex_3690` in
+`src/jq/eval_generic.rs`.
+
 ### `break $x` shadowed by a `def error:` observes arbitrary ambient pipe state, not jq's own context-independent `{"__jq":N}` sentinel (#2687, #2840)
 
 [#2687](https://github.com/rust-works/succinctly/issues/2687): real jq does not treat `break`
