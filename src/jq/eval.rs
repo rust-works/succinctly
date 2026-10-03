@@ -111392,6 +111392,107 @@ mod tests {
         }
     }
 
+    /// #3689: a bare `.[]?` over a scalar settles in `eval_try` and `each_try`
+    /// without evaluating the `.[]` whose `Cannot iterate` message the boundary
+    /// would drop -- and still raises what `?` never swallows.
+    ///
+    /// Both routes are driven here, because the generic evaluator's own copy of
+    /// the rule (`try_single_generic`/`each_try_generic`) answers a cursor
+    /// document before this evaluator sees it, and the values this evaluator
+    /// gets through the reindex bridge are already decoded: only a direct call
+    /// over a document can reach the decode-failure arm. Every row is what the
+    /// `Iterate` arm gave under `?` before the shortcut.
+    #[test]
+    fn eval_rs_swallowed_scalar_iteration_settles_as_the_iterate_arm_did_3689() {
+        fn pulled<S: EvalSemantics>(json: &[u8], filter: &str) -> String {
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap();
+            match eval_full::<Vec<u64>, S>(&expr, index.root(json)) {
+                QueryResult::None => "none".to_owned(),
+                QueryResult::Owned(v) => v.to_json(),
+                QueryResult::Error(e) => format!("error decode={}", e.is_decode_failure()),
+                other => panic!("`{filter}` on {json:?}: {other:?}"),
+            }
+        }
+        fn pushed<S: EvalSemantics>(json: &[u8], filter: &str) -> String {
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap();
+            let mut out = Vec::new();
+            let flow = eval_each::<Vec<u64>, S>(&expr, index.root(json).value(), false, &mut |i| {
+                out.push(i.into_owned::<S>().unwrap().to_json());
+                Demand::Continue
+            });
+            match flow {
+                Flow::Exhausted => format!("exhausted {out:?}"),
+                Flow::Escaped(Control::Error(e)) => {
+                    format!("escaped decode={} {out:?}", e.is_decode_failure())
+                }
+                _ => panic!("`{filter}` on {json:?}: unexpected flow"),
+            }
+        }
+        // Dropped: nothing, and no handler to run.
+        for json in [&br"5"[..], br#""abc""#, b"null", b"true"] {
+            for filter in [".[]?", "(.[])?", "try .[]", "try .[] catch empty"] {
+                assert_eq!(pulled::<JqSemantics>(json, filter), "none", "{filter}");
+                assert_eq!(
+                    pushed::<JqSemantics>(json, filter),
+                    "exhausted []",
+                    "{filter}"
+                );
+                assert_eq!(pulled::<YqSemantics>(json, filter), "none", "{filter}");
+                assert_eq!(
+                    pushed::<YqSemantics>(json, filter),
+                    "exhausted []",
+                    "{filter}"
+                );
+            }
+        }
+        // What `?` never swallows: an undecodable string, and a scalar the
+        // index could not read.
+        for json in [&br#""\ud800""#[..], b"1.2.3"] {
+            for filter in [".[]?", "(.[])?", "try .[]", "try .[] catch empty"] {
+                assert_eq!(
+                    pulled::<JqSemantics>(json, filter),
+                    "error decode=true",
+                    "{filter}"
+                );
+                assert_eq!(
+                    pushed::<JqSemantics>(json, filter),
+                    "escaped decode=true []",
+                    "{filter}"
+                );
+                assert_eq!(
+                    pulled::<YqSemantics>(json, filter),
+                    "error decode=true",
+                    "{filter}"
+                );
+                assert_eq!(
+                    pushed::<YqSemantics>(json, filter),
+                    "escaped decode=true []",
+                    "{filter}"
+                );
+            }
+        }
+        // A handler that is anything but `empty` still runs, and reads the message.
+        assert_eq!(
+            pulled::<JqSemantics>(b"5", r#"try .[] catch "c""#),
+            r#""c""#
+        );
+        assert_eq!(
+            pushed::<JqSemantics>(b"5", r#"try .[] catch "c""#),
+            r#"exhausted ["\"c\""]"#
+        );
+        assert_eq!(
+            pulled::<JqSemantics>(b"5", "try .[] catch ."),
+            r#""Cannot iterate over number (5)""#
+        );
+        // A container is listed, not settled.
+        assert_eq!(
+            pushed::<JqSemantics>(b"[1,2]", ".[]?"),
+            r#"exhausted ["1", "2"]"#
+        );
+    }
+
     /// #1746: `to_entries`'s own `to_owned_lossy` call on each value is on the
     /// primary result path -- an undecodable value must raise instead of
     /// silently becoming `""` in the emitted `{key, value}` entry.
