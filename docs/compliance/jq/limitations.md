@@ -1024,18 +1024,26 @@ is the revert that established what the other one costs.
    resolver's guess about where jq's register went (#3267), and a `try` or `?` around the
    `and` must not swallow a guess. Residuals:
 
-   - **An operand jq leaves in place that this resolver cannot prove it leaves** (`reverse`,
-     `min`/`max`, `group_by(f)`/`sort_by(f)`, `flatten(n)`, `join`, any builtin outside
-     `cannot_move_register`'s allowlist and `leaves_register_in_place`) is read as a loss, so a
-     navigation in `R` is refused where jq accepts: `del(reverse and .[0])` on `[true]` is `[]`
-     in jq. Before #3428 the by-value route answered some of these by accident and accepted
+   - **An operand jq leaves in place that this resolver cannot prove it leaves** (`ltrimstr`,
+     `rtrimstr`, any builtin outside `cannot_move_register`'s allowlist and
+     `leaves_register_in_place`) is read as a loss, so a navigation in `R` is refused where jq
+     accepts: `del(ltrimstr("x") and .[0])` on `[true]` is `[]` in jq. Before #3428 the by-value
+     route answered some of these by accident and accepted
      others jq refuses (`path((first and .b?))` on `[true]` was empty there and refuses near
      `"b"` in jq), so the boundary moved from "accepts, sometimes wrongly" to "refuses, loudly".
      The allowlist grows only with an oracle row: #3361 gave `sort`, `to_entries`, `flatten`,
-     `add`, `map(f)` and `walk(f)` theirs (an `f` that navigates stays refused, see below),
-     which also lifts the same refusal for each of them as a bare pipe stage --
-     `path(. as $x | to_entries | $x)` is `[]` in jq, and a write through the re-established
-     `$x` lands.
+     `add`, `map(f)` and `walk(f)` theirs (an `f` that navigates stays refused, see below), and
+     #3711 gave `reverse`, `min`, `max`, `min_by(f)`, `max_by(f)`, `group_by(f)`, `sort_by(f)`,
+     `flatten(n)` and `join(s)` theirs (`min_by`/`max_by`/`group_by`/`sort_by` take any `f`: it
+     runs inside a C call's subexp). That also lifts the same refusal for each of them as a bare
+     pipe stage -- `path(. as $x | to_entries | $x)` is `[]` in jq, and a write through the
+     re-established `$x` lands. `flatten(n)` and `join(s)` iterate, so they still raise on an
+     input the register is not on (`path([[1]] | flatten(1))`), checked once the call has
+     produced a value (`iterates_untracked_input`) and not in `builtin_navigation`, whose
+     pre-evaluation check would pre-empt an argument's own error (`join(error("boom"))` must
+     raise `boom`, #2646). Before #3711 nothing checked them, and a `foreach` source accepted
+     `del(foreach .[]? as $k (.; flatten(1) and (.a)?; .b?))` on `[true]` where jq raises
+     (#3712).
    - **A refusal jq makes and catches is loud here.** jq catches its own path error inside a
      `try`: `del(try (any and .a))` on `{"a":true}` leaves the document. Where an operand may have
      moved the register this resolver cannot tell which error jq would raise, so its refusal is a
@@ -1044,7 +1052,13 @@ is the revert that established what the other one costs.
      path error, so on the node the register may still be on its refusal is a guess even when the
      step could never succeed (`del(try (any and .a?))` on `{"a":true}` is the document in jq),
      and a `(.a)?`/`(.a | .b)?` first step is no longer pruned silently there. Refuse-only, and
-     pinned (`test_and_or_path_by_value_operands_track_the_register_3428`).
+     pinned (`test_and_or_path_by_value_operands_track_the_register_3428`). The same holds for
+     the refusal of an untracked iteration: `path(. as $x | ["a"] | try join(",") catch . | $x)`
+     is `[]` in jq and exits 5 here, for `add`, `flatten` and `flatten(n)`/`join(s)` alike (the
+     refusal is a guess where the register may have been lost, #3267). The ordering inside
+     `flatten(n)` and `join(s)` is also approximate: jq reports the path error before the
+     body's own type error (`null | join(",")` is `near attempt to iterate through null`),
+     this resolver the type error, both exit 5 with nothing on stdout.
    - **`map(f)` and `walk(f)` with an `f` outside `cannot_move_register`'s allowlist** are
      refused as a stage and as an operand where jq answers (`path(. as $x | map(.a) | $x)` on
      `[{"a":1}]` is `[]` in jq, and so is `map(sort)` on `[[3],[1]]`): jq path-checks `f` against
@@ -1054,15 +1068,21 @@ is the revert that established what the other one costs.
      `map(add)`): `add` iterates the element, which is the register for `map` but a computed
      array for the trailing `| f` of `walk`, so one rule cannot cover both.
    - **The promoted builtins inside a compound stage** (`[sort]`, `limit(1; sort)`,
-     `(sort, add)`, `if`/`try` around them) are read as a loss: the stage is judged as a whole,
-     and jq answers `[]` for each (the stage-level downgrade and `array_contents_are_checked`
-     promotions in `docs/plan/jq-path-register-producer-contract.md`, section 10).
-     Refuse-only. Both rows are pinned
+     `(sort, add)`, `(flatten(1), reverse)`, `[join(",")]`, `if`/`try` around them) are read as
+     a loss: the stage is judged as a whole, and jq answers for each (the stage-level
+     downgrade and `array_contents_are_checked` promotions in
+     `docs/plan/jq-path-register-producer-contract.md`, section 10). Refuse-only, identical
+     before #3361 and #3711. Both rows are pinned
      (`test_path_register_by_value_builtin_stages_do_not_move_it_3361`).
    - **A refusal inside a `?//` body is not retried** (`path_alternative_retries`), so
      `del(. as $x ?// $y \| if $x then (.a and .b) else .c end)` on `{"a":1,"c":2}` refuses
      where jq retries past its own path error and answers `{"a":1}`. Before #3289 the by-value
-     evaluation happened to give jq's answer there.
+     evaluation happened to give jq's answer there. #3711 moved `flatten(n)` and `join(s)` to the
+     same side of the line: refusing their iteration on an untracked input (so a `foreach`
+     source stops accepting what jq raises on, #3712) means
+     `del(. as [$q] ?// $q | (flatten(1) and (.a)?))`
+     on `[true]`, which jq answers with the document, now refuses as bare `flatten` and `add`
+     always did. 48 sweep rows, all in the `?//` contexts and all loud refusals.
    - **Pointer identity** is modelled only for `null`/`true`/`false` and a full slice of a
      non-empty array (`.[0:]` is the input itself to jq; an empty slice is a fresh `[]`, never
      identical -- #3494), so `path(.a as $v \| . as $w \| $v \| (($w \| .a)

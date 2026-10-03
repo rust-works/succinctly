@@ -38710,6 +38710,16 @@ fn builtin_navigation<S: EvalSemantics>(
         | Builtin::AnyF(_)
         | Builtin::All
         | Builtin::AllF(_)
+        // `flatten(n)` and `join(s)` are deliberately not here (#2646): their
+        // `$`-parameter runs before the iteration, so an argument that raises
+        // must win, and this table is consulted before anything is evaluated.
+        // Their iteration is refused once the call has produced a value
+        // instead ([`iterates_untracked_input`], #3711). So the family has two
+        // mechanisms -- this table for the argument-free `flatten`, `add` and
+        // `map`, that one for the `$param` forms -- and
+        // `test_path_register_more_by_value_builtins_do_not_move_it_3711` pins
+        // `flatten` against `flatten(0)` on the same untracked input: move one
+        // and that test says whether the other still agrees.
         | Builtin::Flatten
         | Builtin::Map(_)
         | Builtin::FromEntries => Ok(Some(BuiltinNavigation::Iterate)),
@@ -38960,6 +38970,45 @@ fn always_refuses_as_live_path<S: EvalSemantics>(
     }
 }
 
+/// The iteration `flatten(n)` and `join(s)` make over their input, refused when
+/// the leaf's input is not the register (#3711): jq defines both over `reduce
+/// .[] as $i (...)`, and that `.[]` path-checks its input, so
+/// `path([[1]] | flatten(1))` and `path(["a"] | join(","))` raise `near attempt
+/// to iterate through` while the same call on the register itself passes.
+///
+/// A sibling of [`always_refuses_as_live_path`] and run at the same two sites,
+/// for the same reason: **it must run on a value the call has produced, never as
+/// a pre-check.** `def flatten($x)` and `def join($x)` bind their argument as a
+/// `$param` before iterating, so an argument that raises (`join(error("boom"))`),
+/// `flatten`'s negative-depth guard and a type error on the input all win over
+/// the path error, which [`builtin_navigation`] -- consulted before anything is
+/// evaluated -- cannot honour (#2646). Unlike the always-refuses constructs it
+/// only applies to an input the register is not on, and the refusal is a guess
+/// where the register may have been lost ([`guess_refusal`]), exactly as the
+/// table's own are. jq mode only (ADR-0018). The message names the call's
+/// input, as jq's does.
+fn iterates_untracked_input<S: EvalSemantics>(
+    expr: &Expr,
+    trackable: bool,
+    input: &OwnedValue,
+    register_loss: &RegisterLoss,
+    snapshot: &Snapshot,
+) -> Option<EvalError> {
+    if S::TAG != EvalTag::Jq || trackable {
+        return None;
+    }
+    match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::FlattenDepth(_) | Builtin::Join(_)) => Some(guess_refusal(
+            EvalError::invalid_path_expression_near_iterate(input),
+            register_loss,
+            snapshot,
+            input,
+            Some(NavKind::Iterate),
+        )),
+        _ => None,
+    }
+}
+
 /// [`always_refuses_as_live_path`]'s sibling for the one shape that fell
 /// through it entirely: `match`/`scan`/`capture` (plus their `Flags` forms)
 /// produce **zero** values when the pattern never matches, and
@@ -39079,6 +39128,14 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
         &mut |v| {
             delivered += 1;
             if let Some(e) = always_refuses_as_live_path::<S>(expr, walk_input_reaches_object, &v) {
+                construct_refusal = Some(e);
+                return Demand::Stop;
+            }
+            // #3711: the iteration `flatten(n)`/`join(s)` make, on a value
+            // they have produced, so an argument's own error has already won.
+            if let Some(e) =
+                iterates_untracked_input::<S>(expr, trackable, value, register_loss, snapshot)
+            {
                 construct_refusal = Some(e);
                 return Demand::Stop;
             }
@@ -39422,6 +39479,13 @@ fn resolve_leaf<'a, S: EvalSemantics>(
                 construct_refusal = Some(e);
                 return Demand::Stop;
             }
+            // #3711: as in `resolve_leaf_sink`.
+            if let Some(e) =
+                iterates_untracked_input::<S>(expr, trackable, value, register_loss, snapshot)
+            {
+                construct_refusal = Some(e);
+                return Demand::Stop;
+            }
             values.push(v);
             if values.len() >= limit {
                 Demand::Stop
@@ -39588,12 +39652,41 @@ fn leaf_register<'a, S: EvalSemantics>(
 /// entry, so what it navigates passes. `map` qualifies only for an `f` that
 /// navigates nothing: jq path-checks `f` against every element and a by-value
 /// `map` does not (`map({a:1} | .a)` is a path error in jq and `[1]` here).
+///
+/// #3711 adds the next group, captured the same way. `min` and `max` are
+/// C-coded like `sort`. `min_by(f)`, `max_by(f)`, `group_by(f)` and `sort_by(f)`
+/// are `_IMPL(map([f]))`: the argument of a C function is a subexp, so the
+/// `map([f])` that iterates the input and runs `f` on every element neither
+/// moves the register nor path-checks anything, **whatever `f` navigates**
+/// (`path(. as $x | sort_by(.a) | $x)` is `[]` on `[{"a":1}]`), and on an input
+/// the register is not on they raise nothing at all (`path(. as $x | [[1]] |
+/// group_by(.) | $x)` is `[]`), so unlike `map(f)` they need neither a
+/// restriction on `f` nor a [`builtin_navigation`] entry. `reverse` is
+/// `[.[length - 1 - range(0; length)]]`, a collect that backtracks; it is
+/// already in [`builtin_navigation`] for the access it makes. `flatten(n)` and
+/// `join(s)` are `reduce .[] as $i (...)` like `add`, with the depth or
+/// separator a `$param` binding (a subexp), so their one navigation is the
+/// `.[]` that [`iterates_untracked_input`] refuses on an input the register is
+/// not on, once the call has produced a value (not in [`builtin_navigation`],
+/// whose pre-evaluation check would pre-empt an argument's own error, #2646).
 fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
     cannot_move_register(expr)
         || (S::TAG == EvalTag::Jq
             && match unwrap_paren(expr) {
                 Expr::Builtin(
-                    Builtin::Add | Builtin::Flatten | Builtin::Sort | Builtin::ToEntries,
+                    Builtin::Add
+                    | Builtin::Flatten
+                    | Builtin::FlattenDepth(_)
+                    | Builtin::GroupBy(_)
+                    | Builtin::Join(_)
+                    | Builtin::Max
+                    | Builtin::MaxBy(_)
+                    | Builtin::Min
+                    | Builtin::MinBy(_)
+                    | Builtin::Reverse
+                    | Builtin::Sort
+                    | Builtin::SortBy(_)
+                    | Builtin::ToEntries,
                 ) => true,
                 Expr::Builtin(Builtin::Map(f) | Builtin::Walk(f)) => cannot_move_register(f),
                 _ => false,

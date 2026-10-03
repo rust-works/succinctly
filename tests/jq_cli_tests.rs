@@ -62230,6 +62230,270 @@ fn test_path_register_by_value_builtin_stages_do_not_move_it_3361() -> Result<()
     ])
 }
 
+/// #3711: the next group of by-value builtins jq leaves in place, each captured
+/// from jq 1.7.1 with `-c`. `min` and `max` are C-coded; `min_by`, `max_by`,
+/// `group_by` and `sort_by` are `_IMPL(map([f]))`, a C call whose argument is a
+/// subexp, so they neither move the register nor path-check anything whatever
+/// `f` navigates (`sort_by(.a)`); `reverse` is a collect that backtracks;
+/// `flatten(n)` and `join(s)` are `reduce .[]` like `add`. The ones that iterate
+/// (`flatten(n)`, `join`, `reverse`) still raise on an input the register is not
+/// on, and `unique_by` (which iterates a computed array) stays refused. The
+/// last rows are #3712: `flatten(1)` was missing from the builtins that name the
+/// navigation they do, so a `foreach` source accepted it where jq raises.
+#[test]
+fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()> {
+    let objs = r#"[{"a":1},{"a":2}]"#;
+    let bad = "Invalid path expression";
+    assert_path_rows_3289(&[
+        ("[1,[2]]", r"path(. as $x | reverse | $x)", "[]\n", "", 0),
+        ("[1,[2]]", r"path(. as $x | min | $x)", "[]\n", "", 0),
+        ("[1,[2]]", r"path(. as $x | max | $x)", "[]\n", "", 0),
+        ("[1,[2]]", r"path(. as $x | min_by(.) | $x)", "[]\n", "", 0),
+        ("[1,[2]]", r"path(. as $x | max_by(.) | $x)", "[]\n", "", 0),
+        (
+            "[1,[2]]",
+            r"path(. as $x | group_by(.) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        ("[1,[2]]", r"path(. as $x | sort_by(.) | $x)", "[]\n", "", 0),
+        // An `f` that navigates is fine: it runs inside the C call's subexp.
+        (objs, r"path(. as $x | group_by(.a) | $x)", "[]\n", "", 0),
+        (objs, r"path(. as $x | sort_by(.a) | $x)", "[]\n", "", 0),
+        (objs, r"path(. as $x | min_by(.a) | $x)", "[]\n", "", 0),
+        ("[1,[2]]", r"path(. as $x | flatten(1) | $x)", "[]\n", "", 0),
+        ("[1,[2]]", r"path(. as $x | flatten(0) | $x)", "[]\n", "", 0),
+        (
+            r#"["a","b"]"#,
+            r#"path(. as $x | join(",") | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":"x","b":"y"}"#,
+            r#"path(. as $x | join(",") | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        ("[]", r#"path(. as $x | join(",") | $x)"#, "[]\n", "", 0),
+        ("[]", r"path(. as $x | reverse | $x)", "[]\n", "", 0),
+        ("{}", r"path(. as $x | reverse | $x)", "[]\n", "", 0),
+        ("[]", r"path(. as $x | min | $x)", "[]\n", "", 0),
+        // The register is re-established, so a path off `$x` lands.
+        (
+            "[3,1,2]",
+            r"path(. as $x | sort_by(.) | $x[0])",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[3,1],"k":2}"#,
+            r"path(.a | . as $x | reverse | $x)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "[[3,1],[2]]",
+            r"path(.[] | . as $x | reverse | $x)",
+            "[0]\n[1]\n",
+            "",
+            0,
+        ),
+        // Writes through it.
+        (
+            "[1,[2]]",
+            r"del(. as $x | reverse | $x[0])",
+            "[[2]]\n",
+            "",
+            0,
+        ),
+        (
+            "[3,1,2]",
+            r"(. as $x | sort_by(.) | $x[0]) = 9",
+            "[9,1,2]\n",
+            "",
+            0,
+        ),
+        (
+            "[3,1,2]",
+            r"(. as $x | group_by(.) | $x[1]) |= 9",
+            "[3,9,2]\n",
+            "",
+            0,
+        ),
+        (
+            "[3,1,2]",
+            r"del(. as $x | min_by(.) | try ($x | .[0]))",
+            "[1,2]\n",
+            "",
+            0,
+        ),
+        (
+            "[1,[2]]",
+            r"del(. as $x | flatten(1) | $x[0])",
+            "[[2]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"["a","b"]"#,
+            r#"(. as $x | join(",") | $x[0]) = "z""#,
+            "[\"z\",\"b\"]\n",
+            "",
+            0,
+        ),
+        // As an `and` operand: the family #3428 left refused until each had a row.
+        ("[true]", r"del(reverse and .[0])", "[]\n", "", 0),
+        ("[true]", r"del(min and .[0])", "[]\n", "", 0),
+        ("[true]", r"del(max and .[0])", "[]\n", "", 0),
+        ("[true]", r"del(group_by(.) and .[0])", "[]\n", "", 0),
+        ("[true]", r"del(sort_by(.) and .[0])", "[]\n", "", 0),
+        ("[true]", r"del(flatten(1) and .[0])", "[]\n", "", 0),
+        ("[true]", r#"del(join(",") and .[0])"#, "[]\n", "", 0),
+        // On an input the register is not on, what iterates still raises (once the
+        // call has succeeded: jq reports the path error before the body's own type
+        // error on `[[1],[2]] | join(",")`, this resolver the type error, both exit
+        // 5 with nothing on stdout) ...
+        ("{}", r"path([[1]] | flatten(1))", "", bad, 5),
+        ("{}", r#"path(["a"] | join(","))"#, "", bad, 5),
+        (
+            "{}",
+            r"path(. as $x | [[1],[2]] | flatten(0) | $x)",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "{}",
+            r#"path(. as $x | ["a","b"] | join(",") | $x)"#,
+            "",
+            bad,
+            5,
+        ),
+        (
+            "{}",
+            r"path(. as $x | [[1],[2]] | reverse | $x)",
+            "",
+            bad,
+            5,
+        ),
+        // ... and what is C-coded still does not.
+        ("{}", r"path(. as $x | [[1],[2]] | min | $x)", "[]\n", "", 0),
+        (
+            "{}",
+            r"path(. as $x | [[1],[2]] | group_by(.) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A navigation off the result is checked against a register that is not
+        // on it, and a register that left the root before the stage ran is not
+        // the one a `$x` frozen at the root names.
+        ("[[1],[2]]", r"path(. as $x | reverse | .[0])", "", bad, 5),
+        ("[[1],[2]]", r"path(. as $x | min | .[0])", "", bad, 5),
+        (
+            "[[1],[2]]",
+            r"path(. as $x | sort_by(.) | .[0])",
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#"{"a":[3,1],"k":1}"#,
+            r"path(. as $x | .a | reverse | $x)",
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#"{"a":[3,1],"k":1}"#,
+            r"path(. as $x | .a | sort_by(.) | $x)",
+            "",
+            bad,
+            5,
+        ),
+        // The bare `flatten` is refused by `builtin_navigation` before it is
+        // evaluated and `flatten(n)` by `iterates_untracked_input` after, two
+        // mechanisms for one family: on the same untracked input they agree.
+        (
+            "{}",
+            r"path(. as $x | [[1],[2]] | flatten | $x)",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "{}",
+            r"path(. as $x | [[1],[2]] | flatten(0) | $x)",
+            "",
+            bad,
+            5,
+        ),
+        // The new group inside a compound stage is read as a loss, like the
+        // #3361 group (`test_path_register_by_value_builtin_stages_do_not_move_it_3361`):
+        // jq answers each of these, so they are pinned as today's refuse-only
+        // behaviour. A `try` or `?` around an untracked iteration does not catch
+        // the refusal either, as for `add` and `flatten`.
+        (
+            r#"{"a":["x"]}"#,
+            r"path(.a | . as $x | (flatten(1), reverse) | $x[0])",
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#"{"a":["x"]}"#,
+            r#"path(.a | . as $x | [join(",")] | $x[0])"#,
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#"{"a":["x"]}"#,
+            r"path(.a | . as $x | limit(1; reverse) | $x[0])",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "{}",
+            r#"path(. as $x | ["a"] | try join(",") catch . | $x)"#,
+            "",
+            bad,
+            5,
+        ),
+        // `unique_by` iterates a computed array in jq and raises there.
+        ("[1,[2]]", r"path(. as $x | unique_by(.) | $x)", "", bad, 5),
+        // #3712.
+        (
+            "[true]",
+            r"del(foreach .[]? as $k (.; flatten(1) and (.a)?; .b?))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del(foreach .[]? as $k (.; flatten(1) and (.a | .b)?; .b?))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(foreach .[]? as $k (.; flatten(1) and (.a)?; .b?))",
+            "",
+            bad,
+            5,
+        ),
+    ])
+}
+
 /// #3456 (B2): the survival rule is decided per *stage*, not per leaf. A
 /// compound stage that mixes a leaf that navigates with one that does not
 /// loses the register as a whole, so these refuse where jq 1.7.1 answers `[]`
@@ -64069,13 +64333,14 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
-        // (`walk(.)` was one of these until #3361: it backtracks its source, so
-        // it keeps the register and answers `["a"]` as jq does, pinned in
-        // `test_terminal_null_carve_out_keeps_its_answers_3579`; `reverse` is
-        // jq-defined over a collect too and is still read as a loss)
+        // (`walk(.)` was one of these until #3361 and `reverse` until #3711:
+        // each backtracks its source, so it keeps the register and answers
+        // `["a"]` as jq does, pinned in
+        // `test_terminal_null_carve_out_keeps_its_answers_3579`; `rtrimstr` is
+        // jq's too and still read as a loss)
         (
             r"null",
-            r"path(.a|reverse|null)",
+            r#"path(.a|rtrimstr("x")|null)"#,
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -64109,6 +64374,8 @@ fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
         // #3361: `walk(.)` leaves the register on `.a`, so the terminal `null`
         // is at `["a"]`, not a guess.
         (r"null", r"path(.a|walk(.)|null)", "[\"a\"]\n", "", 0),
+        // #3711: `reverse` is a collect that backtracks, so it keeps it too.
+        (r"null", r"path(.a|reverse|null)", "[\"a\"]\n", "", 0),
         (r"null", r"path((.a | empty), null)", "[]\n", "", 0),
         (r"null", r"del(null)", "null\n", "", 0),
         (r"true", r"path(true)", "[]\n", "", 0),

@@ -189,17 +189,30 @@ OPERANDS = [
     # source or never lets touch the register: `walk(f)` and `map(f)` qualify
     # only for an `f` that navigates nothing (`walk(.a)` and `map(.a)` are the
     # contrasts: jq path-checks `f` against the elements, a by-value stage does
-    # not). The last four are builtins jq also leaves in place that stay refused
-    # until each has an oracle row of its own.
+    # not).
     "walk(.)",
     "walk(tostring)",
     "walk(.a)",
     "map(tostring)",
     "map(.a)",
+    # (#3711) promoted: `reverse` is a collect that backtracks, `min`/`max` are C
+    # calls, `min_by`/`max_by`/`group_by`/`sort_by` are C calls over a `map([f])`
+    # argument (a subexp, so any `f` is fine), `flatten(n)` and `join(s)` are
+    # `reduce .[]` like `add`. `unique_by` is the contrast jq raises on (it
+    # iterates a computed array), which must stay refused.
     "reverse",
     "min",
     "flatten(1)",
     "group_by(.)",
+    "max",
+    "min_by(.)",
+    "max_by(.)",
+    "group_by(.a)",
+    "sort_by(.)",
+    "sort_by(.a)",
+    "flatten(0)",
+    "join(\",\")",
+    "unique_by(.)",
 ]
 
 # The other side of a two-operand shape. Chosen so that, against the inputs
