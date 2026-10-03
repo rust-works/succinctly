@@ -319,7 +319,7 @@ doesn't — a ±~26pp swing driven purely by which CPU the run landed on, not by
 any code change. This is expected, not a regression — and it is now **filtered
 out of the PR comment** rather than merely tolerated: `src/bits/popcount.rs` is
 listed in [`.omni-dev/coverage.yaml`](.omni-dev/coverage.yaml), which
-`omni-dev coverage diff` (>= 0.38.0, pinned in `ci.yml`) reads straight from the
+`omni-dev coverage diff` (>= 0.38.0, pinned in `.github/actions/coverage/action.yml`) reads straight from the
 checkout and applies to *both* the baseline and head reports before diffing, so
 the file can no longer generate a phantom entry. Note the exclusion is symmetric
 and therefore also removes the file from the **`Total:`** the comment reports —
