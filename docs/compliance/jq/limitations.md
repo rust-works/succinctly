@@ -1884,6 +1884,19 @@ is the revert that established what the other one costs.
    The rule is **jq-mode only** (ADR-0018): `map`, `any`, `all` and `flatten` are real yq
    builtins, and yq v4.53.3 raises for none of them, so `succinctly yq` does not either.
 
+   **#3360 added two members to the first row.** `from_entries` is `map({...}) | add`, so it
+   iterates the array `map` built and raises `near attempt to iterate through` it on every value
+   it produces (`path([from_entries] | empty)` on `[{"key":"a","value":1}]`, and on `[]`); it had
+   no arm, so `del(. as $x | [from_entries] | try .[0])` finished with the document untouched and
+   exit 0 where jq exits 5. A `try`/`?` directly on it still catches it, as in jq. And a `walk(f)`
+   over an input that reaches an object raises when `f` yields nothing too (`path(walk(empty))`
+   on `{"a":1}`): its object arm is `map_values`, which raises once it runs at all, but the check
+   only ran on a value the call produced. **Still accepted wrongly:** a `walk(f)` whose `f`
+   navigates the computed array it is applied to (`path(walk(.a?))` on `[1]`, `path(walk(.[]?))`
+   on `[]`): jq raises there, even through a `?`, and a by-value `walk` never checks `f`'s
+   navigation ([#3723](https://github.com/rust-works/succinctly/issues/3723)). Both rules are
+   jq mode only, like the rest of the table.
+
    **#2746's own fix introduced one further, separate divergence, on the register rather
    than on navigation**: `INDEX(gen;f)` (and, until
    [#3643](https://github.com/rust-works/succinctly/issues/3643), `last(f)`) is `reduce`-based

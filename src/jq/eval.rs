@@ -38876,8 +38876,18 @@ fn live_path_refusal(expr: &Expr) -> Option<RefusalShape> {
         // cannot reproduce, the same approximation tradeoff as the
         // `WithEntries`/`Unique` group). Confirmed live against jq 1.7.1
         // for every member of both groups.
+        //
+        // #3360: `from_entries` is the same shape (`map({...}) | add`, and
+        // `add` iterates the array `map` built), and the same oracle: on
+        // `[]`, `[{"key":"a","value":1}]`, `[{"name":"a","v":1}]` and an
+        // object of entries, `path(from_entries)`, `path([from_entries])` and
+        // `path(first(from_entries))` all raise `near attempt to iterate
+        // through` the derived array, which a `try` or `?` catches. It never
+        // had an arm, so `del(. as $x | [from_entries] | try .[0])` finished
+        // with the document untouched and exit 0 where jq exits 5.
         Expr::Builtin(
-            Builtin::WithEntries(_)
+            Builtin::FromEntries
+            | Builtin::WithEntries(_)
             | Builtin::Unique
             | Builtin::UniqueBy(_)
             | Builtin::Sub(_, _)
@@ -39029,7 +39039,22 @@ fn iterates_untracked_input<S: EvalSemantics>(
 /// really is the empty array `[]`, confirmed live for all three
 /// (`match`/`scan`/`capture`), so this reproduces jq's own message exactly
 /// rather than approximating it.
-fn always_refuses_when_empty<S: EvalSemantics>(expr: &Expr) -> Option<EvalError> {
+///
+/// #3360: `walk(f)` over an input that reaches an object at any depth
+/// ([`array_reaches_object`]) is the second member. Its object arm is
+/// `map_values(w)`, whose `_modify` bookkeeping raises once it runs at all, so
+/// jq raises whatever `f` then yields -- including nothing: `path(walk(empty))`
+/// and `path(walk(select(type != "array")))` on `{"a":1}`, `[{"a":1}]` and
+/// `{"a":[1]}` all exit 5 in jq 1.7.1, and answered nothing at exit 0 here
+/// because [`always_refuses_as_live_path`], which already raises for such a
+/// `walk` on every value it *produces*, never ran. The message names `input`
+/// where jq names the derived `[<input>,[]]` (the approximate-container tradeoff
+/// of #3271, recorded in `limitations.md`).
+fn always_refuses_when_empty<S: EvalSemantics>(
+    expr: &Expr,
+    walk_input_reaches_object: bool,
+    input: &OwnedValue,
+) -> Option<EvalError> {
     if S::TAG != EvalTag::Jq {
         return None;
     }
@@ -39044,6 +39069,9 @@ fn always_refuses_when_empty<S: EvalSemantics>(expr: &Expr) -> Option<EvalError>
         ) => Some(EvalError::invalid_path_expression_near_iterate(
             &OwnedValue::Array(Vec::new().into()),
         )),
+        Expr::Builtin(Builtin::Walk(_)) if walk_input_reaches_object => Some(
+            EvalError::invalid_path_expression_near_access(&OwnedValue::Int(0), input),
+        ),
         _ => None,
     }
 }
@@ -39191,7 +39219,7 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     // argument's own type error/`error(...)` must still come first, same
     // ordering rule as `always_refuses_as_live_path`).
     if delivered == 0 && matches!(flow, Flow::Exhausted) {
-        if let Some(e) = always_refuses_when_empty::<S>(expr) {
+        if let Some(e) = always_refuses_when_empty::<S>(expr, walk_input_reaches_object, value) {
             return ResolveFlow::Escaped(EvalEscape::Error(e));
         }
     }
@@ -39537,7 +39565,8 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // must still win first, which a bare-shape pre-check would not
         // respect).
         if matches!(flow, Flow::Exhausted) {
-            if let Some(e) = always_refuses_when_empty::<S>(expr) {
+            if let Some(e) = always_refuses_when_empty::<S>(expr, walk_input_reaches_object, value)
+            {
                 return Err((Vec::new(), EvalEscape::Error(e)));
             }
         }
@@ -40626,16 +40655,12 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // its own type/argument error first. Sharing `live_path_refusal`
         // (rather than re-listing the same builtins here) follows
         // `CLAUDE.md`'s "duplicated predicates diverge silently" rule.
-        // `Walk`/`FromEntries` are deliberately not members of that
-        // classifier and so never reach this arm, for two different
-        // reasons: `Walk` has its own arm just above because its refusal
-        // is genuinely value-dependent (`array_reaches_object`). `FromEntries`
-        // is not value-dependent at all -- confirmed live against jq 1.7.1,
-        // it raises unconditionally on every input tried, empty or not --
-        // it simply has no `always_refuses_as_live_path`/`live_path_refusal`
-        // arm of its own *yet*; adding one is the gap named in step 7's
-        // follow-up, after which `FromEntries` becomes eligible for this
-        // same catch-all with no further change here.
+        // `Walk` is deliberately not a member of that classifier and so never
+        // reaches this arm: it has its own arm just above because its
+        // refusal is genuinely value-dependent (`array_reaches_object`).
+        // `FromEntries` is a member since #3360 -- it raises unconditionally
+        // on every input, empty or not -- and so arrives here with no
+        // further change, as this comment used to predict.
         e if live_path_refusal(e).is_some() => true,
         other => cannot_move_register(other),
     }
