@@ -1384,6 +1384,36 @@ fn decode_failure_or<V: DocumentValue>(
     }
 }
 
+/// What a `?`/`try` boundary that swallows `.[]` settles for a scalar `value`
+/// without evaluating `.[]` (#3689), or `None` when it must evaluate: `expr` is
+/// not such a boundary's body (see
+/// [`try_swallows_scalar_iteration`](crate::jq::eval::try_swallows_scalar_iteration)),
+/// or `value` is a container, which has members to list.
+///
+/// `Some(Ok(()))` is the swallowed `Cannot iterate over ...`; `Some(Err(e))` is
+/// the failure `?` never swallows -- an undecodable string, a value the index
+/// could not read -- which [`decode_failure_or`] checks before anything else,
+/// exactly as the `Iterate` arm does, so the two cannot disagree on which
+/// scalar raises. A yq-mode scalar iterates to nothing, which is `Ok(())` too.
+fn swallowed_scalar_iteration<V: DocumentValue>(
+    expr: &Expr,
+    catch: Option<&Expr>,
+    value: &V,
+) -> Option<Result<(), EvalError>> {
+    if value.as_array().is_some()
+        || value.as_object().is_some()
+        || !crate::jq::eval::try_swallows_scalar_iteration(expr, catch)
+    {
+        return None;
+    }
+    Some(
+        match decode_failure_or(value, true, || GenericResult::None) {
+            GenericResult::Error(e) if e.is_uncatchable_at_value_position() => Err(e),
+            _ => Ok(()),
+        },
+    )
+}
+
 /// The jq `type` name for `value` at `cursor`, resolving an explicit YAML
 /// tag first (e.g. `!!str 1` is `"string"`, not `"number"` — issue #747)
 /// and falling back to [`DocumentValue::type_name`] otherwise. Mirrors
@@ -9503,6 +9533,12 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    // #3689: a bare `.[]?` over a scalar settles here, without evaluating the
+    // `.[]` that would format the `Cannot iterate over ...` message this
+    // boundary drops (see `try_swallows_scalar_iteration`).
+    if let Some(settled) = swallowed_scalar_iteration::<V>(inner, catch, &value) {
+        return settled.map_or_else(GenericResult::Error, |()| GenericResult::None);
+    }
     // A handler that reads path context stands at this stage's position
     // (spine 2416, identity pass): the sink route's `each_try_generic` runs
     // it from the cursor, so delegate to it rather than growing a second
@@ -12521,6 +12557,11 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    // #3689: as in `try_single_generic`, a bare `.[]?` over a scalar settles
+    // here.
+    if let Some(settled) = swallowed_scalar_iteration::<V>(expr, catch, &value) {
+        return settled.map_or_else(|e| Flow::Escaped(Control::Error(e)), |()| Flow::Exhausted);
+    }
     let lazy_fault = StashedEscape::new();
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
         push_checked_lazy_item::<V, S>(&lazy_fault, item, sink)
@@ -22185,6 +22226,29 @@ fn path_context_step_recurse<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<(), Control> {
     guard_nesting_depth(pos.trail.recursion_depth())?;
     out.push(pos.clone());
+    // #3689: a scalar has no members, and `.[]?` drops the error iterating it
+    // raises -- but not one that escapes `?` (an undecodable string, a scalar
+    // the cursor cannot read). Those are decided exactly as the step decides
+    // them, by [`scalar_iteration_precheck`] and [`validate_cursor`] (the pair
+    // `each_recurse_cursor_generic` uses for `..`), so a leaf spares the
+    // `Cannot iterate` message the step would format and `try` would drop, and
+    // most nodes are leaves. A node that is not a live scalar takes the step.
+    if let PathNode::At(cursor) = &pos.node {
+        let node = cursor.value();
+        if node.as_object().is_none() && node.as_array().is_none() {
+            let read = scalar_iteration_precheck::<S, V>(&node).and_then(|reads| {
+                if reads {
+                    validate_cursor::<S, _>(cursor)
+                } else {
+                    Ok(())
+                }
+            });
+            return match read {
+                Err(e) if e.is_uncatchable_at_value_position() => Err(Control::Error(e)),
+                _ => Ok(()),
+            };
+        }
+    }
     let mut children = Vec::new();
     path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;
     for child in &children {
