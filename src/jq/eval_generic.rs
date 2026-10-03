@@ -3212,6 +3212,14 @@ impl<V: DocumentValue> Iterator for LazySeq<V> {
                 Ok(None) => return None,
                 Err(e) => return Some(Err(Control::Error(e))),
             };
+            // No stage to run (`map(.)`'s bare identity, #724/#725; `[.[]]`
+            // printed directly, #2575): `fold_one` would wrap `elem` in a
+            // one-item `Vec` only for the pop above to take it straight
+            // back out (#2913). `instructions` is `None` until the first
+            // stage is pushed, never an empty `Some`.
+            if self.instructions.is_none() {
+                return Some(Ok(elem));
+            }
             match self.fold_one(elem) {
                 Ok(mut items) => {
                     items.reverse();
@@ -33961,6 +33969,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, "");
+    }
+
+    /// #2913: an instruction-free `LazySeq` hands out its source's elements
+    /// without a per-element `fold_one` round trip. Every source kind drains
+    /// to the same elements, in the same order, as the same source behind a
+    /// stage that changes nothing (`map(.)` pushed on top), which still goes
+    /// through `fold_one`.
+    #[test]
+    fn test_instruction_free_lazy_seq_drains_like_an_identity_stage_2913() {
+        fn drained(json: &[u8], filter: &str) -> Vec<String> {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let GenericResult::LazySeq(seq) = eval(&expr, cursor.value()) else {
+                panic!("{filter}: not a LazySeq");
+            };
+            seq.drain_atomic()
+                .unwrap()
+                .into_iter()
+                .map(|elem| match elem {
+                    LazyElem::Cursor(c) => to_owned_cursor::<JqSemantics, _>(&c).unwrap().to_json(),
+                    LazyElem::Owned(o) => o.to_json(),
+                })
+                .collect()
+        }
+        for (json, bare, staged, want) in [
+            // `Elements`
+            (
+                &br#"[{"a":1},[2],"s",null]"#[..],
+                "map(.)",
+                "map(.) | map(.)",
+                vec![r#"{"a":1}"#, "[2]", r#""s""#, "null"],
+            ),
+            // `Values`
+            (
+                &br#"{"x":1,"y":[2]}"#[..],
+                "map(.)",
+                "map(.) | map(.)",
+                vec!["1", "[2]"],
+            ),
+            // `Values`, duplicate-key fallback (`Cursors`): first position, last value.
+            (
+                &br#"{"x":1,"y":2,"x":3}"#[..],
+                "map(.)",
+                "map(.) | map(.)",
+                vec!["3", "2"],
+            ),
+            // `Keys`
+            (
+                &br#"{"x":1,"y":2}"#[..],
+                "keys_unsorted | map(.)",
+                "keys_unsorted | map(.) | map(.)",
+                vec![r#""x""#, r#""y""#],
+            ),
+            // `IndexRange`
+            (
+                &br"[7,8,9]"[..],
+                "keys_unsorted | map(.)",
+                "keys_unsorted | map(.) | map(.)",
+                vec!["0", "1", "2"],
+            ),
+            // Empty.
+            (&br"[]"[..], "map(.)", "map(.) | map(.)", vec![]),
+        ] {
+            let got = drained(json, bare);
+            assert_eq!(got, want, "{bare} over {}", String::from_utf8_lossy(json));
+            assert_eq!(drained(json, staged), want, "{staged}");
+        }
     }
 
     #[test]
