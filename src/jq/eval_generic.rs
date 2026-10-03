@@ -41723,6 +41723,59 @@ mod tests {
         );
     }
 
+    /// #3682, against a reference that does not share the code under test:
+    /// an owned intermediate (`{a: .x}`) meets one of the three owned peel
+    /// doors -- `projection_peel` (`.a`, `length`), `owned_select_door`
+    /// (`select(..)`) and `owned_path_door` (`path(..)`, which runs its rest
+    /// once per path) -- with one plain stage behind it, which now reaches
+    /// the front doors without an owned `Expr::Pipe`. Each prints what jq
+    /// 1.7.1 prints (captured live), through the sink evaluator the CLI
+    /// drives.
+    #[test]
+    fn test_peel_doors_with_a_lone_rest_match_jq_3682() {
+        let doc = r#"{"x":3,"y":[1,2],"z":"s"}"#;
+        for (filter, want) in [
+            ("{a: .x} | .a | . + 1", "4"),
+            ("{a: .x} | length | . + 1", "2"),
+            ("{a: .x} | path(.a) | length", "1"),
+            // The path door's rest runs once per path.
+            ("{a: .x, b: .y} | path(.a, .b) | length", "1 1"),
+            ("first({a: .x, b: .y} | path(.a, .b) | length)", "1"),
+            ("{a: .x} | select(.a) | length", "1"),
+            (r"{a: .x} | select(.a == 3) | type", r#""object""#),
+            ("{a: .x} | select(.a > 5) | length", ""),
+            // A stage the front doors leave to the bridge.
+            ("{a: .x} | .a | floor", "3"),
+            ("{a: .x} | select(.a) | keys", r#"["a"]"#),
+            // More than one stage left: the owned pipe is still built.
+            ("{a: .x} | .a | . + 1 | . * 2", "8"),
+            (r#"{a: .z} | .a | . + "!""#, r#""s!""#),
+            ("{a: null} | .a | . + 1", "1"),
+            // The per-element route into each door.
+            ("[.y[] | {a: .} | .a | . * 2]", "[2,4]"),
+            ("[.y[] | {a: .} | select(.a > 1) | length]", "[1]"),
+            ("[.y[] | [., .] | path(.[0]) | length]", "[1,1]"),
+            // The lone stage fails: caught.
+            (
+                r#"try ({a: .x} | .a | . + "s") catch ."#,
+                r#""number (3) and string (\"s\") cannot be added""#,
+            ),
+            (
+                "try ({a: .x} | select(.a) | . + 1) catch .",
+                r#""object ({\"a\":3}) and number (1) cannot be added""#,
+            ),
+        ] {
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), filter);
+            assert!(control.is_none(), "{filter}: {control:?}");
+            let got = out
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(got, want, "{filter}");
+        }
+    }
+
     /// #3673: a rest the owned front doors answer from its one plain stage
     /// never builds the owned `Expr::Pipe`; a rest they leave to the bridge
     /// (another stage, a nested pipe, a shape no door knows) builds it, once.

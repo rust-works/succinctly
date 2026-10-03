@@ -9336,19 +9336,17 @@ pub(crate) fn owned_path_door<S: EvalSemantics>(
     if rest.is_empty() {
         return path_over_owned::<S>(path_expr, input, &root, optional, sink);
     }
-    let rest = Expr::Pipe(rest.to_vec());
+    // Built at most once and only if a path reaches a rest the front doors
+    // cannot answer from its one plain stage (#3682, see
+    // [`eval_each_owned_rest`]); the closure below runs once per path.
+    let mut whole: Option<Expr> = None;
     let mut downstream: Option<Flow> = None;
-    let upstream =
-        path_over_owned::<S>(
-            path_expr,
-            input,
-            &root,
-            optional,
-            &mut |path| match eval_each_owned::<S>(&rest, &path, optional, Reentry::REBUILT, sink) {
-                Flow::Exhausted => Demand::Continue,
-                other => stop_with_downstream(&mut downstream, other),
-            },
-        )?;
+    let upstream = path_over_owned::<S>(path_expr, input, &root, optional, &mut |path| {
+        match eval_each_owned_rest::<S>(rest, &mut whole, &path, optional, Reentry::REBUILT, sink) {
+            Flow::Exhausted => Demand::Continue,
+            other => stop_with_downstream(&mut downstream, other),
+        }
+    })?;
     // Downstream decided: its verdict wins over the resolver's `Stopped`,
     // which is only the echo of our own driver answering `Stop`.
     Some(downstream.unwrap_or(upstream))
@@ -10121,8 +10119,9 @@ fn owned_select_door<S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         });
     }
-    Some(eval_each_owned::<S>(
-        &Expr::Pipe(stages.to_vec()),
+    Some(eval_each_owned_rest::<S>(
+        stages,
+        &mut None,
         input,
         optional,
         Reentry::REBUILT,
@@ -10188,8 +10187,9 @@ fn projection_peel<S: EvalSemantics>(
     if counted.is_none() && !matches!(first, Expr::Field(_) | Expr::Index { .. }) {
         return None;
     }
-    let rest = Expr::Pipe(rest.to_vec());
-    if needs_path_context(&rest) {
+    // `needs_path_context` of a pipe is "any stage does", so the slice is
+    // asked directly and a declined peel builds no pipe at all (#3682).
+    if rest.iter().any(needs_path_context) {
         return None;
     }
     let child = match counted {
@@ -10201,8 +10201,9 @@ fn projection_peel<S: EvalSemantics>(
             child
         }
     };
-    Some(eval_each_owned::<S>(
-        &rest,
+    Some(eval_each_owned_rest::<S>(
+        rest,
+        &mut None,
         &child,
         optional,
         Reentry::REBUILT,
@@ -79825,6 +79826,108 @@ mod tests {
                 "the embed-table rows must reach the relocating folds: {relocated}"
             );
         }
+    }
+
+    /// #3682: `projection_peel`, `owned_select_door` and `owned_path_door`
+    /// hand a lone remaining stage to [`eval_each_owned_rest`] instead of
+    /// copying it into an owned `Expr::Pipe` first. Whatever route
+    /// [`eval_each_owned`] takes through them -- a door answering the lone
+    /// stage, or declining it to the bridge -- the answer is the reindex
+    /// bridge's: the same outputs, and the same error where there is one.
+    ///
+    /// Heads x lone rests x owned inputs x both modes x `?` on and off. The
+    /// heads include the ones each door declines (an embed-table-free
+    /// `select(false)`, `path` over a missing key), so a door that wrongly
+    /// answers shows up as a disagreement, not only one that wrongly declines.
+    #[test]
+    fn test_peel_doors_with_a_lone_rest_agree_with_the_reindex_bridge_3682() {
+        type Answer = (Vec<String>, Option<String>);
+        fn via_doors<S: EvalSemantics>(expr: &Expr, input: &OwnedValue, optional: bool) -> Answer {
+            let mut out = Vec::new();
+            let flow = eval_each_owned::<S>(expr, input, optional, Reentry::REBUILT, &mut |v| {
+                out.push(v.to_json());
+                Demand::Continue
+            });
+            let control = match flow {
+                Flow::Escaped(control) => Some(format!("{control:?}")),
+                Flow::Exhausted | Flow::Stopped { .. } => None,
+            };
+            (out, control)
+        }
+        fn via_bridge<S: EvalSemantics>(expr: &Expr, input: &OwnedValue, optional: bool) -> Answer {
+            let mut out = Vec::new();
+            let control = push_owned_values::<Vec<u64>, S>(
+                eval_owned_input_bridge::<Vec<u64>, S>(expr, input, optional),
+                &mut out,
+            )
+            .map(|control| format!("{control:?}"));
+            (out.iter().map(OwnedValue::to_json).collect(), control)
+        }
+        let object = |pairs: &[(&str, OwnedValue)]| {
+            OwnedValue::object_from(pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())))
+        };
+        let inputs = [
+            object(&[("a", OwnedValue::Int(3)), ("b", OwnedValue::Null)]),
+            object(&[("a", OwnedValue::Null)]),
+            object(&[("a", object(&[("b", OwnedValue::Int(1))]))]),
+            object(&[(
+                "a",
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            )]),
+            object(&[("a", OwnedValue::String("s".into()))]),
+            OwnedValue::array_from(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+            ]),
+            OwnedValue::array_from(vec![]),
+            OwnedValue::Int(3),
+            OwnedValue::String("x".into()),
+            OwnedValue::Null,
+        ];
+        let heads = [
+            ".a",
+            ".[0]",
+            "length",
+            "select(.a)",
+            "select(true)",
+            "select(false)",
+            "select(.a == 3)",
+            "path(.a)",
+            "path(.[0])",
+            "path(.a, .b)",
+            "path(.missing)",
+        ];
+        let rests = [
+            ". + 1", "length", "tostring", "type", "not", "floor", "keys", ". == 3", "max", ".",
+        ];
+        let mut compared = 0;
+        for head in heads {
+            for rest in rests {
+                let src = format!("{head} | {rest}");
+                let expr = parse(&src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+                let Expr::Pipe(stages) = &expr else {
+                    panic!("{src}: not a pipe"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3682)"
+                };
+                assert_eq!(stages.len(), 2, "{src}: head and one lone rest");
+                for input in &inputs {
+                    for optional in [false, true] {
+                        assert_eq!(
+                            via_doors::<JqSemantics>(&expr, input, optional),
+                            via_bridge::<JqSemantics>(&expr, input, optional),
+                            "jq: {src} on {input:?} (optional={optional})"
+                        );
+                        assert_eq!(
+                            via_doors::<YqSemantics>(&expr, input, optional),
+                            via_bridge::<YqSemantics>(&expr, input, optional),
+                            "yq: {src} on {input:?} (optional={optional})"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert!(compared > 2000, "the matrix shrank: {compared}");
     }
 
     #[test]
