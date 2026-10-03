@@ -92298,3 +92298,58 @@ fn test_reduce_whole_array_slice_is_the_register_3504() -> Result<()> {
         ),
     ])
 }
+
+/// #3519 (mechanism 3): a fractional literal index or slice bound stays a
+/// computed `IndexExpr`/`SliceExpr` (jq truncates it at evaluation), so it was
+/// not a navigation node and a bind through it got no marker. Identical
+/// spellings on both sides now certify, as `.x[1]` already did; a different
+/// slot still refuses. Every row captured from jq 1.7.1.
+#[test]
+fn test_fractional_literal_bind_source_gets_a_marker_3519() -> Result<()> {
+    let input = r#"{"a":{"b":1},"x":[1,1]}"#;
+    assert_path_rows_3289(&[
+        (
+            input,
+            r"path(.x[1.7] as $y | .x[1.7] | $y)",
+            "[\"x\",1.7]\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"path(.x[1.7] as $y | .x | .[1.7] | $y)",
+            "[\"x\",1.7]\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"path(.x[0.5:] as $y | .x[0.5:] | $y)",
+            "[\"x\",{\"start\":0.5,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"del(.x[1.7] as $y | .x[1.7] | $y)",
+            "{\"a\":{\"b\":1},\"x\":[1]}\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"(.x[1.7] as $y | .x[1.7] | $y) = 9",
+            "{\"a\":{\"b\":1},\"x\":[1,9]}\n",
+            "",
+            0,
+        ),
+        // A slice is not the index's node.
+        (
+            input,
+            r"path(.x[1.7] as $y | .x[0.5:] | $y)",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+    ])
+}
