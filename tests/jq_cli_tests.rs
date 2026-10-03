@@ -93582,6 +93582,15 @@ fn test_swallowed_scalar_iteration_answers_what_it_did_3689() -> Result<()> {
             "",
             0,
         ),
+        // A closure argument reaches the boundary as `Expr::Shared`.
+        (MIXED, "def opt(f): f?; [.[] | opt(.[])]", "[2,3]\n", "", 0),
+        (
+            MIXED,
+            "def safe(f): try f catch empty; [.[] | safe(.[])]",
+            "[2,3]\n",
+            "",
+            0,
+        ),
         // The root itself a scalar.
         (r#""abc""#, "[.[]?]", "[]\n", "", 0),
         (r#""abc""#, "try .[] catch empty", "", "", 0),
@@ -93594,6 +93603,35 @@ fn test_swallowed_scalar_iteration_answers_what_it_did_3689() -> Result<()> {
             0,
         ),
         (r#""abc""#, "[.. | path]", "[[]]\n", "", 0),
+        // A user-written boundary in front of a path-context read: nothing
+        // flows past it from a scalar.
+        (MIXED, "[.[] | .[]? | path]", "[[4,0],[5,\"k\"]]\n", "", 0),
+        (MIXED, "[.[] | .[]? | key]", "[0,\"k\"]\n", "", 0),
+        (
+            MIXED,
+            "[.[] | try .[] catch empty | path]",
+            "[[4,0],[5,\"k\"]]\n",
+            "",
+            0,
+        ),
+        // A slice's elements are owned nodes, which the walk settles itself.
+        (
+            MIXED,
+            "[.[2:] | .. | path]",
+            "[[{\"start\":2,\"end\":null}],[{\"start\":2,\"end\":null},0],\
+             [{\"start\":2,\"end\":null},1],[{\"start\":2,\"end\":null},2],\
+             [{\"start\":2,\"end\":null},2,0],[{\"start\":2,\"end\":null},3],\
+             [{\"start\":2,\"end\":null},3,\"k\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[2:] | .. | key]",
+            "[{\"start\":2,\"end\":null},0,1,2,0,3,\"k\"]\n",
+            "",
+            0,
+        ),
     ])?;
 
     // What `?` never swallows escapes through every boundary: an undecodable
@@ -93607,16 +93645,25 @@ fn test_swallowed_scalar_iteration_answers_what_it_did_3689() -> Result<()> {
         ),
         ("[1.2.3,[4]]", "invalid numeric literal"),
         ("[tru]", "invalid boolean"),
-        ("[1,2,]", "Invalid JSON text"),
+        // The malformed array is a member, so a `?` boundary has to pass it on:
+        // as the root it would fail in the unguarded outer `.[]` before any
+        // boundary saw it (`[.[]]` already raises there).
+        ("[[1,2,]]", "Invalid JSON text"),
     ] {
         for filter in [
             "[.[] | .[]?]",
             "[.[] | try .[] catch empty]",
+            "[.[] | .[]? | path]",
+            "[.[2:] | .. | path]",
             "[.. | path]",
             "[.. | key]",
         ] {
             assert_path_rows_3289(&[(doc, filter, "", fragment, 5)])?;
         }
+    }
+    // A malformed array as the root fails the walks themselves, not a boundary.
+    for filter in ["[.. | path]", "[.. | key]"] {
+        assert_path_rows_3289(&[("[1,2,]", filter, "", "Invalid JSON text", 5)])?;
     }
 
     assert_path_rows_3289(&[

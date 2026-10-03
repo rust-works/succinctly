@@ -491,8 +491,7 @@ fn the_owned_streaming_route_saves_the_message_3689() {
         assert!(
             without >= with_shortcut + 4 * N,
             "`{matched}` made {with_shortcut} allocator calls against `{unmatched}`'s {without}: \
-             the message the boundary drops cost at least {} more per scalar before the shortcut",
-            4
+             the message the boundary drops cost at least 4 more per scalar before the shortcut"
         );
     }
 }
