@@ -27227,9 +27227,13 @@ pub fn eval_reindexed_document<'a, S: EvalSemantics>(
 /// (`eval_on_owned_over`), so the answers, including the errors and the
 /// yq-mode "a field of a scalar is empty" rule, are the ones the index route
 /// gives; `registered_document_scalar_door_agrees_with_the_index_route_3479`
-/// pins that. A container is left to the ordinary route on purpose: an
-/// index over it is what a navigation or a stream needs, and its clone here
-/// would cost what it saves.
+/// pins that. A container is left to the ordinary route as a matter of scope,
+/// not because cloning it is costly: an owned container is held behind one
+/// refcounted pointer, so a clone is a refcount bump. The door exists for the
+/// per-line cost of a scalar `-R` line. A container input is a document, whose
+/// writes and `--slurp` run at identical instruction counts with and without
+/// the door (#3679), and answering one here would need its own agreement test
+/// for the values a navigation hands back.
 ///
 /// Not a supported entry point.
 #[doc(hidden)]
