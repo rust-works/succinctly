@@ -8958,10 +8958,10 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
 /// what both accept. Called from the two owned re-entries that reach the
 /// bridge, [`eval_each_owned`] and `eval_generic::eval_on_owned`, and (#3439)
 /// from [`eval_owned_pure_in`]'s opt-in `lengths` arm, which only
-/// [`owned_select_door`] switches on: a `select` condition reads the count as
-/// a truth value, so its answer changes nothing about what a closed
-/// expression or the resolver accepts. A change to what this returns changes
-/// that condition too.
+/// [`owned_select_door`] and [`owned_cond_verdict`] (an `until`/`while`
+/// condition, #3697) switch on: both read the count as a truth value, so its
+/// answer changes nothing about what a closed expression or the resolver
+/// accepts. A change to what this returns changes those conditions too.
 pub(crate) fn eval_owned_length(expr: &Expr, input: &OwnedValue) -> Option<OwnedValue> {
     match unwrap_paren(expr) {
         // `. | length` is `length`: an identity stage yields its input once.
@@ -10249,7 +10249,8 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
 /// cost (`range_values_generic` appends in place once its sink lets go of the
 /// value), the bridge was.
 ///
-/// The condition is answered by [`eval_owned_pure_in`] with `lengths` on, the
+/// The condition is answered by [`owned_cond_verdict`] -- [`eval_owned_pure_in`]
+/// with `lengths` on, shared with `until`/`while` (#3697) -- the
 /// grammar [`eval_owned_pure`] already pins against the bridge (comparisons,
 /// `and`/`or`/`not`, `type`, navigation as an operand) plus `length` over a
 /// container. `select` yields its input unchanged, so a truthy answer emits
@@ -10306,13 +10307,14 @@ fn owned_select_door<S: EvalSemantics>(
         let Expr::Builtin(Builtin::Select(cond)) = unwrap_paren(first) else {
             break;
         };
-        let Some(verdict) = eval_owned_pure_in::<S>(cond, input, ResultPosition::Operand, true)
-        else {
+        // `optional` is gated at the top, so the verdict is the shared one
+        // ([`owned_cond_verdict`], #3697) and the two doors cannot drift.
+        let Some(verdict) = owned_cond_verdict::<S>(cond, input, false) else {
             break;
         };
         match verdict {
-            Ok(verdict) if verdict.is_truthy() => {}
-            Ok(_) => return Some(Flow::Exhausted),
+            Ok(true) => {}
+            Ok(false) => return Some(Flow::Exhausted),
             Err(error) => return Some(Flow::Escaped(Control::Error(error))),
         }
         peeled = true;
@@ -51853,7 +51855,8 @@ fn produces_fresh_value(expr: &Expr) -> bool {
 /// One operand is opt-in rather than part of the grammar: `length` over an
 /// array or object, behind [`eval_owned_pure_in`]'s `lengths` flag (#3439).
 /// This function is the `lengths: false` entry point every caller but
-/// [`owned_select_door`] uses, so its grammar is unchanged.
+/// [`owned_select_door`] and [`owned_cond_verdict`] uses, so its grammar is
+/// unchanged.
 ///
 /// `Builtin::ToString` and the literal-RHS `Arithmetic` accumulator shape
 /// are deliberately **not** here, though #2397's own plan proposed folding
@@ -51881,9 +51884,10 @@ fn eval_owned_pure<S: EvalSemantics>(
 /// `lengths` is a parameter and not an arm of [`eval_owned_pure`] because
 /// that function also decides what [`closed_expr_to_owned`] and the
 /// resolver's owned evaluation accept, and #3477 kept `length` out of the
-/// shared evaluator for that reason. Only [`owned_select_door`], which reads
-/// the answer as a truth value, asks for it, so a `length` in a `select`
-/// condition is settled from the tree instead of through the re-index bridge.
+/// shared evaluator for that reason. Only [`owned_select_door`] and
+/// [`owned_cond_verdict`], which read the answer as a truth value, ask for it,
+/// so a `length` in a `select` condition or an `until`/`while` condition
+/// (#3697) is settled from the tree instead of through the re-index bridge.
 ///
 /// Every recursive call below passes `lengths` on, so a `length` nested in a
 /// comparison, a boolean or a pipe stage is reached under the same flag as
@@ -54622,6 +54626,68 @@ impl<'e> LoopOperand<'e> {
         let expr = if ambient { self.expr } else { self.demoted };
         eval_owned_expr_fork::<S>(expr, input, optional, Reentry::Proven)
     }
+
+    /// [`Self::fork`] for the loop's `cond`, which is read only for its
+    /// truthiness: a shape [`owned_cond_verdict`] answers is settled from the
+    /// state's tree, and anything else is [`Self::fork`]'s (#3697).
+    fn fork_cond<S: EvalSemantics>(
+        &self,
+        input: &OwnedValue,
+        optional: bool,
+        ambient: bool,
+    ) -> (Vec<OwnedValue>, Option<Control>) {
+        let expr = if ambient { self.expr } else { self.demoted };
+        match owned_cond_verdict::<S>(expr, input, optional) {
+            Some(Ok(truthy)) => (vec![OwnedValue::Bool(truthy)], None),
+            Some(Err(error)) => (Vec::new(), Some(Control::Error(error))),
+            None => eval_owned_expr_fork::<S>(expr, input, optional, Reentry::Proven),
+        }
+    }
+}
+
+/// The verdict of an `until`/`while` condition over a state the loop owns,
+/// decided from the tree instead of through the re-index bridge (#3697).
+///
+/// A loop that grows its state every round -- `until(length >= n; . + [1])` --
+/// reads its condition once per round. [`eval_owned_pure`] answers a comparison
+/// or a boolean over the state without a bridge, but it keeps `length` out of
+/// its grammar (#3477), so a `length` condition fell through to the bridge:
+/// serialize the whole state, index it, read one count. That is linear per
+/// round and quadratic over the loop, where jq pays nothing (10000 rounds took
+/// 12.7 s on a debug binary, 20000 took 50.9 s).
+///
+/// The condition is answered by [`eval_owned_pure_in`] with `lengths` on, the
+/// opt-in [`owned_select_door`] already takes for the same reason: the answer
+/// is read as a truth value and nothing else. Both routes use it -- the
+/// `until_step`/`while_step` pair here ([`LoopOperand::fork_cond`]) and
+/// `eval_generic`'s `LoopState::cond_bits` -- so a `length` condition costs the
+/// same on a cursor input as on a computed one.
+///
+/// Unlike [`owned_select_door`] there is no gate on the re-entry or on the embed
+/// table: that door *emits* its input, so the identity of what it emits matters
+/// there, while a verdict is a boolean that carries no node. `optional` is the
+/// one gate kept, as [`eval_owned_fast_path`] keeps it for the same grammar --
+/// the `?`-suppression rules an erroring operand meets stay the bridge's.
+///
+/// The verdict is returned as its truthiness, not as the value: `Operand`
+/// position admits a navigated subvalue (`.a.b`), whose representation may
+/// differ from the bridge's and which must not escape as an expression's own
+/// result, so the type is what keeps it from doing so.
+///
+/// `None` when the condition is outside the pure grammar, or `length` of
+/// anything but an array or an object, so the bridge keeps its diagnostics and
+/// its per-mode rules. Because every accepted shape is pure, a walk that ends in
+/// `None` has cost only wasted work.
+pub(crate) fn owned_cond_verdict<S: EvalSemantics>(
+    cond: &Expr,
+    state: &OwnedValue,
+    optional: bool,
+) -> Option<Result<bool, EvalError>> {
+    if optional {
+        return None;
+    }
+    eval_owned_pure_in::<S>(cond, state, ResultPosition::Operand, true)
+        .map(|verdict| verdict.map(|value| value.is_truthy()))
 }
 
 /// Recursive step for [`eval_until`] (#534): `E(s) = if cond(s) is truthy:
@@ -54689,7 +54755,7 @@ fn until_step<S: EvalSemantics>(
             });
         }
 
-        let (cond_vals, cond_control) = cond.fork::<S>(&state, optional, ambient);
+        let (cond_vals, cond_control) = cond.fork_cond::<S>(&state, optional, ambient);
 
         // Fast path: exactly one falsy `cond` output and exactly one
         // `update` output — continue the loop in place rather than
@@ -54864,7 +54930,7 @@ fn while_step<S: EvalSemantics>(
             });
         }
 
-        let (cond_vals, cond_control) = cond.fork::<S>(&state, optional, ambient);
+        let (cond_vals, cond_control) = cond.fork_cond::<S>(&state, optional, ambient);
 
         // Fast path: exactly one truthy `cond` output and exactly one
         // `update` output — continue the loop in place rather than
@@ -99082,6 +99148,255 @@ mod tests {
                 eval_owned_pure_in::<JqSemantics>(&expr, &array, ResultPosition::Operand, true)
                     .is_some(),
                 "{src}"
+            );
+        }
+    }
+
+    /// #3697: [`owned_cond_verdict`] answers what the reindex bridge answers
+    /// for every value x condition it takes, in both modes -- the truthiness
+    /// the loop reads, and the text of a raised error -- and declines the rest.
+    #[test]
+    fn owned_cond_verdict_agrees_with_the_reindex_bridge_3697() {
+        let mut values = pure_value_matrix();
+        values.push(OwnedValue::array_from(
+            (0..40).map(OwnedValue::Int).collect(),
+        ));
+        let conds = [
+            "length >= 2",
+            "length == 0",
+            "length != 1",
+            "length",
+            "length > 1 and type == \"array\"",
+            "length == 2 or type == \"object\"",
+            "length | . > 1",
+            ". | length > 0",
+            "(. | length) >= 1",
+            "(.a | length) > 0",
+            "(.a | length) == 1 and .a.b == 2",
+            "length >= 1 and .a == 1",
+            "length < 1 or .[0] == 1",
+            // What a loop's condition already took before the `length` opt-in.
+            "type == \"array\"",
+            ".a == 1",
+            ".a.b == 2",
+            ".[0] == 1",
+            "not",
+            "true",
+            "false",
+            "null",
+        ];
+        let (mut taken, mut declined) = (0, 0);
+        for src in conds {
+            let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            for value in &values {
+                let jq = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let yq = normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                    &expr, value, false,
+                ));
+                let doors = [
+                    (
+                        "jq",
+                        owned_cond_verdict::<JqSemantics>(&expr, value, false),
+                        jq,
+                    ),
+                    (
+                        "yq",
+                        owned_cond_verdict::<YqSemantics>(&expr, value, false),
+                        yq,
+                    ),
+                ];
+                for (mode, door, bridge) in doors {
+                    let Some(door) = door else {
+                        declined += 1;
+                        continue;
+                    };
+                    taken += 1;
+                    match door {
+                        Ok(verdict) => {
+                            assert_eq!(bridge.1, "ok", "{mode}: {src:?} on {value:?}");
+                            assert_eq!(bridge.0.len(), 1, "{mode}: {src:?} on {value:?}");
+                            assert_eq!(
+                                verdict,
+                                bridge.0[0].is_truthy(),
+                                "{mode}: {src:?} on {value:?} disagrees with the reindex bridge"
+                            );
+                        }
+                        Err(error) => {
+                            assert!(bridge.0.is_empty(), "{mode}: {src:?} on {value:?}");
+                            assert_eq!(
+                                bridge.1,
+                                format!("error:{}", error.message),
+                                "{mode}: {src:?} on {value:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(taken > 300, "the matrix must reach the verdict: {taken}");
+        assert!(declined > 0, "the matrix must reach the declines too");
+    }
+
+    /// #3697: the verdict is only for shapes it can answer identically.
+    /// `length` of a scalar keeps the bridge's diagnostics and per-mode rules
+    /// (a number's `length` is its absolute value), a condition outside the
+    /// pure grammar is the bridge's outright, and a `?` is gated out.
+    #[test]
+    fn owned_cond_verdict_declines_what_it_cannot_answer_identically_3697() {
+        let array = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        let run = |filter: &str, input: &OwnedValue, optional: bool| {
+            let expr = parse(filter).unwrap();
+            owned_cond_verdict::<JqSemantics>(&expr, input, optional)
+        };
+        // Answered.
+        for src in ["length >= 2", "length == 2", "length", "(. | length) > 1"] {
+            assert!(run(src, &array, false).is_some(), "{src}");
+        }
+        // `length` of a scalar / string / null / bool is not this door's.
+        for scalar in [
+            OwnedValue::Int(-3),
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::string("abc"),
+        ] {
+            assert!(run("length >= 3", &scalar, false).is_none(), "{scalar:?}");
+        }
+        // Outside the pure grammar: a generator, a fan-out, builtins that compute.
+        for src in [
+            ".[] > 1",
+            "length >= 1, length >= 2",
+            "has(0)",
+            "keys == [0, 1]",
+            "any(.[]; . == 1)",
+            "map(. + 1)",
+        ] {
+            assert!(run(src, &array, false).is_none(), "{src}");
+        }
+        // Gated: `?`-suppression stays the bridge's.
+        assert!(run("length >= 2", &array, true).is_none());
+    }
+
+    /// #3697: an `until`/`while` on this route (`until_step`/`while_step`)
+    /// reads a `length` condition off the state it owns instead of serializing
+    /// and re-indexing it every round. The reindex count is what pins that: it
+    /// was one per round (200 rounds, 202 reindexes) and is flat in the round
+    /// count now.
+    #[test]
+    fn until_while_length_condition_needs_no_reindex_per_round_3697() {
+        use crate::jq::value::reindex_count;
+        let json: &[u8] = b"[]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let update = parse(". + [1]").unwrap();
+        let is_array_of = |value: &OwnedValue, n: usize| matches!(value, OwnedValue::Array(items) if items.len() == n);
+        for src in [
+            "length >= 50",
+            "length == 50",
+            "length > 49 and type == \"array\"",
+            "(. | length) >= 50",
+        ] {
+            let cond = parse(src).unwrap();
+            let before = reindex_count::get();
+            let (out, tag) = normalize(eval_until::<Vec<u64>, JqSemantics>(
+                &cond,
+                &update,
+                cursor.value(),
+                false,
+            ));
+            let reindexes = reindex_count::get() - before;
+            assert_eq!(tag, "ok", "until({src})");
+            assert_eq!(out.len(), 1, "until({src})");
+            assert!(is_array_of(&out[0], 50), "until({src}): {:?}", out[0]);
+            assert!(reindexes <= 3, "until({src}): {reindexes} reindexes");
+        }
+        let cond = parse("length < 50").unwrap();
+        let before = reindex_count::get();
+        let (out, tag) = normalize(eval_while::<Vec<u64>, JqSemantics>(
+            &cond,
+            &update,
+            cursor.value(),
+            false,
+        ));
+        let reindexes = reindex_count::get() - before;
+        assert_eq!(tag, "ok");
+        assert_eq!(out.len(), 50);
+        assert!(is_array_of(&out[49], 49), "{:?}", out[49]);
+        assert!(reindexes <= 3, "while: {reindexes} reindexes");
+        // Under a `?` the bridge keeps answering, and the answer is the same.
+        let cond = parse("length >= 5").unwrap();
+        let (out, tag) = normalize(eval_until::<Vec<u64>, JqSemantics>(
+            &cond,
+            &update,
+            cursor.value(),
+            true,
+        ));
+        assert_eq!(tag, "ok");
+        assert!(is_array_of(&out[0], 5), "{:?}", out[0]);
+    }
+
+    /// #3697: a `length` condition that raises keeps the bridge's error (the
+    /// text jq 1.7.1 gives), a `?` on the loop suppresses it as before, and a
+    /// condition that names a bound value (`$d`, under the embed table) answers
+    /// what jq does -- all on the `eval.rs` route (`until_step`/`while_step`),
+    /// where [`LoopOperand::fork_cond`] turns the verdict's `Err` into the loop's
+    /// escape.
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
+    fn until_while_length_condition_raises_and_reads_bound_values_3697() {
+        let one: &[u8] = b"[1]";
+        let index = JsonIndex::build(one);
+        let cursor = index.root(one);
+        let update = parse(". + [1]").unwrap();
+        let raised = "error:Cannot index array with string \"a\"";
+        for (is_until, cond_src) in [(true, "length > 1 and .a"), (false, "length > 0 and .a")] {
+            let cond = parse(cond_src).unwrap();
+            let run = |optional| {
+                normalize(if is_until {
+                    eval_until::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), optional)
+                } else {
+                    eval_while::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), optional)
+                })
+            };
+            let (out, tag) = run(false);
+            assert!(out.is_empty(), "{cond_src}: {out:?}");
+            assert_eq!(tag, raised, "{cond_src}");
+            // Under a `?` the same error is suppressed and the loop ends empty.
+            let (out, tag) = run(true);
+            assert!(out.is_empty(), "{cond_src}: {out:?}");
+            assert_eq!(tag, "ok", "{cond_src}");
+        }
+
+        // Bound values: the answers are jq 1.7.1's (captured live).
+        let json: &[u8] = br#"{"a":[1,2,3],"o":{"p":1}}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        for (filter, want) in [
+            (
+                ". as $d | [] | until(length > ($d | length); . + [1])",
+                "[1,1,1]",
+            ),
+            (
+                ". as $d | {i:0, d:$d} | until(length == ($d | length) and .i >= 50; .i += 1) | .i",
+                "50",
+            ),
+            (
+                ". as $d | [] | [while(length <= ($d | length); . + [1])] | length",
+                "3",
+            ),
+            (
+                ". as $d | {i:0} | until(($d | length) == 2 and .i >= 50; .i += 1) | .i",
+                "50",
+            ),
+        ] {
+            let expr = parse(filter).unwrap();
+            let out =
+                eval_full::<Vec<u64>, JqSemantics>(&expr, cursor).collect_owned::<JqSemantics>();
+            assert_eq!(
+                out.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                [want],
+                "{filter}"
             );
         }
     }
