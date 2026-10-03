@@ -61385,6 +61385,75 @@ fn test_and_or_path_empty_slice_then_optional_index_refuses_3647() -> Result<()>
         ),
         (r"[]", r"del(try (.[0:0] and .b?))", "[]\n", "", 0),
         (r"[1]", r"del(try (.[0:0] and .b?))", "[1]\n", "", 0),
+        // Non-root and nested shapes take the same seed: an empty array at a path, and
+        // a string or `null` input, refuse; a non-empty array whose element is empty has a
+        // full slice that *is* the input, so it is still accepted.
+        (
+            r#"{"a":[]}"#,
+            r"del(.a | (.[0:] and .b?))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(.a[0:] and .b?)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of {"a":[]}"#,
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(.a[0:0] and .b?)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of {"a":[]}"#,
+            5,
+        ),
+        (
+            r#""""#,
+            r"path(.[0:] and .b?)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of """#,
+            5,
+        ),
+        (
+            r"null",
+            r"path(.[0:] and .b?)",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (r"[[]]", r"path(.[0:] and .b?)", "", "", 0),
+        (r"[[]]", r"del(.[0:] and .b?)", "[[]]\n", "", 0),
+        (
+            r"[[]]",
+            r"path(.[0] | (.[0:] and .b?))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        // A bounded consumer or `label` in front changes nothing.
+        (
+            r"[]",
+            r"first(path(.[0:] and .b?))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"[limit(1; path(.[0:] and .b?))]",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
+        (
+            r"[]",
+            r"label $o | path(.[0:] and .b?), break $o",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of []"#,
+            5,
+        ),
     ])
 }
 
