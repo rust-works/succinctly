@@ -747,6 +747,48 @@ retry's child is fine), was the abandoned alternative's `E`. The value and path 
   needed no change. No row here runs queued: it starts only in a walk deeper than the native
   budget.
 
+## `recurse(f)` stops at 10,000 nodes for every `f` but `.[]?` (#3703)
+
+`recurse(f)` and `recurse(f; cond)` deliver at most `RECURSE_MAX_ITEMS` (10,000) nodes, in the value
+walker and in the path walker behind `path(recurse(f))`, `del`, `|=` and `pick` over it, and then end
+**silently, with exit 0**. jq visits every node. The cap exists because an unbounded `f`
+(`null | recurse(.a)` yields `null` forever in jq, and a collecting consumer here would grow until
+memory ran out) cannot be told from a long one by looking at it.
+
+`.[]?` is the exception, and is lifted since #3703: jq defines `def recurse: recurse(.[]?);`
+(`jq --debug-dump-disasm` shows the lambda as `EACH_OPT`), so `recurse(.[]?)`, bare `recurse` and `..`
+are one walk, bounded by the document. The value walker hands exactly that `f` (parentheses allowed,
+no `cond`) to a direct walk of the owned tree, so no cap applies; the path walker takes its cap from
+the caller's own `f` and lifts it for the same shape.
+
+What still diverges, on a 12,001-node document (6,000 one-element arrays), captured from jq 1.7.1:
+
+| Filter                                                            | jq    | succinctly |
+|-------------------------------------------------------------------|-------|------------|
+| `[recurse(.[]?; true)] \| length`                                 | 12001 | 10000      |
+| `[recurse(.[]?; . != null)] \| length`                            | 12001 | 10000      |
+| `[recurse(if type == "array" then .[] else empty end)] \| length` | 12001 | 10000      |
+
+A write through such a walk stops at the same node, so `recurse(f) |= ...` leaves everything past
+it untouched, as the `.[]?` form did before #3703. A silent short answer is not a divergence ADR-0018
+permits, and neither is a hang; raising at the cap, or lifting it where the walk is provably finite,
+is the open question, tracked in [#3716](https://github.com/rust-works/succinctly/issues/3716).
+The path walker still runs `.[]?` at every node, so `path(recurse(.[]?))` takes about 1.8 times
+`path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes of a `users` document,
+[#3717](https://github.com/rust-works/succinctly/issues/3717)).
+
+**Alias fan-out is walked in full.** A YAML document whose aliases expand to N nodes is delivered
+node by node by `..`, `path(..)`, and, since #3703, `recurse(.[]?)` and `path(recurse(.[]?))`; no work
+budget applies to a walk's output. Measured with `memcap.py --report` on a 458-byte document whose
+nine-way alias ladder expands to 5.4 million nodes at six levels: `[path(recurse(.[]?))] | length`
+peaks at 1.95 GB, the same as `[path(..)]`'s 1.95 GB, where it peaked at 0.41 GB capped at 10,000;
+`del(recurse(.[]?) | select(type == "string"))` peaks at 3.70 GB with or without the cap, because
+the expanded document dominates; `[recurse(.[]?)] | length` 1.04 GB against `[..]`'s 0.46 GB. The
+explicit spelling also materializes the whole expanded document before it walks, so
+`first(recurse(.[]?))` costs 0.40 GB there and exhausts a 3 GB cap on a nine-level document where
+`first(..)` and `first(recurse)` answer from nothing
+([#3719](https://github.com/rust-works/succinctly/issues/3719)).
+
 ## A builtin's argument and a `?//` retry (#3487)
 
 jq binds a builtin's argument once per value: a `$param` of a jq-defined builtin (`flatten($x)`,

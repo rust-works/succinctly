@@ -40203,7 +40203,9 @@ fn recurse_family_root_seed<'a>(
 /// spellings, whose queue can grow without bound from an arbitrary `f`, not
 /// to bare structural descent, whose node count is exactly `value`'s own
 /// tree size — `[path(..)] | length` must equal jq's true count even past
-/// [`RECURSE_MAX_ITEMS`] nodes.
+/// [`RECURSE_MAX_ITEMS`] nodes. `recurse(.[]?)` is that same bare walk spelled
+/// out (jq's `def recurse: recurse(.[]?);`), so [`resolve_recurse_sink`] lifts
+/// the cap for exactly that spelling ([`recurse_item_cap`], #3703).
 ///
 /// **Lazy within a node's fan-out too** (#2895): a node's children are a
 /// [`RecursiveChildren`] cursor on a [`DescentFrame`], pulled one at a time,
@@ -40217,8 +40219,9 @@ fn recurse_family_root_seed<'a>(
 /// The parameterised spellings ([`resolve_recurse_sink`], and the value-path
 /// `recurse(f)` evaluator) stay eager on purpose: their `f` can fan out and
 /// raise, so a node's children are the *output of running `f`*, not a slice
-/// already in hand, and they are capped by [`RECURSE_MAX_ITEMS`]. Bare `..`
-/// has no `f`, so its children are exactly the container's own.
+/// already in hand, and they are capped by [`RECURSE_MAX_ITEMS`] (but for
+/// `.[]?`, see [`recurse_item_cap`]). Bare `..` has no `f`, so its children are
+/// exactly the container's own.
 ///
 /// Every value this function ever visits is a live sub-part of the original
 /// top-level `value`, so every branch can borrow directly (`Cow::Borrowed`)
@@ -45589,8 +45592,96 @@ fn eval_recurse_cond<S: EvalSemantics>(
 /// (`resolve_recurse_sink`, `builtin_recurse_f`, `builtin_recurse_cond`) — a
 /// single definition so a future retuning can't silently miss one of the
 /// three copies it used to be (#1023 review of #1021, echoing #106's
-/// "duplicated predicates diverge silently").
+/// "duplicated predicates diverge silently"). Not applied to
+/// [`is_structural_descent`]'s `f`: the value walker hands that to
+/// [`walk_descendants`], and the path walker takes [`recurse_item_cap`].
 const RECURSE_MAX_ITEMS: usize = 10000;
+
+/// Whether `recurse(f)` / `recurse(f; cond)` is bare `recurse` (#3703).
+///
+/// jq defines `def recurse: recurse(.[]?);` (`jq --debug-dump-disasm` shows the
+/// lambda as `EACH_OPT`), so `.[]?` with no `cond` is structural descent of a
+/// finite tree: the walk `..` already does, bounded by the document and never
+/// able to raise. A `cond` can reject children `..` would visit, and any other
+/// `f` can be unbounded (`recurse(.a)` on `null`), so neither qualifies.
+/// Judged on the caller's own `f`, before [`Reentry::reroot`] rewrites it.
+fn is_structural_descent(f: &Expr, cond: Option<&Expr>) -> bool {
+    let mut f = f;
+    while let Expr::Paren(inner) = f {
+        f = inner;
+    }
+    cond.is_none() && matches!(f, Expr::Optional(inner) if matches!(**inner, Expr::Iterate))
+}
+
+/// How many nodes a *path-mode* `recurse` walk may deliver (#3703).
+///
+/// [`RECURSE_MAX_ITEMS`] exists because a parameterised `f` can be unbounded
+/// -- jq's own `recurse(.a)` on `null` never terminates -- so a collecting
+/// consumer would otherwise grow until the host runs out of memory. It
+/// answers silently short, which is a divergence of its own (still open for
+/// every `f` but [`is_structural_descent`]'s).
+///
+/// The value walker needs no cap for that `f`: [`each_recurse_walk`] hands it
+/// to [`walk_descendants`]. The path walker still runs `f` through the
+/// resolver at every node, and only lifts the count, so
+/// `[path(recurse(.[]?))] | length` and the writes through it agree with jq
+/// past [`RECURSE_MAX_ITEMS`] nodes, as `path(..)` already does.
+fn recurse_item_cap(f: &Expr, cond: Option<&Expr>) -> usize {
+    if is_structural_descent(f, cond) {
+        usize::MAX
+    } else {
+        RECURSE_MAX_ITEMS
+    }
+}
+
+/// [`each_recurse_walk`] for [`is_structural_descent`]'s `f`: every node of
+/// `root`, parents before children, siblings in order, delivered to `sink`
+/// until it answers [`Demand::Stop`].
+///
+/// This is what `..` and bare `recurse` do on the document route, and it is
+/// what `.[]?` computes, without evaluating `.[]?` at each node. Running `f`
+/// there reindexed each node's subtree and kept it alive while its children
+/// ran (see [`each_recurse_walk`]'s memory note): about 13x `..`'s time per
+/// node, and on a document whose aliases expand to a few million nodes 3.4 GB
+/// against `..`'s 0.46 GB. An array's elements and an object's values are
+/// exactly the children `Expr::Iterate` gives an owned value, in the same
+/// order; nothing else has any.
+///
+/// An explicit LIFO stack, not recursion, so depth is bounded by memory rather
+/// than by the native stack budget a recursing `f` needs. No `f` runs, so no
+/// escape is possible and the walk either drains or is stopped.
+fn walk_descendants(
+    root: OwnedValue,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> RecurseWalkEnd {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        // Children go on the stack before the node is delivered, so the node
+        // can be moved into `sink` instead of cloned for it; each node is
+        // then cloned once, when its parent pushes it. A stop wastes one
+        // node's pushes at most. Pushed last-first, so the first child is the
+        // next node popped.
+        let first_child = stack.len();
+        match &node {
+            OwnedValue::Array(items) => stack.extend(items.iter().cloned()),
+            OwnedValue::Object(map) => stack.extend(map.values().cloned()),
+            _ => {}
+        }
+        stack[first_child..].reverse();
+        if sink(node) == Demand::Stop {
+            return RecurseWalkEnd {
+                drained: false,
+                pending_error: None,
+                stopped: true,
+            };
+        }
+    }
+    RecurseWalkEnd {
+        drained: true,
+        pending_error: None,
+        stopped: false,
+    }
+}
 
 /// Finalize `builtin_recurse_f`/`builtin_recurse_cond`'s collected
 /// `outputs` into a `QueryResult` — the two functions' identical tail
@@ -45641,6 +45732,10 @@ pub(crate) struct RecurseWalkEnd {
 /// abort-on-`f`-error, #842/#854's deferred escapes and
 /// [`RECURSE_MAX_ITEMS`]' silent cap, and a lazy copy of it would be a
 /// second place every one of those has to be maintained.
+///
+/// **`.[]?` with no `cond` takes none of that** (#3703): it is jq's bare
+/// `recurse`, a walk over a finite tree that can neither raise nor run away,
+/// so [`walk_descendants`] delivers the tree's nodes directly, uncapped.
 ///
 /// **`f` runs only if the sink still wants more.** That is the whole point
 /// of the sink: jq's `def r: ., (f | r); r;` emits `.` *before* `f` is
@@ -45703,6 +45798,9 @@ pub(crate) fn each_recurse_walk<S: EvalSemantics>(
     reentry: Reentry,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> RecurseWalkEnd {
+    if is_structural_descent(f, cond) {
+        return walk_descendants(root, sink);
+    }
     let f = reentry.reroot::<S>(f);
     let demoted_f = demote_for_reentry(&f, &RootWitness::Owned);
     let demoted_cond = cond.map(|c| demote_for_reentry(c, &RootWitness::Owned));
@@ -46086,7 +46184,9 @@ struct ValueRecurseWalk<'e, 'd, 's, S> {
     demoted_f: &'d Expr,
     demoted_cond: Option<&'d Expr>,
     sink: &'s mut dyn FnMut(OwnedValue) -> Demand,
-    /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`].
+    /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`]. Never reached
+    /// by [`is_structural_descent`]'s `f`, which [`each_recurse_walk`] hands
+    /// to [`walk_descendants`] before building this walk.
     emitted: usize,
     budget: RecurseNativeBudget,
     _semantics: PhantomData<S>,
@@ -46445,6 +46545,7 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
         keep,
         sink,
         emitted: 0,
+        cap: recurse_item_cap(f, cond),
         budget: RecurseNativeBudget::start(),
         _semantics: PhantomData,
     };
@@ -46467,8 +46568,10 @@ struct PathRecurseWalk<'e, 'a, 's, S> {
     frame: &'e Frame,
     keep: Keep,
     sink: &'s mut dyn FnMut(PathBranch<'a>) -> Demand,
-    /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`].
+    /// Nodes delivered so far, against [`Self::cap`].
     emitted: usize,
+    /// How many nodes this walk may deliver: [`recurse_item_cap`].
+    cap: usize,
     budget: RecurseNativeBudget,
     _semantics: PhantomData<S>,
 }
@@ -46478,7 +46581,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
     /// levels are already live above it (see [`RecurseNativeBudget`]).
     fn visit(&mut self, node: PathBranch<'a>, level: u32) -> Option<RecurseAbort> {
         let _scope = self.budget.scope();
-        if self.emitted >= RECURSE_MAX_ITEMS {
+        if self.emitted >= self.cap {
             return Some(RecurseAbort::Capped);
         }
         self.emitted += 1;
@@ -46615,7 +46718,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
         let mut pending_error: Option<EvalEscape> = None;
         self.queue_children(node, &mut stack, &mut pending_error);
 
-        while !stack.is_empty() && self.emitted < RECURSE_MAX_ITEMS {
+        while !stack.is_empty() && self.emitted < self.cap {
             let current = stack.pop().expect("loop condition checked non-empty");
             self.emitted += 1;
             if (self.sink)(Self::delivered(&current)) == Demand::Stop {
@@ -55969,7 +56072,10 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // The traversal itself lives in `each_recurse_walk` (#2693), shared with
     // `builtin_recurse_cond` and with `eval_each`'s lazy arm. This sink
     // never stops, so the walk is exactly what it always was: every node
-    // visited, `f` run at each, up to `RECURSE_MAX_ITEMS`.
+    // visited, `f` run at each, up to `RECURSE_MAX_ITEMS` -- except for
+    // `.[]?` with no `cond` (bare `recurse`, which this function is for when
+    // `builtin_recurse` calls it), which `each_recurse_walk` hands to
+    // `walk_descendants` and which has no cap (#3703).
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let end = each_recurse_walk::<S>(f, None, root, Reentry::Proven, &mut |v| {
         outputs.push(v);
@@ -108916,6 +109022,102 @@ mod tests {
                 "`{filter}`"
             );
         }
+    }
+
+    /// #3703: the node cap is lifted for structural descent and for nothing
+    /// else. `recurse(.[]?)` is jq's bare `recurse`, so its walk is bounded by
+    /// the tree it walks; any other `f` can be unbounded (`recurse(.a)` on
+    /// `null`), and a `cond` can reject children `..` would visit, so those
+    /// keep [`RECURSE_MAX_ITEMS`].
+    #[test]
+    fn recurse_item_cap_is_lifted_only_for_structural_descent_3703() {
+        let cap = |filter: &str| match parse(filter).unwrap() {
+            Expr::Builtin(Builtin::RecurseF(f)) => recurse_item_cap(&f, None),
+            Expr::Builtin(Builtin::RecurseCond(f, cond)) => recurse_item_cap(&f, Some(&cond)),
+            other => panic!("not a recurse: {filter} -> {other:?}"),
+        };
+        for filter in ["recurse(.[]?)", "recurse((.[]?))", "recurse(((.[]?)))"] {
+            assert_eq!(cap(filter), usize::MAX, "`{filter}`");
+        }
+        // `.[]` without `?` raises on a scalar; `.a?`, a pipe, a comma and a
+        // computed `f` are all a different walk.
+        for filter in [
+            "recurse(.[])",
+            "recurse(.a?)",
+            "recurse(.[]? | .)",
+            "recurse(.[]?, .[]?)",
+            "recurse(.)",
+            "recurse(if type == \"array\" then .[] else empty end)",
+        ] {
+            assert_eq!(cap(filter), RECURSE_MAX_ITEMS, "`{filter}`");
+        }
+        // A `cond` keeps the cap even over `.[]?`, `true` included.
+        for filter in ["recurse(.[]?; true)", "recurse(.[]?; . != null)"] {
+            assert_eq!(cap(filter), RECURSE_MAX_ITEMS, "`{filter}`");
+        }
+    }
+
+    /// #3703: the direct structural walk and the evaluator-driven one deliver
+    /// the same nodes in the same order, and stop alike.
+    ///
+    /// `recurse(.[]?)` takes [`walk_descendants`]; `recurse(.[]?; true)` has a
+    /// `cond`, so it keeps running `.[]?` at every node through
+    /// [`ValueRecurseWalk`], and `..` is the cursor walk. All three must agree
+    /// on every document small enough for the cap not to separate them.
+    #[test]
+    fn walk_descendants_agrees_with_the_evaluator_driven_walk_3703() {
+        let docs: [&[u8]; 8] = [
+            b"0",
+            b"null",
+            br#""s""#,
+            b"[]",
+            b"{}",
+            br#"[[1,2],[3,[4,5]],{"x":{"y":6}}]"#,
+            br#"{"a":{"b":[1,2,{"c":null}]},"d":[3,[4,[5]]],"e":null,"f":[],"g":{}}"#,
+            br#"[[],[[]],[[],[]],{"k":[{"k":[{}]}]}]"#,
+        ];
+        for doc in docs {
+            for (direct, driven, reference) in [
+                ("[recurse(.[]?)]", "[recurse(.[]?; true)]", "[..]"),
+                (
+                    "[limit(3; recurse(.[]?))]",
+                    "[limit(3; recurse(.[]?; true))]",
+                    "[limit(3; ..)]",
+                ),
+                (
+                    "[first(recurse(.[]?))]",
+                    "[first(recurse(.[]?; true))]",
+                    "[first(..)]",
+                ),
+                (
+                    "[recurse(.[]?) | numbers]",
+                    "[recurse(.[]?; true) | numbers]",
+                    "[.. | numbers]",
+                ),
+                (
+                    "[isempty(recurse(.[]?))]",
+                    "[isempty(recurse(.[]?; true))]",
+                    "[isempty(..)]",
+                ),
+            ] {
+                let want = outputs_and_end(doc, reference);
+                assert_eq!(outputs_and_end(doc, direct), want, "`{direct}` on {doc:?}");
+                assert_eq!(outputs_and_end(doc, driven), want, "`{driven}` on {doc:?}");
+            }
+        }
+    }
+
+    /// #3703: `walk_descendants` is an explicit stack, so a chain nested past
+    /// the native stack budget a recursing `f` spends (tens of levels, see
+    /// [`each_recurse_walk`]) is walked in full.
+    #[test]
+    fn walk_descendants_is_not_bounded_by_the_native_stack_3703() {
+        // `[[[...[1]...]]]`, 300 deep: one array per level and the leaf.
+        let doc = format!("{}1{}", "[".repeat(300), "]".repeat(300));
+        assert_eq!(
+            outputs_and_end(doc.as_bytes(), "[recurse(.[]?)] | length"),
+            (vec!["301".to_string()], String::new())
+        );
     }
 
     /// #2918: `recurse`'s native order (each output of `f` descended into

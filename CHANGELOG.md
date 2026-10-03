@@ -581,6 +581,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq/yq: `recurse(.[]?)` visits every node instead of stopping silently at 10,000** (#3703). jq defines
+  `def recurse: recurse(.[]?);`, so the explicit spelling is bare `recurse`, a walk bounded by the tree it
+  walks, but the node cap meant for a parameterised `f` that can be unbounded (`recurse(.a)` on `null`)
+  applied to it too, and to bare `recurse` on an owned input (`-n`): on a 12,001-node document
+  `[recurse(.[]?)] | length` answered 10000 with exit 0 where jq answers 12001, `[recurse(.[]?) | numbers]`
+  4999 where jq answers 6000, and `[path(recurse(.[]?))]` 10000. A write through the same walk lost what lay
+  past the cap: `(recurse(.[]?) | select(type == "number")) |= . + 1` left 1,001 of the 6,000 numbers
+  un-incremented and `del(recurse(.[]?) | select(type == "number"))` left 1,001 of them in place. The value
+  walker now hands exactly `.[]?` with no `cond` to a direct walk of the owned tree, which is what `..` already
+  does, and the path walker lifts its cap for the same shape. Every row above matches jq 1.7.1. The direct walk
+  also costs what `..` costs, not what running `.[]?` at every node did: over 1.15 M nodes of a `users`
+  document 3.2 s with only the cap lifted, 0.62 s now, `..` 0.34 s (an Apple M5 Max under load, indicative);
+  on a 458-byte YAML whose aliases expand to 5.4 M nodes the walk peaks at 1.04 GB, against 3.4 GB with only the
+  cap lifted, 0.90 GB capped at the old 10,000 nodes, and `..`'s 0.46 GB. Any other `f`, and any `cond`, still
+  stops at 10,000 (#3716), and `path(recurse(.[]?))` still runs `.[]?` at every node, about 1.8 times
+  `path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes, #3717); see `docs/compliance/jq/limitations.md`.
+
 - **jq: an `and`/`or` whose left operand is a full or empty slice of `[]` no longer accepts an optional
   index on its right in path position** (#3647, a #3494 residual). `[] | del(.[0:0] and .b?)`,
   `path(.[0:] and .b?)`, `(.[0:0] and .b?) = 9` and `del(.[0:] and (.. | .a?))` were accepted where jq
