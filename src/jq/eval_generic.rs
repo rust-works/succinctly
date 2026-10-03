@@ -59,28 +59,29 @@ use super::eval::{
     collapse_vec, collect_pattern_var_names, compare_key_arrays, compare_values,
     debug_assert_materialization_error, def_spine_len, demote_for_reentry, descriptor_slice_bounds,
     each_path_on_owned, each_pattern_binding_set, each_recurse_walk, enter_def_call,
-    entries_to_object, eval_each_owned, eval_full as full_eval, finish_fork_flow,
-    finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
-    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
-    index_one_owned as index_owned_by_key, is_assignment_expr, is_eager_arg,
-    is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
-    literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
-    numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
-    owned_to_expr, owned_to_string, pattern_alternatives_var_names, prefer_pending_control,
-    probe_def_call, range_from_literal_override, range_max_exceeded_error, range_num,
-    range_values_f64, range_values_int, recurse_walk_flow, reduce_forks, reroot_for_reentry,
-    reroot_markers, resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty,
-    select_emits, settle_then_replay, settles_before_consumer, shared_arg_depth_refusal,
-    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
-    stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
-    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
-    tostring_owned, try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty,
-    yq_assign_rhs_document, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
-    yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
-    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RootWitness, SliceTargetKind,
-    StashedEscape, StashedVerdict, YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    entries_to_object, eval_each_owned, eval_each_owned_front_doors_of_stage,
+    eval_full as full_eval, finish_fork_flow, finish_fork_from_flow, finish_short_circuit,
+    fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
+    index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
+    is_assignment_expr, is_eager_arg, is_identity_passthrough, is_retryable_control,
+    is_retryable_stop, key_arrays_eq, limit_raising, literal_to_owned, mark_nonretryable_escape,
+    native_stack_exhausted, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
+    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
+    pattern_alternatives_var_names, prefer_pending_control, probe_def_call,
+    range_from_literal_override, range_max_exceeded_error, range_num, range_values_f64,
+    range_values_int, recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
+    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
+    settle_then_replay, settles_before_consumer, shared_arg_depth_refusal, slice_component_value,
+    slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
+    stop_with_error, stop_with_escape, streams_escaped_generator_prefix, streams_unbounded,
+    substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str, tostring_owned,
+    try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
+    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, RangeNum, Reentry, RootWitness, SliceTargetKind, StashedEscape, StashedVerdict,
+    YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -9308,9 +9309,7 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
                 };
                 // #2642: `o` is a computed intermediate value, never
                 // document-backed.
-                let rest_pipe = Expr::Pipe(stages[j..].to_vec());
-                return eval_each_owned::<S>(
-                    &rest_pipe,
+                return RestPipe::new(&stages[j..]).eval_each_owned::<S>(
                     &o,
                     optional,
                     Reentry::REBUILT,
@@ -12309,7 +12308,9 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
 /// *slice* as one is to own a copy: a `Vec` allocation plus a recursive
 /// `Expr` clone per stage. Doing that inside the per-element call meant
 /// paying it once per element; a driver builds one of these instead and
-/// reuses it for its whole loop.
+/// reuses it for its whole loop. A rest of one plain stage does not need the
+/// copy at all when `eval_each_owned`'s front doors answer it (#3673, see
+/// [`RestPipe::eval_each_owned`]).
 ///
 /// The slice and its owned copy are one value rather than two parameters on
 /// purpose. Correctness requires that a cached pipe is only ever used with
@@ -12340,6 +12341,26 @@ impl<'a> RestPipe<'a> {
         let stages = self.stages;
         self.owned
             .get_or_insert_with(|| Expr::Pipe(stages.to_vec()))
+    }
+
+    /// Run these stages against `input`, an owned intermediate, through
+    /// [`eval_each_owned`]. The owned `Expr::Pipe` is only built for a rest
+    /// the owned doors cannot answer from the stage itself (#3673): a lone
+    /// `. + 1` or `length` after a computed value used to cost a `Vec` and a
+    /// clone of the stage for every evaluation that reached it.
+    fn eval_each_owned<S: EvalSemantics>(
+        &mut self,
+        input: &OwnedValue,
+        optional: bool,
+        reentry: Reentry,
+        sink: &mut dyn FnMut(OwnedValue) -> Demand,
+    ) -> Flow {
+        if let Some(flow) =
+            eval_each_owned_front_doors_of_stage::<S>(self.stages, input, optional, sink)
+        {
+            return flow;
+        }
+        eval_each_owned::<S>(self.owned(), input, optional, reentry, sink)
     }
 }
 
@@ -12393,7 +12414,7 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
                 };
             // #2642: `o` is a computed intermediate value, never
             // document-backed.
-            eval_each_owned::<S>(rest.owned(), &o, optional, Reentry::REBUILT, &mut |o| {
+            rest.eval_each_owned::<S>(&o, optional, Reentry::REBUILT, &mut |o| {
                 sink.push(GenericItem::Owned(o))
             })
         }
@@ -41635,6 +41656,107 @@ mod tests {
                 .unwrap();
             let got: Vec<String> = got.iter().map(OwnedValue::to_json).collect();
             assert_eq!(got.join(" "), want, "{filter}");
+        }
+    }
+
+    /// #3673, against a reference that does not share the code under test:
+    /// a lazy prefix (`keys_unsorted`, `map(f)`) folds into a computed value
+    /// and one plain stage is left, the shape `fold_pipe_stages_sink`'s `Owned`
+    /// arm now runs from a borrowed slice. Each prints what jq 1.7.1 prints
+    /// (captured live), through the sink evaluator the CLI drives.
+    #[test]
+    fn test_owned_intermediate_single_stage_tail_matches_jq_3673() {
+        let doc = r#"{"a":[1,2,3],"b":{"x":1,"y":2,"z":3},"s":"hello"}"#;
+        for (filter, want) in [
+            (".b | keys_unsorted | length | . + 1", "4"),
+            (".a | map(. + 1) | length | . * 2", "6"),
+            (".a | map(. + 1) | add | . / 2", "4.5"),
+            (".b | keys_unsorted | length | tostring", r#""3""#),
+            (".a | map(.) | length | type", r#""number""#),
+            (".a | map(. * 2) | max | . - 1", "5"),
+            (".a | map(. * 2) | sort | length", "3"),
+            (".b | keys_unsorted | length | . == 3", "true"),
+            (".b | keys_unsorted | length | not", "false"),
+            (".b | keys_unsorted | length | . + null", "3"),
+            (".a | map(. + 1) | length | . % 2", "1"),
+            // Two stages are left: the owned pipe is still built, and agrees.
+            (".a | map(. + 1) | length | . - 1 | . - 1", "1"),
+            ("[.a | map(. + 1) | length | . + 1]", "[4]"),
+            (".s | explode | map(. + 1) | length | . + 1", "6"),
+            // A stage the front doors leave to the bridge.
+            (".a | map(. + 1) | length | getpath([])", "3"),
+            // Failures raised by the lone stage: caught, suppressed, uncaught.
+            (
+                r#"try (.b | keys_unsorted | length | . + "a") catch ."#,
+                r#""number (3) and string (\"a\") cannot be added""#,
+            ),
+            (
+                r"try (.b | keys_unsorted | length | .a) catch .",
+                r#""Cannot index number with string \"a\"""#,
+            ),
+            // `first` stops the sink after one output.
+            ("first(.b | keys_unsorted | length | . + 1)", "4"),
+        ] {
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), filter);
+            assert!(control.is_none(), "{filter}: {control:?}");
+            assert_eq!(
+                out.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                [want],
+                "{filter}"
+            );
+        }
+        // Uncaught, the stage's error escapes with jq's own message.
+        let (out, control) =
+            drive_each_sink::<JqSemantics>(doc.as_bytes(), ".b | keys_unsorted | length | . + [1]");
+        assert!(out.is_empty());
+        let Some(Control::Error(error)) = control else {
+            panic!("expected the stage's error to escape"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
+        };
+        assert_eq!(error.message, "number (3) and array ([1]) cannot be added");
+        // `?` on the lone stage suppresses it.
+        let (out, control) =
+            drive_each_sink::<JqSemantics>(doc.as_bytes(), "[.b | keys_unsorted | length | .a?]");
+        assert!(control.is_none(), "{control:?}");
+        assert_eq!(
+            out.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+            ["[]"]
+        );
+    }
+
+    /// #3673: a rest the owned front doors answer from its one plain stage
+    /// never builds the owned `Expr::Pipe`; a rest they leave to the bridge
+    /// (another stage, a nested pipe, a shape no door knows) builds it, once.
+    #[test]
+    fn test_rest_pipe_builds_no_owned_pipe_for_a_door_answered_stage_3673() {
+        let two = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        for (src, input, want, builds) in [
+            (". + 1", OwnedValue::Int(3), "4", false),
+            (". * 2", OwnedValue::Int(3), "6", false),
+            ("tostring", OwnedValue::Int(3), r#""3""#, false),
+            ("type", OwnedValue::Int(3), r#""number""#, false),
+            (". == 3", OwnedValue::Int(3), "true", false),
+            ("not", OwnedValue::Int(3), "false", false),
+            ("length", two.clone(), "2", false),
+            ("(. + 1)", OwnedValue::Int(3), "4", true),
+            ("floor", OwnedValue::Float(2.5), "2", true),
+            (". | length", two.clone(), "2", true),
+            (". + 1 | . * 2", OwnedValue::Int(3), "8", true),
+        ] {
+            let expr = parse(src).unwrap();
+            let stages = match expr {
+                Expr::Pipe(stages) if src.starts_with(". + 1 |") => stages,
+                other => vec![other],
+            };
+            let mut rest = RestPipe::new(&stages);
+            let mut out = Vec::new();
+            let flow =
+                rest.eval_each_owned::<JqSemantics>(&input, false, Reentry::REBUILT, &mut |v| {
+                    out.push(v.to_json());
+                    Demand::Continue
+                });
+            assert!(matches!(flow, Flow::Exhausted), "{src}");
+            assert_eq!(out, [want], "{src}");
+            assert_eq!(rest.owned.is_some(), builds, "{src}: owned pipe built");
         }
     }
 

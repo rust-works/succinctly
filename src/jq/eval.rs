@@ -9037,7 +9037,10 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     // `Expr::Pipe` before handing it to `eval_each_owned` (#2543), so a
     // solitary `max` arrives here as `Expr::Pipe([max])`. Unwrapped for the
     // same reason `eval_owned_fast_path` unwraps it; a pipe with an actual
-    // tail is [`embed_peel_step`]'s business, not this function's.
+    // tail is [`embed_peel_step`]'s business, not this function's. (Since
+    // #3673 the generic evaluator offers that lone stage bare first, through
+    // [`eval_each_owned_front_doors_of_stage`], and builds the wrapper only
+    // when the doors decline -- both spellings still reach this function.)
     // Parentheses are spelling, as in [`embed_peel_step`]: the generic
     // re-entry hands `(sort)` over as one `Expr::Paren`.
     let expr = match unwrap_paren(expr) {
@@ -9804,6 +9807,74 @@ fn embed_peel_step<S: EvalSemantics>(
     Some((stepped, rest))
 }
 
+/// The doors [`eval_each_owned`] tries first: they answer from the owned
+/// tree alone, never look at `reentry`, and never rebuild `expr`, so a caller
+/// holding only a one-stage slice can try them without an owned `Expr::Pipe`
+/// (see [`eval_each_owned_front_doors_of_stage`]). `None` when none of them
+/// answers and the rest of [`eval_each_owned`] has to.
+pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    if let Some(flow) = eval_each_owned_fast_path::<S>(expr, input, optional, sink) {
+        return Some(flow);
+    }
+    // #3477: a count needs no index over the container it counts.
+    if let Some(length) = eval_owned_length(expr, input) {
+        return Some(match sink(length) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
+    // #2889: `add`/`min`/`max` hand back one of their inputs rather than
+    // computing a new value, and the round trip below would rebuild that
+    // input as a copy. Before the peel, which cannot help here -- the fold
+    // is the whole expression, not the front of a pipe. See
+    // [`eval_owned_relocating_fold`] for the outcome gate that keeps this
+    // from changing *what* is produced.
+    if let Some(relocated) = eval_owned_relocating_fold::<S>(expr, input) {
+        return Some(match sink(relocated) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        });
+    }
+    None
+}
+
+/// [`eval_each_owned_front_doors`] for the one stage a pipe has left,
+/// without building the `Expr::Pipe` around it (#3673).
+///
+/// `eval_each_owned` takes an `&Expr`, and the generic evaluator hands it
+/// the rest of a pipe as a stage slice, so it had to copy the slice into a
+/// fresh `Expr::Pipe` -- a `Vec` plus a clone of every stage -- for every
+/// owned intermediate, even when the rest was a single `. + 1` or `length`
+/// that these doors answer without ever reading the pipe. A one-stage pipe
+/// is its stage to every one of them (`eval_owned_fast_path` unwraps it
+/// itself, #2543; `eval_owned_length` and `eval_owned_relocating_fold` skip
+/// a pipe of one the same way), so the stage is offered on its own.
+///
+/// `None` means the caller must run [`eval_each_owned`] on the whole pipe:
+/// either the doors declined, or the slice is not one plain stage. A stage
+/// that is itself a pipe (after parentheses) is excluded because the doors
+/// unwrap exactly one level, so `Pipe([Pipe([max])])` and `Pipe([max])` are
+/// not the same question to them. Pinned against the pipe-wrapped form by
+/// `test_single_stage_front_doors_agree_with_the_wrapped_pipe_3673`.
+pub(crate) fn eval_each_owned_front_doors_of_stage<S: EvalSemantics>(
+    stages: &[Expr],
+    input: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    match stages {
+        [only] if !matches!(unwrap_paren(only), Expr::Pipe(_)) => {
+            eval_each_owned_front_doors::<S>(only, input, optional, sink)
+        }
+        _ => None,
+    }
+}
+
 /// Owned-input twin of [`eval_each`], mirroring `eval_owned_input`.
 ///
 /// The sink takes `OwnedValue`, not `Item`: values produced against the
@@ -9838,27 +9909,8 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     reentry: Reentry,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
-    if let Some(flow) = eval_each_owned_fast_path::<S>(expr, input, optional, sink) {
+    if let Some(flow) = eval_each_owned_front_doors::<S>(expr, input, optional, sink) {
         return flow;
-    }
-    // #3477: a count needs no index over the container it counts.
-    if let Some(length) = eval_owned_length(expr, input) {
-        return match sink(length) {
-            Demand::Continue => Flow::Exhausted,
-            Demand::Stop => Flow::Stopped { pending: None },
-        };
-    }
-    // #2889: `add`/`min`/`max` hand back one of their inputs rather than
-    // computing a new value, and the round trip below would rebuild that
-    // input as a copy. Before the peel, which cannot help here -- the fold
-    // is the whole expression, not the front of a pipe. See
-    // [`eval_owned_relocating_fold`] for the outcome gate that keeps this
-    // from changing *what* is produced.
-    if let Some(relocated) = eval_owned_relocating_fold::<S>(expr, input) {
-        return match sink(relocated) {
-            Demand::Continue => Flow::Exhausted,
-            Demand::Stop => Flow::Stopped { pending: None },
-        };
     }
     // #2889: take the front of the pipe natively before re-indexing, so a
     // stage standing *on* an embedded node reaches the bridge as that node
@@ -50981,6 +51033,9 @@ pub(crate) fn eval_owned_fast_path<S: EvalSemantics>(
         // notation threshold (#2456) -- confirmed live:
         // `succinctly jq -n '(2 * 1e16) | tostring'` gave `"2E+16"` where
         // real jq and every non-`-n` succinctly invocation gave `"2e+16"`.
+        // (#3673: that arm now offers a lone stage bare first, through
+        // [`eval_each_owned_front_doors_of_stage`]; this unwrap still serves
+        // every other `Expr::Pipe([x])` that reaches the fast path.)
         Expr::Pipe(stages) => match stages.as_slice() {
             [only] => eval_owned_fast_path::<S>(only, input, optional),
             _ => None,
@@ -79463,6 +79518,140 @@ mod tests {
                 "{src}"
             );
         }
+    }
+
+    /// #3673: a lone stage offered bare to the owned front doors
+    /// ([`eval_each_owned_front_doors_of_stage`]) is answered exactly as the
+    /// one-stage `Expr::Pipe` the generic evaluator used to build around it:
+    /// the same outputs and the same way of ending (whole, or stopped after
+    /// the first output), and no answer where the wrapped form declines. Run
+    /// over every pure value shape, both modes, and `?` on and off, for the
+    /// stages the three doors recognise and the ones they leave to the bridge.
+    #[test]
+    fn test_single_stage_front_doors_agree_with_the_wrapped_pipe_3673() {
+        fn ending(flow: Flow) -> String {
+            match flow {
+                Flow::Exhausted => "exhausted".to_string(),
+                Flow::Stopped { pending } => format!("stopped, pending={}", pending.is_some()),
+                Flow::Escaped(control) => format!("escaped {control:?}"),
+            }
+        }
+        /// What the doors made of `input`, or `None` when they declined.
+        fn answer(
+            doors: impl FnOnce(&mut dyn FnMut(OwnedValue) -> Demand) -> Option<Flow>,
+            stop_after_first: bool,
+        ) -> Option<(Vec<String>, String)> {
+            let mut outputs = Vec::new();
+            let flow = doors(&mut |v| {
+                outputs.push(format!("{v:?}"));
+                if stop_after_first {
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            })?;
+            Some((outputs, ending(flow)))
+        }
+        fn check<S: EvalSemantics>(stage: &Expr, input: &OwnedValue, src: &str) -> bool {
+            let wrapped = Expr::Pipe(vec![stage.clone()]);
+            let mut answered = false;
+            for optional in [false, true] {
+                for stop in [false, true] {
+                    let bare = answer(
+                        |sink| {
+                            eval_each_owned_front_doors_of_stage::<S>(
+                                core::slice::from_ref(stage),
+                                input,
+                                optional,
+                                sink,
+                            )
+                        },
+                        stop,
+                    );
+                    let want = answer(
+                        |sink| eval_each_owned_front_doors::<S>(&wrapped, input, optional, sink),
+                        stop,
+                    );
+                    if matches!(unwrap_paren(stage), Expr::Pipe(_)) {
+                        // Not a plain stage: the doors unwrap one level, so the
+                        // bare form is never offered.
+                        assert_eq!(
+                            bare, None,
+                            "{src} on {input:?}: a nested pipe is not offered"
+                        );
+                    } else {
+                        assert_eq!(
+                            bare, want,
+                            "{src} on {input:?} (optional={optional}, stop={stop})"
+                        );
+                    }
+                    answered |= bare.is_some();
+                }
+            }
+            answered
+        }
+        let mut answered = 0;
+        let mut declined = 0;
+        for src in [
+            // The fast path: the accumulator arithmetic, `tostring`, pure shapes.
+            ". + 1",
+            ". * 2",
+            ". - 1",
+            ". / 2",
+            ". % 2",
+            r#". + "a""#,
+            ". + [1]",
+            r#". + {"a": 1}"#,
+            ". + null",
+            "tostring",
+            "type",
+            ". == 1",
+            ". < 2",
+            "not",
+            ".a",
+            ".[0]",
+            ".",
+            "1",
+            // `length` over a container, and the relocating folds.
+            "length",
+            "max",
+            "min",
+            "add",
+            "sort",
+            "unique",
+            "reverse",
+            "to_entries",
+            r#"getpath(["a"])"#,
+            // Left to the bridge.
+            "floor",
+            "keys",
+            "ascii_downcase",
+            "tojson",
+            // Spelling: parentheses are not structure, a nested pipe is not a stage.
+            "(. + 1)",
+            "(length)",
+            "(max)",
+            ". | length",
+            "(. | max)",
+        ] {
+            let stage = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            for input in &pure_value_matrix() {
+                for was_answered in [
+                    check::<JqSemantics>(&stage, input, src),
+                    check::<YqSemantics>(&stage, input, src),
+                ] {
+                    if was_answered {
+                        answered += 1;
+                    } else {
+                        declined += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            answered > 200 && declined > 200,
+            "the matrix must reach both the doors and the bridge: answered {answered}, declined {declined}"
+        );
     }
 
     #[test]
