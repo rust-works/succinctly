@@ -166,6 +166,19 @@ OPERANDS = [
     "if . then 1 else .a end",
     "try 1 catch .a",
     "(def f: 5; f)",
+    # (#3643) `last(f)` is `reduce f as $x (null; $x)`: its source backtracks, so
+    # the register is where it entered even when `f` navigates. The contrast
+    # rows are the generators that emit from inside the fork (`first(f)`,
+    # `nth(n; f)`, `limit`), which move it and must stay refused.
+    "last(.a)",
+    "last(.a,.b)",
+    "last(.[]?)",
+    "last(empty)",
+    "last(first(.a))",
+    "last(.a | .b?)",
+    "first(.a)",
+    "nth(0; .a)",
+    "limit(1; .a)",
 ]
 
 # The other side of a two-operand shape. Chosen so that, against the inputs

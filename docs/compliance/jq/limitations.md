@@ -1101,10 +1101,13 @@ is the revert that established what the other one costs.
    by-value leaf). Refuse-only, and pinned
    (`test_path_register_compound_stage_is_refused_as_a_whole_3456`) so lifting the verdict to
    the leaf is a deliberate change with rows of its own. The drain builtins are the same kind of
-   case: jq backtracks `last(f)`'s and `INDEX(s; f)`'s source, so `path(. as $x \| last(.l[]) \|
-   $x)` on `{"l":[1,2]}` is `[]` in jq, while here the register is lost at the drain and the
-   later `$x` is refused -- and, since #3267, uncatchably (`isempty(g)` moves it only when `g`
-   emits). Pinned by `test_path_register_drain_producers_lose_the_register_uncatchably_3456`.
+   case: jq backtracks `INDEX(s; f)`'s source, so `path(. as $x \| INDEX(.l[]; .) \| $x)` on
+   `{"l":[1,2]}` is `[]` in jq, while here the register is lost at the drain and the later `$x`
+   is refused -- and, since #3267, uncatchably (`isempty(g)` moves it only when `g` emits).
+   Pinned by `test_path_register_drain_producers_lose_the_register_uncatchably_3456`. `last(f)`
+   is no longer one of them: [#3643](https://github.com/rust-works/succinctly/issues/3643)
+   states its register as unmoved (jq mode), so `path(. as $x \| last(.l[]) \| $x)` is `[]`
+   here too, pinned by `test_path_register_last_f_does_not_move_it_3643`.
    An array is different: jq collects it without a subexp, so its contents
    are path-checked (`path(. as $x \| {k:.a} \| [.k] \| $x)` raises on the `.k`), and then
    backtracks the register to where the collect began. Since
@@ -1798,21 +1801,24 @@ is the revert that established what the other one costs.
    builtins, and yq v4.53.3 raises for none of them, so `succinctly yq` does not either.
 
    **#2746's own fix introduced one further, separate divergence, on the register rather
-   than on navigation**: `last(f)`/`INDEX(gen;f)` are `reduce`-based in jq's own definitions,
-   and this resolver treats a `reduce`-based stage as opaque for register-preservation
-   purposes (the same pre-existing rule already documented above for bare `reduce`/`foreach`
-   and `first(...)`) — so a `$x` bound *before* one of these two stages is no longer
+   than on navigation**: `INDEX(gen;f)` (and, until
+   [#3643](https://github.com/rust-works/succinctly/issues/3643), `last(f)`) is `reduce`-based
+   in jq's own definition, and this resolver treats a `reduce`-based stage as opaque for
+   register-preservation purposes (the same pre-existing rule already documented above for
+   bare `reduce`/`foreach` and `first(...)`) — so a `$x` bound *before* the stage is no longer
    recognized as still being the live register *after* it, even though the stage's own result
-   is discarded. Confirmed live against jq 1.7.1: `[1,2,3] | path(. as $x \| last(.[]) \| $x)`
-   is `[[]]` in jq (the register genuinely survives in the C implementation — `$x` is still
-   `.` itself) but raises `Invalid path expression with result [1,2,3]` here; same for
-   `INDEX(.[]; .)`. `isempty(f)` is not `reduce`-based, and its own answer already matches jq
+   is discarded. Confirmed live against jq 1.7.1: `[1,2,3] | path(. as $x \| INDEX(.[]; .)
+   \| $x)` is `[]` in jq (the register genuinely survives in the C implementation — `$x` is
+   still `.` itself) but raises `Invalid path expression with result [1,2,3]` here. `last(f)`
+   closed in jq mode with #3643, which states its register as unmoved
+   (`path(. as $x \| last(.[]) \| $x)` is `[]` in both; yq mode is unchanged).
+   `isempty(f)` is not `reduce`-based, and its own answer already matches jq
    (both raise) by coincidence of jq's own bytecode, not because either tool "preserves" the
    register in the sense described above. Pinned by
    `test_argument_navigation_builtins_drop_the_register_like_reduce_2746`
    (`tests/jq_cli_tests.rs`). Not tracked by a separate issue: it is the same class of
    divergence the `reduce`/`foreach`/`first(...)` allowlist above already accepts, extended to
-   two more `reduce`-based builtins by #2746's own fix, rather than a new kind of gap.
+   one more `reduce`-based builtin by #2746's own fix, rather than a new kind of gap.
 
    [#2072](https://github.com/rust-works/succinctly/issues/2072) supplied the missing
    half of that but deliberately did not spend it here. `Expr::TrackedVar` now carries a

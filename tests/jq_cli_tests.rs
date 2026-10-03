@@ -59695,24 +59695,25 @@ fn test_argument_navigation_builtins_forward_a_computed_result_2746() -> Result<
     Ok(())
 }
 
-/// #2746: `last`/`isempty`/`INDEX(gen;f)` are "opaque" stages for
+/// #2746: `isempty`/`INDEX(gen;f)` are "opaque" stages for
 /// register-preservation purposes, the same pre-existing rule
 /// `docs/compliance/jq/limitations.md` already documents for
 /// `reduce`/`foreach`/`first(...)`: a `$x` bound before the stage is still
 /// itself, but this resolver does not carry the *live register* through the
-/// stage, so `path(. as $x | last(.[]) | $x)` raises "Invalid path
-/// expression with result [1,2,3]" rather than naming a path. `last`/`INDEX`
-/// (both `reduce`-based in jq's own definitions) diverge from real jq here
-/// exactly as the pre-existing `add`/bare `reduce` already do (jq answers
-/// `[[]]` -- the register genuinely survives in the C implementation) -- an
+/// stage, so `path(. as $x | INDEX(.[]; .) | $x)` raises "Invalid path
+/// expression with result [1,2,3]" rather than naming a path. `INDEX`
+/// (`reduce`-based in jq's own definition) diverges from real jq here exactly
+/// as the pre-existing `add`/bare `reduce` already do (jq answers `[]` -- the
+/// register genuinely survives in the C implementation) -- an
 /// already-documented, unrelated divergence, not something #2746 introduces
 /// or is scoped to fix. `isempty` is not `reduce`-based, and its own answer
-/// happens to already match jq (both raise). All three confirmed live
+/// happens to already match jq (both raise). `last(f)` was in this list until
+/// #3643 promoted it to jq's answer (`[]`,
+/// `test_path_register_last_f_does_not_move_it_3643`). All confirmed live
 /// against jq 1.7.1.
 #[test]
 fn test_argument_navigation_builtins_drop_the_register_like_reduce_2746() -> Result<()> {
     for filter in [
-        "path(. as $x | last(.[]) | $x)",
         "path(. as $x | isempty(.[]) | $x)",
         "path(. as $x | INDEX(.[]; .) | $x)",
     ] {
@@ -61362,27 +61363,22 @@ fn test_path_register_long_and_chain_is_bounded_3456() -> Result<()> {
     Ok(())
 }
 
-/// #3456 (B2): the drain producers -- `last(f)`, `isempty(g)`, `INDEX(s; f)`
-/// and an `[E]` whose contents the resolver does not check -- compute a value
+/// #3456 (B2): the drain producers -- `isempty(g)`, `INDEX(s; f)` and an
+/// `[E]` whose contents the resolver does not check -- compute a value
 /// without navigating to it, so they cannot say jq's register is where it
 /// entered. A later refusal of the frozen `$x` is therefore a guess, and a
 /// guessed refusal must be loud: caught by the `try` beside it, the write
 /// would be lost silently. Every row is exit 5 here and `{"k":1,"l":[1,2]}`
 /// (or the unchanged document) in jq 1.7.1, which keeps the register where it
-/// was for `last`/`INDEX`/`[E]` -- the promotion step's rows, not a fix here.
+/// was for `INDEX`/`[E]` -- a promotion step's rows, not a fix here. `last(f)`
+/// was promoted out of this list by #3643
+/// (`test_path_register_last_f_does_not_move_it_3643`).
 #[test]
 fn test_path_register_drain_producers_lose_the_register_uncatchably_3456() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":1,"l":[1,2]}"#;
     let access_a = r#"Invalid path expression near attempt to access element "a""#;
     let access_k = r#"Invalid path expression near attempt to access element "k""#;
     assert_path_rows_3289(&[
-        (
-            doc,
-            r"del(. as $x | last(.l[]) | try ($x | .a))",
-            "",
-            access_a,
-            5,
-        ),
         (
             doc,
             r"del(. as $x | isempty(.l[]) | try ($x | .a))",
@@ -61465,6 +61461,106 @@ fn test_path_register_drain_producers_keep_where_they_lost_it_3456() -> Result<(
             "",
             0,
         ),
+    ])
+}
+
+/// #3643: jq defines `last(f)` as `reduce f as $x (null; $x)`, so `f` runs as
+/// the reduce's source and backtracks to exhaustion: jq's register is where it
+/// entered even when `f` navigates. Every row captured from jq 1.7.1 on
+/// `{"a":{"b":1},"k":2}`. `first(f)`, `nth(n; f)` and `limit(n; f)` emit from
+/// inside the generator and *do* move it, so they stay refused; so does a
+/// navigation off `last`'s own (by-value) result.
+#[test]
+fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"k":2}"#;
+    let with_root = "Invalid path expression with result";
+    assert_path_rows_3289(&[
+        (doc, r"path(. as $x | last(.a) | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | last(.a,.k) | $x)", "[]\n", "", 0),
+        // The row #2746's register test used to pin as a refusal.
+        ("[1,2,3]", r"path(. as $x | last(.[]) | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | last(.a | .b?) | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | last(first(.a)) | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | last(empty) | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | (last(.a)) | $x)", "[]\n", "", 0),
+        // A node below the root: the register stays on `.a`, so `$x` frozen
+        // there re-establishes it.
+        (
+            doc,
+            r"path(.a | . as $x | last(.b) | $x)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // The write goes through: `$x` is the root again after `last`.
+        (
+            doc,
+            r"del(. as $x | last(.a) | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | last(.a) | $x.k) = 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | last(.a) | $x.k) |= 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        // The row #3456's drain test used to pin as a refusal: a `try` around
+        // the frozen `$x` no longer swallows a guess, because there is none.
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"del(. as $x | last(.l[]) | try ($x | .a))",
+            "{\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        // The generators that emit from inside the fork move the register.
+        (doc, r"path(. as $x | first(.a) | $x)", "", with_root, 5),
+        (doc, r"path(. as $x | nth(0; .a) | $x)", "", with_root, 5),
+        (doc, r"path(. as $x | limit(1; .a) | $x)", "", with_root, 5),
+        // A navigation off `last`'s output is checked against a register that
+        // is not on it.
+        (
+            doc,
+            r"path(. as $x | last(.a) | .a)",
+            "",
+            r#"near attempt to access element "a" of {"b":1}"#,
+            5,
+        ),
+        // The register left the root for `.a` before `last` ran, so a `$x`
+        // frozen at the root is not it.
+        (doc, r"path(. as $x | .a | last(.b) | $x)", "", with_root, 5),
+        // `last` as an operand: its result is by value, so it is never a
+        // path, and the right operand is still checked against the register.
+        (doc, r"path(last(.a) and .k)", "", "with result true", 5),
+        (
+            doc,
+            r"path(.k and last(.a))",
+            "",
+            r#"near attempt to access element "a""#,
+            5,
+        ),
+        // Still refused where jq answers `[]`: a compound stage mixing `last`
+        // with a navigating leaf is judged as a whole, and an `[E]` collect
+        // around it is a separate promotion. Pinned as today's (refuse-only)
+        // behaviour so lifting either is a deliberate change.
+        (
+            doc,
+            r"path(. as $x | (last(.a) // .k) | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (doc, r"path(. as $x | [last(.a)] | $x)", "", with_root, 5),
     ])
 }
 

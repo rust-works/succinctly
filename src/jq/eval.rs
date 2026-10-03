@@ -37105,12 +37105,18 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                     Demand::Continue
                 },
             );
-            forward_drained_result(
-                flow,
-                last.unwrap_or(OwnedValue::Null),
-                drained_register::<S>(trackable, value),
-                sink,
-            )
+            // #3643: jq defines `last(f)` as `reduce f as $x (null; $x)`, so
+            // `f` runs as the reduce's source, backtracks to exhaustion, and
+            // the result is read back from the reduce variable: jq's register
+            // is where it entered even when `f` navigates (`path(. as $x |
+            // last(.a) | $x)` is `[]`). `first(f)`/`nth`/`limit` emit from
+            // inside the generator and do move it, so they are not this arm.
+            let register = if trackable && S::TAG == EvalTag::Jq {
+                BranchRegister::Unmoved(Cow::Borrowed(value))
+            } else {
+                drained_register::<S>(trackable, value)
+            };
+            forward_drained_result(flow, last.unwrap_or(OwnedValue::Null), register, sink)
         }
 
         Expr::Builtin(Builtin::IsEmpty(inner)) => {
@@ -39175,6 +39181,25 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
             })
 }
 
+/// Whether a pipe stage `expr` is a `last(f)`, which in jq mode leaves jq's
+/// register where the stage entered whatever `f` navigates (#3643). jq defines
+/// it as `reduce f as $x (null; $x)`: `f` is the reduce's source, backtracked
+/// to exhaustion before the result is read back from the reduce variable. A
+/// stage-level fact, read by [`resolve_seq_stage`] beside
+/// [`cannot_move_register`] and not folded into it: that predicate also stands
+/// for "navigates nothing, so a register not on this input is never checked"
+/// ([`resolve_from_restored_input`]), and `f` here does navigate.
+/// `first(f)`, `nth` and `limit` emit from inside the generator and *do* move
+/// the register, so they are not admitted. jq mode only, like every admission
+/// here (ADR-0018): yq has no oracle for it.
+fn last_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
+    S::TAG == EvalTag::Jq
+        && matches!(
+            unwrap_paren(expr),
+            Expr::LastExpr(_) | Expr::Builtin(Builtin::LastStream(_))
+        )
+}
+
 /// [`BranchRegister::LostAt`] `value` in jq mode, where the position is read
 /// ([`Frame::register_loss`] is only ever derived there, #3267);
 /// [`BranchRegister::LostSomewhere`] in yq mode, which never reads a lost
@@ -39187,12 +39212,13 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
     }
 }
 
-/// [`leaf_register`] for the drain arms (`last`, `isempty`, `INDEX`): each runs
-/// its argument through a discarding sink and forwards one derived value, so
-/// none can claim the register stayed where it entered (D5). Whether jq's own
-/// definition leaves it (`last(f)` does, `isempty(g)` only when `g` is empty)
+/// [`leaf_register`] for the drain arms (`isempty`, `INDEX`, and `last` outside
+/// jq mode): each runs its argument through a discarding sink and forwards one
+/// derived value, so none can claim the register stayed where it entered (D5).
+/// Whether jq's own definition leaves it (`isempty(g)` only when `g` is empty)
 /// is a promotion with oracle rows of its own, not part of the producer
-/// contract's introduction.
+/// contract's introduction. `last(f)` in jq mode is one such promotion, made by
+/// #3643 in its own arm ([`last_leaves_register_in_place`]).
 fn drained_register<'a, S: EvalSemantics>(
     trackable: bool,
     value: &OwnedValue,
@@ -48380,6 +48406,9 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // re-established on `.a`'s `true` and deleted where jq refuses).
     let stage_reports_register = and_or_negate_resolves_live::<S>(element);
     let stage_preserves_register = cannot_move_register(element)
+        // #3643: `last(f)` backtracks its source, so the register is where the
+        // stage entered even though `f` navigates.
+        || last_leaves_register_in_place::<S>(element)
         // #3263: an array resolved live whose contents the resolver checks as
         // jq does, and jq's collect backtracks the register to where it began.
         || matches!(element, Expr::Array(inner)
