@@ -10786,7 +10786,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         // Fall back to the full evaluator for complex expressions
         _ => {
-            // Convert to OwnedValue, then to JSON, then evaluate with full evaluator
+            // Convert to OwnedValue, then to JSON, then evaluate with full
+            // evaluator -- unless `value` is the root of the DOM document the CLI
+            // registered, in which case that document is evaluated over as it is
+            // (#3479, below).
             //
             // STYLE-0012: `optional` is never `true` here -- after #693 the
             // only caller that forces it is the `IndexExpr`/`SliceExpr`
@@ -10818,9 +10821,23 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let root = RootWitness::of(cursor.as_ref());
             let expr = reroot_for_reentry::<S>(expr, &root);
             let expr = expr.as_ref();
-            let owned = owned_or_err!(bridge_ambient_input::<_, S>(expr, &value, cursor));
-            let doc = owned_or_err!(owned.reindexed::<S>());
-            let cursor = doc.root();
+            //
+            // #3479: when `value` is the root of the DOM document the CLI
+            // registered, that document's text and index already describe it,
+            // so the `-R` line a partial slice (`.[0:3]`, no native arm) was
+            // handed is not decoded and written out again: this arm paid that
+            // second serialize-and-index per line while the bridges above it
+            // did not (+57% on the M4 Pro, +66% on the 7950X at 1 MB).
+            let rooted = reindexed_root_for::<S, _>(expr, cursor.as_ref());
+            let rebuilt;
+            let cursor = match rooted.as_deref() {
+                Some(doc) => doc.root(),
+                None => {
+                    let owned = owned_or_err!(bridge_ambient_input::<_, S>(expr, &value, cursor));
+                    rebuilt = owned_or_err!(owned.reindexed::<S>());
+                    rebuilt.root()
+                }
+            };
 
             // No `if optional { wrap in Expr::Optional }` here (see
             // `eval_on_owned`'s matching comment): this `_` arm is only
@@ -10844,7 +10861,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // already silently degraded there (that gap is #1192's
             // remaining, out-of-scope half, tracked as #1247), not carried
             // through as malformed bytes for `owned_from_standard_json` to
-            // ever encounter here.
+            // ever encounter here. On the registered-document path (#3479)
+            // there is no `owned` and no fresh serialization: `cursor` is the
+            // document the CLI built once from the value itself, so the
+            // premise holds only as far as that document's own construction
+            // does, which is the same one the sibling bridges' reuse (see
+            // `bridge_input_over`) already relies on.
             match full_eval::<Vec<u64>, S>(expr, cursor) {
                 QueryResult::One(v) => {
                     // Convert StandardJson back to OwnedValue
