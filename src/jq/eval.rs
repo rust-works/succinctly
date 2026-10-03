@@ -114385,16 +114385,13 @@ mod tests {
         // body succeeds here where jq's own path-check would raise through
         // it) must not be trusted -- admitting it would fabricate `[]`
         // where jq raises through the handler.
-        for (doc, filter) in [(
-            r#"{"a":1}"#,
+        query!(
+            br#"{"a":1}"#,
             r"path(. as $x | [try with_entries(.) catch .zz] | $x.a)",
-        )] {
-            query!(doc.as_bytes(), filter,
-                QueryResult::Error(e) => {
-                    assert!(is_resolver_refusal(&e), "{filter}: {}", e.message);
-                }
-            );
-        }
+            QueryResult::Error(e) => {
+                assert!(is_resolver_refusal(&e), "{}", e.message);
+            }
+        );
         // The #3271 pin is unchanged: `del(. as $x | [with_entries(.)] |
         // try .[0])` (uncatchable from a later, sibling stage) is already
         // covered by `test_native_builtins_and_update_assignment_raise_unconditionally_3271`.
