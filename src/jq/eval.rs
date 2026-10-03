@@ -8651,7 +8651,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `eval_generic`'s twin of this driver carries the same cache as a
     // `RestPipe`; here the `Owned` arm is the only reader, so a plain
     // `Option` is enough.
-    let mut rest_pipe: Option<Expr> = None;
+    let mut rest_pipe = RestPipe::new(rest);
     let upstream = {
         let mut driver = |item: Item<'a, W>| -> Demand {
             let flow = match item {
@@ -8663,14 +8663,11 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // through the rest of the pipe instead of stopping here
                 // (#820: an eager fallback here silently drained inputs a
                 // downstream sink never asked for).
-                Item::Owned(v) => eval_each_owned_rest::<S>(
-                    rest,
-                    &mut rest_pipe,
-                    &v,
-                    optional,
-                    Reentry::REBUILT,
-                    &mut |o| sink(Item::Owned(o)),
-                ),
+                Item::Owned(v) => {
+                    rest_pipe.run_owned::<S>(&v, optional, Reentry::REBUILT, &mut |o| {
+                        sink(Item::Owned(o))
+                    })
+                }
             };
             match flow {
                 Flow::Exhausted => Demand::Continue,
@@ -9039,7 +9036,7 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     // pipe drivers once always wrapped a single remaining stage before
     // handing it to `eval_each_owned`, and every other re-entry that rebuilds
     // a pipe still does) or, since #3673, bare, through
-    // [`eval_each_owned_rest`]. Unwrapped for the same reason
+    // [`RestPipe::run_owned`]. Unwrapped for the same reason
     // `eval_owned_fast_path` unwraps it; a pipe with an actual tail is
     // [`embed_peel_step`]'s business, not this function's.
     // Parentheses are spelling, as in [`embed_peel_step`]: the generic
@@ -9294,7 +9291,8 @@ pub(crate) fn path_over_owned_collect<S: EvalSemantics>(
 /// and re-materialize round trip with the same resolver over the same tree,
 /// and `reindex_bridge_is_identity` bounds what it may be handed (the
 /// storage clause itself is jq-only). A tail after `path(f)` re-enters per
-/// path under `REBUILT` -- a path is a fresh, scalar-only array -- with the
+/// path under `REBUILT` through one shared [`RestPipe`] (#3682) -- a path is a
+/// fresh, scalar-only array -- with the
 /// downstream verdict stashed out-of-band ([`stop_with_downstream`]),
 /// since `each_path_on_owned` reports a stop as its own and would drop a
 /// tail's escape.
@@ -9336,7 +9334,10 @@ pub(crate) fn owned_path_door<S: EvalSemantics>(
     if rest.is_empty() {
         return path_over_owned::<S>(path_expr, input, &root, optional, sink);
     }
-    let rest = Expr::Pipe(rest.to_vec());
+    // One cache of the owned pipe across every path: the closure below runs
+    // once per path, and builds it only if a path reaches a rest the front
+    // doors cannot answer from its one plain stage (#3682).
+    let mut rest_pipe = RestPipe::new(rest);
     let mut downstream: Option<Flow> = None;
     let upstream =
         path_over_owned::<S>(
@@ -9344,7 +9345,7 @@ pub(crate) fn owned_path_door<S: EvalSemantics>(
             input,
             &root,
             optional,
-            &mut |path| match eval_each_owned::<S>(&rest, &path, optional, Reentry::REBUILT, sink) {
+            &mut |path| match rest_pipe.run_owned::<S>(&path, optional, Reentry::REBUILT, sink) {
                 Flow::Exhausted => Demand::Continue,
                 other => stop_with_downstream(&mut downstream, other),
             },
@@ -9812,7 +9813,7 @@ fn embed_peel_step<S: EvalSemantics>(
 /// tree (and, for the relocating folds, the embed table), never look at
 /// `reentry`, and never rebuild `expr`, so a caller holding only a one-stage
 /// slice can try them without an owned `Expr::Pipe` (see
-/// [`eval_each_owned_rest`]). `None` when none of them answers and the rest
+/// [`RestPipe::run_owned`]). `None` when none of them answers and the rest
 /// of [`eval_each_owned`] has to.
 pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
     expr: &Expr,
@@ -9857,46 +9858,112 @@ fn lone_plain_stage(rest: &[Expr]) -> Option<&Expr> {
     }
 }
 
-/// [`eval_each_owned`] over the rest of a pipe given as its stages, building
-/// the owned `Expr::Pipe` it needs only when it needs one (#3673).
+/// Test-only observable (#3682): how many times [`eval_each_owned`] was
+/// entered with a pipe of one plain stage on this thread.
 ///
-/// `eval_each_owned` takes an `&Expr`, and both pipe drivers hold the rest of
-/// the pipe as a stage slice, so each had to copy the slice into a fresh
-/// `Expr::Pipe` -- a `Vec` plus a clone of every stage -- for every owned
-/// intermediate, even when the rest was a single `. + 1` or `length` that the
-/// front doors answer without ever reading the pipe. A one-stage pipe is its
-/// stage to every one of them (`eval_owned_fast_path` unwraps it itself,
-/// #2543; `eval_owned_length` and `eval_owned_relocating_fold` skip a pipe of
-/// one the same way), so a lone plain stage is offered on its own first.
+/// That shape is exactly what a site that still copies a lone rest into an
+/// owned `Expr::Pipe` hands it (the parser never builds a one-stage pipe, so
+/// nothing else does), so a count that moves during a door's run says the door
+/// went back to the copy. [`RestPipe::run_owned`] never enters it that way: a
+/// lone stage the front doors decline continues in
+/// [`eval_each_owned_past_front_doors`].
+#[cfg(test)]
+pub(crate) mod lone_pipe_entries {
+    use core::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
+/// The stages after the current one, plus the owned `Expr::Pipe` copy that
+/// [`eval_each_owned`] needs of them -- built at most once, and only if the
+/// rest cannot be answered without it (#1598, #3673, #3682).
 ///
-/// `whole` is the caller's cache of the owned pipe, filled on first use and
-/// reused for the caller's whole element loop. When the doors decline the
-/// lone stage they decline `Pipe([stage])` with it, so the fallback enters
-/// past them rather than asking twice; both halves of that are pinned against
-/// the pipe-wrapped form by
-/// `test_single_stage_front_doors_agree_with_the_wrapped_pipe_3673`. A rest of
-/// two or more stages is not offered bare: the later doors
-/// ([`embed_peel_step`], [`owned_path_door`], ...) are keyed on the whole
-/// `&Expr`, and the bridge they usually fall to costs far more than the clone.
-pub(crate) fn eval_each_owned_rest<S: EvalSemantics>(
-    rest: &[Expr],
-    whole: &mut Option<Expr>,
-    input: &OwnedValue,
-    optional: bool,
-    reentry: Reentry,
-    sink: &mut dyn FnMut(OwnedValue) -> Demand,
-) -> Flow {
-    let lone = lone_plain_stage(rest);
-    if let Some(only) = lone {
-        if let Some(flow) = eval_each_owned_front_doors::<S>(only, input, optional, sink) {
-            return flow;
+/// `eval_each_owned` takes an `&Expr`, and the only way to present a `rest`
+/// *slice* as one is to own a copy: a `Vec` allocation plus a recursive
+/// `Expr` clone per stage. Doing that inside the per-element call meant
+/// paying it once per element; a driver builds one of these instead and
+/// reuses it for its whole loop. A rest of one plain stage does not need the
+/// copy at all when `eval_each_owned`'s front doors answer it, so
+/// [`RestPipe::run_owned`] offers the lone stage to them first.
+///
+/// The slice and its owned copy are one value rather than two parameters on
+/// purpose. Correctness requires that a cached pipe is only ever used with
+/// the `rest` it was built from -- a mismatch would evaluate elements
+/// against the wrong stages, which is a wrong answer rather than a crash.
+/// Pairing them here makes that mismatch unrepresentable instead of relying
+/// on every call site to keep two arguments in step.
+///
+/// Every site that re-enters the owned evaluator with the rest of a pipe uses
+/// it: the generic evaluator's drivers (`fold_pipe_stages_sink`,
+/// `continue_pipe_element_generic`), this file's `eval_each_pipe`, and the
+/// owned peel doors ([`projection_peel`], [`owned_select_door`],
+/// [`owned_path_door`]). A site added later should too, so that the lone-stage
+/// route has one definition.
+pub(crate) struct RestPipe<'a> {
+    stages: &'a [Expr],
+    pub(crate) owned: Option<Expr>,
+}
+
+impl<'a> RestPipe<'a> {
+    pub(crate) fn new(stages: &'a [Expr]) -> Self {
+        Self {
+            stages,
+            owned: None,
         }
     }
-    let whole = whole.get_or_insert_with(|| Expr::Pipe(rest.to_vec()));
-    if lone.is_some() {
-        eval_each_owned_past_front_doors::<S>(whole, input, optional, reentry, sink)
-    } else {
-        eval_each_owned::<S>(whole, input, optional, reentry, sink)
+
+    /// The stages themselves, for the arms that can consume a slice.
+    pub(crate) fn stages(&self) -> &'a [Expr] {
+        self.stages
+    }
+
+    /// [`eval_each_owned`] over these stages, building the owned `Expr::Pipe`
+    /// it needs only when it needs one.
+    ///
+    /// A one-stage pipe is its stage to every front door
+    /// (`eval_owned_fast_path` unwraps it itself, #2543; `eval_owned_length`
+    /// and `eval_owned_relocating_fold` skip a pipe of one the same way), so a
+    /// lone plain stage is offered on its own first. When the doors decline
+    /// the lone stage they decline `Pipe([stage])` with it, so the fallback
+    /// enters past them rather than asking twice; both halves of that are
+    /// pinned against the pipe-wrapped form by
+    /// `test_single_stage_front_doors_agree_with_the_wrapped_pipe_3673`. A
+    /// rest of two or more stages is not offered bare: the later doors
+    /// ([`embed_peel_step`], [`owned_path_door`], ...) are keyed on the whole
+    /// `&Expr`, and the bridge they usually fall to costs far more than the
+    /// clone.
+    pub(crate) fn run_owned<S: EvalSemantics>(
+        &mut self,
+        input: &OwnedValue,
+        optional: bool,
+        reentry: Reentry,
+        sink: &mut dyn FnMut(OwnedValue) -> Demand,
+    ) -> Flow {
+        let stages = self.stages;
+        let lone = lone_plain_stage(stages);
+        if let Some(only) = lone {
+            if let Some(flow) = eval_each_owned_front_doors::<S>(only, input, optional, sink) {
+                return flow;
+            }
+        }
+        let whole = self
+            .owned
+            .get_or_insert_with(|| Expr::Pipe(stages.to_vec()));
+        if lone.is_some() {
+            eval_each_owned_past_front_doors::<S>(whole, input, optional, reentry, sink)
+        } else {
+            eval_each_owned::<S>(whole, input, optional, reentry, sink)
+        }
     }
 }
 
@@ -9934,6 +10001,10 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     reentry: Reentry,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
+    #[cfg(test)]
+    if matches!(unwrap_paren(expr), Expr::Pipe(stages) if lone_plain_stage(stages).is_some()) {
+        lone_pipe_entries::bump();
+    }
     if let Some(flow) = eval_each_owned_front_doors::<S>(expr, input, optional, sink) {
         return flow;
     }
@@ -10061,10 +10132,12 @@ fn eval_each_owned_past_front_doors<S: EvalSemantics>(
 /// takes (#3069).
 ///
 /// Consecutive leading `select` stages are settled in a loop; whatever follows
-/// the last one re-enters [`eval_each_owned`] on the same input, so a stage
-/// behind them keeps its own doors -- unless one of them reads the node's
-/// place in the document ([`needs_path_context`]), which only the bridge's
-/// cursor can answer, and then the door declines the whole pipe.
+/// the last one re-enters the owned evaluator on the same input through
+/// [`RestPipe::run_owned`] (one plain stage reaches the front doors without an
+/// owned `Expr::Pipe`, #3682; anything longer is [`eval_each_owned`]'s), so a
+/// stage behind them keeps its own doors -- unless one of them reads the
+/// node's place in the document ([`needs_path_context`]), which only the
+/// bridge's cursor can answer, and then the door declines the whole pipe.
 fn owned_select_door<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -10121,13 +10194,7 @@ fn owned_select_door<S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         });
     }
-    Some(eval_each_owned::<S>(
-        &Expr::Pipe(stages.to_vec()),
-        input,
-        optional,
-        Reentry::REBUILT,
-        sink,
-    ))
+    Some(RestPipe::new(stages).run_owned::<S>(input, optional, Reentry::REBUILT, sink))
 }
 
 /// Take a pipe's leading `.field`/`.[n]` natively, then re-enter with the
@@ -10188,8 +10255,9 @@ fn projection_peel<S: EvalSemantics>(
     if counted.is_none() && !matches!(first, Expr::Field(_) | Expr::Index { .. }) {
         return None;
     }
-    let rest = Expr::Pipe(rest.to_vec());
-    if needs_path_context(&rest) {
+    // `needs_path_context` of a pipe is "any stage does", so the slice is
+    // asked directly and a declined peel builds no pipe at all (#3682).
+    if rest.iter().any(needs_path_context) {
         return None;
     }
     let child = match counted {
@@ -10201,13 +10269,7 @@ fn projection_peel<S: EvalSemantics>(
             child
         }
     };
-    Some(eval_each_owned::<S>(
-        &rest,
-        &child,
-        optional,
-        Reentry::REBUILT,
-        sink,
-    ))
+    Some(RestPipe::new(rest).run_owned::<S>(&child, optional, Reentry::REBUILT, sink))
 }
 
 /// Evaluate the few owned operations whose unchanged siblings must not be
@@ -51075,7 +51137,7 @@ pub(crate) fn eval_owned_fast_path<S: EvalSemantics>(
         // `succinctly jq -n '(2 * 1e16) | tostring'` gave `"2E+16"` where
         // real jq and every non-`-n` succinctly invocation gave `"2e+16"`.
         // (#3673: the pipe drivers now offer a lone stage bare first, through
-        // [`eval_each_owned_rest`]; this unwrap still serves every other
+        // [`RestPipe::run_owned`]; this unwrap still serves every other
         // `Expr::Pipe([x])` that reaches the fast path.)
         Expr::Pipe(stages) => match stages.as_slice() {
             [only] => eval_owned_fast_path::<S>(only, input, optional),
@@ -78529,7 +78591,7 @@ mod tests {
     }
 
     /// #3673: `eval_each_pipe`'s `Owned` arm runs the rest of the pipe
-    /// through `eval_each_owned_rest`, as the generic evaluator's drivers do:
+    /// through `RestPipe::run_owned`, as the generic evaluator's drivers do:
     /// a lone plain stage after a computed value is answered without an
     /// owned `Expr::Pipe`, and everything else still is. Expected values
     /// captured from jq 1.7.1.
@@ -79605,7 +79667,7 @@ mod tests {
     /// answered exactly as the one-stage `Expr::Pipe` the pipe drivers used to
     /// build around it -- the same outputs, the same way of ending (whole, or
     /// stopped after the first output), and no answer where the wrapped form
-    /// declines. [`eval_each_owned_rest`], which skips the doors on its
+    /// declines. [`RestPipe::run_owned`], which skips the doors on its
     /// fallback because of that, then agrees with `eval_each_owned` on the
     /// whole pipe end to end, bridge included.
     ///
@@ -79672,9 +79734,7 @@ mod tests {
                     // End to end, bridge included.
                     let via_rest = answer(
                         |sink| {
-                            Some(eval_each_owned_rest::<S>(
-                                rest,
-                                &mut None,
+                            Some(RestPipe::new(rest).run_owned::<S>(
                                 input,
                                 optional,
                                 Reentry::REBUILT,
@@ -79829,6 +79889,185 @@ mod tests {
                 "the embed-table rows must reach the relocating folds: {relocated}"
             );
         }
+    }
+
+    /// #3682: the three peel doors no longer copy a lone rest into an owned
+    /// `Expr::Pipe`. [`lone_pipe_entries`] counts how often
+    /// [`eval_each_owned`] is entered with exactly that shape, which is what a
+    /// door that went back to `Expr::Pipe(rest.to_vec())` would produce for a
+    /// one-stage rest, answered by a front door or not. The agreement tests
+    /// below cannot see this: the copy never changed an answer, only the cost.
+    #[test]
+    fn test_peel_doors_enter_no_one_stage_pipe_3682() {
+        let one = || OwnedValue::Int(1);
+        let object = |pairs: &[(&str, OwnedValue)]| {
+            OwnedValue::object_from(pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())))
+        };
+        let run = |src: &str, input: &OwnedValue| -> Vec<String> {
+            let expr = parse(src).unwrap();
+            let mut out = Vec::new();
+            let flow =
+                eval_each_owned::<JqSemantics>(&expr, input, false, Reentry::REBUILT, &mut |v| {
+                    out.push(v.to_json());
+                    Demand::Continue
+                });
+            assert!(matches!(flow, Flow::Exhausted), "{src}");
+            out
+        };
+
+        // The counter sees the old shape: a pipe of one handed to the entry.
+        let before = lone_pipe_entries::get();
+        let lone = Expr::Pipe(vec![parse(". + 1").unwrap()]);
+        let mut out = Vec::new();
+        eval_each_owned::<JqSemantics>(&lone, &one(), false, Reentry::REBUILT, &mut |v| {
+            out.push(v.to_json());
+            Demand::Continue
+        });
+        assert_eq!(out, ["2"]);
+        assert_eq!(lone_pipe_entries::get(), before + 1, "the observable works");
+
+        // Door-answered, door-declined, and longer rests, through each door.
+        let ab = object(&[("a", OwnedValue::Int(3)), ("b", OwnedValue::Int(4))]);
+        for (src, input, want) in [
+            // projection_peel
+            (".a | . + 1", &ab, vec!["4"]),
+            ("length | . + 1", &ab, vec!["3"]),
+            (".a | floor", &ab, vec!["3"]),
+            (".a | . + 1 | . * 2", &ab, vec!["8"]),
+            // owned_select_door
+            ("select(.a) | length", &ab, vec!["2"]),
+            ("select(.a == 3) | keys", &ab, vec![r#"["a","b"]"#]),
+            ("select(.a) | length | . + 1", &ab, vec!["3"]),
+            // owned_path_door, whose rest runs once per path
+            ("path(.a) | length", &ab, vec!["1"]),
+            ("path(.a, .b) | length", &ab, vec!["1", "1"]),
+            ("path(.a, .b) | keys", &ab, vec!["[0]", "[0]"]),
+        ] {
+            let before = lone_pipe_entries::get();
+            let got = run(src, input);
+            assert_eq!(got, want, "{src}");
+            assert_eq!(
+                lone_pipe_entries::get(),
+                before,
+                "{src}: a door handed eval_each_owned a one-stage pipe"
+            );
+        }
+    }
+
+    /// #3682: `projection_peel`, `owned_select_door` and `owned_path_door`
+    /// hand a lone remaining stage to [`RestPipe::run_owned`] instead of
+    /// copying it into an owned `Expr::Pipe` first. Whatever route
+    /// [`eval_each_owned`] takes through them -- a door answering the lone
+    /// stage, or declining it to the bridge -- the answer is the reindex
+    /// bridge's: the same outputs, and the same error where there is one.
+    ///
+    /// Heads x lone rests x owned inputs x both modes x `?` on and off. Some
+    /// cases are answered by a door and some decline to the bridge: a
+    /// navigation that fails on the input (`.a` on a number), a `select` whose
+    /// condition is outside the pure grammar (`select(.a | floor)`), a `path`
+    /// over a value that is not an identity of the bridge (a NaN). A door that
+    /// wrongly answers shows up as a disagreement, not only one that wrongly
+    /// declines. With `?` off, a rest of `type`, `not`, `. == 3` or `.` after
+    /// `.a`/`.[0]` is answered whole by the pure fast path before any peel door
+    /// runs, so those rows pin that route's agreement, not a door's; the
+    /// `length`, `. + 1`, `floor`, `keys`, `max` and `tostring` rows are the
+    /// doors'.
+    ///
+    #[test]
+    fn test_peel_doors_with_a_lone_rest_agree_with_the_reindex_bridge_3682() {
+        type Answer = (Vec<String>, Option<String>);
+        fn via_doors<S: EvalSemantics>(expr: &Expr, input: &OwnedValue, optional: bool) -> Answer {
+            let mut out = Vec::new();
+            let flow = eval_each_owned::<S>(expr, input, optional, Reentry::REBUILT, &mut |v| {
+                out.push(v.to_json());
+                Demand::Continue
+            });
+            let control = match flow {
+                Flow::Escaped(control) => Some(format!("{control:?}")),
+                Flow::Exhausted | Flow::Stopped { .. } => None,
+            };
+            (out, control)
+        }
+        fn via_bridge<S: EvalSemantics>(expr: &Expr, input: &OwnedValue, optional: bool) -> Answer {
+            let mut out = Vec::new();
+            let control = push_owned_values::<Vec<u64>, S>(
+                eval_owned_input_bridge::<Vec<u64>, S>(expr, input, optional),
+                &mut out,
+            )
+            .map(|control| format!("{control:?}"));
+            (out.iter().map(OwnedValue::to_json).collect(), control)
+        }
+        let object = |pairs: &[(&str, OwnedValue)]| {
+            OwnedValue::object_from(pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())))
+        };
+        let inputs = [
+            object(&[("a", OwnedValue::Float(f64::NAN))]),
+            object(&[("a", OwnedValue::Int(3)), ("b", OwnedValue::Null)]),
+            object(&[("a", OwnedValue::Null)]),
+            object(&[("a", object(&[("b", OwnedValue::Int(1))]))]),
+            object(&[(
+                "a",
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            )]),
+            object(&[("a", OwnedValue::String("s".into()))]),
+            OwnedValue::array_from(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+            ]),
+            OwnedValue::array_from(vec![]),
+            OwnedValue::Int(3),
+            OwnedValue::String("x".into()),
+            OwnedValue::Null,
+        ];
+        let heads = [
+            ".a",
+            ".[0]",
+            "length",
+            "select(.a)",
+            "select(true)",
+            "select(false)",
+            "select(.a == 3)",
+            "select(.a | floor)",
+            "path(.a)",
+            "path(.[0])",
+            "path(.a, .b)",
+            "path(.missing)",
+        ];
+        let rests = [
+            ". + 1", "length", "tostring", "type", "not", "floor", "keys", ". == 3", "max", ".",
+        ];
+        let mut compared = 0;
+        for head in heads {
+            for rest in rests {
+                let src = format!("{head} | {rest}");
+                let expr = parse(&src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+                let Expr::Pipe(stages) = &expr else {
+                    panic!("{src}: not a pipe"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3682)"
+                };
+                assert_eq!(stages.len(), 2, "{src}: head and one lone rest");
+                for input in &inputs {
+                    for optional in [false, true] {
+                        assert_eq!(
+                            via_doors::<JqSemantics>(&expr, input, optional),
+                            via_bridge::<JqSemantics>(&expr, input, optional),
+                            "jq: {src} on {input:?} (optional={optional})"
+                        );
+                        assert_eq!(
+                            via_doors::<YqSemantics>(&expr, input, optional),
+                            via_bridge::<YqSemantics>(&expr, input, optional),
+                            "yq: {src} on {input:?} (optional={optional})"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            compared,
+            heads.len() * rests.len() * inputs.len() * 2,
+            "every cell of the matrix was compared"
+        );
     }
 
     #[test]

@@ -59,10 +59,10 @@ use super::eval::{
     collapse_vec, collect_pattern_var_names, compare_key_arrays, compare_values,
     debug_assert_materialization_error, def_spine_len, demote_for_reentry, descriptor_slice_bounds,
     each_path_on_owned, each_pattern_binding_set, each_recurse_walk, enter_def_call,
-    entries_to_object, eval_each_owned, eval_each_owned_rest, eval_full as full_eval,
-    finish_fork_flow, finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix,
-    foreach_forks, format_owned, has_type_mismatch_is_permissive, index_component_value,
-    index_in_array_bounds, index_one_owned as index_owned_by_key, is_assignment_expr, is_eager_arg,
+    entries_to_object, eval_each_owned, eval_full as full_eval, finish_fork_flow,
+    finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
+    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    index_one_owned as index_owned_by_key, is_assignment_expr, is_eager_arg,
     is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
@@ -79,8 +79,8 @@ use super::eval::{
     yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
     yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
     ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RootWitness, SliceTargetKind,
-    StashedEscape, StashedVerdict, YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RestPipe, RootWitness,
+    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -12325,59 +12325,6 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
             Flow::Exhausted => continue,
             other => return other,
         }
-    }
-}
-
-/// The stages after the current one, plus the owned `Expr::Pipe` copy an
-/// `Owned` element needs -- built at most once, and only if such an element
-/// actually arrives (#1598).
-///
-/// `eval_each_owned` takes an `&Expr`, and the only way to present a `rest`
-/// *slice* as one is to own a copy: a `Vec` allocation plus a recursive
-/// `Expr` clone per stage. Doing that inside the per-element call meant
-/// paying it once per element; a driver builds one of these instead and
-/// reuses it for its whole loop. A rest of one plain stage does not need the
-/// copy at all when `eval_each_owned`'s front doors answer it (#3673, see
-/// [`RestPipe::run_owned`]).
-///
-/// The slice and its owned copy are one value rather than two parameters on
-/// purpose. Correctness requires that a cached pipe is only ever used with
-/// the `rest` it was built from -- a mismatch would evaluate elements
-/// against the wrong stages, which is a wrong answer rather than a crash.
-/// Pairing them here makes that mismatch unrepresentable instead of relying
-/// on every call site to keep two arguments in step.
-struct RestPipe<'a> {
-    stages: &'a [Expr],
-    owned: Option<Expr>,
-}
-
-impl<'a> RestPipe<'a> {
-    fn new(stages: &'a [Expr]) -> Self {
-        Self {
-            stages,
-            owned: None,
-        }
-    }
-
-    /// The stages themselves, for the arms that can consume a slice.
-    fn stages(&self) -> &'a [Expr] {
-        self.stages
-    }
-
-    /// Run these stages against `input`, an owned intermediate, through
-    /// [`eval_each_owned`], building the owned `Expr::Pipe` it takes only if
-    /// the rest cannot be answered from its one plain stage (#3673): a lone
-    /// `. + 1` or `length` after a computed value used to cost a `Vec` and a
-    /// clone of the stage for every evaluation that reached it. See
-    /// [`eval_each_owned_rest`].
-    fn run_owned<S: EvalSemantics>(
-        &mut self,
-        input: &OwnedValue,
-        optional: bool,
-        reentry: Reentry,
-        sink: &mut dyn FnMut(OwnedValue) -> Demand,
-    ) -> Flow {
-        eval_each_owned_rest::<S>(self.stages, &mut self.owned, input, optional, reentry, sink)
     }
 }
 
@@ -41812,6 +41759,59 @@ mod tests {
             out.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
             ["[]"]
         );
+    }
+
+    /// #3682, against a reference that does not share the code under test:
+    /// an owned intermediate (`{a: .x}`) meets one of the three owned peel
+    /// doors -- `projection_peel` (`.a`, `length`), `owned_select_door`
+    /// (`select(..)`) and `owned_path_door` (`path(..)`, which runs its rest
+    /// once per path) -- with one plain stage behind it, which now reaches
+    /// the front doors without an owned `Expr::Pipe`. Each prints what jq
+    /// 1.7.1 prints (captured live), through the sink evaluator the CLI
+    /// drives.
+    #[test]
+    fn test_peel_doors_with_a_lone_rest_match_jq_3682() {
+        let doc = r#"{"x":3,"y":[1,2],"z":"s"}"#;
+        for (filter, want) in [
+            ("{a: .x} | .a | . + 1", "4"),
+            ("{a: .x} | length | . + 1", "2"),
+            ("{a: .x} | path(.a) | length", "1"),
+            // The path door's rest runs once per path.
+            ("{a: .x, b: .y} | path(.a, .b) | length", "1 1"),
+            ("first({a: .x, b: .y} | path(.a, .b) | length)", "1"),
+            ("{a: .x} | select(.a) | length", "1"),
+            (r"{a: .x} | select(.a == 3) | type", r#""object""#),
+            ("{a: .x} | select(.a > 5) | length", ""),
+            // A stage the front doors leave to the bridge.
+            ("{a: .x} | .a | floor", "3"),
+            ("{a: .x} | select(.a) | keys", r#"["a"]"#),
+            // More than one stage left: the owned pipe is still built.
+            ("{a: .x} | .a | . + 1 | . * 2", "8"),
+            (r#"{a: .z} | .a | . + "!""#, r#""s!""#),
+            ("{a: null} | .a | . + 1", "1"),
+            // The per-element route into each door.
+            ("[.y[] | {a: .} | .a | . * 2]", "[2,4]"),
+            ("[.y[] | {a: .} | select(.a > 1) | length]", "[1]"),
+            ("[.y[] | [., .] | path(.[0]) | length]", "[1,1]"),
+            // The lone stage fails: caught.
+            (
+                r#"try ({a: .x} | .a | . + "s") catch ."#,
+                r#""number (3) and string (\"s\") cannot be added""#,
+            ),
+            (
+                "try ({a: .x} | select(.a) | . + 1) catch .",
+                r#""object ({\"a\":3}) and number (1) cannot be added""#,
+            ),
+        ] {
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), filter);
+            assert!(control.is_none(), "{filter}: {control:?}");
+            let got = out
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(got, want, "{filter}");
+        }
     }
 
     /// #3673: a rest the owned front doors answer from its one plain stage
