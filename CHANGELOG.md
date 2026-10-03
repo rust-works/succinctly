@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a lone stage the owned front doors decline no longer copies itself into an `Expr::Pipe`**
+  (#3692). `RestPipe::run_owned` offered a rest of one plain stage to `eval_each_owned`'s front doors
+  bare, but when they declined it (`floor`, `keys`, `tojson`, an object or array construction, an `if`)
+  it still built `Expr::Pipe(stages.to_vec())`, a `Vec` plus a clone of the stage's whole AST, for every
+  owned element, before entering the later doors. The stage now goes on as itself when
+  `lone_stage_agrees_with_its_pipe` says every later door reads the two spellings alike; a stage that
+  needs path context, and an assignment `owned_assign_shape` declines, keep the copy. The saving is the
+  stage's own AST size, so it is one allocation on a leaf and most of a construction's. Allocator calls
+  for one streaming evaluation (`examples/alloc_probe_3692`, debug build): `{a: .x} | .a | floor` 26 to
+  25, `... | {b: ., c: [., 1]}` 56 to 49, a five-field construction 108 to 89, `if . > 1 then "big"
+  else "small" end` 46 to 37, `{a: {k: .x}} | .a | .k = 1` 34 to 29; the rows a door answers or that
+  have no rest are unchanged. Instruction counts (cachegrind, 7950X, 13,870 NDJSON records, `jq -c`):
+  -2.3% on `floor` and `tojson`, -5.6% to -8.8% on the constructions and the `if`, -5.0% on the
+  assignment; `. + 1` and `.a` are identical to the digit, and the excluded unshaped assignment is
+  +0.18%, the predicate's own 66 instructions per record. Interleaved wall clock against the parent
+  (`scripts/ab-cli.py`, 1, 6 and 23 MB of NDJSON, min of 11, output identical on all 27 configurations
+  per machine): the constructions and the `if` read -5% to -9% on an M4 Pro and -5% to -7% on a 7950X, a
+  leaf stage -0.2% to -2.5%, the assignment -1% to -8%. The rows that cannot move read -1.8% to +3.2%,
+  a code-placement band (their instruction counts are equal) that the noise-floor control puts at -1.1%
+  to +1.9% on the M4 Pro and -0.7% to +1.2% on the 7950X. A leaf stage is the thin case: one allocation
+  in about 26, under the harness's resolution on the 7950X.
+
 - **jq/yq: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and `objects` test the node's type
   instead of materializing it** (#3690). `scalars`, `values` and `iterables` always answered from the
   node; these six fell through to the fallback that decodes the whole value and re-enters the owned
