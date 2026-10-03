@@ -783,7 +783,7 @@ budget applies to a walk's output. Measured with `memcap.py --report` on a 458-b
 nine-way alias ladder expands to 5.4 million nodes at six levels: `[path(recurse(.[]?))] | length`
 peaks at 1.95 GB, the same as `[path(..)]`'s 1.95 GB, where it peaked at 0.41 GB capped at 10,000;
 `del(recurse(.[]?) | select(type == "string"))` peaks at 3.70 GB with or without the cap, because
-the expanded document dominates; `[recurse(.[]?)] | length` 1.06 GB against `[..]`'s 0.46 GB. The
+the expanded document dominates; `[recurse(.[]?)] | length` 1.04 GB against `[..]`'s 0.46 GB. The
 explicit spelling also materializes the whole expanded document before it walks, so
 `first(recurse(.[]?))` costs 0.40 GB there and exhausts a 3 GB cap on a nine-level document where
 `first(..)` and `first(recurse)` answer from nothing

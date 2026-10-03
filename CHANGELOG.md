@@ -592,8 +592,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   walker now hands exactly `.[]?` with no `cond` to a direct walk of the owned tree, which is what `..` already
   does, and the path walker lifts its cap for the same shape. Every row above matches jq 1.7.1. The direct walk
   also costs what `..` costs, not what running `.[]?` at every node did: over 1.15 M nodes of a `users`
-  document 3.2 s with only the cap lifted, 0.69 s now, `..` 0.38 s (an Apple M5 Max under load, indicative);
-  on a 458-byte YAML whose aliases expand to 5.4 M nodes the walk peaks at 1.06 GB, against 3.4 GB with only the
+  document 3.2 s with only the cap lifted, 0.62 s now, `..` 0.34 s (an Apple M5 Max under load, indicative);
+  on a 458-byte YAML whose aliases expand to 5.4 M nodes the walk peaks at 1.04 GB, against 3.4 GB with only the
   cap lifted, 0.90 GB capped at the old 10,000 nodes, and `..`'s 0.46 GB. Any other `f`, and any `cond`, still
   stops at 10,000 (#3716), and `path(recurse(.[]?))` still runs `.[]?` at every node, about 1.8 times
   `path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes, #3717); see `docs/compliance/jq/limitations.md`.
