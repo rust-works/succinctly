@@ -3,10 +3,10 @@ name: CI
 on:
   # `push` to `main` is the merge queue's own commit (merge method MERGE, so the
   # push SHA *is* the merge-group SHA) and was re-running every check the queue
-  # had just passed. Since #3649 it runs only what later runs consume --
-  # `coverage` (the baseline artifact PRs diff against) and `perf-guard`
-  # (push-relative comparison, #2117) -- unless the SHA has no successful
-  # `merge_group` run, in which case it runs everything (see `gate` below).
+  # had just passed. Since #3649 it runs only `perf-guard` (push-relative
+  # comparison, #2117) -- unless the SHA has no successful `merge_group` run,
+  # in which case it runs everything (see `gate` below). The coverage baseline
+  # that PRs diff against is published by coverage-baseline.yml.
   push:
     branches: [main]
   pull_request:
@@ -802,19 +802,17 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # Coverage: the sticky patch-coverage comment on a pull request, and the
-  # baseline artifact on a push to `main`. The steps live in
-  # .github/actions/coverage, shared with coverage-baseline.yml (#3649), which
-  # publishes the same baseline from a push-only workflow whose run concludes on
-  # coverage alone. The push run here is a transitional duplicate: it goes once
-  # PRs look their baseline up in coverage-baseline.yml instead.
-  #
-  # Skipped on `merge_group` (#310): a merge-group build has no PR to comment on,
-  # and patch coverage is reported on the PR before it is ever queued.
+  # Pull-request coverage: the sticky patch-coverage comment, diffed against the
+  # baseline that coverage-baseline.yml published for the PR's merge-base. Only
+  # `pull_request` runs it (#3649): a merge-group build has no PR to comment on
+  # (#310), and the push-to-main run that publishes the baseline lives in
+  # coverage-baseline.yml, where an unrelated job failing or being cancelled
+  # here can no longer make the artifact unreachable. The steps live in
+  # .github/actions/coverage, shared with that workflow.
   coverage:
     name: Coverage (${{ matrix.name }})
     needs: gate
-    if: needs.gate.outputs.code == 'true' && github.event_name != 'merge_group'
+    if: needs.gate.outputs.code == 'true' && github.event_name == 'pull_request'
     strategy:
       fail-fast: false
       matrix:

@@ -17,10 +17,9 @@ inputs:
   baseline-workflow:
     description: >-
       Workflow file whose newest successful run for the PR's merge-base holds the baseline artifact.
-      `ci.yml` until coverage-baseline.yml has been on `main` long enough to have published one for
-      the commits PRs fork from; then `coverage-baseline.yml` (#3649).
+      coverage-baseline.yml publishes it from a push-only run that concludes on coverage alone (#3649).
     required: false
-    default: ci.yml
+    default: coverage-baseline.yml
 
 runs:
   using: composite

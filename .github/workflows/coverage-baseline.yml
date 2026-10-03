@@ -20,11 +20,11 @@ name: Coverage baseline
 # Runs on every push to `main`, docs-only ones included: a PR can fork from any
 # main commit and needs that commit's baseline.
 #
-# Rollout: PRs still look the baseline up in ci.yml (the composite action's
-# `baseline-workflow` input defaults to `ci.yml`), because a workflow that is not
-# yet on the default branch makes the lookup fail with a 404. Once this workflow
-# has published baselines for the commits PRs fork from, flip that default and
-# stop ci.yml's `coverage` job running on `push`.
+# ci.yml's pull-request `Coverage` jobs look the baseline up here (the composite
+# action's `baseline-workflow` input), and ci.yml no longer runs coverage on
+# `push` at all. A PR forked from a commit that predates this workflow, or from
+# one whose run here has not finished yet, falls back to rebuilding the baseline
+# in a worktree.
 on:
   push:
     branches: [main]
