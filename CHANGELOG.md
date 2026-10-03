@@ -66,35 +66,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `null` raises `Cannot iterate over ...`, and the message quotes the scalar: a preview string and an
   owned copy of the value. Wherever the boundary swallows it that was thrown away, once per scalar,
   and most nodes are scalars. `?` and `try` over a bare `.[]` (with no handler, or `catch empty`,
-  which yields nothing for any payload) now answer a scalar themselves -- nothing, or the decode
-  failure `?` never swallows -- instead of evaluating the `.[]`, in both evaluators; and
-  `path_context_step_recurse`, which every `.. | path`, `.. | key` and `.. | parent` goes through,
-  asks a live scalar the pair #3681 added for `..` (`scalar_iteration_precheck`, `validate_cursor`).
-  A handler that reads the payload (`catch .`, `catch "c"`) still sees the message, and a `def empty:`
-  in scope makes `catch empty` an ordinary handler. Output is unchanged: 828 jq and 150 yq
-  base-versus-head runs over valid and malformed documents (an undecodable string, `1.2.3`, `tru`, a
-  stray comma) are byte-identical, and a failure `?` never swallows still escapes at the node the
-  walk reaches it, lazily (`[limit(2; .. | path)]` on `[1.2.3,[4]]` still answers without reading
-  the leaf). Allocator calls over 2,000 scalar members on a release build: `[.[] | .[]?] | length`
+  which yields nothing for any payload; a closure argument or a paren around the `.[]` counts too)
+  now answer a scalar themselves -- nothing, or the decode failure `?` never swallows -- instead of
+  evaluating the `.[]`, in both evaluators. The path-context walk does the same in
+  `path_context_step_try`, which every `.. | path`, `.. | key` and `.. | parent` goes through, and
+  so does a user-written `.[]? | path` and the owned scalars below a slice; its leaf check is the
+  pair #3681 added for `..` (`scalar_iteration_precheck`, `validate_cursor`), now one shared helper.
+  A handler other than `empty` still gets the payload and runs, and a `def empty:` in scope makes
+  `catch empty` an ordinary handler. **yq mode never takes the shortcut**: yq's `.[]` over a scalar
+  never built the message, so there was nothing to save, and the first draft, which probed the value
+  before testing the shape, measured +107% on `.k0?` over 30,000 aliases of a mapping and +13% on
+  `.. | path` over inline mappings (output identical; found in review, not by the benchmark, which
+  had no YAML in it). Output is unchanged: 828 jq and 180 yq base-versus-head runs over valid and
+  malformed documents (an undecodable string, `1.2.3`, `tru`, a stray comma, aliases and merge keys)
+  are byte-identical, and a failure `?` never swallows still escapes where the walk steps the node
+  that holds it (`[limit(2; .. | path)]` on `[1.2.3,[4]]` still answers `[[],[0]]`, and a third node
+  raises). Allocator calls over 2,000 scalar members on a release build: `[.[] | .[]?] | length`
   12,024 to 24 (an object), 12,014 to 14 (an array), against 23 and 13 for the `[.[]]` twin;
   `[.[] | try .[] catch empty] | length` 42,014 to 24; `[.. | path] | length` 22,057 to 10,057
-  against 10,035 for the `[.[] | path]` twin, whose per-member path array it now costs no more than.
-  `try .[] catch "x"` is unchanged at 16,034, since its handler observes the payload.
-  Interleaved wall clock against the parent, 1 to 16 MB, min of 7, output identity 40/40 on each
-  box: on an M4 Pro `.[]?` over a flat array of scalars is 64% to 70% faster (an object 48% to 53%),
-  `try ... catch empty` 84% to 86% (72% to 76%) and `.. | path` 47% to 51% (33% to 36%); on a 7950X
-  52% to 54% (33% to 35%), 82% (66%) and 27% (19% to 21%). Containers are untouched: `.[]?` over
-  records is within 4% on both, while `.. | path` over them, whose scalar leaves it no longer
-  formats, is 30% and 23% to 26% faster. The two controls the change cannot reach (`[.[]] | length`,
-  `[..] | length`) read between -1.2% and +1.1% on the M4 Pro and between +1.3% and -9.7% on the
-  7950X, where the control run itself read -0.9% to +1.6%. That is code placement: under cachegrind
-  the controls' instruction counts are identical to within 0.008% (108,704,436 to 108,704,394 for
-  `[.[]] | length` over the 1 MB array), while `[.[] | .[]?] | length` over it falls from 600.2 M to
-  217.7 M (-63.7%), `[.[] | try .[] catch empty] | length` over the 1 MB object from 798.5 M to
-  203.6 M (-74.5%) and `[.. | path] | length` over the 1 MB records from 827.3 M to 614.0 M
-  (-25.8%).
-  Still open, and not this change: `recurse(.[]?)` written out re-indexes every scalar operand
-  (about 16 allocations each) and, unlike bare `recurse`, silently stops at 10,000 nodes.
+  against 10,035 for the `[.[] | path]` twin, whose per-member path array it now costs no more than;
+  `[.[] | .[]? | key] | length` 14,014 to 2,014 (an array); `def opt(f): f?; [.[] | opt(.[])]`
+  12,016 to 16; `[.[1:] | .. | path]` 50,136 to 14,154. A string with an escape has to be decoded to
+  be validated, which is one allocation per member (two in `.. | path`, whose leaf check decodes it
+  twice) where the message cost eight. `try .[] catch "x"` is unchanged at 16,034: the matcher
+  admits only `empty`, so a handler that never reads the payload still pays for it (#3704).
+  Interleaved wall clock against the parent on an M4 Pro, 1 to 16 MB, min of 7, output identity 48/48
+  (jq) and 22/22 (yq): `.[]?` over a flat array of scalars is 65% to 72% faster (an object 48% to
+  54%), `try ... catch empty` 84% to 87% (72% to 76%), `.. | path` 45% to 50% (32% to 35%; records
+  27% to 29%) and a user-written `.[]? | key` 54% to 60% (36% to 41%). Containers are not what
+  changed: `.[]?` over records is within 3%, and the two controls the change cannot reach
+  (`[.[]] | length`, `[..] | length`) read -1.6% to +2.2%, against -2.5% to +0.3% for the control
+  run. The yq rows (aliases, merge keys, 3 MB of inline mappings, JSON through `yq`) read -3.1% to
+  +1.4%. Still open, and not this change: `recurse(.[]?)` written out re-indexes every scalar operand
+  (about 16 allocations each), and `recurse` over a computed value silently stops at 10,000 nodes
+  (#3703); `path(f)`'s own `?`/`try` arms still build the message (#3722).
 
 - **jq/yq: `..` no longer builds a path trail, an owned key and a swallowed error for every node**
   (#3023). `..` listed each node's children through the `path()` step, which built an `Rc` trail
