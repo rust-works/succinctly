@@ -32955,11 +32955,32 @@ fn eval_owned_multi_first<S: EvalSemantics>(
     // makes "a control after the first output is dropped" structural: nothing
     // evaluates far enough to raise one.
     let mut first: Option<OwnedValue> = None;
+    let mut retried = false;
     let flow = eval_each_owned::<S>(expr, input, false, reentry, &mut |v| {
+        // #3524: the sink is only ever re-invoked after its own `Stop` by a
+        // `?//` alternative chain whose `break $out` landed in the chain's
+        // retry frame instead of unwinding -- see below.
+        if first.is_some() {
+            retried = true;
+            return Demand::Stop;
+        }
         first = Some(v);
         Demand::Stop
     });
+    // #3524: in jq's `_modify`, that retry runs the next alternative with the
+    // update's `reduce` still open, and an output from it corrupts the
+    // `delpaths` accumulator: `.[] |= (1 as $x ?// $y | $x)` raises `Paths
+    // must be specified as an array` (jq 1.7.1) where this used to keep the
+    // retry's output as the answer.
+    if retried {
+        return Err(EvalEscape::Error(EvalError::paths_must_be_array()));
+    }
     match (first, flow) {
+        // #3524: nothing runs past the stop except a `?//` retry, so an error
+        // that escapes after the first output came from that retry --
+        // `.[] |= (1 as $x ?// $y | if $y == null then $x else error("boom")
+        // end)` raises `boom` in jq.
+        (Some(_), Flow::Escaped(control)) => Err(control.into()),
         (Some(v), _) => Ok(Some(v)),
         // A control with nothing produced before it has no prefix to fall
         // back to, so it escapes: a bare `Error`, a bare `break` (#824) and
@@ -78380,6 +78401,53 @@ mod tests {
             eval_owned_multi_first::<JqSemantics>(&expr, &OwnedValue::Null, Reentry::REBUILT)
                 .unwrap();
         assert_eq!(values, None);
+    }
+
+    // #3524: jq 1.7.1, captured live: `[5] | .[] |= (1 as $x ?// $y | $x)` and
+    // the other shapes below raise `Paths must be specified as an array`
+    // whenever the retry that follows the update's first output yields; a
+    // retry that raises surfaces its own error, and a chain whose output
+    // comes from its last alternative has nothing left to retry into.
+    #[test]
+    fn update_rhs_alt_chain_retry_matches_jq_3524() {
+        let paths_err = "Paths must be specified as an array";
+        for (filter, expected) in [
+            ("1 as $x ?// $y | $x", Err(paths_err)),
+            ("1 as $x ?// $y | 9", Err(paths_err)),
+            ("[1] as [$x] ?// $y | 7", Err(paths_err)),
+            ("1 as [$x] ?// $y ?// $z | $y", Err(paths_err)),
+            ("first(1 as $x ?// $y | $x)", Err(paths_err)),
+            ("1 as $x ?// $y | $x, 2", Err(paths_err)),
+            (
+                r#"1 as $x ?// $y | if $y == null then $x else error("boom") end"#,
+                Err("boom"),
+            ),
+            ("1 as [$x] ?// $y | $x", Ok("[null]")),
+            ("1 as [$x] ?// [$y] ?// $z | $z", Ok("[1]")),
+            ("[1 as $x ?// $y | $x] | length", Ok("[1]")),
+            ("1 as $x ?// $y | empty", Ok("[]")),
+            ("1, error(\"x\")", Ok("[1]")),
+        ] {
+            let filter_expr = parse(&format!(".[] |= ({filter})")).unwrap();
+            let input = parse_complete_json("[5]", false).unwrap();
+            let got = match eval_owned_input::<Vec<u64>, JqSemantics>(
+                &filter_expr,
+                &input,
+                false,
+                Reentry::REBUILT,
+            ) {
+                QueryResult::Owned(v) => Ok(v.to_json()),
+                QueryResult::Error(e) => Err(e.to_string()),
+                _ => Ok(String::from("<other>")),
+            };
+            match expected {
+                Ok(json) => assert_eq!(got, Ok(json.to_string()), "{filter}"),
+                Err(msg) => {
+                    let e = got.expect_err(filter);
+                    assert!(e.contains(msg), "{filter}: {e}");
+                }
+            }
+        }
     }
 
     // The input queue exists only with `std`.
