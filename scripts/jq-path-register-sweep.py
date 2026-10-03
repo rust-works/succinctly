@@ -179,6 +179,21 @@ OPERANDS = [
     "first(.a)",
     "nth(0; .a)",
     "limit(1; .a)",
+    # (#3361) the rest of the by-value builtins jq defines over a backtracked
+    # source or never lets touch the register: `walk(f)` and `map(f)` qualify
+    # only for an `f` that navigates nothing (`walk(.a)` and `map(.a)` are the
+    # contrasts: jq path-checks `f` against the elements, a by-value stage does
+    # not). The last four are builtins jq also leaves in place that stay refused
+    # until each has an oracle row of its own.
+    "walk(.)",
+    "walk(tostring)",
+    "walk(.a)",
+    "map(tostring)",
+    "map(.a)",
+    "reverse",
+    "min",
+    "flatten(1)",
+    "group_by(.)",
 ]
 
 # The other side of a two-operand shape. Chosen so that, against the inputs
@@ -245,6 +260,9 @@ CHAIN_CONTEXTS = ["path", "del", "update"]
 
 def shapes_for(operand):
     """Every combinator shape an operand takes part in."""
+    # (#3361) the operand alone, as a bare pipe stage: `. as $x | OP | $x` is
+    # what the `var-rebind` context makes of it.
+    yield f"({operand})"
     yield f"-({operand})"
     for c in COMPANIONS:
         yield f"{operand} and {c}"
