@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq/yq: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and `objects` test the node's type
+  instead of materializing it** (#3690). `scalars`, `values` and `iterables` always answered from the
+  node; these six fell through to the fallback that decodes the whole value and re-enters the owned
+  evaluator, 13-16 allocator calls per element for what jq defines as `select(type == "number")`.
+  Allocator calls for `[.[] | numbers] | length` over 2,000 members: 28,034 to 25 (the others
+  26,024 to 24; `scalars` is 25); `[.. | numbers] | length` over a 300-record document 49,010 to
+  1,533. Interleaved wall clock against the parent, 1 to 16 MB over `users`, `comprehensive`,
+  `arrays` and `literals`, min of 7, output identical on all 72 configurations per machine: on an
+  M4 Pro `[.. | S] | length` is 70% to 80% faster for every one of the six, on a 7950X 64% to 83%,
+  while the unchanged `[.. | scalars] | length` and `[.. | select(type == "number")] | length` rows
+  read -2.8% to +3.4% (noise floor on the 7950X -1.7% to +3.3%) with instruction counts identical to
+  the digit; cachegrind on `users` 1 MB takes `[.. | numbers] | length` from 1.08 G to 0.22 G
+  instructions, `scalars`' own 0.22 G. **Behaviour:** the materialization doubled as a validity
+  check on everything under the node, so a selector no longer raises on an undecodable or malformed
+  *descendant* it never reads (`[.[] | numbers]` over `{"a":"\ud800","d":5}` is `[5]`), the lazy
+  validation boundary #2168 recorded for `path`/`key`/`getpath`; real jq rejects such a document
+  at parse time, so these rows diverge from it, and a selector handed an unreadable value still
+  raises. On every document jq accepts, base and head agree with jq on all 2,130 rows of the
+  differential matrix. In yq mode the node keeps what the owned round trip lost and now agrees with
+  real yq: explicit tags (`!!binary`, `!custom`), repeated keys, the written spelling for `length`
+  (`01` is 2), style and comments, anchors, `line`/`column`/`document_index`. A bare `!`
+  (`! tagged`) now reports its content's type (`!!str`) as yq does instead of `!`. See
+  `docs/compliance/jq/limitations.md`.
+
 - **jq/yq: `..` no longer builds a path trail, an owned key and a swallowed error for every node**
   (#3023). `..` listed each node's children through the `path()` step, which built an `Rc` trail
   link per child, an owned key `String` per object member, a `Vec` per container and, in jq mode, for
