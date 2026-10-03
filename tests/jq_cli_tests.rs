@@ -62591,6 +62591,102 @@ fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()>
     ])
 }
 
+/// #3360: two shapes that finished with exit 0 where jq 1.7.1 raises, every
+/// row captured from jq with `-c`.
+///
+/// `from_entries` is `map({...}) | add`, so it iterates the array `map` built
+/// and raises `near attempt to iterate through` it on every value it produces,
+/// whatever it was given and whether or not the register is on its input. It
+/// had no arm in `live_path_refusal`, so a `[from_entries]` collect was read as
+/// harmless and a later `try .[0]` swallowed the refusal:
+/// `del(. as $x | [from_entries] | try .[0])` left the document untouched and
+/// exited 0. A `try` or `?` directly on it still catches the error, as in jq.
+///
+/// `walk(f)` over an input that reaches an object raises in `map_values` once
+/// it runs at all, so it raises when `f` yields nothing too (`walk(empty)`,
+/// `walk(select(type != "array"))`); the check that already raised for every
+/// value it *produced* never ran for none. An input with no object (`[1]`,
+/// `1`, `[]`, `null`) answers nothing, as in jq.
+#[test]
+fn test_from_entries_and_an_empty_walk_raise_in_path_position_3360() -> Result<()> {
+    let kv = r#"[{"key":"a","value":1}]"#;
+    let bad = "Invalid path expression";
+    assert_path_rows_3289(&[
+        (
+            "[]",
+            r"del(. as $x | [from_entries] | try .[0])",
+            "",
+            bad,
+            5,
+        ),
+        (kv, r"del(. as $x | [from_entries] | try .[0])", "", bad, 5),
+        ("[]", r"del([from_entries] | empty)", "", bad, 5),
+        (kv, r"path(. as $x | [from_entries] | $x)", "", bad, 5),
+        (kv, r"path([from_entries] | empty)", "", bad, 5),
+        (
+            r#"[{"name":"a","v":1}]"#,
+            r"path([from_entries] | empty)",
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#"{"a":{"key":"x","value":1}}"#,
+            r"path([from_entries] | empty)",
+            "",
+            bad,
+            5,
+        ),
+        (kv, r"path(first(from_entries))", "", bad, 5),
+        (
+            kv,
+            r"del(. as $x | [from_entries] | try ($x | .a))",
+            "",
+            bad,
+            5,
+        ),
+        // A `try`/`?` on `from_entries` itself catches it, as in jq.
+        (kv, r"path(try from_entries)", "", "", 0),
+        (kv, r"path(from_entries?)", "", "", 0),
+        (kv, r"path([try from_entries catch .] | empty)", "", "", 0),
+        (
+            "[]",
+            r"path(. as $x | [try from_entries] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // `walk` over an object raises whatever `f` yields.
+        (r#"{"a":1}"#, r"path(walk(empty))", "", bad, 5),
+        (r#"[{"a":1}]"#, r"path(walk(empty))", "", bad, 5),
+        (r#"{"a":[1]}"#, r"path(walk(empty))", "", bad, 5),
+        (
+            r#"[{"a":1}]"#,
+            r#"path(walk(select(type != "array")))"#,
+            "",
+            bad,
+            5,
+        ),
+        (r#"{"a":1}"#, r"path(walk(.[]?))", "", bad, 5),
+        (r#"{"a":1}"#, r"del(walk(empty))", "", bad, 5),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | [walk(empty)] | try .[0])",
+            "",
+            bad,
+            5,
+        ),
+        (r#"{"a":1}"#, r"path(try walk(empty))", "", "", 0),
+        // No object anywhere: nothing to raise.
+        ("[1]", r"path(walk(empty))", "", "", 0),
+        ("1", r"path(walk(empty))", "", "", 0),
+        ("[]", r"path(walk(empty))", "", "", 0),
+        ("null", r"path(walk(empty))", "", "", 0),
+        ("[[1],[2]]", r"path(walk(empty))", "", "", 0),
+        ("[1]", r#"path(walk(select(type != "array")))"#, "", "", 0),
+    ])
+}
+
 /// #3456 (B2): the survival rule is decided per *stage*, not per leaf. A
 /// compound stage that mixes a leaf that navigates with one that does not
 /// loses the register as a whole, so these refuse where jq 1.7.1 answers `[]`

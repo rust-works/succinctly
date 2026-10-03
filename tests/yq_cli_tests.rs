@@ -50866,6 +50866,39 @@ fn test_yq_by_value_stages_keep_no_path_register_3456() -> Result<()> {
     Ok(())
 }
 
+/// #3360: `from_entries` always raising in path position, and an empty `walk`
+/// over an object raising, are jq-mode rules (ADR-0018): jq derives them from
+/// how *jq* defines the builtins, and yq's implementation shares none of it, so
+/// `succinctly yq` keeps answering as it did. A `del` over a `[from_entries]`
+/// collect leaves the document alone, and `walk` (a gated jq builtin, reachable
+/// only through `--jq-extensions`) answers with an empty path stream and an
+/// untouched document instead of raising.
+#[test]
+fn test_yq_from_entries_and_an_empty_walk_do_not_raise_in_path_position_3360() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(
+        "del(. as $x | [from_entries] | try .[0])",
+        r#"[{"key":"a","value":1}]"#,
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout, "[{\"key\":\"a\",\"value\":1}]\n");
+
+    for (filter, expected) in [
+        ("del(walk(empty))", "{\"a\":1}\n"),
+        ("path(walk(empty))", ""),
+        ("del(. as $x | [walk(empty)] | try .[0])", "{\"a\":1}\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(
+            filter,
+            r#"{"a":1}"#,
+            &["--jq-extensions", "-o", "json", "-I0"],
+        )?;
+        assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// On a mapping real yq's `first` names the first *key*, and assigning through
 /// it renames that key (`first = 9` on `{a: 1}` is `{"9":1}`). There is no path
 /// component for a key rename here, so the write is refused loudly rather than

@@ -213,6 +213,16 @@ OPERANDS = [
     "flatten(0)",
     "join(\",\")",
     "unique_by(.)",
+    # (#3360) `from_entries` is `map({...}) | add`: it always iterates the array
+    # `map` built, so jq raises on every value it produces. The `walk` rows are
+    # the zero-output case (`f` yields nothing, but an input that reaches an
+    # object raises in `map_values` all the same) and the contrasts that stay
+    # accepted wrongly where `f` navigates a computed array (`.a?`, `.[]?`).
+    "from_entries",
+    "walk(empty)",
+    "walk(select(type != \"array\"))",
+    "walk(.a?)",
+    "walk(.[]?)",
 ]
 
 # The other side of a two-operand shape. Chosen so that, against the inputs
@@ -246,6 +256,8 @@ INPUTS = [
     # an object with the key `a` below the root: a descent (`..`) reaches a
     # value `.a` can navigate that the root is not
     '[{"a":1}]',
+    # (#3360) entries `from_entries` accepts
+    '[{"key":"a","value":1}]',
 ]
 
 # Contexts wrap a shape `X` in a path-consuming expression. `X` is spliced in

@@ -38928,8 +38928,18 @@ fn live_path_refusal(expr: &Expr) -> Option<RefusalShape> {
         // cannot reproduce, the same approximation tradeoff as the
         // `WithEntries`/`Unique` group). Confirmed live against jq 1.7.1
         // for every member of both groups.
+        //
+        // #3360: `from_entries` is the same shape (`map({...}) | add`, and
+        // `add` iterates the array `map` built), and the same oracle: on
+        // `[]`, `[{"key":"a","value":1}]`, `[{"name":"a","v":1}]` and an
+        // object of entries, `path(from_entries)`, `path([from_entries])` and
+        // `path(first(from_entries))` all raise `near attempt to iterate
+        // through` the derived array, which a `try` or `?` catches. It never
+        // had an arm, so `del(. as $x | [from_entries] | try .[0])` finished
+        // with the document untouched and exit 0 where jq exits 5.
         Expr::Builtin(
-            Builtin::WithEntries(_)
+            Builtin::FromEntries
+            | Builtin::WithEntries(_)
             | Builtin::Unique
             | Builtin::UniqueBy(_)
             | Builtin::Sub(_, _)
@@ -39061,8 +39071,8 @@ fn iterates_untracked_input<S: EvalSemantics>(
     }
 }
 
-/// [`always_refuses_as_live_path`]'s sibling for the one shape that fell
-/// through it entirely: `match`/`scan`/`capture` (plus their `Flags` forms)
+/// [`always_refuses_as_live_path`]'s sibling for the shapes that fell through
+/// it entirely: `match`/`scan`/`capture` (plus their `Flags` forms)
 /// produce **zero** values when the pattern never matches, and
 /// [`always_refuses_as_live_path`] only runs on a value `expr` already
 /// produced -- so a zero-output run never calls it at all, and the
@@ -39081,7 +39091,21 @@ fn iterates_untracked_input<S: EvalSemantics>(
 /// really is the empty array `[]`, confirmed live for all three
 /// (`match`/`scan`/`capture`), so this reproduces jq's own message exactly
 /// rather than approximating it.
-fn always_refuses_when_empty<S: EvalSemantics>(expr: &Expr) -> Option<EvalError> {
+///
+/// #3360: `walk(f)` over an input that reaches an object at any depth
+/// ([`array_reaches_object`]) is the second member. Its object arm is
+/// `map_values(w)`, whose `_modify` bookkeeping raises once it runs at all, so
+/// jq raises whatever `f` then yields -- including nothing: `path(walk(empty))`
+/// and `path(walk(select(type != "array")))` on `{"a":1}`, `[{"a":1}]` and
+/// `{"a":[1]}` all exit 5 in jq 1.7.1, and answered nothing at exit 0 here
+/// because [`always_refuses_as_live_path`], which already raises for such a
+/// `walk` on every value it *produces*, never ran. The message names `input`
+/// where jq names the derived `[<input>,[]]` (the approximate-container tradeoff
+/// of #3271, recorded in `limitations.md`).
+fn always_refuses_when_empty<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<EvalError> {
     if S::TAG != EvalTag::Jq {
         return None;
     }
@@ -39096,6 +39120,11 @@ fn always_refuses_when_empty<S: EvalSemantics>(expr: &Expr) -> Option<EvalError>
         ) => Some(EvalError::invalid_path_expression_near_iterate(
             &OwnedValue::Array(Vec::new().into()),
         )),
+        // Only called once, for a call that produced nothing, so the walk of
+        // `input` is not worth hoisting the way the per-value check's is.
+        Expr::Builtin(Builtin::Walk(_)) if array_reaches_object(input) => Some(
+            EvalError::invalid_path_expression_near_access(&OwnedValue::Int(0), input),
+        ),
         _ => None,
     }
 }
@@ -39243,7 +39272,7 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     // argument's own type error/`error(...)` must still come first, same
     // ordering rule as `always_refuses_as_live_path`).
     if delivered == 0 && matches!(flow, Flow::Exhausted) {
-        if let Some(e) = always_refuses_when_empty::<S>(expr) {
+        if let Some(e) = always_refuses_when_empty::<S>(expr, value) {
             return ResolveFlow::Escaped(EvalEscape::Error(e));
         }
     }
@@ -39589,7 +39618,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // must still win first, which a bare-shape pre-check would not
         // respect).
         if matches!(flow, Flow::Exhausted) {
-            if let Some(e) = always_refuses_when_empty::<S>(expr) {
+            if let Some(e) = always_refuses_when_empty::<S>(expr, value) {
                 return Err((Vec::new(), EvalEscape::Error(e)));
             }
         }
@@ -40618,10 +40647,11 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // **With a handler, the body must stay checked.** If jq's body
         // raises where this resolver's by-value evaluation of it would not,
         // jq runs the handler and this resolver never does -- admitting the
-        // array unconditionally there would fabricate `[]` for e.g. `[try
-        // from_entries catch .zz] | $x` and `[try from_entries catch
-        // error] | $x` on `[{"key":"a","value":1}]`, both of which jq
-        // itself raises through. A handler that runs live against the
+        // array unconditionally there would fabricate `[]` for a body that
+        // raises in jq and succeeds by value here, and jq itself raises
+        // through the handler. (`from_entries` was the example until #3360
+        // gave it a `live_path_refusal` arm: its body now raises here too,
+        // so the handler really runs, as in jq.) A handler that runs live against the
         // error message is checked the same as any other operand --
         // `path(. as $x | [try .a catch .k] | $x)` is `[]` in jq 1.7.1.
         Expr::Try { catch: None, .. } => true,
@@ -40678,16 +40708,12 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // its own type/argument error first. Sharing `live_path_refusal`
         // (rather than re-listing the same builtins here) follows
         // `CLAUDE.md`'s "duplicated predicates diverge silently" rule.
-        // `Walk`/`FromEntries` are deliberately not members of that
-        // classifier and so never reach this arm, for two different
-        // reasons: `Walk` has its own arm just above because its refusal
-        // is genuinely value-dependent (`array_reaches_object`). `FromEntries`
-        // is not value-dependent at all -- confirmed live against jq 1.7.1,
-        // it raises unconditionally on every input tried, empty or not --
-        // it simply has no `always_refuses_as_live_path`/`live_path_refusal`
-        // arm of its own *yet*; adding one is the gap named in step 7's
-        // follow-up, after which `FromEntries` becomes eligible for this
-        // same catch-all with no further change here.
+        // `Walk` is deliberately not a member of that classifier and so never
+        // reaches this arm: it has its own arm just above because its
+        // refusal is genuinely value-dependent (`array_reaches_object`).
+        // `FromEntries` is a member since #3360 -- it raises unconditionally
+        // on every input, empty or not -- and so arrives here with no
+        // further change, as this comment used to predict.
         e if live_path_refusal(e).is_some() => true,
         other => cannot_move_register(other),
     }
@@ -114525,30 +114551,53 @@ mod tests {
             ),
             [r"{}"]
         );
+        // #3360: `from_entries` always raises once it runs (it had no
+        // `live_path_refusal` arm before, so the body *succeeded* here and
+        // these two rows were the negative case below), so the handler is now
+        // really reached and runs by value, as in jq 1.7.1: `catch .` answers
+        // `[]`, `catch .zz` raises on the error *message* (a string), and
+        // `catch error` re-raises it (the message names the input where jq
+        // names the derived array, the approximate-container tradeoff of #3271).
+        assert_eq!(
+            outputs(
+                br#"[{"key":"a","value":1}]"#,
+                r"path(. as $x | [try from_entries catch .] | $x)"
+            ),
+            [r"[]"]
+        );
+        query!(
+            br#"[{"key":"a","value":1}]"#,
+            r"path(. as $x | [try from_entries catch .zz] | $x)",
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains(r#"near attempt to access element "zz""#),
+                    "{}",
+                    e.message
+                );
+            }
+        );
+        query!(
+            br#"[{"key":"a","value":1}]"#,
+            r"path(. as $x | [try from_entries catch error] | $x)",
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains("near attempt to iterate through"),
+                    "{}",
+                    e.message
+                );
+            }
+        );
         // Negative rows: a handler jq never actually reaches (because the
         // body succeeds here where jq's own path-check would raise through
         // it) must not be trusted -- admitting it would fabricate `[]`
         // where jq raises through the handler.
-        for (doc, filter) in [
-            (
-                r#"[{"key":"a","value":1}]"#,
-                r"path(. as $x | [try from_entries catch .zz] | $x)",
-            ),
-            (
-                r#"[{"key":"a","value":1}]"#,
-                r"path(. as $x | [try from_entries catch error] | $x)",
-            ),
-            (
-                r#"{"a":1}"#,
-                r"path(. as $x | [try with_entries(.) catch .zz] | $x.a)",
-            ),
-        ] {
-            query!(doc.as_bytes(), filter,
-                QueryResult::Error(e) => {
-                    assert!(is_resolver_refusal(&e), "{filter}: {}", e.message);
-                }
-            );
-        }
+        query!(
+            br#"{"a":1}"#,
+            r"path(. as $x | [try with_entries(.) catch .zz] | $x.a)",
+            QueryResult::Error(e) => {
+                assert!(is_resolver_refusal(&e), "{}", e.message);
+            }
+        );
         // The #3271 pin is unchanged: `del(. as $x | [with_entries(.)] |
         // try .[0])` (uncatchable from a later, sibling stage) is already
         // covered by `test_native_builtins_and_update_assignment_raise_unconditionally_3271`.
