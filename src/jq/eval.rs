@@ -73805,6 +73805,67 @@ mod tests {
             .unwrap()
     }
 
+    /// [`run_and_count_retained`] through the *collecting* evaluator
+    /// ([`eval_full`]), which is the one [`eval_owned_pipe`] belongs to: the
+    /// streaming one never reaches it.
+    #[cfg(feature = "std")]
+    fn run_and_count_retained_collecting(program: &'static str) -> (String, usize) {
+        const STACK: usize = 256 * 1024 * 1024;
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                with_stack_budget(STACK, || {
+                    let Expr::FuncDef {
+                        name,
+                        params,
+                        body,
+                        then,
+                        ..
+                    } = parse(program).unwrap()
+                    else {
+                        panic!("expected a top-level FuncDef");
+                    };
+                    let cache = FuncDefBound::default();
+                    let bound_then = bind_def(&name, &params, &body, &then, &cache);
+                    let json = b"null";
+                    let index = crate::json::JsonIndex::build(json);
+                    let result = eval_full::<Vec<u64>, JqSemantics>(&bound_then, index.root(json));
+                    let out: Vec<String> = result
+                        .collect_owned::<JqSemantics>()
+                        .iter()
+                        .map(OwnedValue::to_json)
+                        .collect();
+                    (out.join(","), retained_bodies(&bound_then))
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// #3715: a lone `def` stage reached through [`eval_owned_pipe`] keeps its
+    /// copy, as #3692 requires of `RestPipe`. A node remembers what evaluation
+    /// did to it (#3148), so handed the program's own `f` instead of a copy, the
+    /// loop's update reaches the same node every round and leaves it bound. The
+    /// answer is the same either way; only the retained-body count sees it.
+    ///
+    /// An `until` update is the shape that reaches this entry with the program's
+    /// own node: a `map` or `reduce` body is re-rooted into a fresh copy first
+    /// (every other loop below retains none, with or without the copy).
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_eval_owned_pipe_keeps_a_lone_def_its_copy_and_the_3148_retention_3715() {
+        let (out, retained) = run_and_count_retained_collecting(
+            "def f: if . < 1 then . else (. - 1 | f) end; 6 | until(. < 1; (. - 1) | f)",
+        );
+        assert_eq!(out, "0");
+        assert_eq!(
+            retained, 0,
+            "the lone `f` after `. - 1` must keep its copy, or the program's own \
+             node is left bound"
+        );
+    }
+
     /// #3148: a call tree evaluated once retains the root call's body only,
     /// not one body per call. Before the fix, every node's first-use body was
     /// kept for the program's lifetime, so `fib(12)`'s 465 calls left 465
