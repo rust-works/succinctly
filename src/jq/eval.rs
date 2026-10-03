@@ -41864,7 +41864,8 @@ struct FoldSourceValue {
 /// Three sites read this and must agree on each variant -- change them
 /// together: [`fold_pattern_seed`] (the destructuring walk's register),
 /// [`fold_walk_refusal_is_guess`] (whether that walk's refusal is jq's own
-/// verdict) and `resolve_foreach`'s per-step register. `resolve_reduce`
+/// verdict) and [`foreach_step_register`] (`resolve_foreach`'s per-step
+/// register). `resolve_reduce`
 /// reads it only through the first two: its UPDATE is deliberately not
 /// re-seeded, because `reduce` restores the register when it backtracks its
 /// source and only its final accumulator is checked against it.
@@ -43686,6 +43687,215 @@ fn settle_fold_alternative(
     }
 }
 
+/// The register one `foreach` step's UPDATE and EXTRACT navigate against, and
+/// whether the accumulator coming into the step is at it -- jq's own
+/// `jv_identical(current_input, value_at_path)` (#2031, #2159, #2161).
+/// [`resolve_foreach`]'s per-step register, pulled out of its per-branch sink so
+/// the sink holds only the UPDATE/EXTRACT drive (#3114).
+///
+/// `walked` is where this step's pattern walk left the register, `None` for a
+/// bare `$var`; `state`/`state_snapshot`/`state_at_register` are the
+/// accumulator and its provenance coming into the step. Read-only: the sink
+/// keeps every `&mut` slot (`state`, `outcome`, `budget`, ...) to itself.
+///
+/// [`MovedRegister`] names the three sites that must agree on each variant.
+fn foreach_step_register<S: EvalSemantics>(
+    walked: Option<&PatternRegister>,
+    elem: &FoldSourceValue,
+    reg: &FoldRegister,
+    frame: &Frame,
+    state: &OwnedValue,
+    state_snapshot: &Snapshot,
+    state_at_register: bool,
+) -> (FoldRegister, bool) {
+    // #2031: this step's own register -- where the pattern walk
+    // left it, else the register-derived element's own position,
+    // else the fold's persistent `reg`. `resolve_reduce` has no
+    // counterpart: it never seeds a per-step register.
+    if let Some(walked_reg) = walked {
+        let step_reg = FoldRegister {
+            path: Rc::clone(&walked_reg.path),
+            value: walked_reg.value.clone(),
+            trackable: walked_reg.is_input,
+            frame: frame.extend(&walked_reg.path),
+        };
+        let at_register =
+            register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot);
+        return (step_reg, at_register);
+    }
+    match (&elem.register_path, &elem.moved) {
+        // An element reached at the register's *own* path did not
+        // move it (`foreach (., .a) as $k (.; .b)`: jq's first
+        // step is still at INIT's register), so it is the
+        // persistent register's arm below, not a re-seeded one --
+        // re-seeding it compared the accumulator by structural
+        // equality and refused a step jq runs (#2159).
+        (Some(path), _) if **path != *reg.path => {
+            let step_reg = FoldRegister {
+                path: Rc::clone(path),
+                value: elem.value.clone(),
+                trackable: true,
+                frame: frame.extend(path),
+            };
+            let at_register =
+                register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot);
+            (step_reg, at_register)
+        }
+        // #2161: `state_at_register` cannot come from the previous
+        // step's `branch_provenance`, which answers "did the last
+        // UPDATE branch end *at* the register's own path". The
+        // register is fixed for the whole fold and UPDATE almost
+        // always navigates away from it, so that answer is `false`
+        // from step 2 onward and every later step refuses its own
+        // navigation as untracked -- even though real jq re-enters
+        // each step from the register, not from the previous step's
+        // result.
+        //
+        // The register's own doc comment already states the model
+        // ("fixed once per INIT fork -- never advances across
+        // source-element iterations"): what decides a step is jq's
+        // `jv_identical(current_input, value_at_path)`, i.e. whether
+        // the accumulator coming into this step is still the
+        // register's own value. That is exactly the check the
+        // `Some(path)` arm above already performs via
+        // `register_identical`, and it is the missing *second* way
+        // a step can be at the register.
+        //
+        // It has to be an `||` rather than a replacement, because
+        // neither answer subsumes the other. `register_identical`
+        // demands `snapshot || Null | Bool` -- structural equality
+        // is not jq's pointer identity, so a container counts only
+        // when it is known to be the frozen node itself. So it
+        // answers `false` for step 1 of an object-valued register,
+        // where the carried `init_branch.trackable` is the correct
+        // `true`; and the carried provenance answers `false` from
+        // step 2 onward, where the identity check is the correct
+        // `true` for a `null`/`bool` accumulator. Dropping either
+        // half regresses one of the two shapes below.
+        //
+        // **jq mode only**, for exactly the reason
+        // [`trackable_step_register_eligible`] gates its own
+        // re-establishment the same way: the new half turns a step
+        // that would have refused into one that navigates, and on
+        // the *write* side that is a write where yq no-ops. Live
+        // against yq v4.53.3, `(null | .a) = 5` on `null` is a
+        // no-op, so `(foreach (1) as $k (null; .a)) = 5` writing
+        // `a: 5` would be exactly the silent corruption that gate's
+        // doc comment calls "a worse outcome than the refusal it
+        // would replace". yq mode therefore stays refuse-only here,
+        // as it already is for the single-step and carried-forward
+        // shapes. The carried half is left ungated: it is the
+        // pre-existing behaviour, not something this change
+        // introduces.
+        //
+        // Live against jq 1.7.1, on `{"a":1}`:
+        //
+        // ```console
+        // $ jq -c 'path(foreach (1,2,3) as $k (.b; .a))'
+        // ["b","a"]
+        // ["b","a"]
+        // ["b","a"]
+        // ```
+        //
+        // and on `{"a":1,"b":{"a":{"a":9}}}` the same filter emits
+        // `["b","a"]` once and then raises "attempt to access
+        // element \"a\" of {\"a\":9}" -- the accumulator has stopped
+        // being the register's value, so step 2 is genuinely
+        // untracked. Both fall out of the identity check; neither
+        // falls out of the path comparison.
+        // #2159: the element was computed *after* the source
+        // navigated (`.a | tostring`), which moved jq's register
+        // onto where it navigated to -- so UPDATE/EXTRACT are
+        // checked against that register, seeded exactly as the
+        // register-derived arm above seeds its own, rather than
+        // against the INIT-seeded persistent one. `state` (the
+        // accumulator) is not the register's node here, which is
+        // what `register_identical` is asked: a `null`/`bool`
+        // accumulator still re-establishes against a `null`/`bool`
+        // register, anything else is refused, as in jq.
+        (None, MovedRegister::At { path, value }) => {
+            let step_reg = FoldRegister {
+                path: Rc::clone(path),
+                value: value.clone(),
+                trackable: true,
+                frame: frame.extend(path),
+            };
+            let at_register =
+                register_identical::<S>(&step_reg.value, &step_reg.frame, state, state_snapshot);
+            (step_reg, at_register)
+        }
+        // #2159: the source navigated and then ran a stage the
+        // resolver cannot see inside, so the register is
+        // somewhere unknown. An untracked register admits
+        // nothing (`FoldRegister::identical` needs `trackable`),
+        // so every navigation UPDATE/EXTRACT attempts refuses.
+        (None, MovedRegister::Lost) => (
+            FoldRegister {
+                path: Rc::clone(&reg.path),
+                value: reg.value.clone(),
+                trackable: false,
+                frame: reg.frame.unknown(),
+            },
+            false,
+        ),
+        (_, MovedRegister::Unmoved) | (Some(_), _) => (
+            FoldRegister {
+                path: Rc::clone(&reg.path),
+                value: reg.value.clone(),
+                trackable: reg.trackable,
+                frame: reg.frame.clone(),
+            },
+            state_at_register || reg.identical::<S>(state, state_snapshot, S::TAG == EvalTag::Jq),
+        ),
+    }
+}
+
+/// A `foreach` step's verdict on a `Demand::Stop` answered downstream of its
+/// stored state (EXTRACT, the emission's own sink): retry the next `?//`
+/// alternative when [`is_retryable_stop`] allows it, else answer the source
+/// drive with the stop and record the retry generation it happened at, so a
+/// later `?//` retry past it can supersede it (#3293).
+fn fold_stop_outcome(is_last: bool, downstream_stopped: &mut Option<u64>) -> FoldStepOutcome {
+    if is_retryable_stop(is_last) {
+        FoldStepOutcome::Retry
+    } else {
+        *downstream_stopped = Some(pipe_retry_generation());
+        FoldStepOutcome::Return(Demand::Stop)
+    }
+}
+
+/// The branch a `foreach` without an EXTRACT hands its sink for one UPDATE
+/// output (#3114): tracked at its own path when it is, else demoted.
+///
+/// `demoted`, not `untracked`: an emitted value that is still a frozen
+/// snapshot must stay recognisable to an outer register when this `foreach`
+/// is nested inside another fold (#1466) -- same rule as `relocate`'s own
+/// demotion arm.
+fn foreach_emitted_branch<'a>(update_branch: &PathBranch<'a>) -> PathBranch<'a> {
+    if update_branch.trackable {
+        PathBranch::new(
+            update_branch.path.clone(),
+            update_branch.value.clone(),
+            true,
+        )
+    } else {
+        PathBranch::demoted(update_branch.snapshot.clone(), update_branch.value.clone())
+    }
+}
+
+/// A path-mode fold step's verdict on an escape out of UPDATE, EXTRACT or the
+/// emission: retry the next `?//` alternative when
+/// [`path_alternative_retries`] allows it, else stash the escape in `aborted`
+/// and answer the source drive with its stop. Shared by [`resolve_reduce`] and
+/// [`resolve_foreach`] so their retry rules cannot drift (#2979).
+fn fold_escape_outcome(e: EvalEscape, is_last: bool, aborted: &StashedEscape) -> FoldStepOutcome {
+    if path_alternative_retries(&e, is_last) {
+        FoldStepOutcome::Retry
+    } else {
+        FoldStepOutcome::Return(aborted.stop(e.into()))
+    }
+}
+
 /// `path()`-tracking counterpart of [`eval_reduce`] — resolves
 /// `reduce EXPR as $var (INIT; UPDATE)` in path context, replicating
 /// `eval_reduce`'s own control flow (INIT forks, per-source-element UPDATE
@@ -44037,11 +44247,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                 (acc_at_register, acc_snapshot) =
                                     reg.branch_provenance::<S>(last.as_ref(), frame);
                                 acc = last.map(|b| b.value.into_owned());
-                                outcome = Some(if path_alternative_retries(&e, is_last) {
-                                    FoldStepOutcome::Retry
-                                } else {
-                                    FoldStepOutcome::Return(aborted.stop(e.into()))
-                                });
+                                outcome = Some(fold_escape_outcome(e, is_last, &aborted));
                                 Demand::Stop
                             }
                         }
@@ -44345,164 +44551,16 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     &mut |walked, bind| {
                         let bound_update = bind.apply(update, WalkOrigins::Keep);
                         let bound_extract = extract.map(|ext| bind.apply(ext, WalkOrigins::Keep));
-                        // #2031: this step's own register -- where the pattern walk
-                        // left it, else the register-derived element's own position,
-                        // else the fold's persistent `reg`. `resolve_reduce` has no
-                        // counterpart: it never seeds a per-step register.
-                        let (active_reg, active_at_register) = if let Some(walked_reg) = &walked {
-                            let step_reg = FoldRegister {
-                                path: Rc::clone(&walked_reg.path),
-                                value: walked_reg.value.clone(),
-                                trackable: walked_reg.is_input,
-                                frame: frame.extend(&walked_reg.path),
-                            };
-                            let at_register = register_identical::<S>(
-                                &step_reg.value,
-                                &step_reg.frame,
-                                &state,
-                                &state_snapshot,
-                            );
-                            (step_reg, at_register)
-                        } else {
-                            match (&elem.register_path, &elem.moved) {
-                                // An element reached at the register's *own* path did not
-                                // move it (`foreach (., .a) as $k (.; .b)`: jq's first
-                                // step is still at INIT's register), so it is the
-                                // persistent register's arm below, not a re-seeded one --
-                                // re-seeding it compared the accumulator by structural
-                                // equality and refused a step jq runs (#2159).
-                                (Some(path), _) if **path != *reg.path => {
-                                    let step_reg = FoldRegister {
-                                        path: Rc::clone(path),
-                                        value: elem.value.clone(),
-                                        trackable: true,
-                                        frame: frame.extend(path),
-                                    };
-                                    let at_register = register_identical::<S>(
-                                        &step_reg.value,
-                                        &step_reg.frame,
-                                        &state,
-                                        &state_snapshot,
-                                    );
-                                    (step_reg, at_register)
-                                }
-                                // #2161: `state_at_register` cannot come from the previous
-                                // step's `branch_provenance`, which answers "did the last
-                                // UPDATE branch end *at* the register's own path". The
-                                // register is fixed for the whole fold and UPDATE almost
-                                // always navigates away from it, so that answer is `false`
-                                // from step 2 onward and every later step refuses its own
-                                // navigation as untracked -- even though real jq re-enters
-                                // each step from the register, not from the previous step's
-                                // result.
-                                //
-                                // The register's own doc comment already states the model
-                                // ("fixed once per INIT fork -- never advances across
-                                // source-element iterations"): what decides a step is jq's
-                                // `jv_identical(current_input, value_at_path)`, i.e. whether
-                                // the accumulator coming into this step is still the
-                                // register's own value. That is exactly the check the
-                                // `Some(path)` arm above already performs via
-                                // `register_identical`, and it is the missing *second* way
-                                // a step can be at the register.
-                                //
-                                // It has to be an `||` rather than a replacement, because
-                                // neither answer subsumes the other. `register_identical`
-                                // demands `snapshot || Null | Bool` -- structural equality
-                                // is not jq's pointer identity, so a container counts only
-                                // when it is known to be the frozen node itself. So it
-                                // answers `false` for step 1 of an object-valued register,
-                                // where the carried `init_branch.trackable` is the correct
-                                // `true`; and the carried provenance answers `false` from
-                                // step 2 onward, where the identity check is the correct
-                                // `true` for a `null`/`bool` accumulator. Dropping either
-                                // half regresses one of the two shapes below.
-                                //
-                                // **jq mode only**, for exactly the reason
-                                // [`trackable_step_register_eligible`] gates its own
-                                // re-establishment the same way: the new half turns a step
-                                // that would have refused into one that navigates, and on
-                                // the *write* side that is a write where yq no-ops. Live
-                                // against yq v4.53.3, `(null | .a) = 5` on `null` is a
-                                // no-op, so `(foreach (1) as $k (null; .a)) = 5` writing
-                                // `a: 5` would be exactly the silent corruption that gate's
-                                // doc comment calls "a worse outcome than the refusal it
-                                // would replace". yq mode therefore stays refuse-only here,
-                                // as it already is for the single-step and carried-forward
-                                // shapes. The carried half is left ungated: it is the
-                                // pre-existing behaviour, not something this change
-                                // introduces.
-                                //
-                                // Live against jq 1.7.1, on `{"a":1}`:
-                                //
-                                // ```console
-                                // $ jq -c 'path(foreach (1,2,3) as $k (.b; .a))'
-                                // ["b","a"]
-                                // ["b","a"]
-                                // ["b","a"]
-                                // ```
-                                //
-                                // and on `{"a":1,"b":{"a":{"a":9}}}` the same filter emits
-                                // `["b","a"]` once and then raises "attempt to access
-                                // element \"a\" of {\"a\":9}" -- the accumulator has stopped
-                                // being the register's value, so step 2 is genuinely
-                                // untracked. Both fall out of the identity check; neither
-                                // falls out of the path comparison.
-                                // #2159: the element was computed *after* the source
-                                // navigated (`.a | tostring`), which moved jq's register
-                                // onto where it navigated to -- so UPDATE/EXTRACT are
-                                // checked against that register, seeded exactly as the
-                                // register-derived arm above seeds its own, rather than
-                                // against the INIT-seeded persistent one. `state` (the
-                                // accumulator) is not the register's node here, which is
-                                // what `register_identical` is asked: a `null`/`bool`
-                                // accumulator still re-establishes against a `null`/`bool`
-                                // register, anything else is refused, as in jq.
-                                (None, MovedRegister::At { path, value }) => {
-                                    let step_reg = FoldRegister {
-                                        path: Rc::clone(path),
-                                        value: value.clone(),
-                                        trackable: true,
-                                        frame: frame.extend(path),
-                                    };
-                                    let at_register = register_identical::<S>(
-                                        &step_reg.value,
-                                        &step_reg.frame,
-                                        &state,
-                                        &state_snapshot,
-                                    );
-                                    (step_reg, at_register)
-                                }
-                                // #2159: the source navigated and then ran a stage the
-                                // resolver cannot see inside, so the register is
-                                // somewhere unknown. An untracked register admits
-                                // nothing (`FoldRegister::identical` needs `trackable`),
-                                // so every navigation UPDATE/EXTRACT attempts refuses.
-                                (None, MovedRegister::Lost) => (
-                                    FoldRegister {
-                                        path: Rc::clone(&reg.path),
-                                        value: reg.value.clone(),
-                                        trackable: false,
-                                        frame: reg.frame.unknown(),
-                                    },
-                                    false,
-                                ),
-                                (_, MovedRegister::Unmoved) | (Some(_), _) => (
-                                    FoldRegister {
-                                        path: Rc::clone(&reg.path),
-                                        value: reg.value.clone(),
-                                        trackable: reg.trackable,
-                                        frame: reg.frame.clone(),
-                                    },
-                                    state_at_register
-                                        || reg.identical::<S>(
-                                            &state,
-                                            &state_snapshot,
-                                            S::TAG == EvalTag::Jq,
-                                        ),
-                                ),
-                            }
-                        };
+                        // #2031: this step's own register -- see [`foreach_step_register`].
+                        let (active_reg, active_at_register) = foreach_step_register::<S>(
+                            walked.as_ref(),
+                            &elem,
+                            &reg,
+                            frame,
+                            &state,
+                            &state_snapshot,
+                            state_at_register,
+                        );
                         if let Some(control) =
                             charge_alternative_update(&mut budget, &mut ran_update, "foreach")
                         {
@@ -44597,49 +44655,22 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                     // branch -- retries the next alternative from the
                                     // state already stored, which is `update_branch`.
                                     ResolveFlow::Stopped => {
-                                        outcome = Some(if is_retryable_stop(is_last) {
-                                            FoldStepOutcome::Retry
-                                        } else {
-                                            downstream_stopped = Some(pipe_retry_generation());
-                                            FoldStepOutcome::Return(Demand::Stop)
-                                        });
+                                        outcome = Some(fold_stop_outcome(
+                                            is_last,
+                                            &mut downstream_stopped,
+                                        ));
                                         return Demand::Stop;
                                     }
                                     ResolveFlow::Escaped(e) => {
-                                        outcome = Some(if path_alternative_retries(&e, is_last) {
-                                            FoldStepOutcome::Retry
-                                        } else {
-                                            FoldStepOutcome::Return(aborted.stop(e.into()))
-                                        });
+                                        outcome = Some(fold_escape_outcome(e, is_last, &aborted));
                                         return Demand::Stop;
                                     }
                                     ResolveFlow::Exhausted => {}
                                 }
                             } else {
-                                let emitted = if update_branch.trackable {
-                                    PathBranch::new(
-                                        update_branch.path.clone(),
-                                        update_branch.value.clone(),
-                                        true,
-                                    )
-                                } else {
-                                    // `demoted`, not `untracked`: an emitted value that is
-                                    // still a frozen snapshot must stay recognisable to an
-                                    // outer register when this `foreach` is nested inside
-                                    // another fold (#1466) — same rule as `relocate`'s own
-                                    // demotion arm.
-                                    PathBranch::demoted(
-                                        update_branch.snapshot.clone(),
-                                        update_branch.value.clone(),
-                                    )
-                                };
-                                if sink(emitted) == Demand::Stop {
-                                    outcome = Some(if is_retryable_stop(is_last) {
-                                        FoldStepOutcome::Retry
-                                    } else {
-                                        downstream_stopped = Some(pipe_retry_generation());
-                                        FoldStepOutcome::Return(Demand::Stop)
-                                    });
+                                if sink(foreach_emitted_branch(update_branch)) == Demand::Stop {
+                                    outcome =
+                                        Some(fold_stop_outcome(is_last, &mut downstream_stopped));
                                     return Demand::Stop;
                                 }
                             }
@@ -44697,11 +44728,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 reg.branch_provenance::<S>(None, frame);
                         }
                         if let ResolveFlow::Escaped(e) = flow {
-                            outcome = Some(if path_alternative_retries(&e, is_last) {
-                                FoldStepOutcome::Retry
-                            } else {
-                                FoldStepOutcome::Return(aborted.stop(e.into()))
-                            });
+                            outcome = Some(fold_escape_outcome(e, is_last, &aborted));
                             return Demand::Stop;
                         }
                         Demand::Continue
