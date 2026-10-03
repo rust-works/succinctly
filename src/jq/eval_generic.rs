@@ -59,10 +59,10 @@ use super::eval::{
     collapse_vec, collect_pattern_var_names, compare_key_arrays, compare_values,
     debug_assert_materialization_error, def_spine_len, demote_for_reentry, descriptor_slice_bounds,
     each_path_on_owned, each_pattern_binding_set, each_recurse_walk, enter_def_call,
-    entries_to_object, eval_each_owned, eval_each_owned_rest, eval_full as full_eval,
-    finish_fork_flow, finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix,
-    foreach_forks, format_owned, has_type_mismatch_is_permissive, index_component_value,
-    index_in_array_bounds, index_one_owned as index_owned_by_key, is_assignment_expr, is_eager_arg,
+    entries_to_object, eval_each_owned, eval_full as full_eval, finish_fork_flow,
+    finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
+    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    index_one_owned as index_owned_by_key, is_assignment_expr, is_eager_arg,
     is_identity_passthrough, is_retryable_control, is_retryable_stop, key_arrays_eq, limit_raising,
     literal_to_owned, mark_nonretryable_escape, native_stack_exhausted, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
@@ -79,8 +79,8 @@ use super::eval::{
     yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
     yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
     ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RootWitness, SliceTargetKind,
-    StashedEscape, StashedVerdict, YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RestPipe, RootWitness,
+    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -12296,59 +12296,6 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
             Flow::Exhausted => continue,
             other => return other,
         }
-    }
-}
-
-/// The stages after the current one, plus the owned `Expr::Pipe` copy an
-/// `Owned` element needs -- built at most once, and only if such an element
-/// actually arrives (#1598).
-///
-/// `eval_each_owned` takes an `&Expr`, and the only way to present a `rest`
-/// *slice* as one is to own a copy: a `Vec` allocation plus a recursive
-/// `Expr` clone per stage. Doing that inside the per-element call meant
-/// paying it once per element; a driver builds one of these instead and
-/// reuses it for its whole loop. A rest of one plain stage does not need the
-/// copy at all when `eval_each_owned`'s front doors answer it (#3673, see
-/// [`RestPipe::run_owned`]).
-///
-/// The slice and its owned copy are one value rather than two parameters on
-/// purpose. Correctness requires that a cached pipe is only ever used with
-/// the `rest` it was built from -- a mismatch would evaluate elements
-/// against the wrong stages, which is a wrong answer rather than a crash.
-/// Pairing them here makes that mismatch unrepresentable instead of relying
-/// on every call site to keep two arguments in step.
-struct RestPipe<'a> {
-    stages: &'a [Expr],
-    owned: Option<Expr>,
-}
-
-impl<'a> RestPipe<'a> {
-    fn new(stages: &'a [Expr]) -> Self {
-        Self {
-            stages,
-            owned: None,
-        }
-    }
-
-    /// The stages themselves, for the arms that can consume a slice.
-    fn stages(&self) -> &'a [Expr] {
-        self.stages
-    }
-
-    /// Run these stages against `input`, an owned intermediate, through
-    /// [`eval_each_owned`], building the owned `Expr::Pipe` it takes only if
-    /// the rest cannot be answered from its one plain stage (#3673): a lone
-    /// `. + 1` or `length` after a computed value used to cost a `Vec` and a
-    /// clone of the stage for every evaluation that reached it. See
-    /// [`eval_each_owned_rest`].
-    fn run_owned<S: EvalSemantics>(
-        &mut self,
-        input: &OwnedValue,
-        optional: bool,
-        reentry: Reentry,
-        sink: &mut dyn FnMut(OwnedValue) -> Demand,
-    ) -> Flow {
-        eval_each_owned_rest::<S>(self.stages, &mut self.owned, input, optional, reentry, sink)
     }
 }
 
