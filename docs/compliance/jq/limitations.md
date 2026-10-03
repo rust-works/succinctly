@@ -618,9 +618,6 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   raises `Invalid path expression near attempt to access element "z" of [1]` where succinctly
   raises `Cannot index array with string "z"`. Both raise after one attempt; only the wording
   differs.
-- **`path(reduce 1 as $x (.; .[null:]))`** is `[]` in jq 1.7.1 and an error here, with or
-  without a `?//` (the slice returns the whole array, which jq treats as the accumulator's own
-  node). Unrelated to the retry, and unchanged.
 
 ## Path-mode slice bounds and a `?//` retry (#3293)
 
