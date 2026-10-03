@@ -86608,14 +86608,10 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
         (r#"{"a":{"a":1}} | "#, RETRY_ROWS_PATH_CONTEXT_INDEX_3293),
         (r#"{"a":[1,2]} | "#, RETRY_ROWS_OWNED_IDENTITY_3293),
     ] {
-        // #3512: an owned-input `[... | key]` (or `| path`) collector prints the array it
-        // had collected after the error its body raises, with or without a
-        // `?//`; the collector rows that expect that error are not this
-        // audit's.
         let rows: Vec<RetryRow3293> = rows
             .iter()
             .copied()
-            .filter(|&(filter, _, _, _, exit)| {
+            .filter(|&(filter, _, _, _, _)| {
                 // #3503's table also runs `first`/`limit` over `while`; on this route the
                 // loop is collected eagerly, so it runs one `update` past the consumer's
                 // stop (an `A` on stderr where jq prints none) with or without a `?//`.
@@ -86627,9 +86623,6 @@ fn test_retry_supersedes_stashed_sink_verdict_on_owned_route_3293() -> Result<()
                         || filter.contains("limit(1; while(")
                         || filter.contains("first(until((")
                         || filter.contains("limit(1; until((")))
-                    && !(exit == 5
-                        && filter.starts_with('[')
-                        && (filter.contains("| key") || filter.contains("| path]")))
             })
             .collect();
         assert_retry_rows_3293(None, prefix, &rows)?;
@@ -90884,4 +90877,189 @@ fn test_error_of_an_empty_message_yields_nothing_3488() -> Result<()> {
             0,
         ),
     ])
+}
+
+/// #3512: an array collector over a body that reads path context (`key`,
+/// `parent`, `path`) and raises is atomic over an owned input, as it is over a
+/// document cursor and as jq's `[path(...)]` is: the error is the array's
+/// answer, and no `[]` or partial array is delivered ahead of it. The owned
+/// route prefetches such a body (a pipe that moves before it reads) and used to
+/// deliver the prefix as the array, then the escape, which printed `[]` after
+/// `E2`, `["a"]` for `[(.a, error("E2")) | key]`, `0` for its `length`, and
+/// both `[]` and `"c"` through `try ... catch`. Values the *stream* produces
+/// before the escape are still delivered (`(.a | key), [...]` prints `"a"`
+/// first), and an array whose body does not raise is unchanged.
+///
+/// Every expectation is the cursor route's answer to the same body over the same
+/// document, which matches jq 1.7.1's `[path(...)]` (`key` is succinctly's).
+///
+/// The last rows must not change: an array whose own body does not raise is built
+/// as it always was *after* an escape an earlier part of the same stage left (a
+/// sibling field, a comma operand, a `foreach` source), which is reported once
+/// the prefix has been delivered. Only an escape the array's *own* body raised
+/// takes the array with it.
+///
+/// Not pinned: a *consumer* of such a body inside the same stage (`isempty`,
+/// `reduce`, `limit`), which decides from the prefix and then raises on both
+/// routes' owned side -- a separate, older gap (#3639).
+#[test]
+// STYLE-0004: the rows are jq source text, whose `{...}` object literals the lint reads as
+// format placeholders.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_array_collector_over_a_raising_path_context_body_is_atomic_3512() -> Result<()> {
+    for (filter, stdout, stderr, code) in [
+        (
+            r#"{"a":1} | [(error("E2")) | key]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a, error("E2")) | key]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(error("E2"), .a) | key]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a, error("E2"), .a) | key]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [.a | (key, error("E2"))]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a, error("E2")) | parent]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a, error("E2")) | path]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(error("E2")) | key] | length"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | try [(error("E2")) | key] catch "c""#,
+            "\"c\"\n",
+            "",
+            0,
+        ),
+        (r#"{"a":1} | [(error("E2")) | key]?"#, "", "", 0),
+        (
+            r#"{"a":1} | [[(error("E2")) | key], 9]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | ([(error("E2")) | key], 7)"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | {k: [(error("E2")) | key]}"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | first([(error("E2")) | key])"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | (.a | key), [(error("E2")) | key]"#,
+            "\"a\"\n",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | [(.a | key), [(error("E2")) | key]]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (r#"{"a":1} | [(.a | key), 7]"#, "[\"a\",7]\n", "", 0),
+        (r#"{"a":1} | [(.a, .a) | key]"#, "[\"a\",\"a\"]\n", "", 0),
+        (
+            r#"{"a":1} | [(.a, .a) | path]"#,
+            "[[\"a\"],[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (r#"{"a":1} | [[(.a | key)], 9]"#, "[[\"a\"],9]\n", "", 0),
+        // A collector whose own body escapes takes its siblings in the same array
+        // with it, and what is piped from it is never reached.
+        (
+            r#"{"a":1} | .a | [[key], (1, (error("E2") | key))]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | .a | [(1, (error("E2") | key))] | [key]"#,
+            "",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        // An earlier escape of the stage does not take an unrelated array with it.
+        (
+            r#"{"a":1} | .a | {x: (1, (error("E2") | key)), y: [key]}"#,
+            "{\"x\":1,\"y\":[\"a\"]}\n",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | .a | {y: [key], x: (1, (error("E2") | key))}"#,
+            "{\"y\":[\"a\"],\"x\":1}\n",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | .a | {x: (1, (error("E2") | key)), y: [3]}"#,
+            "{\"x\":1,\"y\":[3]}\n",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | .a | foreach (1, (error("E2") | key)) as $x ([key]; .)"#,
+            "[\"a\"]\n",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+        (
+            r#"{"a":1} | .a | (1, (error("E2") | key)), [key]"#,
+            "1\n",
+            "jq: error (at <unknown>): E2\n",
+            5,
+        ),
+    ] {
+        let (out, err, got) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), got),
+            (stdout, stderr, code),
+            "{filter}"
+        );
+    }
+    Ok(())
 }

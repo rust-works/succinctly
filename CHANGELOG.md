@@ -422,6 +422,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: an array collector over a raising `key`/`parent`/`path` body is atomic on an owned input**
+  (#3512). `{"a":1} | [(error("E2")) | key]` printed `[]` after `E2`, `[(.a, error("E2")) | key]`
+  printed `["a"]`, its `length` printed `0`, and `try ... catch` delivered `[]` and then the handler's
+  answer; a document cursor, and jq's `[path(...)]`, print the error alone. The owned route evaluates
+  such a body early and reports its escape after the stage has delivered what the prefix produced,
+  which is right for a stream and wrong for `[...]`, whose answer is the error. An array that ends
+  up after an escape its own body raised is no longer delivered (nested arrays included); what the
+  stream produced before it still is (`(.a | key), [(error("E2")) | key]` prints `"a"` first), and
+  an array whose body raised nothing is built as before, after an earlier escape of the stage too
+  (`.a | {x: (1, (error("E2") | key)), y: [key]}` still prints the object ahead of the error). A
+  consumer of such a body (`isempty`, `limit`, `reduce`) is a separate, older gap, filed as #3639.
+
 - **jq: the compile-error report lists every directive failure jq's walk reaches, with its count**
   (#3573, after #3327). jq walks a program's `include`/`import` directives last-declared first, and
   a module's own directives the same way, and prints each failure it reaches: a data file that does
