@@ -4332,7 +4332,7 @@ mod object_keys_repeat_tests {
         fn has_checks<C: DocumentCursor>(_: &C) -> bool {
             C::HAS_DELIMITER_CHECKS
         }
-        let json = br#"[1,,2]"#;
+        let json = br"[1,,2]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
         assert!(has_checks(&root), "JSON declares delimiter checks");
@@ -4353,7 +4353,7 @@ mod object_keys_repeat_tests {
         );
         assert!(last.is_some());
 
-        let json = br#"[1,]"#;
+        let json = br"[1,]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
         let (only, _) = root
