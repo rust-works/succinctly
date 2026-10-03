@@ -62978,6 +62978,125 @@ fn test_reduce_source_with_a_refusing_construct_does_not_drain_inputs_3726() -> 
     Ok(())
 }
 
+/// #3713: jq defines `walk(f)` as `def w: if type == "object" then map_values(w)
+/// elif type == "array" then map(w) else . end | f; w`, so on a scalar it is `. |
+/// f` run on the path register itself, and `f`'s navigation moves it:
+/// `null | path(walk(.a))` is `["a"]` and `(walk(.a)) |= 9` writes `{"a":9}`.
+/// The resolver evaluated `walk` by value, so its leaf was a `null` at depth 0,
+/// equal to the root's, and #3125's terminal carve-out answered the root path:
+/// `[]`, and a write of `9` over the whole document. A scalar `walk(f)` now
+/// resolves as `f` (as bare `first` resolves as `.[0]`, #3545), so each row below
+/// answers what jq 1.7.1 answers; `walk(.a) | .x` and `.x | walk(.a)`, which were
+/// refused, name `["a","x"]` and `["x","a"]`, and `walk(.)` over a number or a
+/// string no longer refuses.
+///
+/// The rows where `f` leaves the register alone matter as much: a guard that
+/// refused every by-value leaf that does not *prove* it left the register at the
+/// root (the first attempt at this fix) turned `walk(select(true))`, `walk(..)`,
+/// `walk(.a // .)` and `ltrimstr("a")` from jq's `[]` into refusals.
+///
+/// An array or an object does not take this route: `map(w)` rebuilds the
+/// container, so the trailing `| f` runs on a computed value, and jq refuses
+/// where the by-value route still judges it.
+#[test]
+fn test_walk_over_a_scalar_is_f_in_path_position_3713() -> Result<()> {
+    // Input, filter, jq 1.7.1's stdout (captured, never recalled).
+    for (input, filter, want) in [
+        // `f` navigates: the register moves with it.
+        ("null", "path(walk(.a))", r#"["a"]"#),
+        ("null", "[path(walk(.a))]", r#"[["a"]]"#),
+        ("null", "(walk(.a)) |= 9", r#"{"a":9}"#),
+        ("null", "(walk(.a)) = 9", r#"{"a":9}"#),
+        ("null", "del(walk(.a))", "null"),
+        ("null", r#"try path(walk(.a)) catch "c""#, r#"["a"]"#),
+        ("null", "path(walk(.a, .b))", "[\"a\"]\n[\"b\"]"),
+        ("null", "path(walk(first))", "[0]"),
+        ("null", "path(walk(.a?))", r#"["a"]"#),
+        ("null", "path(walk(.a | .b))", r#"["a","b"]"#),
+        // Through a pipe, and from a position other than the root.
+        ("null", "path(walk(.a) | .x)", r#"["a","x"]"#),
+        ("null", "path(walk(.a) | .)", r#"["a"]"#),
+        ("null", "path(.x | walk(.a))", r#"["x","a"]"#),
+        (
+            "null",
+            "path(. as $x | walk(.a) | walk(.a) | $x)",
+            r#"["a","a"]"#,
+        ),
+        // `f` leaves the register where it was.
+        ("null", "path(walk(.))", "[]"),
+        ("null", "path(walk(null))", "[]"),
+        ("null", "path(walk(select(true)))", "[]"),
+        ("null", "path(walk(first(.)))", "[]"),
+        ("null", "path(walk(.a // .))", "[]"),
+        ("null", "path(walk(..))", "[]"),
+        ("null", "path(walk(walk(.)))", "[]"),
+        ("null", "(walk(.)) = 5", "5"),
+        ("null", "del(walk(.))", "null"),
+        // The neighbours a guard on by-value leaves would have broken.
+        ("null", r#"path(ltrimstr("a"))"#, "[]"),
+        ("null", "path(env | null)", "[]"),
+        ("null", "path(until(true; .a))", "[]"),
+        // Other scalars: `walk(.)` is the register itself.
+        ("1", "path(walk(.))", "[]"),
+        (r#""s""#, "path(walk(.))", "[]"),
+        ("true", "path(walk(.))", "[]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3713: `{filter}` on {input}: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3713: `{filter}` on {input}");
+    }
+    // Refused in jq too, each with jq 1.7.1's own wording: a computed result is
+    // not the register (`Invalid path expression with result ...`), `.a` of a
+    // scalar raises its type error before any register is asked about, and an
+    // array or an object keeps the by-value route.
+    for (input, filter, wording) in [
+        (
+            "null",
+            "path(walk(1))",
+            "Invalid path expression with result 1",
+        ),
+        (
+            "null",
+            "path(walk(tostring))",
+            r#"Invalid path expression with result "null""#,
+        ),
+        (
+            "1",
+            "path(walk(.a))",
+            r#"Cannot index number with string "a""#,
+        ),
+        (
+            r#""s""#,
+            "path(walk(.a))",
+            r#"Cannot index string with string "a""#,
+        ),
+        (
+            "[1]",
+            "path(walk(.))",
+            "Invalid path expression with result [1]",
+        ),
+        (
+            "[[1]]",
+            "(walk(.)) = 9",
+            "Invalid path expression with result [[1]]",
+        ),
+        (
+            "[]",
+            "del(walk(.))",
+            "Invalid path expression with result []",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "#3713: `{filter}` on {input}: stdout={stdout:?}");
+        assert_eq!(stdout, "", "#3713: `{filter}` on {input}");
+        assert!(
+            stderr.contains(wording),
+            "#3713: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3456 (B2): the survival rule is decided per *stage*, not per leaf. A
 /// compound stage that mixes a leaf that navigates with one that does not
 /// loses the register as a whole, so these refuse where jq 1.7.1 answers `[]`

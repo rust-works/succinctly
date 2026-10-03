@@ -2926,8 +2926,29 @@ answers `["b"]` — and classified the two residuals appended below):
   `null`/`true`/`false` terminal, read and write forms) found no row where this build still answers a
   root path that jq does not; every difference from jq is a loud refusal.
   (`first(.a) | 5 | select(true) | null` is one: `first(.a)` extends the path, so it refuses.)
-  Should a stage ever move the register without extending the path, the answer would again be the
-  root, and the register-loss state (`Frame::register_loss`) would have to reach the terminal sink.
+  That fact has one exception, found by
+  [#3713](https://github.com/rust-works/succinctly/issues/3713): a by-value stage that navigates
+  inside jq without extending the path. jq defines `walk(f)` as `... else . end | f`, so on a scalar it
+  runs `f` on the register itself: `null | path(walk(.a))` is `["a"]` and `(walk(.a)) |= 9` is
+  `{"a":9}`. The resolver evaluated `walk` by value, so its `null` at depth 0 equalled the root's and it
+  answered `[]` and wrote `9` over the whole document (likewise `walk(first)`, `walk(.a?)`,
+  `walk(.a, .b)`, and through a pipe `walk(.a) | .`). A scalar `walk(f)` now resolves as `f` in path
+  position, as bare `first` resolves as `.[0]` (#3545), so each answers what jq answers,
+  `walk(.a) | .x` and `.x | walk(.a)` (refused until then) name `["a","x"]` and `["x","a"]`, and
+  `walk(.)` over a number or a string no longer refuses. An array or an object keeps the by-value
+  route, where jq refuses too (`map(w)` rebuilds the container, so the trailing `| f` runs on a
+  computed value). A first attempt, a guard that refused every by-value terminal whose producer does not
+  say the register stayed at the root, was wrong: it turned `walk(select(true))`, `walk(..)`,
+  `walk(.a // .)`, `ltrimstr("a")`, `env | null` and `until(true; .a)` from jq's `[]` into refusals, and
+  the sweep's grid has none of those operands, so it could not see it; the matrix in
+  `test_walk_over_a_scalar_is_f_in_path_position_3713` covers them. On
+  `scripts/jq-path-register-sweep.py` over nine operands (53,487 rows) the 5 rows that differed from jq
+  now match, with 38 that were refusals, and nothing regressed; two seeded 20,027-row samples gain 2
+  matches each, and a 4,620-row differential over by-value builtins, nested `walk`s and non-root
+  positions has no row worse than before (4,117 matches become 4,374). The accepted-where-jq-refuses
+  rows left in that differential are all `walk` over an array or an object, the by-value route, and
+  are unchanged.
+
 - **`getpath` is transparent to the path register, and succinctly now models it
   ([#2896](https://github.com/rust-works/succinctly/issues/2896),
   [#2978](https://github.com/rust-works/succinctly/issues/2978)).** The mechanism recorded

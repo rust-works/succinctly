@@ -36750,6 +36750,29 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         Expr::Paren(inner) => {
             resolve_node_sink::<S>(inner, value, trackable, snapshot, frame, keep, sink)
         }
+        // #3713: jq defines `walk(f)` as `def w: if type == "object" then
+        // map_values(w) elif type == "array" then map(w) else . end | f; w`, so on
+        // a scalar it is `. | f`, run on the path register itself: `f`'s
+        // navigation moves it, and `null | path(walk(.a))` is `["a"]`. The eager
+        // fallback evaluated `walk` by value, so its `null` at depth 0 matched the
+        // root and #3125's terminal carve-out answered `[]` (and a write of `9`
+        // over the whole document for `(walk(.a)) |= 9`, where jq writes
+        // `{"a":9}`). Re-dispatching as `f` reuses every rule `f` has in path
+        // position, as the bare `first` arm below does, and answers what jq
+        // answers where the fallback guessed: `path(walk(.a) | .x)` and
+        // `path(.x | walk(.a))` were refused and now name `["a","x"]` and
+        // `["x","a"]`; `walk(select(true))`, `walk(..)` and `walk(.a // .)` stay on
+        // the root, `walk(first)` is `[0]`, and `walk(1)` still refuses with its
+        // result. An array or object does not qualify: `map(w)` rebuilds the
+        // container, so the trailing `| f` runs on a computed value and the by-value
+        // route (`always_refuses_as_live_path`) keeps judging it. jq mode only
+        // (ADR-0018): yq has no oracle for it.
+        Expr::Builtin(Builtin::Walk(f))
+            if S::TAG == EvalTag::Jq
+                && !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) =>
+        {
+            resolve_node_sink::<S>(f, value, trackable, snapshot, frame, keep, sink)
+        }
         // #3545: jq defines bare `first` as `.[0]` and bare `last` as `.[-1]`
         // (`def first: .[0]; def last: .[-1];`), so in a path they extend it by
         // that component and a write through them lands. Without an arm here
@@ -39722,7 +39745,9 @@ fn leaf_register<'a, S: EvalSemantics>(
 /// object arm raises ([`always_refuses_as_live_path`]) before a register is
 /// ever asked about. The trailing `| f` runs on the computed result, which is
 /// not the register, so like `map(f)` it qualifies only for an `f` that
-/// navigates nothing (`walk(.a)` is a path error in jq).
+/// navigates nothing (`walk(.a)` is a path error in jq). A scalar `walk(f)` never
+/// reaches this verdict (#3713): there `walk` is `f` on the register itself, and
+/// [`resolve_node_sink`] resolves it as `f`; this is the array and object route.
 ///
 /// Not part of [`cannot_move_register`], because that predicate also stands
 /// for "navigates nothing, so a register that is not on this expression's
