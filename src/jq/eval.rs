@@ -27227,9 +27227,13 @@ pub fn eval_reindexed_document<'a, S: EvalSemantics>(
 /// (`eval_on_owned_over`), so the answers, including the errors and the
 /// yq-mode "a field of a scalar is empty" rule, are the ones the index route
 /// gives; `registered_document_scalar_door_agrees_with_the_index_route_3479`
-/// pins that. A container is left to the ordinary route on purpose: an
-/// index over it is what a navigation or a stream needs, and its clone here
-/// would cost what it saves.
+/// pins that. A container is left to the ordinary route as a matter of scope,
+/// not because cloning it is costly: an owned container is held behind one
+/// refcounted pointer, so a clone is a refcount bump. The door exists for the
+/// per-line cost of a scalar `-R` line. A container input is a document, whose
+/// writes and `--slurp` run at identical instruction counts with and without
+/// the door (#3679), and answering one here would need its own agreement test
+/// for the values a navigation hands back.
 ///
 /// Not a supported entry point.
 #[doc(hidden)]
@@ -122181,14 +122185,25 @@ mod touched_edge_cases_2999 {
     /// container and every filter the owned fast path does not know, so the
     /// caller goes on to the index route for them. The index route
     /// (`eval_reindexed_document` over the re-indexed value) is the oracle.
+    ///
+    /// Each filter says whether the door must answer it. Without that, a filter
+    /// the door stopped answering would only skip the comparison below and the
+    /// test would pass on a speed-only regression. A filter marked `false` is
+    /// compared whenever the door does answer it, but is not required to.
     #[test]
     fn registered_document_scalar_door_agrees_with_the_index_route_3479() {
+        // A non-finite float shows as itself: `to_json` prints all of them as
+        // `null`, which would let a NaN that came back as `null` pass.
+        let show = |value: &OwnedValue| match value {
+            OwnedValue::Float(f) if !f.is_finite() => format!("float {f}"),
+            other => other.to_json(),
+        };
         let render = |result: QueryResult<'_, Vec<u64>>| match result {
             QueryResult::Error(e) => format!("error: {e}"),
             other => other
                 .collect_owned::<YqSemantics>()
                 .iter()
-                .map(OwnedValue::to_json)
+                .map(show)
                 .collect::<Vec<_>>()
                 .join(" "),
         };
@@ -122196,32 +122211,43 @@ mod touched_edge_cases_2999 {
             OwnedValue::String("User7".into()),
             OwnedValue::String("a\"b\\c\n".into()),
             OwnedValue::String(String::new().into()),
+            // Past the width an error message previews a value to.
+            OwnedValue::String("a line of raw text that is well past any error preview".into()),
             OwnedValue::Int(7),
+            OwnedValue::Int(i64::MAX),
             OwnedValue::Float(1.5),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::NEG_INFINITY),
+            // A number that keeps the spelling it was read with.
+            OwnedValue::from_number_literal::<YqSemantics>("1e3"),
+            OwnedValue::from_number_literal::<YqSemantics>("1.50"),
+            OwnedValue::from_number_literal::<YqSemantics>("100000000000000000000"),
             OwnedValue::Bool(true),
             OwnedValue::Null,
         ];
-        let mut answered = 0;
-        for filter in [
-            ".",
-            r#". + "x""#,
-            ". + 1",
-            ".a",
-            ".[0]",
-            ".[-1]",
-            "tostring",
-            r#"type == "string""#,
-            r#". == "User7""#,
-            "length",
-            ".[0:3]",
-            "[.]",
+        for (filter, door_must_answer) in [
+            (".", true),
+            (r#". + "x""#, true),
+            (". + 1", true),
+            (". + {}", true),
+            (".a", true),
+            (".[0]", true),
+            (".[-1]", true),
+            ("tostring", true),
+            (r#"type == "string""#, true),
+            (r#". == "User7""#, true),
+            ("length", false),
+            (".[0:3]", false),
+            ("[.]", false),
         ] {
             let expr = parse(filter).expect("filter parses");
             for value in &scalars {
                 let Some(door) = eval_owned_scalar_fast::<YqSemantics>(&expr, value) else {
+                    assert!(!door_must_answer, "{filter} on {value:?}: declined");
                     continue;
                 };
-                answered += 1;
                 let doc = alloc::rc::Rc::new(
                     value
                         .reindexed_without_provenance::<JqSemantics>()
@@ -122231,8 +122257,6 @@ mod touched_edge_cases_2999 {
                 assert_eq!(render(door), render(oracle), "{filter} on {value:?}");
             }
         }
-        // The door is not vacuous: the shapes it exists for are answered.
-        assert!(answered >= 40, "{answered}");
         // A container, and a filter outside the fast path, are declined.
         let object = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
         let expr = parse(".a").expect("filter parses");
