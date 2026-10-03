@@ -51340,65 +51340,67 @@ fn fold_step_each<S: EvalSemantics>(
     reentry: Reentry,
     on_update: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
-    match owned_arith_accumulator_shape::<S>(expr) {
-        Some((op, rhs)) => match arith_combine::<S>(op, state, rhs) {
-            Ok(v) => match on_update(v) {
-                Demand::Continue => Flow::Exhausted,
-                Demand::Stop => Flow::Stopped { pending: None },
-            },
-            Err(_) if optional => Flow::Exhausted,
-            Err(e) => Flow::Escaped(Control::Error(e)),
+    // #3036/#3122: `reentry` is `Proven` because `reduce_forks`/
+    // `foreach_forks` ran [`demote_for_reentry`] on the fold's own UPDATE
+    // once, against `Owned`, before any element was substituted into it
+    // -- unless [`FoldOperand::against`] found this step's accumulator
+    // is still a binding's node (#3181), and handed back the UPDATE as
+    // written with `Reentry::REBUILT`, which `eval_each_owned` refines to
+    // that witness. `substitute_foreach_steps` substitutes the loop variable
+    // through `substitute_vars`, which replaces `Expr::Var` with the value's
+    // own literal (`owned_to_expr`) and never with a marker, so the
+    // per-element copy needs no walk of its own (that walk was +3% on a
+    // tight `reduce` over 24k elements, 7950X). What the step itself runs,
+    // and under what gate, is [`owned_update_step`]'s.
+    match owned_update_step::<S>(expr, state) {
+        OwnedStep::Handled(Ok(value)) => match on_update(value) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
         },
-        // #3036/#3122: `reentry` is `Proven` because `reduce_forks`/
-        // `foreach_forks` ran [`demote_for_reentry`] on the fold's own UPDATE
-        // once, against `Owned`, before any element was substituted into it
-        // -- unless [`FoldOperand::against`] found this step's accumulator
-        // is still a binding's node (#3181), and handed back the UPDATE as
-        // written with `Reentry::REBUILT`, which `eval_each_owned` refines to
-        // that witness. `substitute_foreach_steps`
-        // substitutes the loop variable through `substitute_vars`, which
-        // replaces `Expr::Var` with the value's own literal (`owned_to_expr`)
-        // and never with a marker (a node-less `Snapshot` marker *would* be
-        // demotable; the tracked substitution belongs to the resolver's own
-        // folds, which never come through here) nor with one of
-        // `may_enter_resolver_node`'s shapes, so the per-element copy needs
-        // no walk of its own (that walk was +3% on a tight `reduce` over 24k
-        // elements, 7950X).
-        //
-        // #3241: while the #2889 embed table is live (the fold runs inside an
-        // `as` binding that holds a document node) only the assignment half of
-        // the owned step runs; `to_entries`/`from_entries` stay on the bridge,
-        // where [`eval_owned_relocating_fold`] owns them. The assignment step
-        // is sound under the table because it reads neither the table nor a
-        // marker (its right side and keys must be [`closed_expr_to_owned`],
-        // and an `Expr::TrackedVar` is never closed -- so #3181's witnessed
-        // UPDATE, which always carries one, declines to the route above), and
-        // it never writes a container the table registered in place: a
-        // registered container has at least two strong references (the
-        // table's own and the binding's), so `Rc::make_mut` copies it first
-        // and the entry keeps witnessing the unmodified original. The copy
-        // shares its untouched children, as jq's `jv_setpath` does, so a later
-        // `path()`/write through the binding can still see them as that
-        // binding's nodes -- a refusal on the bridge, an answer here. yq mode
-        // never populates the table, so this arm is a no-op there.
-        None => {
-            let step = if super::eval_generic::embed_table_active() {
-                try_owned_assign_step::<S>(expr, state)
-            } else {
-                try_eval_owned_step::<S>(expr, state)
-            };
-            match step {
-                OwnedStep::Handled(Ok(value)) => match on_update(value) {
-                    Demand::Continue => Flow::Exhausted,
-                    Demand::Stop => Flow::Stopped { pending: None },
-                },
-                OwnedStep::Handled(Err(_)) if optional => Flow::Exhausted,
-                OwnedStep::Handled(Err(error)) => Flow::Escaped(Control::Error(error)),
-                OwnedStep::Declined(state) => {
-                    eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
-                }
-            }
+        OwnedStep::Handled(Err(_)) if optional => Flow::Exhausted,
+        OwnedStep::Handled(Err(error)) => Flow::Escaped(Control::Error(error)),
+        OwnedStep::Declined(state) => {
+            eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
         }
+    }
+}
+
+/// The by-value step a `reduce`/`foreach` UPDATE or an `until`/`while` `update`
+/// takes on the state its loop owns (#2157, #3138, #3241, #3674): the
+/// accumulator shapes (`. + <literal>`), the assignment operators, and the
+/// relocating folds, answered on the owned tree and consuming `state` so a
+/// unique copy-on-write container is edited in place rather than serialized
+/// and re-indexed for the bridge every step. A shape it does not answer hands
+/// the untouched state back as [`OwnedStep::Declined`].
+///
+/// One definition for the three drivers that take it ([`fold_step_each`],
+/// `until_step`/`while_step` through [`LoopOperand::advance_owned`], and
+/// `eval_generic`'s `loop_step_generic`), so the gate below cannot drift
+/// between them.
+///
+/// While the #2889 embed table is live (the loop runs inside an `as` binding
+/// that holds a document node) only the assignment half of the step runs;
+/// `to_entries`/`from_entries` stay on the bridge, where
+/// [`eval_owned_relocating_fold`] owns them. The assignment step is sound
+/// under the table because it reads neither the table nor a marker (its right
+/// side and keys must be [`closed_expr_to_owned`], and an `Expr::TrackedVar`
+/// is never closed -- so #3181's witnessed UPDATE, which always carries one,
+/// declines to the route above), and it never writes a container the table
+/// registered in place: a registered container has at least two strong
+/// references (the table's own and the binding's), so `Rc::make_mut` copies it
+/// first and the entry keeps witnessing the unmodified original. The copy
+/// shares its untouched children, as jq's `jv_setpath` does, so a later
+/// `path()`/write through the binding can still see them as that binding's
+/// nodes -- a refusal on the bridge, an answer here. yq mode never populates
+/// the table, so this gate is a no-op there.
+#[inline(always)]
+pub(crate) fn owned_update_step<S: EvalSemantics>(expr: &Expr, state: OwnedValue) -> OwnedStep {
+    match owned_arith_accumulator_shape::<S>(expr) {
+        Some((op, rhs)) => OwnedStep::Handled(arith_combine::<S>(op, state, rhs)),
+        None if super::eval_generic::embed_table_active() => {
+            try_owned_assign_step::<S>(expr, state)
+        }
+        None => try_eval_owned_step::<S>(expr, state),
     }
 }
 
@@ -54343,6 +54345,16 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     finish_fork(outputs, result.err(), optional)
 }
 
+/// What [`LoopOperand::advance_owned`] did with one round's state.
+enum OwnedRound {
+    /// The step answered: the next state.
+    Next(OwnedValue),
+    /// The step raised an error `optional` suppresses: this branch ends.
+    Done,
+    /// The step does not answer this shape: the state, untouched.
+    Declined(OwnedValue),
+}
+
 /// A static `until`/`while` operand (`cond`/`update`) alongside its
 /// [`demote_for_reentry`] (against `Owned`) twin, computed once by `eval_until`/
 /// `eval_while` (#3036 review) instead of re-walked every step -- bundled
@@ -54401,6 +54413,34 @@ impl<'e> LoopOperand<'e> {
         match abort.resume(flow, direct_pattern_retry(expr)) {
             Flow::Escaped(control) => Err(control),
             Flow::Exhausted | Flow::Stopped { .. } => Ok(()),
+        }
+    }
+
+    /// One round's `update` over a state the loop owns, by value (#3674): the
+    /// step a `reduce`/`foreach` UPDATE takes ([`owned_update_step`]), so a
+    /// shape it answers (`.i += 1`, `. + [x]`, the relocating folds) edits the
+    /// state's copy-on-write top level in place instead of serializing the
+    /// whole state and re-indexing it for the bridge every round. Anything else
+    /// hands the untouched state back for [`Self::fork`]. `while` emits the
+    /// state before stepping it, so that second reference makes the step copy
+    /// the top-level container once per round: O(its width), never the
+    /// children it shares.
+    ///
+    /// An error the step raises is suppressed under `optional` by
+    /// [`suppresses`], as `finish_fork` would have, so a resource-limit or
+    /// decode failure still escapes.
+    fn advance_owned<S: EvalSemantics>(
+        &self,
+        state: OwnedValue,
+        optional: bool,
+        ambient: bool,
+    ) -> Result<OwnedRound, Control> {
+        let expr = if ambient { self.expr } else { self.demoted };
+        match owned_update_step::<S>(expr, state) {
+            OwnedStep::Handled(Ok(next)) => Ok(OwnedRound::Next(next)),
+            OwnedStep::Handled(Err(error)) if suppresses(&error, optional) => Ok(OwnedRound::Done),
+            OwnedStep::Handled(Err(error)) => Err(Control::Error(error)),
+            OwnedStep::Declined(state) => Ok(OwnedRound::Declined(state)),
         }
     }
 
@@ -54498,6 +54538,16 @@ fn until_step<S: EvalSemantics>(
                 return update.drive_each::<S>(&state, optional, ambient, &mut |next| {
                     until_step::<S>(cond, update, next, optional, outputs, budget, false)
                 });
+            }
+            // #3674: the single-output step on a state this branch owns.
+            match update.advance_owned::<S>(state, optional, ambient)? {
+                OwnedRound::Next(next) => {
+                    state = next;
+                    ambient = false;
+                    continue;
+                }
+                OwnedRound::Done => return Ok(()),
+                OwnedRound::Declined(declined) => state = declined,
             }
             let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {
@@ -54663,6 +54713,16 @@ fn while_step<S: EvalSemantics>(
                 return update.drive_each::<S>(&state, optional, ambient, &mut |next| {
                     while_step::<S>(cond, update, next, optional, outputs, budget, false)
                 });
+            }
+            // #3674: see [`until_step`].
+            match update.advance_owned::<S>(state, optional, ambient)? {
+                OwnedRound::Next(next) => {
+                    state = next;
+                    ambient = false;
+                    continue;
+                }
+                OwnedRound::Done => return Ok(()),
+                OwnedRound::Declined(declined) => state = declined,
             }
             let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {

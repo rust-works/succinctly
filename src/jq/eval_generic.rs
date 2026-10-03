@@ -14148,26 +14148,28 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
             // The single continuing branch owns its state after emission.
             // Consume eligible updates here, so changing `.i` need not
             // retain another owner of an unchanged long-literal sibling.
-            if !embed_table_active() {
-                state = match state {
-                    LoopState::Owned(owned) => {
-                        match crate::jq::eval::try_eval_owned_step::<S>(update, owned) {
-                            crate::jq::eval::OwnedStep::Handled(Ok(next)) => {
-                                state = LoopState::Owned(next);
-                                continue;
-                            }
-                            crate::jq::eval::OwnedStep::Handled(Err(_)) if optional => {
-                                return Ok(Demand::Continue);
-                            }
-                            crate::jq::eval::OwnedStep::Handled(Err(error)) => {
-                                return Err(Control::Error(error));
-                            }
-                            crate::jq::eval::OwnedStep::Declined(owned) => LoopState::Owned(owned),
+            // The step and its embed-table gate are `owned_update_step`'s,
+            // the one `reduce`/`foreach` and `eval.rs`'s loops take (#3674).
+            state = match state {
+                LoopState::Owned(owned) => {
+                    match crate::jq::eval::owned_update_step::<S>(update, owned) {
+                        crate::jq::eval::OwnedStep::Handled(Ok(next)) => {
+                            state = LoopState::Owned(next);
+                            continue;
                         }
+                        crate::jq::eval::OwnedStep::Handled(Err(error))
+                            if crate::jq::eval::suppresses(&error, optional) =>
+                        {
+                            return Ok(Demand::Continue);
+                        }
+                        crate::jq::eval::OwnedStep::Handled(Err(error)) => {
+                            return Err(Control::Error(error));
+                        }
+                        crate::jq::eval::OwnedStep::Declined(owned) => LoopState::Owned(owned),
                     }
-                    document => document,
-                };
-            }
+                }
+                document => document,
+            };
             let (mut next, update_control) = state.fork::<S>(update, optional);
             if update_control.is_none() && next.len() == 1 {
                 state = next.pop().expect("one update output");
@@ -41861,6 +41863,120 @@ mod tests {
             out.iter().map(OwnedValue::to_json).collect(),
             after - before,
         )
+    }
+
+    /// #3674: an `until`/`while` whose state is a computed value steps its
+    /// `update` on the owned tree instead of serializing the whole state and
+    /// re-indexing it for the bridge every round. The reindex count is what
+    /// pins that: it was one per round (100 rounds over a 1.4 MB state cost
+    /// 286 ms, jq 15 ms) and is now flat in the round count. The outputs are
+    /// jq 1.7.1's (captured live).
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
+    fn test_until_while_owned_update_needs_no_reindex_per_round_3674() {
+        let doc = r#"{"a":[1,2,3],"o":{"p":1}}"#;
+        for (query, want) in [
+            ("{i:0, d:.} | until(.i >= 50; .i += 1) | .i", vec!["50"]),
+            ("{i:0, d:.} | until(.i >= 50; .i |= . + 1) | .i", vec!["50"]),
+            (
+                "{i:0, d:.} | [while(.i < 50; .i += 1)] | length",
+                vec!["50"],
+            ),
+            (
+                "{i:0, d:.} | until(.i >= 50; .i += 1) | .d.a",
+                vec!["[1,2,3]"],
+            ),
+            // The accumulator shapes: `. + <literal>`.
+            // (The condition is a comparison the owned evaluator answers; a
+            // `length` condition still bridges, which this change leaves.)
+            ("[] | until(.[199] == 1; . + [1]) | length", vec!["200"]),
+            (
+                r#"{n:0,s:""} | until(.n >= 200; .n += 1 | .s += "x") | .s | length"#,
+                vec!["200"],
+            ),
+            // The relocating folds, which `fold_step_each` also takes.
+            (
+                "{a:1} | [limit(3; while(true; to_entries | from_entries))] | length",
+                vec!["3"],
+            ),
+            // Under an `as` binding the #2889 embed table is live and only the
+            // assignment half of the step runs.
+            (
+                ". as $d | {i:0, d:$d} | until(.i >= 50; .i += 1) | .d.o",
+                vec![r#"{"p":1}"#],
+            ),
+            (
+                ". as $d | {i:0, d:$d} | [while(.i < 50; .i += 1)] | length",
+                vec!["50"],
+            ),
+        ] {
+            let (got, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+            assert!(
+                reindexes <= 3,
+                "{query}: {reindexes} reindexes over 50 rounds"
+            );
+        }
+        // A loop that starts on the document itself, under an `as` binding, turns
+        // computed after its first round; the loop in `loop_step_generic` then runs
+        // its steps on the owned tree too, with the embed table live.
+        for (query, want) in [
+            (". as $d | until(.i >= 50; .i += 1) | .i", vec!["50"]),
+            (". as $d | [while(.i < 50; .i += 1)] | length", vec!["50"]),
+        ] {
+            let (got, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+            assert!(
+                reindexes <= 3,
+                "{query}: {reindexes} reindexes over 50 rounds"
+            );
+        }
+        // The soundness the assignment step under the table rests on: a node the
+        // binding holds is never copied into the state, so its identity survives
+        // the loop (`path($d)`-style reads answer as jq does).
+        for (query, want) in [
+            (
+                ". as $d | {i:0} | until(.i >= 2; .i += 1 | .e = $d) | path(.e | $d)",
+                vec![r#"["e"]"#],
+            ),
+            (
+                ". as $d | {i:0} | until(.i >= 2; .i += 1 | .e = $d) | .e == $d",
+                vec!["true"],
+            ),
+        ] {
+            let (got, _) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+        }
+        // What the step does not answer keeps its route, and its answers.
+        for (query, want) in [
+            // A right side that reads the state is not a closed step: it keeps
+            // the bridge, and its answer.
+            ("{i:0} | until(.i >= 5; .i = .i + 1) | .i", vec!["5"]),
+            // A forking update: every output runs its own branch.
+            (
+                "{i:0} | [until(.i >= 3; .i += 1, .i += 2)] | length",
+                vec!["5"],
+            ),
+            // No output: the branch ends.
+            ("{i:0} | [until(.i >= 3; empty)]", vec!["[]"]),
+            // An arithmetic failure declines the step and errors on the bridge's
+            // route, where `try` catches it like any other.
+            (
+                r#"{i:0} | try until(.i >= 3; .i += "x") catch ."#,
+                vec![r#""number (0) and string (\"x\") cannot be added""#],
+            ),
+            // The one error the step itself raises: `from_entries` on a non-entry,
+            // suppressed by `?` as it always was.
+            (
+                "[1] | [until(type == \"object\"; from_entries)?]",
+                vec!["[]"],
+            ),
+            // `?` on the loop suppresses the same error.
+            (r#"[{i:0} | until(.i >= 3; .i += "x")?]"#, vec!["[]"]),
+        ] {
+            let (got, _) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+        }
     }
 
     /// #3477: counting a bound array needs no index over it. Binding a

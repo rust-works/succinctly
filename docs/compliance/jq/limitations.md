@@ -7552,12 +7552,21 @@ that spread is code placement, not cost: the layout band
 
 What it does not change: a fold under an `as` whose UPDATE is not an owned
 assignment (`to_entries`, `from_entries`, `if`, one holding a marker) keeps the
-bridge. `until`/`while` read the same with and without the binding (0.28 s for
-100 steps over a 1.4 MB `{i:0, d:$d}` state on the M4 Pro, jq 0.017 s, against
-21.9 ms for a `reduce` over the same state), so what they pay per step is not
-the embed-table guard in `loop_step_generic` and this change does not touch it.
-The cause is not isolated; it is tracked in
-[#3674](https://github.com/rust-works/succinctly/issues/3674).
+bridge. `until`/`while` paid per step for a different reason, which
+[#3674](https://github.com/rust-works/succinctly/issues/3674) fixed: their
+`eval.rs` drivers ran every round's `update` through the re-index bridge
+(0.28 s for 100 steps over a 1.4 MB `{i:0, d:$d}` state on the M4 Pro, jq
+0.017 s, against 21.9 ms for a `reduce` over the same state), with or without
+the binding. They now take the same owned step as a `reduce`/`foreach`
+(`owned_update_step`, one definition for the folds, both loop drivers and
+`loop_step_generic`), under the same embed-table gate, and are flat in the step
+count: the same loop is 22 ms on the M4 Pro and 37 ms on the 7950X, which is
+those boxes' process floor for that input. What the loops still bridge per
+round: a condition `eval_owned_pure` does not answer (a `length`, tracked in
+[#3697](https://github.com/rust-works/succinctly/issues/3697)), an update that
+is not an owned step (a right side that reads the state, `.i = .i + 1`; a pipe
+with one such stage), and a `while`'s emitted copy makes its step copy the
+state's top-level container once per round.
 
 ### `while`/`until`'s own step budget (#534/#2087): the identical bug #2079 already fixed for `reduce`/`foreach`
 
