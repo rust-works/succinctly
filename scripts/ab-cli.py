@@ -172,15 +172,38 @@ def machine_warnings():
         if load1 > 1.0:
             warnings.append(f"1-minute load average is {load1:.2f}")
     # `claude` deliberately excluded: Claude Code's own background helper
-    # (`--chrome-native-host`) matches this pattern, sleeping, on any machine with the
+    # (`--chrome-native-host`) matched the old pattern, sleeping, on any machine with the
     # CLI installed — that fired on every run regardless of load (#1640). Real build
     # tools are a reliable signal on their own; a concurrent agent that's actually
     # compiling shows up as `cargo`/`rustc` here too.
-    busy = run_text(["pgrep", "-fl", "cargo|rustc|criterion"])
-    if busy.strip():
+    busy = busy_processes()
+    if busy:
         warnings.append("build or benchmark processes are running:\n    "
-                        + "\n    ".join(busy.strip().splitlines()[:5]))
+                        + "\n    ".join(busy[:5]))
     return warnings
+
+
+# What `cargo bench` runs is `target/<profile>/deps/<name>-<hash> --bench` (checked with a
+# bench target that only sleeps): the command line has neither `cargo` nor `rustc` in it,
+# so the parent `cargo` and `rustc` are matched by process name and the bench binary by
+# that shape.
+BUSY_PROCESS_NAMES = ("cargo", "rustc")
+BUSY_BENCH_COMMAND = r"/deps/[^ /]+ --bench( |$)"
+
+
+def busy_processes():
+    """`pgrep -l` lines for every build or benchmark process on the machine.
+
+    Matches the process, not any command line that mentions a build tool: `pgrep -fl
+    "cargo|rustc|criterion"` also matched every process whose path contains `.cargo/`
+    (anything `cargo install`ed, such as `omni-dev claude-wrap`), so an idle machine
+    read as busy and the advice was `--force`, which is also what hides a real build
+    (#3695: 66 matches, 2 real)."""
+    lines = []
+    for name in BUSY_PROCESS_NAMES:
+        lines += run_text(["pgrep", "-xl", name]).splitlines()
+    lines += run_text(["pgrep", "-fl", BUSY_BENCH_COMMAND]).splitlines()
+    return [ln for ln in lines if ln.strip()]
 
 
 def run_text(cmd):
