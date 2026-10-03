@@ -13,13 +13,15 @@ The comparison has to be per binary: llvm-cov merges identical functions across
 the objects of one invocation, so a function that mismatches in one binary but
 matches in another disappears from the combined diff.
 
-Run a coverage pass first, with the arguments CI uses, then this script with
-the same feature arguments:
+Run a coverage pass first, then this script from the same checkout with no
+arguments (it reads the objects, profile and ignore regex back from
+`cargo llvm-cov report`, so it follows whatever the pass was run with):
 
     cargo llvm-cov --no-report --features cli,simd,regex,serde --workspace
-    scripts/coverage-mismatched-functions.py --features cli,simd,regex,serde
+    scripts/coverage-mismatched-functions.py
 
 Needs `cargo-llvm-cov`, the `llvm-tools` rustup component, and `rustc`.
+`LLVM_COV` and `LLVM_PROFDATA` are honoured, as cargo-llvm-cov honours them.
 Standard library only.
 """
 
@@ -38,25 +40,33 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
-def llvm_tool_dir():
-    """The `bin` directory `cargo llvm-cov` itself uses for llvm-cov/llvm-profdata."""
+def llvm_tool(name):
+    """llvm-cov / llvm-profdata: the environment override cargo-llvm-cov honours,
+    else the rustup `llvm-tools` copy it falls back to."""
+    override = os.environ.get(name.upper().replace("-", "_"))
+    if override:
+        return override
     sysroot = run(["rustc", "--print", "sysroot"]).stdout.strip()
     host = next(
         line.split(": ", 1)[1]
         for line in run(["rustc", "-vV"]).stdout.splitlines()
         if line.startswith("host: ")
     )
-    return os.path.join(sysroot, "lib", "rustlib", host, "bin")
+    return os.path.join(sysroot, "lib", "rustlib", host, "bin", name)
 
 
-def report_invocation(args):
-    """The exact `llvm-cov report` command cargo-llvm-cov runs: objects, profile, ignore regex."""
-    cmd = ["cargo", "llvm-cov", "report", "--summary-only", "-v"]
-    out = run(cmd)
+def report_invocation():
+    """The exact `llvm-cov report` command cargo-llvm-cov runs: objects, profile, ignore regex.
+
+    Read back from its verbose output rather than rebuilt here, so the object list
+    cannot drift from what the real report uses."""
+    out = run(["cargo", "llvm-cov", "report", "--summary-only", "-v"])
     for line in out.stderr.splitlines():
-        if "llvm-cov report " in line and "-object" in line:
-            return shlex.split(line.split("`")[1])
-    sys.exit("could not find cargo-llvm-cov's llvm-cov invocation; run a coverage pass first")
+        m = re.search(r"Running `(.*llvm-cov report .*-object.*)`", line)
+        if m:
+            return shlex.split(m.group(1))
+    sys.exit("could not find cargo-llvm-cov's llvm-cov invocation in its -v output; "
+             "run `cargo llvm-cov --no-report ...` first.\n" + out.stderr[-500:])
 
 
 def parse_invocation(argv):
@@ -78,7 +88,7 @@ def parse_invocation(argv):
     return objects, profile, ignore
 
 
-def empty_profile(tools, tmp):
+def empty_profile(tmp):
     """A valid profile that names none of the functions under test: a different program's."""
     src = os.path.join(tmp, "d.rs")
     with open(src, "w") as f:
@@ -89,70 +99,84 @@ def empty_profile(tools, tmp):
     raw = os.path.join(tmp, "d.profraw")
     subprocess.run([exe], check=True, capture_output=True, env={**os.environ, "LLVM_PROFILE_FILE": raw})
     out = os.path.join(tmp, "empty.profdata")
-    subprocess.run([os.path.join(tools, "llvm-profdata"), "merge", "-o", out, raw], check=True)
+    subprocess.run([llvm_tool("llvm-profdata"), "merge", "-o", out, raw], check=True)
     return out
 
 
-def functions(tools, obj, profile, ignore):
-    out = run([os.path.join(tools, "llvm-cov"), "export", "-format=text", "-skip-expansions",
-               f"-ignore-filename-regex={ignore}", f"-instr-profile={profile}", obj])
-    data = json.loads(out.stdout)["data"][0]["functions"]
+def export(obj, profile, ignore, *flags):
+    cmd = [llvm_tool("llvm-cov"), "export", "-format=text", *flags, f"-instr-profile={profile}"]
+    if ignore:
+        cmd.append(f"-ignore-filename-regex={ignore}")
+    out = run(cmd + [obj])
+    # A binary whose every function the ignore regex filters out (an integration test
+    # with no library code of its own) has nothing to export; that is zero functions,
+    # not a failure.
+    if out.returncode != 0 and "no coverage data found" in out.stderr:
+        out.stdout = '{"data": [{"functions": []}]}'
+    elif out.returncode != 0:
+        sys.exit(f"llvm-cov export failed on {obj} (exit {out.returncode}):\n{out.stderr[-500:]}")
+    return out
+
+
+def functions(obj, profile, ignore):
+    data = json.loads(export(obj, profile, ignore, "-skip-expansions").stdout)["data"][0]["functions"]
     return collections.Counter((f["name"], (f["filenames"] or [""])[0]) for f in data)
 
 
-def mismatch_count(tools, obj, profile, ignore):
-    out = run([os.path.join(tools, "llvm-cov"), "export", "-format=text", "-summary-only",
-               f"-ignore-filename-regex={ignore}", f"-instr-profile={profile}", obj])
-    m = re.search(r"(\d+) functions have mismatched data", out.stderr)
+def mismatch_count(obj, profile, ignore):
+    m = re.search(r"(\d+) functions have mismatched data",
+                  export(obj, profile, ignore, "-summary-only").stderr)
     return int(m.group(1)) if m else 0
 
 
 def demangle(name):
-    """Best-effort path from a v0 Rust symbol: the length-prefixed identifiers, in order."""
-    # Drop the crate disambiguators (`Cs2mXM1HRIz6G_`) so their base-62 digits
-    # are not read as a length prefix.
-    name = re.sub(r"Cs[0-9A-Za-z]*_", "C", name)
+    """Best-effort path from a v0 Rust symbol: its length-prefixed identifiers, in order.
+
+    Walks the symbol left to right, consuming each identifier whole (so nothing
+    inside one is mistaken for syntax) and each crate disambiguator `s<base62>_`."""
     parts, i = [], 0
     while i < len(name):
-        m = re.match(r"(\d+)", name[i:])
-        if not m:
-            i += 1
+        if name[i] == "C" and name[i + 1:i + 2] == "s":
+            end = name.find("_", i + 2)
+            i = end + 1 if end != -1 else len(name)
             continue
-        n = int(m.group(1))
-        start = i + len(m.group(1))
-        ident = name[start:start + n]
-        if len(ident) == n and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", ident):
-            parts.append(ident)
-            i = start + n
-        else:
-            i += 1
+        m = re.match(r"\d+", name[i:])
+        if m:
+            n = int(m.group())
+            start = i + len(m.group())
+            ident = name[start:start + n]
+            if len(ident) == n and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", ident):
+                parts.append(ident)
+                i = start + n
+                continue
+        i += 1
     return "::".join(parts) if parts else name
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--features", help="accepted for symmetry with the coverage run; unused")
-    args = ap.parse_args()
-    tools = llvm_tool_dir()
-    objects, profile, ignore = parse_invocation(report_invocation(args))
+    argparse.ArgumentParser(description=__doc__.split("\n\n")[0]).parse_args()
+    objects, profile, ignore = parse_invocation(report_invocation())
     if not objects or not profile:
         sys.exit("no objects or profile found; run `cargo llvm-cov --no-report ...` first")
-    ignore = ignore or ""
     with tempfile.TemporaryDirectory() as tmp:
-        empty = empty_profile(tools, tmp)
+        empty = empty_profile(tmp)
+        # The premise: against a profile that names none of the functions, nothing mismatches.
+        if mismatch_count(objects[0], empty, ignore):
+            sys.exit("the stand-in empty profile reports mismatches; the diff would be unsound")
         per_binary = {}
-        total = 0
-        for obj in objects:
-            n = mismatch_count(tools, obj, profile, ignore)
-            total += n
-            if n:
-                per_binary[obj] = n
+        for n, obj in enumerate(objects, 1):
+            print(f"\rcounting {n}/{len(objects)}", end="", file=sys.stderr, flush=True)
+            count = mismatch_count(obj, profile, ignore)
+            if count:
+                per_binary[obj] = count
+        print(file=sys.stderr)
+        total = sum(per_binary.values())
         print(f"{total} mismatched in {len(per_binary)} of {len(objects)} binaries")
         names = collections.Counter()
-        for obj in per_binary:
-            for key, count in (functions(tools, obj, empty, ignore)
-                               - functions(tools, obj, profile, ignore)).items():
-                names[key] += count
+        for n, obj in enumerate(per_binary, 1):
+            print(f"\rnaming {n}/{len(per_binary)}", end="", file=sys.stderr, flush=True)
+            names.update(functions(obj, empty, ignore) - functions(obj, profile, ignore))
+        print(file=sys.stderr)
         for (name, filename), count in names.most_common():
             rel = os.path.relpath(filename) if filename else "?"
             print(f"{count:4d} binaries  {rel}  {demangle(name)}")
