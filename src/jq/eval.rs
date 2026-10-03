@@ -44667,12 +44667,9 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                     }
                                     ResolveFlow::Exhausted => {}
                                 }
-                            } else {
-                                if sink(foreach_emitted_branch(update_branch)) == Demand::Stop {
-                                    outcome =
-                                        Some(fold_stop_outcome(is_last, &mut downstream_stopped));
-                                    return Demand::Stop;
-                                }
+                            } else if sink(foreach_emitted_branch(update_branch)) == Demand::Stop {
+                                outcome = Some(fold_stop_outcome(is_last, &mut downstream_stopped));
+                                return Demand::Stop;
                             }
                             Demand::Continue
                         };
