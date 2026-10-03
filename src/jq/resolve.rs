@@ -700,6 +700,23 @@ pub(crate) struct ScanResult<T> {
     pub(crate) run: Option<(u32, Option<String>)>,
 }
 
+// Scope entries the lookups have examined on this thread -- test-only, so a
+// test can count work instead of timing it (#3455, as #3307's `INSTALL_VISITS`).
+#[cfg(test)]
+thread_local! {
+    static SCOPE_PROBES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Count one scope entry examined (see `SCOPE_PROBES`); nothing in a real build.
+#[cfg(test)]
+fn note_scope_probe() {
+    SCOPE_PROBES.with(|n| n.set(n.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_scope_probe() {}
+
 /// The one place the module-scope floor is applied.
 ///
 /// Walks `scope` innermost-first, handing each ordinary entry to `probe` and
@@ -738,6 +755,7 @@ fn scan_scope<'a, E, T>(
     // point, so its defs are visible and its opener is not a floor.
     let mut closed = 0usize;
     for entry in scope.iter().rev() {
+        note_scope_probe();
         match ModuleRun::parse(name_of(entry)) {
             Some(RunMarker::End { .. }) => closed += 1,
             Some(RunMarker::Begin { id, alias }) => {
@@ -894,14 +912,20 @@ impl<T: Copy> FnScope<T> {
             if !matches!(entry.run, RunEntry::Plain) {
                 continue;
             }
+            // Every plain entry was listed under its name and arity when it was
+            // pushed, and entries leave in reverse order, so this entry's
+            // position is the last of its list. A mismatch means the index and
+            // the stack have drifted, which a lookup would turn into a wrong
+            // scope: stop here rather than carry on from a corrupt index.
             let Some(slots) = self.positions.get_mut(entry.name.as_str()) else {
-                continue; // omni-dev: coverage tolerate-line reason="unreachable by construction: every plain entry was listed under its name when it was pushed"
+                unreachable!("a plain entry is listed under its name"); // omni-dev: coverage tolerate-line reason="unreachable by construction: every plain entry was listed under its name when it was pushed"
             };
-            if let Some(slot) = slots.iter().position(|(a, _)| *a == entry.arity) {
-                slots[slot].1.pop();
-                if slots[slot].1.is_empty() {
-                    slots.swap_remove(slot);
-                }
+            let Some(slot) = slots.iter().position(|(a, _)| *a == entry.arity) else {
+                unreachable!("a plain entry is listed under its arity"); // omni-dev: coverage tolerate-line reason="unreachable by construction: every plain entry was listed under its arity when it was pushed"
+            };
+            slots[slot].1.pop();
+            if slots[slot].1.is_empty() {
+                slots.swap_remove(slot);
             }
             if slots.is_empty() {
                 self.positions.remove(entry.name.as_str());
@@ -913,11 +937,17 @@ impl<T: Copy> FnScope<T> {
     /// if it reaches nothing -- [`scan_scope`]'s answer, from the index.
     /// `crosses_floors` is the same exception it takes (#2955).
     fn lookup(&self, name: &str, arity: usize, crosses_floors: bool) -> ScanResult<T> {
+        note_scope_probe();
         let floor = self.floor();
         let reached = self
             .positions
             .get(name)
-            .and_then(|slots| slots.iter().find(|(a, _)| *a == arity))
+            .and_then(|slots| {
+                slots.iter().find(|(a, _)| {
+                    note_scope_probe();
+                    *a == arity
+                })
+            })
             .and_then(|(_, listed)| listed.last().copied())
             // `map_or(true, ..)`, not `is_none_or`: the crate's MSRV (1.73)
             // predates it (1.82).
@@ -3897,13 +3927,25 @@ mod tests {
 
         /// #3455: [`FnScope::lookup`] answers what the [`scan_scope`] it
         /// replaced answers -- the same entry, and the same open run on a miss
-        /// -- over random histories of pushes (defs at two arities, begin and
+        /// -- over random histories of pushes (defs at three arities, begin and
         /// end markers, link names) and truncations, for every name and arity,
         /// with and without crossing floors. Unbalanced markers are included:
-        /// the stack a lookup sees is not always well bracketed.
+        /// the stack a lookup sees is not always well bracketed. Three seeds,
+        /// over a deliberately small alphabet so shadowing, floors and
+        /// truncation meet constantly.
         #[test]
         fn fn_scope_matches_scan_scope_3455() {
-            let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+            for seed in [
+                0x9E37_79B9_7F4A_7C15_u64,
+                0xD1B5_4A32_D192_ED03,
+                0x2545_F491_4F6C_DD1D,
+            ] {
+                fn_scope_matches_scan_scope_over(seed);
+            }
+        }
+
+        fn fn_scope_matches_scan_scope_over(seed: u64) {
+            let mut state = seed;
             let mut roll = |n: u64| {
                 state ^= state << 13;
                 state ^= state >> 7;
@@ -3932,13 +3974,13 @@ mod tests {
                             3 => ModuleRun::link_name(id, "a"),
                             _ => names[roll(4) as usize].clone(),
                         };
-                        let arity = roll(2) as usize;
+                        let arity = roll(3) as usize;
                         scope.push(name.clone(), arity, step);
                         mirror.push((name, arity, step));
                     }
                     assert_eq!(scope.len(), mirror.len());
                     for name in &names {
-                        for arity in 0..2 {
+                        for arity in 0..3 {
                             for crosses in [false, true] {
                                 let want = scan_scope(
                                     &mirror,
@@ -3958,6 +4000,48 @@ mod tests {
                     }
                 }
             }
+        }
+
+        /// #3455: resolving costs scope work linear in the number of defs,
+        /// counted in entries examined rather than timed. The filter calls the
+        /// *outermost* of `M` defs `M` times, the shape a stack scan pays `M`
+        /// entries for each time; doubling `M` must roughly double the
+        /// entries examined, where the scan it replaced quadrupled them. Both
+        /// passes over the tree (`build_call_graph` and `check`) are counted.
+        ///
+        /// The spine is built def by def, as the runner builds one, and
+        /// resolved on a big stack: `check` recurses once per nested def, and
+        /// the thread this runs on gets only 2 MiB.
+        #[test]
+        fn resolving_many_defs_examines_scope_entries_linearly_3455() {
+            let (p500, p1000, p2000) = std::thread::Builder::new()
+                .stack_size(1 << 30)
+                .spawn(|| {
+                    let probes = |m: usize| {
+                        let calls = alloc::vec!["g0"; m].join(", ");
+                        let mut expr = parse(&format!("[{calls}] | length")).expect("parses");
+                        for i in (0..m).rev() {
+                            expr = Expr::FuncDef {
+                                name: format!("g{i}"),
+                                params: Vec::new(),
+                                body: Box::new(parse(&i.to_string()).expect("parses")),
+                                then: Box::new(expr),
+                                bound: crate::jq::FuncDefBound::default(),
+                            };
+                        }
+                        let before = SCOPE_PROBES.with(core::cell::Cell::get);
+                        assert!(resolve_all(&mut expr).is_empty());
+                        SCOPE_PROBES.with(core::cell::Cell::get) - before
+                    };
+                    (probes(500), probes(1000), probes(2000))
+                })
+                .expect("spawns")
+                .join()
+                .expect("resolves");
+            assert!(
+                p1000 < 3 * p500 && p2000 < 3 * p1000,
+                "probes must grow linearly in the number of defs: {p500} / {p1000} / {p2000}"
+            );
         }
 
         /// #3455: truncating restores what the dropped entries changed -- the

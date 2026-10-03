@@ -1621,6 +1621,13 @@ pub struct FuncDefData {
     /// reduce this to.
     pub params: Vec<Param>,
     /// Function body.
+    ///
+    /// Read it freely, but do not rewrite it in place once
+    /// [`needs_path_context_or_init`](Self::needs_path_context_or_init) may
+    /// have been asked (`Rc::get_mut(..).body = ..`): the remembered answer
+    /// describes the old body. Build a new definition with
+    /// [`FuncDefData::new`] instead, or clone first -- a clone starts with
+    /// nothing remembered.
     pub body: Expr,
     /// Whether `body` needs path context, remembered on first ask.
     needs_path_context: PathContextMemo,
