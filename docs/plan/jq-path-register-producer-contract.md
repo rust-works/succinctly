@@ -177,7 +177,8 @@ P7/P8 follow the same shape: `register_after`'s four-way decision becomes "read 
 
 The producers themselves are as D3 says. `leaf_register(expr, trackable, value)` is `None` /
 `Unmoved(entry)` (`cannot_move_register(expr)`) / `LostAt(entry)`, read once per leaf call and
-only while trackable. The drain arms (`last`, `isempty`, `INDEX`) are `LostAt(entry)` (D5). An
+only while trackable. The drain arms (`last`, `isempty`, `INDEX`) are `LostAt(entry)` (D5), except
+`last(f)` in jq mode, which #3643 promoted to `Unmoved(entry)` (section 5). An
 unchecked `[E]` on a trackable entry is `LostSomewhere`, **not** `LostAt`: that is what `main`
 derives today (`untracked_at_register` was handed `trackable && checked`, so it recorded nothing),
 and `LostAt(entry)` would let `guess_refusal` clear a refusal of a `$x` frozen elsewhere and let a
@@ -291,6 +292,13 @@ Consequences:
   because its source backtracks. It is the one drain producer where promotion to `Unmoved` is
   oracle-backed. It is **not** promoted in B2: B2 is "no behaviour change", and a promotion
   turns a refusal into an answer, which belongs in its own reviewed step with sweep rows.
+  **Promoted by #3643** (jq mode only), at two sites: the `LastExpr`/`LastStream` arm states
+  `Unmoved(entry)` for the leaf (what an `and`/`or` operand reads), and
+  `last_leaves_register_in_place` admits the stage in `resolve_seq_stage`'s
+  `stage_preserves_register` (what a pipe's next stage reads). It is not in
+  `cannot_move_register`, whose "navigates nothing" reading `f` breaks. Pinned by
+  `test_path_register_last_f_does_not_move_it_3643`; the sweep grid gained `last(f)` operands and
+  the `first(f)`/`nth`/`limit` contrasts.
 - `isempty(g)` is per-branch: it moves the register only when `g` emits (it breaks out of a
   `label` before backtracking). That is D4.4 and is the reason a static `Unmoved` cannot be
   used for it.
@@ -388,8 +396,8 @@ Each step is safe to land on `main` by itself.
 
 ## 9. Open questions for review
 
-1. Should `last(f)` be promoted to `Unmoved` in its own step after B2 (section 5)? Recommended:
-   yes, with sweep rows, after B3.
+1. ~~Should `last(f)` be promoted to `Unmoved` in its own step after B2 (section 5)?~~
+   **Answered: yes**, with sweep rows, after B3 (#3643).
 2. ~~Is `BranchRegister` worth carrying `Cow` for the `Lost*` variants, or is `LostAt` enough
    with an `Rc`?~~ **Answered by B1's measurement** (aarch64 macOS, release layout, throwaway
    test, not committed): `size_of::<PathBranch>()` is **112 bytes before and after B1**
@@ -480,7 +488,7 @@ safe direction, so the grid could not see the mark) and 40 (24 worse) once `sort
 
 Each turns a refusal into an answer and needs its own oracle rows:
 
-- `last(f)` to `Unmoved` (section 5).
+- ~~`last(f)` to `Unmoved` (section 5).~~ Done by #3643.
 - The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
   turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`
   into jq's `[]`. Cheap now, because the producers already say it.

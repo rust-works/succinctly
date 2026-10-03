@@ -51131,3 +51131,22 @@ fn test_yq_jq_extensions_path_foreach_update_by_demand_3507() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3643 promoted `last(f)` to leave jq's path register in place in jq mode
+/// only (ADR-0018: yq has no oracle for it). With the jq-only surface enabled,
+/// yq mode still refuses `del(. as $x | last(.a) | $x.k)` exactly as before.
+#[test]
+fn yq_last_f_does_not_leave_the_path_register_in_place_3643() -> Result<()> {
+    let yaml = "a:\n  b: 1\nk: 2\n";
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        "del(. as $x | last(.a) | $x.k)",
+        yaml,
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "stderr {stderr:?}"
+    );
+    Ok(())
+}
