@@ -7586,9 +7586,18 @@ the binding. They now take the same owned step as a `reduce`/`foreach`
 (`owned_update_step`, one definition for the folds, both loop drivers and
 `loop_step_generic`), under the same embed-table gate, and are flat in the step
 count: the same loop is 22 ms on the M4 Pro and 37 ms on the 7950X, which is
-those boxes' process floor for that input. What the loops still bridge per
-round: a condition `eval_owned_pure` does not answer (a `length`, tracked in
-[#3697](https://github.com/rust-works/succinctly/issues/3697)), an update that
+those boxes' process floor for that input. A condition that holds a `length`
+is answered from the same tree since
+[#3697](https://github.com/rust-works/succinctly/issues/3697)
+(`owned_cond_verdict`, the `length` opt-in `select` already takes): it used to
+serialize and index the whole state each round to read one count, and
+`[] | until(length >= 8000; . + [1])` is now 6.0 ms on the M4 Pro and 6.3 ms on
+the 7950X against 701.6 ms and 737.1 ms. What the loops still bridge per
+round: a condition `eval_owned_pure` does not answer (`has`, `keys`, `any`/`all`,
+`tostring`, `startswith`, an array construction, tracked in
+[#3707](https://github.com/rust-works/succinctly/issues/3707); such a condition
+now pays one failed walk of the pure grammar first, 119 instructions per round,
++0.82% on a tiny state), an update that
 is not an owned step (a right side that reads the state, `.i = .i + 1`; a pipe
 with one such stage), and a `while`'s emitted copy makes its step copy the
 state's top-level container once per round.

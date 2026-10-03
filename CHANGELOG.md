@@ -78,9 +78,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the same at 200 steps (86-97% faster on every affected row of both chips, identity gate clean on
   all 18 configurations each). Also covers a loop that starts on the document under an `as` binding
   (`. as $d | until(.users[0].age >= 125; .users[0].age += 1)`), `. + [x]`/`. + "x"` accumulators, and
-  the relocating folds. Unchanged: a `length` condition, a right side that reads the state
-  (`.i = .i + 1`) and a pipe holding one, which still bridge per round (#3697). Output is identical on
-  1,120 generated loop queries and 61 hand-written ones, and to jq 1.7.1 on every row that terminates.
+  the relocating folds. Unchanged: a right side that reads the state (`.i = .i + 1`) and a pipe
+  holding one, which still bridge per round (a `length` condition did too, until #3697). Output is
+  identical on 1,120 generated loop queries and 61 hand-written ones, and to jq 1.7.1 on every row
+  that terminates.
+
+- **jq: an `until`/`while` whose condition holds a `length` is flat in its step count** (#3697).
+  `[] | until(length >= 8000; . + [1])` read its condition through the re-index bridge every round,
+  serializing and indexing the whole state to read one count: O(|state|) per round and quadratic over
+  the loop, which #3674 left behind once the update was owned (about 3.7x per doubling of the round
+  count). Both loop routes, `eval.rs` and the generic driver, now answer the condition from the owned
+  tree through `owned_cond_verdict`, the `length` opt-in `select` already took (#3439);
+  `eval_owned_pure`'s own grammar is unchanged, so `closed_expr_to_owned` and the resolver accept what
+  they did. Growing state, min of 7: 701.6 ms to 6.0 ms at 8,000 rounds on an M4 Pro (-99.1%) and
+  737.1 ms to 6.3 ms on a 7950X, with 2,000 and 4,000 rounds at -89.5%/-89.6% and -97.0%/-97.0%:
+  flat where the base is quadratic. A 100-round loop over a 1.4 / 4.2 / 10.7 MB state with a `length`
+  condition: -92.2% / -93.2% / -93.5% on the M4 Pro and -91.0% / -91.7% / -91.2% on the 7950X
+  (identity gate clean on every configuration). It pays off over a tiny state too, at 80,000 rounds:
+  55.2 ms to 15.1 ms (-72.6%) and 77.6 ms to 17.3 ms (-77.7%). A pure condition (`.i >= N`) is not
+  slower over a large state (within 1%) and over a tiny one runs 2.4% fewer instructions (-4.4% wall on
+  the 7950X, flat on the M4 Pro), because the verdict skips the bridge's wrapper. **The price** is on a
+  condition the pure grammar declines (`has`, `keys`, `any`, `tostring`, `startswith`): it still
+  bridges per round and now pays one failed walk first, 119 instructions per round, +0.82% over a tiny
+  state (cachegrind on the 7950X; +1.0% wall there, +1.4% min on the M4 Pro against a control row that
+  spans +-1%), tracked with the arms themselves in #3707. A `while` that emits its state every round
+  still copies the container once per round, so `[while(length < 4000; . + [1])] | length` is -56.8% and
+  -32.3% rather than flat. Output is identical on 575 generated loop queries against jq 1.7.1, and
+  unchanged from the build before on 30 in yq mode.
 
 - **jq: a `reduce`/`foreach` that assigns into its accumulator is linear inside an `as` binding
   too** (#3241). `. as $d | reduce $d.users[] as $r ({}; .[$r.name] = $r.score)` (and the same with
