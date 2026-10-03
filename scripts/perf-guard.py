@@ -412,14 +412,12 @@ DEFAULT_THRESHOLD = 5.0
 # position or decoded a value before consulting the always-true default;
 # `DocumentCursor::HAS_DELIMITER_CHECKS` (false for YAML) now skips that, and
 # the yq-mode `del(.users[] | select(...))` row walks the document through
-# those helpers (-11.1% x86_64 against the PR's own merge-base, outputs
-# byte-identical; ARM64-Linux can only be read from a CI run, so the override
-# is sized with margin over the x86_64 figure rather than to it). No other
-# row moves (every one reads +0.0% or -0.0%). Remove it once `main` carries the
-# change and the row reads ~0% again.
+# those helpers (-7.8% x86_64 / -5.8% ARM64-Linux against the PR's own
+# merge-base, outputs byte-identical). No other row moves by more than 0.7%.
+# Remove it once `main` carries the change and the row reads ~0% again.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
-    "users_yq_del_select": 20.0,
+    "users_yq_del_select": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
