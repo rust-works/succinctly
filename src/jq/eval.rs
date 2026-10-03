@@ -14647,11 +14647,35 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: map_values(f)
+/// Whether `f` holds a `?//` alternative chain (more than one pattern). Only a
+/// chain can retry after the update's first output (#3524); the retry never
+/// surfaces as a second output through `map_values`' own first-output read, so
+/// the decision comes from the filter's shape (#3666).
+fn has_pattern_alternatives(f: &Expr) -> bool {
+    any_subexpr(f, &mut |e| match e {
+        Expr::AsPattern { patterns, .. }
+        | Expr::Reduce { patterns, .. }
+        | Expr::Foreach { patterns, .. } => patterns.len() > 1,
+        _ => false,
+    })
+}
+
 fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #3666: jq defines `map_values(f)` as `.[] |= f`, so the update's own
+    // reading of `f` -- its first output, and a `?//` retry's raise (#3524) --
+    // is `map_values`'s too. Only the shapes where that `|=` can run on the
+    // value as given; a scalar's `Cannot iterate` and the rest keep this
+    // function's own arms below.
+    if S::TAG == EvalTag::Jq
+        && matches!(value, StandardJson::Object(_) | StandardJson::Array(_))
+        && has_pattern_alternatives(f)
+    {
+        return eval_update::<W, S>(&Expr::Iterate, f, value, optional, false);
+    }
     match value {
         StandardJson::Object(fields) => {
             // #1829: preserve a decode-failure key via its raw source span
@@ -85795,6 +85819,41 @@ mod tests {
             QueryResult::Error(e) => {
                 assert!(e.message.contains("ambiguous"), "message: {}", e.message);
             }
+        );
+    }
+
+    // #3666: jq defines `map_values(f)` as `.[] |= f`, so a `?//` chain's retry
+    // after the first output raises there exactly as in `|=` (#3524). jq 1.7.1,
+    // captured live: `[1,2] | map_values(1 as $x ?// $y | $x)` and the same on
+    // `{"a":1}` raise `Paths must be specified as an array`; a chain whose output
+    // comes from its last alternative, and filters with no pattern, do not.
+    #[test]
+    fn map_values_alt_chain_retry_raises_like_update_3666() {
+        let run = |input: &str, filter: &str| {
+            let expr = parse(filter).unwrap();
+            let input = parse_complete_json(input, false).unwrap();
+            match eval_owned_input::<Vec<u64>, JqSemantics>(&expr, &input, false, Reentry::REBUILT)
+            {
+                QueryResult::Owned(v) => Ok(v.to_json()),
+                QueryResult::Error(e) => Err(e.to_string()),
+                _ => Ok(String::from("<other>")),
+            }
+        };
+        for input in ["[1,2]", r#"{"a":1,"b":2}"#] {
+            let e = run(input, "map_values(1 as $x ?// $y | $x)").unwrap_err();
+            assert!(
+                e.contains("Paths must be specified as an array"),
+                "{input}: {e}"
+            );
+            assert!(
+                run(input, "map_values(1 as [$x] ?// $y | $y)").is_ok(),
+                "{input}"
+            );
+        }
+        assert_eq!(run("[1,2]", "map_values(. + 1)"), Ok("[2,3]".to_string()));
+        assert_eq!(
+            run("[1,2]", "map_values(1 as $x | $x)"),
+            Ok("[1,1]".to_string())
         );
     }
 
