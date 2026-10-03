@@ -7476,10 +7476,86 @@ What it does not change:
   number any closed expression such as `$r.n`): yq's `=` vivifies its targets before the right side
   runs (#2481), classifies no-op writes, and redirects writes through
   aliases (#1351), none of which a direct write reproduces.
-- A fold running inside an `as` binding that holds a document node (the
-  #2889 embed table is active, e.g. `. as $d | reduce ...`) skips the
-  owned step entirely, as before (3.44 s at N=4,000, unchanged); tracked
-  in [#3241](https://github.com/rust-works/succinctly/issues/3241).
+
+### Under an `as` binding ([#3241](https://github.com/rust-works/succinctly/issues/3241))
+
+A fold running inside an `as` binding that holds a document node (the #2889
+embed table is live, e.g. `. as $d | reduce $d.users[] as $r ({}; ...)`)
+used to skip the owned step and take the reindex bridge on every step:
+O(n²), where the same fold outside a binding sits at the process floor.
+`fold_step_each` now runs the *assignment* half of the owned step
+(`try_owned_assign_step`) while the table is live; `to_entries`/`from_entries`
+and the pipes of them stay on the bridge, where `eval_owned_relocating_fold`
+owns them (#3178). That scope is structural: a later arm added to
+`try_eval_owned_step` cannot start running under the table.
+
+It is sound for two reasons, each pinned by a test rather than argued:
+
+- The step reads neither the table nor a marker. Its right side and every key
+  must be `closed_expr_to_owned`, and an `Expr::TrackedVar` is never closed,
+  so the UPDATE #3181's per-step witness hands a step (which always carries a
+  marker) declines to the evaluator's route, exactly as before
+  (`owned_assign_step_declines_markers_3241`).
+- It never writes a container the table registered in place. A registered
+  container has at least two strong references (the table's own and the
+  binding's), so the write's `Rc::make_mut` copies it first and the entry keeps
+  witnessing the unmodified original, even when the accumulator *is* the bound
+  value (INIT `$d`). The copy shares the children the write left alone, as
+  jq's `jv_setpath` does, so a later `path()`/write through the binding still
+  sees them as that binding's own nodes
+  (`owned_assign_step_copies_a_registered_container_3241`).
+
+yq mode is unaffected by construction: `embed_table_push` registers nothing
+unless the program is jq-mode, so the table is never live in a yq program.
+
+Measured (interleaved A/B against the merge-base `45defb786`, min of 5
+reps; the whole-array rows are one run of the base against the min of three of
+the head; `json generate 2mb -p users`, 13,981 records; output identical to
+the merge-base on every row, and to jq 1.7.1 where it was run):
+
+| Filter (after `. as $d \|`)                                          |      N | M4 Pro before | M4 Pro after | 7950X before | 7950X after |
+|----------------------------------------------------------------------|--------|---------------|--------------|--------------|-------------|
+| `reduce $d.users[0:N][] as $r ({}; .[$r.name] = $r.score) \| length` |  1,000 |       85.3 ms |      38.4 ms |     131.4 ms |     67.6 ms |
+| same                                                                 |  2,000 |      224.2 ms |      39.7 ms |     320.7 ms |     68.8 ms |
+| same                                                                 |  4,000 |      783.6 ms |      42.4 ms |   1,085.1 ms |     72.1 ms |
+| same, the whole array                                                | 13,981 |        9.05 s |      0.052 s |      12.63 s |     0.071 s |
+| `.[$r.name] \|= $r.score`                                            |  2,000 |      223.9 ms |      39.4 ms |     320.6 ms |     67.8 ms |
+| `.[$r.name] += $r.score`                                             |  2,000 |      224.0 ms |      40.1 ms |     320.3 ms |     68.0 ms |
+| `.x[$r.name] = $r.score`                                             |  2,000 |      228.0 ms |      40.3 ms |     316.8 ms |     68.8 ms |
+| `.[$r.name] //= $r.score`                                            |  2,000 |      228.6 ms |      39.8 ms |     318.9 ms |     68.8 ms |
+| `.x[$r.name] += 1`, the whole array                                  | 13,981 |        7.43 s |      0.046 s |      11.48 s |     0.065 s |
+| INIT `$d`, `.[$r.name] = $r.score`                                   |    100 |      554.9 ms |      36.8 ms |     779.3 ms |     65.5 ms |
+| INIT `$d`, `.[$r.name] = $r.score`                                   |    400 |        2.10 s |      0.036 s |       2.96 s |     0.067 s |
+| `reduce range(200) as $i ({d: $d}; .n = $i)`                         |    200 |      545.8 ms |      19.1 ms |     769.7 ms |     31.0 ms |
+| `[foreach ...; .[$r.name] = $r.score; length] \| length`             |  2,000 |      226.8 ms |      39.5 ms |     321.2 ms |     68.8 ms |
+| same, the whole array                                                | 13,981 |        9.14 s |      0.052 s |    (not run) |   (not run) |
+
+The "after" columns are flat in N (38-42 ms on the M4 Pro, 68-72 ms on the
+7950X), and over half of that floor is the binding itself:
+`. as $d \| [$d.users[] \| .name] \| length` reads 22.7 ms and 36.1 ms on the
+two chips, against 9.4 ms for `.users \| map(.name) \| length`.
+
+Controls are unchanged. On the M4 Pro the median over eight control rows (the
+non-`as` twin, `. + $r.score`, `. + {(k): v}`, `[$d.users[] \| .name]`,
+`until(.i >= 50000; .i += 1)`, a non-assignment fold under `as`, identity,
+`map`) reads +0.19%, against a harness noise floor of -0.87% (rows -2.1% to
++0.6%). On the 7950X the six of them measured under cachegrind move by
++0.001% to +0.006% in instructions, except a fold under `as` whose UPDATE is
+not an assignment, +0.057%: about 33 instructions per step for the extra tag
+check. Their wall-clock reads up to +9.6% on that chip, but on rows that never
+reach a fold (`.` +3.0% to +4.5%, `.users \| map(.name) \| length` +4.6% to
++9.6%, 21 reps at 2 MB and 10 MB), and a holdout with the new code compiled in
+but never taken (so its behaviour is the merge-base's) reads +0.23% against the
+merge-base. With instruction counts that flat and no executed path in common,
+that spread is code placement, not cost: the layout band
+`docs/guides/benchmarking.md` § 9 describes.
+
+What it does not change: a fold under an `as` whose UPDATE is not an owned
+assignment (`to_entries`, `from_entries`, `if`, one holding a marker) keeps the
+bridge. `until`/`while` read the same with and without the binding (0.28 s for
+100 steps over a 1.4 MB `{i:0, d:$d}` state on the M4 Pro, jq 0.017 s): their
+cost is the loop condition re-indexing a large owned state each step, which
+`loop_step_generic`'s own embed-table guard is not the cause of.
 
 ### `while`/`until`'s own step budget (#534/#2087): the identical bug #2079 already fixed for `reduce`/`foreach`
 
