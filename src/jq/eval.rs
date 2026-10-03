@@ -27103,6 +27103,39 @@ pub fn eval_reindexed_document<'a, S: EvalSemantics>(
     super::eval_generic::with_reindexed_document(doc, || eval::<Vec<u64>, S>(expr, doc.root()))
 }
 
+/// The shapes `eval_owned_fast_path` answers (`.`, `.a`, `.[n]`, `tostring`,
+/// `. + <literal>`, the composite pure comparisons), evaluated straight against
+/// a scalar `input` instead of re-indexing it first (#3479). `None` is "not one
+/// of those shapes": the caller goes on to the ordinary route.
+///
+/// `succinctly yq -R` makes one call per input line on a string a few dozen
+/// bytes long, where serializing the value, building an index over it and
+/// dispatching through the generic evaluator is the whole cost of the call.
+/// The fast path is the evaluation the bridge already runs for these shapes
+/// (`eval_on_owned_over`), so the answers, including the errors and the
+/// yq-mode "a field of a scalar is empty" rule, are the ones the index route
+/// gives; `registered_document_scalar_door_agrees_with_the_index_route_3479`
+/// pins that. A container is left to the ordinary route on purpose: an
+/// index over it is what a navigation or a stream needs, and its clone here
+/// would cost what it saves.
+///
+/// Not a supported entry point.
+#[doc(hidden)]
+#[must_use]
+pub fn eval_owned_scalar_fast<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<QueryResult<'static, Vec<u64>>> {
+    if matches!(input, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+        return None;
+    }
+    Some(match eval_owned_fast_path::<S>(expr, input, false)? {
+        Ok(Some(value)) => QueryResult::Owned(value),
+        Ok(None) => QueryResult::None,
+        Err(error) => QueryResult::Error(error),
+    })
+}
+
 /// Run `f`, turning the generic evaluator's document-nesting panic
 /// ([`assert_nesting_depth`](super::eval_generic::assert_nesting_depth), 256)
 /// into a `decode_failure`-tagged [`QueryResult::Error`] (#3457).
@@ -121310,6 +121343,71 @@ mod touched_edge_cases_2999 {
                 assert!(plain_reindexes >= 2, "{filter} on {line}: unregistered");
             }
         }
+    }
+
+    /// #3479: the scalar door answers a scalar the way the index route does,
+    /// errors and the yq-mode empty field of a scalar included, and declines a
+    /// container and every filter the owned fast path does not know, so the
+    /// caller goes on to the index route for them. The index route
+    /// (`eval_reindexed_document` over the re-indexed value) is the oracle.
+    #[test]
+    fn registered_document_scalar_door_agrees_with_the_index_route_3479() {
+        let render = |result: QueryResult<'_, Vec<u64>>| match result {
+            QueryResult::Error(e) => format!("error: {e}"),
+            other => other
+                .collect_owned::<YqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        let scalars = [
+            OwnedValue::String("User7".into()),
+            OwnedValue::String("a\"b\\c\n".into()),
+            OwnedValue::String(String::new().into()),
+            OwnedValue::Int(7),
+            OwnedValue::Float(1.5),
+            OwnedValue::Bool(true),
+            OwnedValue::Null,
+        ];
+        let mut answered = 0;
+        for filter in [
+            ".",
+            r#". + "x""#,
+            ". + 1",
+            ".a",
+            ".[0]",
+            ".[-1]",
+            "tostring",
+            r#"type == "string""#,
+            r#". == "User7""#,
+            "length",
+            ".[0:3]",
+            "[.]",
+        ] {
+            let expr = parse(filter).expect("filter parses");
+            for value in &scalars {
+                let Some(door) = eval_owned_scalar_fast::<YqSemantics>(&expr, value) else {
+                    continue;
+                };
+                answered += 1;
+                let doc = alloc::rc::Rc::new(
+                    value
+                        .reindexed_without_provenance::<JqSemantics>()
+                        .expect("shallow"),
+                );
+                let oracle = eval_reindexed_document::<YqSemantics>(&expr, &doc);
+                assert_eq!(render(door), render(oracle), "{filter} on {value:?}");
+            }
+        }
+        // The door is not vacuous: the shapes it exists for are answered.
+        assert!(answered >= 40, "{answered}");
+        // A container, and a filter outside the fast path, are declined.
+        let object = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let expr = parse(".a").expect("filter parses");
+        assert!(eval_owned_scalar_fast::<YqSemantics>(&expr, &object).is_none());
+        let expr = parse("ascii_downcase").expect("filter parses");
+        assert!(eval_owned_scalar_fast::<YqSemantics>(&expr, &scalars[0]).is_none());
     }
 
     /// #3479: `path(f)` at the root of a registered document. A `-R` line is a
