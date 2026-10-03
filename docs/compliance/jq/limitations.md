@@ -757,8 +757,9 @@ memory ran out) cannot be told from a long one by looking at it.
 
 `.[]?` is the exception, and is lifted since #3703: jq defines `def recurse: recurse(.[]?);`
 (`jq --debug-dump-disasm` shows the lambda as `EACH_OPT`), so `recurse(.[]?)`, bare `recurse` and `..`
-are one walk, bounded by the document. The cap now comes from the caller's own `f`, and is lifted
-only for `.[]?` (parentheses allowed) with no `cond`.
+are one walk, bounded by the document. The value walker hands exactly that `f` (parentheses allowed,
+no `cond`) to a direct walk of the owned tree, so no cap applies; the path walker takes its cap from
+the caller's own `f` and lifts it for the same shape.
 
 What still diverges, on a 12,001-node document (6,000 one-element arrays), captured from jq 1.7.1:
 
@@ -772,8 +773,9 @@ A write through such a walk stops at the same node, so `recurse(f) |= ...` leave
 it untouched, as the `.[]?` form did before #3703. A silent short answer is not a divergence ADR-0018
 permits, and neither is a hang; raising at the cap, or lifting it where the walk is provably finite,
 is the open question, tracked in [#3716](https://github.com/rust-works/succinctly/issues/3716).
-The explicit `.[]?` spelling is also about 13 times slower per node than `..`
-([#3717](https://github.com/rust-works/succinctly/issues/3717)).
+The path walker still runs `.[]?` at every node, so `path(recurse(.[]?))` takes about 1.8 times
+`path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes of a `users` document,
+[#3717](https://github.com/rust-works/succinctly/issues/3717)).
 
 ## A builtin's argument and a `?//` retry (#3487)
 
