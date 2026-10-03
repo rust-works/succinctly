@@ -146,6 +146,56 @@ fn test_dom_route_path_over_a_scalar_is_empty_like_the_cursor_route_3479() -> Re
     Ok(())
 }
 
+/// #3479: a partial slice over a `-R` line has no native arm, so it bridges,
+/// and the bridge now evaluates over the DOM document the CLI registered
+/// instead of serializing and indexing the line a second time. The evaluator's
+/// own unit row pins that the document is reused; this pins, through the real
+/// runner, that reusing it answers what the cursor route and yq v4.53.3 answer
+/// for the same string: slices count codepoints (`é` and `😀` are one each),
+/// a negative bound counts from the end, and an inverted range is `""`. `-R`
+/// is not a yq flag, so the oracle is each line as a JSON string through the
+/// cursor route, whose answers were captured from yq v4.53.3.
+#[test]
+fn test_raw_input_partial_slice_matches_the_cursor_route_3479() -> Result<()> {
+    let raw_lines = "héllo😀wörld\n{\"id\":7,\"name\":\"User7\"}\n";
+    let as_json = [r#""héllo😀wörld""#, r#""{\"id\":7,\"name\":\"User7\"}""#];
+    for (filter, expected) in [
+        (".[0:3]", [r#""hél""#, r#""{\"i""#]),
+        (".[0:3]?", [r#""hél""#, r#""{\"i""#]),
+        (
+            ".[2:]",
+            [r#""llo😀wörld""#, r#""id\":7,\"name\":\"User7\"}""#],
+        ),
+        (".[:2]", [r#""hé""#, r#""{\"""#]),
+        (".[-3:]", [r#""rld""#, r#""7\"}""#]),
+        (
+            ".[1:-1]",
+            [r#""éllo😀wörl""#, r#""\"id\":7,\"name\":\"User7\"""#],
+        ),
+        (".[5:2]", [r#""""#, r#""""#]),
+    ] {
+        let raw = run_yq_stdin_with_stderr(filter, raw_lines, &["-R", "-o=json", "-I=0"])?;
+        assert_eq!(
+            raw,
+            (
+                format!("{}\n{}\n", expected[0], expected[1]),
+                String::new(),
+                0
+            ),
+            "-R: {filter}"
+        );
+        for (json, want) in as_json.iter().zip(expected) {
+            let cursor = run_yq_stdin_with_stderr(filter, json, &["-p=json", "-o=json", "-I=0"])?;
+            assert_eq!(
+                cursor,
+                (format!("{want}\n"), String::new(), 0),
+                "cursor: {filter} over {json}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: adjacent `?//` is part of an unquoted key, while a
 /// question mark separated from the field by whitespace is a lexer error.
 #[test]
