@@ -21,14 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[..] | length` over 2,000 members on a debug build: 18,055 to 44 (an object), 16,045 to 34 (an
   array), 24,046 to 2,035 (2,000 single-element arrays, where one `Vec` of children per container is
   the floor), against 23, 13 and 13 for the `.[]` twin; in yq, 6,065 to 64 on a 2,000-key mapping.
-  Interleaved wall clock, 1 to 16 MB, min of 7, against the merge-base before #2913 landed: on an M4
-  Pro `[..] | length` is 39% to 62% faster and `[.. | numbers] | length` 16% to 25% on every
-  leaf-heavy shape; on a 7950X 32% to 52% and 9% to 17%. The thin `nested` shape (a 16 MB file is
-  25 ms of parse) has next to no nodes to walk: its instruction count moves -0.2%. **On the 7950X
-  read the instruction count, not the wall clock:** a `length` control row that never reaches this
-  code reads up to 13% slower there with cachegrind `Ir` identical to 21 instructions in 130
-  million (code placement), while `[..] | length` over the 4 MB `arrays` file falls from 5.98 G to
-  2.40 G instructions (-59.9%).
+  Interleaved wall clock against the parent, 4 to 16 MB, min of 7: on an M4 Pro `[..] | length` is
+  44% to 64% faster and `[.. | numbers] | length` 16% to 22% on every leaf-heavy shape; on a 7950X
+  41% to 53% and 10% to 19%. The thin `nested` shape (a 16 MB file is 25 ms of parse) has next to no
+  nodes to walk: its instruction count moves -0.2%. The shared `.[]` step's other callers are
+  unchanged: a path-context walk that swallows the error over 100,000 escaped strings is +0.1% in
+  instructions. **On the 7950X read the instruction count, not the wall clock:** a `length` control
+  row that never reaches this code read between -5% and +13% across two runs of the same two
+  binaries, with cachegrind `Ir` identical to within 73 instructions in 132 million (code placement),
+  while `[..] | length` over the 4 MB `arrays` file falls from 5.73 G to 2.14 G instructions (-62.7%).
 
 - **jq: a `reduce`/`foreach` that assigns into its accumulator is linear inside an `as` binding
   too** (#3241). `. as $d | reduce $d.users[] as $r ({}; .[$r.name] = $r.score)` (and the same with
