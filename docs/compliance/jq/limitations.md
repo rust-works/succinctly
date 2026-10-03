@@ -1067,7 +1067,11 @@ is the revert that established what the other one costs.
    - **A refusal inside a `?//` body is not retried** (`path_alternative_retries`), so
      `del(. as $x ?// $y \| if $x then (.a and .b) else .c end)` on `{"a":1,"c":2}` refuses
      where jq retries past its own path error and answers `{"a":1}`. Before #3289 the by-value
-     evaluation happened to give jq's answer there.
+     evaluation happened to give jq's answer there. #3711 moved `flatten(n)` and `join(s)` to the
+     same side of the line: naming them in `builtin_navigation` (so a `foreach` source stops
+     accepting what jq raises on, #3712) means `del(. as [$q] ?// $q | (flatten(1) and (.a)?))`
+     on `[true]`, which jq answers with the document, now refuses as bare `flatten` and `add`
+     always did. 48 sweep rows, all in the `?//` contexts and all loud refusals.
    - **Pointer identity** is modelled only for `null`/`true`/`false` and a full slice of a
      non-empty array (`.[0:]` is the input itself to jq; an empty slice is a fresh `[]`, never
      identical -- #3494), so `path(.a as $v \| . as $w \| $v \| (($w \| .a)
