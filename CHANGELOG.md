@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq/yq: a program with thousands of top-level defs is linear, not quadratic, in their number**
+  (#3455). A chain of defs that each call the one before through a pipe
+  (`def f_i: f_{i-1} | . + 1`) re-walked every level beneath each one, and a filter naming defs far
+  down the scope scanned the resolver's whole scope stack per call. A def now remembers whether its
+  body needs path context, and the resolver's function scopes are indexed by name. Output is
+  unchanged. On an M5 Pro Max (release, heavily loaded, min of 3): the 12,000-def pipe chain
+  1.70 s to 0.06 s and `[g0, g0, ... x 24000]` 0.88 s to 0.08 s, growth per doubling 3.3-4.5x to
+  1.7-2.0x, jq and yq alike. The index costs about 0.8 us per def, which shows only where the scan
+  was cheapest: calls to the *innermost* def read 0.064 s to 0.084 s at 24,000 defs. The ARM figures
+  are the only ones taken. **For embedders:** `jq::FuncDefData` gained a private field; build one
+  with `FuncDefData::new(name, params, body)` rather than a struct literal.
+
 - **yq: the DOM route (`-R`, `--inplace`, `--slurp`, writes, `--arg`) runs on the converged
   evaluator** (#3479). The hidden `jq::eval_reindexed` is gone. A construct the generic evaluator
   bridges to the owned evaluator now evaluates over the document's existing index instead of
