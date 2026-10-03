@@ -73849,9 +73849,10 @@ mod tests {
     /// loop's update reaches the same node every round and leaves it bound. The
     /// answer is the same either way; only the retained-body count sees it.
     ///
-    /// An `until` update is the shape that reaches this entry with the program's
-    /// own node: a `map` or `reduce` body is re-rooted into a fresh copy first
-    /// (every other loop below retains none, with or without the copy).
+    /// An `until` update is the shape that retains with the program's own node.
+    /// Probed with the guard removed: `until` and `while` retain a body, while
+    /// `map`, `reduce` and `foreach` bodies retain nothing with or without the
+    /// copy (observed, not traced).
     #[cfg(feature = "std")]
     #[test]
     fn test_eval_owned_pipe_keeps_a_lone_def_its_copy_and_the_3148_retention_3715() {
@@ -82213,7 +82214,7 @@ mod tests {
             // Two or more stages: an owned pipe, at least once.
             (".a | tostring", None),
             (".a | . + 1 | tostring | length", None),
-            (r#"[.a, .a] | map(. + 1)"#, None),
+            ("[.a, .a] | map(. + 1)", None),
         ] {
             let parsed = parse(src).unwrap();
             let rest: Vec<Expr> = match parsed.clone() {
