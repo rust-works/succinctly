@@ -88,8 +88,3 @@ yq/*/alt_r/plain/descend     yq_alt_empty_rhs  same, at `..`'s first output (the
 
 # --- jq mode ----------------------------------------------------------------
 
-# `path(foreach (getpath(...)) as $x (null; $x))` raises "Invalid path
-# expression with result ..." where jq 1.7.1 resolves it to the path. Same
-# family as #2388's `foreach` INIT-fork disagreement, and the shape the
-# promoted scratch sweep was originally written to hunt.
-jq/getpath/foreach/path/*   foreach_path   path(foreach getpath(..) as $x ...) raises where jq resolves the path — #2388
