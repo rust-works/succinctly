@@ -1373,14 +1373,102 @@ fn decode_failure_or<V: DocumentValue>(
     optional: bool,
     fallback: impl FnOnce() -> GenericResult<V>,
 ) -> GenericResult<V> {
-    if let Some(reason) = value.string_decode_error() {
-        GenericResult::Error(EvalError::decode_failure(reason))
-    } else if let Some(err) = unreadable_value_error(value) {
+    if let Some(err) = scalar_decode_error(value) {
         GenericResult::Error(err)
     } else if optional {
         GenericResult::None
     } else {
         fallback()
+    }
+}
+
+/// The failure a scalar `value` raises before any type rule gets to speak, or
+/// `None`: an undecodable string, or a value the index could not read (see
+/// [`decode_failure_or`]). Both are decode failures, which `?` never swallows.
+/// One definition for [`decode_failure_or`] and [`swallowed_scalar_iteration`]
+/// (#3689), so the shortcut and the arm it stands in for cannot disagree on
+/// which scalar raises. The path-context walks decide a leaf with
+/// [`scalar_leaf_iteration`] instead (the same string check, then
+/// `validate_cursor`), as the step they replace did; the two agree on every
+/// scalar tried (165 exotic spellings, base and head identical), but they are
+/// two definitions, and the walks' is the one that reads the cursor.
+fn scalar_decode_error<V: DocumentValue>(value: &V) -> Option<EvalError> {
+    value
+        .string_decode_error()
+        .map(EvalError::decode_failure)
+        .or_else(|| unreadable_value_error(value))
+}
+
+/// What a `?`/`try` boundary that swallows `.[]` settles for a scalar `value`
+/// without evaluating `.[]` (#3689), or `None` when it must evaluate. Shared by
+/// both evaluators' boundaries (`try_single_generic`/`each_try_generic` here,
+/// `eval_try`/`each_try` in `eval.rs`), so they are one line each.
+///
+/// `Some(Ok(()))` is the swallowed `Cannot iterate over ...`; `Some(Err(e))` is
+/// the failure `?` never swallows, which [`scalar_decode_error`] names exactly
+/// as the `Iterate` arm does.
+///
+/// The cheap tests come first, and the shortcut is not taken in yq mode. The
+/// shape test is an O(1) match on the AST, so a body that is not a bare `.[]`
+/// (`.k0?`, `.a.b?`) pays nothing, where probing the value first resolved a
+/// YAML alias to a mapping, an O(keys) walk, for every such boundary. And yq's
+/// `.[]` over a scalar never built the message at all (the arm answers `None`
+/// under `optional || yq`), so the shortcut has nothing to save there and
+/// would only repeat the arm's own probes for a container.
+///
+/// The probe that follows the gate is not free for a container: it asks the
+/// value whether it is an array or an object, and the `Iterate` arm then asks
+/// again. That is nothing for JSON, where a value is a view over the index. In
+/// YAML it is an alias-to-mapping resolve, which only a library embedder
+/// evaluating in jq mode over a YAML document reaches (`succinctly jq` reads
+/// JSON, DSV and raw text; `succinctly yq` is excluded by the gate).
+pub(crate) fn swallowed_scalar_iteration<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    catch: Option<&Expr>,
+    value: &V,
+) -> Option<Result<(), EvalError>> {
+    if !swallowing_boundary::<S>(expr, catch)
+        || value.as_array().is_some()
+        || value.as_object().is_some()
+    {
+        return None;
+    }
+    Some(scalar_decode_error(value).map_or(Ok(()), Err))
+}
+
+/// Whether the swallowed-`.[]` shortcut may be taken at all for a `?`/`try`
+/// boundary over `expr` with this handler, in this mode (#3689): the body is a
+/// bare `.[]` ([`try_swallows_scalar_iteration`](crate::jq::eval::try_swallows_scalar_iteration))
+/// and the mode is not yq. One definition for [`swallowed_scalar_iteration`]
+/// (the four boundaries) and [`path_context_step_try`] (the path-context walk),
+/// so the mode rule cannot be changed in one and left behind in the other.
+fn swallowing_boundary<S: EvalSemantics>(expr: &Expr, catch: Option<&Expr>) -> bool {
+    crate::jq::eval::try_swallows_scalar_iteration(expr, catch) && S::TAG != EvalTag::Yq
+}
+
+/// What stepping the scalar `node` (the value at `cursor`) with `.[]?` raises,
+/// decided without building the `Cannot iterate over ...` message the step
+/// would format and `?` would drop (#3023, #3689): `Ok(())` for nothing or an
+/// error `?` swallows, `Err` for a failure it never does -- an undecodable
+/// string ([`scalar_iteration_precheck`]) or a scalar the cursor cannot read
+/// ([`validate_cursor`]). One definition for the `..` walk
+/// ([`each_recurse_cursor_generic`]) and the path-context step
+/// ([`path_context_step_try`]), which each keep their own container test and
+/// their own way of reporting the `Err`.
+fn scalar_leaf_iteration<S: EvalSemantics, V: DocumentValue>(
+    node: &V,
+    cursor: &V::Cursor,
+) -> Result<(), EvalError> {
+    let read = scalar_iteration_precheck::<S, V>(node).and_then(|reads| {
+        if reads {
+            validate_cursor::<S, _>(cursor)
+        } else {
+            Ok(())
+        }
+    });
+    match read {
+        Err(e) if e.is_uncatchable_at_value_position() => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -9503,6 +9591,12 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    // #3689: a bare `.[]?` over a scalar settles here, without evaluating the
+    // `.[]` that would format the `Cannot iterate over ...` message this
+    // boundary drops (see `try_swallows_scalar_iteration`).
+    if let Some(settled) = swallowed_scalar_iteration::<S, V>(inner, catch, &value) {
+        return settled.map_or_else(GenericResult::Error, |()| GenericResult::None);
+    }
     // A handler that reads path context stands at this stage's position
     // (spine 2416, identity pass): the sink route's `each_try_generic` runs
     // it from the cursor, so delegate to it rather than growing a second
@@ -12213,18 +12307,9 @@ fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
         // and most nodes are leaves.
         let node = cursor.value();
         if node.as_object().is_none() && node.as_array().is_none() {
-            let read = scalar_iteration_precheck::<S, V>(&node).and_then(|reads| {
-                if reads {
-                    validate_cursor::<S, _>(&cursor)
-                } else {
-                    Ok(())
-                }
-            });
-            match read {
-                Err(e) if e.is_uncatchable_at_value_position() => {
-                    return Flow::Escaped(Control::Error(e))
-                }
-                _ => continue,
+            match scalar_leaf_iteration::<S, V>(&node, &cursor) {
+                Err(e) => return Flow::Escaped(Control::Error(e)),
+                Ok(()) => continue,
             }
         }
         // The children go straight onto the work stack, in document order,
@@ -12521,6 +12606,11 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    // #3689: as in `try_single_generic`, a bare `.[]?` over a scalar settles
+    // here.
+    if let Some(settled) = swallowed_scalar_iteration::<S, V>(expr, catch, &value) {
+        return settled.map_or_else(|e| Flow::Escaped(Control::Error(e)), |()| Flow::Exhausted);
+    }
     let lazy_fault = StashedEscape::new();
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
         push_checked_lazy_item::<V, S>(&lazy_fault, item, sink)
@@ -22208,6 +22298,35 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
+    // #3689: a scalar has no members, and a `?`/`try` over a bare `.[]` drops
+    // the error iterating it raises -- but not one that escapes (an undecodable
+    // string, a scalar the cursor cannot read), which [`scalar_leaf_iteration`]
+    // decides as the step would. So a leaf spares the `Cannot iterate` message
+    // the step would format and this boundary would drop, and most nodes are
+    // leaves: this is every `.. | path`/`key`/`parent` (whose `..` steps each
+    // node through `.[]?`) and a user-written `.[]? | path`. An owned scalar (a
+    // slice's element) has nothing to decode and yields nothing. Not in yq
+    // mode, where the step never built the message (see
+    // [`swallowed_scalar_iteration`]); a node that is not a live or owned
+    // scalar takes the step.
+    if swallowing_boundary::<S>(body, catch) {
+        match &pos.node {
+            PathNode::At(cursor) => {
+                let node = cursor.value();
+                if node.as_object().is_none() && node.as_array().is_none() {
+                    return scalar_leaf_iteration::<S, V>(&node, cursor).map_err(Control::Error);
+                }
+            }
+            // An owned scalar was decoded when it was built: a slice materializes
+            // its elements, so an undecodable one raised there, before the walk.
+            PathNode::Owned(value)
+                if !matches!(**value, OwnedValue::Array(_) | OwnedValue::Object(_)) =>
+            {
+                return Ok(());
+            }
+            PathNode::Owned(_) | PathNode::Absent => {}
+        }
+    }
     let mut branch = Vec::new();
     let stepped = path_context_step_generic::<S, V>(body, pos, &mut branch);
     out.append(&mut branch);

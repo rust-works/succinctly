@@ -5329,6 +5329,38 @@ pub(crate) fn suppresses(e: &EvalError, optional: bool) -> bool {
     optional && !e.is_uncatchable_at_value_position()
 }
 
+/// Whether `try expr catch handler` (`expr?` when `catch` is `None`) has
+/// nothing to catch but the error `.[]` raises on a scalar (#3689): `expr` is
+/// a bare `.[]` and the handler, if any, is `empty`.
+///
+/// Such a boundary drops that error whether or not anyone built it, so for a
+/// scalar input it answers itself -- nothing, or the decode failure `?` never
+/// swallows -- instead of evaluating `.[]` to format a `Cannot iterate over
+/// ...` message (a preview string and an owned copy of the scalar) only to
+/// discard it. Most nodes of a document are scalars. The answer is the one the
+/// `Iterate` scalar arm gives under an ambient `optional`; it is not reached
+/// by passing one, because `eval_generic::eval_single`'s own contract is that
+/// `optional = true` is unreachable for every shape but four (#2368). This is
+/// the shape half of the test; `eval_generic::swallowed_scalar_iteration` adds
+/// the value half and is what the boundaries call.
+///
+/// `catch empty` qualifies because the handler yields nothing for any payload
+/// (a `break` runs it over `null`, which is the same nothing), so it is the
+/// same boundary as no handler. A `def empty:` in scope makes the handler a
+/// `DefCall`, not `Builtin::Empty`, and the shape no longer matches. A closure
+/// argument reaches the boundary as `Expr::Shared` (`def opt(f): f?;` called as
+/// `opt(.[])`), so both operands are peeled by [`unwrap_bind_source`]: the
+/// shortcut evaluates nothing, so no `Shared` read is skipped that a stack
+/// check (ADR-0025) would have guarded.
+///
+/// Not `Option::is_none_or`: the crate's MSRV is 1.73 and that is 1.82.
+pub(crate) fn try_swallows_scalar_iteration(expr: &Expr, catch: Option<&Expr>) -> bool {
+    matches!(unwrap_bind_source(expr), Expr::Iterate)
+        && catch.map_or(true, |c| {
+            matches!(unwrap_bind_source(c), Expr::Builtin(Builtin::Empty))
+        })
+}
+
 /// Fold `e` into a terminal suppress-or-raise `QueryResult`, per
 /// [`suppresses`]. Collapses the `Err(e) if suppresses(...) =>
 /// QueryResult::None, Err(e) => QueryResult::Error(e)` arm-pair that
@@ -6637,6 +6669,15 @@ fn each_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
+    // #3689: as in `eval_try`, a bare `.[]?` over a scalar settles here.
+    if let Some(settled) = crate::jq::eval_generic::swallowed_scalar_iteration::<
+        S,
+        StandardJson<'a, W>,
+    >(expr, catch, &value)
+    {
+        return settled.map_or_else(|e| Flow::Escaped(Control::Error(e)), |()| Flow::Exhausted);
+    }
+
     match eval_each::<W, S>(expr, value, optional, sink) {
         // A decode failure (#1247) must never be caught by `try`/`catch`,
         // same #1620 exclusion as `eval_try`'s identical arm -- propagates
@@ -13325,6 +13366,17 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #3689: a bare `.[]?` over a scalar settles here, without evaluating the
+    // `.[]` that would build the error this boundary drops (see
+    // `try_swallows_scalar_iteration`).
+    if let Some(settled) = crate::jq::eval_generic::swallowed_scalar_iteration::<
+        S,
+        StandardJson<'a, W>,
+    >(expr, catch, &value)
+    {
+        return settled.map_or_else(QueryResult::Error, |()| QueryResult::None);
+    }
+
     // Evaluate the expression
     let result = eval_single::<W, S>(expr, value, optional);
 
@@ -111347,6 +111399,159 @@ mod tests {
             ),
             other => panic!("expected a decode-failure error, got: {other:?}"),
         }
+    }
+
+    /// #3689: the shortcut's own gate, which no output can show. It is taken for
+    /// a bare `.[]` (under a `Paren` too) with no handler or `catch empty`, over
+    /// a scalar, in jq mode -- and not in yq mode, where the `Iterate` arm never
+    /// built the message, so the shortcut only added the arm's own value probes
+    /// (an alias-to-mapping resolve in YAML, #3709's review measured +107% on
+    /// `.k0?` over 30,000 aliases). The AST shape is tested before the value is
+    /// touched, so a body that is not `.[]` costs nothing.
+    #[test]
+    fn swallowed_scalar_iteration_gate_3689() {
+        use crate::jq::eval_generic::swallowed_scalar_iteration as settle;
+        let scalar_json: &[u8] = b"5";
+        let scalar_index = JsonIndex::build(scalar_json);
+        let scalar = scalar_index.root(scalar_json).value();
+        let container_json: &[u8] = b"[1]";
+        let container_index = JsonIndex::build(container_json);
+        let container = container_index.root(container_json).value();
+        let undecodable_json: &[u8] = br#""\ud800""#;
+        let undecodable_index = JsonIndex::build(undecodable_json);
+        let undecodable = undecodable_index.root(undecodable_json).value();
+
+        let iterate = Expr::Iterate;
+        let parenthesised = Expr::Paren(Box::new(Expr::Iterate));
+        let empty = parse("empty").unwrap();
+        let handler = parse(r#""c""#).unwrap();
+        let field = parse(".a").unwrap();
+
+        // Taken: nothing to catch but the scalar's own error.
+        for body in [&iterate, &parenthesised] {
+            assert!(matches!(
+                settle::<JqSemantics, _>(body, None, &scalar),
+                Some(Ok(()))
+            ));
+            assert!(matches!(
+                settle::<JqSemantics, _>(body, Some(&empty), &scalar),
+                Some(Ok(()))
+            ));
+        }
+        // What `?` never swallows still escapes the shortcut as the same failure.
+        match settle::<JqSemantics, _>(&iterate, None, &undecodable) {
+            Some(Err(e)) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
+        }
+        // Not taken in yq mode, whatever the value.
+        assert!(settle::<YqSemantics, _>(&iterate, None, &scalar).is_none());
+        assert!(settle::<YqSemantics, _>(&iterate, None, &undecodable).is_none());
+        // Not taken: a handler that runs, a body that is not a bare `.[]`, a
+        // container, which has members to list.
+        assert!(settle::<JqSemantics, _>(&iterate, Some(&handler), &scalar).is_none());
+        assert!(settle::<JqSemantics, _>(&field, None, &scalar).is_none());
+        assert!(settle::<JqSemantics, _>(&iterate, None, &container).is_none());
+    }
+
+    /// #3689: a bare `.[]?` over a scalar settles in `eval_try` and `each_try`
+    /// without evaluating the `.[]` whose `Cannot iterate` message the boundary
+    /// would drop -- and still raises what `?` never swallows.
+    ///
+    /// Both routes are driven here, because the generic evaluator's own copy of
+    /// the rule (`try_single_generic`/`each_try_generic`) answers a cursor
+    /// document before this evaluator sees it, and the values this evaluator
+    /// gets through the reindex bridge are already decoded: only a direct call
+    /// over a document can reach the decode-failure arm. Every row is what the
+    /// `Iterate` arm gave under `?` before the shortcut.
+    #[test]
+    fn eval_rs_swallowed_scalar_iteration_settles_as_the_iterate_arm_did_3689() {
+        fn pulled<S: EvalSemantics>(json: &[u8], filter: &str) -> String {
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap();
+            match eval_full::<Vec<u64>, S>(&expr, index.root(json)) {
+                QueryResult::None => "none".to_owned(),
+                QueryResult::Owned(v) => v.to_json(),
+                QueryResult::Error(e) => format!("error decode={}", e.is_decode_failure()),
+                other => panic!("`{filter}` on {json:?}: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
+            }
+        }
+        fn pushed<S: EvalSemantics>(json: &[u8], filter: &str) -> String {
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap();
+            let mut out = Vec::new();
+            let flow = eval_each::<Vec<u64>, S>(&expr, index.root(json).value(), false, &mut |i| {
+                out.push(i.into_owned::<S>().unwrap().to_json());
+                Demand::Continue
+            });
+            match flow {
+                Flow::Exhausted => format!("exhausted {out:?}"),
+                Flow::Escaped(Control::Error(e)) => {
+                    format!("escaped decode={} {out:?}", e.is_decode_failure())
+                }
+                _ => panic!("`{filter}` on {json:?}: unexpected flow"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
+            }
+        }
+        // Dropped: nothing, and no handler to run.
+        for json in [&br"5"[..], br#""abc""#, b"null", b"true"] {
+            for filter in [".[]?", "(.[])?", "try .[]", "try .[] catch empty"] {
+                assert_eq!(pulled::<JqSemantics>(json, filter), "none", "{filter}");
+                assert_eq!(
+                    pushed::<JqSemantics>(json, filter),
+                    "exhausted []",
+                    "{filter}"
+                );
+                assert_eq!(pulled::<YqSemantics>(json, filter), "none", "{filter}");
+                assert_eq!(
+                    pushed::<YqSemantics>(json, filter),
+                    "exhausted []",
+                    "{filter}"
+                );
+            }
+        }
+        // What `?` never swallows: an undecodable string, and a scalar the
+        // index could not read.
+        for json in [&br#""\ud800""#[..], b"1.2.3"] {
+            for filter in [".[]?", "(.[])?", "try .[]", "try .[] catch empty"] {
+                assert_eq!(
+                    pulled::<JqSemantics>(json, filter),
+                    "error decode=true",
+                    "{filter}"
+                );
+                assert_eq!(
+                    pushed::<JqSemantics>(json, filter),
+                    "escaped decode=true []",
+                    "{filter}"
+                );
+                assert_eq!(
+                    pulled::<YqSemantics>(json, filter),
+                    "error decode=true",
+                    "{filter}"
+                );
+                assert_eq!(
+                    pushed::<YqSemantics>(json, filter),
+                    "escaped decode=true []",
+                    "{filter}"
+                );
+            }
+        }
+        // A handler that is anything but `empty` still runs, and reads the message.
+        assert_eq!(
+            pulled::<JqSemantics>(b"5", r#"try .[] catch "c""#),
+            r#""c""#
+        );
+        assert_eq!(
+            pushed::<JqSemantics>(b"5", r#"try .[] catch "c""#),
+            r#"exhausted ["\"c\""]"#
+        );
+        assert_eq!(
+            pulled::<JqSemantics>(b"5", "try .[] catch ."),
+            r#""Cannot iterate over number (5)""#
+        );
+        // A container is listed, not settled.
+        assert_eq!(
+            pushed::<JqSemantics>(b"[1,2]", ".[]?"),
+            r#"exhausted ["1", "2"]"#
+        );
     }
 
     /// #1746: `to_entries`'s own `to_owned_lossy` call on each value is on the

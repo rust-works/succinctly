@@ -61,6 +61,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`! tagged`) now reports its content's type (`!!str`) as yq does instead of `!`. See
   `docs/compliance/jq/limitations.md`.
 
+- **jq: `.[]?`, `try .[] catch empty` and `.. | path` no longer build the `Cannot iterate` error
+  they drop for every scalar** (#3689, a #3023 follow-up). `.[]` over a number, string, boolean or
+  `null` raises `Cannot iterate over ...`, and the message quotes the scalar: a preview string and an
+  owned copy of the value. Wherever the boundary swallows it that was thrown away, once per scalar,
+  and most nodes are scalars. `?` and `try` over a bare `.[]` (with no handler, or `catch empty`,
+  which yields nothing for any payload; a closure argument or a paren around the `.[]` counts too)
+  now answer a scalar themselves -- nothing, or the decode failure `?` never swallows -- instead of
+  evaluating the `.[]`, in both evaluators. The path-context walk does the same in
+  `path_context_step_try`, which every `.. | path`, `.. | key` and `.. | parent` goes through, and
+  so does a user-written `.[]? | path` and the owned scalars below a slice; its leaf check is the
+  pair #3681 added for `..` (`scalar_iteration_precheck`, `validate_cursor`), now one shared helper.
+  A handler other than `empty` still gets the payload and runs, and a `def empty:` in scope makes
+  `catch empty` an ordinary handler. **yq mode never takes the shortcut**: yq's `.[]` over a scalar
+  never built the message, so there was nothing to save, and the first draft, which probed the value
+  before testing the shape, measured +107% on `.k0?` over 30,000 aliases of a mapping and +13% on
+  `.. | path` over inline mappings (output identical; found in review, not by the benchmark, which
+  had no YAML in it). Output is unchanged: 828 jq and 180 yq base-versus-head runs over valid and
+  malformed documents (an undecodable string, `1.2.3`, `tru`, a stray comma, aliases and merge keys)
+  are byte-identical, and a failure `?` never swallows still escapes where the walk steps the node
+  that holds it (`[limit(2; .. | path)]` on `[1.2.3,[4]]` still answers `[[],[0]]`, and a third node
+  raises). Allocator calls over 2,000 scalar members on a release build: `[.[] | .[]?] | length`
+  12,024 to 24 (an object), 12,014 to 14 (an array), against 23 and 13 for the `[.[]]` twin;
+  `[.[] | try .[] catch empty] | length` 42,014 to 24; `[.. | path] | length` 22,057 to 10,057
+  against 10,035 for the `[.[] | path]` twin, whose per-member path array it now costs no more than;
+  `[.[] | .[]? | key] | length` 14,014 to 2,014 (an array); `def opt(f): f?; [.[] | opt(.[])]`
+  12,016 to 16; `[.[1:] | .. | path]` 50,136 to 14,154. A string with an escape has to be decoded to
+  be validated, which is one allocation per member (two in `.. | path`, whose leaf check decodes it
+  twice) where the message cost eight. `try .[] catch "x"` is unchanged at 16,034: the matcher
+  admits only `empty`, so a handler that never reads the payload still pays for it (#3704).
+  Interleaved wall clock against the parent on an M4 Pro, 1 to 16 MB, min of 7, output identity 48/48
+  (jq) and 22/22 (yq): `.[]?` over a flat array of scalars is 65% to 72% faster (an object 48% to
+  54%), `try ... catch empty` 84% to 87% (72% to 76%), `.. | path` 45% to 50% (32% to 35%; records
+  27% to 29%) and a user-written `.[]? | key` 54% to 60% (36% to 41%). Containers are not what
+  changed: `.[]?` over records is within 3%, and the two controls the change cannot reach
+  (`[.[]] | length`, `[..] | length`) read -1.6% to +2.2%, against -2.5% to +0.3% for the control
+  run. The yq rows (aliases, merge keys, 3 MB of inline mappings, JSON through `yq`) read -3.1% to
+  +1.4%. Still open, and not this change: any `recurse` with another `f`, or a `cond`, still stops at
+  10,000 nodes (#3716), and `path(f)`'s own `?`/`try` arms still build the message (#3722).
+
 - **jq/yq: `..` no longer builds a path trail, an owned key and a swallowed error for every node**
   (#3023). `..` listed each node's children through the `path()` step, which built an `Rc` trail
   link per child, an owned key `String` per object member, a `Vec` per container and, in jq mode, for
