@@ -5295,10 +5295,12 @@ away at compile time, and its code is unchanged.
 The flag is a second statement of a fact the check overrides already encode, so it
 could drift. `yaml_has_no_delimiter_checks_2640` pins both halves: each YAML check is
 still the default over a spread of arguments, and the helpers leave the shared
-sequential-cursor cache alone (read through `Debug`; a control shows a real
-`text_position()` does move it, and the test was mutation-checked against removing
-each of the three guards separately). `json_keeps_its_delimiter_checks_2640` pins that JSON still refuses
-`[1,,2]`, `[1,]` and `{"a":1,,"b":2}`.
+position resolver alone (counted directly by a test-build-only call counter on
+`YamlCursor::text_position`; a control shows a real call moves it, and the test was
+mutation-checked against removing each of the three guards separately). The default
+check is swept over every node of a document that mixes block and flow collections.
+`json_keeps_its_delimiter_checks_2640` pins that JSON still refuses `[1,,2]`, `[1,]` and
+`{"a":1,,"b":2}`.
 
 ### Results
 

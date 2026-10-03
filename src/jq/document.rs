@@ -443,9 +443,10 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// `true` at once when it is `false`, instead of first resolving a position
     /// or decoding a value that only the check would have read. That resolve is
     /// not free: YAML's touches a shared sequential cursor, and skipping it
-    /// saves 13-32% of the instructions of a scalar-sequence walk and 9-14% of a
-    /// record sort (#2640). [`key_delimiter_ok`] needs no guard: it reads the
-    /// key's `text_start`, which is the trait default `None` for YAML.
+    /// saves 13-32% of the instructions of a scalar-sequence walk and 9-14%
+    /// of those of a record sort (#2640). [`key_delimiter_ok`] needs no
+    /// guard: it reads the key's `text_start`, which is the trait default
+    /// `None` for YAML.
     ///
     /// The default is `true`, so a new format keeps checking until it opts
     /// out. A format that sets it `false` must leave every check above at its
@@ -4339,10 +4340,8 @@ mod object_keys_repeat_tests {
         let mut elems = root.value().as_array().expect("an array");
         let mut verdicts = Vec::new();
         let mut is_first = true;
-        let mut last = None;
         while let Some((cursor, rest)) = elems.uncons_cursor() {
             verdicts.push(cursor.element_gap_ok(is_first));
-            last = Some(cursor);
             elems = rest;
             is_first = false;
         }
@@ -4351,7 +4350,6 @@ mod object_keys_repeat_tests {
             [true, false],
             "`[1,,2]`: the second gap is doubled"
         );
-        assert!(last.is_some());
 
         let json = br"[1,]";
         let index = JsonIndex::build(json);
@@ -4371,8 +4369,7 @@ mod object_keys_repeat_tests {
         let index = JsonIndex::build(json);
         let root = index.root(json);
         let fields = root.value().as_object().expect("an object");
-        let (first, _, rest) = fields.uncons_key().expect("a first field");
-        let _ = first;
+        let (_, _, rest) = fields.uncons_key().expect("a first field");
         let (second, _) = DocumentFields::uncons(&rest).expect("a second field");
         assert!(
             !second.delimiters_ok::<<StandardJson<'_, Vec<u64>> as DocumentValue>::Fields>(false),
