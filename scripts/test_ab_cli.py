@@ -14,7 +14,9 @@ import importlib.util
 import io
 import os
 import pathlib
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -177,6 +179,87 @@ class GateTests(unittest.TestCase):
         code, out = self.run_harness("--before", before, "--after", after)
         self.assertIn("exited 7 while being timed", code)
         self.assertNotIn("median of medians", out)
+
+
+class BusyProcessTests(unittest.TestCase):
+    """#3695: the idleness probe must match the build or benchmark *process*, not any
+    command line that mentions a build tool. These start real processes (`sleep` under other
+    names) and ask the real `pgrep`, because what is under test is how the pattern behaves
+    against it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = pathlib.Path(self._tmp.name)
+        self.sleep = shutil.which("sleep")
+        self._procs = []
+        self.addCleanup(self._stop)
+
+    def _stop(self):
+        for proc in self._procs:
+            proc.kill()
+            proc.wait()
+
+    def start(self, argv0, *args):
+        # `Popen` returns once the child has exec'd, so `pgrep` can see it at once.
+        proc = subprocess.Popen([str(argv0), *args], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self._procs.append(proc)
+        return proc
+
+    def link_to_sleep(self, relative):
+        path = self.dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(self.sleep)
+        return path
+
+    @staticmethod
+    def listed(proc, lines):
+        return any(ln.split(None, 1)[0] == str(proc.pid) for ln in lines if ln.strip())
+
+    def test_a_process_under_dot_cargo_is_not_a_build(self):
+        # `cargo install`ed tools (here, anything under `.cargo/bin`) matched the old
+        # `pgrep -fl "cargo|rustc|criterion"` however idle they were.
+        proc = self.start(self.link_to_sleep(".cargo/bin/fake-tool"), "30")
+        old = ab_cli.run_text(["pgrep", "-fl", "cargo|rustc|criterion"]).splitlines()
+        self.assertTrue(self.listed(proc, old), "premise: the old pattern flags it")
+        self.assertFalse(self.listed(proc, ab_cli.busy_processes()))
+
+    def test_a_process_named_cargo_is_a_build(self):
+        proc = self.start(self.link_to_sleep("cargo"), "30")
+        self.assertTrue(self.listed(proc, ab_cli.busy_processes()))
+
+    def test_a_process_named_rustc_is_a_build(self):
+        proc = self.start(self.link_to_sleep("rustc"), "30")
+        self.assertTrue(self.listed(proc, ab_cli.busy_processes()))
+
+    def test_a_bench_binary_is_a_build(self):
+        # `cargo bench` runs `target/<profile>/deps/<name>-<hash> --bench`: neither word
+        # of the old pattern is in that command line, so it never caught the benchmark
+        # itself, only the `cargo` above it.
+        script = self.dir / "target" / "release" / "deps" / "sleeper-0123abcd"
+        script.parent.mkdir(parents=True)
+        script.write_text(f"#!{sys.executable}\nimport time; time.sleep(30)\n")
+        script.chmod(script.stat().st_mode | stat.S_IXUSR)
+        proc = self.start(script, "--bench")
+        self.assertTrue(self.listed(proc, ab_cli.busy_processes()))
+        # The same program started without `--bench` is not a benchmark run.
+        plain = self.start(script)
+        self.assertFalse(self.listed(plain, ab_cli.busy_processes()))
+
+    def test_machine_warnings_names_the_busy_processes(self):
+        def fake_run_text(cmd):
+            # `top` is the slow call on macOS and not what is under test; report idle.
+            return "98.0% idle\n98.0% idle\n" if cmd[0] == "top" else ""
+
+        with mock.patch.object(ab_cli, "run_text", side_effect=fake_run_text), \
+                mock.patch.object(ab_cli, "busy_processes",
+                                  return_value=["123 cargo", "456 rustc"]):
+            warnings = ab_cli.machine_warnings()
+        busy = [w for w in warnings if w.startswith("build or benchmark processes")]
+        self.assertEqual(len(busy), 1, warnings)
+        self.assertIn("123 cargo", busy[0])
+        self.assertIn("456 rustc", busy[0])
 
 
 if __name__ == "__main__":
