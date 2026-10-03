@@ -41708,7 +41708,7 @@ mod tests {
         // Uncaught, the stage's error escapes with jq's own message.
         let (out, control) =
             drive_each_sink::<JqSemantics>(doc.as_bytes(), ".b | keys_unsorted | length | . + [1]");
-        assert!(out.is_empty());
+        assert_eq!(out.len(), 0, "nothing is emitted before the error");
         let Some(Control::Error(error)) = control else {
             panic!("expected the stage's error to escape"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3673)"
         };
