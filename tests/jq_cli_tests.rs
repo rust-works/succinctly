@@ -86169,6 +86169,171 @@ fn test_error_of_a_message_that_halts_after_a_value_in_yq_mode_3612() -> Result<
     Ok(())
 }
 
+/// #3636: `error(msg)` raises the first output of `msg` and never evaluates the
+/// rest, so a later output's side effect (`stderr`, `debug`, `halt_error`'s text)
+/// does not fire: `error((1, ("x"|stderr)))` raises `1` with nothing before the
+/// error line on stderr. The message was evaluated in full and then reduced to
+/// its first output, so the `x` was written first. The message is now pulled up
+/// to its first output and stopped, as `first(f)` is (#820). Every value captured
+/// from jq 1.7.1, on both routes; stderr is the observable here, so it is checked
+/// precisely (an empty `expected_start` means stderr must be empty).
+#[test]
+fn test_error_message_is_not_evaluated_past_its_first_output_3636() -> Result<()> {
+    let doc = r#""abc""#;
+    for (filter, expected_stdout, expected_code, expected_start) in [
+        (r#"error((1, ("x"|stderr)))"#, "", 5, "jq: error"),
+        (r#"try error((1, ("x"|stderr))) catch ."#, "1\n", 0, ""),
+        (r#"error(("m", ("y"|debug)))"#, "", 5, "jq: error"),
+        (r#"error((1, ("x"|halt_error(3))))"#, "", 5, "jq: error"),
+        (
+            r#"try error((1, ("x"|halt_error(3)))) catch ."#,
+            "1\n",
+            0,
+            "",
+        ),
+        (r#"[(1, error((2, ("x"|stderr))))?]"#, "[1]\n", 0, ""),
+        (r#"[error((1, ("x"|stderr)))?]"#, "[]\n", 0, ""),
+        // every consumer of the message reaches the same answer
+        (r#"path(error((1, ("x"|stderr))))"#, "", 5, "jq: error"),
+        (r#"del(error((1, ("x"|stderr))))"#, "", 5, "jq: error"),
+        (r#".|= error((1, ("x"|stderr)))"#, "", 5, "jq: error"),
+        // a side effect in the *first* output is reached, as in jq
+        (r#"error((("x"|stderr), 1))"#, "", 5, "xjq: error"),
+        // the other first-output shapes are unchanged
+        ("error(empty)", "", 0, ""),
+        ("error((empty, 1))", "", 5, "jq: error"),
+        ("error(1, 2)", "", 5, "jq: error"),
+        ("error((1, error(\"z\")))", "", 5, "jq: error"),
+        // an error or a break *before* the first output is the flow, as before
+        (r#"error(error("z"), 1)"#, "", 5, "jq: error"),
+        (r#"try error(error("z"), 1) catch ."#, "\"z\"\n", 0, ""),
+        ("error((label $o | break $o), 2)", "", 5, "jq: error"),
+        // a `?//` in the message
+        ("error(([1] as [$a] ?// $b | $a, 7))", "", 5, "jq: error"),
+        ("error(1 as $x ?// $y | 5, 6)", "", 5, "jq: error"),
+    ] {
+        let owned = format!("{doc} | {filter}");
+        for ((stdout, stderr, code), route) in [
+            (run_jq_full(&["-c", "--", filter], Some(doc))?, "cursor"),
+            (run_jq_full(&["-nc", "--", &owned], None)?, "owned"),
+        ] {
+            assert_eq!(
+                (stdout.as_str(), code),
+                (expected_stdout, expected_code),
+                "`{filter}` ({route} route): stderr {stderr:?}"
+            );
+            if expected_start.is_empty() {
+                assert_eq!(
+                    stderr, "",
+                    "`{filter}` ({route} route): nothing may reach stderr"
+                );
+            } else {
+                assert!(
+                    stderr.starts_with(expected_start),
+                    "`{filter}` ({route} route): stderr {stderr:?} must start with {expected_start:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #3636: `input` in a later output of the message is never consumed, so the next
+/// document is still processed on its own: with two documents `error((1, input))`
+/// raises `1` once per document (two error lines), and `try ... catch .` prints `1`
+/// twice, as jq 1.7.1 does. Evaluated in full, the first document's message would
+/// have consumed the second.
+#[test]
+fn test_error_message_does_not_consume_a_later_input_3636() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--", "error((1, input))"], Some("1\n2\n"))?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "stderr {stderr:?}");
+    assert_eq!(
+        stderr.matches("jq: error").count(),
+        2,
+        "one error per document: stderr {stderr:?}"
+    );
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "--", "try error((1, input)) catch ."],
+        Some("1\n2\n"),
+    )?;
+    assert_eq!((stdout.as_str(), code), ("1\n1\n", 0), "stderr {stderr:?}");
+    Ok(())
+}
+
+/// #3636, default yq mode: the messages that take the new first-output pull,
+/// against real yq v4.53.3 (every row captured from it): the first output is
+/// raised, a message that produces nothing aborts.
+#[test]
+fn test_error_multi_output_message_matches_yq_3636() -> Result<()> {
+    let input = "a: 1\nb: 2\nc: [1, 2, 3]\n";
+    for (filter, expected_stderr) in [
+        ("error(.c[])", "Error: 1\n"),
+        ("error((.a, .b))", "Error: 1\n"),
+        ("error(.c[] | select(. > 1))", "Error: 2\n"),
+        ("error(.c[] | select(. > 5))", "Error: aborted\n"),
+        ("error(.zz[])", "Error: aborted\n"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped")
+                    .write_all(input.as_bytes())?;
+                child.wait_with_output()
+            })?;
+        assert_eq!(
+            (
+                String::from_utf8_lossy(&output.stdout).as_ref(),
+                String::from_utf8_lossy(&output.stderr).as_ref(),
+                output.status.code()
+            ),
+            ("", expected_stderr, Some(1)),
+            "#3636 (yq): `{filter}`"
+        );
+    }
+    Ok(())
+}
+
+/// #3636, yq mode: `error` is shared with `succinctly yq`, where `stderr` is a
+/// `--jq-extensions` surface real yq lacks (no oracle), so the rule is jq's: the
+/// message stops at its first output and the later one's side effect never fires.
+#[test]
+fn test_error_message_is_not_evaluated_past_its_first_output_in_yq_mode_3636() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args([
+            "yq",
+            "--jq-extensions",
+            "-o",
+            "json",
+            "-I",
+            "0",
+            r#"error((1, ("x"|stderr)))"#,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().expect("piped").write_all(b"a: 1\n")?;
+            child.wait_with_output()
+        })?;
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&output.stdout).as_ref(),
+            String::from_utf8_lossy(&output.stderr).as_ref(),
+            output.status.code()
+        ),
+        ("", "Error: 1\n", Some(1))
+    );
+    Ok(())
+}
+
 /// #3293 slice 4 and #2163: a `?//` retry that supersedes a consumer's stop
 /// lets the fold go on to its next INIT fork, and there the source runs
 /// against the real `.` where jq gives it a synthetic `null` -- #2163's open

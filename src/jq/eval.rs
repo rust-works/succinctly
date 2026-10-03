@@ -13151,7 +13151,24 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // future native `Expr::Error` arm (mirroring #1812's `Try`/`Optional`
         // ones) would otherwise silently resurrect it.
         Some(msg_expr) => {
-            let msg_result = eval_single::<W, S>(msg_expr, value, optional).materialize_cursor();
+            // #3636: only the message's first output is ever raised, and jq
+            // never evaluates the rest -- `error((1, ("x"|stderr)))` raises
+            // `1` without writing `x`. Pull the first output and stop the
+            // generator (jq's `label $out | (f, break $out)`, as `first(f)`
+            // does, #820), so a later output's side effect (`stderr`,
+            // `debug`, `halt_error`'s text, `input`) never fires. A halt that
+            // comes before any output, and an error or break raised while
+            // producing the first one, still arrive as the flow.
+            //
+            // A message that provably yields at most one value has no later
+            // output to skip, so it keeps the direct single-result path --
+            // `error("literal")` and `error(.msg)` are the common forms.
+            let msg_result = if yields_at_most_one_value(msg_expr) {
+                eval_single::<W, S>(msg_expr, value, optional).materialize_cursor()
+            } else {
+                let (taken, flow) = each_take_first::<W, S>(msg_expr, value, optional);
+                take_stopping_items_to_result::<_, S>(taken, flow).materialize_cursor()
+            };
             // #1953: `to_owned`'s own materialization error here can
             // be a genuine decode failure (never suppressed by `optional`,
             // #1247/#1620 -- a #1642 collision error counts as one too, per
@@ -13177,7 +13194,9 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // Only the first output is raised; a trailing `break`,
                     // error or `halt` after it never runs, as
                     // `error((1, break $out))` and `error((1, halt))` raise
-                    // `1` (#3612).
+                    // `1` (#3612). The pull above already cuts those off
+                    // (#3636), so a trailing control reaches here only from a
+                    // `?//` retry (#1519), and is dropped too.
                     Ok(Some((v, _trailing))) => v,
                     // yq raises `aborted` for a message that produces nothing,
                     // through the same tail as any other payload, so `?`
