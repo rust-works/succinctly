@@ -3521,11 +3521,11 @@ mod tests {
         let mut cx = CheckCtx::default();
         check(
             &mut Expr::DefCall {
-                def: Rc::new(crate::jq::FuncDefData {
-                    name: "f".into(),
-                    params: Vec::new(),
-                    body: Expr::Identity,
-                }),
+                def: Rc::new(crate::jq::FuncDefData::new(
+                    "f".into(),
+                    Vec::new(),
+                    Expr::Identity,
+                )),
                 args: alloc::vec![unresolved()],
                 frames: 0,
                 bound: crate::jq::BoundBody::default(),
@@ -3580,11 +3580,11 @@ mod tests {
         let mut roots = Vec::new();
         build_call_graph(
             &Expr::DefCall {
-                def: Rc::new(crate::jq::FuncDefData {
-                    name: "f".into(),
-                    params: Vec::new(),
-                    body: Expr::Identity,
-                }),
+                def: Rc::new(crate::jq::FuncDefData::new(
+                    "f".into(),
+                    Vec::new(),
+                    Expr::Identity,
+                )),
                 args: alloc::vec![call_to_f()],
                 frames: 0,
                 bound: crate::jq::BoundBody::default(),

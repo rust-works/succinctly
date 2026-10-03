@@ -10129,15 +10129,15 @@ mod tests {
                 .map(|ts| ts.into_iter().map(|t| (t.path, t.kind)).collect::<Vec<_>>())
         };
         let bound_call = |body: Expr, args: Vec<Expr>| Expr::DefCall {
-            def: std::rc::Rc::new(succinctly::jq::FuncDefData {
-                name: "f".into(),
-                params: if args.is_empty() {
+            def: std::rc::Rc::new(succinctly::jq::FuncDefData::new(
+                "f".into(),
+                if args.is_empty() {
                     Vec::new()
                 } else {
                     vec![succinctly::jq::Param::Bare("v".to_string())]
                 },
                 body,
-            }),
+            )),
             args,
             frames: 0,
             bound: succinctly::jq::BoundBody::default(),

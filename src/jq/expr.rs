@@ -1605,7 +1605,11 @@ impl core::fmt::Debug for FuncDefBound {
 /// the innermost step of every recursive call, and cloning the definition
 /// there -- rather than bumping one refcount -- would put a per-level copy
 /// back into the path this design exists to keep flat.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Build one with [`FuncDefData::new`]: it also holds the answer to
+/// `eval::needs_path_context` of its body (#3455), which that walk would
+/// otherwise recompute at every call site that reaches this definition.
+#[derive(Clone, PartialEq)]
 pub struct FuncDefData {
     /// Function name.
     pub name: String,
@@ -1618,6 +1622,66 @@ pub struct FuncDefData {
     pub params: Vec<Param>,
     /// Function body.
     pub body: Expr,
+    /// Whether `body` needs path context, remembered on first ask.
+    needs_path_context: PathContextMemo,
+}
+
+impl FuncDefData {
+    /// A definition with nothing remembered about its body yet.
+    pub fn new(name: String, params: Vec<Param>, body: Expr) -> Self {
+        Self {
+            name,
+            params,
+            body,
+            needs_path_context: PathContextMemo::default(),
+        }
+    }
+
+    /// Whether this definition's body needs path context, computing it with
+    /// `classify` on the first call (#3455).
+    ///
+    /// A bound call's body is reachable from the call node itself, so a chain
+    /// of defs that each call the one before (`def f1: f0 | . + 1;
+    /// def f2: f1 | . + 1; ...`) walked every level beneath it on each
+    /// level's own ask: quadratic in the chain's length. The body is never
+    /// rewritten once the `Rc` holding it exists, so the answer is a property
+    /// of the definition, not of any one call site -- the call's *arguments*
+    /// are not part of it and stay the caller's to walk.
+    pub fn needs_path_context_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
+        memo(&self.needs_path_context.0, || classify(&self.body))
+    }
+}
+
+/// Deliberately leaves out the remembered answer (the trailing `..`), so a
+/// definition prints the same whether or not it has been asked.
+impl core::fmt::Debug for FuncDefData {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FuncDefData")
+            .field("name", &self.name)
+            .field("params", &self.params)
+            .field("body", &self.body)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A [`FuncDefData`]'s remembered `eval::needs_path_context` of its body.
+///
+/// Derived state, so like [`BoundBody`] it takes no part in equality. A clone
+/// starts empty rather than inheriting the answer, so a body rewritten after
+/// the copy is never read through an answer computed for the original.
+#[derive(Default)]
+struct PathContextMemo(core::cell::Cell<Option<bool>>);
+
+impl Clone for PathContextMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for PathContextMemo {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 /// A complete jq program including module directives and the main expression.
@@ -3173,6 +3237,29 @@ mod tests {
         assert!(arg.retrying_bind_or_init(|_| true));
     }
 
+    /// #3455: a `FuncDefData`'s remembered answer is derived state -- it
+    /// takes no part in equality or `Debug` (which marks it with a trailing
+    /// `..` instead of printing it), it answers from its first
+    /// classification, and a clone forgets it, so a body rewritten after the
+    /// copy is never read through the original's answer.
+    #[test]
+    fn func_def_data_memo_is_derived_state_3455() {
+        let fresh = FuncDefData::new("f".into(), Vec::new(), Expr::Identity);
+        let asked = FuncDefData::new("f".into(), Vec::new(), Expr::Identity);
+        assert!(asked.needs_path_context_or_init(|_| true));
+        assert!(asked.needs_path_context_or_init(|_| unreachable!("answered from the memo")));
+        assert_eq!(fresh, asked);
+        assert_eq!(format!("{fresh:?}"), format!("{asked:?}"));
+        assert_eq!(
+            format!("{asked:?}"),
+            r#"FuncDefData { name: "f", params: [], body: Identity, .. }"#
+        );
+
+        let copy = asked.clone();
+        assert!(!copy.needs_path_context_or_init(|_| false));
+        assert!(asked.needs_path_context_or_init(|_| unreachable!("the original kept its own")));
+    }
+
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_expr_size_is_pinned_1401() {
@@ -3380,11 +3467,11 @@ mod tests {
     #[test]
     fn test_bound_body_is_invisible_to_eq_and_debug_1371() {
         let call = |bound| Expr::DefCall {
-            def: Rc::new(FuncDefData {
-                name: "f".into(),
-                params: vec![Param::Bare("n".to_string())],
-                body: Expr::Identity,
-            }),
+            def: Rc::new(FuncDefData::new(
+                "f".into(),
+                vec![Param::Bare("n".to_string())],
+                Expr::Identity,
+            )),
             args: vec![Expr::Literal(Literal::Int(1))],
             frames: 3,
             bound,

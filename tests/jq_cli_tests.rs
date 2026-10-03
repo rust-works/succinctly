@@ -89086,6 +89086,26 @@ fn test_large_def_spine_evaluates_3307() -> Result<()> {
     Ok(())
 }
 
+/// #3455: thousands of top-level defs that each call the one before through a
+/// pipe evaluate. `needs_path_context` re-walked every level beneath each one
+/// (the same chain through `+` never asked it), so the chain was quadratic in
+/// its length; the assertion is on the answer, not the cost, which is
+/// platform-specific (the deterministic guard is the
+/// `needs_path_context_remembers_every_def_of_a_call_chain_3455` unit test).
+/// `/usr/bin/jq` 1.7.1 prints `2999`.
+#[test]
+fn test_large_pipe_shaped_def_chain_evaluates_3455() -> Result<()> {
+    let m = 3000;
+    let mut chain = String::from("def f0: 0;");
+    for i in 1..m {
+        chain.push_str(&format!(" def f{i}: f{} | . + 1;", i - 1));
+    }
+    let (stdout, stderr, code) = run_jq_full(&["-nc", &format!("{chain} f{}", m - 1)], None)?;
+    assert_eq!(code, 0, "#3455: pipe chain: stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "2999");
+    Ok(())
+}
+
 /// Module chains: an included module that itself includes another and
 /// redefines one of its names (`z` sees jq's own resolution, which is not the
 /// textual one), and an `import ... as` alias next to a local redefinition.
