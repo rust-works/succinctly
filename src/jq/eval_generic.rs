@@ -6892,6 +6892,17 @@ impl Drop for EmbedGuards {
 /// binding with no node behind it, or a `null`, `bool` or computed
 /// `Int`/`Float` (no storage to share -- jq compares those by value). See
 /// [`embed_table`] for the full rule.
+///
+/// The entry holds a *strong* clone of `value`. That is load-bearing, not an
+/// implementation detail: it is what makes a write through any other handle
+/// to the same storage copy first (`Rc::make_mut`), so an entry always
+/// witnesses its node's unmodified value. `eval::fold_step_each` relies on
+/// exactly that to run the owned assignment step while the table is live
+/// (#3241); a `Weak` or a raw pointer here would let such a write mutate a
+/// registered container in place with the entry still matching it, and
+/// `path($x)` would then certify a node that changed.
+/// `owned_assign_step_copies_when_the_table_is_the_only_other_holder_3241`
+/// pins it.
 pub(crate) fn embed_table_push<S: EvalSemantics>(
     origin: Option<&BindOrigin>,
     value: &mut OwnedValue,

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a `reduce`/`foreach` that assigns into its accumulator is linear inside an `as` binding
+  too** (#3241). `. as $d | reduce $d.users[] as $r ({}; .[$r.name] = $r.score)` (and the same with
+  `|=`, `op=`, `//=`, a `.x[$k]` chain, or an `INIT` of `$d` itself) skipped the owned step while the
+  #2889 embed table was live and re-indexed its accumulator on every step: O(n²), 9.05 s on 13,981
+  records on an M4 Pro (12.63 s on a 7950X) against jq 1.7.1's 0.02 s. It now writes in place like the same
+  fold outside a binding: 0.052 s and 0.071 s, and flat from 1,000 records (38 ms and 68 ms) to the
+  whole array. A fold whose UPDATE is not an owned assignment (`to_entries`, `from_entries`, `if`) is
+  unchanged, and so is yq mode, where the table is never live. Output is unchanged on every row
+  measured, and one more answers as jq does (`.a as $u | reduce (1) as $i ({w:$u}; .w //= 5) | .w |
+  path($u)` is `[]`, where it refused). Interleaved A/B on both chips with controls and the
+  instruction-count and holdout attribution in `docs/compliance/jq/limitations.md`.
+
 - **jq/yq: a program with thousands of top-level defs is linear, not quadratic, in their number**
   (#3455). A chain of defs that each call the one before through a pipe
   (`def f_i: f_{i-1} | . + 1`) re-walked every level beneath each one, and a filter naming defs far

@@ -145,6 +145,21 @@
 # bridge first agree since #3069: the bridge hands each container back out
 # as the storage that went in.
 #
+# The `owned-embed-fold-assign-*` rows are #3241: a fold whose UPDATE is an owned
+# assignment (`.z = 1`, `.w //= 5`, `.w += {}`, `.[$i] = $i`) used to skip the
+# owned step while a bind's embed table was live, so its accumulator was
+# re-indexed per step and every untouched child came back as a fresh copy that
+# no `path($u)`/write through the binding could recognise. The step now runs
+# under the table (it reads no marker, and a write to a registered container
+# copies it first), so a child the write left alone is still the binding's own
+# node, exactly as in jq's `jv_setpath`. The `-refuses` rows are the other
+# half: where jq itself refuses (a write that *did* replace the node, the
+# accumulator being the bound document itself, an `-= []` that allocates in
+# jq too) both binaries must refuse, which is what pins that the lift does not
+# fabricate an identity the write destroyed. The `-loc`, `-first`,
+# `-limit-foreach`, `-error-mid-fold`, `-try-catch` and `-multi-output-rhs`
+# rows pin the value, stop and error paths under the table.
+#
 # The `owned-embed-array-multi-*`, `owned-embed-object-add` and
 # `owned-embed-array-tie-*` rows are the #2889 review: the relocating fold
 # was reached only from the generic evaluator, so it fired for the
@@ -1052,6 +1067,44 @@ bound-comma-path-element-refuses	{"a":{"b":1}}	[.a, .a] as $a | path($a[0])
 bound-comma-del-element-refuses	{"a":{"b":1}}	[.a, .a] as $a | del($a[0])
 bound-comma-write-element-refuses	{"a":{"b":1}}	[., .] as $a | ($a[1] | .a) = 9
 bound-comma-nested-node-refuse-only	{"a":{"b":1}}	[., .a] as $a | $a[1] as $y | $a[0] | .a | path($y)
+owned-embed-fold-assign-child-path	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i (.; .z = 1) | .a | path($u)
+owned-embed-fold-assign-child-write	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i (.; .z = 1) | .a | ($u.k) = 9
+owned-embed-fold-assign-child-key-path	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i (.; .z = 1) | .a | path($u.k)
+owned-embed-fold-assign-wrapped-root-write	{"a":{"k":1},"b":2}	. as $d | reduce (1) as $i ({w: $d}; .z = 1) | .w | ($d.b) = 9
+owned-embed-fold-assign-array-acc-element	{"a":{"k":1},"b":2}	. as $d | reduce (1,2) as $i ([$d]; .[$i] = $i) | .[0] | path($d)
+owned-embed-fold-assign-alt-keeps-child	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i ({w:$u}; .w //= 5) | .w | path($u)
+owned-embed-fold-assign-add-object-keeps-child	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i ({w:$u}; .w += {}) | .w | path($u)
+owned-embed-fold-assign-add-null-keeps-child	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i ({w:$u}; .w += null) | .w | path($u)
+owned-embed-fold-assign-update-add-null-keeps-child	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i ({w:$u}; .w |= . + null) | .w | path($u)
+owned-embed-fold-assign-mul-object-keeps-child	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i ({w:$u}; .w *= {}) | .w | path($u)
+owned-embed-fold-assign-add-array-errors	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i ({w:$u}; .w += []) | .w | path($u)
+owned-embed-fold-assign-del-scalar-refuses	{"a":{"k":1},"b":2}	.b as $u | reduce (1) as $i ({w:$u}; .x = 1) | .w | del($u.k)
+owned-embed-fold-assign-del-write-through	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i ({w:$u}; .x = 1) | .w | del($u.k)
+owned-embed-fold-assign-update-write-through	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i ({w:$u}; .x = 1) | .w | ($u.k) |= 7
+owned-embed-fold-assign-multi-step	{"a":{"k":1},"b":2}	.a as $u | reduce (1,2) as $i ({w:$u}; .[$i|tostring] = $i) | .w | path($u)
+owned-embed-fold-assign-init-root-refuses	{"a":{"k":1},"b":2}	. as $d | reduce (1) as $i ($d; .z = 1) | path($d)
+owned-embed-fold-assign-init-root-child-refuses	{"a":{"k":1},"b":2}	. as $d | reduce (1) as $i ($d; .z = 1) | .a | path($d.a)
+owned-embed-fold-assign-wrapped-child-refuses	{"a":{"k":1},"b":2}	. as $d | reduce (1) as $i ({w:$d}; .w.z = 1) | .w.a | path($d.a)
+owned-embed-fold-assign-sub-array-refuses	{"a":{"k":1},"b":2}	.a as $u | reduce (1) as $i ({w:$u}; .w -= []) | .w | path($u)
+owned-embed-fold-assign-fold-then-write-refuses	{"a":{"k":1},"b":2}	. as $x | reduce (1) as $i (.; .q = 1 | ($x.a) = 9)
+owned-embed-fold-assign-write-after-fold-refuses	{"a":{"k":1},"b":2}	. as $x | reduce (1) as $i (.; .q = 1) | ($x.a) = 9
+owned-embed-fold-assign-foreach-extract-refuses	{"a":{"k":1},"b":2}	. as $x | [foreach (1,2) as $i (.; .[$i|tostring] = $i; path($x))]
+owned-embed-fold-assign-loc	{"a":{"k":1},"b":2}	. as $d | reduce (1) as $i (.; .[$__loc__.line|tostring] = 1) | keys
+owned-embed-fold-assign-first	{"a":{"k":1},"b":2}	. as $d | first(reduce (1,2) as $i ({}; .x[$i] = 1))
+owned-embed-fold-assign-limit-foreach	{"a":{"k":1},"b":2}	. as $d | [limit(1; foreach (1,2,3) as $i ({}; .[$i|tostring] = $i))]
+owned-embed-fold-assign-error-mid-fold	{"a":{"k":1},"b":2}	. as $d | reduce (1,2) as $i ({}; .x[$i|tostring] = ($i | if . == 2 then error("boom") else . end))
+owned-embed-fold-assign-try-catch	{"a":{"k":1},"b":2}	. as $d | try (reduce (1,2) as $i ({}; .[$i|tostring] = $i, error("x"))) catch .
+owned-embed-fold-assign-multi-output-rhs	{"a":{"k":1},"b":2}	. as $d | reduce (1) as $i ({}; .a = (1,2))
+owned-embed-fold-assign-init-doc-nested-write	{"a":{"k":1},"b":2}	. as $d | reduce ("a") as $k (.; .[$k].k = 5) | .a
+owned-embed-fold-assign-rhs-document-field	{"a":{"k":1},"b":2}	. as $d | reduce (1,2) as $i ([]; .[$i] = $d.b)
+owned-embed-fold-assign-rhs-marker-bind	{"a":{"k":1},"b":2}	. as $d | reduce ("a") as $k ({}; .[$k] = $d) | .a | path($d)
+owned-embed-fold-assign-path-mode-fold	{"a":{"k":1},"b":2}	. as $d | path(reduce (1) as $i (.; .a = 1))
+owned-embed-fold-assign-wrapped-acc-field	{"a":{"k":1},"b":2}	. as $d | reduce range(5) as $i ({d: $d}; .n = $i) | .n
+owned-embed-fold-assign-compound-keys	{"a":{"k":1},"b":2}	. as $d | reduce ("x","y") as $k (.; .[$k] += 1) | keys
+owned-embed-fold-assign-compound-sum	{"a":{"k":1},"b":2}	. as $d | reduce (1,2,3) as $i ({}; .a += $i) | .a
+owned-embed-fold-assign-alt-first-wins	{"a":{"k":1},"b":2}	. as $d | reduce (1,2,3) as $i ({}; .a //= $i) | .a
+owned-embed-fold-assign-update-add	{"a":{"k":1},"b":2}	. as $d | reduce (1,2,3) as $i (.; .b |= . + $i) | .b
+owned-embed-fold-assign-deep-field	{"a":{"k":1},"b":2}	. as $d | reduce (1,2) as $i (.; .a.k = $i) | .a.k
 CASES_EOF
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
