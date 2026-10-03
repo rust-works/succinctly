@@ -14647,12 +14647,17 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: map_values(f)
-/// Whether `f` contains a pattern binding (`as`, `reduce`, `foreach`) -- the
-/// only constructs that can carry a `?//` chain. A superset is fine: routing a
-/// filter through `|=` that needs no retry reading gives the same answer.
-fn binds_patterns(f: &Expr) -> bool {
-    let shape = alloc::format!("{f:?}");
-    shape.contains("AsPattern") || shape.contains("Reduce {") || shape.contains("Foreach {")
+/// Whether `f` holds a `?//` alternative chain (more than one pattern). Only a
+/// chain can retry after the update's first output (#3524); the retry never
+/// surfaces as a second output through `map_values`' own first-output read, so
+/// the decision comes from the filter's shape (#3666).
+fn has_pattern_alternatives(f: &Expr) -> bool {
+    any_subexpr(f, &mut |e| match e {
+        Expr::AsPattern { patterns, .. }
+        | Expr::Reduce { patterns, .. }
+        | Expr::Foreach { patterns, .. } => patterns.len() > 1,
+        _ => false,
+    })
 }
 
 fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -14667,7 +14672,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // function's own arms below.
     if S::TAG == EvalTag::Jq
         && matches!(value, StandardJson::Object(_) | StandardJson::Array(_))
-        && binds_patterns(f)
+        && has_pattern_alternatives(f)
     {
         return eval_update::<W, S>(&Expr::Iterate, f, value, optional, false);
     }
