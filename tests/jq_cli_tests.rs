@@ -54398,6 +54398,142 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
     Ok(())
 }
 
+/// #3690: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and `objects`
+/// test the node's own type, as `type`, `scalars`, `iterables`, `values` and
+/// `select(type == ...)` always did. They used to fall through to the
+/// materializing fallback -- decode the whole input, re-enter the owned
+/// evaluator -- which doubled as a validity check on everything under the node
+/// they were handed, so `numbers` raised on a document whose `.a` it never
+/// looked at while `select(type == "number")`, which jq defines it as, answered.
+///
+/// **Every row diverges from jq**, which rejects this document at parse time
+/// whatever the filter. What #3690 changed is that the answering column grew,
+/// on the same footing as #2168: the contract pinned is succinctly's own,
+/// recorded with its cost in `docs/compliance/jq/limitations.md`. What a
+/// selector still does is raise when it is handed the unreadable thing itself.
+#[test]
+fn test_type_selectors_validate_only_what_they_read_3690() -> Result<()> {
+    let doc = r#"{"a":"\ud800","d":5}"#;
+
+    // Answers: tests a type, never decodes `.a`.
+    for (filter, want) in [
+        ("numbers", ""),
+        ("strings", ""),
+        ("nulls", ""),
+        ("booleans", ""),
+        ("arrays", ""),
+        (r#"try numbers catch "caught""#, ""),
+        ("objects | .d", "5"),
+        ("[.[] | numbers]", "[5]"),
+        ("[.[] | nulls]", "[]"),
+        ("[.[] | arrays]", "[]"),
+        ("[.[] | numbers, objects]", "[5]"),
+        // The undecodable string is dropped by every selector but `strings`,
+        // which hands it on as a cursor (#2575): counting what was selected
+        // reads nothing, and printing it echoes its raw source bytes (#2103).
+        (".a | numbers | length", ""),
+        ("[.[] | strings] | length", "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "{filter}");
+    }
+
+    // Raises: reads the string `strings` selected.
+    for filter in [
+        ".a | strings | length",
+        ".a | strings | ascii_downcase",
+        "[.[] | strings] | tojson",
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert!(
+            stderr.contains("invalid unicode escape sequence"),
+            "{filter}: {stderr:?}"
+        );
+    }
+
+    // Raises: the selector is handed a value the index could not read. That
+    // is `type`'s own rule (#3222), unchanged: only a *descendant* the
+    // selector never reads stopped raising.
+    for filter in ["[.[] | numbers]", ".[] | strings", "[.[] | nulls]"] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "[1.2.3, 4]", &["-c"])?;
+        assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert!(
+            stderr.contains("invalid numeric literal"),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3690: each of the six selectors is `select(type == "<its type>")`, which
+/// is how jq defines it, so it answers exactly what its definition answers --
+/// the same output and the same exit status -- over valid, undecodable and
+/// malformed documents alike, through every position a selector is used in.
+/// Before #3690 the selector and its definition disagreed on the same
+/// document (`numbers` raised where `select(type == "number")` answered).
+#[test]
+fn test_type_selectors_equal_their_definition_3690() -> Result<()> {
+    let docs = [
+        r#"{"a":1,"b":"x","c":null,"d":[1,"y",true,null,[2],{"k":3}],"e":{"f":true,"g":1.5}}"#,
+        r#"{"a":"\ud800","d":5}"#,
+        r#"["a\udc00b",1]"#,
+        "[1.2.3, 4]",
+        r#"{"a":1.2.3,"b":2}"#,
+        "[tru, 1]",
+        "[nul]",
+        "[]",
+        "{}",
+        "1",
+        "null",
+        r#""s""#,
+        "[NaN, 1]",
+        "[1e999, 123456789012345678901234567890]",
+        r#"1 "a" null [1] {"a":1}"#,
+        r#"[[[1,[2,[3,"x",null]]]],{"a":{"b":{"c":[true]}}}]"#,
+    ];
+    let templates = [
+        "{S}",
+        "[.[]? | {S}]",
+        "[.. | {S}]",
+        "[.. | {S}] | length",
+        "first(.. | {S})",
+        r#"try ({S}) catch "caught""#,
+        r#"[.[]? | try ({S}) catch "caught"]"#,
+        "[.. | {S} | type]",
+    ];
+    let mut compared = 0;
+    for (selector, ty) in [
+        ("nulls", "null"),
+        ("booleans", "boolean"),
+        ("numbers", "number"),
+        ("strings", "string"),
+        ("arrays", "array"),
+        ("objects", "object"),
+    ] {
+        let definition = format!(r#"select(type == "{ty}")"#);
+        for template in templates {
+            for doc in docs {
+                let ask = |body: &str| {
+                    let filter = template.replace("{S}", body);
+                    let (stdout, _stderr, code) = run_jq_stdin_streams(&filter, doc, &["-c"])?;
+                    Ok::<_, anyhow::Error>((stdout, code))
+                };
+                let got = ask(selector)?;
+                let want = ask(&definition)?;
+                assert_eq!(
+                    got, want,
+                    "{template} with `{selector}` vs `{definition}` on {doc}"
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert_eq!(compared, 6 * templates.len() * docs.len());
+    Ok(())
+}
+
 /// #2061: the walk's remaining arms — navigating *through* an absent node, and
 /// the multi-stage pipe forms.
 ///

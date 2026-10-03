@@ -1406,6 +1406,21 @@ fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &
         .map_or_else(|| value.type_name(), crate::yaml::ResolvedScalar::type_name)
 }
 
+/// `numbers`, `strings`, `nulls`, `booleans`, `arrays` and `objects` (#3690):
+/// the input itself when its jq type (tag-aware, like `type`) is `want`,
+/// nothing otherwise.
+fn select_by_type_generic<V: DocumentValue>(
+    value: V,
+    cursor: Option<V::Cursor>,
+    want: &str,
+) -> GenericResult<V> {
+    if tagged_type_name(&value, cursor) == want {
+        cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
+    } else {
+        GenericResult::None
+    }
+}
+
 /// Whether the node at `cursor` is null, an applicable explicit YAML tag
 /// deciding before the text does (`!!null foo` is null, `!!str null` is not
 /// -- #2639). A bare `value.is_null()` is not tag-aware (a `YamlValue` has no
@@ -1558,7 +1573,18 @@ fn yq_type_tag<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> String
         // `&c` (an elided-lifetime `&self` method) can't outlive this
         // scope even though the underlying text can -- same constraint
         // `tagged_type_name`'s own doc comment explains.
-        if let Some(tag) = c.explicit_tag().map(str::to_string) {
+        //
+        // A bare `!` is YAML's non-specific tag: it names no type, and go-yaml
+        // (so real yq) resolves the node from its content as it would with no
+        // tag at all -- `! tagged` is `!!str`, `! 1` is `!!int`, `!` alone is
+        // `!!null`, `! [a]` is `!!seq`. Reporting it as `!` was already wrong
+        // for plain navigation (`.[0] | tag`); a selector that hands the node
+        // on (#3690) made it visible one step further.
+        if let Some(tag) = c
+            .explicit_tag()
+            .filter(|tag| *tag != "!")
+            .map(str::to_string)
+        {
             return tag;
         }
     }
@@ -26265,6 +26291,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         | Builtin::IsString
         | Builtin::IsArray
         | Builtin::IsObject
+        | Builtin::Nulls
+        | Builtin::Booleans
+        | Builtin::Numbers
+        | Builtin::Strings
+        | Builtin::Arrays
+        | Builtin::Objects
         | Builtin::Iterables
         | Builtin::Scalars
             if value.is_error() =>
@@ -26315,6 +26347,33 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::None
             }
         }
+
+        // #3690: the other six selectors answer from the node's own type,
+        // as `iterables`/`scalars` above do. They used to fall through to
+        // the materializing `_` arm below, which decodes the whole value and
+        // re-enters the owned evaluator for what jq defines as
+        // `select(type == "number")` -- 13-16 allocator calls per element, three
+        // times what that definition costs here. Same type test as `type` and
+        // the `is*` family (`tagged_type_name`, so an explicit YAML tag decides
+        // before the text does); the input itself is handed on, so a cursor
+        // keeps its position for a later `path`/`key`.
+        Builtin::Nulls
+        | Builtin::Booleans
+        | Builtin::Numbers
+        | Builtin::Strings
+        | Builtin::Arrays
+        | Builtin::Objects => select_by_type_generic(
+            value,
+            cursor,
+            match builtin {
+                Builtin::Nulls => "null",
+                Builtin::Booleans => "boolean",
+                Builtin::Numbers => "number",
+                Builtin::Strings => "string",
+                Builtin::Arrays => "array",
+                _ => "object",
+            },
+        ),
 
         Builtin::First => {
             // jq: first == .[0], so [] and null both yield null
@@ -41898,6 +41957,45 @@ mod tests {
             before,
             "yq reindexed"
         );
+    }
+
+    /// #3690: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and
+    /// `objects` answer from the node's own type. They used to fall through to
+    /// the materializing fallback, which decoded each element and re-entered
+    /// the owned evaluator -- a reindex-bridge round trip per element -- for
+    /// what is `select(type == "...")`. `scalars` and `iterables` never did.
+    ///
+    /// Each shape is compared with the selector's definition, so a selector
+    /// that answers the wrong elements in any position fails here too, not
+    /// only one that goes back to the bridge.
+    #[test]
+    fn test_type_selectors_do_not_reindex_3690() {
+        let doc = r#"{"a":1,"b":"x","c":null,"d":[1,2],"e":{"f":true},"g":false}"#;
+        for (selector, ty) in [
+            ("nulls", "null"),
+            ("booleans", "boolean"),
+            ("numbers", "number"),
+            ("strings", "string"),
+            ("arrays", "array"),
+            ("objects", "object"),
+        ] {
+            let definition = format!(r#"select(type == "{ty}")"#);
+            for shape in [
+                "[.[] | {S}] | length",
+                "[.. | {S}] | length",
+                "first(.. | {S}) | type",
+                "[.. | {S} | type]",
+            ] {
+                let (out, reindexes) = outputs_and_reindexes(doc, &shape.replace("{S}", selector));
+                let (want, _) = outputs_and_reindexes(doc, &shape.replace("{S}", &definition));
+                assert!(
+                    !want.is_empty(),
+                    "{shape} with `{selector}` selected nothing"
+                );
+                assert_eq!(out, want, "{shape}: `{selector}` vs `{definition}`");
+                assert_eq!(reindexes, 0, "{shape} with `{selector}` reindexed");
+            }
+        }
     }
 
     /// #3477: a comma sequence that names a container node twice builds it
