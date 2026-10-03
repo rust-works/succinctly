@@ -31,6 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binaries, with cachegrind `Ir` identical to within 73 instructions in 132 million (code placement),
   while `[..] | length` over the 4 MB `arrays` file falls from 5.73 G to 2.14 G instructions (-62.7%).
 
+- **yq: sequence walks and record sorts are 3-20% faster wall-clock, from skipping delimiter
+  checks YAML cannot fail** (#2640). YAML validates delimiters while it parses, so every
+  delimiter check is a no-op there, but `element_gap_ok`, `value_delimiter_ok` and the free
+  `trailing_element_gap_ok` resolved a position or decoded a value before consulting one.
+  `DocumentCursor::HAS_DELIMITER_CHECKS` (`false` for YAML, `true` for JSON and any new
+  format) now lets them return at once. On a 10 MB fixture, M4 Pro and 7950X:
+  `.sequences | length` -18.1% and -20.2%, `[.sequences[]] | length` -17.0% and -17.9%,
+  `.sequences | sort | length` -5.9% and -7.1%, `.users | sort_by(.score) | length` -9.5%
+  and -10.6%, `.users | sort | length` -4.6% and -3.5%. A query that only counts records
+  moves by about 1%. Output is identical, and JSON is unchanged (every JSON row runs the same
+  instructions, +0.000%). The issue's other question, whether fusing JSON's repeated
+  position resolve is worth it, was measured and answered no: the repeat is a cache hit worth
+  at most ~2.9% of instructions on the worst shape. Details in `docs/parsing/yaml.md` (O8).
+
 - **jq: a `reduce`/`foreach` that assigns into its accumulator is linear inside an `as` binding
   too** (#3241). `. as $d | reduce $d.users[] as $r ({}; .[$r.name] = $r.score)` (and the same with
   `|=`, `op=`, `//=`, a `.x[$k]` chain, or an `INIT` of `$d` itself) skipped the owned step while the

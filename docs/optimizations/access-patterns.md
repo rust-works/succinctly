@@ -261,6 +261,15 @@ End to end, Apple M4 Pro, interleaved A/B with output identity gated, medians of
 -> 117.3 ms (-30%); the navigation-only control `keys_unsorted[0]` moved -1.3%,
 inside the harness's own noise floor.
 
+**The repeat, re-measured** (#2640). The second ask for a node's position in
+that walk (the gap check, then `value()`) is a cache hit for JSON: about 2.9%
+of instructions at most on the most resolve-dense shape, 0.1-0.5% on `sort`, so
+threading one resolved position down was not worth a second code path. YAML was
+the surprise: its delimiter checks cannot fail, but the helpers resolved a
+position or decoded a key before consulting them, which was 29-32% of the
+instructions of a scalar-sequence walk. See
+[O8 in the YAML parsing notes](../parsing/yaml.md#o8-skip-the-delimiter-checks-yaml-cannot-fail--accepted-).
+
 ---
 
 ## Temporal Locality

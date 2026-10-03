@@ -922,6 +922,13 @@ For detailed documentation on optimization techniques used in this project, see 
   - `yaml_bench` build-side clean (< 2% on 38/39 groups, both platforms) except one x86-only `block_scalars` anomaly (12-28%, reproduced twice), investigated and attributed to binary code-layout rather than the new logic: the BP structure for that workload is a fixed 7 words regardless of document size, too small to mechanistically explain the delta, and the same workload is neutral on ARM — filed as #595
   - Also surfaced a pre-existing, unrelated `yaml_bench` bug: the `anchors` group panics with `UnknownAnchor` on unmodified `main` too — filed as #594
   - See [docs/plan/cspoppy.md](docs/plan/cspoppy.md#5a-results-2026-08-03) for full analysis
+- ✅ O8 (Skip Delimiter Checks YAML Cannot Fail): **-17% to -20% wall-clock on scalar-sequence queries, -9.5% to -10.6% on record `sort_by`** (M4 Pro and 7950X), issue #2640
+  - The issue asked whether fusing the walk's double position-resolve was worth it. **JSON: no** — the repeat is a cache hit worth at most ~2.9% of instructions on the worst shape, 0.1-0.5% on `sort`. **YAML: the checks are dead code that still cost** — `element_gap_ok`, `value_delimiter_ok` and the free `trailing_element_gap_ok` resolved a position or decoded a value before consulting a delimiter check YAML can never fail
+  - `DocumentCursor::HAS_DELIMITER_CHECKS` (default `true`, `false` for `YamlCursor`) lets the three helpers return early; for JSON the branch folds away at compile time
+  - **Measured** (interleaved A/B, 0 output differences; cachegrind on a 7950X): `[.sequences[]] | length` -29% instructions / -17% to -18% wall, `.sequences | length` -32% / -18% to -20%, `.users | sort_by(...)` -13.6% / -9.5% to -10.6%; every JSON row +0.000% instructions
+  - **A test of "no work was done" must be able to fail**: the first draft of the cache-state test ended its sequence on the element the cache was parked on, so removing the guard still passed; found by mutating the guard, fixed by ending on a different element
+  - Key insight: a doc comment saying a default "costs them nothing" is a claim about the *default*, not about the code that decides whether to call it — the wrapper resolved a position before reaching the free default. Check what runs *before* the cheap branch
+  - See [docs/parsing/yaml.md#o8-skip-the-delimiter-checks-yaml-cannot-fail--accepted-](docs/parsing/yaml.md#o8-skip-the-delimiter-checks-yaml-cannot-fail--accepted-) for full analysis
 
 **UTF-8 validation optimizations:**
 - ⚠️ Broadword (SWAR) UTF-8 accept scan: opt-in only, **not the default** — issue #134

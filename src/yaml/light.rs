@@ -96,6 +96,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///
     /// Uses the direct BP-to-text mapping for O(1) lookup.
     pub fn text_position(&self) -> Option<usize> {
+        #[cfg(test)]
+        TEXT_POSITION_CALLS.with(|calls| calls.set(calls.get() + 1));
         self.index.bp_to_text_pos(self.bp_pos)
     }
 
@@ -7309,8 +7311,25 @@ fn decode_failure(e: YamlStringError) -> StreamFailure {
 /// itself to make a one-node unbounded chain.
 const MAX_ALIAS_CHAIN_DEPTH: usize = 65_536;
 
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`YamlCursor::text_position`] on this thread, counted in test
+    /// builds only (#2640): the direct observable for "a delimiter check
+    /// resolved a position", which does not depend on what `Debug` prints.
+    pub(crate) static TEXT_POSITION_CALLS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     type Value = YamlValue<'a, W>;
+
+    /// The YAML parser validates delimiters while it builds the index, and
+    /// this impl overrides none of the delimiter checks, so each is the
+    /// `true`-returning default; saying so lets the generic walk skip
+    /// resolving the position and decoding the key or value that only a check
+    /// would have read (#2640). `yaml_has_no_delimiter_checks_2640` pins the
+    /// two staying in step.
+    const HAS_DELIMITER_CHECKS: bool = false;
 
     #[inline]
     fn value(&self) -> Self::Value {
@@ -15387,6 +15406,106 @@ mod tests {
             }
         }
         panic!("Could not find value");
+    }
+
+    /// #2640: YAML declares it has no delimiter checks, and that claim is
+    /// only sound while every one of them is the `true`-returning default --
+    /// so this checks both halves. First the defaults, at every node of a
+    /// document that mixes block and flow collections, at that node's real
+    /// position and at the extremes, for every `expected` byte. Then that the
+    /// helpers which feed a check no longer resolve a position for it, counted
+    /// directly (`TEXT_POSITION_CALLS`) rather than inferred from a cache; a
+    /// control asserts a real `text_position()` does move the counter, so
+    /// "unchanged" cannot be vacuous. Each of the three guards was removed in
+    /// turn to confirm this fails.
+    #[test]
+    fn yaml_has_no_delimiter_checks_2640() {
+        fn has_checks<C: DocumentCursor>(_: &C) -> bool {
+            C::HAS_DELIMITER_CHECKS
+        }
+        fn calls() -> usize {
+            TEXT_POSITION_CALLS.with(core::cell::Cell::get)
+        }
+        // Every node: the root, children, siblings, recursively.
+        fn visit<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>, seen: &mut usize) {
+            *seen += 1;
+            let at = cursor.text_position().unwrap_or(0);
+            for pos in [0, at, usize::MAX] {
+                for expected in [None, Some(b','), Some(b':'), Some(b'}'), Some(b'x')] {
+                    assert!(
+                        cursor.preceding_delimiter_ok(pos, expected),
+                        "{pos} {expected:?}"
+                    );
+                }
+                assert!(cursor.trailing_element_gap_ok(pos, b']'), "{pos}");
+                assert!(cursor.trailing_element_gap_ok(pos, b'}'), "{pos}");
+                assert!(cursor.following_colon_ok(pos), "{pos}");
+            }
+            assert!(cursor.container_gap_ok(b']'));
+            assert!(cursor.container_gap_ok(b'}'));
+            let mut child = cursor.first_child();
+            while let Some(c) = child {
+                visit(c, seen);
+                child = c.next_sibling();
+            }
+        }
+        let rich = b"a: 1\nb: [1, 2, {c: d}]\ne:\n  - x\n  - y: z\n  - [p, q]\nf: {g: h, i: [j]}\n";
+        let index = YamlIndex::build(rich).unwrap();
+        let root = index.root(rich);
+        assert!(!has_checks(&root), "YAML declares no delimiter checks");
+        let mut seen = 0;
+        visit(root, &mut seen);
+        assert!(seen > 20, "the sweep reached {seen} nodes");
+
+        // The array side: park nothing, just count.
+        let yaml = b"- 1\n- 2\n- 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let YamlValue::Sequence(elements) = first_doc(index.root(yaml)) else {
+            panic!("expected a sequence"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixture above is a block sequence (#2640)"
+        };
+        let (first, rest) = elements.uncons_cursor().expect("first");
+        let (second, _) = rest.uncons_cursor().expect("second");
+        let before = calls();
+        assert!(first.element_gap_ok(true));
+        assert!(second.element_gap_ok(false));
+        assert!(crate::jq::document::trailing_element_gap_ok(&second, b']'));
+        assert_eq!(
+            calls(),
+            before,
+            "a delimiter check resolved a position it never reads"
+        );
+        let _ = second.text_position();
+        assert_eq!(
+            calls(),
+            before + 1,
+            "control: a real text_position is counted"
+        );
+
+        // The object arm: a member's value feeds `value_delimiter_ok` through
+        // `delimiters_ok`, which falls back to the value cursor's
+        // `text_position()` when the value carries no text start (YAML's never
+        // does).
+        let yaml = b"a: 1\nb: 2\nc: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let YamlValue::Mapping(fields) = first_doc(index.root(yaml)) else {
+            panic!("expected a mapping"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixture above is a block mapping (#2640)"
+        };
+        let (a, rest) = DocumentFields::uncons(&fields).expect("a");
+        let (b, _) = DocumentFields::uncons(&rest).expect("b");
+        let before = calls();
+        assert!(a.delimiters_ok::<YamlFields<'_, Vec<u64>>>(true));
+        assert!(b.delimiters_ok::<YamlFields<'_, Vec<u64>>>(false));
+        assert_eq!(
+            calls(),
+            before,
+            "a member's delimiter check resolved a position it never reads"
+        );
+        let _ = b.value_cursor.text_position();
+        assert_eq!(
+            calls(),
+            before + 1,
+            "control: a real text_position is counted"
+        );
     }
 
     /// Direct coverage for the stripped `line_comment` getter (issue #710)
