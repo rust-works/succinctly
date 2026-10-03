@@ -111441,7 +111441,7 @@ mod tests {
         // What `?` never swallows still escapes the shortcut as the same failure.
         match settle::<JqSemantics, _>(&iterate, None, &undecodable) {
             Some(Err(e)) => assert!(e.is_decode_failure()),
-            other => panic!("expected a decode failure, got {other:?}"),
+            other => panic!("expected a decode failure, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
         }
         // Not taken in yq mode, whatever the value.
         assert!(settle::<YqSemantics, _>(&iterate, None, &scalar).is_none());
@@ -111472,7 +111472,7 @@ mod tests {
                 QueryResult::None => "none".to_owned(),
                 QueryResult::Owned(v) => v.to_json(),
                 QueryResult::Error(e) => format!("error decode={}", e.is_decode_failure()),
-                other => panic!("`{filter}` on {json:?}: {other:?}"),
+                other => panic!("`{filter}` on {json:?}: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
             }
         }
         fn pushed<S: EvalSemantics>(json: &[u8], filter: &str) -> String {
@@ -111488,7 +111488,7 @@ mod tests {
                 Flow::Escaped(Control::Error(e)) => {
                     format!("escaped decode={} {out:?}", e.is_decode_failure())
                 }
-                _ => panic!("`{filter}` on {json:?}: unexpected flow"),
+                _ => panic!("`{filter}` on {json:?}: unexpected flow"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3689 pin, only reached when the pin is already failing"
             }
         }
         // Dropped: nothing, and no handler to run.
