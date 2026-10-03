@@ -38710,14 +38710,12 @@ fn builtin_navigation<S: EvalSemantics>(
         | Builtin::AnyF(_)
         | Builtin::All
         | Builtin::AllF(_)
+        // `flatten(n)` and `join(s)` are deliberately not here (#2646): their
+        // `$`-parameter runs before the iteration, so an argument that raises
+        // must win, and this table is consulted before anything is evaluated.
+        // Their iteration is refused once the call has produced a value
+        // instead ([`iterates_untracked_input`], #3711).
         | Builtin::Flatten
-        // #3711: `flatten(n)` is `if $x < 0 then error(...) else _flatten($x)
-        // end`, the same `reduce .[]` as `flatten`; `join(s)` is `reduce .[] as
-        // $i (null; ...)`. Both iterate a computed array the register is not
-        // on and so raise `near attempt to iterate through` in jq
-        // (`path([[1]] | flatten(1))`, `path(["a"] | join(","))`).
-        | Builtin::FlattenDepth(_)
-        | Builtin::Join(_)
         | Builtin::Map(_)
         | Builtin::FromEntries => Ok(Some(BuiltinNavigation::Iterate)),
         // The one entry whose answer depends on the *input*, because its
@@ -38967,6 +38965,45 @@ fn always_refuses_as_live_path<S: EvalSemantics>(
     }
 }
 
+/// The iteration `flatten(n)` and `join(s)` make over their input, refused when
+/// the leaf's input is not the register (#3711): jq defines both over `reduce
+/// .[] as $i (...)`, and that `.[]` path-checks its input, so
+/// `path([[1]] | flatten(1))` and `path(["a"] | join(","))` raise `near attempt
+/// to iterate through` while the same call on the register itself passes.
+///
+/// A sibling of [`always_refuses_as_live_path`] and run at the same two sites,
+/// for the same reason: **it must run on a value the call has produced, never as
+/// a pre-check.** `def flatten($x)` and `def join($x)` bind their argument as a
+/// `$param` before iterating, so an argument that raises (`join(error("boom"))`),
+/// `flatten`'s negative-depth guard and a type error on the input all win over
+/// the path error, which [`builtin_navigation`] -- consulted before anything is
+/// evaluated -- cannot honour (#2646). Unlike the always-refuses constructs it
+/// only applies to an input the register is not on, and the refusal is a guess
+/// where the register may have been lost ([`guess_refusal`]), exactly as the
+/// table's own are. jq mode only (ADR-0018). The message names the call's
+/// input, as jq's does.
+fn iterates_untracked_input<S: EvalSemantics>(
+    expr: &Expr,
+    trackable: bool,
+    input: &OwnedValue,
+    register_loss: &RegisterLoss,
+    snapshot: &Snapshot,
+) -> Option<EvalError> {
+    if S::TAG != EvalTag::Jq || trackable {
+        return None;
+    }
+    match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::FlattenDepth(_) | Builtin::Join(_)) => Some(guess_refusal(
+            EvalError::invalid_path_expression_near_iterate(input),
+            register_loss,
+            snapshot,
+            input,
+            Some(NavKind::Iterate),
+        )),
+        _ => None,
+    }
+}
+
 /// [`always_refuses_as_live_path`]'s sibling for the one shape that fell
 /// through it entirely: `match`/`scan`/`capture` (plus their `Flags` forms)
 /// produce **zero** values when the pattern never matches, and
@@ -39086,6 +39123,14 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
         &mut |v| {
             delivered += 1;
             if let Some(e) = always_refuses_as_live_path::<S>(expr, walk_input_reaches_object, &v) {
+                construct_refusal = Some(e);
+                return Demand::Stop;
+            }
+            // #3711: the iteration `flatten(n)`/`join(s)` make, on a value
+            // they have produced, so an argument's own error has already won.
+            if let Some(e) =
+                iterates_untracked_input::<S>(expr, trackable, value, register_loss, snapshot)
+            {
                 construct_refusal = Some(e);
                 return Demand::Stop;
             }
@@ -39429,6 +39474,13 @@ fn resolve_leaf<'a, S: EvalSemantics>(
                 construct_refusal = Some(e);
                 return Demand::Stop;
             }
+            // #3711: as in `resolve_leaf_sink`.
+            if let Some(e) =
+                iterates_untracked_input::<S>(expr, trackable, value, register_loss, snapshot)
+            {
+                construct_refusal = Some(e);
+                return Demand::Stop;
+            }
             values.push(v);
             if values.len() >= limit {
                 Demand::Stop
@@ -39609,7 +39661,9 @@ fn leaf_register<'a, S: EvalSemantics>(
 /// already in [`builtin_navigation`] for the access it makes. `flatten(n)` and
 /// `join(s)` are `reduce .[] as $i (...)` like `add`, with the depth or
 /// separator a `$param` binding (a subexp), so their one navigation is the
-/// `.[]` that [`builtin_navigation`] now names for them.
+/// `.[]` that [`iterates_untracked_input`] refuses on an input the register is
+/// not on, once the call has produced a value (not in [`builtin_navigation`],
+/// whose pre-evaluation check would pre-empt an argument's own error, #2646).
 fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
     cannot_move_register(expr)
         || (S::TAG == EvalTag::Jq

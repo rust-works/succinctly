@@ -500,7 +500,8 @@ Each turns a refusal into an answer and needs its own oracle rows:
   row each.~~ Done for `sort`, `to_entries`, `flatten`, `add`, `map(f)` and `walk(f)` by #3361, at the
   leaf (`leaves_register_in_place`) and as a stage (`resolve_seq_stage`'s `stage_preserves_register`).
   #3711 did `reverse`, `min`, `max`, `min_by(f)`, `max_by(f)`, `group_by(f)`, `sort_by(f)`,
-  `flatten(n)` and `join(s)`, and named `flatten(n)`/`join(s)` in `builtin_navigation`. Still
+  `flatten(n)` and `join(s)`, and refused `flatten(n)`/`join(s)` on an untracked input once the
+  call has produced a value (`iterates_untracked_input`; not `builtin_navigation`, #2646). Still
   refused, each needing its own row: a `map(f)`/`walk(f)` whose `f` navigates, and the rest of
   the builtins jq leaves in place (`ltrimstr`/`rtrimstr`, ...).
 - A register-position-aware `try` for the guess a lost `and`/`or` operand raises, so a refusal jq

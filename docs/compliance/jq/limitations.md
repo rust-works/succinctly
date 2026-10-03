@@ -1036,11 +1036,13 @@ is the revert that established what the other one costs.
      `flatten(n)` and `join(s)` theirs (`min_by`/`max_by`/`group_by`/`sort_by` take any `f`: it
      runs inside a C call's subexp). That also lifts the same refusal for each of them as a bare
      pipe stage -- `path(. as $x | to_entries | $x)` is `[]` in jq, and a write through the
-     re-established `$x` lands. `flatten(n)` and `join(s)` iterate, so they are named in
-     `builtin_navigation` and still raise on an input the register is not on
-     (`path([[1]] | flatten(1))`); before #3711 `flatten(1)` was not, and a `foreach` source
-     accepted `del(foreach .[]? as $k (.; flatten(1) and (.a)?; .b?))` on `[true]` where jq
-     raises (#3712).
+     re-established `$x` lands. `flatten(n)` and `join(s)` iterate, so they still raise on an
+     input the register is not on (`path([[1]] | flatten(1))`), checked once the call has
+     produced a value (`iterates_untracked_input`) and not in `builtin_navigation`, whose
+     pre-evaluation check would pre-empt an argument's own error (`join(error("boom"))` must
+     raise `boom`, #2646). Before #3711 nothing checked them, and a `foreach` source accepted
+     `del(foreach .[]? as $k (.; flatten(1) and (.a)?; .b?))` on `[true]` where jq raises
+     (#3712).
    - **A refusal jq makes and catches is loud here.** jq catches its own path error inside a
      `try`: `del(try (any and .a))` on `{"a":true}` leaves the document. Where an operand may have
      moved the register this resolver cannot tell which error jq would raise, so its refusal is a
@@ -1068,8 +1070,9 @@ is the revert that established what the other one costs.
      `del(. as $x ?// $y \| if $x then (.a and .b) else .c end)` on `{"a":1,"c":2}` refuses
      where jq retries past its own path error and answers `{"a":1}`. Before #3289 the by-value
      evaluation happened to give jq's answer there. #3711 moved `flatten(n)` and `join(s)` to the
-     same side of the line: naming them in `builtin_navigation` (so a `foreach` source stops
-     accepting what jq raises on, #3712) means `del(. as [$q] ?// $q | (flatten(1) and (.a)?))`
+     same side of the line: refusing their iteration on an untracked input (so a `foreach`
+     source stops accepting what jq raises on, #3712) means
+     `del(. as [$q] ?// $q | (flatten(1) and (.a)?))`
      on `[true]`, which jq answers with the document, now refuses as bare `flatten` and `add`
      always did. 48 sweep rows, all in the `?//` contexts and all loud refusals.
    - **Pointer identity** is modelled only for `null`/`true`/`false` and a full slice of a

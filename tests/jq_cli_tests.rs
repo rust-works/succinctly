@@ -62355,7 +62355,10 @@ fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()>
         ("[true]", r"del(sort_by(.) and .[0])", "[]\n", "", 0),
         ("[true]", r"del(flatten(1) and .[0])", "[]\n", "", 0),
         ("[true]", r#"del(join(",") and .[0])"#, "[]\n", "", 0),
-        // On an input the register is not on, what iterates still raises ...
+        // On an input the register is not on, what iterates still raises (once the
+        // call has succeeded: jq reports the path error before the body's own type
+        // error on `[[1],[2]] | join(",")`, this resolver the type error, both exit
+        // 5 with nothing on stdout) ...
         ("{}", r"path([[1]] | flatten(1))", "", bad, 5),
         ("{}", r#"path(["a"] | join(","))"#, "", bad, 5),
         (
@@ -62367,7 +62370,7 @@ fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()>
         ),
         (
             "{}",
-            r#"path(. as $x | [[1],[2]] | join(",") | $x)"#,
+            r#"path(. as $x | ["a","b"] | join(",") | $x)"#,
             "",
             bad,
             5,
