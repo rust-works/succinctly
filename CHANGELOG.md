@@ -29,12 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `fromjson | .id` on a 7950X). Against the previous route, re-measured from the PR's real
   merge-base at 10 MB of `-R` lines: the rows the generic evaluator answers natively are 41% to
   66% faster (`[match("a";"g")] | length`, `split(",") | length`, `fromjson | to_entries | length`),
-  writes 8% to 29% and `--slurp` 28% to 40% faster, and the rows that still bridge are +1% to
-  +19% slower on one chip or the other (`. + "x"` +9% to +12%, `sub` +6% to +8%, `ltrimstr` and
-  `startswith` under `--jq-extensions` +13% to +19%). A partial slice (`.[0:3]`) was +74% to +80%
-  until #3642. The first version of this entry said every `-R` row was within +6%; that came from
-  a baseline 15 commits older than the PR's merge-base and does not hold, and the residual stays
-  open under #3479. `to_json_for_reindex` now writes one buffer instead of a `String` per node,
+  writes 8% to 29% and `--slurp` 28% to 40% faster, and a scalar line that `.`, `. + "x"`,
+  `tostring` or a comparison answers is 46% to 81% faster, because it skips the index entirely.
+  The rows that still bridge (`sub`, `test`, `tojson`, `@base64`, a partial slice) are +3% to +8%
+  slower on an M4 Pro and up to +5.7% on a 7950X, and `ltrimstr`/`startswith` under
+  `--jq-extensions` +13% to +19%. A partial slice (`.[0:3]`) was +74% to +80% until #3642. The
+  first version of this entry said every `-R` row was within +6%; that came from a baseline 15
+  commits older than the PR's merge-base and does not hold. The residual, and the ceiling it is
+  judged against, are in `docs/compliance/jq/limitations.md`. `to_json_for_reindex` now writes one
+  buffer instead of a `String` per node,
   with identical bytes; every reindex bridge in both modes gets it. Output is unchanged, and
   `line`/`column`/`at_offset` after a write still answer the defaults, never a position in the
   re-indexed text (#3641).

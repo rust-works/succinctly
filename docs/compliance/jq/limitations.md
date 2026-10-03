@@ -8682,9 +8682,10 @@ plain `eval` it measured slower (7950X, interleaved, 9 reps, the `users` documen
 10 MB of `-R` lines: `select(test("age"))` +30%, `tojson` +41%, `sub` +32%, `fromjson | .id`
 +129%), because the generic evaluator answers a builtin it has no native arm for by decoding the
 value, writing it out again and indexing it again on every call, and `-R` makes one call per
-line. Three changes narrow that (#3535) and a fourth (#3642) closes a hole the first left; the
-first, third and fourth are scoped to the DOM route (no cursor on the `succinctly jq` route is
-ever registered), and the second is a plain speedup everywhere:
+line. Three changes narrow that (#3535), a fourth (#3642) closes a hole the first left and a fifth
+skips the index altogether for the shapes it can; the first, third, fourth and fifth are scoped to
+the DOM route (no cursor on the `succinctly jq` route is ever registered), and the second is a
+plain speedup everywhere:
 
 - The route calls the hidden `jq::eval_reindexed_document`, which is `eval` plus a registration
   of the document it was handed. A bridge whose value is that document's root evaluates over its
@@ -8699,6 +8700,12 @@ ever registered), and the second is a plain speedup everywhere:
   it has no native arm, asks the same question the bridges above it do and evaluates over the
   registered root's existing cursor (#3642). #3535 shipped without it: that arm bridged without
   asking, and `.[0:3]` paid a second serialize-and-index on every line.
+- For a scalar input, which is what `-R` hands the evaluator once per line, and a filter of one of
+  the shapes `eval_owned_fast_path` answers against the value itself (`.`, `.a`, `.[n]`,
+  `. + <literal>`, `tostring`, the composite comparisons), `evaluate_input` answers it without
+  writing the line out, indexing it or dispatching through the generic evaluator
+  (`jq::eval_owned_scalar_fast`). A container keeps the index route. The answers and errors are the
+  index route's, pinned by `registered_document_scalar_door_agrees_with_the_index_route_3479`.
 
 Result against the pre-#3479 route. #3535 first recorded "every `-R` row within +6%", which does
 not hold: it was measured against `c850a0683`, 15 commits before the PR's real merge-base
@@ -8738,11 +8745,19 @@ Rows that do not use `-R` moved the other way: writes (`.users[0].name = "x"`, `
 `del(.users[0])`, a `select` update) are 8% to 29% faster and `--slurp` 28% to 40%; `-P`, `--arg`
 and `-ea` are unchanged.
 
-What stays open is that per-line cost, which a native generic arm for the builtin removes. The gate
-#3479 set, no `-R` row outside the old route's noise floor, is not met: `. + "x"`, the string
-builtins and `@base64`/`tojson`/`sub` stay above it on at least one chip. This section records the
-residual rather than closing it; the issue keeps the decision between a native arm per hot builtin
-and a stated ceiling.
+After the scalar door, against the same pre-#3535 base and method (a control of -4.5%..+3.5% on an
+idle M4 Pro and -2.1%..+2.0% on the 7950X): the rows it answers (`.`, `. + "x"`, `tostring`,
+`. == "x"`) are 46% to 80% faster on the M4 Pro and 60% to 81% faster on the 7950X, in instructions
+68% to 87% fewer; writes and `--slurp` are unchanged against the commit before it (identical
+instruction counts). The rows that still go through the generic evaluator, the bridged builtins and
+the partial slice, are +3% to +8% slower on the M4 Pro (10 MB: `sub` +8.1%, `.[0:3]` +7.8%, `tojson`
++7.9%, `test` +7.3%) and from -3% to +5.7% on the 7950X, +2.4% to +5.2% in instructions. That is the
+generic evaluator's own cost per call, not an index build, and it is what #3479 is now judged
+against: a ceiling of +10% wall-clock and about +5% instructions for a yq-native `-R` row, in place
+of its original "no row outside the control's noise floor", which these rows do not meet. The string
+builtins that exist only under `--jq-extensions` (`ltrimstr`, `startswith`, `ascii_downcase`,
++9% to +19% as merged) are above even the ceiling and stay a recorded exception; a native generic
+arm per builtin is what removes them.
 
 Cursor metadata on that route is **not** read from the document it evaluates: the text is
 throwaway serialization, so `line`, `column`, `document_index`, `anchor`, `style`, the comment
