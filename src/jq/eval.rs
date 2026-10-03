@@ -70617,6 +70617,103 @@ mod tests {
         assert_eq!(after.get("z"), Some(&OwnedValue::Int(1)));
     }
 
+    /// #3241: the soundness argument for running the owned assignment under
+    /// the embed table is a refcount one -- a registered container is held by
+    /// the table's entry *and* by whoever else has it, so a write copies it
+    /// first. The test above has a third handle (the test's own `bound`), which
+    /// would copy even if the table held nothing. Here the only holders are
+    /// the entry and the accumulator, as in a real fold, so the copy happens
+    /// because of the entry and for no other reason: if the table stopped
+    /// holding a strong reference, the write would be in place and the result
+    /// would still be witnessed as the registered node.
+    ///
+    /// Then every arm of the step on a registered *child*: the ones that keep
+    /// the old value (`+= {}`, `+= null`, `|= . + null`, `*= {}`, a truthy
+    /// `//=`) hand back the very node, as jq does; the ones that change it
+    /// (`+= {"x": 1}`, `= 7`) leave the registered container untouched and
+    /// build a new one.
+    #[test]
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
+    fn owned_assign_step_copies_when_the_table_is_the_only_other_holder_3241() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let child = || OwnedValue::object_from([("k".to_string(), OwnedValue::Int(1))]);
+        let doc = |a: OwnedValue| {
+            OwnedValue::object_from([("a".to_string(), a), ("b".to_string(), OwnedValue::Int(2))])
+        };
+        let origin = |node| BindOrigin::Node { node, document: 42 };
+        let node = |node| RootWitness::Node { node, document: 42 };
+
+        // The registered *root*: entry plus accumulator, nothing else.
+        let _root = {
+            let bound = doc(child());
+            let guard = embed_table_push::<JqSemantics>(Some(&origin(7)), &mut bound.clone());
+            // A second entry for the child, so its identity can be read back.
+            let OwnedValue::Object(fields) = &bound else {
+                unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `doc` builds an object (#3241)"
+            };
+            let mut inner = fields.get("a").expect("child").clone();
+            let inner_guard = embed_table_push::<JqSemantics>(Some(&origin(8)), &mut inner);
+            drop(inner);
+            let written =
+                match try_owned_assign_step::<JqSemantics>(&parse(".z = 1").unwrap(), bound) {
+                    OwnedStep::Handled(Ok(written)) => written,
+                    _ => panic!("the assignment was not handled"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined or errored on the single closed assignment this test drives (#3241)"
+                };
+            assert_eq!(
+                RootWitness::of_owned::<JqSemantics>(&written),
+                RootWitness::Owned,
+                "the write copied the registered root off the entry's storage"
+            );
+            let OwnedValue::Object(after) = &written else {
+                unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- an object assignment keeps its kind (#3241)"
+            };
+            assert_eq!(
+                RootWitness::of_owned::<JqSemantics>(after.get("a").expect("kept child")),
+                node(8),
+                "the child the write left alone is still the registered node"
+            );
+            (guard, inner_guard)
+        };
+
+        // A registered *child*, one row per arm of the step.
+        for (src, keeps_node, want) in [
+            (".a += {}", true, child()),
+            (".a += null", true, child()),
+            (".a |= . + null", true, child()),
+            (".a *= {}", true, child()),
+            (".a //= 5", true, child()),
+            (
+                r#".a += {"x": 1}"#,
+                false,
+                OwnedValue::object_from([
+                    ("k".to_string(), OwnedValue::Int(1)),
+                    ("x".to_string(), OwnedValue::Int(1)),
+                ]),
+            ),
+            (".a = 7", false, OwnedValue::Int(7)),
+        ] {
+            let registered = child();
+            let _guard = embed_table_push::<JqSemantics>(Some(&origin(9)), &mut registered.clone());
+            let state = doc(registered);
+            let OwnedStep::Handled(Ok(written)) =
+                try_owned_assign_step::<JqSemantics>(&parse(src).unwrap(), state)
+            else {
+                panic!("not handled: {src}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if try_owned_assign_step declined or errored on a closed assignment this table asserts is always answered (#3241)"
+            };
+            let OwnedValue::Object(fields) = &written else {
+                unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- an object assignment keeps its kind (#3241)"
+            };
+            let a = fields.get("a").expect("a");
+            assert_eq!(a, &want, "{src}: value");
+            assert_eq!(
+                RootWitness::of_owned::<JqSemantics>(a) == node(9),
+                keeps_node,
+                "{src}: the registered child's identity"
+            );
+        }
+    }
+
     /// #3241: an UPDATE holding a marker is never closed, so the owned
     /// assignment declines it and the step takes the evaluator route with the
     /// witness #3181 gives it. A marker is how a binding's node reaches the

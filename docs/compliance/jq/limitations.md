@@ -7553,9 +7553,11 @@ that spread is code placement, not cost: the layout band
 What it does not change: a fold under an `as` whose UPDATE is not an owned
 assignment (`to_entries`, `from_entries`, `if`, one holding a marker) keeps the
 bridge. `until`/`while` read the same with and without the binding (0.28 s for
-100 steps over a 1.4 MB `{i:0, d:$d}` state on the M4 Pro, jq 0.017 s): their
-cost is the loop condition re-indexing a large owned state each step, which
-`loop_step_generic`'s own embed-table guard is not the cause of.
+100 steps over a 1.4 MB `{i:0, d:$d}` state on the M4 Pro, jq 0.017 s, against
+21.9 ms for a `reduce` over the same state), so what they pay per step is not
+the embed-table guard in `loop_step_generic` and this change does not touch it.
+The cause is not isolated; it is tracked in
+[#3674](https://github.com/rust-works/succinctly/issues/3674).
 
 ### `while`/`until`'s own step budget (#534/#2087): the identical bug #2079 already fixed for `reduce`/`foreach`
 
