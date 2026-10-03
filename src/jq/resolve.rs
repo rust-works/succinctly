@@ -4030,7 +4030,8 @@ mod tests {
                             };
                         }
                         let before = SCOPE_PROBES.with(core::cell::Cell::get);
-                        assert!(resolve_all(&mut expr).is_empty());
+                        let errors = resolve_all(&mut expr);
+                        assert!(errors.is_empty(), "{m} defs resolve cleanly: {errors:?}");
                         SCOPE_PROBES.with(core::cell::Cell::get) - before
                     };
                     (probes(500), probes(1000), probes(2000))
