@@ -32623,7 +32623,7 @@ fn needs_path_prepass(expr: &Expr) -> bool {
 }
 
 /// Like [`needs_path_prepass`], but also treats a bare `Iterate` (or
-/// `Optional(Iterate)`) as needing `resolve_seq`'s per-element fan-out loop.
+/// `Optional(Iterate)`) as needing `resolve_seq_sink`'s per-element fan-out loop.
 ///
 /// `needs_path_prepass` says `Iterate` doesn't need `resolve_node`'s help
 /// because `walk_path` and friends already understand it natively -- true,
@@ -32637,7 +32637,7 @@ fn needs_path_prepass(expr: &Expr) -> bool {
 /// container into O(n^2)-or-worse (measured ~250-1500x slower in review).
 ///
 /// This function instead answers a narrower question, asked only once
-/// `resolve_seq` has *already* been reached (a real computed key elsewhere
+/// `resolve_seq_sink` has *already* been reached (a real computed key elsewhere
 /// in the pipe, or -- unconditionally -- `resolve_recurse_sink` resolving `f`):
 /// can its "nothing left needs resolving" fast path assume the remaining
 /// tail is single-valued? For `Iterate` the answer is no --
@@ -32649,7 +32649,7 @@ fn needs_path_prepass(expr: &Expr) -> bool {
 /// a genuine computed key fixes that, without touching
 /// `resolve_dynamic_indexes`'s much more common no-computed-key fast path.
 ///
-/// No `Expr::Pipe` arm: this function's only caller (`resolve_seq`) always
+/// No `Expr::Pipe` arm: this function's only caller (`resolve_seq_sink`) always
 /// calls it on `flat`'s already-`push_path_components`-flattened elements,
 /// which never contains a raw `Pipe` at the top level. (Since #2909 an
 /// element *can* be an `Optional` wrapping one -- a group that can fan out
@@ -35075,7 +35075,7 @@ struct PathBranch<'a> {
     /// second ambient parameter threaded alongside `trackable` through
     /// every "passes a value through without navigating" arm (`select`,
     /// the typeof filters, a no-key `getpath([])`, an already-untracked
-    /// bare `.`, `resolve_seq`'s own seed/tail, and the recurse family's
+    /// bare `.`, `resolve_seq_sink`'s own seed/tail, and the recurse family's
     /// own seed/root entry), all via [`PathBranch::passthrough`] — the
     /// invariant is that `snapshot` implies `!trackable`, since a certified
     /// snapshot already resolves to a real path and needs no second
@@ -35132,7 +35132,7 @@ impl<'a> PathBranch<'a> {
     /// computed value into an accepted path, which on the write side means
     /// `del`/`=` hitting a path that was never really there. Review found
     /// four sites that a `true` default got wrong — `Select`, the type
-    /// filters, `Builtin::GetPath` and `resolve_seq`'s own root branch, all
+    /// filters, `Builtin::GetPath` and `resolve_seq_sink`'s own root branch, all
     /// of which pass a value *through* without navigating and so must
     /// inherit their caller's answer rather than assert one.
     ///
@@ -35154,7 +35154,7 @@ impl<'a> PathBranch<'a> {
     /// Build a branch for a site that passes an *ambient* `(trackable,
     /// snapshot)` pair straight through without navigating (#1591) —
     /// `select`, the typeof filters, a no-key `getpath([])`, an
-    /// already-untracked bare `.`, `resolve_seq`'s own seed/tail, and the
+    /// already-untracked bare `.`, `resolve_seq_sink`'s own seed/tail, and the
     /// recurse family's own seed/root entry all read this way.
     ///
     /// Forces `snapshot && !trackable` rather than trusting the caller to
@@ -35185,8 +35185,8 @@ impl<'a> PathBranch<'a> {
             // #1573: `passthrough` hands a value straight through without
             // navigating, so a live register would survive it — but every
             // one of its call sites sits *inside* a single resolve step,
-            // with no access to the register `resolve_seq` threads between
-            // steps. `resolve_seq`'s own loop re-attaches it around the
+            // with no access to the register `resolve_seq_sink` threads between
+            // steps. `resolve_seq_sink`'s own loop re-attaches it around the
             // call instead (see `carried_register` there), which keeps this
             // constructor's contract to its callers unchanged.
             register: BranchRegister::None,
@@ -35243,7 +35243,7 @@ impl<'a> PathBranch<'a> {
 
     /// Rebuild as `untracked`/`snapshot` according to `snapshot`, for the
     /// sites that demote a branch but must not lose its provenance — see
-    /// `FoldRegister::relocate` and `resolve_foreach`'s own emission (#1466).
+    /// `FoldRegister::relocate_one` and `resolve_foreach`'s own emission (#1466).
     fn demoted(snapshot: Snapshot, value: Cow<'a, OwnedValue>) -> Self {
         match snapshot {
             Snapshot::Marked(origin) => Self::marked(origin, value),
@@ -36269,7 +36269,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
 ) -> ResolveFlow {
     match expr {
         // `None`: an ordinary pipe has no externally-known register to
-        // inject (#2046) — see `resolve_seq`'s own doc comment.
+        // inject (#2046) — see `resolve_seq_sink`'s own doc comment.
         Expr::Pipe(exprs) => {
             resolve_seq_sink::<S>(exprs, value, trackable, snapshot, frame, keep, None, sink)
         }
@@ -39413,12 +39413,17 @@ fn computed_at_register(
 /// the driven operand superseded an outcome stashed at generation `at`
 /// (#3293's rule, in `ResolveFlow` terms).
 fn resolve_retry_superseded(flow: &ResolveFlow, at: u64, direct_retry: bool) -> bool {
-    let flow = match flow {
+    retry_superseded(&resolve_flow_as_flow(flow), at, direct_retry)
+}
+
+/// A resolver's verdict in [`Flow`] terms, for the #3293 stash helpers that
+/// speak `Flow` ([`resolve_retry_superseded`], [`StashedVerdict::settle`]).
+fn resolve_flow_as_flow(flow: &ResolveFlow) -> Flow {
+    match flow {
         ResolveFlow::Exhausted => Flow::Exhausted,
         ResolveFlow::Stopped => Flow::Stopped { pending: None },
         ResolveFlow::Escaped(escape) => Flow::Escaped(Control::from(escape.clone())),
-    };
-    retry_superseded(&flow, at, direct_retry)
+    }
 }
 
 /// Resolve `expr` against the *original* input `value` with jq's register at
@@ -39554,11 +39559,11 @@ fn forward_drained_result<'a>(
 /// is still in hand. Real jq does not lose it here: `value_at_path` is
 /// untouched by a literal, so a later `$var` frozen from this same position
 /// is still `jv_identical` to it (`path(. as $x | 5 | $x)` is `[]`).
-/// Recording it lets `resolve_seq` re-establish that.
+/// Recording it lets `resolve_seq_sink` re-establish that.
 ///
 /// Only meaningful when the incoming position *was* the register
 /// (`trackable`); otherwise the register is somewhere further back and
-/// `resolve_seq` carries its own copy forward instead.
+/// `resolve_seq_sink` carries its own copy forward instead.
 ///
 /// This records where the register stood *entering* the leaf, which is a
 /// fact about the incoming branch — the same for every value this call
@@ -40092,7 +40097,7 @@ fn patterns_all_bare(patterns: &[Pattern]) -> bool {
 /// per-stage rule (the original #1573 use, applied once to the register
 /// entering a step), the by-value leaf's own verdict ([`leaf_register`],
 /// #3456), `FoldRegister::advance`'s carry-forward across UPDATE into EXTRACT
-/// (#2046), and `FoldRegister::relocate`'s `identical_eligible` gate (#2860)
+/// (#2046), and `FoldRegister::relocate_one`'s `identical_eligible` gate (#2860)
 /// -- all ask the identical question ("could this expression's own execution
 /// have moved jq's real register") of a different expression, so one
 /// definition serves all of them rather than one per call site.
@@ -40369,7 +40374,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
         // this same check, never the reverse. Confirmed live: `path(. as
         // $x | foreach (1) as $i (0; reduce (1) as $j (0; $x)))` on `{"a":
         // 1}` is jq's `[]` (#1466's own nested-fold snapshot-passthrough
-        // case) -- lost when `FoldRegister::relocate`'s `identical()` was
+        // case) -- lost when `FoldRegister::relocate_one`'s `identical()` was
         // first gated on this predicate (#2860) before this arm existed,
         // since a bare `false` here made the outer register's own
         // `identical()` check ineligible even though nothing anywhere in
@@ -40460,7 +40465,7 @@ fn getpath_result_position<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq {
         // Review finding on #2896: `Snapshot::At` is **minted** in jq mode
         // only, which is what makes every downstream admission of it
-        // (`register_identical`, `FoldRegister::relocate`) jq-only without
+        // (`register_identical`, `FoldRegister::relocate_one`) jq-only without
         // each needing its own gate -- the variant simply never exists in yq
         // mode, so those arms are unreachable there. Gating at the two mint
         // sites rather than at the N admission sites is deliberate: it is one
@@ -40741,7 +40746,7 @@ fn fans_out(expr: &Expr) -> bool {
 /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type
 /// that has no pointer to compare — the single definition shared by every
 /// site that has to answer "is this branch still sitting *on* the path
-/// register?" (#1466 for the fold register, #1573 for `resolve_seq`'s own
+/// register?" (#1466 for the fold register, #1573 for `resolve_seq_sink`'s own
 /// pipe register).
 ///
 /// `jv_identical` is **not** structural equality. It compares the two `jv`s'
@@ -41123,7 +41128,7 @@ impl FoldRegister {
     /// reopening #1466's bug class through this second call site.
     ///
     /// **#2046**: when `expr` is (under any wrapping `Paren`) an
-    /// `Expr::Pipe`, this dispatches straight to [`resolve_seq`] with
+    /// `Expr::Pipe`, this dispatches straight to [`resolve_seq_sink`] with
     /// `self.value` threaded in as its externally-known register — rather
     /// than through the ordinary `resolve_against_cow`/`resolve_node`
     /// route, which has no parameter for one at all. That register is what
@@ -41135,7 +41140,7 @@ impl FoldRegister {
     /// describe. `tr` alone cannot express this: it says whether the
     /// accumulator *itself* is currently sitting at the register, which
     /// `INIT = 0` here already answered `false` — exactly the case
-    /// [`resolve_seq`]'s own carried-register mechanism (#1573/#2041)
+    /// [`resolve_seq_sink`]'s own carried-register mechanism (#1573/#2041)
     /// exists to recover from, just never wired to a fold's register until
     /// now. A bare `$var` (no chain after it) needs none of this: it
     /// resolves to a single untracked, snapshot-marked branch that
@@ -41154,6 +41159,33 @@ impl FoldRegister {
         snapshot: &Snapshot,
         keep: Keep,
     ) -> PathResolveResult<'a> {
+        collect_resolved(|sink| {
+            self.resolve_sink::<S>(expr, input, at_register, snapshot, keep, sink)
+        })
+    }
+
+    /// [`FoldRegister::resolve`] by demand (#3507): each relocated branch goes
+    /// to `sink` as `expr` produces it, so a consumer that answers
+    /// [`Demand::Stop`] reaches the generator before it is asked for the next
+    /// output -- and a `?//` inside `expr` is asked to retry at that stop, as
+    /// jq's is. `resolve` collects what this delivers and keeps the
+    /// all-at-once answer for `resolve_reduce`, whose UPDATE jq does evaluate
+    /// to completion; `foreach`'s UPDATE and EXTRACT, which jq drives one
+    /// output at a time, call this.
+    ///
+    /// Everything `resolve`'s own doc comment says holds here unchanged: this
+    /// *is* that body, with the final `collect`/`relocate` pass moved into the
+    /// sink wrapper, so the two cannot disagree on what a branch is. An escape
+    /// is reported once everything produced before it has been delivered.
+    fn resolve_sink<'a, S: EvalSemantics>(
+        &self,
+        expr: &Expr,
+        input: OwnedValue,
+        at_register: bool,
+        snapshot: &Snapshot,
+        keep: Keep,
+        sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+    ) -> ResolveFlow {
         let tr = self.trackable && at_register;
         // #2042: the register's own position is what a navigated marker in
         // UPDATE/EXTRACT is certified against -- whether or not the
@@ -41193,12 +41225,28 @@ impl FoldRegister {
         } else {
             self.frame.unknown()
         };
-        let resolved = if let Expr::Pipe(exprs) = unwrap_paren(expr) {
+        // #2860: `relocate`'s own `identical()` fallback re-derives
+        // trackability from this call's *entry-time* register
+        // (`self.value`/`self.frame`), which `resolve_seq_sink`/`resolve_node`
+        // may have already correctly moved past (or refused to move past)
+        // while resolving `expr` -- gating it on `cannot_move_register`
+        // is the same "did the expression this branch came from ever
+        // navigate" question [`FoldRegister::advance`] already asks
+        // before trusting its own analogous carry-forward. See
+        // `relocate`'s own doc comment for why a value-equality check
+        // alone (`identical()`'s whole job) cannot substitute for this.
+        let identical_eligible = cannot_move_register(expr);
+        // Each branch is owned before it leaves, which is what lets `sink`
+        // keep it past `input`'s own scope.
+        let mut deliver = |branch: PathBranch<'_>| {
+            sink(self.relocate_one::<S>(branch.into_owned_value(), identical_eligible))
+        };
+        if let Expr::Pipe(exprs) = unwrap_paren(expr) {
             // The register goes in as the explicit argument here, which
             // `resolve_seq_sink` prefers over the frame's and every later
             // stage overwrites from `carried_register` -- so the frame does
             // not carry it too (that copy would never be read).
-            resolve_seq::<S>(
+            resolve_seq_sink::<S>(
                 exprs,
                 &input,
                 tr,
@@ -41206,6 +41254,7 @@ impl FoldRegister {
                 &update_frame,
                 keep,
                 self.trackable.then_some(&self.value),
+                &mut deliver,
             )
         } else {
             let update_frame = update_frame.with_register(
@@ -41215,35 +41264,15 @@ impl FoldRegister {
                     None
                 },
             );
-            resolve_node::<S>(expr, &input, tr, snapshot, &update_frame, keep)
-        };
-        let owned = match resolved {
-            Ok(branches) => Ok(branches
-                .into_iter()
-                .map(PathBranch::into_owned_value)
-                .collect()),
-            Err((prefix, e)) => Err((
-                prefix
-                    .into_iter()
-                    .map(PathBranch::into_owned_value)
-                    .collect(),
-                e,
-            )),
-        };
-        // #2860: `relocate`'s own `identical()` fallback re-derives
-        // trackability from this call's *entry-time* register
-        // (`self.value`/`self.frame`), which `resolve_seq`/`resolve_node`
-        // may have already correctly moved past (or refused to move past)
-        // while resolving `expr` -- gating it on `cannot_move_register`
-        // is the same "did the expression this branch came from ever
-        // navigate" question [`FoldRegister::advance`] already asks
-        // before trusting its own analogous carry-forward. See
-        // `relocate`'s own doc comment for why a value-equality check
-        // alone (`identical()`'s whole job) cannot substitute for this.
-        let identical_eligible = cannot_move_register(expr);
-        match owned {
-            Ok(branches) => Ok(self.relocate::<S>(branches, identical_eligible)),
-            Err((prefix, e)) => Err((self.relocate::<S>(prefix, identical_eligible), e)),
+            resolve_node_sink::<S>(
+                expr,
+                &input,
+                tr,
+                snapshot,
+                &update_frame,
+                keep,
+                &mut deliver,
+            )
         }
     }
 
@@ -41252,7 +41281,7 @@ impl FoldRegister {
     /// has no pointer to compare (#1466).
     ///
     /// The rule itself lives in [`register_identical`], which
-    /// `resolve_seq`'s own pipe register shares (#1573); this adds only the
+    /// `resolve_seq_sink`'s own pipe register shares (#1573); this adds only the
     /// `trackable` precondition and the caller's explicit `eligible` gate
     /// (#2901). Eligibility can be expression-specific (`relocate`), jq-mode
     /// only (source fork 0 and accumulator re-entry), or unconditional
@@ -41275,9 +41304,9 @@ impl FoldRegister {
     /// intervening step that moved *past* the register and merely produced
     /// an equal-looking value (a missing-key/`null`-absorbing step whose
     /// result happens to still equal it, or genuinely lands on it) would
-    /// tautologically re-certify here even though `resolve_seq`/
+    /// tautologically re-certify here even though `resolve_seq_sink`/
     /// `resolve_node`'s own finer-grained tracking already, correctly,
-    /// marked it untracked. See [`relocate`](Self::relocate)'s own doc
+    /// marked it untracked. See [`relocate_one`](Self::relocate_one)'s own doc
     /// comment for the gate that gives this its precondition back.
     fn identical<S: EvalSemantics>(
         &self,
@@ -41290,77 +41319,76 @@ impl FoldRegister {
             && register_identical::<S>(&self.value, &self.frame, value, snapshot)
     }
 
+    /// Place one branch of `resolve_sink`'s output on this register (#3507:
+    /// applied as each is delivered; `resolve_reduce`'s final emission calls it
+    /// directly).
+    ///
     /// `identical_eligible` -- **#2860**: whether `self.identical`'s
     /// coarse, position-blind value-equality check is even a valid
     /// question to ask for the expression `branches` came from. `false`
     /// whenever [`cannot_move_register`] says that expression could have
-    /// navigated -- in that case, `resolve_seq`/`resolve_node` already had
+    /// navigated -- in that case, `resolve_seq_sink`/`resolve_node` already had
     /// a full, position-aware chance to reestablish trackability (the
     /// `b.trackable == true` arm below, unaffected by this parameter), and
     /// its verdict must not be second-guessed by a check that only knows
     /// this call's *entry-time* register, not wherever that expression
     /// actually navigated -- `self.value` is always exactly `$var`'s own
     /// frozen value whenever `$var` appears anywhere downstream, so
-    /// `identical()` would otherwise re-certify a branch `resolve_seq`
+    /// `identical()` would otherwise re-certify a branch `resolve_seq_sink`
     /// already, correctly, refused (`path(foreach .a as $v0 (.; $v0;
     /// (.zzz | $v0)))` answered `["a"]` instead of raising, and `=`/`|=`/
     /// `del()` through it corrupted a document jq refuses to touch).
     ///
-    /// True for [`FoldRegister::resolve`]'s own two callers, gated on the
+    /// True for [`FoldRegister::resolve_sink`], gated on the
     /// expression just resolved; unconditionally `true` at
     /// [`resolve_reduce`]'s final-emission call site, which builds its
     /// branch directly from the fold's own accumulator rather than from a
     /// `resolve()` call and has no single expression to gate on -- see
     /// that call site's own doc comment for why `identical()` must stay
     /// available there.
-    fn relocate<'a, S: EvalSemantics>(
+    fn relocate_one<'a, S: EvalSemantics>(
         &self,
-        branches: Vec<PathBranch<'a>>,
+        b: PathBranch<'a>,
         identical_eligible: bool,
-    ) -> Vec<PathBranch<'a>> {
-        branches
-            .into_iter()
-            .map(|b| {
-                if b.trackable {
-                    let path = PathPrefix::extend_many(&self.path, b.path.to_vec());
-                    PathBranch::new(path, b.value, true)
-                } else if self.identical::<S>(
-                    &b.value,
-                    &b.snapshot,
-                    // #2896: #2860's gate exists to stop *position-blind*
-                    // value equality from second-guessing a verdict
-                    // `resolve_seq`/`resolve_node` already reached with full
-                    // position awareness. A `Snapshot::At` mark is not
-                    // position-blind: it is an exact absolute-position proof,
-                    // minted by the `getpath` arm at the moment it produced
-                    // this very value, from the input's own proven position
-                    // composed with the keys it actually navigated. So it is
-                    // admitted even where `cannot_move_register(expr)` is
-                    // `false` -- which for `getpath` it always is.
-                    //
-                    // Deliberately *not* widened to `Marked(Origin::At)`,
-                    // which `Snapshot::position` also answers for: a `Marked`
-                    // origin names where a *variable* was bound, which says
-                    // nothing about where the expression that produced this
-                    // branch ended up, and admitting it here is exactly the
-                    // regression #2860 closed (`path(foreach .a as $v0 (.;
-                    // $v0; (.zzz | $v0)))` answered `["a"]` instead of
-                    // raising, and `del()` through it corrupted a document jq
-                    // refuses to touch).
-                    identical_eligible || b.snapshot.proves_position(),
-                ) {
-                    PathBranch::new(Rc::clone(&self.path), b.value, true)
-                } else {
-                    // Demoting must not erase the snapshot mark: a fold
-                    // nested inside another one has its own, untrackable
-                    // register, and the *outer* register is the one that can
-                    // still recognise the value (confirmed live,
-                    // `path(. as $x | reduce (1) as $i (0; reduce (1) as $j
-                    // (0; $x)))` is `[]`). #1466.
-                    PathBranch::demoted(b.snapshot, b.value)
-                }
-            })
-            .collect()
+    ) -> PathBranch<'a> {
+        if b.trackable {
+            let path = PathPrefix::extend_many(&self.path, b.path.to_vec());
+            PathBranch::new(path, b.value, true)
+        } else if self.identical::<S>(
+            &b.value,
+            &b.snapshot,
+            // #2896: #2860's gate exists to stop *position-blind*
+            // value equality from second-guessing a verdict
+            // `resolve_seq_sink`/`resolve_node` already reached with full
+            // position awareness. A `Snapshot::At` mark is not
+            // position-blind: it is an exact absolute-position proof,
+            // minted by the `getpath` arm at the moment it produced
+            // this very value, from the input's own proven position
+            // composed with the keys it actually navigated. So it is
+            // admitted even where `cannot_move_register(expr)` is
+            // `false` -- which for `getpath` it always is.
+            //
+            // Deliberately *not* widened to `Marked(Origin::At)`,
+            // which `Snapshot::position` also answers for: a `Marked`
+            // origin names where a *variable* was bound, which says
+            // nothing about where the expression that produced this
+            // branch ended up, and admitting it here is exactly the
+            // regression #2860 closed (`path(foreach .a as $v0 (.;
+            // $v0; (.zzz | $v0)))` answered `["a"]` instead of
+            // raising, and `del()` through it corrupted a document jq
+            // refuses to touch).
+            identical_eligible || b.snapshot.proves_position(),
+        ) {
+            PathBranch::new(Rc::clone(&self.path), b.value, true)
+        } else {
+            // Demoting must not erase the snapshot mark: a fold
+            // nested inside another one has its own, untrackable
+            // register, and the *outer* register is the one that can
+            // still recognise the value (confirmed live,
+            // `path(. as $x | reduce (1) as $i (0; reduce (1) as $j
+            // (0; $x)))` is `[]`). #1466.
+            PathBranch::demoted(b.snapshot, b.value)
+        }
     }
 
     /// Move to a trackable UPDATE branch, for resolving `foreach`'s EXTRACT
@@ -41389,11 +41417,11 @@ impl FoldRegister {
     /// `value_at_path` regardless of the `catch`. Before this gate, this
     /// function carried `self` (wherever the register was *before* UPDATE
     /// ran) forward unconditionally whenever `branch` was untracked, and
-    /// that was already reachable through [`FoldRegister::relocate`]'s own
+    /// that was already reachable through [`FoldRegister::relocate_one`]'s own
     /// pre-existing `identical()` check — which consults exactly `self`
     /// (this type's own `value`/`trackable`, i.e. `advance`'s own return
     /// value threaded in as `extract_reg`) once EXTRACT's own resolution
-    /// finishes, with no dependency on #2046's own `resolve_seq` register
+    /// finishes, with no dependency on #2046's own `resolve_seq_sink` register
     /// injection at all. Differential fuzzing against jq 1.7.1, run against
     /// a build *without* #2046's own change as a baseline check, still
     /// found it: `path(. as $x | foreach (1,2,3) as $k (null; try $x.c
@@ -41403,7 +41431,7 @@ impl FoldRegister {
     /// `cannot_move_register(Select)` being `false`, but the fabrication
     /// originates one step earlier, at this function, independent of that).
     /// Reusing [`cannot_move_register`] — already the exact, oracle-verified
-    /// allowlist [`resolve_seq`]'s own stage-to-stage carrying uses for this
+    /// allowlist [`resolve_seq_sink`]'s own stage-to-stage carrying uses for this
     /// identical question — is what closes it: only a
     /// syntactically-provable-safe UPDATE (a literal, `$var`, arithmetic
     /// over safe operands, ...) still carries `self` forward; anything else
@@ -41616,7 +41644,7 @@ fn drive_fold_source<S: EvalSemantics>(
             // `register_path` -- rebased onto the register for the one
             // ambient shape whose paths come back relative to it
             // (`FoldSourceAmbient::relocate`, #2388), mirroring
-            // `FoldRegister::relocate`'s own trackable arm.
+            // `FoldRegister::relocate_one`'s own trackable arm.
             let rebase = |path: &Rc<PathPrefix>| match relocate_base {
                 Some(base) => PathPrefix::extend_many(base, path.to_vec()),
                 None => Rc::clone(path),
@@ -41625,7 +41653,7 @@ fn drive_fold_source<S: EvalSemantics>(
             // #2159: an *untracked* element can still have moved the
             // register -- `.a | tostring` navigates, then computes -- and
             // the branch says where: an untracked branch that navigated
-            // keeps the register's own path, and `resolve_seq` carries the
+            // keeps the register's own path, and `resolve_seq_sink` carries the
             // register's value alongside it (`carry_register`, #1573). A
             // branch still at the root never navigated (a literal, an `as`
             // source, a conditional whose taken arm computes, the first
@@ -44010,7 +44038,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // `identical()` must stay available here (see this call's own
         // surrounding doc comment for why a trackable-but-not-at-register
         // accumulator still needs it).
-        if emit_branches(reg.relocate::<S>(vec![final_branch], true), sink) == Demand::Stop {
+        if sink(reg.relocate_one::<S>(final_branch, true)) == Demand::Stop {
             fork_outcome.stash(ResolveFlow::Stopped);
             return Demand::Stop;
         }
@@ -44415,31 +44443,45 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         // jq's generator does (`path(foreach (1) as $x (.; (.a,
                         // error("x"))))` prints `["a"]` before raising), and then
                         // either retries from the last of them or propagates.
-                        let (update_branches, update_escape) = match active_reg.resolve::<S>(
-                            &bound_update,
-                            core::mem::replace(&mut state, OwnedValue::Null),
-                            active_at_register,
-                            &state_snapshot,
-                            keep,
-                        ) {
-                            Ok(branches) => (branches, None),
-                            Err((prefix, e)) => (prefix, Some(e)),
-                        };
-                        // Each UPDATE output becomes the state *before* it is emitted --
-                        // jq stores it first, then runs EXTRACT/emits -- so the last one
-                        // carries forward as the next element's state (same rule as
-                        // `eval_foreach`), with its provenance (#1590, mirroring
-                        // `resolve_reduce`'s `acc_at_register`/`acc_snapshot`). The
-                        // ordering is observable once a stop is retried by a source
-                        // `?//`: the retried step re-enters from the refused output, not
-                        // from the state before it, which is how `path(foreach (1 as $x
-                        // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
-                        // then . else $v end))` names `1` in jq 1.7.1's second refusal.
-                        if update_branches.is_empty() {
-                            (state_at_register, state_snapshot) =
-                                reg.branch_provenance::<S>(None, frame);
-                        }
-                        for update_branch in &update_branches {
+                        //
+                        // #3507: UPDATE is driven by demand, one output at a time,
+                        // with that output's EXTRACT and emission run inside the sink
+                        // before the generator is asked for the next. Collecting it
+                        // first ran every later fork's side effects before a consumer
+                        // that stopped at the first output could say so, and a `?//`
+                        // inside UPDATE never saw the stop it retries at --
+                        // `first(path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))`
+                        // wrote `ab` where jq writes `a`. `resolve_reduce`'s UPDATE stays
+                        // collected: jq evaluates every one of its outputs.
+                        let entry_state = core::mem::replace(&mut state, OwnedValue::Null);
+                        let entry_snapshot = state_snapshot.clone();
+                        let mut delivered = false;
+                        let update_stop_at = core::cell::Cell::new(None::<u64>);
+                        let mut on_update = |update_branch: PathBranch<'a>| -> Demand {
+                            delivered = true;
+                            // This closure runs again when a `?//` inside UPDATE
+                            // retries past a stop it answered, so the verdicts the
+                            // previous run left are stale: a leftover
+                            // `downstream_stopped` outranks the fresh escape EXTRACT
+                            // raises on the retried alternative (the caller reads it
+                            // before `aborted`), and the error is swallowed.
+                            outcome = None;
+                            downstream_stopped = None;
+                            aborted.begin();
+                            let update_branch = &update_branch;
+                            // Each UPDATE output becomes the state *before* it is
+                            // emitted -- jq stores it first, then runs EXTRACT/emits
+                            // -- so the last one carries forward as the next
+                            // element's state (same rule as `eval_foreach`), with its
+                            // provenance (#1590, mirroring `resolve_reduce`'s
+                            // `acc_at_register`/`acc_snapshot`). The ordering is
+                            // observable once a stop is retried by a source `?//`: the
+                            // retried step re-enters from the refused output, not from
+                            // the state before it, which is how `path(foreach (1 as $x
+                            // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
+                            // then . else $v end))` names `1` in jq 1.7.1's second
+                            // refusal.
+                            //
                             // Every output, not just the last: a review pass tried
                             // carrying only the last one (the others are read straight
                             // off `update_branch` for EXTRACT/emission, so the clone
@@ -44461,7 +44503,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 let extract_reg =
                                     active_reg.advance(update_branch, &bound_update, frame);
                                 // `update_branch` is itself already relocated (it's
-                                // `active_reg.resolve()`'s own output above), and
+                                // `active_reg.resolve_sink()`'s own output above), and
                                 // `advance()` built `extract_reg` from this same
                                 // branch, so `extract_reg`'s own `branch_provenance` of
                                 // it answers exactly `update_branch`'s `(trackable,
@@ -44469,14 +44511,15 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 // `identical()` check (#1590).
                                 let (extract_at_register, extract_snapshot) =
                                     extract_reg.branch_provenance::<S>(Some(update_branch), frame);
-                                match drain_path_result(
-                                    extract_reg.resolve::<S>(
-                                        ext_expr,
-                                        update_branch.value.clone().into_owned(),
-                                        extract_at_register,
-                                        &extract_snapshot,
-                                        keep,
-                                    ),
+                                // #3507: EXTRACT is driven by demand too, straight into
+                                // the outer sink, so `first(path(foreach 1 as $x (.; .;
+                                // .[("a"|stderr), ("b"|stderr)])))` stops after `a`.
+                                match extract_reg.resolve_sink::<S>(
+                                    ext_expr,
+                                    update_branch.value.clone().into_owned(),
+                                    extract_at_register,
+                                    &extract_snapshot,
+                                    keep,
                                     sink,
                                 ) {
                                     // #2979 rule 3: anything after `STOREV` that escapes --
@@ -44530,8 +44573,60 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                     return Demand::Stop;
                                 }
                             }
+                            Demand::Continue
+                        };
+                        let flow = active_reg.resolve_sink::<S>(
+                            &bound_update,
+                            entry_state,
+                            active_at_register,
+                            &entry_snapshot,
+                            keep,
+                            &mut |update_branch| {
+                                let demand = on_update(update_branch);
+                                if demand == Demand::Stop {
+                                    update_stop_at.set(Some(pipe_retry_generation()));
+                                }
+                                demand
+                            },
+                        );
+                        // The sink answered `Stop`: its own verdict is in `outcome`,
+                        // and a flow that merely ended early (a bounded consumer
+                        // *inside* UPDATE) is a success for this step.
+                        //
+                        // Unless a `?//` inside UPDATE retried past that stop (#3293,
+                        // the rule INIT's drive applies to its forks): a retry that then
+                        // produced nothing, or raised, is jq's answer, and the verdict
+                        // belongs to an alternative it abandoned. `foreach 1 as $x (.;
+                        // .[(["a"] as [$q] ?// $b | if $q then "a" else ["x"] end)])`
+                        // under `first(path(...))` raises the index error from the
+                        // second alternative once `first` has stopped the first.
+                        if outcome.is_some() {
+                            let update_direct_retry = direct_pattern_retry(&bound_update);
+                            // An escape stashed in `aborted` is dropped by `settle` only
+                            // when a retry consumed it and it is retryable; any other
+                            // verdict is a plain stop, superseded by the same rule.
+                            let stashed = aborted.is_set();
+                            if stashed {
+                                aborted.settle(&resolve_flow_as_flow(&flow), update_direct_retry);
+                            }
+                            let superseded = if stashed {
+                                !aborted.is_set()
+                            } else {
+                                update_stop_at.get().is_some_and(|at| {
+                                    resolve_retry_superseded(&flow, at, update_direct_retry)
+                                })
+                            };
+                            if !superseded {
+                                return Demand::Stop;
+                            }
+                            outcome = None;
+                            downstream_stopped = None;
                         }
-                        if let Some(e) = update_escape {
+                        if !delivered {
+                            (state_at_register, state_snapshot) =
+                                reg.branch_provenance::<S>(None, frame);
+                        }
+                        if let ResolveFlow::Escaped(e) = flow {
                             outcome = Some(if path_alternative_retries(&e, is_last) {
                                 FoldStepOutcome::Retry
                             } else {
@@ -44652,7 +44747,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
 /// fallacy `#986` Stage 2 already found and removed for `Expr::Comma` (see
 /// that arm's own comment). Fixed the same way (#1297): each branch now
 /// simply carries its own `trackable` outward, and whoever turns out to be
-/// terminal decides — `resolve_seq`'s fan-out loop / `resolve_static_tail`
+/// terminal decides — `resolve_seq_sink`'s fan-out loop / `resolve_static_tail`
 /// for a pipe continuation, `resolve_index_expr`/`resolve_slice_expr`'s own
 /// post-target check for `(try ... catch .)[K]`/`[S:T]`, or
 /// `resolve_dynamic_indexes`'s own terminal check when nothing follows at
@@ -45885,7 +45980,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
             snapshot: node_snapshot,
             // #1573: the recurse family walks *into* the document, so every
             // node it visits is reached by navigation and carries no
-            // separate register of its own. `resolve_seq` re-attaches the
+            // separate register of its own. `resolve_seq_sink` re-attaches the
             // pipe register around this whole call if one is live.
             register: _,
         } = node;
@@ -47405,7 +47500,7 @@ fn eval_static_component_fallback<S: EvalSemantics>(
 ) -> Result<Option<OwnedValue>, EvalEscape> {
     let mut values = eval_owned_multi::<S>(component, current)?;
     // Every caller hands this a tail already proven single-valued by
-    // construction (`resolve_seq`, gated on `needs_fanout_pass`) -- a
+    // construction (`resolve_seq_sink`, gated on `needs_fanout_pass`) -- a
     // `> 1` output count here is a genuine invariant violation, not
     // the ordinary "component matched nothing" case (a missing key
     // still yields exactly one output, `null`). #682 was exactly
@@ -47569,13 +47664,13 @@ fn navigate_static_component_ref<'v, S: EvalSemantics>(
 
 /// [`value_after_components`], except when `trackable` is false (#843): then
 /// it raises immediately instead of walking anything, exactly the way
-/// `resolve_seq`'s top-level fast path already did before this helper
+/// `resolve_seq_sink`'s top-level fast path already did before this helper
 /// existed — `#530`'s classic "with result" message if `components` is
 /// empty (nothing left to navigate, so `value` itself, still untracked, is
 /// the final answer), or the "near attempt" message naming the first
 /// component otherwise.
 ///
-/// Shared by two call sites in `resolve_seq`: the top-level no-computed-key
+/// Shared by two call sites in `resolve_seq_sink`: the top-level no-computed-key
 /// fast path, and the tail applied after an earlier dynamic step in the
 /// same pipe has already run. That second site is why this exists as its
 /// own function rather than being inlined once — `Builtin::GetPath`'s
@@ -47654,7 +47749,7 @@ fn resolve_static_tail<'a, S: EvalSemantics>(
 /// `Ok(None)` is a `?`-suppressed step in `tail` pruning the branch (#2124)
 /// -- zero output, not a fabricated `null` one. `Err` is a genuine tail
 /// failure; the caller keeps whatever it had already emitted, which is
-/// `resolve_seq`'s own "keep what already resolved" contract (#977, #1013).
+/// `resolve_seq_sink`'s own "keep what already resolved" contract (#977, #1013).
 ///
 /// [`resolve_seq_stage`] calls this on every branch that reaches the end of
 /// the fan-out -- whether it got there cleanly or is the partial output of
@@ -47773,7 +47868,7 @@ struct StepRegisterFacts {
 /// jq mode only: real yq no-ops a field/index access against a scalar
 /// (#1181's convention) rather than navigating through it, a rule neither
 /// call site knows about — this resolver's `resolve_leaf` fallback (what
-/// `resolve_seq` ultimately reaches for a literal like the `null` here) is
+/// `resolve_seq_sink` ultimately reaches for a literal like the `null` here) is
 /// part of the "dynamic-prepass" family #1419 already tracks as having no
 /// yq-mode exception anywhere — so yq mode treats a still-trackable
 /// branch's own step as ineligible
@@ -48094,37 +48189,6 @@ fn resolve_seq_from_seed<'a, S: EvalSemantics>(
     };
 
     resolve_seq_stage::<S>(&flat, last_dynamic, 0, seed, frame, keep, sink)
-}
-
-/// Collecting adapter over [`resolve_seq_sink`], for the callers that still
-/// want a materialized `Vec<PathBranch>` ([`FoldRegister::resolve`]).
-fn resolve_seq<'a, S: EvalSemantics>(
-    exprs: &[Expr],
-    value: &'a OwnedValue,
-    trackable: bool,
-    snapshot: &Snapshot,
-    frame: &Frame,
-    keep: Keep,
-    register: Option<&'a OwnedValue>,
-) -> PathResolveResult<'a> {
-    let mut out = Vec::new();
-    let flow = resolve_seq_sink::<S>(
-        exprs,
-        value,
-        trackable,
-        snapshot,
-        frame,
-        keep,
-        register,
-        &mut |b| {
-            out.push(b);
-            Demand::Continue
-        },
-    );
-    match flow {
-        ResolveFlow::Exhausted | ResolveFlow::Stopped => Ok(out),
-        ResolveFlow::Escaped(e) => Err((out, e)),
-    }
 }
 
 /// Thread one branch through `flat[stage_index..]` and the static tail,
@@ -48698,12 +48762,12 @@ fn assemble_one_branch(branch: &PathBranch<'_>) -> Expr {
 /// makes it the one place that can answer "is this untracked value
 /// actually an error?" with a plain yes.
 ///
-/// It has to live here rather than in `resolve_seq`, for two reasons that
-/// each break the alternative on their own. `resolve_seq` never runs at
+/// It has to live here rather than in `resolve_seq_sink`, for two reasons that
+/// each break the alternative on their own. `resolve_seq_sink` never runs at
 /// all for a non-`Pipe` expression, so `path(1)` and — far worse —
 /// `del(1)` would sail past every check and be assembled into
 /// `Expr::Identity` below, silently deleting the whole document (the
-/// shapes pinned in #1284). And `resolve_seq` cannot know whether it is
+/// shapes pinned in #1284). And `resolve_seq_sink` cannot know whether it is
 /// terminal even when it does run, because it is also reached as an
 /// `IndexExpr`/`SliceExpr` target, where its own tail is empty but the
 /// enclosing key still has to be navigated.
@@ -49157,7 +49221,7 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
 ///   path set first and applies it after (#498's clobber case).
 /// - `resolve_terminal` below answers trackability for every
 ///   branch before any branch's iterability is tested, inverting the two
-///   against `resolve_seq`'s per-branch interleaving: `del((.a, 1) | .[])`
+///   against `resolve_seq_sink`'s per-branch interleaving: `del((.a, 1) | .[])`
 ///   on `{"a":7}` reports jq's "Cannot iterate over number (7)" only while
 ///   the iterate is still a fan-out stage.
 ///
@@ -49220,7 +49284,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
     }
 
     /// Is this a bare trailing iterate — `Expr::Iterate` or
-    /// `Expr::Optional(Iterate)` (`.foo[]?`) — the shape `resolve_seq`'s
+    /// `Expr::Optional(Iterate)` (`.foo[]?`) — the shape `resolve_seq_sink`'s
     /// fan-out loop would otherwise fully enumerate one static `Index`
     /// component at a time (#888, see below)?
     fn is_bare_iterate(expr: &Expr) -> bool {
@@ -49254,7 +49318,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
     // #888: a bare trailing iterate never needs its per-element *value* here
     // — this function is always the terminal entry point (see
     // `resolve_terminal`'s own doc comment above), so nothing
-    // downstream of it ever consults one. Left inside `resolve_seq`'s
+    // downstream of it ever consults one. Left inside `resolve_seq_sink`'s
     // fan-out loop, it gets fully enumerated into one static `Index(i)`
     // branch per array element, turning a computed key ahead of it into
     // O(element count) resolved expressions instead of one per *branch* —
@@ -49308,7 +49372,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
 
 /// Drop any `Expr::Optional` wrapper a resolved path component still
 /// carries — from `resolve_node`'s bare-`?` arm, `resolve_index_expr`, or
-/// verbatim from `resolve_seq`'s no-computed-key fast path, whose static
+/// verbatim from `resolve_seq_sink`'s no-computed-key fast path, whose static
 /// suffix is spliced in unresolved and can still hold a source-level `?`.
 ///
 /// `?` finishes its job during path *production* — this function's caller
@@ -49321,7 +49385,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
 /// unconditionally after — even when an earlier sibling in the same
 /// fan-out batch has since clobbered the container this branch needs
 /// (#498's multi-branch case, and its purely-static variant reached through
-/// `resolve_seq` rather than a computed key).
+/// `resolve_seq_sink` rather than a computed key).
 fn strip_resolved_optional(component: Expr) -> Expr {
     match component {
         Expr::Optional(inner) | Expr::Paren(inner) => strip_resolved_optional(*inner),
@@ -58756,7 +58820,7 @@ fn peek_static_prefix<'a>(
 /// yq no-op into a wrongly-raised error -- confirmed live (yq v4.53.3):
 /// `{"x":1} | del(.missing[]?, .x)` is `{}`, not an error.
 ///
-/// `push_path_components` (already used by `resolve_seq` for the identical
+/// `push_path_components` (already used by `resolve_seq_sink` for the identical
 /// job) does the flattening -- including splicing a `Paren`/nested `Pipe`
 /// and distributing an outer `Optional` over a group -- so this doesn't have
 /// to hand-roll that walk a second time. `Expr::Index`'s own `idx` is always
@@ -95302,7 +95366,7 @@ mod tests {
     /// #2050: a rejecting `select(...)` after a *generator builtin* used
     /// mid-pipe (i.e. not as `path()`'s own terminal leaf) used to swallow
     /// the surviving branch's own path-validity check entirely, rather
-    /// than merely re-ordering it. Root cause: `resolve_seq`'s fan-out loop
+    /// than merely re-ordering it. Root cause: `resolve_seq_sink`'s fan-out loop
     /// threaded the caller's own terminal `keep` (`Keep::First`, #987's
     /// "stop a generator after its first output" rule) into *every* stage
     /// of the pipe, not just the genuinely terminal one -- so bare `paths`
@@ -95323,7 +95387,7 @@ mod tests {
             )
         );
         // A different generator builtin (`range`, not `paths`) reproduces
-        // the identical shape, confirming this is `resolve_seq`'s own
+        // the identical shape, confirming this is `resolve_seq_sink`'s own
         // per-stage `keep` propagation, not something specific to
         // `paths`'s own resolve_node handling. Confirmed live: jq raises
         // on `2` here (the first candidate `select` actually lets
@@ -95367,7 +95431,7 @@ mod tests {
 
     /// The two rows from #2050's own divergence table that were already
     /// correct before this fix -- pinned here so a future change to
-    /// `resolve_seq`'s fan-out loop can't quietly regress them back.
+    /// `resolve_seq_sink`'s fan-out loop can't quietly regress them back.
     #[test]
     fn test_path_select_after_generator_previously_correct_rows_2050() {
         // A *non-rejecting* `select` (`select(true)`) never exercises the
@@ -95664,11 +95728,11 @@ mod tests {
         );
     }
 
-    /// #843, `resolve_seq`'s own leaf: `. | .` is a two-element
+    /// #843, `resolve_seq_sink`'s own leaf: `. | .` is a two-element
     /// `Expr::Pipe` where both sides are `Identity`, so `push_path_components`
-    /// drops both and `resolve_seq`'s static-tail fast path runs with a
+    /// drops both and `resolve_seq_sink`'s static-tail fast path runs with a
     /// genuinely *empty* `flat` — a different code path than the bare `.`
-    /// case above (which never reaches `resolve_seq` at all, since a lone
+    /// case above (which never reaches `resolve_seq_sink` at all, since a lone
     /// `.` isn't wrapped in a `Pipe`). Same "with result" outcome either
     /// way: zero navigation performed. Confirmed against jq 1.7.1.
     #[test]
@@ -95797,7 +95861,7 @@ mod tests {
     }
 
     /// #843: a genuine navigation attempt against the untracked value still
-    /// raises correctly when it is reached through `resolve_seq`'s
+    /// raises correctly when it is reached through `resolve_seq_sink`'s
     /// dedicated static-chain fast path (`.a.b`, i.e. `Expr::Pipe([Field,
     /// Field])` with no computed key anywhere) rather than through
     /// `resolve_leaf`'s single-component dispatch — that fast path bypasses
@@ -96102,7 +96166,7 @@ mod tests {
     /// #843 review, the true `resolve_index_expr`/`resolve_slice_expr`
     /// `target == Builtin::GetPath(...)` shape: `.[0]`/`.[0:2]` after a
     /// literal-key `getpath(...)` fold onto the *same* static chain as the
-    /// `getpath` call (reaching `resolve_seq`, already covered above), so
+    /// `getpath` call (reaching `resolve_seq_sink`, already covered above), so
     /// forcing the actual `IndexExpr`/`SliceExpr` variant these two
     /// functions handle requires a genuinely *computed* key/bound —
     /// confirmed live against jq 1.7.1: both still raise "near attempt",
@@ -96243,7 +96307,7 @@ mod tests {
     /// must still succeed and let that further navigation raise the more
     /// specific "near attempt" message — the untracked-rejection check only
     /// applies at a genuinely-terminal checkpoint (`resolve_dynamic_indexes`,
-    /// or `resolve_seq`/`resolve_index_expr`/`resolve_slice_expr` for a
+    /// or `resolve_seq_sink`/`resolve_index_expr`/`resolve_slice_expr` for a
     /// pipe/target continuation — see #1297), not here, where `.y` is still
     /// to come. Confirmed live against jq 1.7.1 for both the piped and
     /// dot-chain spellings.
@@ -99538,7 +99602,7 @@ mod tests {
         ]);
 
         // The purely static flavour, reached without any computed key at
-        // all: `resolve_seq`'s no-dynamic-component fast path splices a
+        // all: `resolve_seq_sink`'s no-dynamic-component fast path splices a
         // chain like `.a.a?` straight through unresolved rather than routing
         // it through `resolve_node`, so it needed its own fix at
         // `resolve_dynamic_indexes`'s assembly point rather than only at the
@@ -112480,8 +112544,8 @@ mod tests {
             // literal-then-fold-untracked-init (#2860): moved here from the
             // refuse-only matrix -- `cannot_move_register`'s own widening
             // for a fully navigation-free nested `reduce`/`foreach` (added
-            // alongside the `FoldRegister::relocate` fix #2860 needed) lets
-            // `resolve_seq`'s plain-pipe carrying reestablish through this
+            // alongside the `FoldRegister::relocate_one` fix #2860 needed) lets
+            // `resolve_seq_sink`'s plain-pipe carrying reestablish through this
             // stage too, not only a fold's own UPDATE/EXTRACT dispatch.
             (
                 br#"{"a":{"b":1},"c":{"b":1}}"#,
@@ -114804,7 +114868,7 @@ mod tests {
 
     /// #2044 code review: the two tests above only exercise the mode gate
     /// through an assignment's write-target resolution -- `path()` itself
-    /// reaches the identical `resolve_seq`/`reestablishes_register` code
+    /// reaches the identical `resolve_seq_sink`/`reestablishes_register` code
     /// (there's no `--jq-extensions` gate on `path` in yq mode), so pin the
     /// bare read form too. Live-verified against yq v4.53.3: `path(null |
     /// .a)` on `null` still refuses, matching the pre-#2044 behavior this
@@ -115140,7 +115204,7 @@ mod tests {
     /// comma operand escaped via `break` — `cannot_move_register` had an
     /// `Expr::Error` arm for exactly the `($x, error("boom"))` shape
     /// (#1832/#2860) but no `Expr::Break` arm, so `($x, break $out)` fell
-    /// to the catch-all `false` and `FoldRegister::relocate`'s `identical()`
+    /// to the catch-all `false` and `FoldRegister::relocate_one`'s `identical()`
     /// fallback never ran. jq streams the already-computed path before
     /// unwinding; `main` reported "Invalid path expression with result 1"
     /// at exit 5 instead of emitting anything. All rows captured live
@@ -117119,7 +117183,7 @@ mod tests {
             "path(. as $x | reduce (1) as $i (0; $x as $y | $y))",
             "path(. as $x | reduce (1) as $i (0; if true then $x else 0 end))",
             "path(. as $x | reduce (1) as $i (0; ($x,empty)))",
-            // Through a pipe stage and a builtin: `resolve_seq` rebuilds
+            // Through a pipe stage and a builtin: `resolve_seq_sink` rebuilds
             // the branch but takes the mark from the *step*, so a pipe
             // whose last stage is the snapshot still is one.
             "path(. as $x | reduce (1) as $i (0; $x|.))",

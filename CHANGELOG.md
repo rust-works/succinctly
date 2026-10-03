@@ -422,6 +422,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a path-mode `foreach` drives its UPDATE and EXTRACT by demand** (#3507).
+  `first(path(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))` wrote `ab` where jq writes `a`: the
+  fold collected UPDATE (and the three-argument form's EXTRACT) before its consumer could answer, so every
+  later output's side effect ran past the stop, and a `?//` inside UPDATE was never asked to retry at it,
+  missing the error jq raises from the retried alternative (`E2`, an index error). Each UPDATE output is now
+  stored, extracted and emitted before the generator is asked for the next, as value-mode `foreach` (#2668)
+  and the fold's INIT (#2903) already were, and a retry that goes past the stop and raises or produces
+  nothing supersedes the stop. Path-mode `reduce` keeps collecting its UPDATE: jq evaluates every output
+  there. An unbounded fold is unchanged. Known residual: a fold *nested* in UPDATE/EXTRACT whose own source
+  carries a `?//` now sees the consumer's stop and retries it from the stored state, where jq does not
+  (already so un-nested), filed as #3651.
+
 - **jq: an array collector over a raising `key`/`parent`/`path` body is atomic on an owned input**
   (#3512). `{"a":1} | [(error("E2")) | key]` printed `[]` after `E2`, `[(.a, error("E2")) | key]`
   printed `["a"]`, its `length` printed `0`, and `try ... catch` delivered `[]` and then the handler's

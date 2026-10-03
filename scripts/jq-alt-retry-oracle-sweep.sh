@@ -670,10 +670,8 @@ IX_ENTRIES=(
   # operation.
   'ix-paths::::paths(.[__X__])'
 )
-# Path-mode `foreach` evaluates its UPDATE before a consumer can stop it
-# (#3507), so a `?//` in the UPDATE is never asked to retry on a stop: only the
-# stop variants under a `first`/`limit` consumer diverge, and only for that
-# reason. The endings that need no stop are swept untagged.
+# Path-mode `foreach` (#3507): UPDATE is driven by demand, so the stop variants
+# reach a `?//` in it.
 IX_FOREACH_TEMPLATE='path(foreach 1 as $x (.; .[__X__]))'
 run_ix_family() {
   local label="$1" tag="$2" template="$3"; shift 3
@@ -693,8 +691,7 @@ for ix_entry in "${IX_ENTRIES[@]}"; do
   ix_template="${ix_rest#*::}"
   run_ix_family "$ix_label" "$ix_tag" "$ix_template" "${IX_VARIANTS[@]}" "${IX_STOP_VARIANTS[@]}"
 done
-run_ix_family ix-foreach '' "$IX_FOREACH_TEMPLATE" "${IX_VARIANTS[@]}"
-run_ix_family ix-foreach-stop '#3507' "$IX_FOREACH_TEMPLATE" "${IX_STOP_VARIANTS[@]}"
+run_ix_family ix-foreach '' "$IX_FOREACH_TEMPLATE" "${IX_VARIANTS[@]}" "${IX_STOP_VARIANTS[@]}"
 
 printf '%s' "$divergence_log"
 echo "== $total cases vs $JQ: $unexpected unexpected, $((diverged - unexpected)) known, $((total - diverged)) matched =="

@@ -50994,3 +50994,32 @@ fn test_yq_array_collector_over_a_raising_key_body_is_atomic_3512() -> Result<()
     }
     Ok(())
 }
+
+/// #3507: path-mode `foreach` is shared with `succinctly yq`, where `foreach` is
+/// a jq-only surface real yq's lexer rejects, gated behind `--jq-extensions`. An
+/// extension follows jq (ADR-0018), so its UPDATE is driven by demand there too:
+/// a consumer's stop ends it before the second key is written. Rows captured from
+/// jq 1.7.1's own spelling of the same writes.
+#[test]
+fn test_yq_jq_extensions_path_foreach_update_by_demand_3507() -> Result<()> {
+    let doc = r#"{"a":{"a":1}}"#;
+    for (filter, expected) in [
+        (
+            r#"del(first(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))"#,
+            "{}\n",
+        ),
+        (
+            r#"first(foreach 1 as $x (.; .[("a"|stderr), ("b"|stderr)])) = 5"#,
+            "{\"a\":5}\n",
+        ),
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (expected, "a", 0),
+            "`{filter}`"
+        );
+    }
+    Ok(())
+}
