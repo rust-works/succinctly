@@ -42901,7 +42901,24 @@ fn is_navigation_node(e: &Expr) -> bool {
             | Expr::Iterate
             | Expr::RecursiveDescent
             | Expr::Builtin(Builtin::GetPath(_) | Builtin::Recurse)
-    )
+    ) || is_constant_key_navigation(e)
+}
+
+/// A computed index or slice whose key and bounds are all literals (#3519):
+/// the parser cannot fold a fractional one (`.x[1.7]`, `.x[0.5:]`) into a
+/// static [`Expr::Index`]/[`Expr::Slice`] because jq truncates it at
+/// evaluation, so it stays an `IndexExpr`/`SliceExpr`. It is still a single
+/// navigation step with a fixed key -- nothing in it can fan out or observe
+/// the register -- so it navigates exactly as the static node does.
+fn is_constant_key_navigation(e: &Expr) -> bool {
+    let literal = |k: &Expr| matches!(k, Expr::Literal(_));
+    match e {
+        Expr::IndexExpr { key, .. } => literal(key),
+        Expr::SliceExpr { start, end, .. } => {
+            start.as_deref().map_or(true, literal) && end.as_deref().map_or(true, literal)
+        }
+        _ => false,
+    }
 }
 
 /// Whether `source` is pure navigation *and* navigates at all, computed in
