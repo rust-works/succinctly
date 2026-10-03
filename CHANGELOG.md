@@ -58,6 +58,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #3781's), and 25 stock-family runs of 3,000 programs and `scripts/jq-bind-origin-oracle-sweep.sh` move no row that
   agreed. Pinned by `test_transparent_bind_source_keeps_register_3402`.
 
+- **jq: the collecting evaluator hands a lone stage that holds no `def` on without copying it** (#3715).
+  `eval_owned_pipe` copied the rest of its pipe for every owned value (`map({a: .} | REST)` reaches it once
+  per element). A lone stage was already evaluated bare, so the copy bought nothing unless the stage holds a
+  `def`, which keeps its copy (a node remembers what evaluation did to it, #3148). Allocator calls over 2,000
+  values: lone `.a` 24,058 to 22,058, lone `select(.a > 3 and .a < 100000)` 97,922 to 75,922, a parenthesized
+  regex pipe 401,958 to 379,958; a two-stage rest (55,958) and `map(tostring)` (4,058) unchanged. Interleaved
+  wall clock on an Apple M4 Pro, min of 9: the lone `select` row -9.5% to -11.5% at 10 k, 45 k and 90 k values,
+  lone `.a` -4.9%, the regex pipe -1.7%, the unchanged rows -0.1%; output identical on all 7 configurations and on
+  1,722 differential programs (owned stage x rest x context, jq `-n`). x86_64 was not timed: the 7950X bench box was
+  unreachable, so its figure is the allocator counts above. A rest of two or more
+  stages still copies, because each element is its own `eval_pipe` call and the AST has no slot to cache an owned
+  pipe in (`RestPipe` has a drive to hang it on).
+
 - **jq: a `foreach` whose EXTRACT navigates and then ends on an untracked `null` no longer answers the root path** (#3769).
   `(foreach (1,2) as $i (.; .; .a? | limit(1; last(.a?)))) = 9` on `null` is `{"a":9}` in jq and replaced the whole
   document with `9` here (exit 0), and `path(...)` answered `[]` twice where jq answers `["a"]`. The same held for any
