@@ -802,10 +802,15 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # Skipped on `merge_group` (#310): this posts a sticky *PR* comment and needs
-  # `pull-requests: write`, but a merge-group build has no associated PR
-  # (`github.event.pull_request` is absent), so it could only error or no-op.
-  # Patch coverage is reported on the PR before it is ever queued.
+  # Coverage: the sticky patch-coverage comment on a pull request, and the
+  # baseline artifact on a push to `main`. The steps live in
+  # .github/actions/coverage, shared with coverage-baseline.yml (#3649), which
+  # publishes the same baseline from a push-only workflow whose run concludes on
+  # coverage alone. The push run here is a transitional duplicate: it goes once
+  # PRs look their baseline up in coverage-baseline.yml instead.
+  #
+  # Skipped on `merge_group` (#310): a merge-group build has no PR to comment on,
+  # and patch coverage is reported on the PR before it is ever queued.
   coverage:
     name: Coverage (${{ matrix.name }})
     needs: gate
@@ -829,71 +834,10 @@ jobs:
         with:
           fetch-depth: 0            # full history for git merge-base (PR fork point)
 
-      # #3585: from ~03:20 UTC on 2026-10-02 `Coverage (x86_64)` died on every PR
-      # after 30-31 minutes with `No space left on device` raised by the runner
-      # worker's own log file, no test failing, while `Coverage (ARM64)` (a
-      # different image) passed on the same commits. The instrumented build plus
-      # a profile file per spawned test process leaves little headroom on the
-      # hosted `ubuntu-latest` disk, so reclaim the multi-GB toolchains this job
-      # never uses (the Rust toolchain lives under the runner's home and is
-      # untouched) before the action starts. x86_64 only: ARM64 passes without it.
-      - name: Reclaim disk space (x86_64)
-        if: matrix.name == 'x86_64'
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift
-          df -h /
-
-      # Sample the free space every 20 s so a passing run says how close it came.
-      # A failing run cannot report (the runner dies writing its own log), which
-      # is why the headroom above is printed *before* the action starts.
-      - name: Sample free disk space
-        run: |
-          samples="$RUNNER_TEMP/df-avail-kb"
-          nohup bash -c "while :; do df --output=avail -k / | tail -1 >> '$samples'; sleep 20; done" >/dev/null 2>&1 &
-
-      - uses: action-works/omni-dev-coverage-check@v1
+      - uses: ./.github/actions/coverage
         with:
-          # Pin; we're a consumer. Must stay >= 0.38.0: that release added the
-          # declarative `.omni-dev/coverage.yaml` ignore-list (omni-dev#1398),
-          # which is how the CPU-conditional `src/bits/popcount.rs` flap (#302)
-          # is silenced. The action does not thread `--ignore-filename-regex`,
-          # so config-file discovery from the checkout is the only route.
-          # Bumped to 0.42.0 for #1554: that release carries omni-dev#1580's
-          # fix (PR rust-works/omni-dev#1586, switching `coverage diff`'s
-          # internal git diff to libgit2's patience algorithm), which resolves
-          # the patch-coverage misattribution this repo hit on refactor-shaped
-          # diffs with long runs of near-duplicate lines (src/jq/eval.rs on
-          # PR #1551) -- verified locally against that PR's exact base/head
-          # commits with the 0.42.0 binary: patch coverage now reports 7/7
-          # new lines for eval.rs, not the pre-fix "5161/6070 new lines"
-          # spanning nearly the whole file.
-          # Bumped to 0.43.0 for #2467: that release adds source-comment
-          # coverage markers (rust-works/omni-dev#1593) -- `tolerate`/`ignore`
-          # regions delimited by `// omni-dev: coverage tolerate reason="..."`
-          # ... `// omni-dev: coverage end`, scanned from each revision's own
-          # source. On an older binary a marker comment is inert and nothing
-          # is silenced, so this pin must stay >= 0.43.0. This is what lets
-          # `src/util/simd/x86.rs` mask its CPU-gated `detect_fast_bmi2` flap
-          # (10 lines, net 9 covered, #2449) via an in-source marker instead
-          # of a file-level exclusion.
-          version: 0.43.0
-          use-prebuilt-binary: ${{ matrix.use-prebuilt }}
-          test-args: --features cli,simd,regex,serde --workspace
-          fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
-          # fail-under-patch left unset → report-only initially
-          baseline-artifact-name: coverage-baseline-${{ matrix.name }}
-          artifact-name: coverage-summary-${{ matrix.name }}
-          comment-header: coverage-${{ matrix.name }}
-
-      - name: Report disk headroom
-        if: always()
-        run: |
-          df -h /
-          if [ -s "$RUNNER_TEMP/df-avail-kb" ]; then
-            echo "lowest free space sampled: $(sort -n "$RUNNER_TEMP/df-avail-kb" | head -1 | awk '{printf "%.1f GiB", $1/1048576}')"
-          fi
+          name: ${{ matrix.name }}
+          use-prebuilt: ${{ matrix.use-prebuilt }}
 
   # Drift detector for the yq golden fixtures (tests/data/yq-golden/): the
   # goldens are frozen oracle output, so this is the one job that re-checks

@@ -1,0 +1,65 @@
+name: Coverage baseline
+
+# Publishes the per-line coverage report of every commit on `main`, the baseline
+# that ci.yml's pull-request `Coverage` jobs diff against (#3649).
+#
+# It is its own workflow, not a job in ci.yml, for two reasons:
+#
+#   * The PR job looks the artifact up by "newest *successful* run of the
+#     workflow for the merge-base commit". In ci.yml that run also contained the
+#     test matrices, Clippy and perf-guard, so a failing or cancelled job there
+#     (13% of the last 100 main pushes) made the run unsuccessful and left a
+#     published artifact unreachable. Here the run succeeds exactly when
+#     coverage does.
+#   * ci.yml serialised main pushes in one concurrency group with
+#     `cancel-in-progress: false`, so a newer pending run replaced an older
+#     pending one: those commits never ran coverage at all, and the rest ran
+#     25-50 min after the merge. Every push has its own group here, so every
+#     commit gets a baseline, about one coverage run after it lands.
+#
+# Runs on every push to `main`, docs-only ones included: a PR can fork from any
+# main commit and needs that commit's baseline.
+#
+# Rollout: PRs still look the baseline up in ci.yml (the composite action's
+# `baseline-workflow` input defaults to `ci.yml`), because a workflow that is not
+# yet on the default branch makes the lookup fail with a 404. Once this workflow
+# has published baselines for the commits PRs fork from, flip that default and
+# stop ci.yml's `coverage` job running on `push`.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: coverage-baseline-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: Coverage baseline (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-latest
+            use-prebuilt: 'true'
+          - name: ARM64
+            runner: ubuntu-24.04-arm
+            use-prebuilt: 'false'   # no aarch64-linux prebuilt; build omni-dev from source
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/coverage
+        with:
+          name: ${{ matrix.name }}
+          use-prebuilt: ${{ matrix.use-prebuilt }}

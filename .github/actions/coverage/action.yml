@@ -1,0 +1,102 @@
+name: Coverage
+description: >-
+  Instrumented test run, coverage report and (on a pull request) the sticky
+  patch-coverage comment, shared by ci.yml (pull requests) and
+  coverage-baseline.yml (pushes to main, which publish the baseline artifact
+  that pull requests diff against). Run it after `actions/checkout` with
+  `fetch-depth: 0`. One definition so the two workflows cannot drift apart on
+  the pinned omni-dev version, the test arguments or the coverage gate (#3649).
+
+inputs:
+  name:
+    description: 'Matrix leg name (x86_64 or ARM64); suffixes the artifact names and the comment header'
+    required: true
+  use-prebuilt:
+    description: "Whether to download a prebuilt omni-dev binary ('true') or build it from source ('false')"
+    required: true
+  baseline-workflow:
+    description: >-
+      Workflow file whose newest successful run for the PR's merge-base holds the baseline artifact.
+      `ci.yml` until coverage-baseline.yml has been on `main` long enough to have published one for
+      the commits PRs fork from; then `coverage-baseline.yml` (#3649).
+    required: false
+    default: ci.yml
+
+runs:
+  using: composite
+  steps:
+    # #3585: from ~03:20 UTC on 2026-10-02 `Coverage (x86_64)` died on every PR
+    # after 30-31 minutes with `No space left on device` raised by the runner
+    # worker's own log file, no test failing, while `Coverage (ARM64)` (a
+    # different image) passed on the same commits. The instrumented build plus
+    # a profile file per spawned test process leaves little headroom on the
+    # hosted `ubuntu-latest` disk, so reclaim the multi-GB toolchains this job
+    # never uses (the Rust toolchain lives under the runner's home and is
+    # untouched) before the action starts. x86_64 only: ARM64 passes without it.
+    - name: Reclaim disk space (x86_64)
+      if: inputs.name == 'x86_64'
+      shell: bash
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift
+        df -h /
+
+    # Sample the free space every 20 s so a passing run says how close it came.
+    # A failing run cannot report (the runner dies writing its own log), which
+    # is why the headroom above is printed *before* the action starts.
+    - name: Sample free disk space
+      shell: bash
+      run: |
+        samples="$RUNNER_TEMP/df-avail-kb"
+        nohup bash -c "while :; do df --output=avail -k / | tail -1 >> '$samples'; sleep 20; done" >/dev/null 2>&1 &
+
+    - uses: action-works/omni-dev-coverage-check@v1
+      with:
+        # Pin; we're a consumer. Must stay >= 0.38.0: that release added the
+        # declarative `.omni-dev/coverage.yaml` ignore-list (omni-dev#1398),
+        # which is how the CPU-conditional `src/bits/popcount.rs` flap (#302)
+        # is silenced. The action does not thread `--ignore-filename-regex`,
+        # so config-file discovery from the checkout is the only route.
+        # Bumped to 0.42.0 for #1554: that release carries omni-dev#1580's
+        # fix (PR rust-works/omni-dev#1586, switching `coverage diff`'s
+        # internal git diff to libgit2's patience algorithm), which resolves
+        # the patch-coverage misattribution this repo hit on refactor-shaped
+        # diffs with long runs of near-duplicate lines (src/jq/eval.rs on
+        # PR #1551) -- verified locally against that PR's exact base/head
+        # commits with the 0.42.0 binary: patch coverage now reports 7/7
+        # new lines for eval.rs, not the pre-fix "5161/6070 new lines"
+        # spanning nearly the whole file.
+        # Bumped to 0.43.0 for #2467: that release adds source-comment
+        # coverage markers (rust-works/omni-dev#1593) -- `tolerate`/`ignore`
+        # regions delimited by `// omni-dev: coverage tolerate reason="..."`
+        # ... `// omni-dev: coverage end`, scanned from each revision's own
+        # source. On an older binary a marker comment is inert and nothing
+        # is silenced, so this pin must stay >= 0.43.0. This is what lets
+        # `src/util/simd/x86.rs` mask its CPU-gated `detect_fast_bmi2` flap
+        # (10 lines, net 9 covered, #2449) via an in-source marker instead
+        # of a file-level exclusion.
+        version: 0.43.0
+        use-prebuilt-binary: ${{ inputs.use-prebuilt }}
+        test-args: --features cli,simd,regex,serde --workspace
+        fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
+        # fail-under-patch left unset → report-only initially
+        # Where the baseline is looked up: the newest *successful* run of this
+        # workflow for the merge-base commit. ci.yml's push run also holds the
+        # test matrices and perf-guard, so an unrelated failing or cancelled job
+        # there (13% of recent main pushes) leaves a published artifact
+        # unreachable and the PR rebuilds the baseline (~9.5 min) -- which is
+        # why coverage-baseline.yml exists (#3649).
+        baseline-workflow: ${{ inputs.baseline-workflow }}
+        baseline-artifact-name: coverage-baseline-${{ inputs.name }}
+        artifact-name: coverage-summary-${{ inputs.name }}
+        comment-header: coverage-${{ inputs.name }}
+
+    - name: Report disk headroom
+      if: always()
+      shell: bash
+      run: |
+        df -h /
+        if [ -s "$RUNNER_TEMP/df-avail-kb" ]; then
+          echo "lowest free space sampled: $(sort -n "$RUNNER_TEMP/df-avail-kb" | head -1 | awk '{printf "%.1f GiB", $1/1048576}')"
+        fi
