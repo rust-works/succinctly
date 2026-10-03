@@ -92232,5 +92232,21 @@ fn test_reduce_whole_array_slice_is_the_register_3504() -> Result<()> {
             "Invalid path expression with result []",
             5,
         ),
+        // A navigating source or a destructuring/`?//` pattern moves jq's
+        // register off the accumulator, so the slice refuses there.
+        (
+            r"[[1],[1]]",
+            r"path(reduce .[] as $a (.; .[0:]))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[[1],[1]]",
+            r"(reduce .[] as [$a] ?// $a (.; .[0:])) |= map(.+[1])",
+            "",
+            "Invalid path expression",
+            5,
+        ),
     ])
 }

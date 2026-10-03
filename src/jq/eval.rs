@@ -41171,13 +41171,30 @@ impl FoldRegister {
         branch: Option<&PathBranch<'_>>,
         fold_frame: &Frame,
     ) -> (bool, Snapshot) {
-        let at_register = branch.is_some_and(|b| {
-            b.trackable
-                && (b.path == self.path
-                    || (S::TAG == EvalTag::Jq && self.whole_array_slice_of_register(b)))
-        });
+        let at_register = branch.is_some_and(|b| b.trackable && b.path == self.path);
         let snapshot = branch.map_or(Snapshot::No, |b| accumulator_provenance::<S>(b, fold_frame));
         (at_register, snapshot)
+    }
+
+    /// [`FoldRegister::branch_provenance`] for a `reduce` accumulator, which
+    /// also counts a whole-array slice of the register as still on it
+    /// (#3504, jq mode). `slice_ok` is false for a fold whose source navigates
+    /// (jq's register has moved off the accumulator by then) or whose pattern
+    /// is not a plain variable (a destructuring bind navigates, and after a
+    /// failed `?//` alternative jq's state is `null`); value equality below
+    /// cannot see either.
+    fn reduce_branch_provenance<S: EvalSemantics>(
+        &self,
+        branch: Option<&PathBranch<'_>>,
+        fold_frame: &Frame,
+        slice_ok: bool,
+    ) -> (bool, Snapshot) {
+        let (at_register, snapshot) = self.branch_provenance::<S>(branch, fold_frame);
+        let slice_of_register = S::TAG == EvalTag::Jq
+            && !at_register
+            && slice_ok
+            && branch.is_some_and(|b| b.trackable && self.whole_array_slice_of_register(b));
+        (at_register || slice_of_register, snapshot)
     }
 
     /// Whether `b` is the register's own array seen through one or more
@@ -43761,6 +43778,11 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    // #3504: whether a whole-array slice may keep the accumulator on the
+    // register -- only for a plain-variable pattern over a source that does
+    // not navigate (jq's register has moved off the accumulator otherwise).
+    let slice_ok = matches!(patterns, [Pattern::Var(_)])
+        && !any_subexpr(input, &mut |e| is_navigation_node(e));
     // INIT resolved first, before SOURCE (#2031, reordered from the
     // original #1467/#1872 shape): confirmed live against jq 1.7.1 (via
     // `debug`-instrumented INIT/SOURCE/UPDATE clauses) that real jq
@@ -44058,8 +44080,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                 // starting point purely from this step's own output
                                 // branch, same as before #2632.
                                 let last = branches.into_iter().last();
-                                (acc_at_register, acc_snapshot) =
-                                    reg.branch_provenance::<S>(last.as_ref(), frame);
+                                (acc_at_register, acc_snapshot) = reg
+                                    .reduce_branch_provenance::<S>(last.as_ref(), frame, slice_ok);
                                 acc = last.map(|b| b.value.into_owned());
                                 Demand::Continue
                             }
@@ -44070,8 +44092,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                 // Some(control); break;`, and nothing past this
                                 // element is ever pulled from the source.
                                 let last = prefix.into_iter().last();
-                                (acc_at_register, acc_snapshot) =
-                                    reg.branch_provenance::<S>(last.as_ref(), frame);
+                                (acc_at_register, acc_snapshot) = reg
+                                    .reduce_branch_provenance::<S>(last.as_ref(), frame, slice_ok);
                                 acc = last.map(|b| b.value.into_owned());
                                 outcome = Some(if path_alternative_retries(&e, is_last) {
                                     FoldStepOutcome::Retry
