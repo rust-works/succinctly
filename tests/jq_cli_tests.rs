@@ -89259,6 +89259,54 @@ fn test_large_def_spine_evaluates_3307() -> Result<()> {
     Ok(())
 }
 
+/// #3455: thousands of top-level defs that each call the one before through a
+/// pipe evaluate. `needs_path_context` re-walked every level beneath each one
+/// (the same chain through `+` never asked it), so the chain was quadratic in
+/// its length; the assertion is on the answer, not the cost, which is
+/// platform-specific (the deterministic guard is the
+/// `needs_path_context_remembers_every_def_of_a_call_chain_3455` unit test).
+/// `/usr/bin/jq` 1.7.1 prints `2999`.
+#[test]
+fn test_large_pipe_shaped_def_chain_evaluates_3455() -> Result<()> {
+    let m = 3000;
+    let mut chain = String::from("def f0: 0;");
+    for i in 1..m {
+        chain.push_str(&format!(" def f{i}: f{} | . + 1;", i - 1));
+    }
+    let (stdout, stderr, code) = run_jq_full(&["-nc", &format!("{chain} f{}", m - 1)], None)?;
+    assert_eq!(code, 0, "#3455: pipe chain: stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "2999");
+    Ok(())
+}
+
+/// #3455: a filter that names every one of a few thousand top-level defs, and
+/// one that calls the *outermost* def over and over, evaluate. The resolver
+/// scanned its scope stack for each call, so a call to the outermost of `M`
+/// defs read all `M` entries and the filter was quadratic in `M`; the
+/// assertion is on the answer, not the cost (the equivalence of the index to
+/// that scan is `fn_scope_matches_scan_scope_3455`). `/usr/bin/jq` 1.7.1
+/// prints `3000` for both.
+#[test]
+fn test_filter_naming_many_top_level_defs_evaluates_3455() -> Result<()> {
+    let m = 3000;
+    let mut defs = String::new();
+    for i in 0..m {
+        defs.push_str(&format!("def g{i}: {i}; "));
+    }
+    let every: Vec<String> = (0..m).map(|i| format!("g{i}")).collect();
+    let outermost = vec!["g0"; m];
+    for (what, calls) in [
+        ("every def once", every.join(", ")),
+        ("the outermost def", outermost.join(", ")),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", &format!("{defs}[{calls}] | length")], None)?;
+        assert_eq!(code, 0, "#3455: {what}: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), "3000", "#3455: {what}");
+    }
+    Ok(())
+}
+
 /// Module chains: an included module that itself includes another and
 /// redefines one of its names (`z` sees jq's own resolution, which is not the
 /// textual one), and an `import ... as` alias next to a local redefinition.

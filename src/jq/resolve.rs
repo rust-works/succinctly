@@ -510,10 +510,12 @@ const JQ_BUILTIN_ROSTER: &[(&str, usize)] = &[
 /// A lexical function scope: the `(name, arity)` pairs visible at a point in
 /// the tree.
 ///
-/// A `Vec` used as a stack, not a map: scopes are small (a handful of `def`s
-/// and parameters), shadowing falls out of searching from the top, and pushing
-/// and truncating is cheaper than cloning a map per node.
-type Scope = Vec<(String, usize)>;
+/// A stack, not a map cloned per node: shadowing falls out of the order, and
+/// pushing and truncating is cheaper than cloning. It is *indexed* by name
+/// ([`FnScope`], #3455), because a module run can hold thousands of defs and a
+/// lookup that scanned the stack was linear in the distance to the def it
+/// reached.
+type Scope = FnScope<()>;
 
 /// The module-run bracket: how a *scope boundary* is encoded in the def
 /// chain, so a module body cannot see names that are merely wrapped around
@@ -719,6 +721,12 @@ pub(crate) struct ScanResult<T> {
 /// bookkeeping out: the file's own header already flags the two as the pair
 /// that must stay in lock-step, and "which names are visible here" is exactly
 /// the kind of duplicated predicate that diverges silently.
+///
+/// Function scopes answer the same question from an index ([`FnScope`], #3455)
+/// instead of calling this: [`in_scope`] and [`reach_in_scope`] share that one
+/// lookup, so they still cannot drift from each other, and
+/// `fn_scope_matches_scan_scope_3455` pins it to this scan over random
+/// push/truncate histories. The variable and label stacks still call it.
 fn scan_scope<'a, E, T>(
     scope: &'a [E],
     name_of: impl Fn(&'a E) -> &'a str,
@@ -764,6 +772,178 @@ fn scan_scope<'a, E, T>(
     ScanResult {
         hit: None,
         run: None,
+    }
+}
+
+/// What a [`FnScope`] entry is to the module-run bracket (see [`ModuleRun`]).
+enum RunEntry {
+    /// An ordinary def or parameter -- including a link name, which
+    /// [`ModuleRun::parse`] reads as the def it is.
+    Plain,
+    /// A begin marker: it is the scope floor for as long as no end marker
+    /// closes it.
+    Begin { id: u32, alias: Option<String> },
+    /// An end marker: it closes the innermost run still open.
+    End,
+}
+
+/// One entry of a [`FnScope`].
+struct FnEntry<T> {
+    name: String,
+    arity: usize,
+    /// What a lookup that lands on this entry reports.
+    payload: T,
+    run: RunEntry,
+    /// Where the floor is once this entry is on the stack: the position of
+    /// the innermost begin marker no end marker has closed, if any.
+    floor: Option<usize>,
+}
+
+/// A lexical function scope, indexed by name (#3455).
+///
+/// The question it answers is the one [`scan_scope`] answers -- which entry a
+/// `(name, arity)` call reaches, innermost first, stopping at the module-scope
+/// floor, plus the innermost open run on a miss -- without reading the stack.
+/// A call to the outermost of `M` defs scanned all `M` entries, and a filter
+/// naming every def did that `M` times.
+///
+/// Every entry that is not a marker is recorded under its name and arity, in
+/// push order, so the innermost entry of a key is the last of its list. It is
+/// *visible* when it sits above the floor, or when the lookup crosses floors
+/// (#2955). That is all the scan decides: it probes every ordinary entry above
+/// the floor and none below. A closed run's entries are above the floor too,
+/// because its end marker lifts the floor back below them. The floor is kept
+/// per entry, so [`truncate`](Self::truncate) restores it without replaying
+/// the stack.
+///
+/// Pushing parses the entry's name once, where each scan parsed every entry
+/// it passed.
+struct FnScope<T> {
+    entries: Vec<FnEntry<T>>,
+    /// Positions into `entries`, ascending, by name and then arity. Markers
+    /// are never listed: no call can name one.
+    positions: BTreeMap<String, Vec<(usize, Vec<usize>)>>,
+}
+
+impl<T> Default for FnScope<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            positions: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T: Copy> FnScope<T> {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The floor the whole stack presents: the innermost open begin marker.
+    fn floor(&self) -> Option<usize> {
+        self.entries.last().and_then(|entry| entry.floor)
+    }
+
+    fn push(&mut self, name: String, arity: usize, payload: T) {
+        let at = self.entries.len();
+        let open = self.floor();
+        let run = match ModuleRun::parse(&name) {
+            Some(RunMarker::Begin { id, alias }) => RunEntry::Begin {
+                id,
+                alias: alias.map(ToString::to_string),
+            },
+            Some(RunMarker::End { .. }) => RunEntry::End,
+            None => RunEntry::Plain,
+        };
+        let floor = match run {
+            RunEntry::Begin { .. } => Some(at),
+            // Closing the innermost open run puts the floor back where it was
+            // when that run began: after the entry just below its begin marker.
+            RunEntry::End => open
+                .and_then(|begin| begin.checked_sub(1))
+                .and_then(|below| self.entries[below].floor),
+            RunEntry::Plain => open,
+        };
+        if matches!(run, RunEntry::Plain) {
+            match self.positions.get_mut(name.as_str()) {
+                Some(slots) => match slots.iter_mut().find(|(a, _)| *a == arity) {
+                    Some((_, listed)) => listed.push(at),
+                    None => slots.push((arity, alloc::vec![at])),
+                },
+                None => {
+                    self.positions
+                        .insert(name.clone(), alloc::vec![(arity, alloc::vec![at])]);
+                }
+            }
+        }
+        self.entries.push(FnEntry {
+            name,
+            arity,
+            payload,
+            run,
+            floor,
+        });
+    }
+
+    /// Drop every entry from `len` up, as [`Vec::truncate`] does.
+    fn truncate(&mut self, len: usize) {
+        if len >= self.entries.len() {
+            return;
+        }
+        for entry in self.entries.drain(len..).rev() {
+            if !matches!(entry.run, RunEntry::Plain) {
+                continue;
+            }
+            let Some(slots) = self.positions.get_mut(entry.name.as_str()) else {
+                continue; // omni-dev: coverage tolerate-line reason="unreachable by construction: every plain entry was listed under its name when it was pushed"
+            };
+            if let Some(slot) = slots.iter().position(|(a, _)| *a == entry.arity) {
+                slots[slot].1.pop();
+                if slots[slot].1.is_empty() {
+                    slots.swap_remove(slot);
+                }
+            }
+            if slots.is_empty() {
+                self.positions.remove(entry.name.as_str());
+            }
+        }
+    }
+
+    /// What a call to `(name, arity)` reaches here, and the innermost open run
+    /// if it reaches nothing -- [`scan_scope`]'s answer, from the index.
+    /// `crosses_floors` is the same exception it takes (#2955).
+    fn lookup(&self, name: &str, arity: usize, crosses_floors: bool) -> ScanResult<T> {
+        let floor = self.floor();
+        let reached = self
+            .positions
+            .get(name)
+            .and_then(|slots| slots.iter().find(|(a, _)| *a == arity))
+            .and_then(|(_, listed)| listed.last().copied())
+            // `map_or(true, ..)`, not `is_none_or`: the crate's MSRV (1.73)
+            // predates it (1.82).
+            .filter(|&at| crosses_floors || floor.map_or(true, |open| at > open));
+        if let Some(at) = reached {
+            // As `scan_scope`: a hit reports no run, which no caller reads.
+            return ScanResult {
+                hit: Some(self.entries[at].payload),
+                run: None,
+            };
+        }
+        // A lookup that crosses floors never stops at one, so it names none.
+        let run = floor
+            .filter(|_| !crosses_floors)
+            .and_then(|open| self.entries[open].run.open());
+        ScanResult { hit: None, run }
+    }
+}
+
+impl RunEntry {
+    /// The run this begin marker opens, as [`ScanResult::run`] reports it.
+    fn open(&self) -> Option<(u32, Option<String>)> {
+        let Self::Begin { id, alias } = self else {
+            return None; // omni-dev: coverage tolerate-line reason="unreachable by construction: `FnScope::floor` only ever names a begin marker"
+        };
+        Some((*id, alias.clone()))
     }
 }
 
@@ -846,7 +1026,7 @@ name_scope! {
 /// exact node, forever, as a silent invariant nothing enforces; a
 /// recomputed address needs the two passes to agree on nothing at all past
 /// "this box hasn't moved since the last pass read its address".
-type ReachScope = Vec<(String, usize, ScopeHit)>;
+type ReachScope = FnScope<ScopeHit>;
 
 /// What a [`ReachScope`] entry resolves to: a real `def` (identified by its
 /// body's address, for [`build_call_graph`]'s call graph) or a parameter,
@@ -867,12 +1047,7 @@ enum ScopeHit {
 /// which def a call reaches, or reachability and checking disagree about
 /// which bodies are compiled at all (#2951).
 fn reach_in_scope(scope: &ReachScope, name: &str, arity: usize) -> ScanResult<ScopeHit> {
-    scan_scope(
-        scope,
-        |(n, _, _)| n.as_str(),
-        |(n, a, hit)| (*a == arity && n == name).then_some(*hit),
-        ModuleRun::is_link_name(name),
-    )
+    scope.lookup(name, arity, ModuleRun::is_link_name(name))
 }
 
 /// Read-only twin of [`builtin_fallback_into_args`]: yields `fallback`'s own
@@ -1068,10 +1243,10 @@ fn build_call_graph(
             let body_addr = body.as_ref() as *const Expr as usize;
 
             let outer = scope.len();
-            scope.push((name.clone(), params.len(), ScopeHit::Def(body_addr)));
+            scope.push(name.clone(), params.len(), ScopeHit::Def(body_addr));
             let with_self = scope.len();
             for p in params {
-                scope.push((p.name().to_string(), 0, ScopeHit::Param));
+                scope.push(p.name().to_string(), 0, ScopeHit::Param);
             }
             build_call_graph(body, scope, Some(body_addr), graph, roots);
             scope.truncate(with_self);
@@ -1460,7 +1635,7 @@ fn walk_resolve(expr: &mut Expr) -> CheckCtx {
     // it only ever compiles a `def` at the call site substituting it in.
     // `build_call_graph` (read-only) computes which bodies are reachable
     // before `check` (below, `&mut`-mutating) walks the tree for real.
-    let mut reach_scope = ReachScope::new();
+    let mut reach_scope = ReachScope::default();
     let mut graph = BTreeMap::new();
     let mut roots = Vec::new();
     build_call_graph(expr, &mut reach_scope, None, &mut graph, &mut roots);
@@ -1740,12 +1915,7 @@ fn next_call_occurrence(occurrences: &mut Occurrences, name: &str, arity: usize)
 /// (#2989), and to attribute the resulting compile error to the module the
 /// call was written in rather than to `<top-level>` (#2951).
 fn in_scope(scope: &Scope, name: &str, arity: usize) -> ScanResult<()> {
-    scan_scope(
-        scope,
-        |(n, _)| n.as_str(),
-        |(n, a)| (*a == arity && n == name).then_some(()),
-        ModuleRun::is_link_name(name),
-    )
+    scope.lookup(name, arity, ModuleRun::is_link_name(name))
 }
 
 /// Whether `name` resolves against a plain name-stack scope (`VarScope` or
@@ -2382,7 +2552,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             ..
         } => {
             let outer = cx.scope.len();
-            cx.scope.push((name.clone(), params.len()));
+            cx.scope.push(name.clone(), params.len(), ());
             let with_self = cx.scope.len();
 
             // A parameter binds its bare name at arity 0 only: `def f(g):
@@ -2392,7 +2562,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             // in the same pass over `params`, one loop for both namespaces.
             let var_outer = cx.var_scope.len();
             for p in params.iter() {
-                cx.scope.push((p.name().to_string(), 0));
+                cx.scope.push(p.name().to_string(), 0, ());
                 if p.is_dollar() {
                     cx.var_scope.push(p.name().to_string());
                 }
@@ -3521,11 +3691,11 @@ mod tests {
         let mut cx = CheckCtx::default();
         check(
             &mut Expr::DefCall {
-                def: Rc::new(crate::jq::FuncDefData {
-                    name: "f".into(),
-                    params: Vec::new(),
-                    body: Expr::Identity,
-                }),
+                def: Rc::new(crate::jq::FuncDefData::new(
+                    "f".into(),
+                    Vec::new(),
+                    Expr::Identity,
+                )),
                 args: alloc::vec![unresolved()],
                 frames: 0,
                 bound: crate::jq::BoundBody::default(),
@@ -3563,7 +3733,8 @@ mod tests {
             builtin_fallback: None,
         };
 
-        let mut scope: ReachScope = alloc::vec![("f".to_string(), 0, ScopeHit::Def(42))];
+        let mut scope = ReachScope::default();
+        scope.push("f".to_string(), 0, ScopeHit::Def(42));
         let mut graph = BTreeMap::new();
         let mut roots = Vec::new();
         build_call_graph(
@@ -3575,16 +3746,17 @@ mod tests {
         );
         assert_eq!(roots, alloc::vec![42]);
 
-        let mut scope: ReachScope = alloc::vec![("f".to_string(), 0, ScopeHit::Def(42))];
+        let mut scope = ReachScope::default();
+        scope.push("f".to_string(), 0, ScopeHit::Def(42));
         let mut graph = BTreeMap::new();
         let mut roots = Vec::new();
         build_call_graph(
             &Expr::DefCall {
-                def: Rc::new(crate::jq::FuncDefData {
-                    name: "f".into(),
-                    params: Vec::new(),
-                    body: Expr::Identity,
-                }),
+                def: Rc::new(crate::jq::FuncDefData::new(
+                    "f".into(),
+                    Vec::new(),
+                    Expr::Identity,
+                )),
                 args: alloc::vec![call_to_f()],
                 frames: 0,
                 bound: crate::jq::BoundBody::default(),
@@ -3695,33 +3867,132 @@ mod tests {
         /// def `g` as emitted inside that run, and anything else is a def of
         /// that name at arity 0.
         fn scope_of(entries: &[&str]) -> Scope {
-            entries
-                .iter()
-                .map(|e| {
-                    let name = if let Some(rest) = e.strip_prefix("begin:") {
-                        match rest.split_once('@') {
-                            Some((id, alias)) => {
-                                ModuleRun::begin_marker(id.parse().expect("id"), Some(alias))
-                            }
-                            None => ModuleRun::begin_marker(rest.parse().expect("id"), None),
+            let mut scope = Scope::default();
+            for e in entries {
+                let name = if let Some(rest) = e.strip_prefix("begin:") {
+                    match rest.split_once('@') {
+                        Some((id, alias)) => {
+                            ModuleRun::begin_marker(id.parse().expect("id"), Some(alias))
                         }
-                    } else if let Some(id) = e.strip_prefix("end:") {
-                        ModuleRun::end_marker(id.parse().expect("id"))
-                    } else if let Some(id) = e.strip_prefix("link:") {
-                        let id = id.parse().expect("id");
-                        ModuleRun::begin_marker(id, Some(&ModuleRun::link_alias(id)))
-                    } else if let Some((id, name)) = e.split_once("::") {
-                        ModuleRun::link_name(id.parse().expect("id"), name)
-                    } else {
-                        (*e).to_string()
-                    };
-                    (name, 0usize)
-                })
-                .collect()
+                        None => ModuleRun::begin_marker(rest.parse().expect("id"), None),
+                    }
+                } else if let Some(id) = e.strip_prefix("end:") {
+                    ModuleRun::end_marker(id.parse().expect("id"))
+                } else if let Some(id) = e.strip_prefix("link:") {
+                    let id = id.parse().expect("id");
+                    ModuleRun::begin_marker(id, Some(&ModuleRun::link_alias(id)))
+                } else if let Some((id, name)) = e.split_once("::") {
+                    ModuleRun::link_name(id.parse().expect("id"), name)
+                } else {
+                    (*e).to_string()
+                };
+                scope.push(name, 0, ());
+            }
+            scope
         }
 
         fn visible(entries: &[&str], name: &str) -> bool {
             in_scope(&scope_of(entries), name, 0).hit.is_some()
+        }
+
+        /// #3455: [`FnScope::lookup`] answers what the [`scan_scope`] it
+        /// replaced answers -- the same entry, and the same open run on a miss
+        /// -- over random histories of pushes (defs at two arities, begin and
+        /// end markers, link names) and truncations, for every name and arity,
+        /// with and without crossing floors. Unbalanced markers are included:
+        /// the stack a lookup sees is not always well bracketed.
+        #[test]
+        fn fn_scope_matches_scan_scope_3455() {
+            let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+            let mut roll = |n: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % n
+            };
+            let names: Vec<String> = ["a", "b", "c", "d"]
+                .iter()
+                .map(|n| (*n).to_string())
+                .chain((0..3).map(|id| ModuleRun::link_name(id, "a")))
+                .collect();
+            for history in 0..300 {
+                let mut scope = FnScope::<usize>::default();
+                let mut mirror: Vec<(String, usize, usize)> = Vec::new();
+                for step in 0..60 {
+                    if roll(8) == 0 {
+                        let keep = roll(mirror.len() as u64 + 1) as usize;
+                        scope.truncate(keep);
+                        mirror.truncate(keep);
+                    } else {
+                        let id = roll(3) as u32;
+                        let name = match roll(8) {
+                            0 => ModuleRun::begin_marker(id, None),
+                            1 => ModuleRun::begin_marker(id, Some("alias")),
+                            2 => ModuleRun::end_marker(id),
+                            3 => ModuleRun::link_name(id, "a"),
+                            _ => names[roll(4) as usize].clone(),
+                        };
+                        let arity = roll(2) as usize;
+                        scope.push(name.clone(), arity, step);
+                        mirror.push((name, arity, step));
+                    }
+                    assert_eq!(scope.len(), mirror.len());
+                    for name in &names {
+                        for arity in 0..2 {
+                            for crosses in [false, true] {
+                                let want = scan_scope(
+                                    &mirror,
+                                    |(n, _, _)| n.as_str(),
+                                    |(n, a, at)| (*a == arity && n == name).then_some(*at),
+                                    crosses,
+                                );
+                                let got = scope.lookup(name, arity, crosses);
+                                assert_eq!(
+                                    (got.hit, got.run),
+                                    (want.hit, want.run),
+                                    "history {history} step {step}: {name:?}/{arity} \
+                                     (crosses floors: {crosses}) over {mirror:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// #3455: truncating restores what the dropped entries changed -- the
+        /// floor a begin marker raised or an end marker lifted, and the def a
+        /// redefinition had shadowed -- and truncating past the end is a no-op.
+        #[test]
+        fn fn_scope_truncate_restores_floor_and_shadowed_defs_3455() {
+            let mut scope = scope_of(&["outer", "begin:1", "own"]);
+            assert!(in_scope(&scope, "outer", 0).hit.is_none());
+            scope.truncate(1);
+            assert!(in_scope(&scope, "outer", 0).hit.is_some());
+            assert!(in_scope(&scope, "own", 0).hit.is_none());
+
+            let mut scope = scope_of(&["outer", "begin:1", "own", "end:1"]);
+            assert!(in_scope(&scope, "outer", 0).hit.is_some());
+            scope.truncate(3);
+            let scan = in_scope(&scope, "outer", 0);
+            assert!(scan.hit.is_none());
+            assert_eq!(scan.run, Some((1, None)));
+
+            let mut scope = FnScope::<usize>::default();
+            scope.push("f".to_string(), 0, 1);
+            scope.push("f".to_string(), 0, 2);
+            scope.push("f".to_string(), 1, 3);
+            assert_eq!(scope.lookup("f", 0, false).hit, Some(2));
+            assert_eq!(scope.lookup("f", 1, false).hit, Some(3));
+            scope.truncate(2);
+            assert_eq!(scope.lookup("f", 0, false).hit, Some(2));
+            assert_eq!(scope.lookup("f", 1, false).hit, None);
+            scope.truncate(1);
+            assert_eq!(scope.lookup("f", 0, false).hit, Some(1));
+            scope.truncate(9);
+            assert_eq!(scope.len(), 1);
+            scope.truncate(0);
+            assert_eq!(scope.lookup("f", 0, false).hit, None);
         }
 
         /// A name below an *open* run's begin marker is invisible -- the

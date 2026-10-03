@@ -24930,11 +24930,11 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             frames,
             bound: _,
         } => Expr::DefCall {
-            def: Rc::new(FuncDefData {
-                name: def.name.clone(),
-                params: def.params.clone(),
-                body: path_context_resolve_constants::<S>(&def.body, at)?,
-            }),
+            def: Rc::new(FuncDefData::new(
+                def.name.clone(),
+                def.params.clone(),
+                path_context_resolve_constants::<S>(&def.body, at)?,
+            )),
             args: args
                 .iter()
                 .map(|arg| path_context_resolve_constants::<S>(arg, at))

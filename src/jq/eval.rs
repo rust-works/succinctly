@@ -2960,8 +2960,14 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // closes that arm's documented gap for bound calls: a path-context
         // builtin passed *as an argument* (`def f(x): x; .a | f(key)`) is
         // visible here, because `args` are right there.
+        //
+        // The body's answer is remembered on the definition (#3455), so a
+        // chain of defs that each call the one before is walked once, not once
+        // per level beneath each ask. Only the body is: `args` belong to this
+        // call site.
         Expr::DefCall { def, args, .. } => {
-            needs_path_context(&def.body) || args.iter().any(needs_path_context)
+            def.needs_path_context_or_init(needs_path_context)
+                || args.iter().any(needs_path_context)
         }
         // Transparent: a `Shared` is its inner expression as far as
         // evaluation -- and therefore routing -- is concerned. Remembered on
@@ -34062,11 +34068,7 @@ fn rewrite_markers<'e>(
         {
             let body = walk(&def.body, rewrite, memo);
             return Expr::DefCall {
-                def: Rc::new(FuncDefData {
-                    name: def.name.clone(),
-                    params: def.params.clone(),
-                    body,
-                }),
+                def: Rc::new(FuncDefData::new(def.name.clone(), def.params.clone(), body)),
                 args: args.iter().map(|a| walk(a, rewrite, memo)).collect(),
                 frames: *frames,
                 bound: BoundBody::default(),
@@ -67574,11 +67576,11 @@ pub(crate) fn bind_def(
 ) -> Rc<Expr> {
     let depth = ambient_frame_depth::get();
     bound.get_or_init_at(depth, || {
-        let def = Rc::new(FuncDefData {
-            name: name.to_string(),
-            params: params.to_vec(),
-            body: body.clone(),
-        });
+        let def = Rc::new(FuncDefData::new(
+            name.to_string(),
+            params.to_vec(),
+            body.clone(),
+        ));
         // `false`: `then` is everything textually *after* this `def`
         // declaration, not `def`'s own body -- a one-shot scope this walk
         // visits exactly once for this `def`, never a self-recursive
@@ -67928,11 +67930,7 @@ fn install_def_spine(first: &Rc<FuncDefData>, then: &Expr, depth: u32) -> Expr {
         installer.unmask(name, params.len());
         frames += 1;
         installer.push(
-            Rc::new(FuncDefData {
-                name: name.clone(),
-                params: params.clone(),
-                body: new_body,
-            }),
+            Rc::new(FuncDefData::new(name.clone(), params.clone(), new_body)),
             frames,
         );
         cur = next;
@@ -71318,15 +71316,15 @@ mod tests {
     /// itself would go undetected in a no_std build.
     #[test]
     fn test_bind_def_call_guard_fires_without_ambient_depth_2083() {
-        let def = Rc::new(FuncDefData {
-            name: "f".to_string(),
-            params: vec![],
-            body: Expr::FuncCall {
+        let def = Rc::new(FuncDefData::new(
+            "f".to_string(),
+            vec![],
+            Expr::FuncCall {
                 name: "f".to_string(),
                 args: vec![],
                 builtin_fallback: None,
             },
-        });
+        ));
         let bound = BoundBody::default();
         let err = bind_def_call(&def, &[], MAX_EVAL_FRAMES, &bound)
             .expect_err("frames at the ceiling must refuse the call, not run it");
@@ -79654,11 +79652,7 @@ mod tests {
             else {
                 panic!("expected a def") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every source this helper parses starts with `def f(n): ...;` (#3296)"
             };
-            let def = Rc::new(FuncDefData {
-                name,
-                params,
-                body: *body,
-            });
+            let def = Rc::new(FuncDefData::new(name, params, *body));
             install_def_calls(&then, &def, 0, false)
         }
         let fib = "if n < 2 then n else f(n - 1) + f(n - 2) end";
@@ -105513,11 +105507,7 @@ mod tests {
         assert_eq!(
             install_def_calls(
                 &slice_number,
-                &Rc::new(FuncDefData {
-                    name: "f".into(),
-                    params: Vec::new(),
-                    body: Expr::Identity,
-                }),
+                &Rc::new(FuncDefData::new("f".into(), Vec::new(), Expr::Identity)),
                 0,
                 false,
             ),
@@ -105539,11 +105529,7 @@ mod tests {
     /// to a `DefCall`, not silently left as an unresolvable `FuncCall`.
     #[test]
     fn install_def_calls_descends_into_nth_expr_1371() {
-        let def = Rc::new(FuncDefData {
-            name: "f".into(),
-            params: Vec::new(),
-            body: Expr::Identity,
-        });
+        let def = Rc::new(FuncDefData::new("f".into(), Vec::new(), Expr::Identity));
         let call_f = || Expr::FuncCall {
             name: "f".into(),
             args: Vec::new(),
@@ -105578,11 +105564,7 @@ mod tests {
     /// namespaced call, so the CLI can't be relied on to reach this arm.
     #[test]
     fn install_def_calls_descends_into_namespaced_call_args_1371() {
-        let def = Rc::new(FuncDefData {
-            name: "f".into(),
-            params: Vec::new(),
-            body: Expr::Identity,
-        });
+        let def = Rc::new(FuncDefData::new("f".into(), Vec::new(), Expr::Identity));
         let ns_call = Expr::NamespacedCall {
             namespace: "ns".into(),
             name: "g".into(),
@@ -118529,15 +118511,15 @@ mod tests {
 
     fn def_call_2091(body: Expr, args: Vec<Expr>) -> Expr {
         Expr::DefCall {
-            def: Rc::new(FuncDefData {
-                name: "f".into(),
-                params: if args.is_empty() {
+            def: Rc::new(FuncDefData::new(
+                "f".into(),
+                if args.is_empty() {
                     Vec::new()
                 } else {
                     vec![Param::Bare("v".to_string())]
                 },
                 body,
-            }),
+            )),
             args,
             frames: 0,
             bound: BoundBody::default(),
@@ -119874,11 +119856,7 @@ mod touched_edge_cases_2999 {
                     then,
                     ..
                 } => {
-                    let def = Rc::new(FuncDefData {
-                        name,
-                        params,
-                        body: *body,
-                    });
+                    let def = Rc::new(FuncDefData::new(name, params, *body));
                     cur = install_def_calls(&then, &def, depth, false);
                 }
                 other => return other,
@@ -119898,14 +119876,7 @@ mod touched_edge_cases_2999 {
         else {
             panic!("{program}: expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every corpus program starts with a def (#3307)"
         };
-        (
-            Rc::new(FuncDefData {
-                name,
-                params,
-                body: *body,
-            }),
-            *then,
-        )
+        (Rc::new(FuncDefData::new(name, params, *body)), *then)
     }
 
     /// The corpus the two installs are compared over: every rule the walk has
@@ -120030,11 +120001,7 @@ mod touched_edge_cases_2999 {
                 else {
                     panic!("{program}: expected the spine to stay a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every corpus program's first node is a def (#3307)"
                 };
-                let first = Rc::new(FuncDefData {
-                    name,
-                    params,
-                    body: *body,
-                });
+                let first = Rc::new(FuncDefData::new(name, params, *body));
                 // The calls to `o` are real `DefCall`s already, so the walk
                 // below meets pre-existing ones.
                 assert!(
@@ -120097,11 +120064,11 @@ mod touched_edge_cases_2999 {
                             bound: FuncDefBound::default(),
                         };
                     }
-                    let first = Rc::new(FuncDefData {
-                        name: "f0".to_string(),
-                        params: Vec::new(),
-                        body: parse("0").unwrap(),
-                    });
+                    let first = Rc::new(FuncDefData::new(
+                        "f0".to_string(),
+                        Vec::new(),
+                        parse("0").unwrap(),
+                    ));
                     (first, then)
                 };
                 let (first, then) = chain(150);
@@ -120316,6 +120283,77 @@ mod touched_edge_cases_2999 {
         assert!(!inner.is_cached(), "inner spine nodes stay unbound");
     }
 
+    /// #3455: one `needs_path_context` ask of a chain of defs that each call
+    /// the one before (`def f_i: f_{i-1} | . + 1`) fills every level's
+    /// remembered answer, so no level's own ask re-walks the levels beneath
+    /// it. Counted by what each definition holds afterwards, not timed: the
+    /// chain was quadratic in its length because nothing was kept.
+    #[test]
+    fn needs_path_context_remembers_every_def_of_a_call_chain_3455() {
+        let m = 40;
+        for (leaf, expected) in [("0", false), ("key", true)] {
+            let names: Vec<String> = (0..m).map(|i| format!("f{i}")).collect();
+            let bodies: Vec<String> = (0..m)
+                .map(|i| {
+                    if i == 0 {
+                        leaf.to_string()
+                    } else {
+                        format!("f{} | . + 1", i - 1)
+                    }
+                })
+                .collect();
+            let defs: Vec<(&str, &str)> = names
+                .iter()
+                .zip(&bodies)
+                .map(|(n, b)| (n.as_str(), b.as_str()))
+                .collect();
+            let bound =
+                bind_through_spine(&spine_node(&defs, parse(&format!("f{}", m - 1)).unwrap()));
+
+            assert_eq!(needs_path_context(&bound), expected, "leaf `{leaf}`");
+
+            // Each level's body starts with the call to the level below.
+            let mut call = &*bound;
+            let mut levels = 0;
+            while let Expr::DefCall { def, .. } = call {
+                assert_eq!(
+                    def.needs_path_context_or_init(|_| unreachable!("answered from the memo")),
+                    expected,
+                    "level {levels} of leaf `{leaf}`"
+                );
+                levels += 1;
+                let Expr::Pipe(stages) = &def.body else {
+                    break;
+                };
+                call = &stages[0];
+            }
+            assert_eq!(levels, m, "every level was reached through its caller");
+        }
+    }
+
+    /// #3455: only a definition's *body* is remembered. The arguments of a
+    /// call are the caller's own code (`.a | f(key)`), so the same definition
+    /// called with and without a path-context argument answers differently
+    /// whatever was asked of it first.
+    #[test]
+    fn needs_path_context_still_reads_each_calls_arguments_3455() {
+        let def = Rc::new(FuncDefData::new(
+            "f".into(),
+            vec![Param::Bare("x".to_string())],
+            Expr::Identity,
+        ));
+        let call = |arg: Expr| Expr::DefCall {
+            def: Rc::clone(&def),
+            args: vec![arg],
+            frames: 0,
+            bound: BoundBody::default(),
+        };
+
+        assert!(!needs_path_context(&call(Expr::Identity)));
+        assert!(needs_path_context(&call(Expr::Builtin(Builtin::Key))));
+        assert!(!needs_path_context(&call(Expr::Identity)));
+    }
+
     /// #3307: `bind_def`'s own spine branch takes the ambient depth from
     /// [`ambient_frame_depth`] (`test_bind_def_seeds_defcall_frames_from_
     /// ambient_depth_1371`'s contract, for a spine): the result at each depth
@@ -120338,11 +120376,11 @@ mod touched_edge_cases_2999 {
         else {
             panic!("expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: `spine_node` builds a def head (#3307)"
         };
-        let first = Rc::new(FuncDefData {
-            name: name.clone(),
-            params: params.clone(),
-            body: (**body).clone(),
-        });
+        let first = Rc::new(FuncDefData::new(
+            name.clone(),
+            params.clone(),
+            (**body).clone(),
+        ));
         let mut at_zero = None;
         for depth in [0, 5, 60] {
             let _guard = enter_def_call_frame(depth);
@@ -120399,11 +120437,7 @@ mod touched_edge_cases_2999 {
         else {
             panic!("expected a def"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: the loop above builds a def (#3307)"
         };
-        let first = Rc::new(FuncDefData {
-            name,
-            params,
-            body: *body,
-        });
+        let first = Rc::new(FuncDefData::new(name, params, *body));
         let installed = install_def_spine(&first, &then, 0);
         assert_eq!(installed, nested_spine_reference(&first, &then, 0));
         // The reference leaves the captured `a` alone, and so must this: the

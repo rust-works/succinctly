@@ -10364,11 +10364,11 @@ mod tests {
         assert_eq!(rewrite_namespaced_calls(shared.clone()), shared);
 
         let def_call = Expr::DefCall {
-            def: Rc::new(jq::FuncDefData {
-                name: "f".to_string(),
-                params: Vec::new(),
-                body: Expr::Identity,
-            }),
+            def: Rc::new(jq::FuncDefData::new(
+                "f".to_string(),
+                Vec::new(),
+                Expr::Identity,
+            )),
             args: vec![Expr::Literal(jq::Literal::Int(1))],
             frames: 3,
             bound: jq::BoundBody::default(),

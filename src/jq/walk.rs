@@ -2455,11 +2455,11 @@ mod tests {
         let mut is_marker = |e: &Expr| matches!(e, Expr::Var(name) if name == "marker");
 
         let in_body = Expr::DefCall {
-            def: Rc::new(crate::jq::FuncDefData {
-                name: "f".into(),
-                params: Vec::new(),
-                body: marker(),
-            }),
+            def: Rc::new(crate::jq::FuncDefData::new(
+                "f".into(),
+                Vec::new(),
+                marker(),
+            )),
             args: vec![Expr::Identity],
             frames: 0,
             bound: crate::jq::BoundBody::default(),
@@ -2467,11 +2467,11 @@ mod tests {
         assert!(any_subexpr(&in_body, &mut is_marker));
 
         let in_args = Expr::DefCall {
-            def: Rc::new(crate::jq::FuncDefData {
-                name: "f".into(),
-                params: Vec::new(),
-                body: Expr::Identity,
-            }),
+            def: Rc::new(crate::jq::FuncDefData::new(
+                "f".into(),
+                Vec::new(),
+                Expr::Identity,
+            )),
             args: vec![marker()],
             frames: 0,
             bound: crate::jq::BoundBody::default(),
@@ -2479,11 +2479,11 @@ mod tests {
         assert!(any_subexpr(&in_args, &mut is_marker));
 
         let neither = Expr::DefCall {
-            def: Rc::new(crate::jq::FuncDefData {
-                name: "f".into(),
-                params: Vec::new(),
-                body: Expr::Identity,
-            }),
+            def: Rc::new(crate::jq::FuncDefData::new(
+                "f".into(),
+                Vec::new(),
+                Expr::Identity,
+            )),
             args: vec![Expr::Identity],
             frames: 0,
             bound: crate::jq::BoundBody::default(),
@@ -2872,11 +2872,11 @@ mod tests {
     /// exercises the arm directly.
     #[test]
     fn map_subexprs_defcall_default_maps_args_and_resets_bound() {
-        let def = Rc::new(FuncDefData {
-            name: "f".into(),
-            params: vec![Param::Bare("x".to_string())],
-            body: Expr::Identity,
-        });
+        let def = Rc::new(FuncDefData::new(
+            "f".into(),
+            vec![Param::Bare("x".to_string())],
+            Expr::Identity,
+        ));
         let original = Expr::DefCall {
             def: Rc::clone(&def),
             args: vec![Expr::Field("a".into()), Expr::Field("b".into())],
