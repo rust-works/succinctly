@@ -154,6 +154,51 @@ cargo test --test property_tests
 cargo test --test properties
 ```
 
+### Coverage
+
+CI line coverage uses the feature set `cli,simd,regex,serde` (see `CLAUDE.md`'s Coverage
+section). To reproduce its numbers and the PR patch-coverage list locally:
+
+```bash
+cargo llvm-cov --features cli,simd,regex,serde --workspace --summary-only --fail-under-lines 0
+omni-dev coverage diff
+```
+
+#### `warning: N functions have mismatched data`
+
+`cargo llvm-cov report` prints this on every run (41 on a local macOS build, 56 on x86_64
+Linux, more on ARM64 Linux), and llvm-cov prints only the count. It is harmless, and
+it is not a profile mix-up between baseline and head (#3672, #3649).
+
+- **Cause.** A non-generic `#[inline(always)]` function is codegen'd as its own instrumented
+  copy in each crate that inlines it, so the library and the test binaries carry copies of the
+  same symbol whose coverage hashes differ. When the merged profile has a record for that
+  name under another binary's hash and none under this binary's own, llvm-cov drops this
+  binary's copy of the function and counts it as mismatched. A copy that has a record
+  matches, so only copies this binary never executed are dropped. Measured: macOS names one
+  function (`json::light::word_special_mask`, in 41 test binaries); x86_64 Linux names two
+  (`yaml::scalar::could_be_null_or_bool`, 41 binaries; `yaml::end_positions` `get`, 15).
+  Changing those three from `#[inline(always)]` to `#[inline]` takes the x86_64 count to 0.
+- **Effect on coverage.** None found. The line counts the report shows for an affected
+  function are the sum of every record in the profile (`word_special_mask`'s lines read
+  2,692,884 = 2,660,434 + 32,450, its two records), so no executed copy is lost. What is
+  dropped is a copy with zero executions in that binary.
+- **Not fixed by removing the attribute.** `#[inline(always)]` is deliberate on those hot
+  paths and a warning is not worth a perf-guard shift.
+
+To name the functions behind the count on any platform, run a coverage pass and then the
+script, with no other arguments:
+
+```bash
+cargo llvm-cov --no-report --features cli,simd,regex,serde --workspace
+scripts/coverage-mismatched-functions.py
+```
+
+It reads each instrumented binary's coverage mapping against the merged profile and against a
+profile that names none of its functions; per binary, the functions present only in the second
+are the mismatched ones. The comparison cannot be made on the combined export, because llvm-cov
+merges identical functions across binaries.
+
 ### Benchmarking
 
 For comprehensive benchmarking instructions, see [benchmarking.md](benchmarking.md).
