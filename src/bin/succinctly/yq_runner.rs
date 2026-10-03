@@ -1802,6 +1802,16 @@ fn evaluate_input(
     expr: &jq::Expr,
     sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
+    // #3479: a scalar input, which is what `-R` hands this function once per
+    // line, and a filter of one of the shapes the owned evaluator answers
+    // against the value itself (`.`, `. + "x"`, `.a`, `tostring`, ...): answer
+    // it without writing the value out, indexing it and dispatching through the
+    // generic evaluator, which was the whole cost of the call. `None` is any
+    // other filter, or a container, and goes on below as before.
+    if let Some(result) = jq::eval_owned_scalar_fast::<YqSemantics>(expr, input) {
+        return Ok(query_result_to_owned_values(result, sink));
+    }
+
     // Convert OwnedValue to JSON bytes for indexing
     let doc = match input
         .reindexed_without_provenance::<jq::JqSemantics>()

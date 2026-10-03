@@ -196,6 +196,47 @@ fn test_raw_input_partial_slice_matches_the_cursor_route_3479() -> Result<()> {
     Ok(())
 }
 
+/// #3479: `-R` hands the evaluator one string per line, and the filters the
+/// owned evaluator answers against the value itself (`.`, `. + "x"`, `tostring`,
+/// `.a`, a comparison) are answered without indexing the line. The answer, the
+/// error and the exit code are the ones the cursor route gives the same value as
+/// a document, so the shortcut is unobservable except in speed.
+#[test]
+fn test_dom_route_scalar_door_answers_like_the_cursor_route_3479() -> Result<()> {
+    let raw = ["-R", "-o=json", "-I=0"];
+    let doc = ["-p=json", "-o=json", "-I=0"];
+    for (filter, expected) in [
+        (".", "\"User7\"\n"),
+        (r#". + "x""#, "\"User7x\"\n"),
+        ("tostring", "\"User7\"\n"),
+        (".a", ""),
+        (".[0]", ""),
+        (r#". == "User7""#, "true\n"),
+        (r#". == "other""#, "false\n"),
+    ] {
+        let line = run_yq_stdin_with_stderr(filter, "User7\n", &raw)?;
+        assert_eq!(line, (expected.into(), String::new(), 0), "-R: {filter}");
+        let cursor = run_yq_stdin_with_stderr(filter, "\"User7\"\n", &doc)?;
+        assert_eq!(line, cursor, "-R against the cursor route: {filter}");
+    }
+    // An error is reported, not swallowed, and the next line is still read.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(". + {}", "a\nb\n", &raw)?;
+    assert_eq!((stdout.as_str(), code), ("", 1), "{stderr}");
+    assert_eq!(stderr.matches("cannot be added").count(), 2, "{stderr}");
+    let cursor = run_yq_stdin_with_stderr(". + {}", "\"a\"\n", &doc)?;
+    assert_eq!(cursor.2, 1, "{}", cursor.1);
+    assert!(cursor
+        .1
+        .contains("string (\"a\") and object ({}) cannot be added"));
+    // A line that is not a bare string keeps its place in the output order.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#". + "!""#, "a\nb\nc\n", &raw)?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("\"a!\"\n\"b!\"\n\"c!\"\n", "", 0)
+    );
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: adjacent `?//` is part of an unquoted key, while a
 /// question mark separated from the field by whitespace is a lexer error.
 #[test]
