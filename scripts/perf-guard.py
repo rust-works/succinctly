@@ -405,8 +405,21 @@ DEFAULT_THRESHOLD = 5.0
 # `test_dom_route_scalar_door_answers_like_the_cursor_route_3479`). Now in
 # `main` (#3679); the entry was removed once the row read ~0% again against a
 # merge-base that already included it.
+#
+# `users_yq_del_select` (#2640) carries an override of the same one-off kind:
+# YAML has no delimiter checks to run, but `element_gap_ok`,
+# `value_delimiter_ok` and the free `trailing_element_gap_ok` resolved a
+# position or decoded a value before consulting the always-true default;
+# `DocumentCursor::HAS_DELIMITER_CHECKS` (false for YAML) now skips that, and
+# the yq-mode `del(.users[] | select(...))` row walks the document through
+# those helpers (-11.1% x86_64 against the PR's own merge-base, outputs
+# byte-identical; ARM64-Linux can only be read from a CI run, so the override
+# is sized with margin over the x86_64 figure rather than to it). No other
+# row moves (every one reads +0.0% or -0.0%). Remove it once `main` carries the
+# change and the row reads ~0% again.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
+    "users_yq_del_select": 20.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
