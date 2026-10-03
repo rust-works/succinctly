@@ -51,5 +51,37 @@ class FailureAdviceModeTests(unittest.TestCase):
         self.assertNotIn("QUERY_THRESHOLDS", advice)
 
 
+class RawInputRowTests(unittest.TestCase):
+    """#3479: the `-R` rows read a derived one-record-per-line fixture and pass
+    `-R`; a row listed in one place and not the other would measure a shape it
+    does not name (a line-oriented filter over the pretty-printed document, or
+    the document through `-R` as one string), and still report a number."""
+
+    def test_every_lines_row_is_a_yq_row_passing_dash_r(self):
+        queries = {q[0]: q for q in perf_guard.QUERIES}
+        self.assertTrue(perf_guard.LINES_FIXTURE_ROWS)
+        for query_id in perf_guard.LINES_FIXTURE_ROWS:
+            self.assertIn(query_id, queries)
+            self.assertEqual(queries[query_id][3], "yq", query_id)
+            self.assertIn("-R", perf_guard.QUERY_FLAGS[query_id], query_id)
+
+    def test_every_dash_r_row_gets_the_lines_fixture(self):
+        raw = {k for k, flags in perf_guard.QUERY_FLAGS.items() if "-R" in flags}
+        self.assertEqual(raw, set(perf_guard.LINES_FIXTURE_ROWS))
+
+    def test_every_flagged_row_is_a_query(self):
+        ids = {q[0] for q in perf_guard.QUERIES}
+        self.assertLessEqual(set(perf_guard.QUERY_FLAGS), ids)
+
+    def test_the_partial_slice_row_that_3535_missed_stays_in_the_guard(self):
+        # A presence ratchet only: it stops the row being deleted or reworded
+        # away, and cannot tell whether `.[0:3]` still reaches the evaluator's
+        # catch-all arm (a native slice arm would keep this green while the row
+        # measured a different path). That is `registered_document_bridges_
+        # without_reindexing_3479`'s job, not this file's.
+        filters = {q[4] for q in perf_guard.QUERIES if q[0] in perf_guard.LINES_FIXTURE_ROWS}
+        self.assertIn(".[0:3]", filters)
+
+
 if __name__ == "__main__":
     unittest.main()
