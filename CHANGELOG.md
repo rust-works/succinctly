@@ -11,19 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **jq/yq: `..` no longer builds a path trail, an owned key and a swallowed error for every node**
   (#3023). `..` listed each node's children through the `path()` step, which built an `Rc` trail
-  link per child, an owned key `String` per object member, a `Vec` per container and, for every
-  scalar leaf, the `Cannot iterate over ...` error that `..`'s own `.[]?` then discards. Most nodes
-  are leaves, so that last term was the largest, and the issue had not named it. Output is
-  unchanged: a leaf is still validated lazily, in document order, with the same uncatchable error
-  (`[..] | length` on `[1.2.3]` still raises, `[limit(2; ..)]` still answers without reaching it).
-  Allocator calls for `[..] | length` over 2,000 members: 20,056 to 2,045 (an object), 18,046 to
-  2,035 (an array), level with the `.[]` twin. Interleaved wall clock, 1 to 16 MB, min of 7: on an
-  M4 Pro `[..] | length` is 39% to 62% faster and `[.. | numbers] | length` 16% to 25% on every
+  link per child, an owned key `String` per object member, a `Vec` per container and, in jq mode, for
+  every scalar leaf the `Cannot iterate over ...` error that `..`'s own `.[]?` then discards (yq
+  never built that one). Most nodes are leaves, so in jq that last term was the largest, and the
+  issue had not named it. Output is unchanged: a leaf is still validated lazily, in document order,
+  with the same uncatchable error (`[..] | length` on `[1.2.3]` still raises, `[limit(2; ..)] |
+  length` still answers 2 without reading the leaf it stops on), and a container that cannot be
+  listed (`[1,2,]`) still raises when the walk reaches it, not before. Allocator calls for
+  `[..] | length` over 2,000 members on a debug build: 18,055 to 44 (an object), 16,045 to 34 (an
+  array), 24,046 to 2,035 (2,000 single-element arrays, where one `Vec` of children per container is
+  the floor), against 23, 13 and 13 for the `.[]` twin; in yq, 6,065 to 64 on a 2,000-key mapping.
+  Interleaved wall clock, 1 to 16 MB, min of 7, against the merge-base before #2913 landed: on an M4
+  Pro `[..] | length` is 39% to 62% faster and `[.. | numbers] | length` 16% to 25% on every
   leaf-heavy shape; on a 7950X 32% to 52% and 9% to 17%. The thin `nested` shape (a 16 MB file is
-  25 ms of parse) and a `length` control row are neutral. **On the 7950X read the instruction
-  count, not the wall clock:** the `length` control reads up to 13% slower there with cachegrind
-  `Ir` identical to 21 instructions in 130 million (code placement), while `[..] | length` over the
-  4 MB `arrays` file falls from 5.98 G to 2.40 G instructions (-59.9%).
+  25 ms of parse) has next to no nodes to walk: its instruction count moves -0.2%. **On the 7950X
+  read the instruction count, not the wall clock:** a `length` control row that never reaches this
+  code reads up to 13% slower there with cachegrind `Ir` identical to 21 instructions in 130
+  million (code placement), while `[..] | length` over the 4 MB `arrays` file falls from 5.98 G to
+  2.40 G instructions (-59.9%).
 
 - **jq: a `reduce`/`foreach` that assigns into its accumulator is linear inside an `as` binding
   too** (#3241). `. as $d | reduce $d.users[] as $r ({}; .[$r.name] = $r.score)` (and the same with

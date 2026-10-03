@@ -92589,3 +92589,78 @@ fn test_fractional_literal_bind_source_gets_a_marker_3519() -> Result<()> {
         ),
     ])
 }
+
+/// #3023: `..` raises what it always raised, at the node the walk reaches it.
+///
+/// `each_recurse_cursor_generic` used to step every node through the `.[]` step
+/// and swallow the `Cannot iterate` error a scalar leaf raised. It now asks a
+/// leaf `scalar_iteration_precheck` and `validate_cursor` instead, so that
+/// message is never built, and steps only a container, with a trail that
+/// records nothing. What must not change is which failures survive `..`'s own
+/// `?`: an undecodable string, a scalar the cursor cannot read, and a container
+/// whose members cannot be listed (a stray comma, #2261, #2594) are all decode
+/// failures, which neither `..?` nor `try` ever catches. And the walk is lazy:
+/// a consumer that stops first never reaches the failure, and one that asks for
+/// one node more does.
+///
+/// Every row was captured from the binary built from the parent commit and is
+/// identical on this one. The container rows are the only ones that reach the
+/// walk's handling of an error from *listing* a container, which no other test
+/// drives through `..`.
+#[test]
+fn test_recurse_failures_escape_where_the_walk_reaches_them_3023() -> Result<()> {
+    for (doc, fragment) in [
+        // A scalar the cursor cannot read: `validate_cursor`'s own failure.
+        ("[1.2.3,[4]]", "invalid numeric literal"),
+        // An undecodable string: `scalar_iteration_precheck`'s failure.
+        (r#"["\ud800"]"#, "invalid unicode escape sequence"),
+        // A container whose members cannot be listed: `collect_cursors_checked`...
+        ("[1,2,]", "Invalid JSON text"),
+        ("[[1,2,],3]", "Invalid JSON text"),
+        // ...and `effective_fields_checked`.
+        (r#"{"a":1,}"#, "Invalid JSON text"),
+        (r#"{"a":[1,]}"#, "Invalid JSON text"),
+        // The zero-member stray comma.
+        ("[,]", "Invalid JSON text"),
+        ("{,}", "Invalid JSON text"),
+    ] {
+        for filter in ["[..]", "[..?]", r#"try [..] catch "caught""#] {
+            assert_path_rows_3289(&[(doc, filter, "", fragment, 5)])?;
+        }
+    }
+
+    assert_path_rows_3289(&[
+        // `limit` stops on the leaf it has just received, before the walk reads it.
+        ("[1.2.3,[4]]", "[limit(2; ..)] | length", "2\n", "", 0),
+        (r#"["\ud800"]"#, "[limit(2; ..)] | length", "2\n", "", 0),
+        // `[4]` comes first here, so the unreadable leaf is the fourth node.
+        ("[[4],1.2.3]", "[limit(4; ..)] | length", "4\n", "", 0),
+        // One node more and the walk reads it.
+        (
+            "[1.2.3,[4]]",
+            "[limit(3; ..)] | length",
+            "",
+            "invalid numeric literal",
+            5,
+        ),
+        (
+            r#"["\ud800"]"#,
+            "[limit(3; ..)] | length",
+            "",
+            "invalid unicode escape sequence",
+            5,
+        ),
+        // A container is listed only once it has been delivered: the walk stops on
+        // the malformed array without listing it, and fails on the next request.
+        ("[1,2,]", "[limit(1; ..)] | length", "1\n", "", 0),
+        (r#"{"a":[1,]}"#, "[limit(2; ..)] | length", "2\n", "", 0),
+        (
+            r#"{"a":[1,]}"#,
+            "[limit(3; ..)] | length",
+            "",
+            "Invalid JSON text",
+            5,
+        ),
+        ("[3,[1,2,]]", "[limit(3; ..)] | length", "3\n", "", 0),
+    ])
+}
