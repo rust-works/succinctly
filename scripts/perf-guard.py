@@ -377,6 +377,16 @@ DEFAULT_THRESHOLD = 5.0
 # PR's own merge-base, outputs byte-identical). Remove it once `main` carries
 # #3479 and the row reads ~0% again.
 #
+# `users_yq_raw_slice` (#3479) carries an override of the same one-off kind:
+# `eval_single`'s catch-all arm evaluates a partial slice over the DOM document
+# `succinctly yq -R` registered instead of serializing and indexing the line a
+# second time, which takes the row back to what it cost before #3535 added
+# that second pass (-44.7% ARM64-Linux / -45.0% x86_64 against the PR's own
+# merge-base; the answers are pinned by
+# `test_raw_input_partial_slice_matches_the_cursor_route_3479`). The other two
+# `-R` rows read within -1.1% on both architectures and stay on the default.
+# Remove it once `main` carries the change and the row reads ~0% again.
+#
 # `users_path_walk` (#3477) carried an override of the same one-off kind:
 # `[path(.users[] | .age)] | length` had `length` answered from the owned
 # tree (`eval_owned_length`) instead of serializing and reindexing it first
@@ -390,6 +400,7 @@ QUERY_THRESHOLDS = {
     "users_update_select": 30.0,
     "users_assign_scores": 30.0,
     "users_yq_del_select": 10.0,
+    "users_yq_raw_slice": 50.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
