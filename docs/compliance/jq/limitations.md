@@ -5885,8 +5885,18 @@ past the consumer's stop and produces nothing, or raises, supersedes the stop (#
 drive applies it). `resolve_reduce`'s UPDATE stays collected on purpose: jq evaluates every one of
 its outputs (`first(path(reduce 1 as $x (.; .[("a"|stderr), ("b"|stderr)])))` writes `ab` and raises
 `Invalid path expression with result null`, in jq and here). Pinned in
-`path_mode_foreach_update_and_extract_resolve_by_demand_3507` (`tests/jq_cli_tests.rs`); the `ix-foreach-stop`
-family in `scripts/jq-alt-retry-oracle-sweep.sh` is no longer a known divergence.
+`path_mode_foreach_update_and_extract_resolve_by_demand_3507` (`tests/jq_cli_tests.rs`); the `ix-foreach`
+family in `scripts/jq-alt-retry-oracle-sweep.sh` (stop variants included) is no longer a known divergence.
+
+*Residual, filed as [#3651](https://github.com/rust-works/succinctly/issues/3651).* The consumer's stop now
+also reaches a fold **nested** in UPDATE or EXTRACT, and a `?//` in that inner fold's *source* then retries
+after the stop from the stored state, where jq does not raise: `first(path(foreach 1 as $v (.; foreach
+([[1]] as [$x] ?// $y | $x) as $w (.; .b))))` on `{"b":[1,2,3]}` prints `["b"]` and then
+`Invalid path expression near attempt to access element "b" of [1,2,3]` here, and `["b"]` alone in jq. That
+retry-after-stop model is already wrong un-nested (`[first(path(foreach ([[1]] as [$x] ?// $y | $x) as $w
+(.; .b)))]` raises on `main` too); nesting only makes it reachable from a position the inner fold used to
+run to completion in. A nested fold whose EXTRACT also carries a `?//` retries both on the one stop and
+over-delivers (four paths where jq prints two).
 
 Value-mode `reduce`'s INIT (#2899 above) is untouched and still collects — it needs a native
 `Expr::Reduce` dispatch arm before a stop has anywhere to land, which is a different change.
