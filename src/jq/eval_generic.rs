@@ -41923,7 +41923,7 @@ mod tests {
             });
             assert!(matches!(flow, Flow::Exhausted), "{src}");
             assert_eq!(out, [want], "{src}");
-            assert_eq!(rest.owned.is_some(), builds, "{src}: owned pipe built");
+            assert_eq!(rest.built_copy(), builds, "{src}: owned pipe built");
         }
     }
 

@@ -9917,19 +9917,57 @@ pub(crate) mod lone_pipe_entries {
 /// route has one definition.
 pub(crate) struct RestPipe<'a> {
     stages: &'a [Expr],
-    pub(crate) owned: Option<Expr>,
-    /// [`lone_stage_can_go_bare`] of the one plain stage, once asked: it is a
-    /// property of `stages` alone, so one walk serves every element (#3692).
-    bare: Option<bool>,
+    copy: RestCopy,
+}
+
+/// What a [`RestPipe`] has settled about its rest (#3692): whether the one
+/// plain stage can go past the doors as itself, and the owned `Expr::Pipe` if
+/// it cannot.
+///
+/// One enum rather than an `Option<Expr>` beside an `Option<bool>`: the two
+/// dataless states live in the niche of `Expr`'s tag, so this is exactly as
+/// wide as the `Option<Expr>` it replaced
+/// (`test_rest_copy_is_no_wider_than_an_optional_expr_3692`). A `RestPipe`
+/// that was one word wider moved per-call drives that never reach this code
+/// by +3% to +8% on an M4 Pro at an identical retired-instruction count,
+/// through the frames that hold it.
+enum RestCopy {
+    /// Not asked yet.
+    Unasked,
+    /// The lone stage goes past the doors as itself, so no copy is ever
+    /// built ([`lone_stage_can_go_bare`], asked once: it is a property of
+    /// `stages` alone).
+    Bare,
+    /// The owned pipe, built on the first call that needed it.
+    Owned(Expr),
+}
+
+impl RestCopy {
+    /// The owned pipe over `stages`, built on the first call.
+    fn owned_pipe(&mut self, stages: &[Expr]) -> &Expr {
+        if !matches!(self, Self::Owned(_)) {
+            *self = Self::Owned(Expr::Pipe(stages.to_vec()));
+        }
+        match self {
+            Self::Owned(whole) => whole,
+            Self::Unasked | Self::Bare => unreachable!("the owned pipe was just built"), // omni-dev: coverage tolerate-line reason="unreachable: the `if` above replaces every other state with `Owned` before this match"
+        }
+    }
 }
 
 impl<'a> RestPipe<'a> {
     pub(crate) fn new(stages: &'a [Expr]) -> Self {
         Self {
             stages,
-            owned: None,
-            bare: None,
+            copy: RestCopy::Unasked,
         }
+    }
+
+    /// Whether the owned `Expr::Pipe` copy has been built: what the cost of a
+    /// rest comes down to, which no answer shows.
+    #[cfg(test)]
+    pub(crate) fn built_copy(&self) -> bool {
+        matches!(self.copy, RestCopy::Owned(_))
     }
 
     /// The stages themselves, for the arms that can consume a slice.
@@ -9986,18 +10024,15 @@ impl<'a> RestPipe<'a> {
         reentry: Reentry,
         sink: &mut dyn FnMut(OwnedValue) -> Demand,
     ) -> Flow {
-        let stages = self.stages;
         if let Some(only) = lone {
-            if *self
-                .bare
-                .get_or_insert_with(|| lone_stage_can_go_bare(only))
-            {
+            if matches!(self.copy, RestCopy::Unasked) && lone_stage_can_go_bare(only) {
+                self.copy = RestCopy::Bare;
+            }
+            if matches!(self.copy, RestCopy::Bare) {
                 return eval_each_owned_past_front_doors::<S>(only, input, optional, reentry, sink);
             }
         }
-        let whole = self
-            .owned
-            .get_or_insert_with(|| Expr::Pipe(stages.to_vec()));
+        let whole = self.copy.owned_pipe(self.stages);
         if lone.is_some() {
             eval_each_owned_past_front_doors::<S>(whole, input, optional, reentry, sink)
         } else {
@@ -80093,7 +80128,7 @@ mod tests {
     /// embed table. Every production caller re-enters with
     /// [`Reentry::REBUILT`], so that is the one run here.
     ///
-    /// [`RestPipe::owned`] is what the agreement cannot see, since the copy
+    /// [`RestPipe::built_copy`] is what the agreement cannot see, since the copy
     /// never changed an answer, only the cost: it must be unset after an
     /// admitted stage the doors declined and set after an excluded one, so the
     /// predicate cannot widen (and skip a copy a later door needed) or narrow
@@ -80153,7 +80188,7 @@ mod tests {
                     );
                     assert_eq!(via_rest, via_pipe, "{context}");
                     assert_eq!(
-                        pipe.owned.is_some(),
+                        pipe.built_copy(),
                         !doors_answer && !admitted,
                         "{context}: the owned pipe is built exactly when the doors decline a stage that must keep it"
                     );
@@ -80391,6 +80426,23 @@ mod tests {
                 "the embed-table rows must reach embed_peel_step: {peeled}"
             );
         }
+    }
+
+    /// #3692: [`RestCopy`] is no wider than the `Option<Expr>` it replaced, so
+    /// a `RestPipe` is no wider than it was. The two dataless states fit in
+    /// `Expr`'s tag niche as long as `Expr` leaves it room; a wider `RestPipe`
+    /// moved drives that never reach this code by several percent at an
+    /// identical instruction count (see [`RestCopy`]).
+    #[test]
+    fn test_rest_copy_is_no_wider_than_an_optional_expr_3692() {
+        assert_eq!(
+            core::mem::size_of::<RestCopy>(),
+            core::mem::size_of::<Option<Expr>>()
+        );
+        assert_eq!(
+            core::mem::size_of::<RestPipe<'static>>(),
+            core::mem::size_of::<&[Expr]>() + core::mem::size_of::<Option<Expr>>()
+        );
     }
 
     /// #3692: a stage that holds a `def` keeps its copy, because the program's
