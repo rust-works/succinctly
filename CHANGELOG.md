@@ -97,9 +97,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed: `.[]?` over records is within 3%, and the two controls the change cannot reach
   (`[.[]] | length`, `[..] | length`) read -1.6% to +2.2%, against -2.5% to +0.3% for the control
   run. The yq rows (aliases, merge keys, 3 MB of inline mappings, JSON through `yq`) read -3.1% to
-  +1.4%. Still open, and not this change: `recurse(.[]?)` written out re-indexes every scalar operand
-  (about 16 allocations each), and `recurse` over a computed value silently stops at 10,000 nodes
-  (#3703); `path(f)`'s own `?`/`try` arms still build the message (#3722).
+  +1.4%. Still open, and not this change: any `recurse` with another `f`, or a `cond`, still stops at
+  10,000 nodes (#3716), and `path(f)`'s own `?`/`try` arms still build the message (#3722).
 
 - **jq/yq: `..` no longer builds a path trail, an owned key and a swallowed error for every node**
   (#3023). `..` listed each node's children through the `path()` step, which built an `Rc` trail
