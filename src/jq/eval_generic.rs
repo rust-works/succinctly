@@ -13984,11 +13984,22 @@ impl<V: DocumentValue> LoopState<V> {
     /// The truthiness of every output of `cond` over this state, with the
     /// escape that ended it -- the values themselves are never kept, only
     /// the bit each `if` reads (#2692: testing a value decodes nothing).
+    ///
+    /// A computed state answers a condition the pure owned grammar covers,
+    /// `length` included, from its tree (#3697); a document state reads it at
+    /// its own cursor, which never indexed anything.
     fn cond_bits<S: EvalSemantics>(
         &self,
         cond: &Expr,
         optional: bool,
     ) -> (Vec<bool>, Option<Control>) {
+        if let Self::Owned(owned) = self {
+            match crate::jq::eval::owned_cond_verdict::<S>(cond, owned, optional) {
+                Some(Ok(verdict)) => return (vec![verdict.is_truthy()], None),
+                Some(Err(error)) => return (Vec::new(), Some(Control::Error(error))),
+                None => {}
+            }
+        }
         let mut bits = Vec::new();
         let mut escape: Option<Control> = None;
         let flow = self.each::<S>(
@@ -41960,7 +41971,7 @@ mod tests {
             ),
             // The accumulator shapes: `. + <literal>`.
             // (The condition is a comparison the owned evaluator answers; a
-            // `length` condition still bridges, which this change leaves.)
+            // `length` condition is #3697's, pinned by its own test below.)
             ("[] | until(.[199] == 1; . + [1]) | length", vec!["200"]),
             (
                 r#"{n:0,s:""} | until(.n >= 200; .n += 1 | .s += "x") | .s | length"#,
@@ -42045,6 +42056,112 @@ mod tests {
             ),
             // `?` on the loop suppresses the same error.
             (r#"[{i:0} | until(.i >= 3; .i += "x")?]"#, vec!["[]"]),
+        ] {
+            let (got, _) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+        }
+    }
+
+    /// #3697: an `until`/`while` whose state is a computed value reads a
+    /// `length` condition off the owned tree instead of serializing the whole
+    /// state and re-indexing it every round -- the cost #3674 left in the
+    /// condition once the update was owned (200 rounds, 202 reindexes). The
+    /// reindex count is what pins it; the outputs are jq 1.7.1's (captured
+    /// live).
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
+    fn test_until_while_length_condition_needs_no_reindex_per_round_3697() {
+        let doc = r#"{"a":[1,2,3],"o":{"p":1}}"#;
+        for (query, want) in [
+            ("[] | until(length >= 50; . + [1]) | length", vec!["50"]),
+            ("[] | [while(length < 50; . + [1])] | length", vec!["50"]),
+            ("[] | until(length == 50; . + [1]) | length", vec!["50"]),
+            // `length` inside a boolean, over a state that is an object.
+            (
+                "{i:0, d:.} | until(length == 2 and .i >= 50; .i += 1) | .i",
+                vec!["50"],
+            ),
+            (
+                "{i:0, d:.} | until(length != 2 or .i >= 50; .i += 1) | .i",
+                vec!["50"],
+            ),
+            (
+                "{i:0, d:.} | until((.d | length) >= 2 and .i >= 50; .i += 1) | .i",
+                vec!["50"],
+            ),
+            (
+                "{i:0, d:.} | [while(length == 2 and .i < 50; .i += 1)] | length",
+                vec!["50"],
+            ),
+            // Under an `as` binding the #2889 embed table is live.
+            (
+                ". as $d | {i:0, d:$d} | until(length == 2 and .i >= 50; .i += 1) | .i",
+                vec!["50"],
+            ),
+            (
+                ". as $d | [] | until(length >= 50; . + [1]) | length",
+                vec!["50"],
+            ),
+        ] {
+            let (got, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+            assert!(
+                reindexes <= 3,
+                "{query}: {reindexes} reindexes over 50 rounds"
+            );
+        }
+        // yq's bridge is a different entry point; the verdict must not reindex there either.
+        let before = crate::jq::value::reindex_count::get();
+        let (out, control) = drive_each_sink::<YqSemantics>(
+            doc.as_bytes(),
+            "[] | until(length >= 50; . + [1]) | length",
+        );
+        assert!(control.is_none(), "{control:?}");
+        assert_eq!(
+            out.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+            ["50"]
+        );
+        assert!(
+            crate::jq::value::reindex_count::get() - before <= 3,
+            "yq reindexed per round"
+        );
+        // What the verdict does not answer keeps its route, and jq's answers: a
+        // number's or a string's `length` (its magnitude / its characters), a
+        // `?`, a forking update, a multi-output condition, and conditions that
+        // raise.
+        for (query, want) in [
+            ("[] | until(length; . + [1])", vec!["[]"]),
+            ("0 | until(length >= 3; . + 1)", vec!["3"]),
+            (r#""" | until(length >= 3; . + "x")"#, vec![r#""xxx""#]),
+            ("null | until(length > 0; 1)", vec!["1"]),
+            ("-5 | [while(length > 2; . + 1)] | length", vec!["3"]),
+            ("[] | [until(length >= 3; . + [1])?]", vec!["[[1,1,1]]"]),
+            (
+                "[] | [until(length >= 2; . + [1], . + [2])]",
+                vec!["[[1,1],[1,2],[2,1],[2,2]]"],
+            ),
+            (
+                "[[] | until((length >= 2), (length >= 3); . + [1])]",
+                vec![
+                    "[[1,1],[1,1,1],[1,1,1],[1,1],[1,1,1],[1,1,1],[1,1],[1,1,1],[1,1,1],[1,1],[1,1,1],[1,1,1]]",
+                ],
+            ),
+            (
+                "[1] | try until(length > 1 and .a; . + [1]) catch .",
+                vec![r#""Cannot index array with string \"a\"""#],
+            ),
+            (
+                "[1] | try until(.a.b; . + [1]) catch .",
+                vec![r#""Cannot index array with string \"a\"""#],
+            ),
+            (
+                r#"[] | try until(length >= 3 and error("x"); . + [1]) catch ."#,
+                vec![r#""x""#],
+            ),
+            (
+                r#"[] | [until(length >= 3 and error("x"); . + [1])?]"#,
+                vec!["[]"],
+            ),
         ] {
             let (got, _) = outputs_and_reindexes(doc, query);
             assert_eq!(got, want, "{query}");
