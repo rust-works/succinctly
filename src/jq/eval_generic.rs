@@ -7807,10 +7807,10 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             // or `line`/`column` can then still resolve a position.
             // Degrade to materialized `ManyOwned` for computed values.
             GenericResult::ManyCursor(cs) => {
-                let rest = Expr::Pipe(stages[j..].to_vec());
+                let rest = &stages[j..];
                 let mut per_element = vec_with_capacity(cs.len());
                 for c in cs {
-                    match eval_single::<S, _>(&rest, c.value(), optional, Some(c)) {
+                    match eval_single_pipe::<S, _>(rest, None, c.value(), optional, Some(c)) {
                         // The elements already piped through no
                         // longer vanish (#400, #494). If an earlier
                         // element's own buffered `LazySeq` also fails
@@ -9545,6 +9545,99 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// `whole` if the caller has the `Expr::Pipe` already, else a rebuilt copy
+/// of `exprs`. Only the rare `eval_single_pipe` fallbacks pay for the copy.
+fn pipe_expr<'a>(whole: Option<&'a Expr>, exprs: &[Expr]) -> Cow<'a, Expr> {
+    whole.map_or_else(|| Cow::Owned(Expr::Pipe(exprs.to_vec())), Cow::Borrowed)
+}
+
+/// The `Expr::Pipe` arm of [`eval_single`], over a borrowed stage slice.
+///
+/// `whole` is the `Expr::Pipe` those stages came from, when the caller has
+/// one; the few fallbacks that hand the whole pipe to a function taking
+/// `&Expr` use it as is and only rebuild it (`pipe_expr`) when it is `None`.
+/// `fold_pipe_stages`' `ManyCursor` arm passes `None` and a sub-slice, so a
+/// middle stage that answers several cursors no longer deep-clones the rest
+/// of the pipe once per evaluation (#3502).
+fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    whole: Option<&Expr>,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    // #2451 rule 1: the branch-major union walk lives on the sink
+    // route, so the non-sink route reaches the *same* function
+    // through `collect_each_generic` rather than growing a second
+    // copy of it -- the same delegation `Expr::Label`/`Expr::DefCall`
+    // above already use.
+    if yq_context_pipe_applies::<S>(exprs) {
+        return collect_each_generic::<S, V>(&pipe_expr(whole, exprs), value, optional, cursor);
+    }
+    // `path`/`parent`/`parent(n)`/`key` need the path accumulated
+    // across every stage of this pipe, which only the full evaluator
+    // tracks (`eval::eval_pipe`'s own `needs_path_context` routing,
+    // `eval.rs:6441-6444`). Bridge the *whole* pipe there rather than
+    // letting a later stage fall through `eval_builtin`'s per-builtin
+    // fallback in isolation, which has no path to give it (#554).
+    if exprs.iter().any(needs_path_context) {
+        // #2061: `key`/`path`/`parent` answer from the path the walk
+        // accumulates, so for a purely navigational pipe there is no
+        // reason to build an `OwnedValue` tree for the document
+        // first. `.[0] | key` cost 519 MiB on a 20 MB array to
+        // answer `0`. Anything the walk does not model returns
+        // `None` and falls through to the bridge below, unchanged.
+        //
+        if let Some(root) = cursor {
+            if let Some(result) = try_path_context_cursor_walk::<S, V>(exprs, root) {
+                return result;
+            }
+        }
+        // #2416 step 2: a head that can land on an absent node.
+        if let Some(root) = cursor {
+            if let Some(result) = try_path_context_absent_walk::<S, V>(exprs, root) {
+                return result;
+            }
+        }
+        // spine 2416 (identity pass): a value carried without its
+        // cursor has no position of its own to answer these from.
+        // The owned door (`eval::eval_path_context_pipe_owned`)
+        // gives it one -- a reindexed copy walked with a cursor --
+        // or hands it over, by this same gate; before this arm the
+        // gate alone decided, and a pipe it declined lost the
+        // position entirely.
+        if cursor.is_none() {
+            let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, None), optional);
+            // #2642: `cursor` is `None` in this arm, so the root has
+            // no document node -- `Owned` demotes any `Snapshot`
+            // marker `exprs` carries.
+            let pipe = pipe_expr(whole, exprs);
+            return eval_on_owned::<S, _>(&pipe, owned, optional, Reentry::REBUILT);
+        }
+    }
+
+    if exprs.is_empty() {
+        return GenericResult::One(value);
+    }
+
+    // Keep the bind alive while a downstream stop/error unwinds into
+    // its next alternative; the eager fold below runs it too soon.
+    if matches!(exprs.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
+    {
+        return collect_each_generic::<S, V>(&pipe_expr(whole, exprs), value, optional, cursor);
+    }
+
+    // #2416 step 3: the owned identity pipe lives in the sink route;
+    // the staged fold below would hand its owned values to
+    // `eval_on_owned` with no position.
+    if owned_identity_pipe_applies(exprs) {
+        return collect_each_generic::<S, V>(&pipe_expr(whole, exprs), value, optional, cursor);
+    }
+
+    let current = eval_single::<S, _>(&exprs[0], value, optional, cursor);
+    fold_pipe_stages::<S, V>(current, &exprs[1..], optional)
+}
+
 /// Evaluate a single expression against a value with optional cursor context.
 ///
 /// **`optional = true` is unreachable here for every `expr` shape except the
@@ -9954,84 +10047,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
-        Expr::Pipe(exprs) => {
-            // #2451 rule 1: the branch-major union walk lives on the sink
-            // route, so the non-sink route reaches the *same* function
-            // through `collect_each_generic` rather than growing a second
-            // copy of it -- the same delegation `Expr::Label`/`Expr::DefCall`
-            // above already use.
-            if yq_context_pipe_applies::<S>(exprs) {
-                return collect_each_generic::<S, V>(expr, value, optional, cursor);
-            }
-            // `path`/`parent`/`parent(n)`/`key` need the path accumulated
-            // across every stage of this pipe, which only the full evaluator
-            // tracks (`eval::eval_pipe`'s own `needs_path_context` routing,
-            // `eval.rs:6441-6444`). Bridge the *whole* pipe there rather than
-            // letting a later stage fall through `eval_builtin`'s per-builtin
-            // fallback in isolation, which has no path to give it (#554).
-            if exprs.iter().any(needs_path_context) {
-                // #2061: `key`/`path`/`parent` answer from the path the walk
-                // accumulates, so for a purely navigational pipe there is no
-                // reason to build an `OwnedValue` tree for the document
-                // first. `.[0] | key` cost 519 MiB on a 20 MB array to
-                // answer `0`. Anything the walk does not model returns
-                // `None` and falls through to the bridge below, unchanged.
-                //
-                if let Some(root) = cursor {
-                    if let Some(result) = try_path_context_cursor_walk::<S, V>(exprs, root) {
-                        return result;
-                    }
-                }
-                // #2416 step 2: a head that can land on an absent node.
-                if let Some(root) = cursor {
-                    if let Some(result) = try_path_context_absent_walk::<S, V>(exprs, root) {
-                        return result;
-                    }
-                }
-                // spine 2416 (identity pass): a value carried without its
-                // cursor has no position of its own to answer these from.
-                // The owned door (`eval::eval_path_context_pipe_owned`)
-                // gives it one -- a reindexed copy walked with a cursor --
-                // or hands it over, by this same gate; before this arm the
-                // gate alone decided, and a pipe it declined lost the
-                // position entirely.
-                if cursor.is_none() {
-                    let owned =
-                        owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, None), optional);
-                    // #2642: `cursor` is `None` in this arm, so the root has
-                    // no document node -- `Owned` demotes any `Snapshot`
-                    // marker `exprs` carries.
-                    let pipe = Expr::Pipe(exprs.clone());
-                    return eval_on_owned::<S, _>(&pipe, owned, optional, Reentry::REBUILT);
-                }
-            }
-
-            if exprs.is_empty() {
-                return GenericResult::One(value);
-            }
-
-            // Keep the bind alive while a downstream stop/error unwinds into
-            // its next alternative; the eager fold below runs it too soon.
-            if matches!(exprs.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
-            {
-                return collect_each_generic::<S, V>(expr, value, optional, cursor);
-            }
-
-            // #2416 step 3: the owned identity pipe lives in the sink route;
-            // the staged fold below would hand its owned values to
-            // `eval_on_owned` with no position.
-            if owned_identity_pipe_applies(exprs) {
-                return collect_each_generic::<S, V>(
-                    &Expr::Pipe(exprs.clone()),
-                    value,
-                    optional,
-                    cursor,
-                );
-            }
-
-            let current = eval_single::<S, _>(&exprs[0], value, optional, cursor);
-            fold_pipe_stages::<S, V>(current, &exprs[1..], optional)
-        }
+        Expr::Pipe(exprs) => eval_single_pipe::<S, V>(exprs, Some(expr), value, optional, cursor),
 
         // Handled natively rather than through the `_` fallback below: the
         // fallback materializes the whole input via `to_owned::<S, _>()` before
@@ -41371,6 +41387,89 @@ mod tests {
             comma_array_route::<YqSemantics>("[(., .) | .a]", doc),
             "prevalidated"
         );
+    }
+
+    /// #3502: `fold_pipe_stages`' `ManyCursor` arm borrows the rest of the
+    /// pipe (`eval_single_pipe` over a sub-slice, no `whole`) instead of
+    /// deep-cloning it into a fresh `Expr::Pipe` per evaluation. The two must
+    /// agree on every tail, including the ones whose fallbacks hand the whole
+    /// pipe on as an `&Expr` (a `. as $x` head, a path-context stage, an
+    /// owned-identity pipe) and so rebuild it when `whole` is `None`.
+    #[test]
+    fn test_borrowed_pipe_tail_matches_rebuilt_pipe_3502() {
+        fn show<S: EvalSemantics, V: DocumentValue>(result: GenericResult<V>) -> String {
+            match result.collect_owned::<S>() {
+                Ok(values) => values
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                Err(control) => format!("{control:?}"),
+            }
+        }
+        fn check<S: EvalSemantics>(json: &[u8], filter: &str) -> usize {
+            let index = JsonIndex::build(json);
+            let Expr::Pipe(stages) = parse(filter).unwrap() else {
+                panic!("{filter}: not a pipe");
+            };
+            for j in 1..stages.len() {
+                let tail = &stages[j..];
+                let rebuilt = Expr::Pipe(tail.to_vec());
+                let cursor = index.root(json);
+                let want = show::<S, _>(eval_single::<S, _>(
+                    &rebuilt,
+                    cursor.value(),
+                    false,
+                    Some(cursor),
+                ));
+                let cursor = index.root(json);
+                let got = show::<S, _>(eval_single_pipe::<S, _>(
+                    tail,
+                    None,
+                    cursor.value(),
+                    false,
+                    Some(cursor),
+                ));
+                assert_eq!(got, want, "{filter}: tail from stage {j}");
+                let cursor = index.root(json);
+                let with_whole = show::<S, _>(eval_single_pipe::<S, _>(
+                    tail,
+                    Some(&rebuilt),
+                    cursor.value(),
+                    false,
+                    Some(cursor),
+                ));
+                assert_eq!(
+                    with_whole, want,
+                    "{filter}: tail from stage {j}, whole given"
+                );
+                // No cursor: the value-only door (`key` has nothing to answer from).
+                let value = index.root(json).value();
+                let want = show::<S, _>(eval_single::<S, _>(&rebuilt, value.clone(), false, None));
+                let got = show::<S, _>(eval_single_pipe::<S, _>(tail, None, value, false, None));
+                assert_eq!(got, want, "{filter}: tail from stage {j}, no cursor");
+            }
+            stages.len() - 1
+        }
+        let doc = br#"{"a":[{"x":{"y":{"z":1}}},{"x":{"y":{"z":2}}}],"b":[{"x":{"y":[3]}}],"m":3}"#;
+        let mut tails = 0;
+        for filter in [
+            ".a[] | .x | .y | .z",
+            ".a[] | .x | .y | .z | tostring | ascii_downcase",
+            ".a[] | . as $v | $v.x | .y",
+            ".a[] | (. as {x: $q} | $q) | .y | .z",
+            ".a[] | .x | key",
+            ".a[] | .x | .y | path(.z)",
+            ".a[] | .x | .y | [., 1] | length",
+            ".a[], .b[] | .x | .y",
+            ".[] | .[]? | .x? | .y?",
+            ".a[] | .x | select(.y.z > 1) | .y",
+            ".a[] | .x | first(.y) | .z",
+        ] {
+            tails += check::<JqSemantics>(doc, filter);
+            tails += check::<YqSemantics>(doc, filter);
+        }
+        assert!(tails > 40, "the sweep must reach real tails, got {tails}");
     }
 
     /// The outputs `filter` prints over `json` through the sink evaluator
