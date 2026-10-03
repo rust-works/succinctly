@@ -472,7 +472,8 @@ earlier match was luck: the eager route answered the root path where jq answers 
 of either leaves the same document, and #3579's rule now refuses a terminal `null` after a
 navigation. All are refuse-only. No row is newly accepted wrongly, and none newly differs; the
 36 that still accept are `.[0:] and R` and `.[0:0] and R` on `[]`, #3494's empty-slice rule, the
-same rows `main` accepts, and the 2 `DIFF` rows are `main`'s too (jq prints a path before it
+same rows `main` accepts (closed afterwards by #3647: the restored seed took `[]` for the input, see
+`restored_register_is_input`), and the 2 `DIFF` rows are `main`'s too (jq prints a path before it
 errors). The promotions commit on its own, measured on the 162,207-row
 grid of the time, moved 498 rows to a match and none the other way.
 
