@@ -9929,8 +9929,8 @@ pub(crate) struct RestPipe<'a> {
 /// wide as the `Option<Expr>` it replaced
 /// (`test_rest_copy_is_no_wider_than_an_optional_expr_3692`). A `RestPipe`
 /// that was one word wider moved per-call drives that never reach this code
-/// by +3% to +8% on an M4 Pro at an identical retired-instruction count,
-/// through the frames that hold it.
+/// by +1% to +8% (minimum) on an M4 Pro at an identical retired-instruction
+/// count, through the frames that hold it.
 enum RestCopy {
     /// Not asked yet.
     Unasked,

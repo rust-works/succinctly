@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `if` read -3.6% to -8.8%, the assignments -3.4% to -6.5%, a leaf stage -1.2% to -3.3%, and the rows that
   cannot move -0.6% to +1.2% against a noise-floor control of -1.1% to +1.9%. A leaf stage is the thin case:
   one allocation in about 26. `RestPipe` must stay as wide as it was: a version with one more field read
-  +3% to +8% slower on drives that never reach this code, at an identical instruction count, through the
+  +1% to +8% slower on drives that never reach this code, at an identical instruction count, through the
   frames that hold it, and `test_rest_copy_is_no_wider_than_an_optional_expr_3692` pins the width.
 
 - **jq/yq: `nulls`, `booleans`, `numbers`, `strings`, `arrays` and `objects` test the node's type
