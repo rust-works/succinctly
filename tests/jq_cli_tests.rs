@@ -93661,6 +93661,15 @@ fn test_swallowed_scalar_iteration_answers_what_it_did_3689() -> Result<()> {
             assert_path_rows_3289(&[(doc, filter, "", fragment, 5)])?;
         }
     }
+    // An undecodable string below a slice raises when the slice materializes it,
+    // so the walk never meets an owned scalar it would have to validate.
+    assert_path_rows_3289(&[(
+        r#"[1,"\ud800",[2]]"#,
+        "[.[1:] | .. | path]",
+        "",
+        "invalid unicode escape sequence",
+        5,
+    )])?;
     // A malformed array as the root fails the walks themselves, not a boundary.
     for filter in ["[.. | path]", "[.. | key]"] {
         assert_path_rows_3289(&[("[1,2,]", filter, "", "Invalid JSON text", 5)])?;

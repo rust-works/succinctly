@@ -1387,7 +1387,11 @@ fn decode_failure_or<V: DocumentValue>(
 /// [`decode_failure_or`]). Both are decode failures, which `?` never swallows.
 /// One definition for [`decode_failure_or`] and [`swallowed_scalar_iteration`]
 /// (#3689), so the shortcut and the arm it stands in for cannot disagree on
-/// which scalar raises.
+/// which scalar raises. The path-context walks decide a leaf with
+/// [`scalar_leaf_iteration`] instead (the same string check, then
+/// `validate_cursor`), as the step they replace did; the two agree on every
+/// scalar tried (165 exotic spellings, base and head identical), but they are
+/// two definitions, and the walks' is the one that reads the cursor.
 fn scalar_decode_error<V: DocumentValue>(value: &V) -> Option<EvalError> {
     value
         .string_decode_error()
@@ -1411,19 +1415,35 @@ fn scalar_decode_error<V: DocumentValue>(value: &V) -> Option<EvalError> {
 /// `.[]` over a scalar never built the message at all (the arm answers `None`
 /// under `optional || yq`), so the shortcut has nothing to save there and
 /// would only repeat the arm's own probes for a container.
+///
+/// The probe that follows the gate is not free for a container: it asks the
+/// value whether it is an array or an object, and the `Iterate` arm then asks
+/// again. That is nothing for JSON, where a value is a view over the index. In
+/// YAML it is an alias-to-mapping resolve, which only a library embedder
+/// evaluating in jq mode over a YAML document reaches (`succinctly jq` reads
+/// JSON, DSV and raw text; `succinctly yq` is excluded by the gate).
 pub(crate) fn swallowed_scalar_iteration<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     catch: Option<&Expr>,
     value: &V,
 ) -> Option<Result<(), EvalError>> {
-    if !crate::jq::eval::try_swallows_scalar_iteration(expr, catch)
-        || S::TAG == EvalTag::Yq
+    if !swallowing_boundary::<S>(expr, catch)
         || value.as_array().is_some()
         || value.as_object().is_some()
     {
         return None;
     }
     Some(scalar_decode_error(value).map_or(Ok(()), Err))
+}
+
+/// Whether the swallowed-`.[]` shortcut may be taken at all for a `?`/`try`
+/// boundary over `expr` with this handler, in this mode (#3689): the body is a
+/// bare `.[]` ([`try_swallows_scalar_iteration`](crate::jq::eval::try_swallows_scalar_iteration))
+/// and the mode is not yq. One definition for [`swallowed_scalar_iteration`]
+/// (the four boundaries) and [`path_context_step_try`] (the path-context walk),
+/// so the mode rule cannot be changed in one and left behind in the other.
+fn swallowing_boundary<S: EvalSemantics>(expr: &Expr, catch: Option<&Expr>) -> bool {
+    crate::jq::eval::try_swallows_scalar_iteration(expr, catch) && S::TAG != EvalTag::Yq
 }
 
 /// What stepping the scalar `node` (the value at `cursor`) with `.[]?` raises,
@@ -22289,7 +22309,7 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
     // mode, where the step never built the message (see
     // [`swallowed_scalar_iteration`]); a node that is not a live or owned
     // scalar takes the step.
-    if S::TAG != EvalTag::Yq && crate::jq::eval::try_swallows_scalar_iteration(body, catch) {
+    if swallowing_boundary::<S>(body, catch) {
         match &pos.node {
             PathNode::At(cursor) => {
                 let node = cursor.value();
@@ -22297,6 +22317,8 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
                     return scalar_leaf_iteration::<S, V>(&node, cursor).map_err(Control::Error);
                 }
             }
+            // An owned scalar was decoded when it was built: a slice materializes
+            // its elements, so an undecodable one raised there, before the walk.
             PathNode::Owned(value)
                 if !matches!(**value, OwnedValue::Array(_) | OwnedValue::Object(_)) =>
             {
