@@ -460,6 +460,19 @@ jobs:
   # other step stays chained in one combined leg, matching the rebalance
   # applied to test-x86-matrix's bench-runner-and-sse2-dispatch leg and
   # test-arm-matrix's clippy-all-variants leg below.
+  #
+  # #3649 split the chained leg in two. #3064 had merged the legs because macOS
+  # slots were scarce (5 concurrent on the Team plan); #3649 phase 1 took
+  # `bench` and the beta/nightly legs off the PR/push path, which removed that
+  # pressure. The merge queue's critical path was this chained leg --
+  # 12.8 min of `Run` (15.2 min wall with setup) against 9 for `cli-gated` --
+  # because every `cargo test` invocation recompiles the crate (1.3-2.9 min
+  # each) for its own feature set. The split balances measured cost (per-
+  # invocation timings from run 37081253550): orchestrate-default is ~7-8 min
+  # and simd-variants ~8 min, both under `cli-gated`'s ~10, so the macOS
+  # critical path becomes `cli-gated` rather than the chained leg.
+  # Re-measure the macOS queue wait after any change here; one more macOS job
+  # per run is the price.
   test-macos-arm:
     name: Test (macOS ARM64)
     needs: [gate, test-macos-arm-matrix]
@@ -490,10 +503,17 @@ jobs:
           # `cargo run`-spawned CLI subprocesses would otherwise re-link the
           # shared `target/debug/succinctly` binary with a narrower feature
           # set, dropping the `bench` subcommand out from under this test
-          # target if it ran in the same invocation. The remaining four
-          # `cargo test` invocations don't share that hazard (none of them
-          # spawn the CLI binary), so they're chained after it in the same
-          # leg rather than each getting a dedicated runner -- see #3064.
+          # target if it ran in the same invocation. The default-features
+          # run chained after it doesn't spawn the CLI binary, so it shares
+          # the leg (#3064) -- keep every other invocation out of this leg
+          # unless it too never touches `target/debug/succinctly`.
+          - name: orchestrate-default
+            buildCli: true
+            testCmd: |
+              cargo test --features cli,bench-runner --test orchestrate_cli_tests
+              cargo test --verbose
+          # The three remaining feature sets are independent of the CLI binary
+          # and of each other, so they share one leg without a build step.
           #
           # Same no_std cargo-test rationale as test-x86 (#2114) applies to
           # the last line -- macOS ARM64 is the only leg that builds the
@@ -501,11 +521,9 @@ jobs:
           # toolchain rather than Linux's; a #2083-class std-only-symbol bug
           # reachable only there was invisible to every CI leg until this
           # one (#2123).
-          - name: rest
-            buildCli: true
+          - name: simd-variants
+            buildCli: false
             testCmd: |
-              cargo test --features cli,bench-runner --test orchestrate_cli_tests
-              cargo test --verbose
               cargo test --verbose --features simd
               cargo test --verbose --features portable-popcount
               cargo test --no-default-features --verbose
