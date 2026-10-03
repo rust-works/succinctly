@@ -54404,6 +54404,23 @@ impl<'e> LoopOperand<'e> {
         }
     }
 
+    /// One round's `update` over a state the loop owns, by value (#3674): the
+    /// owned step [`fold_step_each`] takes for a `reduce`/`foreach` UPDATE,
+    /// under the same gate. A shape it answers (`.i += 1`, the relocating
+    /// folds) consumes the state and edits its copy-on-write top level in
+    /// place, instead of serializing the whole state and re-indexing it for the
+    /// bridge every round; anything else hands the untouched state back for
+    /// [`Self::fork`]. While the #2889 embed table is live only the assignment
+    /// half runs, for the reasons `fold_step_each` gives.
+    fn step_owned<S: EvalSemantics>(&self, state: OwnedValue, ambient: bool) -> OwnedStep {
+        let expr = if ambient { self.expr } else { self.demoted };
+        if super::eval_generic::embed_table_active() {
+            try_owned_assign_step::<S>(expr, state)
+        } else {
+            try_eval_owned_step::<S>(expr, state)
+        }
+    }
+
     /// [`eval_owned_expr_fork`] over this operand: `expr` itself while
     /// `ambient` (the loop's first round, on the caller's own input, which
     /// the enclosing re-entry already demoted for) and the pre-demoted twin
@@ -54498,6 +54515,17 @@ fn until_step<S: EvalSemantics>(
                 return update.drive_each::<S>(&state, optional, ambient, &mut |next| {
                     until_step::<S>(cond, update, next, optional, outputs, budget, false)
                 });
+            }
+            // #3674: the single-output step on a state this branch owns.
+            match update.step_owned::<S>(state, ambient) {
+                OwnedStep::Handled(Ok(next)) => {
+                    state = next;
+                    ambient = false;
+                    continue;
+                }
+                OwnedStep::Handled(Err(_)) if optional => return Ok(()),
+                OwnedStep::Handled(Err(error)) => return Err(Control::Error(error)),
+                OwnedStep::Declined(declined) => state = declined,
             }
             let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {
@@ -54663,6 +54691,17 @@ fn while_step<S: EvalSemantics>(
                 return update.drive_each::<S>(&state, optional, ambient, &mut |next| {
                     while_step::<S>(cond, update, next, optional, outputs, budget, false)
                 });
+            }
+            // #3674: see [`until_step`].
+            match update.step_owned::<S>(state, ambient) {
+                OwnedStep::Handled(Ok(next)) => {
+                    state = next;
+                    ambient = false;
+                    continue;
+                }
+                OwnedStep::Handled(Err(_)) if optional => return Ok(()),
+                OwnedStep::Handled(Err(error)) => return Err(Control::Error(error)),
+                OwnedStep::Declined(declined) => state = declined,
             }
             let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {

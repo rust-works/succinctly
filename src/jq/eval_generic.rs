@@ -41863,6 +41863,70 @@ mod tests {
         )
     }
 
+    /// #3674: an `until`/`while` whose state is a computed value steps its
+    /// `update` on the owned tree instead of serializing the whole state and
+    /// re-indexing it for the bridge every round. The reindex count is what
+    /// pins that: it was one per round (100 rounds over a 1.4 MB state cost
+    /// 286 ms, jq 15 ms) and is now flat in the round count. The outputs are
+    /// jq 1.7.1's (captured live).
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // jq object literals, not format strings
+    fn test_until_while_owned_update_needs_no_reindex_per_round_3674() {
+        let doc = r#"{"a":[1,2,3],"o":{"p":1}}"#;
+        for (query, want) in [
+            ("{i:0, d:.} | until(.i >= 50; .i += 1) | .i", vec!["50"]),
+            ("{i:0, d:.} | until(.i >= 50; .i |= . + 1) | .i", vec!["50"]),
+            (
+                "{i:0, d:.} | [while(.i < 50; .i += 1)] | length",
+                vec!["50"],
+            ),
+            (
+                "{i:0, d:.} | until(.i >= 50; .i += 1) | .d.a",
+                vec!["[1,2,3]"],
+            ),
+            // Under an `as` binding the #2889 embed table is live and only the
+            // assignment half of the step runs.
+            (
+                ". as $d | {i:0, d:$d} | until(.i >= 50; .i += 1) | .d.o",
+                vec![r#"{"p":1}"#],
+            ),
+            (
+                ". as $d | {i:0, d:$d} | [while(.i < 50; .i += 1)] | length",
+                vec!["50"],
+            ),
+        ] {
+            let (got, reindexes) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+            assert!(
+                reindexes <= 3,
+                "{query}: {reindexes} reindexes over 50 rounds"
+            );
+        }
+        // What the step does not answer keeps its route, and its answers.
+        for (query, want) in [
+            // A right side that reads the state is not a closed step: it keeps
+            // the bridge, and its answer.
+            ("{i:0} | until(.i >= 5; .i = .i + 1) | .i", vec!["5"]),
+            // A forking update: every output runs its own branch.
+            (
+                "{i:0} | [until(.i >= 3; .i += 1, .i += 2)] | length",
+                vec!["5"],
+            ),
+            // No output: the branch ends.
+            ("{i:0} | [until(.i >= 3; empty)]", vec!["[]"]),
+            // An update that errors is caught like any other.
+            (
+                r#"{i:0} | try until(.i >= 3; .i += "x") catch ."#,
+                vec![r#""number (0) and string (\"x\") cannot be added""#],
+            ),
+            // `?` on the loop suppresses the same error.
+            (r#"[{i:0} | until(.i >= 3; .i += "x")?]"#, vec!["[]"]),
+        ] {
+            let (got, _) = outputs_and_reindexes(doc, query);
+            assert_eq!(got, want, "{query}");
+        }
+    }
+
     /// #3477: counting a bound array needs no index over it. Binding a
     /// cursor sequence materializes it, and `$a | length` then serialized and
     /// indexed the whole owned tree to answer a number it already held.
