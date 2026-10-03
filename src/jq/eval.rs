@@ -120827,6 +120827,12 @@ mod touched_edge_cases_2999 {
             ("fromjson | .id", "7"),
             (r#"fromjson | .name + "x""#, r#""User7x""#),
             (r#"sub("User";"U")"#, r#""{\"id\":7,\"name\":\"U7\"}""#),
+            // A partial slice has no native arm: it reaches `eval_single`'s
+            // catch-all, which bridged without consulting the registered
+            // document and paid a second serialize-and-index per line.
+            (".[0:3]", r#""{\"i""#),
+            (".[2:]", r#""id\":7,\"name\":\"User7\"}""#),
+            (".[:2]", r#""{\"""#),
         ] {
             let (plain, plain_reindexes) = run(filter, false);
             let (rooted, rooted_reindexes) = run(filter, true);

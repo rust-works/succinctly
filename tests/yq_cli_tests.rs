@@ -88,6 +88,114 @@ fn test_dom_route_cursor_metadata_is_positionless_3479() -> Result<()> {
     Ok(())
 }
 
+/// #3479: moving yq's DOM route onto the converged evaluator changed two
+/// answers on it, both toward the cursor route and real yq. A union evaluates
+/// each side over the whole set the pipe handed it, so `.d[] | (., 1)` is
+/// `10 20 1 1` in yq v4.53.3 (the previous DOM route answered jq's way, `10 1 20
+/// 1`), and the cursor route has always said so. The rows run the same filter
+/// over the same value through the cursor route, `-R` and `--slurp`.
+#[test]
+fn test_dom_route_union_over_a_generator_follows_yq_3479() -> Result<()> {
+    let json = r#"{"d":[10,20]}"#;
+    for (filter, expected) in [
+        (".d[] | (., 1)", "10\n20\n1\n1\n"),
+        (".d[] | ([.], 1)", "[10]\n[20]\n1\n1\n"),
+    ] {
+        // yq's own answer, captured from v4.53.3 on the same document.
+        let cursor = run_yq_stdin_with_stderr(filter, json, &["-p=json", "-o=json", "-I=0"])?;
+        assert_eq!(
+            cursor,
+            (expected.into(), String::new(), 0),
+            "cursor: {filter}"
+        );
+        let raw = run_yq_stdin_with_stderr(
+            &format!("fromjson | {filter}"),
+            json,
+            &["-R", "-o=json", "-I=0"],
+        )?;
+        assert_eq!(raw, (expected.into(), String::new(), 0), "-R: {filter}");
+    }
+    Ok(())
+}
+
+/// #3479: `--jq-extensions`' `path(.a)` over a string answers nothing on every
+/// route: in yq a field of a scalar is an empty result, not jq's error. The
+/// previous DOM route (`-R`, `--slurp`) raised `Cannot index string with
+/// string "a"` for it while the cursor route said nothing, so the same filter
+/// over the same value differed with the flag.
+#[test]
+fn test_dom_route_path_over_a_scalar_is_empty_like_the_cursor_route_3479() -> Result<()> {
+    for (filter, expected) in [("path(.a)", ""), ("[path(.a)]", "[]\n")] {
+        let cursor =
+            run_yq_stdin_with_stderr(filter, "x\n", &["--jq-extensions", "-o=json", "-I=0"])?;
+        assert_eq!(
+            cursor,
+            (expected.into(), String::new(), 0),
+            "cursor: {filter}"
+        );
+        let raw =
+            run_yq_stdin_with_stderr(filter, "x\n", &["--jq-extensions", "-R", "-o=json", "-I=0"])?;
+        assert_eq!(raw, (expected.into(), String::new(), 0), "-R: {filter}");
+        let slurped = run_yq_stdin_with_stderr(
+            &format!(".[0] | {filter}"),
+            "x\n",
+            &["--jq-extensions", "-s", "-o=json", "-I=0"],
+        )?;
+        assert_eq!(slurped, (expected.into(), String::new(), 0), "-s: {filter}");
+    }
+    Ok(())
+}
+
+/// #3479: a partial slice over a `-R` line has no native arm, so it bridges,
+/// and the bridge now evaluates over the DOM document the CLI registered
+/// instead of serializing and indexing the line a second time. The evaluator's
+/// own unit row pins that the document is reused; this pins, through the real
+/// runner, that reusing it answers what the cursor route and yq v4.53.3 answer
+/// for the same string: slices count codepoints (`é` and `😀` are one each),
+/// a negative bound counts from the end, and an inverted range is `""`. `-R`
+/// is not a yq flag, so the oracle is each line as a JSON string through the
+/// cursor route, whose answers were captured from yq v4.53.3.
+#[test]
+fn test_raw_input_partial_slice_matches_the_cursor_route_3479() -> Result<()> {
+    let raw_lines = "héllo😀wörld\n{\"id\":7,\"name\":\"User7\"}\n";
+    let as_json = [r#""héllo😀wörld""#, r#""{\"id\":7,\"name\":\"User7\"}""#];
+    for (filter, expected) in [
+        (".[0:3]", [r#""hél""#, r#""{\"i""#]),
+        (".[0:3]?", [r#""hél""#, r#""{\"i""#]),
+        (
+            ".[2:]",
+            [r#""llo😀wörld""#, r#""id\":7,\"name\":\"User7\"}""#],
+        ),
+        (".[:2]", [r#""hé""#, r#""{\"""#]),
+        (".[-3:]", [r#""rld""#, r#""7\"}""#]),
+        (
+            ".[1:-1]",
+            [r#""éllo😀wörl""#, r#""\"id\":7,\"name\":\"User7\"""#],
+        ),
+        (".[5:2]", [r#""""#, r#""""#]),
+    ] {
+        let raw = run_yq_stdin_with_stderr(filter, raw_lines, &["-R", "-o=json", "-I=0"])?;
+        assert_eq!(
+            raw,
+            (
+                format!("{}\n{}\n", expected[0], expected[1]),
+                String::new(),
+                0
+            ),
+            "-R: {filter}"
+        );
+        for (json, want) in as_json.iter().zip(expected) {
+            let cursor = run_yq_stdin_with_stderr(filter, json, &["-p=json", "-o=json", "-I=0"])?;
+            assert_eq!(
+                cursor,
+                (format!("{want}\n"), String::new(), 0),
+                "cursor: {filter} over {json}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Pinned yq v4.53.3: adjacent `?//` is part of an unquoted key, while a
 /// question mark separated from the field by whitespace is a lexer error.
 #[test]

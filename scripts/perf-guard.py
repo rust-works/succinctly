@@ -249,6 +249,21 @@ QUERIES = [
     # scan, then full re-render).
     ("users_compact_identity", "users", "2mb", "jq", "."),
     ("users_compact_latefail", "users", "2mb", "jq", "."),
+    # #3479: `-R` rows. `succinctly yq -R` evaluates one tiny document per
+    # input line, through the DOM route that a bridged builtin (a construct the
+    # generic evaluator has no native arm for) used to pay a decode, a
+    # serialize and an index build for on every call. No row above runs `-R`,
+    # so a bridge that quietly stopped reusing the DOM document's index passed
+    # this guard at +0.0% while `-R` got up to 80% slower: #3535 shipped with
+    # `.[0:3]` (a partial slice, which has no native arm) at +74% wall-clock /
+    # +83.7% instructions on a 7950X, found a day later by hand. The three
+    # shapes are the bridge's three call patterns: a partial slice (the
+    # catch-all arm), `. + "x"` (the owned fast path) and `test("age")` (the
+    # regex bridge). The fixture is the `users`/2mb document's records, one
+    # per line (see `measure_all`).
+    ("users_yq_raw_slice", "users", "2mb", "yq", ".[0:3]"),
+    ("users_yq_raw_concat", "users", "2mb", "yq", '. + "x"'),
+    ("users_yq_raw_test", "users", "2mb", "yq", 'test("age")'),
 ]
 
 # Per-query extra CLI flags, inserted between the mode (`jq`/`yq`) and the
@@ -261,7 +276,15 @@ QUERIES = [
 QUERY_FLAGS = {
     "users_compact_identity": ["-c"],
     "users_compact_latefail": ["-c"],
+    "users_yq_raw_slice": ["-R"],
+    "users_yq_raw_concat": ["-R"],
+    "users_yq_raw_test": ["-R"],
 }
+
+# Rows whose fixture is the base `users`/2mb document's records, one compact
+# object per line (#3479). Listed once so `measure_all` and the self-tests
+# agree on which rows are derived this way.
+LINES_FIXTURE_ROWS = ("users_yq_raw_slice", "users_yq_raw_concat", "users_yq_raw_test")
 
 IR_PATTERN = re.compile(r"I\s+refs:\s+([\d,]+)")
 
@@ -354,6 +377,16 @@ DEFAULT_THRESHOLD = 5.0
 # PR's own merge-base, outputs byte-identical). Remove it once `main` carries
 # #3479 and the row reads ~0% again.
 #
+# `users_yq_raw_slice` (#3479) carries an override of the same one-off kind:
+# `eval_single`'s catch-all arm evaluates a partial slice over the DOM document
+# `succinctly yq -R` registered instead of serializing and indexing the line a
+# second time, which takes the row back to what it cost before #3535 added
+# that second pass (-44.7% ARM64-Linux / -45.0% x86_64 against the PR's own
+# merge-base; the answers are pinned by
+# `test_raw_input_partial_slice_matches_the_cursor_route_3479`). The other two
+# `-R` rows read within -1.1% on both architectures and stay on the default.
+# Remove it once `main` carries the change and the row reads ~0% again.
+#
 # `users_path_walk` (#3477) carried an override of the same one-off kind:
 # `[path(.users[] | .age)] | length` had `length` answered from the owned
 # tree (`eval_owned_length`) instead of serializing and reindexing it first
@@ -367,6 +400,7 @@ QUERY_THRESHOLDS = {
     "users_update_select": 30.0,
     "users_assign_scores": 30.0,
     "users_yq_del_select": 10.0,
+    "users_yq_raw_slice": 50.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
@@ -453,6 +487,22 @@ def generate_compact_fixture(binary, source_path, out_path):
     fires when the span it's about to write is *exactly* what this same
     write path would have produced anyway."""
     cmd = [binary, "jq", "-c", ".", source_path]
+    with open(out_path, "wb") as out:
+        result = subprocess.run(cmd, stdout=out, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        sys.exit(
+            f"'{' '.join(cmd)}' exited {result.returncode}; stderr:\n"
+            f"{result.stderr.decode(errors='replace')}"
+        )
+
+
+def generate_lines_fixture(binary, source_path, out_path):
+    """Writes `source_path`'s `users` records one compact object per line
+    (`jq -c '.users[]'`) for the `-R` rows (#3479), using the binary under
+    test for the same reason `generate_compact_fixture` does. The `.json`
+    extension is load-bearing for the `yq`-mode rows, as for every other
+    fixture here."""
+    cmd = [binary, "jq", "-c", ".users[]", source_path]
     with open(out_path, "wb") as out:
         result = subprocess.run(cmd, stdout=out, stderr=subprocess.PIPE)
     if result.returncode != 0:
@@ -596,6 +646,11 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
         latefail_path = os.path.join(tmp, "users_2mb_compact_latefail.json")
         inject_duplicate_last_member(compact_path, latefail_path)
         derived_fixture_paths["users_compact_latefail"] = latefail_path
+        # #3479: the `-R` rows read the same records one per line.
+        lines_path = os.path.join(tmp, "users_2mb_lines.json")
+        generate_lines_fixture(binary, base, lines_path)
+        for query_id in LINES_FIXTURE_ROWS:
+            derived_fixture_paths[query_id] = lines_path
 
         measured = {}
         print(f"Measuring {label} ({binary}):")
