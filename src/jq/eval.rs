@@ -98839,6 +98839,7 @@ mod tests {
     /// where [`LoopOperand::fork_cond`] turns the verdict's `Err` into the loop's
     /// escape.
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
     fn until_while_length_condition_raises_and_reads_bound_values_3697() {
         let one: &[u8] = b"[1]";
         let index = JsonIndex::build(one);
