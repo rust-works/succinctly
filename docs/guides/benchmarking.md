@@ -921,6 +921,17 @@ Diff both binaries' stdout across every input x query combination, and confirm t
 the reference tool (`jq`/`yq`). #106 compared 48 configurations per machine, 0 differences. A
 faster binary that changed behaviour is not a win, and this check is cheap.
 
+Look at the exit status in the same pass, because identity does not imply it. Two binaries that
+both fail the same way print the same error, so the identity gate passes and the table reports a
+delta for the time each took to say so. #2626 timed a 3.5 ms parse error (`add` is not a yq builtin
+without `--jq-extensions`) and #3479 a 2.8 ms one (`ascii_downcase`), each as a "+0.7%" row with
+`0 differences` above it, and both were caught only by noticing the absolute time.
+`scripts/ab-cli.py` now runs every configuration once per binary before timing and refuses the
+whole run when either binary exits non-zero or the two disagree, naming the input, the query and
+the first line of output; it prints how many configurations exited 0 next to the identity count,
+and `--allow-nonzero` is for a run whose point is an error path. A harness without this check has
+one tell: a row of a few milliseconds against an input of megabytes.
+
 ### 5. Measure both architectures — the effect size differs, not just the noise
 
 The same #106 commit measured **6.1x on Apple M4 Pro and 16.4x on Ryzen 9 7950X**. Post-fix

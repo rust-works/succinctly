@@ -579,6 +579,11 @@ jobs:
       - name: perf-guard.py self-tests
         run: python3 scripts/test_perf_guard.py -v
 
+      # #3687: the same shape for `scripts/ab-cli.py`: fake binaries, no cargo, no
+      # fixtures. It pins that a command which exits non-zero is refused, not timed.
+      - name: ab-cli.py self-tests
+        run: python3 scripts/test_ab_cli.py -v
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
