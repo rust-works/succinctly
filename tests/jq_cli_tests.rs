@@ -60672,6 +60672,11 @@ fn test_any_all_navigating_cond_states_the_register_it_left_3757() -> Result<()>
 /// `true` and `false` is equality, so a computed `true` over a `true` register *is*
 /// the register and `cond` navigates it with no path error (`any(true; .[0]?)`
 /// raises only the type error its `?` catches); over any other register it raises.
+/// The last six run it as an `and` right operand, on an untracked entry whose
+/// carried register the element may equal by kind: neither a live stage nor a
+/// position is available there, so it runs by value with no register stated,
+/// as it did before #3757, and a swallowed path error no longer turns a refusal
+/// into a silent no-op.
 #[test]
 fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -60883,6 +60888,48 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
             "",
             "Invalid path expression",
             5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(try (.a and any(true; .[0]?)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(.a and any(true; .[0]?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(.a and any(true; .[0]?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(((.a)? and any(true; .[0]?))?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[true]",
+            r"del(try (.[0] and any(true; .[0]?)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(try (.a and any(true; .[0]?)))",
+            "{\"a\":1}\n",
+            "",
+            0,
         ),
     ])
 }
