@@ -597,6 +597,32 @@ def route_program(rng, d):
     body = prefix + " | ".join(parts)
     return rng.choice(ROUTES) % body
 
+# #3519: bind sources that carry a postfix `?` on a navigation step -- jq's
+# `INDEX_OPT`/`EACH_OPT`, which swallows a type error but never a path error,
+# so the witness grammar admits it. SOURCES holds a handful (`.a?`, `.arr[0]?`,
+# `($p | .b?)`) but a stock run draws one in ~1 program in 3000, too few to
+# say the admission is sound (a base-vs-new run moved one program in 9000).
+# The mix is deliberate: shapes the witness now binds with a marker, a
+# string's `?`-sliced copy and a missing key (a fresh value, never the node),
+# a `?` that swallows a type error (no source output), a marker head, and
+# controls the grammar must keep refusing -- a `?` after a construction or a
+# computed stage, where the resolver's own refusal has to reach the by-value
+# fallback instead of being caught.
+OPTIONAL_SOURCES = [
+    (".a?", False), (".c?", False), (".x?", False), (".x.a?", False), (".x?.a", False),
+    (".a.b?", False), (".x.b?", False), (".a?.b?", False), (".arr[0]?", False),
+    (".arr[]?", False), (".arr[-1]?", False), (".arr[0:1]?", False), (".arr[1:]?", False),
+    (".a[0:1]?", False), (".a[1:2]?", False), (".a[0:3]?", False), (".arr[0]?.b?", False),
+    (".d?.zz?", False), (".[]?", False), (".arr[.d]?", False), (".arr[.d:]?", False), ("(.x | .a?)", False), ("(.arr | .[0]?)", False),
+    ("(.a | .b?)", False), ("(.a | [.] | .[0]?)", False), ("(.a | tostring | .[0:1]?)", False),
+    ("([.a] | .[0]?)", False), ("(.a | select(.b?) | .b?)", False),
+    ("$p.b?", True), ("$p[0]?", True), ("($p | .b?)", True), ("($p | .[]?)", True),
+    ("([$p] | .[0]?)", True), ("($p | .b? | .c?)", True),
+]
+
+def optional_source_program(rng):
+    return program(rng, OPTIONAL_SOURCES)
+
 def stage(rng, v):
     r = rng.random()
     if r < 0.4: return rng.choice(NAV)
@@ -605,14 +631,14 @@ def stage(rng, v):
     if r < 0.8: return rng.choice(MOVES)
     return rng.choice(USES).replace("$v", v)
 
-def program(rng):
+def program(rng, sources=SOURCES):
     n_bind = rng.choice([1, 1, 2])
     parts = []; prev = None
     if rng.random() < PREFIX_P:
         parts.append(rng.choice(PREFIX))
     for i in range(n_bind):
         v = f"$v{i}"
-        cands = [s for s, needs in SOURCES if not needs or prev]
+        cands = [s for s, needs in sources if not needs or prev]
         src = rng.choice(cands).replace("$p", prev or "$v0")
         if rng.random() < DESTRUCTURE_P:
             # #2649: a destructuring bind; the body uses the pattern's variable.
@@ -702,6 +728,11 @@ def main():
                     help="probability a program binds a scalar document root (#3191). doc() "
                          "always draws an object root, so the bind-time promotion of a scalar "
                          "is unreachable by default -- run at 1.0 to weight the sweep onto it")
+    ap.add_argument("--optional-source-p", type=float, default=0.0,
+                    help="probability a program binds from a postfix-`?` source (#3519). The stock "
+                         "SOURCES pool draws one in ~1 program in 3000, so a regression in the witness "
+                         "grammar's `?` admission is invisible to a stock run. Off by default so "
+                         "existing seeds keep their stream; run at 1.0 to weight the sweep onto it")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     pin = open("tests/data/jq-golden/JQ_VERSION").read().strip()
@@ -724,7 +755,8 @@ def main():
                            ("POSITIONAL_TARGETS", POSITIONAL_TARGETS),
                            ("POSITIONAL_WRAPS", POSITIONAL_WRAPS),
                            ("DESTRUCTURE_BIND_SOURCES", DESTRUCTURE_BIND_SOURCES),
-                           ("DESTRUCTURE_BIND_STAGES", DESTRUCTURE_BIND_STAGES)]:
+                           ("DESTRUCTURE_BIND_STAGES", DESTRUCTURE_BIND_STAGES),
+                           ("OPTIONAL_SOURCES", [src for src, _ in OPTIONAL_SOURCES])]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
@@ -749,6 +781,8 @@ def main():
             f = scalar_root_program(rng)
         elif a.positional_bind_p and rng.random() < a.positional_bind_p:
             f = positional_bind_program(rng)
+        elif a.optional_source_p and rng.random() < a.optional_source_p:
+            f = optional_source_program(rng)
         elif a.embed_write_p and rng.random() < a.embed_write_p:
             f = embed_write_program(rng)
         elif a.destructure_bind_p and rng.random() < a.destructure_bind_p:

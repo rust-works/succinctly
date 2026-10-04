@@ -1422,11 +1422,12 @@ is the revert that established what the other one costs.
    still resolves against the arm's own ambient value, trackability and frame, exactly as
    before #2042. The witness therefore runs only where it is provably the same computation
    as value evaluation: for a source on the closed pure-navigation grammar
-   (`is_pure_navigation` — `.`, `.a`, `.[n]`, a slice, `.[]`, `..`/`recurse`, `getpath` of a
+   (`is_pure_navigation` — `.`, `.a`, `.[n]`, a slice, `.[]`, a postfix `?` on one of those
+   steps (`.a?`, `.[]?`, #3519), `..`/`recurse`, `getpath` of a
    literal, pipes and commas of those, a literal, `error`), and only when `$var` can reach a
    position the resolver dispatches on in the body (`var_reaches_path_position`; a `$y` used
    only inside `select(..)`, an `if` condition or an operand gains nothing from an origin).
-   Any other source — `try`, `?`, `//`, `select`, `if`, `first`, a construction, a builtin —
+   Any other source — `try`, a `?` over a group, `//`, `select`, `if`, `first`, a construction, a builtin —
    binds by value with no origin, exactly as before #2042. The first cut ran the witness on
    every source and relied on its refusal escaping to a value-mode fallback; the review
    showed that a `try`/`?`/`//` *inside* the source caught that refusal (jq never raises it)
@@ -1466,6 +1467,21 @@ is the revert that established what the other one costs.
    `Expr::FuncDef` arm, so a `def` declared inside `path()` is bound and resolved in path mode
    instead of falling to the eager value fallback as an opaque leaf.
 
+   [#3519](https://github.com/rust-works/succinctly/issues/3519) moved
+   `path(.a? as $y \| .a \| $y)` there as well: a postfix `?` on a navigation step is jq's
+   `INDEX_OPT`/`EACH_OPT`, which swallows a type error but never a path error, so it cannot catch the
+   resolver's own refusal and the source stays on the witness grammar (`is_postfix_optional_navigation`,
+   `src/jq/eval.rs`). `try`-style groups stay out (`(.a)? as $y` is a syntax error in jq 1.7.1 anyway), and a
+   `?` after a construction (`([$q] \| .[0]?) as $y`) still binds by value.
+
+   One consequence is recorded as [#3732](https://github.com/rust-works/succinctly/issues/3732): a `?` source now
+   behaves like the plain spelling when a `try` or a `?` group catches a near-access refusal after the register was
+   lost (a construction, a `reduce`). `path(.a as $v \| {k: .a} \| ($v \| select(true)) \| try ($v \| .b?))` and
+   `... \| (($v \| .b)?)` both refuse where jq's own `try` answers, which the `?` spelling used to match only because it
+   bound by value. The exposure depends on the program's shape: four programs in about 93,000 fuzzed against the
+   pre-change binary, between one in 12,000 and one in 18,000 of those drawn from `?` sources alone, and none in a
+   21,600-case grid. Each has a plain twin that already refused on `main`.
+
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
    | `.a as $y \| path(.a \| $y)`                             | `["a"]`                     | value-mode binding — `eval_as` never resolves its source in path position; the *positional* half of #3037 (its root-of-invocation half is closed)                                                                                                          |
@@ -1473,7 +1489,7 @@ is the revert that established what the other one costs.
    | `path((.a \| select(.b)) as $y \| .a \| $y)`             | `["a"]`                     | the witness grammar is pure navigation; a `select`-wrapped source binds by value                                                                                                                                          |
    | `path((.a // 1) as $y \| .a \| $y)`                      | `["a"]`                     | same: a `//` source binds by value                                                                                                                                                                                        |
    | `path((if .a then .a else .b end) as $y \| .a \| $y)`    | `["a"]`                     | same: an `if` source binds by value                                                                                                                                                                                       |
-   | `path(.a? as $y \| .a \| $y)`                            | `["a"]`                     | a `?` on the bind *source* is outside the witness grammar, so it binds by value (a `?` on a later step agrees since #3464)                                                                                                |
+   | `path(.a as $q \| ([$q] \| .[0]?) as $y \| .a \| $y)`    | `["a"]`                     | a `?` after a construction: the resolver refuses the navigation of the rebuilt value and the `?` lets that refusal through to the by-value fallback, which binds a plain value (#3519)                                    |
    | `path(.a[0:3] as $y \| .a \| $y)` on `{"a":[1,2,3]}`     | `["a"]`                     | jq's full slice *is* the array; the bind path ends in a slice component and `.a` does not                                                                                                                                 |
    | `path(.a as $y \| (.c \| $y \| .b) as $w \| .a.b \| $w)` | `["a","b"]`                 | a marker is re-rooted only at the head of a source (`$y.b as $w`, `(($y \| .b) \| .c) as $w`); elsewhere it is certified against the ambient position                                                                     |
    | `path(.a as $y \| .a \| 5 \| reduce (1) as $i (0; $y))`  | `["a"]`                     | after a literal the register is only *carried*, and a fold whose INIT is untracked seeds its own register from the ambient literal — pre-existing: `path(. as $x \| 5 \| reduce (1) as $i (0; $x))` refuses too (jq `[]`) |
@@ -1491,11 +1507,11 @@ is the revert that established what the other one costs.
    answers too. A slice is never folded onto its container (#3494), and an empty range never agrees
    (`path(.x[5:] as $y | .x[6:] | $y)` refuses in jq too). The emitted path is unchanged. Pinned in
    `test_resolver_frame_position_is_spelling_insensitive_3464` and
-   `test_resolver_frame_position_spelling_controls_refuse_3464`. What stays refuse-only is not a
-   spelling comparison and refuses with identical spelling on both sides:
-   `first`/`last` (the resolver does not track them), a `?` on the bind *source*, a fractional
-   index on the bind side, and a full-range fractional slice
-   ([#3519](https://github.com/rust-works/succinctly/issues/3519)).
+   `test_resolver_frame_position_spelling_controls_refuse_3464`. What was left over was not a
+   spelling comparison and refused with identical spelling on both sides: `first`/`last` (the
+   resolver did not track them, closed by #3545), a fractional index on the bind side and a
+   full-range fractional slice (closed by #3677), and a `?` on the bind *source*
+   ([#3519](https://github.com/rust-works/succinctly/issues/3519), closed).
 
    Two related divergences were pre-existing and out of scope for #2042, tracked separately:
    **[#2642](https://github.com/rust-works/succinctly/issues/2642), now closed.** The *root*

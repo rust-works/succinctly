@@ -93834,6 +93834,150 @@ fn test_fractional_literal_bind_source_gets_a_marker_3519() -> Result<()> {
     ])
 }
 
+/// #3519 (mechanism 2): a postfix `?` on a navigation step is jq's
+/// `INDEX_OPT`/`EACH_OPT`, which never catches a path error, so it cannot
+/// swallow the resolver's own refusal and a bind source carrying one stays on
+/// the witness grammar. It used to bind by value, so a later step through
+/// `$y` refused where jq answers. Every row captured from jq 1.7.1.
+#[test]
+fn test_postfix_optional_bind_source_gets_a_marker_3519() -> Result<()> {
+    let input = r#"{"a":{"b":1},"x":[1,1]}"#;
+    assert_path_rows_3289(&[
+        (input, r"path(.a? as $y | .a | $y)", "[\"a\"]\n", "", 0),
+        (
+            input,
+            r"path(.a.b? as $y | .a.b | $y)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"path(.a.b? as $y | .a.b? | $y)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"path(.x[0]? as $y | .x[0] | $y)",
+            "[\"x\",0]\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"path(.x[1:]? as $y | .x[1:] | $y)",
+            "[\"x\",{\"start\":1,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        // A fractional literal stays a computed index/slice (jq truncates it
+        // at evaluation), admitted under `?` by its literal key alone; a
+        // different slot still refuses.
+        (
+            input,
+            r"path(.x[1.7]? as $y | .x[1.7] | $y)",
+            "[\"x\",1.7]\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"path(.x[0.5:]? as $y | .x[0.5:] | $y)",
+            "[\"x\",{\"start\":0.5,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"path(.x[1.7]? as $y | .x[0] | $y)",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        // A marker-headed source reroots its `?` continuation the same way.
+        (
+            input,
+            r"path(.a as $q | $q.b? as $y | .a.b | $y)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        // `.x[]?` binds each element: the first certifies, the second is a
+        // different node with an equal value and refuses, as in jq.
+        (
+            input,
+            r"path(.x[]? as $y | .x[0] | $y)",
+            "[\"x\",0]\n",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            input,
+            r"del(.a.b? as $y | .a.b | $y)",
+            "{\"a\":{},\"x\":[1,1]}\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"(.a.b? as $y | .a.b | $y) = 9",
+            "{\"a\":{\"b\":9},\"x\":[1,1]}\n",
+            "",
+            0,
+        ),
+        // A `?` still swallows a type error: no source output, no body.
+        (r"[1]", r"path(.a? as $y | .a | $y)", "", "", 0),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(.a.b.c? as $y | .a | $y)",
+            "",
+            "",
+            0,
+        ),
+        // Controls: the marker names `.a.b`'s node and nothing else.
+        (
+            input,
+            r"path(.a.b? as $y | .a | $y)",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"path(.a.b? as $y | .c.b | $y)",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(.a.zz? as $y | .a | $y)",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+        // A string slice is a fresh string, never a node: the `?` wrapper on
+        // the bind path must not hide that (it minted a marker, and the
+        // later `.a[1:2]` fabricated a path where jq refuses).
+        (
+            r#"{"a":"hello"}"#,
+            r"path(.a[1:2]? as $y | .a[1:2] | $y)",
+            "",
+            "Invalid path expression with result \"e\"",
+            5,
+        ),
+        (
+            r#"{"a":"hello"}"#,
+            r"del(.a[1:2]? as $y | .a[1:2] | $y)",
+            "",
+            "Invalid path expression with result \"e\"",
+            5,
+        ),
+    ])
+}
+
 /// #3023: `..` raises what it always raised, at the node the walk reaches it.
 ///
 /// `each_recurse_cursor_generic` used to step every node through the `.[]` step

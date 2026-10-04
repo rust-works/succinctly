@@ -664,6 +664,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `limit(0; unique)`, `true or unique`, an untaken `if` arm). Every row matches jq 1.7.1, and the 26 cells of the
   issue's table (13 constructs, `reduce` and `foreach`) went from 26 mismatches to none.
 
+- **jq: a postfix `?` on a bind source no longer makes `path()`, `del` and an assignment refuse a variable
+  bound through it** (#3519). `path(.a.b? as $y | .a.b | $y)` is `["a","b"]` in jq and exited 5 here, and
+  `del(.a.b? as $y | .a.b | $y)` and `(.a.b? as $y | .a.b | $y) = 9` refused alike: the witness that gives
+  `$y` the node it was bound from admitted no `?` at all, so the source bound by value and the later step
+  through `$y` had no node to name. A `?` directly on a navigation step (`.a?`, `.[0]?`, `.[]?`, `.[1:]?`) is
+  jq's `INDEX_OPT`/`EACH_OPT`, which swallows a type error but never a path error, and the resolver's own `?`
+  arm keeps that line, so it cannot catch the resolver's refusal and now stays on the witness grammar. A
+  `?` after a construction or a computed stage still binds by value, and a `?` over a group is `try` and stays
+  out. A string's `?`-sliced copy is a fresh string, never a node, as the plain slice already was:
+  `path(.a[1:2]? as $y | .a[1:2] | $y)` on `{"a":"hello"}` still refuses with `result "e"`, the same as jq
+  (`slice_witnesses_node` now looks through the `?` wrapper a branch carries). Every row in
+  `test_postfix_optional_bind_source_gets_a_marker_3519` is captured from jq 1.7.1, and the bind-origin
+  oracle sweep and fuzzer both gained `?`-source rows. One class moves the other way, in the refusing
+  direction: a `?` source now shares the plain spelling's refusal when a `try` or a `?` group catches a
+  near-access error after the register was lost, a construction or a `reduce` (#3732), where it used to agree
+  only because it bound by value.
+
 - **jq/yq: `recurse(.[]?)` visits every node instead of stopping silently at 10,000** (#3703). jq defines
   `def recurse: recurse(.[]?);`, so the explicit spelling is bare `recurse`, a walk bounded by the tree it
   walks, but the node cap meant for a parameterised `f` that can be unbounded (`recurse(.a)` on `null`)
