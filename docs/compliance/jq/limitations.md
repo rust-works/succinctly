@@ -1106,14 +1106,17 @@ is the revert that established what the other one costs.
      `del(foreach .[]? as $k (.; flatten(1) and (.a)?; .b?))` on `[true]` where jq raises
      (#3712).
    - **A refusal jq makes and catches is loud here.** jq catches its own path error inside a
-     `try`: `del(try (any and .a))` on `{"a":true}` leaves the document. Where an operand may have
-     moved the register this resolver cannot tell which error jq would raise, so its refusal is a
-     guess, uncatchable by design (#3267), and the row exits 5. The same holds for a right operand
+     `try`. Where an operand may have moved the register this resolver cannot tell which error jq
+     would raise, so its refusal is a guess, uncatchable by design (#3267), and the row exits 5.
+     `any`, `all` and `isempty(g)` were the examples (`del(try (any and .a))` on `{"a":true}`
+     leaves the document in jq); since #3749 and #3763 a deciding or emitting generator states the
+     register it left, so the refusal of `.a` is exact and a `try` catches it as jq's does, and
+     the row now leaves the document here too. The same holds for a right operand
      wrapped in `?`: a bare `.a?` is jq's `INDEX_OPT`, which suppresses a type error but not a
      path error, so on the node the register may still be on its refusal is a guess even when the
-     step could never succeed (`del(try (any and .a?))` on `{"a":true}` is the document in jq),
-     and a `(.a)?`/`(.a | .b)?` first step is no longer pruned silently there. Refuse-only, and
-     pinned (`test_and_or_path_by_value_operands_track_the_register_3428`). The same holds for
+     step could never succeed, and a `(.a)?`/`(.a | .b)?` first step is no longer pruned silently
+     there. Refuse-only, and pinned
+     (`test_and_or_path_by_value_operands_track_the_register_3428`). The same holds for
      the refusal of an untracked iteration: `path(. as $x | ["a"] | try join(",") catch . | $x)`
      is `[]` in jq and exits 5 here, for `add`, `flatten` and `flatten(n)`/`join(s)` alike (the
      refusal is a guess where the register may have been lost, #3267). The ordering inside
@@ -1149,7 +1152,14 @@ is the revert that established what the other one costs.
      identical -- #3494), so `path(.a as $v \| . as $w \| $v \| (($w \| .a)
      and .b))` refuses where jq answers.
    - **`any(gen; cond)`/`all(gen; cond)` state the register since
-     [#3749](https://github.com/rust-works/succinctly/issues/3749)**, in jq mode only. A deciding
+     [#3749](https://github.com/rust-works/succinctly/issues/3749), and so do bare `any`/`all`,
+     `any(f)`/`all(f)` and `isempty(g)` since
+     [#3763](https://github.com/rust-works/succinctly/issues/3763)**, in jq mode only. jq defines
+     the bare and one-argument spellings as `any(.[]; .)` and `any(.[]; f)` (`all` alike) and
+     `isempty(g)` as `first((g | false), true)`, so they take the same rules: `path(any)` on
+     `[true,false]` is `[0]`, `path(isempty(.[]?))` on `[false]` is `[0]`, and `del`/`=`/`|=` write
+     there; an untracked input still raises `near attempt to iterate through` from the `.[]`.
+     In yq mode they keep yq's own errors (`all only supports arrays, was !!int`). A deciding
      element is emitted from inside `gen`, so the result is a fresh boolean *at* the register `gen`
      left, and `PATH_END` accepts it when it is `jv_identical` to it: `path(any(.[]; .))` on
      `[true,false]` is `[0]`, `path(all(.[]; .))` is `[1]`, `del(any(.[]; .))` is `[false]`, and
@@ -1166,10 +1176,8 @@ is the revert that established what the other one costs.
      ([#3757](https://github.com/rust-works/succinctly/issues/3757)); a plain pipe stage does
      not read the backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any |
      $x)` on `{"a":false,"b":null}` is `[]` in jq and refuses here, as do the by-value forms
-     ([#3758](https://github.com/rust-works/succinctly/issues/3758)); and the bare `any`/`all`,
-     `any(f)`/`all(f)` and `isempty(g)` spellings have no such arm, so `path(any)` on
-     `[true,false]` is `[0]` in jq and refuses here
-     ([#3763](https://github.com/rust-works/succinctly/issues/3763)). The exhausted-generator
+     ([#3758](https://github.com/rust-works/succinctly/issues/3758)); `any(.a)` is the first
+     shape again. The exhausted-generator
      statement is `drained_register_after`, shared with `isempty(g)`, and it is made only on a
      trackable entry: after `false |` the value is not jq's register, and stating it would let
      `and` accept the `false` it computes (`path(false | (any(empty; .) and 1))` on `{"a":1}`).
@@ -1236,11 +1244,15 @@ is the revert that established what the other one costs.
    the leaf is a deliberate change with rows of its own. The drain builtins are the same kind of
    case: jq backtracks `INDEX(s; f)`'s source, so `path(. as $x \| INDEX(.l[]; .) \| $x)` on
    `{"l":[1,2]}` is `[]` in jq, while here the register is lost at the drain and the later `$x`
-   is refused -- and, since #3267, uncatchably (`isempty(g)` moves it only when `g` emits).
+   is refused -- and, since #3267, uncatchably.
    Pinned by `test_path_register_drain_producers_lose_the_register_uncatchably_3456`. `last(f)`
    is no longer one of them: [#3643](https://github.com/rust-works/succinctly/issues/3643)
    states its register as unmoved (jq mode), so `path(. as $x \| last(.l[]) \| $x)` is `[]`
-   here too, pinned by `test_path_register_last_f_does_not_move_it_3643`.
+   here too, pinned by `test_path_register_last_f_does_not_move_it_3643`. Nor is `isempty(g)`:
+   [#3763](https://github.com/rust-works/succinctly/issues/3763) states the register the first
+   branch `g` emitted left (and the entry register when it emitted nothing), so
+   `del(. as $x \| isempty(.l[]) \| try ($x \| .a))` leaves the document here as in jq, pinned by
+   `test_isempty_and_bare_any_all_state_the_register_3763`.
    An array is different: jq collects it without a subexp, so its contents
    are path-checked (`path(. as $x \| {k:.a} \| [.k] \| $x)` raises on the `.k`), and then
    backtracks the register to where the collect began. Since
