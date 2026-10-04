@@ -29,10 +29,10 @@ inputs:
     default: '75'
   pool-profile-files:
     description: >-
-      'true' merges the raw profile files of the processes the tests spawn into a pool of a few files
-      per binary instead of leaving one file per process (30,814 files, 47 GiB per run on 2026-10-04),
-      by setting LLVM_PROFILE_FILE_NAME for the coverage run. The default 'false' keeps cargo-llvm-cov's
-      per-process files (#3750).
+      'true' merges the raw profile files of the processes the tests spawn into a pool of one file per
+      CPU per binary instead of leaving one file per process (30,814 files, 47 GiB per run on 2026-10-04),
+      by setting LLVM_PROFILE_FILE_NAME for the rest of the job. Any value but 'true' or 'false' fails.
+      The default 'false' keeps cargo-llvm-cov's per-process files (#3750).
     required: false
     default: 'false'
 
@@ -99,20 +99,41 @@ runs:
         samples="$RUNNER_TEMP/df-avail-kb"
         nohup bash -c "while :; do df --output=avail -k / | tail -1 >> '$samples'; sleep 20; done" >/dev/null 2>&1 &
 
-    # #3750: pinned to v1.3 rather than the floating `@v1` while profile-file
-    # pooling is timed. `@v1` moved to v1.3 between two runs on 2026-10-04 with no
+    # #3750 B1: opt-in pooling of the raw profile files. cargo-llvm-cov's `show-env`
+    # (which every step of the action evals) ignores a preset LLVM_PROFILE_FILE but
+    # honours LLVM_PROFILE_FILE_NAME, which replaces its default
+    # `<package>-%p-%Nm.profraw`. Dropping the `%p` is what pools: the processes of
+    # one binary then merge, at exit, into `%Nm` = N files per binary (the slot is
+    # pid % N), with N the runner's CPU count, as in cargo-llvm-cov's own default.
+    # The name goes through $GITHUB_ENV and only when pooling is on: the default
+    # path never exports it, not even empty (which cargo-llvm-cov 0.9.1 reads as
+    # unset but a later release need not), and every later step, the ones nested in
+    # the action below included, is certain to see it. profraw-stats.sh fails the
+    # run if pooling was asked for and the files are not pooled.
+    - name: Pool raw profile files (when enabled)
+      shell: bash
+      env:
+        POOL_PROFILE_FILES: ${{ inputs.pool-profile-files }}
+      run: |
+        case "$POOL_PROFILE_FILES" in
+          true)
+            name="profile-%$(nproc)m.profraw"
+            echo "LLVM_PROFILE_FILE_NAME=$name" >> "$GITHUB_ENV"
+            echo "pooling raw profile files: LLVM_PROFILE_FILE_NAME=$name"
+            ;;
+          false) ;;
+          *)
+            echo "::error::pool-profile-files must be 'true' or 'false', got '$POOL_PROFILE_FILES'"
+            exit 1
+            ;;
+        esac
+
+    # #3750 (2026-10-04): pinned to v1.3 rather than the floating `@v1` while profile-file
+    # pooling is timed. `@v1` moved to v1.3 between two runs that day with no
     # commit here, and the job shortened by 5-8 minutes: a change like that makes
     # a before/after of anything else unreadable. Go back to `@v1` once the pooling
-    # decision is made.
+    # decision is made; nothing but this comment and #3750 reminds anyone.
     - uses: action-works/omni-dev-coverage-check@99cb840f1a614c83b3839b9d67b3c5caee227ae1 # v1.3
-      env:
-        # #3750 B1. cargo-llvm-cov's `show-env` (which every step of the action evals)
-        # ignores a preset LLVM_PROFILE_FILE but honours this name, which replaces its
-        # default `<package>-%p-%Nm.profraw`. Dropping the `%p` is what pools: the
-        # processes of one binary then merge, at exit, into `%4m` = four files (the slot
-        # is pid % 4), sized for four test threads. An empty value is treated as unset
-        # (checked against cargo-llvm-cov 0.9.1), so 'false' keeps the default pattern.
-        LLVM_PROFILE_FILE_NAME: ${{ inputs.pool-profile-files == 'true' && 'profile-%4m.profraw' || '' }}
       with:
         # Pin; we're a consumer. Must stay >= 0.38.0: that release added the
         # declarative `.omni-dev/coverage.yaml` ignore-list (omni-dev#1398),
