@@ -37871,24 +37871,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // #3349: `any(gen;cond)`/`all(gen;cond)` navigate `gen` live, so an
         // untracked value inside it raises as it does in jq. Value mode
         // (`each_any_all_gen_cond`) runs `gen` on the owned bridge and never
-        // reaches the resolver. `gen` is resolved here instead, each branch's
-        // value is probed with `cond` exactly as value mode probes it
-        // ([`any_all_probe_element`]), and the first decisive element stops
-        // `gen`. `cond` itself runs by value, as in jq's `isempty(first(gen |
-        // cond or empty))` desugar, where `cond` is not a path position.
-        //
-        // #3749: the result is a computed boolean, but jq's register is not
-        // where this arm entered, and `path()` accepts a result that is
-        // identical to it. A decisive element is emitted from inside `gen`,
-        // so the register is wherever `gen` left it, and `any(.[]; .)` on
-        // `[true,false]` is `[0]`: `true` is identical to the element it
-        // stopped at ([`register_after`], [`computed_at_register`], the
-        // `and`/`or` arms' rule). That holds only while `cond` cannot move
-        // the register itself (`any(.[]; .a)` is `[0,"a"]` in jq, which this
-        // arm still refuses), so a `cond` that might is a loss as before. A
-        // generator that produced no decisive element backtracked every
-        // branch, so the register is where the arm entered, like `isempty`.
-        // Both are jq mode only (ADR-0018), like the by-value leaf's verdict.
+        // reaches the resolver, so the resolver's own body is
+        // [`resolve_any_all_gen_cond_sink`]: it says how `cond` is run (by value
+        // when it navigates nothing, otherwise as a pipe stage on each branch
+        // `gen` produced, #3757), and what register the result carries
+        // (#3749, #3763), all jq mode only (ADR-0018).
         Expr::Builtin(builtin @ (Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond))) => {
             resolve_any_all_gen_cond_sink::<S>(
                 gen,
@@ -40383,6 +40370,21 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
 ///   `cond` (`.a`), one jq leaves in place that the allowlist cannot prove
 ///   (`select(.)`, `first(.)`), and a builtin whose own path rules the resolver
 ///   already models (`unique_by(.)`, an update assignment).
+///
+/// An *untracked* element (one `gen` computed) can still be jq's register: `path_intact`
+/// compares by `jv_identical`, which is pointer identity for a string, array or object and
+/// equality for `null`, `true` and `false`. A pass-through builtin hands back the value it
+/// was given (`ltrimstr("x")` on a non-string, `tostring` on a string) and a computed `true`
+/// over a `true` register is it by kind; `cond` then navigates it with no path error, where
+/// over any other value it raises one an enclosing `try` catches. The stage is given such an
+/// element only when the producer vouches for the register (`Unmoved`, or the frame's
+/// carried register when `gen` provably moves nothing and the entry is untracked): equal by
+/// kind it is re-established where the register stands, unequal it cannot be it (identical
+/// implies equal) and the stage raises as jq does. Anything else -- an equal string or
+/// container, a producer that lost the register, a `gen` the allowlist cannot vouch for
+/// -- is ambiguous and refuses as an uncatchable guess (#3267): a live stage could raise an
+/// error jq does not, which a `try` swallows so a write goes through. It also keeps a
+/// lost-register state out of the stage, whose entry asserts it never meets one.
 ///
 /// yq mode keeps the by-value route (ADR-0018: no oracle).
 ///
