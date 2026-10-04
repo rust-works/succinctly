@@ -304,6 +304,25 @@ OPERANDS = [
     "booleans",
     "iterables",
     "scalars",
+    # (#3738) a fold's own loop variable used inside its UPDATE/EXTRACT, where the
+    # generator in the body (`.[]?`, `..`) used to make the fold decline to hand
+    # the body its register, so a `try` around it caught the resulting refusal
+    # and the UPDATE yielded nothing. The comma and `//` rows are the contrasts
+    # that must keep refusing (sibling branches see the register unevenly). A
+    # context that does not bind `$k` makes both sides fail to compile, a MATCH.
+    "$k",
+    "($k | .[]?)",
+    "($k | ..)",
+    "($k | .[0])",
+    "($k | .a?)",
+    "($k | .[]? | .a?)",
+    "first($k | .[]?)",
+    "try ($k | .[]?)",
+    "try ($k | ..)",
+    "try ($k | .a)",
+    "($k, 1)",
+    "(($k | .[]?), $k)",
+    "($k | .[]?) // $k",
     # (#3361) the rest of the by-value builtins jq defines over a backtracked
     # source or never lets touch the register: `walk(f)` and `map(f)` qualify
     # only for an `f` that navigates nothing (`walk(.a)` and `map(.a)` are the
@@ -425,6 +444,14 @@ CONTEXTS = [
     ("reduce-update-computed-key", "path(reduce .[1+1] as $k (.; {X}))"),
     ("reduce-update-first-source", "path(reduce first as $k (.; {X}))"),
     ("reduce-update-pattern", "path(reduce [1] as [$q] (.; {X}))"),
+    # (#3738) the fold's UPDATE under a `try`, with a source that navigates (so jq's
+    # register has moved) and EXTRACT either the loop variable or `.`; the plain
+    # row is the control without the `try`.
+    ("foreach-update-try-var", "path(foreach .a? as $k (0; try ({X}); $k))"),
+    ("foreach-update-try-dot", "path(foreach .a? as $k (0; try ({X}); .))"),
+    ("foreach-update-try-del", "del(foreach .a? as $k (0; try ({X}); .))"),
+    ("foreach-update-try-assign", "(foreach .a? as $k (0; try ({X}); .)) = 9"),
+    ("foreach-update-plain", "path(foreach .a? as $k (0; {X}; .))"),
 ]
 
 # Long chains are the O(N^3) row: a timing axis, not a correctness one.
@@ -472,8 +499,8 @@ def build_rows(operands=None, stage_only=False):
             for cname, template in CONTEXTS:
                 # An operand that names `$x` only means something where the context
                 # binds it; elsewhere jq and the build both fail to compile, a
-                # trivial MATCH that carries no signal (3.4% of the grid, #3653).
-                if "$x" in shape and "$x" not in template:
+                # trivial MATCH that carries no signal (3.4% of the grid, #3653; `$k` since #3738).
+                if any(v in shape and v not in template for v in ("$x", "$k")):
                     continue
                 program = template.replace("{X}", shape)
                 for doc in INPUTS:
