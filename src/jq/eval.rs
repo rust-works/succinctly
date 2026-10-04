@@ -28395,7 +28395,11 @@ fn eval_update_no_vivify<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn is_plain_fan_out_path(path_expr: &Expr) -> bool {
     fn plain(expr: &Expr) -> bool {
         match expr {
-            Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
+            Expr::Identity
+            | Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Slice { .. }
+            | Expr::Iterate => true,
             Expr::Optional(inner) | Expr::Paren(inner) => plain(inner),
             Expr::Pipe(stages) => stages.iter().all(plain),
             _ => false,
@@ -28413,19 +28417,84 @@ fn concrete_update_paths<S: EvalSemantics>(
         doc,
     )
     .ok()?;
-    // A slice descriptor needs the real container to resolve against; those
-    // keep the route they already took.
     paths
         .iter()
         .map(|path| match path {
             OwnedValue::Array(parts)
                 if parts.iter().any(|p| matches!(p, OwnedValue::Object(_))) =>
             {
-                None
+                static_path_expr(&OwnedValue::array_from(resolve_slice_components(
+                    parts, doc,
+                )?))
             }
             _ => static_path_expr(path),
         })
         .collect()
+}
+
+/// A `path()` output with its slice descriptors resolved against the real
+/// container (#3756): a descriptor followed by an index names the element at
+/// `start + index` of the container it slices, so the pair collapses to that
+/// plain index. A descriptor that is last, is followed by anything but an
+/// in-range integer index, or starts past the front has no single-element
+/// spelling and declines.
+fn front_bound(bound: Option<&OwnedValue>) -> bool {
+    match bound {
+        Some(OwnedValue::Null) => true,
+        Some(OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n >= 0,
+        Some(OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
+            *f >= 0.0
+        }
+        _ => false,
+    }
+}
+
+fn resolve_slice_components(parts: &[OwnedValue], doc: &OwnedValue) -> Option<Vec<OwnedValue>> {
+    let mut out = vec_with_capacity(parts.len());
+    let mut cur = Some(doc);
+    let mut i = 0;
+    while i < parts.len() {
+        let part = &parts[i];
+        if let OwnedValue::Object(desc) = part {
+            let OwnedValue::Array(items) = cur? else {
+                return None;
+            };
+            let range = super::slice::SliceBounds::from_descriptor(desc)
+                .ok()?
+                .resolve(items.len());
+            // jq resolves a descriptor against the state the write has reached,
+            // not the pristine document, so only a slice that no earlier
+            // collapse can shift is spelled here: anchored at the front, with
+            // no bound counted from the back.
+            if range.start != 0 || !["start", "end"].iter().all(|k| front_bound(desc.get(*k))) {
+                return None;
+            }
+            let idx = match parts.get(i + 1)? {
+                OwnedValue::Int(n) => *n,
+                _ => return None,
+            };
+            let len = i64::try_from(range.len()).ok()?;
+            let idx = if idx < 0 { idx + len } else { idx };
+            if !(0..len).contains(&idx) {
+                return None;
+            }
+            let abs = i64::try_from(range.start).ok()? + idx;
+            out.push(OwnedValue::Int(abs));
+            cur = items.get(usize::try_from(abs).ok()?);
+            i += 2;
+        } else {
+            cur = match (part, cur) {
+                (OwnedValue::String(k), Some(OwnedValue::Object(m))) => m.get(&**k),
+                (OwnedValue::Int(n), Some(OwnedValue::Array(a))) => {
+                    usize::try_from(*n).ok().and_then(|n| a.get(n))
+                }
+                _ => None,
+            };
+            out.push(part.clone());
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 /// The `delpaths` entry for a write whose target is `path`, when every step
