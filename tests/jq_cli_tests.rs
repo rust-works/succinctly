@@ -63898,6 +63898,72 @@ fn test_foreach_update_under_try_over_a_generator_keeps_the_register_3738() -> R
             "",
             0,
         ),
+        // The same chain as the EXTRACT (every fold body goes through the same route).
+        (
+            doc,
+            r"path(foreach .x as $w (0; .; try ($w | .a[])))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (0; .; try ($w | .a[])))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[]}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as $w (0; .; try ($w | .a[] | .b))) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":9}]}}\n",
+            "",
+            0,
+        ),
+        // A chain through an index or a slice is a chain too (`is_navigation_node`); a slice
+        // write raises as jq's does instead of being silently skipped.
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"del(foreach .x as $w (0; try ($w | .a[0] | .[]?); .))",
+            "{\"x\":{\"a\":[[]]}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"(foreach .x as $w (0; try ($w | .a[0][]); .)) = 9",
+            "{\"x\":{\"a\":[[9]]}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"path(foreach .x as $w (0; try ($w | .a[0] | .[]?); .))",
+            "[\"x\",\"a\",0,0]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"(foreach .x as $w (0; try ($w | .a | .[] | .[0:1]); .)) = 9",
+            "",
+            "A slice of an array can only be assigned another array",
+            5,
+        ),
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"path(foreach .x as $w (0; try ($w | .a | .[] | .[0:1]); .))",
+            "[\"x\",\"a\",0,{\"start\":0,\"end\":1}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"path(foreach .x as $w (0; try ($w | .a[0:1][]); .))",
+            "[\"x\",\"a\",{\"start\":0,\"end\":1},0]\n",
+            "",
+            0,
+        ),
         // Control: a body with no generator already agreed.
         (
             doc,
