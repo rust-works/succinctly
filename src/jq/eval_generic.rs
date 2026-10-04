@@ -1440,8 +1440,9 @@ pub(crate) fn swallowed_scalar_iteration<S: EvalSemantics, V: DocumentValue>(
 /// boundary over `expr` with this handler, in this mode (#3689): the body is a
 /// bare `.[]` ([`try_swallows_scalar_iteration`](crate::jq::eval::try_swallows_scalar_iteration))
 /// and the mode is not yq. One definition for [`swallowed_scalar_iteration`]
-/// (the four boundaries) and [`path_context_step_try`] (the path-context walk),
-/// so the mode rule cannot be changed in one and left behind in the other.
+/// (the four value boundaries) and [`swallowed_path_leaf`] (every path walk: the
+/// path-context step and both `path(f)` walkers), so the mode rule cannot be
+/// changed in one and left behind in another.
 fn swallowing_boundary<S: EvalSemantics>(expr: &Expr, catch: Option<&Expr>) -> bool {
     crate::jq::eval::try_swallows_scalar_iteration(expr, catch) && S::TAG != EvalTag::Yq
 }
@@ -1452,9 +1453,9 @@ fn swallowing_boundary<S: EvalSemantics>(expr: &Expr, catch: Option<&Expr>) -> b
 /// error `?` swallows, `Err` for a failure it never does -- an undecodable
 /// string ([`scalar_iteration_precheck`]) or a scalar the cursor cannot read
 /// ([`validate_cursor`]). One definition for the `..` walk
-/// ([`each_recurse_cursor_generic`]) and the path-context step
-/// ([`path_context_step_try`]), which each keep their own container test and
-/// their own way of reporting the `Err`.
+/// ([`each_recurse_cursor_generic`]) and [`swallowed_path_leaf`] (which serves the
+/// path-context step and both `path(f)` walkers), which each keep their own
+/// container test and their own way of reporting the `Err`.
 fn scalar_leaf_iteration<S: EvalSemantics, V: DocumentValue>(
     node: &V,
     cursor: &V::Cursor,
@@ -1486,6 +1487,16 @@ fn scalar_leaf_iteration<S: EvalSemantics, V: DocumentValue>(
 /// An owned scalar needs no check: it was decoded when it was built, and a slice
 /// materializes its elements, so an undecodable one raised there, before the walk.
 ///
+/// A container with members is told from its cursor ([`DocumentCursor::is_container`])
+/// without resolving its value, so a container-heavy document does not pay a second
+/// resolve per member for a shortcut that cannot help it; only an empty container
+/// or a scalar is probed (the probe is free over JSON, an alias resolve over YAML,
+/// which only a library embedder in jq mode reaches).
+///
+/// `Some(Err(e))` carries what [`scalar_leaf_iteration`] decides, which is a decode
+/// failure today; a caller whose old arm re-raised only a decode failure narrows
+/// it to that (the `path(f)` walkers do), so the two rules cannot drift apart.
+///
 /// One definition for the path-context step ([`path_context_step_try`]) and the
 /// `path(f)` walkers' own `Optional` arms ([`path_walk_generic`],
 /// [`path_step_generic`]), so the three cannot disagree about a leaf.
@@ -1498,6 +1509,11 @@ fn swallowed_path_leaf<S: EvalSemantics, V: DocumentValue>(
         return None;
     }
     match node {
+        // A container with members is answered from the cursor alone: it has
+        // something to list, so the step runs, and the value is not resolved here
+        // only to be resolved again there. An empty container, or a scalar,
+        // falls through to the value test.
+        PathNode::At(cursor) if cursor.is_container() => None,
         PathNode::At(cursor) => {
             let value = cursor.value();
             if value.as_object().is_none() && value.as_array().is_none() {
@@ -20203,7 +20219,14 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
             // it, so the `Cannot iterate` message the step would format and
             // this arm would drop is never built (see [`swallowed_path_leaf`]).
             if let Some(settled) = swallowed_path_leaf::<S, V>(inner, None, node) {
-                return settled;
+                // This arm re-raises only a decode failure, as it always did.
+                return settled.or_else(|e| {
+                    if e.is_decode_failure() {
+                        Err(e)
+                    } else {
+                        Ok(())
+                    }
+                });
             }
             let mut branch = Vec::new();
             let result = path_walk_generic::<S, V>(inner, node, path, &mut branch);
@@ -20657,7 +20680,14 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
             // #3722: a bare `.[]?` over a scalar settles here without stepping
             // it, as in `path_walk_generic` (see [`swallowed_path_leaf`]).
             if let Some(settled) = swallowed_path_leaf::<S, V>(inner, None, node) {
-                return settled;
+                // This arm re-raises only a decode failure, as it always did.
+                return settled.or_else(|e| {
+                    if e.is_decode_failure() {
+                        Err(e)
+                    } else {
+                        Ok(())
+                    }
+                });
             }
             let mut branch = Vec::new();
             let result = path_step_generic::<S, V, T>(
@@ -44374,6 +44404,82 @@ mod tests {
         assert!(can(".a?.b"));
         assert!(!can(".a?[]"));
         assert!(!can(".[]?"));
+    }
+
+    /// #3722: `swallowed_path_leaf`'s own gate, which no output shows. A bare
+    /// `.[]` (under a `Paren` too) with no handler or `catch empty` settles a
+    /// scalar node -- live or owned -- as nothing, or as the decode failure `?`
+    /// never swallows; it never settles a container (a non-empty one is told
+    /// from its cursor, an empty one by its value), an absent node, a body that
+    /// is not a bare `.[]`, or a handler that runs; and it is not taken in yq
+    /// mode, where the step never built the message.
+    #[test]
+    fn swallowed_path_leaf_gate_3722() {
+        type Node<'a> = PathNode<crate::json::StandardJson<'a, Vec<u64>>>;
+        fn settle<S: EvalSemantics>(
+            node: &Node<'_>,
+            body: &Expr,
+            catch: Option<&Expr>,
+        ) -> Option<Result<(), EvalError>> {
+            swallowed_path_leaf::<S, _>(body, catch, node)
+        }
+        let live = |json: &'static [u8], check: &dyn Fn(&Node<'_>)| {
+            let index = JsonIndex::build(json);
+            check(&PathNode::At(index.root(json)));
+        };
+        let iterate = Expr::Iterate;
+        let parenthesised = Expr::Paren(Box::new(Expr::Iterate));
+        let empty = parse("empty").unwrap();
+        let handler = parse(r#""c""#).unwrap();
+        let field = parse(".a").unwrap();
+
+        live(b"5", &|scalar| {
+            for body in [&iterate, &parenthesised] {
+                assert!(matches!(
+                    settle::<JqSemantics>(scalar, body, None),
+                    Some(Ok(()))
+                ));
+                assert!(matches!(
+                    settle::<JqSemantics>(scalar, body, Some(&empty)),
+                    Some(Ok(()))
+                ));
+            }
+            // Not in yq mode, a handler that runs, or a body that is not `.[]`.
+            assert!(settle::<YqSemantics>(scalar, &iterate, None).is_none());
+            assert!(settle::<JqSemantics>(scalar, &iterate, Some(&handler)).is_none());
+            assert!(settle::<JqSemantics>(scalar, &field, None).is_none());
+        });
+        // What `?` never swallows escapes as the decode failure it is.
+        live(br#""\ud800""#, &|undecodable| {
+            match settle::<JqSemantics>(undecodable, &iterate, None) {
+                Some(Err(e)) => assert!(e.is_decode_failure()),
+                other => panic!("expected a decode failure, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3722 pin, only reached when the pin is already failing"
+            }
+            assert!(settle::<YqSemantics>(undecodable, &iterate, None).is_none());
+        });
+        // A container is stepped: one with members by its cursor, an empty one
+        // by its value.
+        live(b"[1]", &|container| {
+            assert!(settle::<JqSemantics>(container, &iterate, None).is_none());
+        });
+        live(b"[]", &|empty_container| {
+            assert!(settle::<JqSemantics>(empty_container, &iterate, None).is_none());
+        });
+        live(b"{}", &|empty_object| {
+            assert!(settle::<JqSemantics>(empty_object, &iterate, None).is_none());
+        });
+        // Owned nodes: a scalar settles (it was decoded when it was built), a
+        // container and an absent node are stepped.
+        let owned_scalar: Node<'_> = PathNode::Owned(Rc::new(OwnedValue::Int(1)));
+        let owned_container: Node<'_> = PathNode::Owned(Rc::new(OwnedValue::array()));
+        let absent: Node<'_> = PathNode::Absent;
+        assert!(matches!(
+            settle::<JqSemantics>(&owned_scalar, &iterate, None),
+            Some(Ok(()))
+        ));
+        assert!(settle::<YqSemantics>(&owned_scalar, &iterate, None).is_none());
+        assert!(settle::<JqSemantics>(&owned_container, &iterate, None).is_none());
+        assert!(settle::<JqSemantics>(&absent, &iterate, None).is_none());
     }
 
     /// #2572: a walk step extends the position's trail rather than copying

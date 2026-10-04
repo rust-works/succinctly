@@ -93892,15 +93892,26 @@ fn test_path_f_swallowed_scalar_iteration_answers_what_it_did_3722() -> Result<(
             assert_path_rows_3289(&[(doc, filter, "", fragment, 5)])?;
         }
     }
-    // An undecodable string below a slice raises when the slice materializes it.
-    for filter in ["[.[1:] | path(.[]?)]", "[.[2:] | path(.[]?)]"] {
-        assert_path_rows_3289(&[(
-            r#"[1,"\ud800",[2]]"#,
-            filter,
+    // A slice validates the array it slices, so a bad string raises there (even
+    // when the slice itself would not contain it)...
+    assert_path_rows_3289(&[(
+        r#"[1,"\ud800",[2]]"#,
+        "[.[1:] | path(.[]?)]",
+        "",
+        "invalid unicode escape sequence",
+        5,
+    )])?;
+    // ...and over a readable one the slice's elements are owned nodes, which
+    // jq 1.7.1 lists the same way.
+    assert_path_rows_3289(&[
+        (MIXED, "[.[2:] | path(.[]?)]", "[[0],[1],[2],[3]]\n", "", 0),
+        (
+            MIXED,
+            "[path(.[2:] | .[]? | .[]?)]",
+            "[[{\"start\":2,\"end\":null},2,0],[{\"start\":2,\"end\":null},3,\"k\"]]\n",
             "",
-            "invalid unicode escape sequence",
-            5,
-        )])?;
-    }
+            0,
+        ),
+    ])?;
     Ok(())
 }
