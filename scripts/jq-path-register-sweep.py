@@ -402,12 +402,24 @@ CHAIN_LENGTHS = [16, 64, 256]
 CHAIN_CONTEXTS = ["path", "del", "update"]
 
 
-def shapes_for(operand):
-    """Every combinator shape an operand takes part in."""
+def shapes_for(operand, stage_only=False):
+    """Every combinator shape an operand takes part in.
+
+    `stage_only` keeps just the operand as a bare pipe stage (and negated), about
+    1/15 of the rows: a quick run to repeat while iterating. It does **not**
+    bound a change to a stage-level rule (what `resolve_seq_stage` carries across
+    a stage: #3643, #3653). The right operand of an `and`/`or` is resolved as a
+    one-stage pipe seeded at the register (`resolve_from_restored_input`), so
+    those rules reach the `and`/`or` shapes too: #3653's seeded sample flipped
+    108 `and`/`or` rows beside 109 bare-stage ones. Judge a change on the full
+    shapes (or a seeded `--sample` over them).
+    """
     # (#3361) the operand alone, as a bare pipe stage: `. as $x | OP | $x` is
     # what the `var-rebind` context makes of it.
     yield f"({operand})"
     yield f"-({operand})"
+    if stage_only:
+        return
     for c in COMPANIONS:
         yield f"{operand} and {c}"
         yield f"{c} and {operand}"
@@ -415,7 +427,7 @@ def shapes_for(operand):
         yield f"{c} or {operand}"
 
 
-def build_rows(operands=None):
+def build_rows(operands=None, stage_only=False):
     """The grid and the chain rows, separately: (label, input, program).
 
     The chain rows are the timing axis and are never sampled away. `operands`
@@ -426,7 +438,7 @@ def build_rows(operands=None):
     rows = []
     chains = []
     for operand in OPERANDS if operands is None else operands:
-        for shape in shapes_for(operand):
+        for shape in shapes_for(operand, stage_only):
             for cname, template in CONTEXTS:
                 program = template.replace("{X}", shape)
                 for doc in INPUTS:
@@ -546,13 +558,20 @@ def main():
         metavar="TEXT",
         help="restrict the grid to this operand (exact text from --list-axes); repeatable",
     )
+    ap.add_argument(
+        "--stage-only",
+        action="store_true",
+        help="only the operand as a bare pipe stage (and negated), about 1/15 of the "
+        "rows: a quick iteration run, not a gate (an and/or operand is a one-stage "
+        "pipe too)",
+    )
     ap.add_argument("--list-axes", action="store_true", help="print the grid's size and exit")
     args = ap.parse_args()
 
     unknown = [o for o in args.operand if o not in OPERANDS]
     if unknown:
         ap.error(f"--operand {unknown[0]!r} is not an operand; see --list-axes")
-    grid, chains = build_rows(args.operand or None)
+    grid, chains = build_rows(args.operand or None, args.stage_only)
     if args.list_axes:
         print(f"operands={len(OPERANDS)} companions={len(COMPANIONS)} inputs={len(INPUTS)} "
               f"contexts={len(CONTEXTS)}")
