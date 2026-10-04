@@ -1148,6 +1148,23 @@ is the revert that established what the other one costs.
      non-empty array (`.[0:]` is the input itself to jq; an empty slice is a fresh `[]`, never
      identical -- #3494), so `path(.a as $v \| . as $w \| $v \| (($w \| .a)
      and .b))` refuses where jq answers.
+   - **`any(gen; cond)`/`all(gen; cond)` state the register since
+     [#3749](https://github.com/rust-works/succinctly/issues/3749)**, in jq mode only. A deciding
+     element is emitted from inside `gen`, so the result is a fresh boolean *at* the register `gen`
+     left, and `PATH_END` accepts it when it is `jv_identical` to it: `path(any(.[]; .))` on
+     `[true,false]` is `[0]`, `path(all(.[]; .))` is `[1]`, `del(any(.[]; .))` is `[false]`, and
+     `[1,2]`/`[null]` still refuse (a truthy `1` is not `true`, `null` is not `false`). A generator
+     that never decided backtracked every branch, so the register is where the construct entered
+     (`path(any(.[]; .) or .a)` on `{"a":false}` is `["a"]`). Two shapes are still refused where jq
+     answers, both pinned
+     (`test_any_all_gen_cond_navigating_cond_and_pipe_stage_stay_refused_3749`): a `cond` that
+     navigates moves jq's register itself, so `path(any(.[]; .a))` on `[{"a":true}]` is
+     `[0,"a"]` in jq and refuses here, because `cond` runs by value
+     ([#3757](https://github.com/rust-works/succinctly/issues/3757)); and a plain pipe stage does
+     not read the backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any |
+     $x)` on `{"a":false,"b":null}` is `[]` in jq and refuses here, as do the by-value forms
+     ([#3758](https://github.com/rust-works/succinctly/issues/3758)). Real yq rejects the
+     two-argument form outright, so yq mode (`--jq-extensions`) keeps its refusal.
 
    A generated sweep (`scripts/jq-path-register-sweep.py`: 54 operands -- native navigation,
    literals, by-value builtins, `try`/`//`/`if`/`def` wrappers, folds, `label`, `limit`,

@@ -658,6 +658,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (74,547 rows: 0 regressions, `REFUSE_WRONG` 2,679 to 1,638, `ACCEPT_WRONG` unchanged at 2). Pinned by
   `test_reduce_with_a_computing_update_leaves_the_register_3710`.
 
+- **jq: `path(any(gen; cond))`/`all(gen; cond)` accept a boolean result that is identical to jq's register** (#3749, a #3349 follow-up).
+  A deciding element is emitted from inside `gen`, so jq's path register is wherever `gen` left it and `path()` accepts
+  a result that is `jv_identical` to it, which for a boolean is any equal boolean: `path(any(.[]; .))` on `[true,false]`
+  is `[0]`, `path(all(.[]; .))` is `[1]`, `del(any(.[]; .))` is `[false]`, and `(all(.[]; .)) = 5` writes there. The
+  arm built its result as an untracked boolean at the root with a lost register, so every one of them exited 5. The
+  result is now emitted with `register_after`/`computed_at_register`, the rule the `and`/`or` arms use, so `[1,2]`
+  (`1` is not `true`) and `[null]` (`null` is not `false`) still refuse; a generator that never decided backtracked
+  every branch and states its register as unmoved, which `and`/`or` read (`path(any(.[]; .) or .a)` on `{"a":false}`
+  is `["a"]`). jq mode only. Two shapes still refuse where jq answers and are pinned: a `cond` that navigates moves
+  jq's register onto its own node (`path(any(.[]; .a))` on `[{"a":true}]` is `[0,"a"]`, #3757), and a plain pipe stage
+  does not read the backtracked-register verdict of `any`/`all`/`isempty` (`path(. as $x | any | $x)`, #3758). 28 of 42
+  oracle rows differed from jq before the change on both the stdin and `-n` routes, none after. Pinned by
+  `test_any_all_gen_cond_decisive_result_sits_at_the_register_3749` and
+  `test_any_all_gen_cond_exhausted_register_stays_at_entry_3749`.
+
 - **jq: a `foreach` whose update is a full slice keeps its state on the register** (#3742).
   `path(foreach (1,2) as $x (.; .[0:]; .))` on `[10,20,30]` answered the first step and refused the second, where
   jq answers both: a slice that keeps every element of a non-empty array shares its parent's buffer, so `foreach`
