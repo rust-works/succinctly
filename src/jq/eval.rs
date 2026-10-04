@@ -41967,6 +41967,11 @@ impl FoldRegister {
     /// result still equals the register's value kept every element; an empty
     /// array is a fresh `jv_array()` and a string slice a fresh string, so
     /// neither qualifies ([`slice_witnesses_node`]).
+    ///
+    /// A slice under a postfix `?` (`.[0:]?`) is the same step: the wrapper only
+    /// prunes a failure to slice, and a branch resolved under it carries
+    /// `Optional(Slice)`, so each component is read through [`strip_optional`]
+    /// (#3734), as [`slice_witnesses_node`] already does for the last one.
     fn whole_array_slice_of_register(&self, b: &PathBranch<'_>) -> bool {
         if !slice_witnesses_node(&b.path, &b.value)
             || !matches!(&self.value, OwnedValue::Array(items) if !items.is_empty())
@@ -41979,7 +41984,10 @@ impl FoldRegister {
             parent, component, ..
         } = cur
         {
-            if !matches!(component, Expr::Slice { .. } | Expr::SliceExpr { .. }) {
+            if !matches!(
+                strip_optional(component),
+                Expr::Slice { .. } | Expr::SliceExpr { .. }
+            ) {
                 return false;
             }
             if Rc::ptr_eq(parent, &self.path) || **parent == *self.path {

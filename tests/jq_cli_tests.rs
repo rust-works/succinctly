@@ -94302,6 +94302,123 @@ fn test_reduce_whole_array_slice_is_the_register_3504() -> Result<()> {
     ])
 }
 
+/// #3734: the #3504 rule through a postfix `?`. A branch resolved under `?`
+/// carries `Optional(Slice)`, and the chain walk that decides whether a `reduce`
+/// accumulator is still the register matched the raw component, so `.[0:]?`
+/// refused where `.[0:]` answered. The wrapper only prunes a failure to slice;
+/// the step is the same one. Partial slices, an empty array, a string and a
+/// navigating source or destructuring pattern still refuse, `?` or not. Every
+/// row captured from jq 1.7.1.
+#[test]
+fn test_reduce_whole_array_slice_under_optional_is_the_register_3734() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[0:]?))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[null:]?))",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A fractional bound stays a computed `SliceExpr`: the same wrapper,
+        // a different slice node.
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[0.5:]?))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[0:]? | .[0:]?))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"del(reduce 1 as $x (.; .[0:]?))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"(reduce 1 as $x (.; .[0:]?)) |= length",
+            "3\n",
+            "",
+            0,
+        ),
+        // The accumulator seeded from a field keeps that field's path.
+        (
+            r#"{"a":[1,2],"b":[1,2]}"#,
+            r"path(reduce 1 as $x (.a; .[0:]?))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1,2],"b":[1,2]}"#,
+            r"path(reduce 1 as $x (.b; .[0:]?))",
+            "[\"b\"]\n",
+            "",
+            0,
+        ),
+        // Partial slices, empty arrays and strings stay refused.
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[null:1]?))",
+            "",
+            "Invalid path expression with result [10]",
+            5,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(reduce 1 as $x (.; .[1:]?))",
+            "",
+            "Invalid path expression with result [20,30]",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(reduce 1 as $x (.; .[0:]?))",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        (
+            r#""abc""#,
+            r"path(reduce 1 as $x (.; .[0:]?))",
+            "",
+            "Invalid path expression with result \"abc\"",
+            5,
+        ),
+        // A navigating source or a destructuring/`?//` pattern moves jq's
+        // register off the accumulator, so the slice refuses there.
+        (
+            r"[[1],[1]]",
+            r"path(reduce .[] as $a (.; .[0:]?))",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r"[[1],[1]]",
+            r"(reduce .[] as [$a] ?// $a (.; .[0:]?)) |= map(.+[1])",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+    ])
+}
+
 /// #3519 (mechanism 3): a fractional literal index or slice bound stays a
 /// computed `IndexExpr`/`SliceExpr` (jq truncates it at evaluation), so it was
 /// not a navigation node and a bind through it got no marker. Identical
