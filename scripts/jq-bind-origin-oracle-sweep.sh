@@ -329,6 +329,19 @@ select-wrapped-source	{"a":{"b":1}}	path((.a | select(.b)) as $y | .a | $y)
 alternative-source	{"a":{"b":1}}	path((.a // 1) as $y | .a | $y)
 if-source	{"a":{"b":1}}	path((if .a then .a else .b end) as $y | .a | $y)
 optional-source-spelling	{"a":{"b":1}}	path(.a? as $y | .a | $y)
+optional-source-field-chain	{"a":{"b":1}}	path(.a.b? as $y | .a.b | $y)
+optional-source-twice	{"a":{"b":1}}	path(.a.b? as $y | .a.b? | $y)
+optional-source-index	{"x":[1,1]}	path(.x[0]? as $y | .x[0] | $y)
+optional-source-slice	{"x":[1,2,3]}	path(.x[1:]? as $y | .x[1:] | $y)
+optional-source-string-slice	{"a":"hello"}	path(.a[1:2]? as $y | .a[1:2] | $y)
+optional-source-string-slice-del	{"a":"hello"}	del(.a[1:2]? as $y | .a[1:2] | $y)
+optional-source-marker-head	{"a":{"b":1}}	path(.a as $q | $q.b? as $y | .a.b | $y)
+optional-source-type-error	{"a":{"b":1}}	path(.a.b.c? as $y | .a | $y)
+optional-source-other-node	{"a":{"b":1}}	path(.a.b? as $y | .a | $y)
+optional-source-sibling	{"a":{"b":1},"c":{"b":1}}	path(.a.b? as $y | .c.b | $y)
+optional-source-write	{"a":{"b":1}}	del(.a.b? as $y | .a.b | $y)
+optional-source-assign	{"a":{"b":1}}	(.a.b? as $y | .a.b | $y) = 9
+optional-source-over-construction	{"a":{"b":1}}	path(.a as $q | ([$q] | .[0]?) as $y | .a | $y)
 negative-index-spelling	[{"b":1},{"b":1}]	path(.[0] as $y | .[-2] | $y)
 full-slice-is-the-array	{"a":[1,2,3]}	path(.a[0:3] as $y | .a | $y)
 marker-not-at-head	{"a":{"b":1}}	path(.a as $y | (.c | $y | .b) as $w | .a.b | $w)
@@ -1119,7 +1132,7 @@ source-rebuilt-container:the source navigates inside a construction, which jq's 
 select-wrapped-source:the witness grammar is pure navigation (is_pure_navigation); a select-wrapped source binds by value
 alternative-source:the witness grammar is pure navigation; a // source binds by value
 if-source:the witness grammar is pure navigation; an if source binds by value
-optional-source-spelling:a ? on the bind source is outside the witness grammar (is_pure_navigation), so it binds by value; a ? on a later step matches since #3464
+optional-source-over-construction:#3519 -- a ? after a construction (`([$q] | .[0]?) as $y`) is refused by the resolver where jq's suspended tracking allows it; the postfix ? lets that refusal through to the by-value fallback, which binds a plain value
 full-slice-is-the-array:jq's full slice is the array itself; the bind path ends in a slice component, .a does not
 marker-not-at-head:a marker is re-rooted only at the head of a source; elsewhere it is certified against the ambient position
 destructure-bind-after-pattern:#2649 residue 1 -- a plain bind on the ambient input after a pattern moved the register: resolve_bind_source needs a trackable stage, and the pattern's body stage is not
