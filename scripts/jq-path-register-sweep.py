@@ -56,8 +56,8 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 2,059,000 rows (`--list-axes` prints the exact count:
-170 operands, each also swept as a bare pipe stage since #3361, across 37 contexts),
+**Size.** The full grid is about 2,299,000 rows (`--list-axes` prints the exact count:
+188 operands, each also swept as a bare pipe stage since #3361, across 37 contexts),
 which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
@@ -162,20 +162,53 @@ OPERANDS = [
     # raises in jq (`.[]?` and `.a?` on a computed `1`, `unique_by(.)`) under a
     # generator that decides nothing, bare and wrapped in `isempty`, which is
     # what let a later `$x` re-establish the root and a `del` delete it.
-    # Known residual (#3757): `cond` runs by value, so jq's path error on a
-    # *computed* element is invisible and `any(1; .[]?) or true`, `.. // .a`
-    # and friends still write where jq exits 5. On these five operands alone
-    # that is 1,603 ACCEPT_WRONG rows in a 155,547-program run over the sixteen
-    # any/all/isempty operands (`--operand` for each) at the grid's 27 contexts,
-    # against a build of `main` without #3763, down from 2,342: 739 closed, none
-    # new, none writes a different document. They are not regressions of a later
-    # change, and the older operands have none. The counts move with the grid:
-    # 1,087 and 1,826 at its 23 contexts, before #3653 added four.
+    # They were the by-value `cond` hole (#3757): jq's path error on a
+    # *computed* element was invisible, and `any(1; .[]?) or true` or
+    # `.. // .a` wrote where jq exits 5. #3757 resolves such a `cond` as
+    # `gen | cond`: `--operand` over the any/all/isempty operands, against a build
+    # of `main` without it, went from ACCEPT_WRONG rows to none, with no
+    # regression. The counts move with the grid, so rerun rather than compare.
     "any(1; .[]?)",
     "any(true; .[0]?)",
     "all(unique_by(.))",
     "isempty(any(1; .[]?))",
     "isempty(all(1; .a?))",
+    # (#3757) a `cond` outside the by-value allowlist is resolved as `gen | cond`
+    # in jq mode: the stage rules for `select`/`first`, a navigating chain, an
+    # update assignment and `unique_by` (which raises on a computed element), and
+    # a computed generator under a navigating `cond`, the shape that wrote where
+    # jq exits 5.
+    "any(.[]?; select(.))",
+    "all(.[]?; first(.))",
+    "any(.[]?; .a | .b)",
+    "all(.[]?; .a += 1)",
+    "any(.[]?; unique_by(.))",
+    "any(1; .a)",
+    "any(true; select(.))",
+    # (#3757 review) a computed generator element can still be jq's register: a
+    # pass-through builtin returns the value it was given (`ltrimstr("x")` on a
+    # non-string, `tostring` on a string) and jq then raises no path error in
+    # `cond`, where a live stage assuming "computed means not the register" raised
+    # one an enclosing `try` swallowed. And an opaque generator (`input_line_number`,
+    # `now`) states no register at all, which used to trip the stage's entry
+    # assertion in a debug build. `first(2, 3)` against `2` is the pair that tells a
+    # generator the allowlist cannot prove from one it can.
+    "any(ltrimstr(\"x\"); .[0])",
+    "all(ltrimstr(\"x\"); first)",
+    "any(.a | tostring; .[0]?)",
+    "any(.a | ltrimstr(\"x\"); .a?)",
+    "all(tostring; .a?)",
+    "any(input_line_number; .a)",
+    "any(now; .a)",
+    "any(first(2, 3); .a?)",
+    "any(2; .a?)",
+    # (#3757 review) a `?//` inside `gen` retries after a failed alternative and
+    # resolves a later one, which supersedes whatever the abandoned alternative's
+    # element stashed: the first alternative yields a number `cond` cannot
+    # navigate (or, for the by-value `cond`, raises on), the second the element
+    # itself. A stash that outlived the retry raised the first one's error.
+    "any((.[0]? | length) as $p ?// $q | if $p != null then $p else .[0]? end; .a?)",
+    "any((.[0]? | tostring | length) as $p ?// $q | if $p != null then $p else .[0]? end; if type == \"number\" then error(\"x\") else . end)",
     # wrappers and control flow around the above
     "try .a",
     "(.a // .b)",

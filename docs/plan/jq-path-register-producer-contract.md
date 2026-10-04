@@ -316,11 +316,22 @@ Consequences:
   B3 first decided that per value from the result (`register_stays_on_result`); that verdict is
   gone. Every spelling now has its own arm (`resolve_any_all_gen_cond_sink`, #3749 and #3763;
   the `isempty` arm), which states the register the *deciding branch* left, or the entry
-  register when nothing decided. Both claims are sound only for a `cond` that cannot raise a
-  path error: jq path-checks `cond` and the resolver runs it by value, so the decided claim
-  needs `cannot_move_register(cond)`, and the undecided one needs that, or an empty `gen`, or
-  pure navigation that only ran on the register. The per-result verdict made the claim for any
-  `cond` and wrote `null` over a document for `all(unique_by(.))`.
+  register when nothing decided. Both claims are sound only if `cond` cannot raise a path
+  error jq would raise: jq path-checks `cond` (it is `or`'s left operand, not a subexp), and
+  an arm that runs it by value cannot see that. So a `cond` that provably navigates nothing
+  (`cannot_move_register`) runs by value, and any other is resolved as a pipe stage on each
+  branch `gen` produced (`resolve_seq_stage`, #3757), which is `gen | cond`: its register and
+  its path errors are the resolver's own, so the decided claim is the output branch's
+  register (`register_after`) and the undecided one needs no extra condition, because a
+  `cond` that could raise already did. An *untracked* generator element is the one thing
+  the stage cannot be handed blindly: `jv_identical` makes a pass-through value
+  (`ltrimstr("x")` on a non-string) or an equal `null`/`true`/`false` the register itself, and
+  `cond` then raises no path error. The stage gets it only when the producer vouches
+  (`Unmoved(register)`, or the frame's carried register when `gen` moves nothing): equal by
+  kind, re-established at the branch's path; unequal, it raises as jq does; otherwise it is an
+  uncatchable guess, which also keeps a lost-register state out of the stage's entry assertion.
+  The per-result verdict made the claim for any `cond` and wrote `null` over a document for
+  `all(unique_by(.))`; #3749's undecided claim did the same for `any(1; .[]?) or 1`.
 
 ## 6. Delivery
 
