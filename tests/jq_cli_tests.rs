@@ -60269,27 +60269,9 @@ fn test_any_all_gen_cond_navigation_in_path_context_3349() -> Result<()> {
 /// (`eval.rs`) instead of the cursor one the stdin rows take.
 fn assert_path_rows_both_routes_3749(rows: &[PathRow3289]) -> Result<()> {
     assert_path_rows_3289(rows)?;
-    for &(input, filter, stdout, message, exit) in rows {
-        let program = format!("{input} | {filter}");
-        let (out, err, code) = run_jq_full(&["-nc", &program], None)?;
-        assert_eq!(
-            (out.as_str(), code),
-            (stdout, exit),
-            "`{program}` (-n): stderr {err:?}"
-        );
-        if message.is_empty() {
-            assert!(
-                err.is_empty(),
-                "`{program}` (-n): unexpected stderr {err:?}"
-            );
-        } else {
-            assert!(
-                err.contains(message),
-                "`{program}` (-n): stderr {err:?} lacks {message:?}"
-            );
-        }
-    }
-    Ok(())
+    assert_path_rows_via_3749(rows, |input, filter| {
+        run_jq_full(&["-nc", &format!("{input} | {filter}")], None)
+    })
 }
 
 /// #3749: `any(gen; cond)`/`all(gen; cond)` emit their boolean from inside
@@ -60463,6 +60445,10 @@ fn test_any_all_gen_cond_decisive_result_sits_at_the_register_3749() -> Result<(
 /// `any(.[]; .) or .a` on `{"a":false}` is `["a"]` (the right operand's `.a`
 /// navigates from the register at the root), where a lost register refused.
 /// A decided `any` composes the same way, through the position it stopped at.
+/// The register is stated only on a trackable entry: after `false |` the value
+/// is not jq's register, so stating it would let `and` accept the `false` it
+/// computes (`path(false | (any(empty; .) and 1))` answered `[]`, and `del` of
+/// it wrote `null`, where jq refuses); the last three rows pin that conjunct.
 /// Every row captured from jq 1.7.1.
 #[test]
 fn test_any_all_gen_cond_exhausted_register_stays_at_entry_3749() -> Result<()> {
@@ -60518,26 +60504,61 @@ fn test_any_all_gen_cond_exhausted_register_stays_at_entry_3749() -> Result<()> 
             r"Invalid path expression with result true",
             5,
         ),
+        (
+            r#"{"a":1}"#,
+            r"path(false | (any(empty; .) and 1))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(false | (any(empty; .) and 1))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(.a | (any(empty; .) and 1))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
     ])
 }
 
-/// #3749, what is still refused: a `cond` that navigates moves jq's register
-/// itself (`or`'s left operand is not a subexp), so the register after
-/// `any(.[]; .a)` is on `.a` of the element and jq answers `[0,"a"]`; this
-/// arm runs `cond` by value and cannot say where it left the register, so it
-/// stays a loss and refuses (#3757). And a plain pipe stage does not yet read the
-/// backtracked-register verdict `any`/`all`/`isempty` state, so a frozen
-/// `$x` after an exhausted `any` refuses where jq answers `[]` -- the same
-/// gap the by-value `any | $x` has (#3758). Pinned as the current
-/// refusals so lifting either is a deliberate change; the jq answers are in
-/// each row.
+/// #3749, what is still refused. The decisive result is stated only while
+/// `cond` provably cannot move jq's register (`cannot_move_register`'s
+/// allowlist), because `cond` runs by value here and the arm cannot say where
+/// it left the register. So a `cond` that navigates (`.a`: `or`'s left operand
+/// is not a subexp, so jq answers `[0,"a"]`) refuses, and so does one jq leaves
+/// in place that the allowlist cannot prove (`select(.)`, `first(.)`: jq
+/// answers `[0]`), a loss either way (#3757). And a plain pipe stage does not
+/// yet read the backtracked-register verdict `any`/`all`/`isempty` state, so a
+/// frozen `$x` after an exhausted `any` refuses where jq answers `[]` -- the
+/// same gap the by-value `any | $x` has (#3758). Pinned as the current
+/// refusals, on both routes, so lifting any is a deliberate change; the jq
+/// answers are in each row.
 #[test]
-fn test_any_all_gen_cond_navigating_cond_and_pipe_stage_stay_refused_3749() -> Result<()> {
+fn test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749() -> Result<()> {
     for (input, filter, jq_answer, expected) in [
         (
             r#"[{"a":true}]"#,
             r"path(any(.[]; .a))",
             r#"[0,"a"]"#,
+            "Invalid path expression with result true",
+        ),
+        (
+            r"[true,false]",
+            r"path(any(.[]; select(.)))",
+            "[0]",
+            "Invalid path expression with result true",
+        ),
+        (
+            r"[true,false]",
+            r"path(any(.[]; first(.)))",
+            "[0]",
             "Invalid path expression with result true",
         ),
         (
@@ -60553,16 +60574,24 @@ fn test_any_all_gen_cond_navigating_cond_and_pipe_stage_stay_refused_3749() -> R
             r#"Invalid path expression with result {"a":true}"#,
         ),
     ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(
-            (stdout.as_str(), code),
-            ("", 5),
-            "`{filter}` on {input} (jq answers {jq_answer}): stderr {stderr:?}"
-        );
-        assert!(
-            stderr.contains(expected),
-            "`{filter}` on {input}: {stderr:?}"
-        );
+        let routes = [
+            ("stdin", run_jq_full(&["-c", filter], Some(input))?),
+            (
+                "-n",
+                run_jq_full(&["-nc", &format!("{input} | {filter}")], None)?,
+            ),
+        ];
+        for (route, (stdout, stderr, code)) in routes {
+            assert_eq!(
+                (stdout.as_str(), code),
+                ("", 5),
+                "`{filter}` on {input} via {route} (jq answers {jq_answer}): stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains(expected),
+                "`{filter}` on {input} via {route}: {stderr:?}"
+            );
+        }
     }
     Ok(())
 }
@@ -60573,14 +60602,20 @@ fn test_any_all_gen_cond_navigating_cond_and_pipe_stage_stay_refused_3749() -> R
 /// write through it still raises exactly as it did before the jq-mode rule.
 #[test]
 fn test_any_all_gen_cond_register_verdict_is_jq_mode_only_3749() -> Result<()> {
-    for filter in ["del(any(.[]; .))", "del(all(.[]; .))"] {
+    // A deciding element, then a generator that never decides (the arm's two
+    // register statements).
+    for (filter, input) in [
+        ("del(any(.[]; .))", "[true, false]\n"),
+        ("del(all(.[]; .))", "[true, false]\n"),
+        ("del(any(.[]; .))", "[false, false]\n"),
+    ] {
         let (output, code) = spawn_with_signal_retry(
             || {
                 let mut cmd = Command::new(succinctly_bin());
                 cmd.arg("yq").args(["--jq-extensions", filter]);
                 cmd
             },
-            Some(b"[true, false]\n"),
+            Some(input.as_bytes()),
         )?;
         let stdout = String::from_utf8(output.stdout)?;
         let stderr = String::from_utf8(output.stderr)?;
@@ -61351,8 +61386,20 @@ fn test_and_or_tracked_var_nested_in_compound_operand_does_not_blind_sibling_nav
 type PathRow3289 = (&'static str, &'static str, &'static str, &'static str, i32);
 
 fn assert_path_rows_3289(rows: &[PathRow3289]) -> Result<()> {
+    assert_path_rows_via_3749(rows, |input, filter| {
+        run_jq_full(&["-c", filter], Some(input))
+    })
+}
+
+/// [`assert_path_rows_3289`]'s check with the route that runs a row left to
+/// the caller (#3749): `run` takes `(input, filter)` and answers
+/// `(stdout, stderr, exit)`.
+fn assert_path_rows_via_3749(
+    rows: &[PathRow3289],
+    run: impl Fn(&str, &str) -> Result<(String, String, i32)>,
+) -> Result<()> {
     for &(input, filter, stdout, message, exit) in rows {
-        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        let (out, err, code) = run(input, filter)?;
         assert_eq!(
             (out.as_str(), code),
             (stdout, exit),

@@ -37849,11 +37849,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             // #3456: an empty generator backtracked every branch it explored,
             // so jq's register is where it entered; an emitting one may have
             // moved it ([`register_stays_on_result`]).
-            let register = if trackable && S::TAG == EvalTag::Jq && is_empty {
-                BranchRegister::Unmoved(Cow::Borrowed(value))
-            } else {
-                drained_register::<S>(trackable, value)
-            };
+            let register = drained_register_after::<S>(trackable, value, !is_empty);
             forward_drained_result(flow, OwnedValue::Bool(is_empty), register, sink)
         }
 
@@ -37880,8 +37876,6 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // Both are jq mode only (ADR-0018), like the by-value leaf's verdict.
         Expr::Builtin(builtin @ (Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond))) => {
             let target_truthy = matches!(builtin, Builtin::AnyCond(..));
-            let states_register = S::TAG == EvalTag::Jq;
-            let cond_keeps_register = states_register && cannot_move_register(cond);
             let mut decided = false;
             let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
             let mut probe_escape: Option<Control> = None;
@@ -37895,7 +37889,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 &mut |branch| match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
                     Ok(true) => {
                         decided = true;
-                        if cond_keeps_register {
+                        // Asked here, not on entry: only a deciding element
+                        // needs the verdict, and most `any`s never decide.
+                        if S::TAG == EvalTag::Jq && cannot_move_register(cond) {
                             decided_at = Some(register_after(gen, branch, frame));
                         }
                         Demand::Stop
@@ -37907,23 +37903,19 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             if let Some(control) = probe_escape {
                 return ResolveFlow::Escaped(EvalEscape::from(control));
             }
-            let answer = OwnedValue::Bool(if decided {
-                target_truthy
-            } else {
-                !target_truthy
-            });
-            let result = match decided_at {
-                Some((path, register)) => computed_at_register(answer, path, register),
-                None => untracked_at_register(
-                    Cow::Owned(answer),
-                    if states_register && trackable && !decided {
-                        BranchRegister::Unmoved(Cow::Borrowed(value))
-                    } else {
-                        drained_register::<S>(trackable, value)
-                    },
+            // `any` answers true when an element decided, `all` answers false.
+            let answer = OwnedValue::Bool(decided == target_truthy);
+            match decided_at {
+                Some((path, register)) => {
+                    forward_drained_branch(flow, computed_at_register(answer, path, register), sink)
+                }
+                None => forward_drained_result(
+                    flow,
+                    answer,
+                    drained_register_after::<S>(trackable, value, decided),
+                    sink,
                 ),
-            };
-            forward_drained_branch(flow, result, sink)
+            }
         }
 
         Expr::Builtin(Builtin::UpperIndexStream(stream, idx_expr)) => {
@@ -40296,6 +40288,31 @@ fn drained_register<'a, S: EvalSemantics>(
     }
 }
 
+/// [`drained_register`] for a drain arm that knows whether its generator
+/// emitted anything (`isempty(g)`, `any(gen; cond)`, `all(gen; cond)`): a
+/// generator that emitted nothing backtracked every branch it explored, so
+/// jq's register is where the arm entered, and it is stated as unmoved
+/// (#3456, #3749). An emitting generator may have moved it, so that stays a
+/// loss.
+///
+/// Both conditions are load-bearing. Jq mode only, like every admission here
+/// (ADR-0018). And only on a trackable entry, where `value` *is* the register:
+/// an untracked entry's register is carried by the stage and `value` is not
+/// it, so stating `value` there lets `and`/`or` accept a boolean identical to
+/// it -- `path(false | (any(empty; .) and 1))` on `{"a":1}` answered `[]`, and
+/// `del` of it wrote `null`, where jq refuses.
+fn drained_register_after<'a, S: EvalSemantics>(
+    trackable: bool,
+    value: &'a OwnedValue,
+    emitted: bool,
+) -> BranchRegister<'a> {
+    if trackable && S::TAG == EvalTag::Jq && !emitted {
+        BranchRegister::Unmoved(Cow::Borrowed(value))
+    } else {
+        drained_register::<S>(trackable, value)
+    }
+}
+
 /// The result of a by-value leaf that says jq's register stayed where it
 /// entered (#3456): `Some(r)` when the register stayed exactly when the leaf's
 /// boolean result is `r`, `None` for every other leaf.
@@ -40497,8 +40514,9 @@ fn register_after<'a>(
     (branch.path, register)
 }
 
-/// A value `and`/`or`/unary minus computed, emitted at `path` with the
-/// register [`register_after`] found there (#3289).
+/// A value `and`/`or`/unary minus computed (#3289), or `any(gen; cond)`/
+/// `all(gen; cond)` answered from a deciding element (#3749), emitted at `path`
+/// with the register [`register_after`] found there.
 ///
 /// Trackable again only when it is identical to that register -- jq's
 /// `PATH_END` check, and for a fresh `true`/`false`/number only the
@@ -40632,12 +40650,13 @@ fn resolve_from_restored_input<'a, S: EvalSemantics>(
 
 /// Shared tail for every "drain an argument fully via a discarding sink,
 /// then forward one computed value" arm in [`resolve_node_sink`] (`Array`,
-/// `LastExpr`/`LastStream`, `IsEmpty`, `UpperIndexStream` -- #2746): once the
-/// drain itself is done (`flow`), build the one branch it produced and
-/// forward it to `sink`, propagating an escape from the drain immediately
-/// and mapping the caller's own `Demand` back to a `ResolveFlow`. Lets each
-/// call site's own match arm differ only in *what* `computed` is, not in
-/// this control shape.
+/// `LastExpr`/`LastStream`, `IsEmpty`, `UpperIndexStream` -- #2746 -- and
+/// `AnyCond`/`AllCond` when nothing decided or `cond` may move the register,
+/// #3749): once the drain itself is done (`flow`), build the one branch it
+/// produced and forward it to `sink`, propagating an escape from the drain
+/// immediately and mapping the caller's own `Demand` back to a `ResolveFlow`.
+/// Lets each call site's own match arm differ only in *what* `computed` is,
+/// not in this control shape.
 fn forward_drained_result<'a>(
     flow: ResolveFlow,
     computed: OwnedValue,
