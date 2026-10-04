@@ -28382,11 +28382,20 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //   document with every target vivified before any filter runs. `parent`
     //   is a succinctly extension with no jq oracle, so that shape keeps the
     //   eager route rather than invent an ordering.
+    // #3747: a `?//` chain can end `_modify`'s `reduce` with no state part-way
+    // through a fan-out (#3663), and only a walk that updates one concrete
+    // path at a time can carry on from there -- the native `.[]` arms cannot
+    // re-root onto the null state. `path(PATH)` over the document spells those
+    // paths out; `None` keeps the route the shape already took.
+    let collapse_paths: Option<Vec<Expr>> =
+        (S::TAG == EvalTag::Jq && !skip_absent_paths && has_pattern_alternatives(filter_expr))
+            .then(|| concrete_update_paths::<S>(path_expr, &result))
+            .flatten();
     if S::TAG == EvalTag::Jq
         && !skip_absent_paths
         && !(positioned && reads_parent(filter_expr))
-        && needs_path_prepass(path_expr)
-        && assignment_path_needs_streaming(path_expr)
+        && ((needs_path_prepass(path_expr) && assignment_path_needs_streaming(path_expr))
+            || collapse_paths.is_some())
     {
         let base = if positioned {
             super::eval_generic::current_path_base()
@@ -28396,72 +28405,93 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let pristine = result.clone();
         let mut untouched = true;
         let mut deletes = DeferredUpdateDeletes::default();
-        let outcome = stream_path_writes::<S>(
-            path_expr,
-            &pristine,
-            &mut result,
-            RetryResumes::No,
-            &mut |result, path| {
-                let pos = positioned.then(|| UpdatePos {
-                    path: base.clone(),
-                    base_len: base.len(),
-                    pre: None,
-                });
-                // #3036: a root path before any write updates the document
-                // `|=` was called on, untouched -- see the eager loop below.
-                let ambient = untouched && is_root_path(path);
-                let pending_before = deletes.paths.len();
-                let write = if ambient {
-                    update_root_with_filter::<S>(
-                        result,
-                        filter_expr,
-                        pos.as_ref(),
-                        Reentry::Proven,
-                        Some(&mut deletes),
-                    )
-                } else {
-                    // `false` for `scalar_noop`, as the eager route computes it
-                    // in jq mode.
-                    update_path_with_deletes::<S>(
-                        result,
-                        path,
-                        filter_expr,
-                        false,
-                        false,
-                        pos.as_ref(),
-                        Some(&mut deletes),
-                    )
-                };
-                // A `?//` in the path generator can retry after a failed
-                // write. Its next path must not inherit this attempt's
-                // unbalanced walk prefix or uncommitted pending deletes.
-                match write {
-                    Ok(wrote) => {
-                        if wrote {
-                            untouched = false;
-                        }
-                        Ok(())
-                    }
-                    // #3663: `_modify`'s `reduce` ends with no state, so the
-                    // whole accumulator -- the deletes queued by earlier
-                    // paths included -- is `null` from here; only this path
-                    // is queued again for the final `delpaths`.
-                    Err(EvalEscape::Error(e)) if e.is_update_collapse() => {
-                        deletes.paths.clear();
-                        deletes.record();
-                        deletes.at.clear();
-                        *result = OwnedValue::Null;
+        let mut write_path = |result: &mut OwnedValue, path: &Expr| -> Result<(), EvalEscape> {
+            let pos = positioned.then(|| UpdatePos {
+                path: base.clone(),
+                base_len: base.len(),
+                pre: None,
+            });
+            // #3036: a root path before any write updates the document
+            // `|=` was called on, untouched -- see the eager loop below.
+            let ambient = untouched && is_root_path(path);
+            let pending_before = deletes.paths.len();
+            let write = if ambient {
+                update_root_with_filter::<S>(
+                    result,
+                    filter_expr,
+                    pos.as_ref(),
+                    Reentry::Proven,
+                    Some(&mut deletes),
+                )
+            } else {
+                // `false` for `scalar_noop`, as the eager route computes it
+                // in jq mode.
+                update_path_with_deletes::<S>(
+                    result,
+                    path,
+                    filter_expr,
+                    false,
+                    false,
+                    pos.as_ref(),
+                    Some(&mut deletes),
+                )
+            };
+            // A `?//` in the path generator can retry after a failed
+            // write. Its next path must not inherit this attempt's
+            // unbalanced walk prefix or uncommitted pending deletes.
+            match write {
+                Ok(wrote) => {
+                    if wrote {
                         untouched = false;
-                        Ok(())
                     }
-                    Err(escape) => {
-                        deletes.at.clear();
-                        deletes.paths.truncate(pending_before);
-                        Err(escape)
+                    Ok(())
+                }
+                // #3663: `_modify`'s `reduce` ends with no state, so the
+                // whole accumulator -- the deletes queued by earlier
+                // paths included -- is `null` from here; only this path
+                // is queued again for the final `delpaths`.
+                Err(EvalEscape::Error(e)) if e.is_update_collapse() => {
+                    // The walk has already unwound `deletes.at`, so the path
+                    // is spelled out from the write's own target.
+                    deletes.paths.clear();
+                    match static_delete_path(path) {
+                        Some(at) => deletes.paths.push(at),
+                        None => deletes.record(),
+                    }
+                    deletes.at.clear();
+                    *result = OwnedValue::Null;
+                    untouched = false;
+                    Ok(())
+                }
+                Err(escape) => {
+                    deletes.at.clear();
+                    deletes.paths.truncate(pending_before);
+                    Err(escape)
+                }
+            }
+        };
+        let outcome = match &collapse_paths {
+            Some(concrete) => {
+                let mut failed = None;
+                for path in concrete {
+                    if let Err(escape) = write_path(&mut result, path) {
+                        failed = Some(escape);
+                        break;
                     }
                 }
-            },
-        );
+                match failed {
+                    Some(escape) => StreamedWrites::WriteFailed(escape),
+                    None => StreamedWrites::Done,
+                }
+            }
+            None => stream_path_writes::<S>(
+                path_expr,
+                &pristine,
+                &mut result,
+                RetryResumes::No,
+                &mut write_path,
+            ),
+        };
         return match outcome {
             StreamedWrites::Done => match finish_deferred_update_deletes::<S>(result, deletes) {
                 Ok(result) => QueryResult::Owned(result),
@@ -28631,7 +28661,10 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(EvalEscape::Error(e)) if e.is_update_collapse() => {
                 if defer_deletes {
                     deletes.paths.clear();
-                    deletes.record();
+                    match static_delete_path(path) {
+                        Some(at) => deletes.paths.push(at),
+                        None => deletes.record(),
+                    }
                     deletes.at.clear();
                 }
                 result = OwnedValue::Null;
@@ -31824,6 +31857,45 @@ fn position_update_filter<S: EvalSemantics>(
 /// Same question [`is_effectively_identity`] already answers -- delegated
 /// rather than re-derived, so a future path-shape [`unwrap_path_component`]
 /// learns to unwrap reaches both call sites for free.
+/// The concrete paths `|=` would update for `path_expr` over `doc`, spelled as
+/// static navigation (#3747): `path(path_expr)` evaluated on the document, each
+/// result re-spelled by [`static_path_expr`]. `None` when the paths cannot all
+/// be named that way or evaluating them raises -- the caller then keeps the
+/// route it would have taken without them.
+fn concrete_update_paths<S: EvalSemantics>(
+    path_expr: &Expr,
+    doc: &OwnedValue,
+) -> Option<Vec<Expr>> {
+    let paths = eval_owned_multi::<S>(
+        &Expr::Builtin(Builtin::Path(Box::new(path_expr.clone()))),
+        doc,
+    )
+    .ok()?;
+    // A slice descriptor needs the real container to resolve against; those
+    // keep the route they already took.
+    paths
+        .iter()
+        .map(|path| match path {
+            OwnedValue::Array(parts)
+                if parts.iter().any(|p| matches!(p, OwnedValue::Object(_))) =>
+            {
+                None
+            }
+            _ => static_path_expr(path),
+        })
+        .collect()
+}
+
+/// The `delpaths` entry for a write whose target is `path`, when every step
+/// is a plain field or index (#3747). A collapsing write unwinds the walk's
+/// own `DeferredUpdateDeletes::at` before its handler runs, so the entry is
+/// rebuilt from the target itself.
+fn static_delete_path(path: &Expr) -> Option<Vec<OwnedValue>> {
+    let mut steps = Vec::new();
+    push_path_components(&mut steps, path);
+    steps.iter().map(update_delete_component).collect()
+}
+
 fn is_root_path(path: &Expr) -> bool {
     is_effectively_identity(path)
 }
@@ -80275,6 +80347,32 @@ mod tests {
                     "(.[0], .[1], .[0]) |= (if . == 1 then empty elif . == 5 then {q} else 7 end)"
                 ),
                 "[7]",
+            ),
+            // #3747: a collapse part-way through a fan-out. The paths still
+            // to come write into the null state, from `null` input, and the
+            // collapsed path's delete applies at the end.
+            ("[5,\"x\"]", format!(".[] |= {cond}"), "[7]"),
+            ("[\"x\",5]", format!(".[] |= {cond}"), "null"),
+            ("[\"x\",5,\"y\"]", format!(".[] |= {cond}"), "[null,7]"),
+            ("[5,6,7]", format!(".[] |= {cond}"), "[7,7]"),
+            ("[5,6,7]", format!(".[]? |= {cond}"), "[7,7]"),
+            (r#"{"a":5,"b":6}"#, format!(".[] |= {cond}"), r#"{"b":7}"#),
+            ("[[5],[6]]", format!(".[][] |= {cond}"), "[null,[7]]"),
+            (
+                r#"{"a":[5,6],"b":7}"#,
+                format!(".a[] |= {cond}"),
+                r#"{"a":[7]}"#,
+            ),
+            ("[[5,6],[7]]", format!(".[][0] |= {cond}"), "[null,[7]]"),
+            (
+                "[1,5,1,2]",
+                format!(".[] |= (if . == 1 then empty elif . == 5 then {q} else 7 end)"),
+                "[null,7,7]",
+            ),
+            (
+                "[[1,5,1],[6]]",
+                format!(".[][] |= (if . == 1 then empty elif . == 5 then {q} else 7 end)"),
+                "[[null,7],[7]]",
             ),
         ] {
             let filter_expr = parse(&program).unwrap();

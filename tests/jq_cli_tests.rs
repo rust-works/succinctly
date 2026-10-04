@@ -93108,6 +93108,46 @@ fn test_computed_slice_and_index_target_is_lazy_3520() -> Result<()> {
     Ok(())
 }
 
+/// #3747: a `?//` retry that yields nothing ends `_modify`'s `reduce` with no
+/// state (#3663); a fan-out carries on from there -- the paths still to come
+/// write into the null state, and the collapsed path's delete applies at the
+/// end. jq 1.7.1, captured live, on the document read and on `-n`.
+#[test]
+fn test_update_collapse_mid_fan_out_matches_jq_3747() -> Result<()> {
+    let q = "(1 as $x ?// $y | select($y == null) | $x)";
+    let cond = format!("(if . == 5 then {q} else 7 end)");
+    for (input, filter, expected) in [
+        ("[5,\"x\"]", format!(".[] |= {cond}"), "[7]\n"),
+        ("[\"x\",5]", format!(".[] |= {cond}"), "null\n"),
+        ("[5,6,7]", format!(".[] |= {cond}"), "[7,7]\n"),
+        ("[5,6,7]", format!(".[]? |= {cond}"), "[7,7]\n"),
+        (r#"{"a":5,"b":6}"#, format!(".[] |= {cond}"), "{\"b\":7}\n"),
+        ("[[5],[6]]", format!(".[][] |= {cond}"), "[null,[7]]\n"),
+        (
+            r#"{"a":[5,6],"b":7}"#,
+            format!(".a[] |= {cond}"),
+            "{\"a\":[7]}\n",
+        ),
+        ("[[5,6],[7]]", format!(".[][0] |= {cond}"), "[null,[7]]\n"),
+        (
+            "[1,5,1,2]",
+            format!(".[] |= (if . == 1 then empty elif . == 5 then {q} else 7 end)"),
+            "[null,7,7]\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", &filter], Some(input))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (expected, 0),
+            "`{filter}` on {input}: {err:?}"
+        );
+        let program = format!("{input} | {filter}");
+        let (out, err, code) = run_jq_full(&["-nc", &program], None)?;
+        assert_eq!((out.as_str(), code), (expected, 0), "`{program}`: {err:?}");
+    }
+    Ok(())
+}
+
 /// #3471, owned route: the tables above again with the target built under `-n`
 /// (`eval.rs`'s evaluator, which has its own `each_slice_expr`), and once more
 /// with an `input` builtin inside the bound, which forces that evaluator for an
