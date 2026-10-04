@@ -105,6 +105,9 @@ pub enum ErrorKind {
     /// See [`EvalError::is_guessed_path_refusal`] -- always uncatchable, in
     /// path and value position alike (#3267).
     GuessedPathRefusal,
+    /// See [`EvalError::is_update_collapse`] -- an internal signal, never
+    /// user-visible (#3663).
+    UpdateCollapse,
 }
 
 /// A stream terminator: what ended a sequence of outputs when it wasn't
@@ -1157,6 +1160,22 @@ impl EvalError {
         )
     }
 
+    /// The signal `|=`'s update filter raises when a `?//` retry past its
+    /// first output yields nothing (#3663): jq's `_modify` `reduce` then ends
+    /// with no state, so its whole accumulator is `null` from that path on.
+    /// Never reaches the user -- `eval_update_impl` catches it at each path.
+    pub(crate) fn update_collapse() -> Self {
+        Self::with_kind("update collapsed".to_string(), ErrorKind::UpdateCollapse)
+    }
+
+    /// Whether this is [`Self::update_collapse`] (#3663).
+    pub fn is_update_collapse(&self) -> bool {
+        matches!(
+            self.value,
+            EvalErrorPayload::Kind(ErrorKind::UpdateCollapse)
+        )
+    }
+
     /// `Invalid path expression near attempt to access element <k> of <v>`
     /// (#843).
     ///
@@ -1426,6 +1445,7 @@ impl EvalError {
             || self.is_yq_negative_index_error()
             || self.is_resource_limit()
             || self.is_guessed_path_refusal()
+            || self.is_update_collapse()
     }
 
     /// [`Self::is_uncatchable`], narrowed to the subset that also applies at
@@ -1458,6 +1478,7 @@ impl EvalError {
             || self.is_yq_negative_index_error()
             || self.is_resource_limit()
             || self.is_guessed_path_refusal()
+            || self.is_update_collapse()
     }
 
     /// `Cannot check whether <container> has a <key type> key`.
