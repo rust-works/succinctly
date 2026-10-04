@@ -40325,8 +40325,9 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
 /// [`computed_at_register`], the `and`/`or` arms' rule). A generator that
 /// produced no decisive element backtracked every branch, so the register is
 /// where this entered ([`drained_register_after`]) -- unless a `cond` that is
-/// not provably inert ran, whose path error jq would have raised instead. Both
-/// are jq mode only (ADR-0018).
+/// not provably inert ran on some element, whose path error jq would have
+/// raised instead (a `gen` that produced nothing never ran it). Both are jq
+/// mode only (ADR-0018).
 #[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambient state, plus the arm's two operands.
 fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     gen: &Expr,
@@ -40339,6 +40340,9 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     let mut decided = false;
+    // How many branches `gen` produced for `cond` to run on: none means `cond`
+    // never ran, so jq cannot have raised from it.
+    let mut probed = 0usize;
     let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
     let mut probe_escape: Option<Control> = None;
     let flow = resolve_node_sink::<S>(
@@ -40348,7 +40352,10 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         snapshot,
         frame,
         Keep::AtMost(usize::MAX),
-        &mut |branch| match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
+        &mut |branch| match {
+            probed += 1;
+            any_all_probe_element::<S>(cond, &branch.value, target_truthy)
+        } {
             Ok(true) => {
                 decided = true;
                 // Asked here, not on entry: only a deciding element needs the
@@ -40371,15 +40378,20 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         Some((path, register)) => {
             forward_drained_branch(flow, computed_at_register(answer, path, register), sink)
         }
-        // Nothing decided is `emitted == false`, but only when `cond` is inert:
-        // an undecided `any(1; .[]?)` is jq's path error, not a backtrack.
+        // Nothing decided is `emitted == false`, but only when `cond` cannot
+        // have raised: an undecided `any(1; .[]?)` is jq's path error, not a
+        // backtrack. It cannot have if it never ran (`gen` was empty, so
+        // `any(.a)` over `[]` is a clean backtrack whatever `cond` navigates)
+        // or if it is inert.
         None => forward_drained_result(
             flow,
             answer,
             drained_register_after::<S>(
                 trackable,
                 value,
-                decided || !(S::TAG == EvalTag::Jq && trackable && cannot_move_register(cond)),
+                decided
+                    || (probed > 0
+                        && !(S::TAG == EvalTag::Jq && trackable && cannot_move_register(cond))),
             ),
             sink,
         ),
