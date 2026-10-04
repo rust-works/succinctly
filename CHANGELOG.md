@@ -666,12 +666,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result is now emitted with `register_after`/`computed_at_register`, the rule the `and`/`or` arms use, so `[1,2]`
   (`1` is not `true`) and `[null]` (`null` is not `false`) still refuse; a generator that never decided backtracked
   every branch and states its register as unmoved, which `and`/`or` read (`path(any(.[]; .) or .a)` on `{"a":false}`
-  is `["a"]`). jq mode only. Two shapes still refuse where jq answers and are pinned: a `cond` that navigates moves
-  jq's register onto its own node (`path(any(.[]; .a))` on `[{"a":true}]` is `[0,"a"]`, #3757), and a plain pipe stage
-  does not read the backtracked-register verdict of `any`/`all`/`isempty` (`path(. as $x | any | $x)`, #3758). 28 of 42
-  oracle rows differed from jq before the change on both the stdin and `-n` routes, none after. Pinned by
-  `test_any_all_gen_cond_decisive_result_sits_at_the_register_3749` and
-  `test_any_all_gen_cond_exhausted_register_stays_at_entry_3749`.
+  is `["a"]`). jq mode only. Three shapes still refuse where jq answers, each tracked: a `cond` outside
+  `cannot_move_register`'s allowlist, whether it navigates (`path(any(.[]; .a))` on `[{"a":true}]` is `[0,"a"]`, as
+  `or`'s left operand moves jq's register) or not (`select(.)`, `first(.)`, `..` are `[0]`) (#3757); a plain pipe stage,
+  which does not read the backtracked-register verdict of `any`/`all`/`isempty` (`path(. as $x | any | $x)`, #3758); and
+  the bare `any`/`all`, `any(f)`/`all(f)` and `isempty(g)` spellings, which have no such arm (`path(any)` on
+  `[true,false]` is `[0]`, #3763). 28 of 42 oracle rows differed from jq before the change on both the stdin and `-n`
+  routes, none after. The shared exhausted-register rule is `drained_register_after`; its `trackable` condition is
+  pinned (without it `path(false | (any(empty; .) and 1))` answers `[]` and `del` of it writes `null`, where jq
+  refuses). Pinned by `test_any_all_gen_cond_decisive_result_sits_at_the_register_3749`,
+  `test_any_all_gen_cond_exhausted_register_stays_at_entry_3749` and
+  `test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749`; the path-register sweep gained four
+  `any`/`all(gen; cond)` operands.
 
 - **jq: a `foreach` whose update is a full slice keeps its state on the register** (#3742).
   `path(foreach (1,2) as $x (.; .[0:]; .))` on `[10,20,30]` answered the first step and refused the second, where

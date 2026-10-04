@@ -1156,15 +1156,25 @@ is the revert that established what the other one costs.
      `[1,2]`/`[null]` still refuse (a truthy `1` is not `true`, `null` is not `false`). A generator
      that never decided backtracked every branch, so the register is where the construct entered
      (`path(any(.[]; .) or .a)` on `{"a":false}` is `["a"]`). Two shapes are still refused where jq
-     answers, both pinned
-     (`test_any_all_gen_cond_navigating_cond_and_pipe_stage_stay_refused_3749`): a `cond` that
-     navigates moves jq's register itself, so `path(any(.[]; .a))` on `[{"a":true}]` is
-     `[0,"a"]` in jq and refuses here, because `cond` runs by value
-     ([#3757](https://github.com/rust-works/succinctly/issues/3757)); and a plain pipe stage does
+     answers, pinned
+     (`test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749`): the result is
+     stated only while `cond` is on `cannot_move_register`'s allowlist, because `cond` runs by
+     value and the arm cannot say where it left the register. So a `cond` that navigates refuses
+     (`path(any(.[]; .a))` on `[{"a":true}]` is `[0,"a"]` in jq, since `or`'s left operand moves
+     the register), and so does one that jq leaves in place but the allowlist cannot prove
+     (`select(.)`, `first(.)`, `limit(1; .)`, `..`, a `def`: jq answers `[0]` on `[true,false]`)
+     ([#3757](https://github.com/rust-works/succinctly/issues/3757)); a plain pipe stage does
      not read the backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any |
      $x)` on `{"a":false,"b":null}` is `[]` in jq and refuses here, as do the by-value forms
-     ([#3758](https://github.com/rust-works/succinctly/issues/3758)). Real yq rejects the
-     two-argument form outright, so yq mode (`--jq-extensions`) keeps its refusal.
+     ([#3758](https://github.com/rust-works/succinctly/issues/3758)); and the bare `any`/`all`,
+     `any(f)`/`all(f)` and `isempty(g)` spellings have no such arm, so `path(any)` on
+     `[true,false]` is `[0]` in jq and refuses here
+     ([#3763](https://github.com/rust-works/succinctly/issues/3763)). The exhausted-generator
+     statement is `drained_register_after`, shared with `isempty(g)`, and it is made only on a
+     trackable entry: after `false |` the value is not jq's register, and stating it would let
+     `and` accept the `false` it computes (`path(false | (any(empty; .) and 1))` on `{"a":1}`).
+     Real yq rejects the two-argument form outright, so yq mode (`--jq-extensions`) keeps its
+     refusal.
 
    A generated sweep (`scripts/jq-path-register-sweep.py`: 54 operands -- native navigation,
    literals, by-value builtins, `try`/`//`/`if`/`def` wrappers, folds, `label`, `limit`,
