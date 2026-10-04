@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: `path(f)`'s own `?` arms no longer build the `Cannot iterate` error they drop for every
+  scalar** (#3722, a #3689 follow-up). `path_walk_generic` and `path_step_generic` each have an
+  `Expr::Optional` arm that stepped a scalar under a bare `.[]?` and dropped what it raised, except a
+  decode failure, so the step formatted `Cannot iterate over ...` (a preview string and an owned copy of
+  the scalar) for nothing: 7 allocator calls per scalar for `[.[] | path(.[]?)]`, 13 for
+  `path(.[]?, .[]?)`. `swallowed_path_leaf` is the path-walk twin of #3689's
+  `swallowed_scalar_iteration`: it answers a *position* -- nothing for a live or owned scalar, or the
+  failure `?` never swallows, decided by `scalar_leaf_iteration` exactly as the step decides it -- in jq
+  mode only (yq's step never built the message). The path-context walk's inline copy of that match is
+  the same helper now, so it, `.. | path` and both `path(f)` walkers share one definition of a leaf.
+  Output is unchanged: 912 jq runs over valid and malformed documents (an undecodable string, `1.2.3`,
+  `tru`, stray commas, huge and tiny exponents, a slice's owned scalars) are identical to the parent
+  and, on every document jq can read, to jq 1.7.1, and 264 yq runs are identical to the parent. A
+  failure `?` never swallows still escapes where the walk steps the node that holds it, and a consumer
+  that stops first never reaches it (`[limit(1; path(.[]?))]` on `[1.2.3,[4]]` answers `[[0]]`).
+  Allocator calls over 2,000 scalar members on a release build: `[.[] | path(.[]?)] | length` 14,014
+  to 2,014 (below the `[.[] | path(.)]` twin's 6,024, since nothing flows past it),
+  `path(.[]?, .[]?)` 26,014 to 2,014, `path(.[]? | .a)` 14,014 to 2,014 (a pipe stage, which is
+  `path_step_generic`'s arm). Interleaved wall clock against the parent on an M4 Pro, 1 to 16 MB, min of
+  7, output identity 40/40: `[.[] | path(.[]?)]` is 48% to 54% faster over a flat array of scalars and
+  36% to 41% over an object, `path(.[]? | .a?)` 47% to 51% and 35% to 39%, `path(.[]?, .[]?)` 60% to
+  64% and 49% to 54%; over records, whose members are containers, they read -0.1% to +2.0%, against
+  -1.2% to +1.0% for the control run, and the controls (`path(.)`, `path(..)`) -2.0% to +1.9%. yq mode
+  (`--jq-extensions`, aliases, mappings, JSON) reads -1.8% to +1.2%. Not changed here:
+  `path(try .[] catch empty)` (66,004 over 2,000 members) runs through `eval.rs`'s path resolver and
+  its `catch` handling, and `path(f)?`, `first(.[]?)`, `.[]? // .`, `paths(f)` and `del(.[]?)` use
+  other walkers.
+
 - **jq/yq: a lone stage the owned front doors decline no longer copies itself into an `Expr::Pipe`**
   (#3692). `RestPipe::run_owned` offered a rest of one plain stage to `eval_each_owned`'s front doors
   bare, but when they declined it (`floor`, `keys`, `tojson`, an object or array construction, an `if`)
