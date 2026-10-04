@@ -40519,14 +40519,13 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
             if !flattened {
                 push_path_components(&mut stages, cond);
                 flattened = true;
+                // `cannot_move_register` admits `.` and a pipe of `.`, the only
+                // conds that flatten to nothing, so a live one has a stage.
+                debug_assert!(!stages.is_empty(), "a live cond flattens to a stage");
             }
             let Some(last) = stages.len().checked_sub(1) else {
                 // `cond` flattened to nothing: it is the branch itself.
-                debug_assert!(
-                    false,
-                    "a live cond flattens to at least one stage: {cond:?}"
-                );
-                return decide(branch); // omni-dev: coverage tolerate-line reason="unreachable: a cond that flattens to no stages is `.` or a pipe of `.`, which cannot_move_register admits, so it never takes the live route (#3757); the debug_assert above fails a test build that breaks that"
+                return decide(branch); // omni-dev: coverage tolerate-line reason="unreachable: a cond that flattens to no stages is `.` or a pipe of `.`, which cannot_move_register admits, so it never takes the live route (#3757); the debug_assert where `stages` is built fails a test build that breaks that"
             };
             match resolve_seq_stage::<S>(
                 &stages,
