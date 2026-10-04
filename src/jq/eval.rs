@@ -28432,12 +28432,7 @@ fn concrete_update_paths<S: EvalSemantics>(
         .collect()
 }
 
-/// A `path()` output with its slice descriptors resolved against the real
-/// container (#3756): a descriptor followed by an index names the element at
-/// `start + index` of the container it slices, so the pair collapses to that
-/// plain index. A descriptor that is last, is followed by anything but an
-/// in-range integer index, or starts past the front has no single-element
-/// spelling and declines.
+/// A slice bound that no earlier collapse can shift: `null`, or a non-negative number.
 fn front_bound(bound: Option<&OwnedValue>) -> bool {
     match bound {
         Some(OwnedValue::Null) => true,
@@ -28449,6 +28444,12 @@ fn front_bound(bound: Option<&OwnedValue>) -> bool {
     }
 }
 
+/// A `path()` output with its slice descriptors resolved against the real
+/// container (#3756): a descriptor followed by an index names the element at
+/// `start + index` of the container it slices, so the pair collapses to that
+/// plain index. A descriptor that is last, is followed by anything but an
+/// in-range integer index, or starts past the front has no single-element
+/// spelling and declines.
 fn resolve_slice_components(parts: &[OwnedValue], doc: &OwnedValue) -> Option<Vec<OwnedValue>> {
     let mut out = vec_with_capacity(parts.len());
     let mut cur = Some(doc);
@@ -28473,8 +28474,9 @@ fn resolve_slice_components(parts: &[OwnedValue], doc: &OwnedValue) -> Option<Ve
                 OwnedValue::Int(n) => *n,
                 _ => return None,
             };
+            // A back-counted index resolves against the slice as it stands when
+            // written, which an earlier collapse may have shortened.
             let len = i64::try_from(range.len()).ok()?;
-            let idx = if idx < 0 { idx + len } else { idx };
             if !(0..len).contains(&idx) {
                 return None;
             }
