@@ -56,8 +56,8 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 2,059,000 rows (`--list-axes` prints the exact count:
-170 operands, each also swept as a bare pipe stage since #3361, across 37 contexts),
+**Size.** The full grid is about 2,299,000 rows (`--list-axes` prints the exact count:
+188 operands, each also swept as a bare pipe stage since #3361, across 37 contexts),
 which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
@@ -202,6 +202,13 @@ OPERANDS = [
     "any(now; .a)",
     "any(first(2, 3); .a?)",
     "any(2; .a?)",
+    # (#3757 review) a `?//` inside `gen` retries after a failed alternative and
+    # resolves a later one, which supersedes whatever the abandoned alternative's
+    # element stashed: the first alternative yields a number `cond` cannot
+    # navigate (or, for the by-value `cond`, raises on), the second the element
+    # itself. A stash that outlived the retry raised the first one's error.
+    "any((.[0]? | length) as $p ?// $q | if $p != null then $p else .[0]? end; .a?)",
+    "any((.[0]? | tostring | length) as $p ?// $q | if $p != null then $p else .[0]? end; if type == \"number\" then error(\"x\") else . end)",
     # wrappers and control flow around the above
     "try .a",
     "(.a // .b)",

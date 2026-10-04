@@ -40412,16 +40412,18 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     // Whether `gen` provably leaves the register where this entered, so the
     // frame's carried register is still the one `cond` meets.
     let gen_inert = live && cannot_move_register(gen);
-    // `gen | cond`'s second stage, flattened once rather than per branch.
-    let mut stages = Vec::new();
-    if live {
-        push_path_components(&mut stages, cond);
-    }
-    let last_stage = stages.len().checked_sub(1);
+    // `gen | cond`'s second stage, flattened on the first branch `gen` produces
+    // rather than per call: a `gen` that yields nothing never pays the clone.
+    let mut stages: Vec<Expr> = Vec::new();
+    let mut flattened = false;
     let mut decided = false;
     let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
-    let mut probe_escape: Option<Control> = None;
-    let mut stage_escape: Option<EvalEscape> = None;
+    // A stop's stashed escape, with the retry generation it was stashed at: a
+    // `?//` inside `gen` can retry after a failed alternative and resolve a later
+    // one, which supersedes it (#3293, the `and`/`or`/negate arms' rule), so each
+    // slot is cleared on every branch and checked against the retry afterwards.
+    let mut probe_escape: Option<(Control, u64)> = None;
+    let mut stage_escape: Option<(EvalEscape, u64)> = None;
     let flow = resolve_node_sink::<S>(
         gen,
         value,
@@ -40430,6 +40432,8 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         frame,
         Keep::AtMost(usize::MAX),
         &mut |branch| {
+            probe_escape = None;
+            stage_escape = None;
             if !live {
                 return match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
                     Ok(true) => {
@@ -40441,7 +40445,12 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
                         Demand::Stop
                     }
                     Ok(false) => Demand::Continue,
-                    Err(control) => stop_with_escape(&mut probe_escape, control),
+                    Err(control) => {
+                        let mut slot = None;
+                        let demand = stop_with_escape(&mut slot, control);
+                        probe_escape = slot.map(|control| (control, pipe_retry_generation()));
+                        demand
+                    }
                 };
             }
             // jq's `path_intact` compares by `jv_identical`: pointer identity for a
@@ -40484,10 +40493,10 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
                     }
                     _ => {
                         let refusal = EvalError::invalid_path_expression_guessed(&branch.value);
-                        return stop_with_eval_escape(
-                            &mut stage_escape,
-                            EvalEscape::Error(refusal),
-                        );
+                        let mut slot = None;
+                        let demand = stop_with_eval_escape(&mut slot, EvalEscape::Error(refusal));
+                        stage_escape = slot.map(|escape| (escape, pipe_retry_generation()));
+                        return demand;
                     }
                 }
             };
@@ -40502,9 +40511,17 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
                     Demand::Continue
                 }
             };
-            let Some(last) = last_stage else {
+            if !flattened {
+                push_path_components(&mut stages, cond);
+                flattened = true;
+            }
+            let Some(last) = stages.len().checked_sub(1) else {
                 // `cond` flattened to nothing: it is the branch itself.
-                return decide(branch); // omni-dev: coverage tolerate-line reason="unreachable: a cond that flattens to no stages is `.` or a pipe of `.`, which cannot_move_register admits, so it never takes the live route (#3757)"
+                debug_assert!(
+                    false,
+                    "a live cond flattens to at least one stage: {cond:?}"
+                );
+                return decide(branch); // omni-dev: coverage tolerate-line reason="unreachable: a cond that flattens to no stages is `.` or a pipe of `.`, which cannot_move_register admits, so it never takes the live route (#3757); the debug_assert above fails a test build that breaks that"
             };
             match resolve_seq_stage::<S>(
                 &stages,
@@ -40517,15 +40534,25 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
             ) {
                 ResolveFlow::Exhausted => Demand::Continue,
                 ResolveFlow::Stopped => Demand::Stop,
-                ResolveFlow::Escaped(escape) => stop_with_eval_escape(&mut stage_escape, escape),
+                ResolveFlow::Escaped(escape) => {
+                    let mut slot = None;
+                    let demand = stop_with_eval_escape(&mut slot, escape);
+                    stage_escape = slot.map(|escape| (escape, pipe_retry_generation()));
+                    demand
+                }
             }
         },
     );
-    if let Some(escape) = stage_escape {
-        return ResolveFlow::Escaped(escape);
+    let direct_retry = direct_pattern_retry(gen);
+    if let Some((escape, at)) = stage_escape {
+        if !resolve_retry_superseded(&flow, at, direct_retry) {
+            return ResolveFlow::Escaped(escape);
+        }
     }
-    if let Some(control) = probe_escape {
-        return ResolveFlow::Escaped(EvalEscape::from(control));
+    if let Some((control, at)) = probe_escape {
+        if !resolve_retry_superseded(&flow, at, direct_retry) {
+            return ResolveFlow::Escaped(EvalEscape::from(control));
+        }
     }
     // `any` answers true when an element decided, `all` answers false.
     let answer = OwnedValue::Bool(decided == target_truthy);

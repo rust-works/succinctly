@@ -61025,6 +61025,101 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
     ])
 }
 
+/// #3757 review: a `?//` inside `gen` retries after a failed alternative, and
+/// the retry supersedes what the abandoned alternative's element stashed. The
+/// first alternative here binds `$p` to `1` (an object's `length`), so `gen`
+/// yields the number `1`, which `cond` cannot navigate (`.a` raises on it, or
+/// the by-value `cond` raises its own `error("x")`); the second alternative
+/// yields the element itself, which `cond` handles. A stash that outlived the
+/// retry raised the first alternative's error: `path(any(...))` exited 5 where
+/// jq answers `[0,"a"]` / `[0]`, and `del(try ... catch empty)` dropped a write
+/// jq performs. Both routes of the helper (the live stage and the by-value
+/// `cond`), each on the stdin and `-n` evaluators. Every row captured from jq
+/// 1.7.1.
+#[test]
+fn test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        // The live route: `.a` navigates the element.
+        (
+            r#"[{"a":true}]"#,
+            r#"path(any((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a))"#,
+            "[0,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r#"del(any((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a))"#,
+            "[{}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r#"del(try any((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a) catch empty)"#,
+            "[{}]\n",
+            "",
+            0,
+        ),
+        // `all` decides on a falsy element, so a truthy `.a` is a path error in jq,
+        // from the retry's element rather than the abandoned one.
+        (
+            r#"[{"a":true}]"#,
+            r#"path(all((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a))"#,
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        // The by-value route: an inert `cond` that raises on the first element.
+        (
+            r"[true]",
+            r#"path(any((.[0]|tostring|length) as $p ?// $q | if $p != null then $p else .[0] end; if type == "number" then error("x") else . end))"#,
+            "[0]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r#"del(any((.[0]|tostring|length) as $p ?// $q | if $p != null then $p else .[0] end; if type == "number" then error("x") else . end))"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r#"del(try any((.[0]|tostring|length) as $p ?// $q | if $p != null then $p else .[0] end; if type == "number" then error("x") else . end) catch empty)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        // A retry that yields nothing, or raises, ends the drive without reaching
+        // the closure again: the abandoned alternative's stash is dropped by the
+        // retry generation, not by the per-branch reset, and jq's own answer
+        // (`false`'s path error, `late`) is the one raised.
+        (
+            r#"[{"a":true}]"#,
+            r#"path(any((.[0] | length) as $p ?// $q | if $p != null then $p else empty end; .a))"#,
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r#"try path(any((.[0] | length) as $p ?// $q | if $p != null then $p else error("late") end; .a)) catch ."#,
+            "\"late\"\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r#"try path(any((.[0]|tostring|length) as $p ?// $q | if $p != null then $p else empty end; if type == "number" then error("x") else . end)) catch ."#,
+            "\"Invalid path expression with result false\"\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
 /// plain pipe stage does not read the backtracked-register verdict that
 /// `any`/`all`/`isempty` state, so a frozen `$x` after one that decided or did
