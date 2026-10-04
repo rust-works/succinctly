@@ -45211,6 +45211,38 @@ fn test_wildcard_bridge_over_alias_fanout_completes_2173() -> Result<()> {
     Ok(())
 }
 
+/// #3719: `recurse(.[]?)` is jq's own definition of bare `recurse`, so it
+/// takes the cursor walk `..` takes instead of materializing the
+/// alias-expanded document first.
+///
+/// Same method as `test_wildcard_bridge_over_alias_fanout_completes_2173`:
+/// no bound is asserted, only that a consumer needing a few nodes finishes
+/// with the right answer. The document expands to 2^26 leaves, so a
+/// regression to the materializing route exhausts memory instead of
+/// answering. Each spelling is also pinned equal to `..` on the same node.
+#[test]
+fn test_recurse_structural_descent_over_alias_fanout_completes_3719() -> Result<()> {
+    let mut doc = String::from("a0: &a0 [x, x]\n");
+    for i in 1..=26 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+    doc.push_str("root: *a26\n");
+
+    for (filter, want) in [
+        (".root | first(recurse(.[]?)) | length", "2"),
+        (".root | first(recurse) | length", "2"),
+        (".root | first(..) | length", "2"),
+        (".root | [limit(3; recurse(.[]?))] | length", "3"),
+        (".root | [limit(3; recurse(.[]?)) | length] | .[2]", "2"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &["--jq-extensions"])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
 /// #2476's one behaviour change: #1804's accepted trade-off, now shared by
 /// `and`/`or`.
 ///
