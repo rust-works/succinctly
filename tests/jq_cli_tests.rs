@@ -62657,7 +62657,7 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
         (doc, r"path(. as $x | 5 | select(.) | $x)", "[]\n", "", 0),
         (
             doc,
-            r"path(. as $x | {k:1} | select(.) | $x)",
+            r#"path(. as $x | {"k":1} | select(.) | $x)"#,
             "[]\n",
             "",
             0,
