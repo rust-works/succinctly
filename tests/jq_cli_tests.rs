@@ -60201,6 +60201,69 @@ fn test_argument_navigation_builtins_continue_when_nested_in_an_array_2746() -> 
     Ok(())
 }
 
+/// #3349: `any(gen;cond)`/`all(gen;cond)` navigate `gen` live, so an untracked
+/// value inside it raises where it was previously evaluated by value and
+/// answered nothing. The result is a computed boolean, never a path, and
+/// `cond` errors and `gen`'s post-decision errors follow jq's short-circuit.
+/// Captured live from jq 1.7.1.
+#[test]
+fn test_any_all_gen_cond_navigation_in_path_context_3349() -> Result<()> {
+    for filter in [
+        "[path(([1] | any(.[]; .)) | empty)]",
+        "[path(([1] | all(.[]; .)) | empty)]",
+        "[path([1] | any(.[]; .))]",
+        "[path([1] | all(.[]; .))]",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression near attempt to iterate through [1]"),
+            "{filter}: {stderr:?}"
+        );
+    }
+    for (filter, input, expected) in [
+        ("path(any(.[]; .))", "[1,2,3]", "result true"),
+        ("path(all(.[]; .))", "[1,2,3]", "result true"),
+        ("path(any(.[]; .))", "{}", "result false"),
+        (
+            "path(any(.[]; error(\"x\")))",
+            "[1]",
+            "error (at <stdin>:0): x",
+        ),
+        ("path([any(.[]; .), 5])", "[1,2,3]", "result [true,5]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(stderr.contains(expected), "{filter}: {stderr:?}");
+    }
+    // A `try` directly on the construct still catches it; the write side
+    // (`del`) raises like `path`.
+    for (filter, input, expected) in [
+        (r"del(try ([1] | any(.[]; .)))", "{}", "{}"),
+        (
+            r"try path([1] | all(.[]; .)) catch .",
+            "{}",
+            r#""Invalid path expression near attempt to iterate through [1]""#,
+        ),
+        (
+            r#"try path(any(.[], error("late"); .)) catch ."#,
+            "[false]",
+            r#""late""#,
+        ),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+    // Value mode is untouched.
+    for (filter, expected) in [("any(.[]; .)", "true"), ("all(.[]; .)", "true")] {
+        let (stdout, code) = run_jq_stdin(filter, "[1,2,3]", &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+    Ok(())
+}
+
 /// #2746: `INDEX(gen;f)`'s own `idx_expr` error aborts the whole
 /// construction with no partial object, matching `reduce`'s "only the final
 /// value is observable" semantics -- the same rule `build_upper_index`'s own

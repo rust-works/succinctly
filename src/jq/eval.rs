@@ -37568,12 +37568,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `FirstExpr` uses), so the ambient `keep` is harmless to forward
         // there -- it can only tighten an already-tight bound.
         //
-        // `any(gen;cond)`/`all(gen;cond)` are deliberately not handled here:
-        // unlike these three, they must interleave real per-element `cond`
-        // evaluation with `gen`'s own consumption to decide when to stop,
-        // which this discard-and-drain shape cannot express safely -- see
-        // #3347's own postmortem on `nth`/`indices`/`index`/`rindex` for the
-        // risk class a rushed version of that would repeat. Filed as #3348.
+        // `any(gen;cond)`/`all(gen;cond)` are the next arm: unlike these
+        // three they interleave a per-element `cond` probe with `gen`'s own
+        // consumption to decide when to stop (#3349).
         Expr::LastExpr(inner) | Expr::Builtin(Builtin::LastStream(inner)) => {
             let mut last: Option<OwnedValue> = None;
             let flow = resolve_node_sink::<S>(
@@ -37629,6 +37626,54 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 drained_register::<S>(trackable, value)
             };
             forward_drained_result(flow, OwnedValue::Bool(is_empty), register, sink)
+        }
+
+        // #3349: `any(gen;cond)`/`all(gen;cond)` navigate `gen` live, so an
+        // untracked value inside it raises as it does in jq. Value mode
+        // (`each_any_all_gen_cond`) runs `gen` on the owned bridge and never
+        // reaches the resolver. `gen` is resolved here instead, each branch's
+        // value is probed with `cond` exactly as value mode probes it
+        // ([`any_all_probe_element`]), and the first decisive element stops
+        // `gen`. `cond` itself runs by value, as in jq's `isempty(first(gen |
+        // cond or empty))` desugar, where `cond` is not a path position. The
+        // result is a computed boolean, never a path into the document.
+        Expr::Builtin(builtin @ (Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond))) => {
+            let target_truthy = matches!(builtin, Builtin::AnyCond(..));
+            let mut decided = false;
+            let mut probe_escape: Option<Control> = None;
+            let flow = resolve_node_sink::<S>(
+                gen,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                Keep::AtMost(usize::MAX),
+                &mut |branch| {
+                    let elem = branch.value.into_owned();
+                    match any_all_probe_element::<S>(cond, &elem, target_truthy) {
+                        Ok(true) => {
+                            decided = true;
+                            Demand::Stop
+                        }
+                        Ok(false) => Demand::Continue,
+                        Err(control) => stop_with_escape(&mut probe_escape, control),
+                    }
+                },
+            );
+            if let Some(control) = probe_escape {
+                return ResolveFlow::Escaped(EvalEscape::from(control));
+            }
+            let answer = if decided {
+                target_truthy
+            } else {
+                !target_truthy
+            };
+            forward_drained_result(
+                flow,
+                OwnedValue::Bool(answer),
+                drained_register::<S>(trackable, value),
+                sink,
+            )
         }
 
         Expr::Builtin(Builtin::UpperIndexStream(stream, idx_expr)) => {
