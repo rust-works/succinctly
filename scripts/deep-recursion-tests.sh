@@ -22,11 +22,12 @@
 # Because the skip list is generated from the same array, that is enough to keep
 # the two legs in step: there is no second list to go stale.
 #
-# To move another test here, add its name to DEEP_RECURSION_TESTS.
+# To move another slow test here, add its name to DEEP_RECURSION_TESTS. It must be a
+# test in tests/jq_cli_tests.rs: `run` lists and runs that one target only.
 #
-# `CARGO` overrides the cargo binary (scripts/test_deep_recursion_tests.py uses a
-# fake one). Runs on macOS runners, whose /bin/bash is 3.2: no mapfile, no
-# associative arrays.
+# Calls `cargo` from PATH; scripts/test_deep_recursion_tests.py puts a fake one first
+# on PATH, so its cases can never launch the real suite. Runs on macOS runners, whose
+# /bin/bash is 3.2: no mapfile, no associative arrays.
 
 set -euo pipefail
 
@@ -36,8 +37,6 @@ DEEP_RECURSION_TESTS=(
   test_recursion_refuses_before_the_native_stack_runs_out_3262
   test_composed_recursion_across_two_defs_errors_not_aborts_1371
 )
-
-CARGO="${CARGO:-cargo}"
 
 usage() {
   echo "usage: $0 skip-args|run" >&2
@@ -61,7 +60,7 @@ run() {
   listing="$workdir/listing"
   output="$workdir/output"
 
-  "$CARGO" test --features cli --test "$TEST_TARGET" -- --list > "$listing"
+  cargo test --features cli --test "$TEST_TARGET" -- --list > "$listing"
   for name in "${DEEP_RECURSION_TESTS[@]}"; do
     # grep reads the file, not a pipe: with `pipefail`, `grep -q` exiting on its
     # first match could SIGPIPE a producer and read as "not found".
@@ -77,7 +76,7 @@ run() {
   # `pipefail` makes this pipeline's status cargo's, so a failing test fails the leg.
   # `--color never`: libtest wraps `ok` in escape codes when told to colour (and
   # ci.yml sets CARGO_TERM_COLOR=always), which would hide the result line below.
-  "$CARGO" test --features cli --test "$TEST_TARGET" -- --color never --exact "${DEEP_RECURSION_TESTS[@]}" 2>&1 | tee "$output"
+  cargo test --features cli --test "$TEST_TARGET" -- --color never --exact "${DEEP_RECURSION_TESTS[@]}" 2>&1 | tee "$output"
 
   passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' "$output")"
   if [ "$passed" != "$expected" ]; then

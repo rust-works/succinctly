@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Unit tests for scripts/deep-recursion-tests.sh that need no cargo build: `CARGO` is
-pointed at a small shell script that prints canned `--list` and run output, so these check
-the script's own guards and nothing about the tests it names. Run directly
-(`python3 scripts/test_deep_recursion_tests.py`) or via
-`python3 -m unittest scripts/test_deep_recursion_tests.py`; wired into CI's `perf-guard`
-job beside `test_ab_cli.py`.
+"""Unit tests for scripts/deep-recursion-tests.sh that need no cargo build: a fake `cargo`,
+a small shell script first on PATH, prints canned `--list` and run output, so these check
+the script's own guards and nothing about the tests it names (and can never launch the
+real suite). Run directly (`python3 scripts/test_deep_recursion_tests.py`) or via
+`python3 -m unittest scripts/test_deep_recursion_tests.py`.
 
 The guards matter because libtest exits 0 with `running 0 tests` when `--exact` matches
 nothing (#3698): without them a renamed test would leave the `deep-recursion` leg green
-and the test running nowhere.
+and the test running nowhere. `CiWiringTests` pins the other half: that on every platform
+the tests the `cli-gated` leg skips are the ones a `deep-recursion` leg runs.
+
+It is run by the `deep-recursion` legs themselves (ci.yml), so it sits on the required
+path: weakening a guard fails `Test (...)`, not just a side job.
 """
 
 import os
@@ -21,7 +24,8 @@ import unittest
 
 _SCRIPTS = pathlib.Path(__file__).resolve().parent
 SCRIPT = _SCRIPTS / "deep-recursion-tests.sh"
-TEST_FILE = _SCRIPTS.parent / "tests" / "jq_cli_tests.rs"
+CI_YML = _SCRIPTS.parent / ".github" / "workflows" / "ci.yml"
+MATRIX_JOBS = ("test-x86-matrix", "test-arm-matrix", "test-macos-arm-matrix")
 
 # Records each invocation, then answers `--list` or a run from the environment.
 FAKE_CARGO = """#!/bin/sh
@@ -58,15 +62,6 @@ class SkipArgsTests(unittest.TestCase):
         self.assertEqual(tokens, ["--exact"] + [t for n in names for t in ("--skip", n)])
         self.assertEqual(len(names), len(set(names)))
 
-    def test_every_listed_name_is_a_test_in_the_real_file(self):
-        source = TEST_FILE.read_text()
-        for name in listed_names():
-            with self.subTest(name=name):
-                self.assertEqual(
-                    len(re.findall(rf"^fn {re.escape(name)}\(", source, re.M)), 1
-                )
-                self.assertRegex(source, rf"#\[test\]\nfn {re.escape(name)}\(")
-
     def test_unknown_or_missing_subcommand_is_a_usage_error(self):
         for args in ([], ["bogus"]):
             with self.subTest(args=args):
@@ -93,7 +88,7 @@ class RunTests(unittest.TestCase):
             listing = [f"{n}: test" for n in ["unrelated_test", *self.names]]
         env = dict(
             os.environ,
-            CARGO=str(self.cargo),
+            PATH=f"{self.dir}{os.pathsep}{os.environ['PATH']}",
             FAKE_LOG=str(self.log),
             FAKE_LISTING="\n".join(listing),
             FAKE_RESULT=result,
@@ -172,6 +167,67 @@ class RunTests(unittest.TestCase):
         done, _ = self.run_script(result=PASSED_2, exit_code=101)
         self.assertEqual(done.returncode, 101, done.stdout + done.stderr)
         self.assertNotIn("::error::", done.stdout)
+
+
+def matrix_legs(job):
+    """{leg name: its non-comment text} for one matrix job of ci.yml.
+
+    Plain text, not YAML: PyYAML is not guaranteed on every runner. The job and leg
+    indentation are the file's own, so a restructure fails here loudly rather than
+    passing vacuously.
+    """
+    text = CI_YML.read_text()
+    found = re.search(
+        rf"^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text, re.M | re.S
+    )
+    if not found:
+        raise AssertionError(f"{job} is not a job in {CI_YML}")
+    body = "\n".join(
+        line for line in found.group(1).split("\n") if not line.lstrip().startswith("#")
+    )
+    parts = re.split(r"^          - name: ", body, flags=re.M)[1:]
+    return {part.split("\n", 1)[0].strip(): part for part in parts}
+
+
+class CiWiringTests(unittest.TestCase):
+    """The names are single-sourced; this pins the platforms (#3698)."""
+
+    def test_every_platform_skips_in_cli_gated_and_runs_in_deep_recursion(self):
+        for job in MATRIX_JOBS:
+            with self.subTest(job=job):
+                legs = matrix_legs(job)
+                self.assertIn("cli-gated", legs)
+                self.assertIn("deep-recursion", legs)
+
+                gated = legs["cli-gated"]
+                self.assertEqual(
+                    gated.count("skip=$(scripts/deep-recursion-tests.sh skip-args)"), 1
+                )
+                # The skip is only worth anything on the line that runs jq_cli_tests.
+                commands = [
+                    line.strip()
+                    for line in gated.split("\n")
+                    if line.strip().startswith("cargo test ")
+                ]
+                self.assertEqual(len(commands), 1, commands)
+                self.assertIn(" --test jq_cli_tests ", commands[0])
+                self.assertTrue(commands[0].endswith(" -- $skip"), commands[0])
+
+                deep = legs["deep-recursion"]
+                self.assertEqual(deep.count("scripts/deep-recursion-tests.sh run"), 1)
+                # The guard's own self-test rides in the same (required) leg.
+                self.assertEqual(
+                    deep.count("python3 scripts/test_deep_recursion_tests.py"), 1
+                )
+                self.assertIn("buildCli: true", deep)
+
+    def test_no_other_leg_runs_jq_cli_tests_with_the_two_tests_twice(self):
+        # A third place running `--test jq_cli_tests` unskipped would run them twice.
+        for job in MATRIX_JOBS:
+            with self.subTest(job=job):
+                for name, leg in matrix_legs(job).items():
+                    if name != "cli-gated":
+                        self.assertNotIn("--test jq_cli_tests", leg, name)
 
 
 if __name__ == "__main__":

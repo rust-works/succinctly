@@ -223,9 +223,14 @@ jobs:
           # #3698: the two slowest jq_cli_tests, split out of `cli-gated` (see its comment).
           # `run` fails if a listed name stopped being a test, or if fewer tests passed than
           # are listed: libtest runs zero tests and exits 0 when `--exact` matches nothing.
+          # The script's self-test (a fake `cargo`, ~2 s) runs first, in this leg and not in a
+          # side job, so weakening a guard fails the required `Test (...)` check; it also pins
+          # that each of the three matrices here has both halves of the split.
           - name: deep-recursion
             buildCli: true
-            testCmd: scripts/deep-recursion-tests.sh run
+            testCmd: |
+              python3 scripts/test_deep_recursion_tests.py
+              scripts/deep-recursion-tests.sh run
     env:
       # x86 SIMD CI leg (#193): the SIMD suites self-skip (with a visible
       # `SKIPPED` line) when a CPU feature is missing, so this pins the runner
@@ -406,7 +411,9 @@ jobs:
           # guards as the x86_64 leg's (see the comment on its `cli-gated` entry).
           - name: deep-recursion
             buildCli: true
-            testCmd: scripts/deep-recursion-tests.sh run
+            testCmd: |
+              python3 scripts/test_deep_recursion_tests.py
+              scripts/deep-recursion-tests.sh run
     env:
       # ARM SIMD CI leg (#194, mirroring the x86 pattern from #193): the SVE2
       # suites self-skip (with a visible `SKIPPED` line) when a CPU feature is
@@ -542,7 +549,9 @@ jobs:
           # guards as the x86_64 leg's (see the comment on its `cli-gated` entry).
           - name: deep-recursion
             buildCli: true
-            testCmd: scripts/deep-recursion-tests.sh run
+            testCmd: |
+              python3 scripts/test_deep_recursion_tests.py
+              scripts/deep-recursion-tests.sh run
     env:
       # Apple Silicon has NEON but no SVE/SVE2, so only NEON is pinned; the
       # SVE2 suites are *expected* to print `SKIPPED` lines on this leg. SVE2
@@ -617,12 +626,6 @@ jobs:
       # fixtures. It pins that a command which exits non-zero is refused, not timed.
       - name: ab-cli.py self-tests
         run: python3 scripts/test_ab_cli.py -v
-
-      # #3698: the same shape for `scripts/deep-recursion-tests.sh`, which keeps the
-      # `cli-gated` skip list and the `deep-recursion` leg in step. A fake `cargo`, no
-      # build: it pins that a renamed, moved or ignored test fails the leg, not passes it.
-      - name: deep-recursion-tests.sh self-tests
-        run: python3 scripts/test_deep_recursion_tests.py -v
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
