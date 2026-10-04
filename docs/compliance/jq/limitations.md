@@ -1241,20 +1241,29 @@ is the revert that established what the other one costs.
    is no longer one of them: [#3643](https://github.com/rust-works/succinctly/issues/3643)
    states its register as unmoved (jq mode), so `path(. as $x \| last(.l[]) \| $x)` is `[]`
    here too, pinned by `test_path_register_last_f_does_not_move_it_3643`.
-   [#3653](https://github.com/rust-works/succinctly/issues/3653) extends that to the wrappers
-   jq passes the register through unchanged (`last(f)?`, `try last(f)` with no `catch`, and
-   `first(last(f))`, where `first` emits from inside `last`) and to a `select(f)` or type-filter
-   stage (`path(. as $x \| 5 \| select(.) \| $x)` is `[]` in both tools): jq defines `select(f)`
-   as `if f then . else empty end`, whose condition is a subexp, so `f` neither moves the
-   register nor path-checks anything, and every type filter (`numbers`, `strings`, `objects`,
-   ...) is a `select` over a type test. Both are stage-level rules read in `resolve_seq_stage`
-   (jq mode only, like every admission here), and pinned by
+   [#3653](https://github.com/rust-works/succinctly/issues/3653) extends that to a `select(f)`
+   or type-filter stage (`path(. as $x \| 5 \| select(.) \| $x)` is `[]` in both tools) and to
+   the wrappers jq passes the register through unchanged around either (`E?`, `try E` with no
+   `catch`, and `first(E)`: `last(f)?`, `try last(f)`, `first(last(f))`, `select(.)?`,
+   `try numbers`, `first(select(.))`). jq defines `select(f)` as `if f then . else empty end`,
+   whose condition is a subexp, so `f` neither moves the register nor path-checks anything,
+   and every type filter (`numbers`, `strings`, `objects`, ...) is a `select` over a type
+   test; `first(E)` emits from inside `E`, so it keeps the register only when `E` does, and
+   `first(.a)` still moves it. These are stage-level rules read in `resolve_seq_stage` (jq mode
+   only, like every admission here), pinned by
    `test_path_register_last_f_wrappers_and_select_keep_it_3653`, with the yq side by
-   `yq_last_f_wrappers_and_select_do_not_keep_the_path_register_3653`. Still refused where jq
-   answers `[]`: a `catch` handler around `last` (it runs on a caught error's payload),
-   `limit(n; last(f))` and `nth(n; last(f))` (wrappers of their own), and `last(f)` inside a
-   compound stage (a comma, a `//`, a `def` call) or an `[E]` collect, which need the
-   leaf-level verdict for a compound stage described above.
+   `yq_last_f_wrappers_and_type_filters_do_not_keep_the_path_register_3653` (real yq rejects
+   `last`, `try` and the type filters in its lexer, and answers `select` differently, an older
+   divergence this leaves alone). Still refused where jq answers `[]`
+   ([#3767](https://github.com/rust-works/succinctly/issues/3767)): a `catch` handler (it runs
+   on a caught error's payload), `limit(n; E)` and `nth(n; E)` (wrappers of their own), an
+   `[E]` collect of a type filter, and either stage inside a compound stage (a comma, a `//`, a
+   `def` call), which need the leaf-level verdict for a compound stage described above.
+   `select` hands its input through as the very value it received, so a `$x` that reaches it
+   keeps its identity; `last(f)` returns a copy, so a `last` whose output *is* the register
+   (`last($x)`, `last(.)`) loses it, and a `try` around the next navigation then catches a
+   refusal jq never raises and drops the write
+   ([#3766](https://github.com/rust-works/succinctly/issues/3766), older than #3653).
    An array is different: jq collects it without a subexp, so its contents
    are path-checked (`path(. as $x \| {k:.a} \| [.k] \| $x)` raises on the `.k`), and then
    backtracks the register to where the collect began. Since
