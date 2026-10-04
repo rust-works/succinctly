@@ -40361,35 +40361,40 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
 /// `.[]` (#3763). `target_truthy` is `any` (a truthy element decides) or `all`
 /// (a falsy one does, and the answer is `false`).
 ///
-/// `gen` is resolved live, so an untracked value inside it raises as it does in
-/// jq (value mode, `each_any_all_gen_cond`, runs `gen` on the owned bridge and
-/// never reaches the resolver); each branch's value is probed with `cond`
-/// exactly as value mode probes it ([`any_all_probe_element`]), and the first
-/// decisive element stops `gen`.
+/// jq defines `any(g; c)` as `isempty(first(g | (c or empty))) | not` and
+/// `all(g; c)` as `isempty(g | (c and empty))`, so `gen` is resolved live (an
+/// untracked value inside it raises as it does in jq; value mode,
+/// `each_any_all_gen_cond`, runs `gen` on the owned bridge and never reaches the
+/// resolver) and the first decisive element stops it.
 ///
-/// `cond` runs by value here, but jq does not: it is `or`'s (or `and`'s) left
-/// operand in `isempty(first(gen | (cond or empty)))`, which is not a subexp, so
-/// jq path-checks it. A `cond` that navigates moves jq's register onto its own
-/// node (`any(.[]; .a)` is `[0,"a"]`), and one that navigates a computed value
-/// raises a path error this resolver never sees (`any(1; .[]?)` raises `near
-/// attempt to iterate through 1`, and so does `all(unique_by(.))`). So the
-/// decided register is stated only while `cannot_move_register(cond)` holds --
-/// `cond` navigates nothing, so it can neither move the register nor raise --
-/// and a `cond` outside that allowlist is a loss there (#3757). The undecided
-/// one is wider, below.
+/// `cond` is `or`'s (or `and`'s) left operand there, which is not a subexp, so
+/// jq path-checks it: it moves jq's register onto its own node (`any(.[]; .a)`
+/// is `[0,"a"]`), and on a computed element it raises a path error (`any(1;
+/// .[]?)` raises `near attempt to iterate through 1`, a postfix `?` does not
+/// catch it, and so does `all(unique_by(.))`). Two routes in jq mode (#3757):
+///
+/// - A `cond` that provably navigates nothing (`cannot_move_register`, the
+///   allowlist: `.`, a literal, a comparison, ...) can neither move the register
+///   nor raise, so evaluating it by value is exact ([`any_all_probe_element`]).
+/// - Anything else is resolved live, as a pipe stage on each branch `gen`
+///   produced -- `gen | cond`, which is what jq runs -- so a path error on a
+///   computed element raises as jq's does (catchable by `try`, as jq's is), and a
+///   deciding output carries the register `cond` left. That covers a navigating
+///   `cond` (`.a`), one jq leaves in place that the allowlist cannot prove
+///   (`select(.)`, `first(.)`), and a builtin whose own path rules the resolver
+///   already models (`unique_by(.)`, an update assignment).
+///
+/// yq mode keeps the by-value route (ADR-0018: no oracle).
 ///
 /// The result is a computed boolean, but jq's register is not where this
 /// entered, and `path()` accepts a result that is `jv_identical` to it. A
-/// decisive element is emitted from inside `gen`, so the register is wherever
-/// `gen` left it, and `any(.[]; .)` on `[true,false]` is `[0]`: `true` is
-/// identical to the element it stopped at ([`register_after`],
+/// decisive output is emitted from inside `gen | cond`, so the register is
+/// wherever that left it, and `any(.[]; .)` on `[true,false]` is `[0]`: `true`
+/// is identical to the element it stopped at ([`register_after`],
 /// [`computed_at_register`], the `and`/`or` arms' rule). A generator that
-/// produced no decisive element backtracked every branch, so the register is
-/// where this entered ([`drained_register_after`]) -- unless a `cond` ran on
-/// some element that could have raised a path error jq would have raised
-/// instead. It cannot have if `gen` produced nothing (it never ran), if `cond`
-/// is inert, or if it is pure navigation ([`is_pure_navigation`]) that only ever
-/// ran on the register. Both are jq mode only (ADR-0018).
+/// produced no decisive output backtracked every branch, so the register is
+/// where this entered ([`drained_register_after`]): sound on both routes,
+/// because nothing in `cond` could have raised that jq would not have.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambient state, plus the arm's two operands.
 fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     gen: &Expr,
@@ -40401,14 +40406,17 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     frame: &Frame,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    let live = S::TAG == EvalTag::Jq && !cannot_move_register(cond);
+    // `gen | cond`'s second stage, flattened once rather than per branch.
+    let mut stages = Vec::new();
+    if live {
+        push_path_components(&mut stages, cond);
+    }
+    let last_stage = stages.len().checked_sub(1);
     let mut decided = false;
-    // How many branches `gen` produced for `cond` to run on: none means `cond`
-    // never ran, so jq cannot have raised from it. And whether every one was
-    // the register itself, where a plain navigation cannot raise either.
-    let mut probed = 0usize;
-    let mut all_tracked = true;
     let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
     let mut probe_escape: Option<Control> = None;
+    let mut stage_escape: Option<EvalEscape> = None;
     let flow = resolve_node_sink::<S>(
         gen,
         value,
@@ -40417,23 +40425,53 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         frame,
         Keep::AtMost(usize::MAX),
         &mut |branch| {
-            probed += 1;
-            all_tracked &= branch.trackable;
-            match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
-                Ok(true) => {
-                    decided = true;
-                    // Asked here, not on entry: only a deciding element needs
-                    // the verdict, and most `any`s never decide.
-                    if S::TAG == EvalTag::Jq && cannot_move_register(cond) {
-                        decided_at = Some(register_after(gen, branch, frame));
+            if !live {
+                return match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
+                    Ok(true) => {
+                        decided = true;
+                        // `cond` is inert here, so jq mode states the register.
+                        if S::TAG == EvalTag::Jq {
+                            decided_at = Some(register_after(gen, branch, frame));
+                        }
+                        Demand::Stop
                     }
+                    Ok(false) => Demand::Continue,
+                    Err(control) => stop_with_escape(&mut probe_escape, control),
+                };
+            }
+            // `c or empty`: each output of `cond` that is truthy emits `true`
+            // (`c and empty`: a falsy one emits `false`), the rest backtrack.
+            let mut decide = |output: PathBranch<'a>| -> Demand {
+                if output.value.is_truthy() == target_truthy {
+                    decided = true;
+                    decided_at = Some(register_after(cond, output, frame));
                     Demand::Stop
+                } else {
+                    Demand::Continue
                 }
-                Ok(false) => Demand::Continue,
-                Err(control) => stop_with_escape(&mut probe_escape, control),
+            };
+            let Some(last) = last_stage else {
+                // `cond` flattened to nothing: it is the branch itself.
+                return decide(branch);
+            };
+            match resolve_seq_stage::<S>(
+                &stages,
+                last,
+                0,
+                branch,
+                frame,
+                Keep::AtMost(usize::MAX),
+                &mut decide,
+            ) {
+                ResolveFlow::Exhausted => Demand::Continue,
+                ResolveFlow::Stopped => Demand::Stop,
+                ResolveFlow::Escaped(escape) => stop_with_eval_escape(&mut stage_escape, escape),
             }
         },
     );
+    if let Some(escape) = stage_escape {
+        return ResolveFlow::Escaped(escape);
+    }
     if let Some(control) = probe_escape {
         return ResolveFlow::Escaped(EvalEscape::from(control));
     }
@@ -40443,24 +40481,12 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         Some((path, register)) => {
             forward_drained_branch(flow, computed_at_register(answer, path, register), sink)
         }
-        // Nothing decided is `emitted == false`, but only when `cond` cannot
-        // have raised: an undecided `any(1; .[]?)` is jq's path error, not a
-        // backtrack. It cannot have if it never ran (`gen` was empty, so
-        // `any(.a)` over `[]` is a clean backtrack whatever `cond` navigates),
-        // if it is inert, or if it is pure navigation that only ever ran on
-        // the register (`any(.a)` over `[{"a":null}]` navigates and backtracks).
-        None => {
-            let cond_cannot_have_raised = probed == 0
-                || (S::TAG == EvalTag::Jq
-                    && trackable
-                    && (cannot_move_register(cond) || (all_tracked && is_pure_navigation(cond))));
-            forward_drained_result(
-                flow,
-                answer,
-                drained_register_after::<S>(trackable, value, decided || !cond_cannot_have_raised),
-                sink,
-            )
-        }
+        None => forward_drained_result(
+            flow,
+            answer,
+            drained_register_after::<S>(trackable, value, decided),
+            sink,
+        ),
     }
 }
 
