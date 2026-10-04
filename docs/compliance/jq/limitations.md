@@ -747,13 +747,32 @@ retry's child is fine), was the abandoned alternative's `E`. The value and path 
   needed no change. No row here runs queued: it starts only in a walk deeper than the native
   budget.
 
-## `recurse(f)` stops at 10,000 nodes for every `f` but `.[]?` (#3703)
+## `recurse(f)` raises at 10,000 nodes for every `f` but `.[]?` (#3703, #3716)
 
 `recurse(f)` and `recurse(f; cond)` deliver at most `RECURSE_MAX_ITEMS` (10,000) nodes, in the value
-walker and in the path walker behind `path(recurse(f))`, `del`, `|=` and `pick` over it, and then end
-**silently, with exit 0**. jq visits every node. The cap exists because an unbounded `f`
-(`null | recurse(.a)` yields `null` forever in jq, and a collecting consumer here would grow until
-memory ran out) cannot be told from a long one by looking at it.
+walker and in the path walker behind `path(recurse(f))`, `del`, `|=` and `pick` over it. A walk that
+reaches the cap with a node still to visit **raises** `recurse: maximum nodes exceeded`
+(`ErrorKind::ResourceLimit`, exit 5, uncatchable by `?`/`try`/`catch`/`?//` like every cap in this
+file, see "Every resource cap is uncatchable" below), accepted under ADR-0018 rule 4c for the reason the
+cap exists: an unbounded `f` (`null | recurse(.a)` yields `null` forever in jq, and a collecting
+consumer here would grow until memory ran out) cannot be told from a long one by looking at it.
+Before #3716 the cap ended the walk as though it had finished: **silently, with exit 0**, so a finite
+walk over a larger document answered short and a write through it stopped at the same node.
+
+The nodes delivered before the cap stay delivered, as with `range`: a streamed consumer prints 10,000
+outputs and then the error, a collecting one (`[recurse(f)]`, `length`) raises instead of answering, and
+a write through the walk (`|=`, `=`, `del`, `pick`) raises instead of finishing partially. A consumer
+that stops first never meets it (`first`, `limit(10000; ...)`, `isempty`, `nth(9999; ...)`), and the
+boundary is exact: a 10,000-node document answers, a 10,001-node one raises, because the cap fires only
+when a node remains. It replaces a deferred `f`/`cond` error rather than the other way round, since the
+cap is the error the walk's size decided. Both evaluators and both modes share the one walker (yq's
+`recurse` is a succinctly extension behind `--jq-extensions`, real yq's lexer rejects it).
+
+**`paths(f)` is a walk whose output is thrown away.** jq 1.7.1 defines it as `path(..|select(f)) |
+select(length > 0)`, so it runs `f` on the root too and discards that output. A `recurse` as the filter
+argument over a document past the cap (`[paths(recurse(.[]?; true))] | length`, 18000 in jq) therefore
+raises here, where the silent truncation of the discarded root walk used to leave jq's count intact by
+luck.
 
 `.[]?` is the exception, and is lifted since #3703: jq defines `def recurse: recurse(.[]?);`
 (`jq --debug-dump-disasm` shows the lambda as `EACH_OPT`), so `recurse(.[]?)`, bare `recurse` and `..`
@@ -761,21 +780,21 @@ are one walk, bounded by the document. The value walker hands exactly that `f` (
 no `cond`) to a direct walk of the owned tree, so no cap applies; the path walker takes its cap from
 the caller's own `f` and lifts it for the same shape.
 
-What still diverges, on a 12,001-node document (6,000 one-element arrays), captured from jq 1.7.1:
+What still differs from jq, on a 12,001-node document (6,000 one-element arrays), captured from jq 1.7.1:
 
-| Filter                                                            | jq    | succinctly |
-|-------------------------------------------------------------------|-------|------------|
-| `[recurse(.[]?; true)] \| length`                                 | 12001 | 10000      |
-| `[recurse(.[]?; . != null)] \| length`                            | 12001 | 10000      |
-| `[recurse(if type == "array" then .[] else empty end)] \| length` | 12001 | 10000      |
+| Filter                                                            | jq    | succinctly                                       |
+|-------------------------------------------------------------------|-------|--------------------------------------------------|
+| `[recurse(.[]?; true)] \| length`                                 | 12001 | raises `recurse: maximum nodes exceeded` (exit 5) |
+| `[recurse(.[]?; . != null)] \| length`                            | 12001 | raises, as above                                 |
+| `[recurse(if type == "array" then .[] else empty end)] \| length` | 12001 | raises, as above                                 |
 
-A write through such a walk stops at the same node, so `recurse(f) |= ...` leaves everything past
-it untouched, as the `.[]?` form did before #3703. A silent short answer is not a divergence ADR-0018
-permits, and neither is a hang; raising at the cap, or lifting it where the walk is provably finite,
-is the open question, tracked in [#3716](https://github.com/rust-works/succinctly/issues/3716).
-The path walker still runs `.[]?` at every node, so `path(recurse(.[]?))` takes about 1.8 times
-`path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes of a `users` document,
-[#3717](https://github.com/rust-works/succinctly/issues/3717)).
+A finite walk past the cap is still refused rather than answered; lifting it where the walk is provably
+finite (`recurse(.[]?; cond)` with a `cond` that yields at most one value, `recurse(.children[]?)`) needs
+the peak memory of an uncapped parameterised walk measured on both machines first, and is tracked in
+[#3737](https://github.com/rust-works/succinctly/issues/3737). A hang is not a divergence ADR-0018
+permits either, so the cap stays. The path walker still runs `.[]?` at every node, so
+`path(recurse(.[]?))` takes about 1.8 times `path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes of
+a `users` document, [#3717](https://github.com/rust-works/succinctly/issues/3717)).
 
 **Alias fan-out is walked in full.** A YAML document whose aliases expand to N nodes is delivered
 node by node by `..`, `path(..)`, and, since #3703, `recurse(.[]?)` and `path(recurse(.[]?))`; no work
@@ -8016,11 +8035,12 @@ own repro table didn't happen to list, not new ones introduced by this fix.
   [#2131](https://github.com/rust-works/succinctly/issues/2131). **Fixed**:
   see the next section.
 
-### Every resource cap is uncatchable by `?`/`try`/`catch` (#2132) -- shared by the five cap sections
+### Every resource cap is uncatchable by `?`/`try`/`catch` (#2132) -- shared by the six cap sections
 
-The five evaluator-imposed caps documented in this file -- `range`'s `MAX_RANGE` (#2089, above),
+The six evaluator-imposed caps documented in this file -- `range`'s `MAX_RANGE` (#2089, above),
 `while`/`until`'s `WHILE_UNTIL_MAX_STEPS` (#534/#2087), `reduce`/`foreach`'s
-`REDUCE_FOREACH_MAX_STEPS` (#695/#2079), `repeat`'s `MAX_ITERATIONS` (#2014), and a recursive
+`REDUCE_FOREACH_MAX_STEPS` (#695/#2079), `repeat`'s `MAX_ITERATIONS` (#2014), `recurse(f)`'s
+`RECURSE_MAX_ITEMS` (#3716, which ended the walk silently until then), and a recursive
 `def` past `MAX_EVAL_FRAMES` (#1371) -- raise as `ErrorKind::ResourceLimit`
 (`src/jq/error.rs`), which every catch boundary treats exactly like a decode failure: never
 suppressed by `?`, never handed to `catch`, and never a reason for `?//` to try the next

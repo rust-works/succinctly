@@ -648,6 +648,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq/yq: `recurse(f)` and `recurse(f; cond)` raise at the 10,000-node cap instead of ending silently
+  short** (#3716). A walk that reached `RECURSE_MAX_ITEMS` with a node still to visit used to end as
+  though it had finished, with exit 0: `[recurse(.[]?; true)] | length` over a 12,001-node document
+  answered `10000` (jq: 12001), and `(recurse(.[]?; true) | select(type == "number")) |= . + 1` left 1,001
+  of the 6,000 numbers un-incremented, in the value walker and in the path walker behind `path`, `del`,
+  `|=`, `=` and `pick`. It now raises `recurse: maximum nodes exceeded`, an uncatchable
+  `ErrorKind::ResourceLimit` like every other cap (`range`, `until`, `reduce`: #2132): exit 5, never
+  suppressed by `?`/`try`/`catch`/`?//`. The nodes delivered before it stay delivered (a streamed consumer
+  prints 10,000 outputs, then the error), a collecting consumer raises instead of answering, and a write
+  through the walk raises instead of finishing partially. A consumer that stops first never meets the cap,
+  `.[]?` with no `cond` is still uncapped (#3703), and the boundary is exact (10,000 nodes answer, 10,001
+  raise). The cap replaces a deferred `f`/`cond` error rather than being dropped with it. A finite walk
+  past the cap is still refused rather than answered; lifting it where the walk is provably bounded needs
+  the memory of an uncapped parameterised walk measured first (#3737). yq's `recurse` extension shares the
+  walker and raises the same way. See `docs/compliance/jq/limitations.md`.
+
 - **jq: `walk(f)` over a scalar is `f` in path position** (#3713). jq defines `walk(f)` as `... else . end |
   f`, so on a scalar it runs `f` on the path register itself: over `null`, `path(walk(.a))` is `["a"]` and
   `(walk(.a)) |= 9` writes `{"a":9}`. succinctly evaluated `walk` by value and answered `[]` and wrote `9`
