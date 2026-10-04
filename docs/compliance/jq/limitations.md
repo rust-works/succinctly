@@ -1159,13 +1159,22 @@ is the revert that established what the other one costs.
      `isempty(g)` as `first((g | false), true)`, so they take the same rules: `path(any)` on
      `[true,false]` is `[0]`, `path(isempty(.[]?))` on `[false]` is `[0]`, and `del`/`=`/`|=` write
      there; an untracked input still raises `near attempt to iterate through` from the `.[]`.
-     In yq mode they keep yq's own errors (`all only supports arrays, was !!int`). A deciding
+     In yq mode `any`/`all` are real yq builtins and keep yq's own scalar error (`all only
+     supports arrays, was !!int`). A deciding
      element is emitted from inside `gen`, so the result is a fresh boolean *at* the register `gen`
      left, and `PATH_END` accepts it when it is `jv_identical` to it: `path(any(.[]; .))` on
      `[true,false]` is `[0]`, `path(all(.[]; .))` is `[1]`, `del(any(.[]; .))` is `[false]`, and
      `[1,2]`/`[null]` still refuse (a truthy `1` is not `true`, `null` is not `false`). A generator
      that never decided backtracked every branch, so the register is where the construct entered
-     (`path(any(.[]; .) or .a)` on `{"a":false}` is `["a"]`). Two shapes are still refused where jq
+     (`path(any(.[]; .) or .a)` on `{"a":false}` is `["a"]`) -- but only for a `cond` that cannot
+     raise a path error. jq path-checks `cond` (it is `or`'s left operand, not a subexp) and this
+     resolver runs it by value, so an `any(1; .[]?)` that jq raises on (`near attempt to iterate
+     through 1`) would read as a clean backtrack, and a later `$x` would re-establish the root: the
+     first push of #3763 deleted the whole document for
+     `del(. as $x | (isempty(any(1; .[]?)) and 1) | $x)` on `{"a":1}`, and so did `main` for
+     `del(. as $x | (any(1; .[]?) or 1) | $x)` since #3749. Both claims, decided or not, therefore
+     need `cannot_move_register(cond)`
+     (`test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763`). Two shapes are still refused where jq
      answers, pinned
      (`test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749`): the result is
      stated only while `cond` is on `cannot_move_register`'s allowlist, because `cond` runs by
@@ -1200,7 +1209,7 @@ is the revert that established what the other one costs.
    0 rows are newly accepted wrongly; the 36 that
    still accept are all `.[0:] and R` and `.[0:0] and R` on `[]` (an empty slice is a fresh
    array, #3494's identity rule; unchanged by this work). yq mode is unchanged: the per-result
-   and `add`/`map` verdicts are gated on jq mode, and 1,400 yq-mode runs of
+   (since moved into the `any`/`all`/`isempty` arms, #3749/#3763) and `add`/`map` verdicts are gated on jq mode, and 1,400 yq-mode runs of
    `has`/`range`/`paths`/`add`/`map`/`any` and friends in write contexts (610 succeed, the rest
    fail identically) answer the same before and after; five of them are pinned
    (`test_yq_by_value_stages_keep_no_path_register_3456`).

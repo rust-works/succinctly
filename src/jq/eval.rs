@@ -40389,10 +40389,12 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
 /// [`leaf_register`] for the drain arms (`isempty`, `INDEX`, and `last` outside
 /// jq mode): each runs its argument through a discarding sink and forwards one
 /// derived value, so none can claim the register stayed where it entered (D5).
-/// Whether jq's own definition leaves it (`isempty(g)` only when `g` is empty)
-/// is a promotion with oracle rows of its own, not part of the producer
-/// contract's introduction. `last(f)` in jq mode is one such promotion, made by
-/// #3643 in its own arm ([`last_leaves_register_in_place`]).
+/// Whether jq's own definition leaves it is a promotion with oracle rows of its
+/// own, not part of the producer contract's introduction. `last(f)` in jq mode
+/// is one such promotion, made by #3643 in its own arm
+/// ([`last_leaves_register_in_place`]); `isempty(g)`, `any` and `all` are
+/// others, made by #3456, #3749 and #3763 through [`drained_register_after`]
+/// and the register their emitting branch left.
 fn drained_register<'a, S: EvalSemantics>(
     trackable: bool,
     value: &OwnedValue,
@@ -40438,8 +40440,10 @@ fn drained_register_after<S: EvalSemantics>(
 /// an untracked one alike. The arm used to decline on a trackable input
 /// unless the resolver followed every move of jq's register inside the
 /// operands ([`register_movement_tracked`]): an operand jq navigates inside
-/// but the resolver evaluates by value -- `any`, `isempty(g)`, a user `def` --
-/// would otherwise be read as having left the register where it entered, and
+/// but the resolver evaluates by value -- a user `def`, a builtin outside the
+/// allowlist (`any` and `isempty(g)` were two until #3749 and #3763 gave them
+/// arms of their own) -- would otherwise be read as having left the register
+/// where it entered, and
 /// `del(first and .[0])` on `[true]` deleted where jq refuses near element 0.
 /// Such operands kept the eager by-value catch-all, which accepted shapes jq
 /// refuses (#3428). They no longer need to: each operand's branch says what
