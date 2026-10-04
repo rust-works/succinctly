@@ -294,7 +294,7 @@ Consequences:
   turns a refusal into an answer, which belongs in its own reviewed step with sweep rows.
   **Promoted by #3643** (jq mode only), at two sites: the `LastExpr`/`LastStream` arm states
   `Unmoved(entry)` for the leaf (what an `and`/`or` operand reads), and
-  `last_leaves_register_in_place` admits the stage in `resolve_seq_stage`'s
+  `stage_leaves_register_in_place` admits the stage in `resolve_seq_stage`'s
   `stage_preserves_register` (what a pipe's next stage reads). It is not in
   `cannot_move_register`, whose "navigates nothing" reading `f` breaks. Pinned by
   `test_path_register_last_f_does_not_move_it_3643`; the sweep grid gained `last(f)` operands and
@@ -492,6 +492,18 @@ safe direction, so the grid could not see the mark) and 40 (24 worse) once `sort
 Each turns a refusal into an answer and needs its own oracle rows:
 
 - ~~`last(f)` to `Unmoved` (section 5).~~ Done by #3643.
+- ~~A `select(f)`/type-filter stage, and the wrappers around it and around `last(f)` that add no
+  movement (`?`, `try`, `first(...)`).~~ Done by #3653, as two stage-level rules beside
+  `cannot_move_register` in `resolve_seq_stage` (`stage_leaves_register_in_place`, which asks
+  `is_last_stage` and `is_select_stage` of what `peel_register_transparent` leaves): jq
+  defines `select(f)` as `if f then . else empty end`, so `f` is a subexp, and `try` and `first`
+  pass the inner register on. A `select` entered on the register already passed a trackable
+  branch through; only the register *carried* by an untracked entry was dropped, so the sweep
+  gained contexts that enter the stage on a literal (`untracked-*`). Still refused where jq
+  answers, tracked by #3767: `try ... catch H`, `limit(n; E)`, `nth(n; E)`, an `[E]` collect of a
+  type filter, and either stage inside a compound stage. Not a promotion but found on the way,
+  #3766: `last(f)` returns a copy, so a `last` whose output is the register itself
+  (`last($x)`, `last(.)`) loses its identity.
 - The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
   turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`
   into jq's `[]`. Cheap now, because the producers already say it.
