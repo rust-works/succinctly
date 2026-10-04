@@ -1472,6 +1472,49 @@ fn scalar_leaf_iteration<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// What a `?`/`try` boundary that swallows `.[]` settles for the path-walk node
+/// `node`, without stepping it, or `None` when the step must run (#3689, #3722).
+///
+/// The path-walk twin of [`swallowed_scalar_iteration`], which answers a *value*:
+/// this answers a *position*. `Some(Ok(()))` is a scalar's swallowed `Cannot
+/// iterate over ...` -- nothing is reached below it; `Some(Err(e))` is the failure
+/// `?` never swallows, decided by [`scalar_leaf_iteration`] exactly as the step
+/// decides it. A live node that is a container, an absent node, and an owned
+/// container take the step, and so does everything in yq mode, where the step
+/// never built the message ([`swallowing_boundary`]).
+///
+/// An owned scalar needs no check: it was decoded when it was built, and a slice
+/// materializes its elements, so an undecodable one raised there, before the walk.
+///
+/// One definition for the path-context step ([`path_context_step_try`]) and the
+/// `path(f)` walkers' own `Optional` arms ([`path_walk_generic`],
+/// [`path_step_generic`]), so the three cannot disagree about a leaf.
+fn swallowed_path_leaf<S: EvalSemantics, V: DocumentValue>(
+    body: &Expr,
+    catch: Option<&Expr>,
+    node: &PathNode<V>,
+) -> Option<Result<(), EvalError>> {
+    if !swallowing_boundary::<S>(body, catch) {
+        return None;
+    }
+    match node {
+        PathNode::At(cursor) => {
+            let value = cursor.value();
+            if value.as_object().is_none() && value.as_array().is_none() {
+                Some(scalar_leaf_iteration::<S, V>(&value, cursor))
+            } else {
+                None
+            }
+        }
+        PathNode::Owned(value)
+            if !matches!(**value, OwnedValue::Array(_) | OwnedValue::Object(_)) =>
+        {
+            Some(Ok(()))
+        }
+        PathNode::Owned(_) | PathNode::Absent => None,
+    }
+}
+
 /// The jq `type` name for `value` at `cursor`, resolving an explicit YAML
 /// tag first (e.g. `!!str 1` is `"string"`, not `"number"` — issue #747)
 /// and falling back to [`DocumentValue::type_name`] otherwise. Mirrors
@@ -20155,6 +20198,13 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
             // that the pre-walk is gone, `path(.a[]?)` on an undecodable
             // string reached it silently, diverging from plain `.a[]?`
             // navigation, which does raise.
+            //
+            // #3722: a bare `.[]?` over a scalar settles here without stepping
+            // it, so the `Cannot iterate` message the step would format and
+            // this arm would drop is never built (see [`swallowed_path_leaf`]).
+            if let Some(settled) = swallowed_path_leaf::<S, V>(inner, None, node) {
+                return settled;
+            }
             let mut branch = Vec::new();
             let result = path_walk_generic::<S, V>(inner, node, path, &mut branch);
             out.append(&mut branch);
@@ -20603,6 +20653,12 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
             // pre-walk always raised first); now that it is live, the
             // unguarded discard let `path((.a[]?)|.x)` answer past an
             // undecodable string that plain `(.a[])|.x` still raises on.
+            //
+            // #3722: a bare `.[]?` over a scalar settles here without stepping
+            // it, as in `path_walk_generic` (see [`swallowed_path_leaf`]).
+            if let Some(settled) = swallowed_path_leaf::<S, V>(inner, None, node) {
+                return settled;
+            }
             let mut branch = Vec::new();
             let result = path_step_generic::<S, V, T>(
                 inner,
@@ -22299,33 +22355,13 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
     // #3689: a scalar has no members, and a `?`/`try` over a bare `.[]` drops
-    // the error iterating it raises -- but not one that escapes (an undecodable
-    // string, a scalar the cursor cannot read), which [`scalar_leaf_iteration`]
-    // decides as the step would. So a leaf spares the `Cannot iterate` message
-    // the step would format and this boundary would drop, and most nodes are
-    // leaves: this is every `.. | path`/`key`/`parent` (whose `..` steps each
-    // node through `.[]?`) and a user-written `.[]? | path`. An owned scalar (a
-    // slice's element) has nothing to decode and yields nothing. Not in yq
-    // mode, where the step never built the message (see
-    // [`swallowed_scalar_iteration`]); a node that is not a live or owned
-    // scalar takes the step.
-    if swallowing_boundary::<S>(body, catch) {
-        match &pos.node {
-            PathNode::At(cursor) => {
-                let node = cursor.value();
-                if node.as_object().is_none() && node.as_array().is_none() {
-                    return scalar_leaf_iteration::<S, V>(&node, cursor).map_err(Control::Error);
-                }
-            }
-            // An owned scalar was decoded when it was built: a slice materializes
-            // its elements, so an undecodable one raised there, before the walk.
-            PathNode::Owned(value)
-                if !matches!(**value, OwnedValue::Array(_) | OwnedValue::Object(_)) =>
-            {
-                return Ok(());
-            }
-            PathNode::Owned(_) | PathNode::Absent => {}
-        }
+    // the error iterating it raises, so a leaf spares the `Cannot iterate`
+    // message the step would format and this boundary would drop (see
+    // [`swallowed_path_leaf`]). Most nodes are leaves: this is every
+    // `.. | path`/`key`/`parent`, whose `..` steps each node through `.[]?`, and
+    // a user-written `.[]? | path`.
+    if let Some(settled) = swallowed_path_leaf::<S, V>(body, catch, &pos.node) {
+        return settled.map_err(Control::Error);
     }
     let mut branch = Vec::new();
     let stepped = path_context_step_generic::<S, V>(body, pos, &mut branch);
