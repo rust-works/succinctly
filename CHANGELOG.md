@@ -649,8 +649,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`slice_witnesses_node` now looks through the `?` wrapper a branch carries). Every row in
   `test_postfix_optional_bind_source_gets_a_marker_3519` is captured from jq 1.7.1, and the bind-origin
   oracle sweep and fuzzer both gained `?`-source rows. One class moves the other way, in the refusing
-  direction: a `?` source now shares the plain spelling's refusal under a `try` that catches a near-access
-  error after a construction (#3732), where it used to agree only because it bound by value.
+  direction: a `?` source now shares the plain spelling's refusal when a `try` or a `?` group catches a
+  near-access error after the register was lost, a construction or a `reduce` (#3732), where it used to agree
+  only because it bound by value.
 
 - **jq/yq: `recurse(.[]?)` visits every node instead of stopping silently at 10,000** (#3703). jq defines
   `def recurse: recurse(.[]?);`, so the explicit spelling is bare `recurse`, a walk bounded by the tree it

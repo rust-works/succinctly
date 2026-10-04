@@ -103,10 +103,10 @@ suspended (`subexp_nest > 0` in the real interpreter), so the source itself neve
 register (`path(.a as $y \| .b)` is `["b"]`, not an error) and never raises a path error of
 its own. The witness therefore runs only where it is provably the same computation as value
 evaluation, on a **closed pure-navigation grammar** (`is_pure_navigation`: `.`, `.a`, `.[n]`,
-a slice, `.[]`, `..`/`recurse`, `getpath` of a literal, pipes and commas of those, a literal,
+a slice, `.[]`, a postfix `?` on one of those steps (#3519), `..`/`recurse`, `getpath` of a literal, pipes and commas of those, a literal,
 `error`), against a tracked value at a known position, and only when `$var` can reach a
 position the resolver dispatches on in the body (`var_reaches_path_position`). Anything else
-— `try`, `?`, `//`, `select`, `if`, `first`, a construction, a builtin — binds by value with
+— `try`, a `?` over a group, `//`, `select`, `if`, `first`, a construction, a builtin — binds by value with
 no origin, exactly as before. On that grammar the resolver's own refusal (a slice of a
 non-array, or navigation of a literal) always escapes, and the fallback re-runs the source by
 value with nothing to repeat; any other escape (a genuine `error`/`halt`) keeps the

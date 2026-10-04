@@ -1422,11 +1422,12 @@ is the revert that established what the other one costs.
    still resolves against the arm's own ambient value, trackability and frame, exactly as
    before #2042. The witness therefore runs only where it is provably the same computation
    as value evaluation: for a source on the closed pure-navigation grammar
-   (`is_pure_navigation` — `.`, `.a`, `.[n]`, a slice, `.[]`, `..`/`recurse`, `getpath` of a
+   (`is_pure_navigation` — `.`, `.a`, `.[n]`, a slice, `.[]`, a postfix `?` on one of those
+   steps (`.a?`, `.[]?`, #3519), `..`/`recurse`, `getpath` of a
    literal, pipes and commas of those, a literal, `error`), and only when `$var` can reach a
    position the resolver dispatches on in the body (`var_reaches_path_position`; a `$y` used
    only inside `select(..)`, an `if` condition or an operand gains nothing from an origin).
-   Any other source — `try`, `?`, `//`, `select`, `if`, `first`, a construction, a builtin —
+   Any other source — `try`, a `?` over a group, `//`, `select`, `if`, `first`, a construction, a builtin —
    binds by value with no origin, exactly as before #2042. The first cut ran the witness on
    every source and relied on its refusal escaping to a value-mode fallback; the review
    showed that a `try`/`?`/`//` *inside* the source caught that refusal (jq never raises it)
@@ -1455,7 +1456,7 @@ is the revert that established what the other one costs.
    answers `["c"]` on both
    ([#3136](https://github.com/rust-works/succinctly/issues/3136)).
 
-   Eight rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
+   Nine rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
    (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
 
    #3049 moved `path(.a as $y | .a | tojson | fromjson | $y)` to the accepting
@@ -1474,10 +1475,12 @@ is the revert that established what the other one costs.
    `?` after a construction (`([$q] \| .[0]?) as $y`) still binds by value.
 
    One consequence is recorded as [#3732](https://github.com/rust-works/succinctly/issues/3732): a `?` source now
-   behaves like the plain spelling under a `try` that catches a near-access refusal after a construction
-   (`path(.a as $v \| {k: .a} \| ($v \| select(true)) \| try ($v \| .b?))` refuses where jq's `try` answers), which the
-   `?` spelling used to match only because it bound by value. Three programs in about 75,000 fuzzed against the
-   pre-change binary, each with a plain twin that already refused on `main`, and none in a 21,600-case grid.
+   behaves like the plain spelling when a `try` or a `?` group catches a near-access refusal after the register was
+   lost (a construction, a `reduce`). `path(.a as $v \| {k: .a} \| ($v \| select(true)) \| try ($v \| .b?))` and
+   `... \| (($v \| .b)?)` both refuse where jq's own `try` answers, which the `?` spelling used to match only because it
+   bound by value. The exposure depends on the program's shape: four programs in about 93,000 fuzzed against the
+   pre-change binary, between one in 12,000 and one in 18,000 of those drawn from `?` sources alone, and none in a
+   21,600-case grid. Each has a plain twin that already refused on `main`.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1486,6 +1489,7 @@ is the revert that established what the other one costs.
    | `path((.a \| select(.b)) as $y \| .a \| $y)`             | `["a"]`                     | the witness grammar is pure navigation; a `select`-wrapped source binds by value                                                                                                                                          |
    | `path((.a // 1) as $y \| .a \| $y)`                      | `["a"]`                     | same: a `//` source binds by value                                                                                                                                                                                        |
    | `path((if .a then .a else .b end) as $y \| .a \| $y)`    | `["a"]`                     | same: an `if` source binds by value                                                                                                                                                                                       |
+   | `path(.a as $q \| ([$q] \| .[0]?) as $y \| .a \| $y)`    | `["a"]`                     | a `?` after a construction: the resolver refuses the navigation of the rebuilt value and the `?` lets that refusal through to the by-value fallback, which binds a plain value (#3519)                                    |
    | `path(.a[0:3] as $y \| .a \| $y)` on `{"a":[1,2,3]}`     | `["a"]`                     | jq's full slice *is* the array; the bind path ends in a slice component and `.a` does not                                                                                                                                 |
    | `path(.a as $y \| (.c \| $y \| .b) as $w \| .a.b \| $w)` | `["a","b"]`                 | a marker is re-rooted only at the head of a source (`$y.b as $w`, `(($y \| .b) \| .c) as $w`); elsewhere it is certified against the ambient position                                                                     |
    | `path(.a as $y \| .a \| 5 \| reduce (1) as $i (0; $y))`  | `["a"]`                     | after a literal the register is only *carried*, and a fold whose INIT is untracked seeds its own register from the ambient literal — pre-existing: `path(. as $x \| 5 \| reduce (1) as $i (0; $x))` refuses too (jq `[]`) |
