@@ -42574,8 +42574,9 @@ type BindSourceWitness = (Vec<(OwnedValue, Option<Origin>)>, Option<Control>);
 ///   the origin could never be consulted;
 /// - only for a source on the closed pure-navigation grammar
 ///   ([`is_pure_navigation`]), against a tracked value at a known
-///   position; anything else -- `try`, `?`, `//`, `select`, a construction,
-///   a builtin -- binds by value, with no origin, exactly as before #2042.
+///   position; anything else -- `try`, a `?` over a group, `//`, `select`, a
+///   construction, a builtin -- binds by value, with no origin, exactly as
+///   before #2042. (A postfix `?` on a navigation step is navigation, #3519.)
 ///   On that grammar the resolver's one refusal is a slice of a non-array
 ///   (`.a[1:2]` on a string, which jq allows), and the `None` it answers
 ///   re-runs the source by value with nothing to repeat; any other escape keeps
@@ -43425,10 +43426,12 @@ fn apply_pattern_bindings(expr: &Expr, bindings: &[PatternBinding]) -> Expr {
 /// tracking suspended, so the witness is only sound where the resolver can
 /// neither raise, catch, nor repeat anything value evaluation would not:
 ///
-/// - a `try`/`?`/`//` inside the source would *catch* the resolver's own
-///   untracked-navigation refusal (an artefact jq never raises) and bind
-///   the handler's value: `del(([1] | try .[0] catch "c") as $y |
-///   .[$y|tostring])` deleted key `"c"` where jq deletes `"1"`;
+/// - a `try`/`//`, or a `?` over anything but a single navigation step
+///   (`(.a | .b)?` is `try`; `.a?` is not, see
+///   [`is_postfix_optional_navigation`]), inside the source would *catch* the
+///   resolver's own untracked-navigation refusal (an artefact jq never
+///   raises) and bind the handler's value: `del(([1] | try .[0] catch "c") as
+///   $y | .[$y|tostring])` deleted key `"c"` where jq deletes `"1"`;
 /// - `getpath`/`recurse`/`..` on a constructed value raise the resolver's
 ///   *other* refusal kind, which no fallback classified, so `path(([1] | ..)
 ///   as $y | .)` errored where jq prints `[]`;
@@ -43468,6 +43471,22 @@ fn is_pure_navigation_node(e: &Expr) -> bool {
                 | Expr::Array(_)
                 | Expr::Error(_)
         )
+        || is_postfix_optional_navigation(e)
+}
+
+/// A postfix `?` directly on a navigation step (`.a?`, `.[0]?`, `.[]?`,
+/// `.[1:]?`): jq's `INDEX_OPT`/`EACH_OPT`, not `try` (#3519). Unlike `try`, it
+/// covers a *type* error only, never a path error, and the resolver's `?` arm
+/// keeps the same line -- [`resolve_optional_sink`] lets a bare primitive's
+/// untracked-navigation refusal escape, and `invalid_path_expression` survives
+/// every `?`. So it cannot catch the resolver's own refusal, which is what keeps
+/// the rest of the witness grammar closed: the refusal still reaches
+/// [`resolve_bind_source_in`]'s fallback and a by-value re-run with nothing to
+/// repeat. A `?` on a group (`(.a)?`, `(.a | .b)?`) *is* `try` and stays out.
+/// The operand's own nodes are vetted by the same walk, so `.[f]?` is admitted
+/// only for a literal key ([`is_constant_key_navigation`]).
+fn is_postfix_optional_navigation(e: &Expr) -> bool {
+    matches!(e, Expr::Optional(inner) if is_postfix_optional_primitive(inner))
 }
 
 /// The navigation-shaped node kinds [`classify_navigation`] looks for,
@@ -43628,8 +43647,16 @@ fn marker_headed(source: &Expr) -> Option<(&Rc<Tracked>, Vec<Expr>)> {
 /// while `.a[1:1]`, `.a[5:9]` and a string's `.a[1:2]` all refuse. A path
 /// ending in a slice therefore witnesses a node only for a non-empty array
 /// (`null` needs no origin -- it is admitted by value everywhere).
+///
+/// A branch resolved under a postfix `?` ends in `Optional(Slice)`, not `Slice`
+/// (#3519: `.a[1:2]? as $y` is a bind source now), so the wrapper is looked
+/// through; without that a string's `?`-sliced copy would mint a marker and a
+/// later `.a[1:2]` would be certified as the node jq calls a fresh string.
 fn slice_witnesses_node(path: &PathPrefix, value: &OwnedValue) -> bool {
-    match path.last() {
+    match path
+        .last()
+        .map(|component| unwrap_path_component(component).0)
+    {
         Some(Expr::Slice { .. } | Expr::SliceExpr { .. }) => slice_is_same_array(value),
         _ => true,
     }
@@ -115337,6 +115364,15 @@ mod tests {
                 "path(.a as $y | .a | $y)",
                 r#"[["a"]]"#,
             ),
+            // optional-source-spelling, refuse-only until #3519: a postfix `?`
+            // on a navigation step is `INDEX_OPT`, which never catches the
+            // resolver's own refusal, so the bind source stays on the witness
+            // grammar and `$y` gets its marker
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a? as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
             // def-body-in-path, refuse-only until #3297: `resolve_node_sink`
             // had no `Expr::FuncDef` arm at all, so a `def` declared inside
             // `path(...)` fell to the eager value fallback regardless of
@@ -115805,8 +115841,19 @@ mod tests {
                 "path(.a as $y | ([$y] | .[0]) as $z | .a | $z)",
                 r#"[["a"]]"#,
             ),
+            // A `?` on a step *after* a construction is still refused by the
+            // resolver, which is exactly what keeps `?` from catching it:
+            // #3519 admits a postfix `?` into the witness grammar only because
+            // it lets that refusal through to the by-value fallback.
+            // optional-source-over-construction
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $q | ([$q] | .[0]?) as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
             // The witness grammar is pure navigation (#2042 review), so a
-            // source wrapped in `select`/`//`/`if`/`?` binds by value.
+            // source wrapped in `select`/`//`/`if` binds by value. (A postfix
+            // `?` on a navigation step is navigation, #3519.)
             // select-wrapped-source
             (
                 br#"{"a":{"b":1}}"#,
@@ -115823,14 +115870,6 @@ mod tests {
             (
                 br#"{"a":{"b":1}}"#,
                 "path((if .a then .a else .b end) as $y | .a | $y)",
-                r#"[["a"]]"#,
-            ),
-            // optional-source-spelling (a `?` on the bind *source* is outside
-            // the witness grammar, so it binds by value; a `?` on a later
-            // step agrees since #3464)
-            (
-                br#"{"a":{"b":1}}"#,
-                "path(.a? as $y | .a | $y)",
                 r#"[["a"]]"#,
             ),
             // full-slice-is-the-array (jq's `.a[0:3]` of a 3-array is `.a`)
@@ -116896,6 +116935,10 @@ mod tests {
         let one = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
         let nested_empty = OwnedValue::array_from(vec![OwnedValue::array()]);
         let slice_path = PathPrefix::extend(&PathPrefix::root(), Expr::slice(None, None));
+        let optional_slice_path = PathPrefix::extend(
+            &PathPrefix::root(),
+            Expr::Optional(Box::new(Expr::slice(None, None))),
+        );
         let field_path = PathPrefix::extend(&PathPrefix::root(), Expr::Field("a".to_string()));
         for (value, same) in [
             (&empty, false),
@@ -116908,6 +116951,12 @@ mod tests {
         ] {
             assert_eq!(slice_is_same_array(value), same, "{value:?}");
             assert_eq!(slice_witnesses_node(&slice_path, value), same, "{value:?}");
+            // #3519: the same rule through a postfix `?` on the slice.
+            assert_eq!(
+                slice_witnesses_node(&optional_slice_path, value),
+                same,
+                "{value:?}"
+            );
             // A non-slice position names its node whatever the value is.
             assert!(slice_witnesses_node(&field_path, value), "{value:?}");
             // Only an empty *array* needs a position in `certifies_value`.
