@@ -496,6 +496,58 @@ fn the_owned_streaming_route_saves_the_message_3689() {
     }
 }
 
+/// #3722: `path(f)`'s own `?` arms (`path_walk_generic`'s and
+/// `path_step_generic`'s) settle a scalar like the boundaries do. A scalar's
+/// `.[]?` reaches nothing, so each query costs what `path(.)` does for the same
+/// members, and no more. The escape allowance is the walks' (a leaf check
+/// decodes a string twice).
+#[test]
+fn a_swallowed_iteration_inside_path_f_allocates_no_more_than_its_twin_3722() {
+    for Fixture {
+        name,
+        json,
+        walk_allowance,
+        ..
+    } in fixtures()
+    {
+        let (twin, answered) = allocations_collecting("[.[] | path(.)] | length", &json);
+        assert_eq!(answered, N as i64, "{name}: the twin's answer");
+        assert_counting(name, ("[.[] | path(.)] | length", twin));
+
+        for query in [
+            // `path_walk_generic`'s own arm.
+            "[.[] | path(.[]?)] | length",
+            "[.[] | path(.[]?, .[]?)] | length",
+            // `path_step_generic`'s: the `?` is a stage of a pipe.
+            "[.[] | path(.[]? | .a)] | length",
+            "[.[] | path((.[]?) | .[]?)] | length",
+        ] {
+            let (swallowed, answered) = allocations_collecting(query, &json);
+            assert_eq!(answered, 0, "{name}: `{query}` reaches nothing");
+            assert_costs_like_twin(
+                name,
+                (query, swallowed),
+                ("[.[] | path(.)] | length", twin),
+                walk_allowance,
+            );
+        }
+
+        // Streamed: what `succinctly jq` drives.
+        let (twin, outputs) = allocations_streaming(".[] | path(.)", &json);
+        assert_eq!(outputs, N, "{name}: the streamed twin's outputs");
+        for query in [".[] | path(.[]?)", ".[] | path(.[]? | .a)"] {
+            let (swallowed, outputs) = allocations_streaming(query, &json);
+            assert_eq!(outputs, 0, "{name}: `{query}` reaches nothing");
+            assert_costs_like_twin(
+                name,
+                (query, swallowed),
+                (".[] | path(.)", twin),
+                walk_allowance,
+            );
+        }
+    }
+}
+
 /// The counter can fail: a handler that reads the payload still has to see the
 /// `Cannot iterate` message, so `catch .` must keep paying for it. If this
 /// stopped holding, the proportion above could be passing because nothing was

@@ -93829,3 +93829,78 @@ fn test_swallowed_scalar_iteration_answers_what_it_did_3689() -> Result<()> {
         ),
     ])
 }
+
+/// #3722: a `?` over a bare `.[]` inside `path(f)` still answers what it did,
+/// now without building the `Cannot iterate` error it drops.
+///
+/// `path_walk_generic` and `path_step_generic` have their own `Expr::Optional`
+/// arms, which ran the step over a scalar and dropped the message it raised. A
+/// scalar now settles in `swallowed_path_leaf`, the helper the path-context
+/// walk shares (#3689): nothing is reached below it, or the failure `?` never
+/// swallows -- an undecodable string, a scalar the cursor cannot read -- escapes
+/// as the step raised it, and the walk stays lazy (a consumer that stops first
+/// never steps the leaf).
+///
+/// The valid-JSON rows are jq 1.7.1's own, where `path(f)` is real jq. The rest,
+/// which jq cannot read, were captured from the binary built from the parent
+/// commit and are identical on this one.
+#[test]
+fn test_path_f_swallowed_scalar_iteration_answers_what_it_did_3722() -> Result<()> {
+    const MIXED: &str = r#"[1,"a",null,true,[2],{"k":3}]"#;
+    assert_path_rows_3289(&[
+        // The root is a container, so its members are listed; none is stepped.
+        (MIXED, "[path(.[]?)]", "[[0],[1],[2],[3],[4],[5]]\n", "", 0),
+        (MIXED, "[path(.[]?)] | length", "6\n", "", 0),
+        // Each member is a scalar (nothing below it) or a container (listed).
+        (MIXED, "[.[] | path(.[]?)]", "[[0],[\"k\"]]\n", "", 0),
+        (
+            MIXED,
+            "[.[] | path(.[]?, .[]?)]",
+            "[[0],[0],[\"k\"],[\"k\"]]\n",
+            "",
+            0,
+        ),
+        (
+            MIXED,
+            "[.[] | path((.[]?, .))]",
+            "[[],[],[],[],[0],[],[\"k\"],[]]\n",
+            "",
+            0,
+        ),
+        // `path_step_generic`'s arm: the `?` is a stage of a pipe.
+        (MIXED, "[path(.[]? | .[]?)]", "[[4,0],[5,\"k\"]]\n", "", 0),
+        (MIXED, "[.[] | path(.[]? | .a?)]", "[]\n", "", 0),
+        (MIXED, "[limit(2; path(.[]?))]", "[[0],[1]]\n", "", 0),
+        (r#""abc""#, "[path(.[]?)]", "[]\n", "", 0),
+        (r#""abc""#, "[path((.[]?, .))]", "[[]]\n", "", 0),
+        // The walk lists the root's members without stepping them, so a bad
+        // scalar among them is not met by the root's own `.[]?`...
+        (r#"["\ud800"]"#, "[path(.[]?)]", "[[0]]\n", "", 0),
+        (r#"["\ud800"]"#, "[limit(1; path(.[]?))]", "[[0]]\n", "", 0),
+        ("[1.2.3,[4]]", "[limit(1; path(.[]?))]", "[[0]]\n", "", 0),
+    ])?;
+
+    // ...but the next level steps it, and what `?` never swallows escapes.
+    for (doc, fragment) in [
+        (r#"["\ud800"]"#, "invalid unicode escape sequence"),
+        ("[1.2.3,[4]]", "invalid numeric literal"),
+        ("[tru]", "invalid boolean"),
+        // The malformed array is a member, so the boundary has to pass it on.
+        ("[[1,2,]]", "Invalid JSON text"),
+    ] {
+        for filter in ["[.[] | path(.[]?)]", "[.[] | path(.[]? | .a?)]"] {
+            assert_path_rows_3289(&[(doc, filter, "", fragment, 5)])?;
+        }
+    }
+    // An undecodable string below a slice raises when the slice materializes it.
+    for filter in ["[.[1:] | path(.[]?)]", "[.[2:] | path(.[]?)]"] {
+        assert_path_rows_3289(&[(
+            r#"[1,"\ud800",[2]]"#,
+            filter,
+            "",
+            "invalid unicode escape sequence",
+            5,
+        )])?;
+    }
+    Ok(())
+}
