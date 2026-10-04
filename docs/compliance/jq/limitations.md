@@ -1187,8 +1187,12 @@ is the revert that established what the other one costs.
      `test_any_all_navigating_cond_states_the_register_it_left_3757`,
      `test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757` and the `_3763` rows, each clause failing a test
      when removed. The sweep (`scripts/jq-path-register-sweep.py`, `--operand` for each of the any/all/isempty
-     operands, against a build of `main` without #3757) went from `ACCEPT_WRONG` rows to none, with no regression
-     and no `DIFF`; the counts move with the grid, so rerun rather than compare. One shape still refuses where jq
+     operands, against a build of `main` without #3757) went from `ACCEPT_WRONG` rows to none; the counts move with
+     the grid, so rerun rather than compare. It is not regression-free: where the producer cannot say whether an
+     untracked generator element is jq's register, the arm now refuses where `main` happened to match, all in the safe
+     direction. A `?//` inside `gen` that retries after a failed alternative supersedes the escape the abandoned
+     alternative stashed (the `and`/`or`/negate arms' rule, #3293), pinned by
+     `test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757`. One shape still refuses where jq
      answers, pinned (`test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`): a plain pipe stage does not read
      the backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any | $x)` on
      `{"a":false,"b":null}` is `[]` in jq and refuses here, and so does `isempty(g)` as a `cond`

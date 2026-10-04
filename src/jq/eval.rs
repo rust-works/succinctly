@@ -40388,6 +40388,11 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
 ///
 /// yq mode keeps the by-value route (ADR-0018: no oracle).
 ///
+/// A `?//` inside `gen` can retry after a failed alternative and resolve a
+/// later one, so an escape a branch stashed before the retry is superseded by
+/// it, as in the `and`/`or`/negate arms (#3293): both slots are cleared on each
+/// branch and checked against the retry generation after the drive.
+///
 /// The result is a computed boolean, but jq's register is not where this
 /// entered, and `path()` accepts a result that is `jv_identical` to it. A
 /// decisive output is emitted from inside `gen | cond`, so the register is

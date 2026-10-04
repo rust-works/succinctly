@@ -703,8 +703,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `try` for `del((try (all(ltrimstr("x"); .[0]))), .[0])` on `[true]` and panicked a debug build for `any(input_line_number; .a)`; both are pinned.
   One shape still refuses where jq answers, pinned: a plain pipe stage that drops the any/all/isempty verdict, which also hides `isempty(g)`
   used as a `cond` (#3758). Against a build of `main` without this change, the sweep's any/all/isempty operands (`--operand` for each; the
-  counts move with the grid, so rerun rather than compare) went from `ACCEPT_WRONG` rows to none, with no regression and no `DIFF`.
+  counts move with the grid, so rerun rather than compare) went from `ACCEPT_WRONG` rows to none. It is not regression-free: where the producer
+  cannot say whether an untracked generator element is jq's register (an opaque or pass-through generator, or a computed string or container
+  equal to it) the arm now refuses where `main` happened to match, all in the safe direction; the `DIFF` rows left are `true or <operand>`
+  inside a `foreach` update, identical on `main`. A `?//` inside `gen` that retries after a failed alternative now supersedes the escape the
+  abandoned alternative stashed (it raised the first alternative's error where jq answers, `path(any((.[0] | length) as $p ?// $q | if $p != null
+  then $p else .[0] end; .a))` on `[{"a":true}]` exiting 5 for `[0,"a"]`, on both routes and on `main` too); the retry rule is the `and`/`or`/negate
+  arms' (#3293).
   Pinned by `test_any_all_navigating_cond_states_the_register_it_left_3757`,
+  `test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757`,
   `test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757` and `test_any_all_live_cond_is_jq_mode_only_3757` (the yq entry, since the
   CLI's yq routes never reach the arm); each clause of the live route, the decisive and undecided registers, the escape, the jq-mode gate and
   the vouched-register rule fails a test when removed. The sweep gained operands for the live route and for pass-through and opaque generators.
