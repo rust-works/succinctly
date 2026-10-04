@@ -60672,11 +60672,18 @@ fn test_any_all_navigating_cond_states_the_register_it_left_3757() -> Result<()>
 /// `true` and `false` is equality, so a computed `true` over a `true` register *is*
 /// the register and `cond` navigates it with no path error (`any(true; .[0]?)`
 /// raises only the type error its `?` catches); over any other register it raises.
-/// The last six run it as an `and` right operand, on an untracked entry whose
-/// carried register the element may equal by kind: neither a live stage nor a
-/// position is available there, so it runs by value with no register stated,
-/// as it did before #3757, and a swallowed path error no longer turns a refusal
-/// into a silent no-op.
+/// The next six run it as an `and` right operand, on an untracked entry whose
+/// carried register the element may equal by kind: its identity is not known
+/// and neither is the register's position, so an ambiguous element refuses as
+/// an uncatchable guess (jq exits 5 on every one; `del(try (.a and any(true;
+/// .[0]?)))` on `{"a":1}` is the exact case, where the carried register is
+/// known to differ, and answers the document as jq does). The last eleven are
+/// the second review's: a pass-through generator (`ltrimstr("x")` on a
+/// non-string, `tostring` on a string) can hand back the very value jq holds as
+/// its register, so a live stage would raise a path error jq never raises and
+/// an enclosing `try` would swallow it; and an `input_line_number`, `now`,
+/// `env` or `input_filename` generator carries no register state at all, which
+/// used to trip the stage's entry assertion in a debug build.
 #[test]
 fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -60932,16 +60939,79 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
             0,
         ),
         (
-            r#"{"a":true}"#,
-            r#"del(.a and any(true; select(.) | error("boom")))"#,
+            r"[true]",
+            r#"del((try (all(ltrimstr("x"); .[0]))), .[0])"#,
             "",
-            "boom",
+            "Invalid path expression",
             5,
         ),
         (
-            r#"{"a":true}"#,
-            r#"try del(.a and any(true; select(.) | error("boom"))) catch ."#,
-            "\"boom\"\n",
+            r#"{"a":"x"}"#,
+            r"del((try (any(.a | tostring; .[0]?))), .a)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r"path(any(input_line_number; .a))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r"path(any(now; .a))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r"path(all(input_line_number; .a))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r"path(any(env; .a))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r"path(any(input_filename; .a))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r#"path(any(ltrimstr("x"); .a))"#,
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(foreach .a? as $k (0; any(true, false; .[0]?) or (.a)?; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"del(foreach .[]? as $k (.; all(null, false; .a?) or (.a | .b)?; .b?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(try (.a and any(true; .[0]?)))",
+            "{\"a\":1}\n",
             "",
             0,
         ),
@@ -60953,11 +61023,12 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
 /// `any`/`all`/`isempty` state, so a frozen `$x` after one that decided or did
 /// not refuses where jq answers `[]`, and so does `isempty(g)` as a `cond`
 /// (`any(.[]; isempty(empty))` is `[0]`) -- the same stage gap, #3758. And a
-/// computed `true` that decides under a navigating `cond` on an untracked entry
-/// (`.a and any(true; select(.))`, an `and` right operand) runs by value with no
-/// register stated, because its identity with the carried register is not
-/// known, so jq's `["a"]` is refused loudly. Pinned on both routes so lifting
-/// any is a deliberate change; the jq answers are in each row.
+/// computed `true` that decides under a `cond` on an untracked entry
+/// (`.a and any(true; select(.))`, an `and` right operand) is ambiguous -- it
+/// may be the carried register, whose position is not known -- so jq's `["a"]`
+/// is refused as an uncatchable guess, and so is a `cond` that raises there
+/// (`try ... catch .` would answer `"boom"` in jq). Pinned on both routes so
+/// lifting any is a deliberate change; the jq answers are in each row.
 #[test]
 fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
     for (input, filter, jq_answer, expected) in [
@@ -61001,6 +61072,12 @@ fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
             r#"{"a":true}"#,
             r"del(.a and any(true; select(.)))",
             "{}",
+            "Invalid path expression with result true",
+        ),
+        (
+            r#"{"a":true}"#,
+            r#"try del(.a and any(true; select(.) | error("boom"))) catch ."#,
+            r#""boom""#,
             "Invalid path expression with result true",
         ),
     ] {
