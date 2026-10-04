@@ -43653,10 +43653,7 @@ fn marker_headed(source: &Expr) -> Option<(&Rc<Tracked>, Vec<Expr>)> {
 /// through; without that a string's `?`-sliced copy would mint a marker and a
 /// later `.a[1:2]` would be certified as the node jq calls a fresh string.
 fn slice_witnesses_node(path: &PathPrefix, value: &OwnedValue) -> bool {
-    match path
-        .last()
-        .map(|component| unwrap_path_component(component).0)
-    {
+    match path.last().map(strip_optional) {
         Some(Expr::Slice { .. } | Expr::SliceExpr { .. }) => slice_is_same_array(value),
         _ => true,
     }
@@ -115850,6 +115847,22 @@ mod tests {
                 br#"{"a":{"b":1}}"#,
                 "path(.a as $q | ([$q] | .[0]?) as $y | .a | $y)",
                 r#"[["a"]]"#,
+            ),
+            // A computed key under `?` is admitted by `is_postfix_optional_primitive`
+            // but not by the grammar's literal-key gate
+            // (`is_constant_key_navigation`), so it binds by value: loosening
+            // that gate would flip these two to answers.
+            // optional-source-computed-key
+            (
+                br#"{"x":[1,2],"i":1}"#,
+                "path(.x[.i]? as $y | .x[1] | $y)",
+                r#"[["x",1]]"#,
+            ),
+            // optional-source-computed-slice
+            (
+                br#"{"x":[1,2],"i":1}"#,
+                "path(.x[.i:]? as $y | .x[1:] | $y)",
+                r#"[["x",{"start":1,"end":null}]]"#,
             ),
             // The witness grammar is pure navigation (#2042 review), so a
             // source wrapped in `select`/`//`/`if` binds by value. (A postfix

@@ -613,7 +613,7 @@ OPTIONAL_SOURCES = [
     (".a.b?", False), (".x.b?", False), (".a?.b?", False), (".arr[0]?", False),
     (".arr[]?", False), (".arr[-1]?", False), (".arr[0:1]?", False), (".arr[1:]?", False),
     (".a[0:1]?", False), (".a[1:2]?", False), (".a[0:3]?", False), (".arr[0]?.b?", False),
-    (".d?.zz?", False), (".[]?", False), ("(.x | .a?)", False), ("(.arr | .[0]?)", False),
+    (".d?.zz?", False), (".[]?", False), (".arr[.d]?", False), (".arr[.d:]?", False), ("(.x | .a?)", False), ("(.arr | .[0]?)", False),
     ("(.a | .b?)", False), ("(.a | [.] | .[0]?)", False), ("(.a | tostring | .[0:1]?)", False),
     ("([.a] | .[0]?)", False), ("(.a | select(.b?) | .b?)", False),
     ("$p.b?", True), ("$p[0]?", True), ("($p | .b?)", True), ("($p | .[]?)", True),
