@@ -317,15 +317,21 @@ OPERANDS = [
     "first(numbers)",
     # (#3653 review) a `last`/`select` whose output *is* the register: `.` and, in
     # the contexts that bind it, `$x`. `select` hands its input through as the
-    # very value it received, so the register keeps its identity; `last(f)`
-    # returns a copy, so `last(.)`/`last($x)` lose it (a defect older than
-    # #3653, #3643's arm). A context that does not bind `$x` makes both sides
-    # fail to compile, which is a MATCH.
+    # very value it received, so the register keeps its identity; `last(f)`'s
+    # result is the very value `f` last emitted, so `last(.)`/`last($x)` keep it
+    # too (#3766 fixed what #3643's arm lost). A context that does not bind `$x`
+    # makes both sides fail to compile, which is a MATCH.
     "last(.)",
     "last($x)",
     "try last($x)",
     "last($x)?",
     "first(last($x))",
+    # (#3766) which of a generator's outputs is the register: only the last one
+    # decides, and only when it is the entry node itself.
+    "last(.a, .)",
+    "last(., .a)",
+    "last(first(.))",
+    "last(select(true))",
     "select($x)",
     "try select($x)",
     "numbers",
