@@ -61017,7 +61017,7 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
         ),
         (
             r#"{"a":true}"#,
-            r#"del(try (.a and any(2; .a?)))"#,
+            r"del(try (.a and any(2; .a?)))",
             "{\"a\":true}\n",
             "",
             0,
@@ -61092,7 +61092,7 @@ fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
         ),
         (
             r#"{"a":true}"#,
-            r#"del(try (.a and any(first(2, 3); .a?)))"#,
+            r"del(try (.a and any(first(2, 3); .a?)))",
             r#"{"a":true}"#,
             "Invalid path expression with result 2",
         ),
