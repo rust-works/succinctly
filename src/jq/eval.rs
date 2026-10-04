@@ -8170,6 +8170,46 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             },
             Item::Owned(o) => o,
         };
+        // #3520: a target that can fan out is pulled one output at a time --
+        // see `eval_generic::process_index_key`.
+        if S::TAG == EvalTag::Jq && !yields_at_most_one_value(target) {
+            let mut own_escape: Option<Control> = None;
+            let mut stopped = false;
+            let target_flow = eval_each::<W, S>(target, value.clone(), false, &mut |t_item| {
+                let t = match t_item.into_owned::<S>() {
+                    Ok(t) => t,
+                    Err(err) => {
+                        own_escape = Some(Control::Error(err));
+                        return Demand::Stop;
+                    }
+                };
+                match index_one_owned::<S>(&t, &k, optional) {
+                    Ok(Some(v)) => {
+                        if sink(Item::Owned(v)) == Demand::Stop {
+                            stopped = true;
+                            return Demand::Stop;
+                        }
+                        Demand::Continue
+                    }
+                    Ok(None) => Demand::Continue,
+                    Err(err) => {
+                        own_escape = Some(Control::Error(err));
+                        Demand::Stop
+                    }
+                }
+            });
+            if stopped {
+                return Demand::Stop;
+            }
+            if let Some(control) = own_escape {
+                return escape.stop(control);
+            }
+            return match target_flow {
+                Flow::Exhausted => Demand::Continue,
+                Flow::Stopped { .. } => Demand::Stop,
+                Flow::Escaped(control) => escape.stop(control),
+            };
+        }
         let literal_key = owned_to_expr(&k);
         let one_key_result = eval_index_expr::<W, S>(target, &literal_key, value.clone(), optional);
         match drain_result(one_key_result, sink) {
@@ -25835,6 +25875,19 @@ fn each_slice_expr<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let mut end_sink = |e: ComputedSliceBound| -> Demand {
             // #3293: likewise for a retry inside `end`.
             stash.begin();
+            // #3520: a target that can fan out is pulled one output at a
+            // time -- see `eval_generic::each_slice_expr_generic`.
+            if S::TAG == EvalTag::Jq && !yields_at_most_one_value(target) {
+                let (escape, stopped) =
+                    slice_pair_streaming::<W, S>(target, &s, &e, value.clone(), optional, sink);
+                if stopped {
+                    return Demand::Stop;
+                }
+                return match escape {
+                    Some(control) => stash.stop(control),
+                    None => Demand::Continue,
+                };
+            }
             let (slices, escape) = slice_pair::<W, S>(target, &s, &e, value.clone(), optional);
             // #3471: the pair's slices go to the consumer first. A stop here
             // is the consumer's own (no stash), and the pair's escape -- which
@@ -25879,6 +25932,49 @@ fn each_slice_expr<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1528: otherwise `start`'s own trailing escape (or the consumer's stop)
     // is the verdict; `end`'s own escape is handled per-`s` above (#2225).
     stash.resume(flow, start.as_deref().is_some_and(direct_pattern_retry))
+}
+
+/// [`slice_pair`] for a target that can fan out, in jq mode (#3520): each
+/// target output is sliced and handed to `sink` as it is produced, so a stop
+/// ends the target's own generator. Returns the control that ended the pair,
+/// if any, and whether the consumer stopped.
+fn slice_pair_streaming<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    target: &Expr,
+    s: &ComputedSliceBound,
+    e: &ComputedSliceBound,
+    value: StandardJson<'_, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> (Option<Control>, bool) {
+    let mut escape: Option<Control> = None;
+    let mut stopped = false;
+    let flow = eval_each::<W, S>(target, value, false, &mut |item| {
+        let t = match item.into_owned::<S>() {
+            Ok(t) => t,
+            Err(err) => {
+                escape = Some(Control::Error(err));
+                return Demand::Stop;
+            }
+        };
+        match slice_owned_value_read_computed::<S>(&t, s, e, optional) {
+            Ok(Some(v)) => {
+                if sink(v) == Demand::Stop {
+                    stopped = true;
+                    return Demand::Stop;
+                }
+                Demand::Continue
+            }
+            Ok(None) => Demand::Continue,
+            Err(err) => {
+                escape = Some(Control::Error(err));
+                Demand::Stop
+            }
+        }
+    });
+    if let (None, false, Flow::Escaped(control)) = (&escape, stopped, flow) {
+        escape = Some(control);
+    }
+    (escape, stopped)
 }
 
 /// One `(s, e)` pair's worth of [`each_slice_expr`]'s work: evaluate `target`
@@ -28987,7 +29083,7 @@ fn resolves_to_at_most_one_path(expr: &Expr) -> bool {
 ///   `update` still yields one), but its `?//` pattern alternatives are a
 ///   second fan-out axis with its own retry rule. Neither shape appears in a
 ///   key position in practice, so both stream.
-fn yields_at_most_one_value(expr: &Expr) -> bool {
+pub(crate) fn yields_at_most_one_value(expr: &Expr) -> bool {
     match expr {
         // Leaves: no sub-expression to fan out.
         Expr::Literal(_)

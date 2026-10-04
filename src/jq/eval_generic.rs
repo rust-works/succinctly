@@ -14685,6 +14685,58 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
     escape: &StashedEscape,
 ) -> bool {
+    // #3520: a target that can fan out is pulled one output at a time, so a
+    // consumer that stops after its first output never runs the target's
+    // later ones (jq's `E as $t`). An error on one output comes after the
+    // outputs before it, as in jq.
+    if S::TAG == EvalTag::Jq && !crate::jq::eval::yields_at_most_one_value(target) {
+        let mut own_escape: Option<Control> = None;
+        let mut stopped = false;
+        let flow = eval_each_generic::<S, V>(
+            target,
+            value,
+            false,
+            cursor,
+            &mut MaterializesLazyItems(|item: GenericItem<V>| {
+                let t = match generic_item_into_owned::<V, S>(item) {
+                    Ok(t) => t,
+                    Err(control) => {
+                        own_escape = Some(control);
+                        return Demand::Stop;
+                    }
+                };
+                match index_owned_checked::<S>(&t, k, optional) {
+                    Ok(Some(v)) => {
+                        if sink.push(GenericItem::Owned(v)) == Demand::Stop {
+                            stopped = true;
+                            return Demand::Stop;
+                        }
+                        Demand::Continue
+                    }
+                    Ok(None) => Demand::Continue,
+                    Err(e) => {
+                        own_escape = Some(Control::Error(e));
+                        Demand::Stop
+                    }
+                }
+            }),
+        );
+        if stopped {
+            return false;
+        }
+        if let Some(control) = own_escape {
+            escape.stop(control);
+            return false;
+        }
+        return match flow {
+            Flow::Exhausted => true,
+            Flow::Stopped { .. } => false,
+            Flow::Escaped(control) => {
+                escape.stop(control);
+                false
+            }
+        };
+    }
     let literal_key = owned_to_expr(k);
     let one_key_result = eval_index_expr::<S, V>(target, &literal_key, value, optional, cursor);
     match drain_result_generic(one_key_result, sink) {
@@ -18701,6 +18753,27 @@ fn each_slice_expr_generic<S: EvalSemantics, V: DocumentValue>(
         let mut end_sink = |e: ComputedSliceBound| -> Demand {
             // #3293: likewise for a retry inside `end`.
             stash.begin();
+            // #3520: a target that can fan out is pulled one output at a time,
+            // so a consumer that stops after its first slice never runs the
+            // target's later outputs (jq's `E as $t`).
+            if S::TAG == EvalTag::Jq && !crate::jq::eval::yields_at_most_one_value(target) {
+                let (escape, stopped) = slice_pair_streaming::<S, V>(
+                    target,
+                    &s,
+                    &e,
+                    value.clone(),
+                    optional,
+                    cursor,
+                    sink,
+                );
+                if stopped {
+                    return Demand::Stop;
+                }
+                return match escape {
+                    Some(control) => stash.stop(control),
+                    None => Demand::Continue,
+                };
+            }
             let (slices, escape) =
                 slice_pair_generic::<S, V>(target, &s, &e, value.clone(), optional, cursor);
             // #3471: the pair's slices go to the consumer first. A stop here
@@ -18754,6 +18827,56 @@ fn each_slice_expr_generic<S: EvalSemantics, V: DocumentValue>(
             .as_deref()
             .is_some_and(crate::jq::eval::direct_pattern_retry),
     )
+}
+
+/// [`slice_pair_generic`] for a target that can fan out, in jq mode (#3520):
+/// each target output is sliced and handed to `sink` as it is produced, so a
+/// stop ends the target's own generator. Returns the control that ended the
+/// pair, if any, and whether the consumer stopped.
+fn slice_pair_streaming<S: EvalSemantics, V: DocumentValue>(
+    target: &Expr,
+    s: &ComputedSliceBound,
+    e: &ComputedSliceBound,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> (Option<Control>, bool) {
+    let mut escape: Option<Control> = None;
+    let mut stopped = false;
+    let flow = eval_each_generic::<S, V>(
+        target,
+        value,
+        false,
+        cursor,
+        &mut MaterializesLazyItems(|item: GenericItem<V>| {
+            let t = match generic_item_into_owned::<V, S>(item) {
+                Ok(t) => t,
+                Err(control) => {
+                    escape = Some(control);
+                    return Demand::Stop;
+                }
+            };
+            match slice_owned_value_read_computed::<S>(&t, s, e, optional) {
+                Ok(Some(v)) => {
+                    if sink(v) == Demand::Stop {
+                        stopped = true;
+                        return Demand::Stop;
+                    }
+                    Demand::Continue
+                }
+                Ok(None) => Demand::Continue,
+                Err(err) => {
+                    escape = Some(Control::Error(err));
+                    Demand::Stop
+                }
+            }
+        }),
+    );
+    if let (None, false, Flow::Escaped(control)) = (&escape, stopped, flow) {
+        escape = Some(control);
+    }
+    (escape, stopped)
 }
 
 /// One `(s, e)` pair's worth of [`each_slice_expr_generic`]'s work: evaluate
