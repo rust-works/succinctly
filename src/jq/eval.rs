@@ -40296,6 +40296,29 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
     }
 }
 
+/// Whether `expr` is a chain of plain navigation steps -- `.a`, `.[0]`, `.[]`,
+/// `.[1:]`, each optionally with a postfix `?` -- which, run on jq's register
+/// itself, cannot raise a *path* error (#3763): each step is `INDEX`/`EACH`
+/// on a value `path_intact`. A type error it can raise, and by-value
+/// evaluation raises that identically. Run on a computed value it raises
+/// (`any(1; .a)`), so the caller must also know the input was the register.
+/// Computed keys (`IndexExpr`, `.[.k]`) and everything else are not members.
+fn is_plain_navigation_chain(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Iterate
+        | Expr::Slice { .. } => true,
+        Expr::Optional(inner) => {
+            is_postfix_optional_primitive(inner) && is_plain_navigation_chain(inner)
+        }
+        Expr::Paren(inner) => is_plain_navigation_chain(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_plain_navigation_chain),
+        _ => false,
+    }
+}
+
 /// The path-position body of `any(gen; cond)`/`all(gen; cond)` (#3349, #3749),
 /// shared with the bare `any`/`all`/`any(f)`/`all(f)` that jq defines over
 /// `.[]` (#3763). `target_truthy` is `any` (a truthy element decides) or `all`
@@ -40326,7 +40349,8 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
 /// produced no decisive element backtracked every branch, so the register is
 /// where this entered ([`drained_register_after`]) -- unless a `cond` that is
 /// not provably inert ran on some element, whose path error jq would have
-/// raised instead (a `gen` that produced nothing never ran it). Both are jq
+/// raised instead (a `gen` that produced nothing never ran it, and a plain
+/// navigation that only ran on the register cannot raise one). Both are jq
 /// mode only (ADR-0018).
 #[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambient state, plus the arm's two operands.
 fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
@@ -40341,8 +40365,10 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
 ) -> ResolveFlow {
     let mut decided = false;
     // How many branches `gen` produced for `cond` to run on: none means `cond`
-    // never ran, so jq cannot have raised from it.
+    // never ran, so jq cannot have raised from it. And whether every one was
+    // the register itself, where a plain navigation cannot raise either.
     let mut probed = 0usize;
+    let mut all_tracked = true;
     let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
     let mut probe_escape: Option<Control> = None;
     let flow = resolve_node_sink::<S>(
@@ -40354,6 +40380,7 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         Keep::AtMost(usize::MAX),
         &mut |branch| match {
             probed += 1;
+            all_tracked &= branch.trackable;
             any_all_probe_element::<S>(cond, &branch.value, target_truthy)
         } {
             Ok(true) => {
@@ -40381,8 +40408,9 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         // Nothing decided is `emitted == false`, but only when `cond` cannot
         // have raised: an undecided `any(1; .[]?)` is jq's path error, not a
         // backtrack. It cannot have if it never ran (`gen` was empty, so
-        // `any(.a)` over `[]` is a clean backtrack whatever `cond` navigates)
-        // or if it is inert.
+        // `any(.a)` over `[]` is a clean backtrack whatever `cond` navigates),
+        // if it is inert, or if it is plain navigation that only ever ran on
+        // the register (`any(.a)` over `[{"a":null}]` navigates and backtracks).
         None => forward_drained_result(
             flow,
             answer,
@@ -40391,7 +40419,10 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
                 value,
                 decided
                     || (probed > 0
-                        && !(S::TAG == EvalTag::Jq && trackable && cannot_move_register(cond))),
+                        && !(S::TAG == EvalTag::Jq
+                            && trackable
+                            && (cannot_move_register(cond)
+                                || (all_tracked && is_plain_navigation_chain(cond))))),
             ),
             sink,
         ),
