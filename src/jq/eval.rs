@@ -37835,6 +37835,15 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             // generator after one branch either way) turns its returned
             // `flow` itself into the emptiness signal: `Stopped` means a
             // branch arrived, `Exhausted` means none did.
+            //
+            // #3763: jq defines `isempty(g)` as `first((g | false), true)`, so
+            // a generator that emits leaves the register on the node `g` put
+            // it on, and `path()` accepts the `false` it answers when that is
+            // identical to it: `isempty(.[]?)` on `[false]` is `[0]`. The first
+            // branch is kept for that (the same `register_after` +
+            // `computed_at_register` rule as `any`/`all(gen; cond)`, jq mode
+            // only). A generator that emits nothing is #3456's case below.
+            let mut first_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
             let flow = resolve_bounded_sink::<S>(
                 inner,
                 value,
@@ -37843,14 +37852,30 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 frame,
                 keep,
                 1,
-                &mut |_branch| Demand::Stop,
+                &mut |branch| {
+                    if S::TAG == EvalTag::Jq {
+                        first_at = Some(register_after(inner, branch, frame));
+                    }
+                    Demand::Stop
+                },
             );
             let is_empty = !matches!(flow, ResolveFlow::Stopped);
-            // #3456: an empty generator backtracked every branch it explored,
-            // so jq's register is where it entered; an emitting one may have
-            // moved it ([`register_stays_on_result`]).
-            let register = drained_register_after::<S>(trackable, value, !is_empty);
-            forward_drained_result(flow, OwnedValue::Bool(is_empty), register, sink)
+            match first_at {
+                Some((path, register)) => forward_drained_branch(
+                    flow,
+                    computed_at_register(OwnedValue::Bool(false), path, register),
+                    sink,
+                ),
+                // #3456: an empty generator backtracked every branch it
+                // explored, so jq's register is where it entered; an emitting
+                // one may have moved it ([`register_stays_on_result`]).
+                None => forward_drained_result(
+                    flow,
+                    OwnedValue::Bool(is_empty),
+                    drained_register_after::<S>(trackable, value, !is_empty),
+                    sink,
+                ),
+            }
         }
 
         // #3349: `any(gen;cond)`/`all(gen;cond)` navigate `gen` live, so an
@@ -37875,47 +37900,69 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // branch, so the register is where the arm entered, like `isempty`.
         // Both are jq mode only (ADR-0018), like the by-value leaf's verdict.
         Expr::Builtin(builtin @ (Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond))) => {
-            let target_truthy = matches!(builtin, Builtin::AnyCond(..));
-            let mut decided = false;
-            let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
-            let mut probe_escape: Option<Control> = None;
-            let flow = resolve_node_sink::<S>(
+            resolve_any_all_gen_cond_sink::<S>(
                 gen,
+                cond,
+                matches!(builtin, Builtin::AnyCond(..)),
                 value,
                 trackable,
                 snapshot,
                 frame,
-                Keep::AtMost(usize::MAX),
-                &mut |branch| match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
-                    Ok(true) => {
-                        decided = true;
-                        // Asked here, not on entry: only a deciding element
-                        // needs the verdict, and most `any`s never decide.
-                        if S::TAG == EvalTag::Jq && cannot_move_register(cond) {
-                            decided_at = Some(register_after(gen, branch, frame));
-                        }
-                        Demand::Stop
-                    }
-                    Ok(false) => Demand::Continue,
-                    Err(control) => stop_with_escape(&mut probe_escape, control),
-                },
-            );
-            if let Some(control) = probe_escape {
-                return ResolveFlow::Escaped(EvalEscape::from(control));
-            }
-            // `any` answers true when an element decided, `all` answers false.
-            let answer = OwnedValue::Bool(decided == target_truthy);
-            match decided_at {
-                Some((path, register)) => {
-                    forward_drained_branch(flow, computed_at_register(answer, path, register), sink)
-                }
-                None => forward_drained_result(
-                    flow,
-                    answer,
-                    drained_register_after::<S>(trackable, value, decided),
-                    sink,
-                ),
-            }
+                sink,
+            )
+        }
+
+        // #3763: jq defines `any` as `any(.[]; .)` and `any(f)` as `any(.[];
+        // f)` (`all` alike), so in a path they are the two-argument form with
+        // `.[]` as the generator and take its rules: a deciding element emits
+        // its boolean at the register `.[]` left, and the by-value leaf these
+        // used to fall to could only report a loss. An untracked input still
+        // raises `near attempt to iterate through` from the `.[]` itself, as
+        // `builtin_navigation` did, and the arm is jq mode only (ADR-0018):
+        // yq's `any`/`all` are real yq builtins with no oracle for this.
+        Expr::Builtin(Builtin::Any) if S::TAG == EvalTag::Jq => resolve_any_all_gen_cond_sink::<S>(
+            &Expr::Iterate,
+            &Expr::Identity,
+            true,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            sink,
+        ),
+        Expr::Builtin(Builtin::All) if S::TAG == EvalTag::Jq => resolve_any_all_gen_cond_sink::<S>(
+            &Expr::Iterate,
+            &Expr::Identity,
+            false,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            sink,
+        ),
+        Expr::Builtin(Builtin::AnyF(cond)) if S::TAG == EvalTag::Jq => {
+            resolve_any_all_gen_cond_sink::<S>(
+                &Expr::Iterate,
+                cond,
+                true,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                sink,
+            )
+        }
+        Expr::Builtin(Builtin::AllF(cond)) if S::TAG == EvalTag::Jq => {
+            resolve_any_all_gen_cond_sink::<S>(
+                &Expr::Iterate,
+                cond,
+                false,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                sink,
+            )
         }
 
         Expr::Builtin(Builtin::UpperIndexStream(stream, idx_expr)) => {
@@ -40267,6 +40314,82 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
         BranchRegister::LostAt(Rc::new(value.clone()))
     } else {
         BranchRegister::LostSomewhere
+    }
+}
+
+/// The path-position body of `any(gen; cond)`/`all(gen; cond)` (#3349, #3749),
+/// shared with the bare `any`/`all`/`any(f)`/`all(f)` that jq defines over
+/// `.[]` (#3763). `target_truthy` is `any` (a truthy element decides) or `all`
+/// (a falsy one does, and the answer is `false`).
+///
+/// `gen` is resolved live, so an untracked value inside it raises as it does in
+/// jq (value mode, `each_any_all_gen_cond`, runs `gen` on the owned bridge and
+/// never reaches the resolver); each branch's value is probed with `cond`
+/// exactly as value mode probes it ([`any_all_probe_element`]), and the first
+/// decisive element stops `gen`. `cond` itself runs by value, as in jq's
+/// `isempty(first(gen | cond or empty))` desugar.
+///
+/// The result is a computed boolean, but jq's register is not where this
+/// entered, and `path()` accepts a result that is `jv_identical` to it. A
+/// decisive element is emitted from inside `gen`, so the register is wherever
+/// `gen` left it, and `any(.[]; .)` on `[true,false]` is `[0]`: `true` is
+/// identical to the element it stopped at ([`register_after`],
+/// [`computed_at_register`], the `and`/`or` arms' rule). That holds only while
+/// `cond` cannot move the register itself (`any(.[]; .a)` is `[0,"a"]` in jq,
+/// which this still refuses, #3757), so a `cond` that might is a loss. A
+/// generator that produced no decisive element backtracked every branch, so
+/// the register is where this entered ([`drained_register_after`]). Both are
+/// jq mode only (ADR-0018).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambient state, plus the arm's two operands.
+fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
+    gen: &Expr,
+    cond: &Expr,
+    target_truthy: bool,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let mut decided = false;
+    let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
+    let mut probe_escape: Option<Control> = None;
+    let flow = resolve_node_sink::<S>(
+        gen,
+        value,
+        trackable,
+        snapshot,
+        frame,
+        Keep::AtMost(usize::MAX),
+        &mut |branch| match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
+            Ok(true) => {
+                decided = true;
+                // Asked here, not on entry: only a deciding element needs the
+                // verdict, and most `any`s never decide.
+                if S::TAG == EvalTag::Jq && cannot_move_register(cond) {
+                    decided_at = Some(register_after(gen, branch, frame));
+                }
+                Demand::Stop
+            }
+            Ok(false) => Demand::Continue,
+            Err(control) => stop_with_escape(&mut probe_escape, control),
+        },
+    );
+    if let Some(control) = probe_escape {
+        return ResolveFlow::Escaped(EvalEscape::from(control));
+    }
+    // `any` answers true when an element decided, `all` answers false.
+    let answer = OwnedValue::Bool(decided == target_truthy);
+    match decided_at {
+        Some((path, register)) => {
+            forward_drained_branch(flow, computed_at_register(answer, path, register), sink)
+        }
+        None => forward_drained_result(
+            flow,
+            answer,
+            drained_register_after::<S>(trackable, value, decided),
+            sink,
+        ),
     }
 }
 
