@@ -156,9 +156,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # #3698: scripts/deep-recursion-tests.sh lists the two jq_cli_tests whose cost is
+          # the native stack being filled (~100-150 s each, a third of this leg's test CPU).
+          # They run in the `deep-recursion` leg below instead. `skip-args` prints
+          # `--exact --skip <name> ...` from the very list that leg runs, so the two cannot
+          # drift apart; it is computed on its own line so a failure there fails the step
+          # rather than quietly running everything. The skip applies to every `--test`
+          # binary here, and `--exact` keeps it from matching anything but those names.
           - name: cli-gated
             buildCli: true
-            testCmd: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests
+            testCmd: |
+              skip=$(scripts/deep-recursion-tests.sh skip-args)
+              cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
           # `tests/orchestrate_cli_tests.rs` is `#![cfg(feature = "bench-runner")]`
           # and must stay isolated from the cli-gated leg above (#1705): its
           # `cargo run`-spawned CLI subprocesses would otherwise re-link the
@@ -211,6 +220,17 @@ jobs:
           - name: no-std
             buildCli: false
             testCmd: cargo test --no-default-features --verbose
+          # #3698: the two slowest jq_cli_tests, split out of `cli-gated` (see its comment).
+          # `run` fails if a listed name stopped being a test, or if fewer tests passed than
+          # are listed: libtest runs zero tests and exits 0 when `--exact` matches nothing.
+          # The script's self-test (a fake `cargo`, ~2 s) runs first, in this leg and not in a
+          # side job, so weakening a guard fails the required `Test (...)` check; it also pins
+          # that each of the three matrices here has both halves of the split.
+          - name: deep-recursion
+            buildCli: true
+            testCmd: |
+              python3 scripts/test_deep_recursion_tests.py
+              scripts/deep-recursion-tests.sh run
     env:
       # x86 SIMD CI leg (#193): the SIMD suites self-skip (with a visible
       # `SKIPPED` line) when a CPU feature is missing, so this pins the runner
@@ -309,7 +329,9 @@ jobs:
         include:
           - name: cli-gated
             buildCli: true
-            testCmd: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests
+            testCmd: |
+              skip=$(scripts/deep-recursion-tests.sh skip-args)
+              cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
           - name: bench-runner-gated
             buildCli: true
             testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
@@ -385,6 +407,13 @@ jobs:
               source scripts/lib/clippy-variants.sh
               cargo clippy --all-targets --features "$CLIPPY_CORE_FEATURES" -- -D warnings
               cargo clippy --all-targets --features "$CLIPPY_ARM_BROADWORD_FEATURES" -- -D warnings
+          # #3698: the two slowest jq_cli_tests, split out of `cli-gated`; same list and
+          # guards as the x86_64 leg's (see the comment on its `cli-gated` entry).
+          - name: deep-recursion
+            buildCli: true
+            testCmd: |
+              python3 scripts/test_deep_recursion_tests.py
+              scripts/deep-recursion-tests.sh run
     env:
       # ARM SIMD CI leg (#194, mirroring the x86 pattern from #193): the SVE2
       # suites self-skip (with a visible `SKIPPED` line) when a CPU feature is
@@ -455,6 +484,11 @@ jobs:
   # critical path becomes `cli-gated` rather than the chained leg.
   # Re-measure the macOS queue wait after any change here; one more macOS job
   # per run is the price.
+  #
+  # #3698 took the two slowest tests in `cli-gated` (~100-150 s each, 270 of its ~820 s
+  # of test CPU) into a `deep-recursion` leg: a fourth macOS job per run, spent to shorten
+  # `cli-gated`, which is the critical path above. Whether it is worth the slot is what
+  # that issue's decision gate (macOS queue wait under weekday load) is measuring.
   test-macos-arm:
     name: Test (macOS ARM64)
     needs: [gate, test-macos-arm-matrix]
@@ -479,7 +513,9 @@ jobs:
         include:
           - name: cli-gated
             buildCli: true
-            testCmd: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests
+            testCmd: |
+              skip=$(scripts/deep-recursion-tests.sh skip-args)
+              cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests --test serde_tests --test locate_cli_tests --test corpus_stats_cli_tests --test yq_tonumber_fixture_tests --test jq_path_context_alphabet_tests -- $skip
           # `tests/orchestrate_cli_tests.rs` is `#![cfg(feature = "bench-runner")]`
           # and must stay isolated from the cli-gated leg above (#1705): its
           # `cargo run`-spawned CLI subprocesses would otherwise re-link the
@@ -509,6 +545,13 @@ jobs:
               cargo test --verbose --features simd
               cargo test --verbose --features portable-popcount
               cargo test --no-default-features --verbose
+          # #3698: the two slowest jq_cli_tests, split out of `cli-gated`; same list and
+          # guards as the x86_64 leg's (see the comment on its `cli-gated` entry).
+          - name: deep-recursion
+            buildCli: true
+            testCmd: |
+              python3 scripts/test_deep_recursion_tests.py
+              scripts/deep-recursion-tests.sh run
     env:
       # Apple Silicon has NEON but no SVE/SVE2, so only NEON is pinned; the
       # SVE2 suites are *expected* to print `SKIPPED` lines on this leg. SVE2
