@@ -154,6 +154,14 @@ cargo test --test property_tests
 cargo test --test properties
 ```
 
+Two `jq_cli_tests` take 100-150 s each in a debug build, because the cost is the native
+stack being filled to the point where ADR-0025's guard refuses (not logic that can be
+trimmed). CI runs them in their own `deep-recursion` leg rather than in `cli-gated`;
+`scripts/deep-recursion-tests.sh` holds the list for both sides (#3698), so to move another
+slow test there, add its name to that script. `scripts/deep-recursion-tests.sh run` runs
+just those tests locally, and `scripts/test_deep_recursion_tests.py` is the script's own
+self-test. A plain `cargo test --features cli` still runs everything.
+
 ### Coverage
 
 CI line coverage uses the feature set `cli,simd,regex,serde` (see `CLAUDE.md`'s Coverage
