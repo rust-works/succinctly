@@ -165,10 +165,9 @@ OPERANDS = [
     # They were the by-value `cond` hole (#3757): jq's path error on a
     # *computed* element was invisible, and `any(1; .[]?) or true` or
     # `.. // .a` wrote where jq exits 5. #3757 resolves such a `cond` as
-    # `gen | cond`; `--operand` over the twenty-three any/all/isempty operands
-    # (223,587 programs at the grid's then 27 contexts; #3738 has since added ten) went from 1,675 ACCEPT_WRONG
-    # on a build of `main` without it to 0, with 0 regressions. The counts move
-    # with the grid, so rerun rather than compare.
+    # `gen | cond`: `--operand` over the any/all/isempty operands, against a build
+    # of `main` without it, went from ACCEPT_WRONG rows to none, with no
+    # regression. The counts move with the grid, so rerun rather than compare.
     "any(1; .[]?)",
     "any(true; .[0]?)",
     "all(unique_by(.))",
@@ -186,6 +185,23 @@ OPERANDS = [
     "any(.[]?; unique_by(.))",
     "any(1; .a)",
     "any(true; select(.))",
+    # (#3757 review) a computed generator element can still be jq's register: a
+    # pass-through builtin returns the value it was given (`ltrimstr("x")` on a
+    # non-string, `tostring` on a string) and jq then raises no path error in
+    # `cond`, where a live stage assuming "computed means not the register" raised
+    # one an enclosing `try` swallowed. And an opaque generator (`input_line_number`,
+    # `now`) states no register at all, which used to trip the stage's entry
+    # assertion in a debug build. `first(2, 3)` against `2` is the pair that tells a
+    # generator the allowlist cannot prove from one it can.
+    "any(ltrimstr(\"x\"); .[0])",
+    "all(ltrimstr(\"x\"); first)",
+    "any(.a | tostring; .[0]?)",
+    "any(.a | ltrimstr(\"x\"); .a?)",
+    "all(tostring; .a?)",
+    "any(input_line_number; .a)",
+    "any(now; .a)",
+    "any(first(2, 3); .a?)",
+    "any(2; .a?)",
     # wrappers and control flow around the above
     "try .a",
     "(.a // .b)",

@@ -323,9 +323,15 @@ Consequences:
   branch `gen` produced (`resolve_seq_stage`, #3757), which is `gen | cond`: its register and
   its path errors are the resolver's own, so the decided claim is the output branch's
   register (`register_after`) and the undecided one needs no extra condition, because a
-  `cond` that could raise already did. The per-result verdict made the claim for any `cond`
-  and wrote `null` over a document for `all(unique_by(.))`; #3749's undecided claim did the
-  same for `any(1; .[]?) or 1`.
+  `cond` that could raise already did. An *untracked* generator element is the one thing
+  the stage cannot be handed blindly: `jv_identical` makes a pass-through value
+  (`ltrimstr("x")` on a non-string) or an equal `null`/`true`/`false` the register itself, and
+  `cond` then raises no path error. The stage gets it only when the producer vouches
+  (`Unmoved(register)`, or the frame's carried register when `gen` moves nothing): equal by
+  kind, re-established at the branch's path; unequal, it raises as jq does; otherwise it is an
+  uncatchable guess, which also keeps a lost-register state out of the stage's entry assertion.
+  The per-result verdict made the claim for any `cond` and wrote `null` over a document for
+  `all(unique_by(.))`; #3749's undecided claim did the same for `any(1; .[]?) or 1`.
 
 ## 6. Delivery
 

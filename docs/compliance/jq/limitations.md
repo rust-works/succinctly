@@ -1172,15 +1172,27 @@ is the revert that established what the other one costs.
      `try` no longer accepts and writes where jq exits 5 (`del(((any(1; .[]?))) // .a)` on `{"a":true}`;
      `(try (all(tostring; .a?))) |= 5` on `true` is `true`). Before #3757 `cond` ran by value everywhere: the undecided
      claim was made for a `cond` that could raise, so `del(. as $x | (any(1; .[]?) or 1) | $x)` on `{"a":1}` deleted the
-     whole document on `main` since #3749. Pinned by `test_any_all_navigating_cond_states_the_register_it_left_3757`,
+     whole document on `main` since #3749. An *untracked* element (one `gen` computed) can still be jq's register:
+     `path_intact` compares by `jv_identical`, which is pointer identity for a string, array or object and equality
+     for `null`/`true`/`false`, so a pass-through builtin hands back the value it was given (`ltrimstr("x")` on a
+     non-string, `tostring` on a string) and a computed `true` over a `true` register is it by kind, and `cond`
+     then navigates it with no path error (`any(true; .[0]?)` on `true` raises only the type error its `?` catches),
+     where over any other value it raises one a `try` catches. The stage is given such an element only when the
+     producer vouches for the register: equal by kind it is re-established where the register stands, unequal it
+     cannot be it and the stage raises as jq does; anything else -- an equal string or container, a producer that
+     lost the register, an untracked entry that states none, a `gen` the allowlist cannot prove leaves the register
+     in place (`first(2, 3)`, where a literal `2` is exact) -- is ambiguous and refuses as an uncatchable guess, so
+     `del(try (.a and any(true; select(.))))`-shaped writes cannot go through on a swallowed error (jq answers
+     `["a"]` for `path(.a and any(true; select(.)))` and this refuses). Pinned by
+     `test_any_all_navigating_cond_states_the_register_it_left_3757`,
      `test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757` and the `_3763` rows, each clause failing a test
-     when removed. A computed `null`/`true`/`false` generator element over a register that is equal by kind *is* the
-     register in jq (`jv_identical`), so `any(true; .[0]?)` on `true` raises no path error there, and the branch is
-     re-established at the entry on a trackable entry; over an untracked entry the register's position is not known
-     and the element is treated as computed. A sweep of the twenty-three `any`/`all`/`isempty` operands against a build of `main` without #3757 (223,587 programs at the grid's then 27 contexts, ten fewer than #3738 later added; `--operand` for each) has `ACCEPT_WRONG` 1,675 to 0, `REFUSE_WRONG` 5,495 to 2,278, `DIFF` 8 to 0 and no regression: the first sweep of this family to exit 0. One shape still refuses where jq answers, pinned
-     (`test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`): a plain pipe stage does not read the
-     backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any | $x)` on `{"a":false,"b":null}` is
-     `[]` in jq and refuses here, and so does `isempty(g)` as a `cond` (`any(.[]; isempty(empty))` is `[0]`)
+     when removed. The sweep (`scripts/jq-path-register-sweep.py`, `--operand` for each of the any/all/isempty
+     operands, against a build of `main` without #3757) went from `ACCEPT_WRONG` rows to none, with no regression
+     and no `DIFF`; the counts move with the grid, so rerun rather than compare. One shape still refuses where jq
+     answers, pinned (`test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`): a plain pipe stage does not read
+     the backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any | $x)` on
+     `{"a":false,"b":null}` is `[]` in jq and refuses here, and so does `isempty(g)` as a `cond`
+     (`any(.[]; isempty(empty))` is `[0]`)
      ([#3758](https://github.com/rust-works/succinctly/issues/3758)). In yq mode `any`/`all` are real yq
      builtins and keep yq's own scalar error (`all only supports arrays, was !!int`); real yq rejects the two-argument
      form outright, so `--jq-extensions` keeps its refusal.

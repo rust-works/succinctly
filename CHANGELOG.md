@@ -693,14 +693,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `near attempt to ...`, `unique_by(.)` and an update assignment raise as jq's do, `select(.)`/`first(.)`/`..` leave the register, a deciding
   output carries the register `cond` left, and the undecided claim needs no extra condition because a `cond` that could raise already did.
   The empty-generator, inert-`cond` and plain-navigation clauses #3763 added for the undecided claim are gone. yq mode is unchanged.
-  A computed `null`/`true`/`false` generator element over a register equal to it by kind *is* the register in jq (`jv_identical`), so
-  `any(true; .[0]?)` on `true` raises no path error there; the branch is re-established at the entry (trackable entry only). One shape
-  still refuses where jq answers, pinned: a plain pipe stage that drops the any/all/isempty verdict, which also hides `isempty(g)`
-  used as a `cond` (#3758). A twenty-three-operand sweep against a build of `main` without this change (223,587 programs at the grid's then 27 contexts, ten fewer than #3738 later added; reproduce with `--operand` for each of the any/all/isempty operands) goes from `ACCEPT_WRONG` 1,675 to 0, `REFUSE_WRONG` 5,495 to 2,278 and `DIFF` 8 to 0, with 0 regressions: the first sweep of this family to exit 0. Pinned by `test_any_all_navigating_cond_states_the_register_it_left_3757`,
+  An *untracked* element can still be jq's register (`jv_identical` is pointer identity for a string, array or object and equality for
+  `null`/`true`/`false`): a pass-through builtin hands back the value it was given (`ltrimstr("x")` on a non-string, `tostring` on a string),
+  and a computed `true` over a `true` register is it by kind, so `cond` navigates it with no path error. The stage is given such an element only
+  when the producer vouches for the register: equal by kind it is re-established where the register stands, unequal it cannot be it and the
+  stage raises as jq does; anything else (an equal string or container, a lost register, an untracked entry that states none, a `gen` the
+  allowlist cannot prove leaves the register in place) refuses as an uncatchable guess, which also keeps a lost-register state out of the
+  stage's entry assertion. A first version of this change assumed a computed element is never the register and, in review, wrote through a
+  `try` for `del((try (all(ltrimstr("x"); .[0]))), .[0])` on `[true]` and panicked a debug build for `any(input_line_number; .a)`; both are pinned.
+  One shape still refuses where jq answers, pinned: a plain pipe stage that drops the any/all/isempty verdict, which also hides `isempty(g)`
+  used as a `cond` (#3758). Against a build of `main` without this change, the sweep's any/all/isempty operands (`--operand` for each; the
+  counts move with the grid, so rerun rather than compare) went from `ACCEPT_WRONG` rows to none, with no regression and no `DIFF`.
+  Pinned by `test_any_all_navigating_cond_states_the_register_it_left_3757`,
   `test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757` and `test_any_all_live_cond_is_jq_mode_only_3757` (the yq entry, since the
-  CLI's yq routes never reach the arm); each of the live route, the decisive register, the undecided register, the escape and the jq-mode
-  gate and the identity re-establish fails a test when removed. The sweep gained seven operands (`select`, `first`, a navigating chain, an update assignment,
-  `unique_by`, a computed generator under a navigating `cond`).
+  CLI's yq routes never reach the arm); each clause of the live route, the decisive and undecided registers, the escape, the jq-mode gate and
+  the vouched-register rule fails a test when removed. The sweep gained operands for the live route and for pass-through and opaque generators.
 
 - **jq: bare `any`/`all`, `any(f)`/`all(f)` and `isempty(g)` state jq's path register** (#3763, a #3749 follow-up).
   jq defines `any` as `any(.[]; .)`, `any(f)` as `any(.[]; f)` (`all` alike) and `isempty(g)` as `first((g | false), true)`,
@@ -713,7 +720,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   register when `g` emitted nothing, #3456). yq mode is unchanged (`all only supports arrays, was !!int`, pinned). Two
   rows that recorded the old loud refusal now answer jq's: `del(try (any and .a))` on `{"a":true}` and
   `del(. as $x | isempty(.l[]) | try ($x | .a))` both leave the document. A `cond` outside `cannot_move_register`'s allowlist
-  (#3757) and a plain pipe stage that does not read the verdict (#3758) still refuse, and `any(.a)` is the first of them. Swept
+  was refused here and is fixed by #3757, above; a plain pipe stage that does not read the verdict (#3758) still refuses. Swept
   over seven bare and one-argument operands of `scripts/jq-path-register-sweep.py` (four of them new; 57,987 programs at the
   grid's 23 contexts then, pre-change binary as base: 0 `ACCEPT_WRONG`, 0 regressions, `REFUSE_WRONG` 1,942 to 583). Pinned by `test_isempty_and_bare_any_all_state_the_register_3763`
   and `test_bare_any_all_and_isempty_keep_their_refusals_3763`; each arm and the jq-mode gate fail a test when removed.
@@ -753,7 +760,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned (without it `path(false | (any(empty; .) and 1))` answers `[]` and `del` of it writes `null`, where jq
   refuses). Pinned by `test_any_all_gen_cond_decisive_result_sits_at_the_register_3749`,
   `test_any_all_gen_cond_exhausted_register_stays_at_entry_3749` and
-  `test_any_all_pipe_stage_verdict_and_identity_residuals_stay_refused_3757` (named `..._unprovable_cond_and_pipe_stage_stay_refused_3749` then); the path-register sweep gained four
+  `test_any_all_pipe_stage_verdict_residuals_stay_refused_3757` (named `..._unprovable_cond_and_pipe_stage_stay_refused_3749` then); the path-register sweep gained four
   `any`/`all(gen; cond)` operands.
 
 - **jq: a `foreach` whose update is a full slice keeps its state on the register** (#3742).
