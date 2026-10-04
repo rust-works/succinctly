@@ -40461,7 +40461,10 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
             // position is not, so a live stage could neither raise as jq does
             // (it does not, when equal) nor name where `cond` left it. Run
             // `cond` by value as before this change and state no register.
-            let by_value = !branch.trackable
+            // (On a trackable entry the register *is* `value`: an equal element was
+            // re-established above, and an unequal one raises as jq's does.)
+            let by_value = !trackable
+                && !branch.trackable
                 && matches!(&*branch.value, OwnedValue::Null | OwnedValue::Bool(_))
                 && frame.register().map_or(true, |register| {
                     null_bool_identical(&branch.value, register)
