@@ -492,6 +492,15 @@ safe direction, so the grid could not see the mark) and 40 (24 worse) once `sort
 Each turns a refusal into an answer and needs its own oracle rows:
 
 - ~~`last(f)` to `Unmoved` (section 5).~~ Done by #3643.
+- ~~The wrappers around `last(f)` that add no movement (`?`, `try`, `first(...)`), and a
+  `select(f)`/type-filter stage.~~ Done by #3653, as two stage-level rules beside
+  `cannot_move_register` in `resolve_seq_stage` (`last_leaves_register_in_place` reading through
+  `register_keeping_last`, and `select_leaves_register_in_place`): jq defines `select(f)` as `if f
+  then . else empty end`, so `f` is a subexp, and `try` and `first` pass `last`'s register on. A
+  `select` entered on the register already passed a trackable branch through; only the register
+  *carried* by an untracked entry was dropped, so the sweep gained contexts that enter the stage
+  on a literal (`untracked-*`). Still refused where jq answers: `try last(f) catch H`,
+  `limit(n; last(f))`, `nth(n; last(f))`, and `last(f)` inside a compound stage or an `[E]`.
 - The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
   turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`
   into jq's `[]`. Cheap now, because the producers already say it.

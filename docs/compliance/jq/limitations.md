@@ -1241,6 +1241,20 @@ is the revert that established what the other one costs.
    is no longer one of them: [#3643](https://github.com/rust-works/succinctly/issues/3643)
    states its register as unmoved (jq mode), so `path(. as $x \| last(.l[]) \| $x)` is `[]`
    here too, pinned by `test_path_register_last_f_does_not_move_it_3643`.
+   [#3653](https://github.com/rust-works/succinctly/issues/3653) extends that to the wrappers
+   jq passes the register through unchanged (`last(f)?`, `try last(f)` with no `catch`, and
+   `first(last(f))`, where `first` emits from inside `last`) and to a `select(f)` or type-filter
+   stage (`path(. as $x \| 5 \| select(.) \| $x)` is `[]` in both tools): jq defines `select(f)`
+   as `if f then . else empty end`, whose condition is a subexp, so `f` neither moves the
+   register nor path-checks anything, and every type filter (`numbers`, `strings`, `objects`,
+   ...) is a `select` over a type test. Both are stage-level rules read in `resolve_seq_stage`
+   (jq mode only, like every admission here), and pinned by
+   `test_path_register_last_f_wrappers_and_select_keep_it_3653`, with the yq side by
+   `yq_last_f_wrappers_and_select_do_not_keep_the_path_register_3653`. Still refused where jq
+   answers `[]`: a `catch` handler around `last` (it runs on a caught error's payload),
+   `limit(n; last(f))` and `nth(n; last(f))` (wrappers of their own), and `last(f)` inside a
+   compound stage (a comma, a `//`, a `def` call) or an `[E]` collect, which need the
+   leaf-level verdict for a compound stage described above.
    An array is different: jq collects it without a subexp, so its contents
    are path-checked (`path(. as $x \| {k:.a} \| [.k] \| $x)` raises on the `.k`), and then
    backtracks the register to where the collect began. Since
