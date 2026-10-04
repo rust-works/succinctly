@@ -76208,10 +76208,36 @@ fn test_scalar_bind_keeps_node_identity_3191() -> Result<()> {
         (r"5", r". as $x | [.] | add | path($x)", r"[]"),
         (r#""abc""#, r". as $x | [.] | min | path($x)", r"[]"),
         (r"1", r". as $x | [.] | sort | .[0] | path($x)", r"[]"),
+        // `strings`/`numbers` are `select(type == ...)`, which hands the input
+        // back. The bind-origin sweep listed both as refuse-only until #3731
+        // found them agreeing; the sweep is not run by CI, so pin them here.
+        (r#""abc""#, r". as $x | strings | path($x)", r"[]"),
+        (r"1.50", r". as $x | numbers | path($x)", r"[]"),
+        (r#""abc""#, r". as $x | strings | strings | path($x)", r"[]"),
+        (
+            r#"{"a":"abc"}"#,
+            r".a as $x | .a | strings | path($x)",
+            r"[]",
+        ),
+        (
+            r#"{"a":1.50}"#,
+            r".a as $x | .a | numbers | path($x)",
+            r"[]",
+        ),
         // The write half: `$x` names the node, so a write through it lands.
         (r#""s""#, r". as $x | {k:.} | .k | $x = 1", r"1"),
         (r"5", r". as $x | [.] | .[0] | ($x) |= . + 1", r"6"),
         (r#""s""#, r". as $x | {k:.} | del(.k | $x)", r"{}"),
+        (
+            r#"{"a":"abc"}"#,
+            r".a as $x | (.a | strings | $x) = 5",
+            r#"{"a":5}"#,
+        ),
+        (
+            r#"{"a":"abc"}"#,
+            r".a as $x | del(.a | strings | $x)",
+            r"{}",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
@@ -76250,6 +76276,12 @@ fn test_scalar_bind_keeps_node_identity_3191() -> Result<()> {
         (r"5", r". as $x | tostring | tonumber | path($x)"),
         (r#"["s","s"]"#, r".[0] as $x | .[1] | path($x)"),
         (r#""s""#, r#""s" as $x | "s" | path($x)"#),
+        // `strings` hands its input back only for the node it was bound from: a
+        // sibling holding an equal string is another storage, so jq refuses.
+        (
+            r#"{"a":"abc","b":"abc"}"#,
+            r".a as $x | .b | strings | path($x)",
+        ),
         (r#""abc""#, r#". as $x | ltrimstr("z") | path($x)"#),
         (r#""abc""#, r#". as $x | sub("z";"y") | path($x)"#),
         (r"5", r". as $x | abs | path($x)"),
