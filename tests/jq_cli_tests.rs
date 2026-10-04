@@ -60903,6 +60903,124 @@ fn test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763() -> Resu
             "",
             0,
         ),
+    ])?;
+    // The same navigation on a computed element: jq raises a path error
+    // (`near attempt to access element "a" of 1`), and this raises the type
+    // error its by-value `cond` hits first. Both exit 5 and write nothing; the
+    // wording is not shared, so only the status and stdout are pinned. `any(1;
+    // .a)` is the converse of the `any(.a)` rows below, which run on the
+    // register itself.
+    for (input, filter) in [
+        (r#"{"a":1}"#, "del(. as $x | (any(1; .a) or 1) | $x)"),
+        (r#"{"a":1}"#, "del(. as $x | (any(1; .a?) or 1) | $x)"),
+        (r#"{"a":1}"#, "del(. as $x | (any(true; .[0]) or 1) | $x)"),
+    ] {
+        for (route, (stdout, stderr, code)) in [
+            ("stdin", run_jq_full(&["-c", filter], Some(input))?),
+            (
+                "-n",
+                run_jq_full(&["-nc", &format!("{input} | {filter}")], None)?,
+            ),
+        ] {
+            assert_eq!(
+                (stdout.as_str(), code),
+                ("", 5),
+                "`{filter}` on {input} via {route}: stderr {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3763 review, the other direction: the undecided claim must not refuse what
+/// jq backtracks cleanly. A generator that produced nothing never ran `cond`
+/// (`any(.a)` over `[]`), and a chain of plain navigation steps run only on the
+/// register cannot raise a path error (`any(.a)` over `[{"key":"a","value":1}]`
+/// navigates to `null` and backtracks), so the register is where the construct
+/// entered and a `$x` frozen before it re-establishes. The rows above are the
+/// converse: the same navigation on a computed element (`any(1; .a)`) raises in
+/// jq, so it stays refused. Every row captured from jq 1.7.1, on both routes.
+#[test]
+fn test_any_all_undecided_register_survives_a_cond_that_never_raised_3763() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (r"[]", r"path(any(.a) or .b?)", "", "", 0),
+        (
+            r"{}",
+            r"path(all(.a) and .b?)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[]",
+            r"del(. as $x | (any(.a) and .b?) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"path(any(.a) or .b?)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"del(. as $x | (any(.a) and .b?) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"[path(any(.a) or .b?)]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"del(any(.a) or .b?)",
+            "[{\"key\":\"a\",\"value\":1}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":null}]"#,
+            r"del(. as $x | (any(.a) and 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del(. as $x | (all(.a) or 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del(. as $x | (any(.a | .b?) or 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":{"b":1}}]"#,
+            r"del(. as $x | (any(.a | .b) and 1) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del(. as $x | (any(.[.a]) or 1) | $x)",
+            "",
+            r"Cannot index object with number",
+            5,
+        ),
     ])
 }
 
