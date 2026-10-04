@@ -40301,11 +40301,11 @@ fn drained_register<'a, S: EvalSemantics>(
 /// it, so stating `value` there lets `and`/`or` accept a boolean identical to
 /// it -- `path(false | (any(empty; .) and 1))` on `{"a":1}` answered `[]`, and
 /// `del` of it wrote `null`, where jq refuses.
-fn drained_register_after<'a, S: EvalSemantics>(
+fn drained_register_after<S: EvalSemantics>(
     trackable: bool,
-    value: &'a OwnedValue,
+    value: &OwnedValue,
     emitted: bool,
-) -> BranchRegister<'a> {
+) -> BranchRegister<'_> {
     if trackable && S::TAG == EvalTag::Jq && !emitted {
         BranchRegister::Unmoved(Cow::Borrowed(value))
     } else {
