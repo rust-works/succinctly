@@ -37914,12 +37914,12 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         Expr::Builtin(
             builtin @ (Builtin::Any | Builtin::All | Builtin::AnyF(_) | Builtin::AllF(_)),
         ) if S::TAG == EvalTag::Jq => {
+            // The pattern admits exactly these four, so `All` is what is left.
             let (cond, target_truthy) = match builtin {
                 Builtin::Any => (&Expr::Identity, true),
-                Builtin::All => (&Expr::Identity, false),
                 Builtin::AnyF(cond) => (&**cond, true),
                 Builtin::AllF(cond) => (&**cond, false),
-                _ => unreachable!("matched above"), // omni-dev: coverage tolerate-line reason="the arm's own pattern admits only Any, All, AnyF and AllF"
+                _ => (&Expr::Identity, false),
             };
             resolve_any_all_gen_cond_sink::<S>(
                 &Expr::Iterate,
@@ -40356,29 +40356,6 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
     }
 }
 
-/// Whether `expr` is a chain of plain navigation steps -- `.a`, `.[0]`, `.[]`,
-/// `.[1:]`, each optionally with a postfix `?` -- which, run on jq's register
-/// itself, cannot raise a *path* error (#3763): each step is `INDEX`/`EACH`
-/// on a value `path_intact`. A type error it can raise, and by-value
-/// evaluation raises that identically. Run on a computed value it raises
-/// (`any(1; .a)`), so the caller must also know the input was the register.
-/// Computed keys (`IndexExpr`, `.[.k]`) and everything else are not members.
-fn is_plain_navigation_chain(expr: &Expr) -> bool {
-    match expr {
-        Expr::Identity
-        | Expr::Field(_)
-        | Expr::Index { .. }
-        | Expr::Iterate
-        | Expr::Slice { .. } => true,
-        Expr::Optional(inner) => {
-            is_postfix_optional_primitive(inner) && is_plain_navigation_chain(inner)
-        }
-        Expr::Paren(inner) => is_plain_navigation_chain(inner),
-        Expr::Pipe(stages) => stages.iter().all(is_plain_navigation_chain),
-        _ => false,
-    }
-}
-
 /// The path-position body of `any(gen; cond)`/`all(gen; cond)` (#3349, #3749),
 /// shared with the bare `any`/`all`/`any(f)`/`all(f)` that jq defines over
 /// `.[]` (#3763). `target_truthy` is `any` (a truthy element decides) or `all`
@@ -40396,9 +40373,10 @@ fn is_plain_navigation_chain(expr: &Expr) -> bool {
 /// node (`any(.[]; .a)` is `[0,"a"]`), and one that navigates a computed value
 /// raises a path error this resolver never sees (`any(1; .[]?)` raises `near
 /// attempt to iterate through 1`, and so does `all(unique_by(.))`). So the
-/// register is stated only while `cannot_move_register(cond)` holds -- `cond`
-/// navigates nothing, so it can neither move the register nor raise -- and a
-/// `cond` outside that allowlist is a loss in both cases below (#3757).
+/// decided register is stated only while `cannot_move_register(cond)` holds --
+/// `cond` navigates nothing, so it can neither move the register nor raise --
+/// and a `cond` outside that allowlist is a loss there (#3757). The undecided
+/// one is wider, below.
 ///
 /// The result is a computed boolean, but jq's register is not where this
 /// entered, and `path()` accepts a result that is `jv_identical` to it. A
@@ -40407,11 +40385,11 @@ fn is_plain_navigation_chain(expr: &Expr) -> bool {
 /// identical to the element it stopped at ([`register_after`],
 /// [`computed_at_register`], the `and`/`or` arms' rule). A generator that
 /// produced no decisive element backtracked every branch, so the register is
-/// where this entered ([`drained_register_after`]) -- unless a `cond` that is
-/// not provably inert ran on some element, whose path error jq would have
-/// raised instead (a `gen` that produced nothing never ran it, and a plain
-/// navigation that only ran on the register cannot raise one). Both are jq
-/// mode only (ADR-0018).
+/// where this entered ([`drained_register_after`]) -- unless a `cond` ran on
+/// some element that could have raised a path error jq would have raised
+/// instead. It cannot have if `gen` produced nothing (it never ran), if `cond`
+/// is inert, or if it is pure navigation ([`is_pure_navigation`]) that only ever
+/// ran on the register. Both are jq mode only (ADR-0018).
 #[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambient state, plus the arm's two operands.
 fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     gen: &Expr,
@@ -40469,23 +40447,20 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         // have raised: an undecided `any(1; .[]?)` is jq's path error, not a
         // backtrack. It cannot have if it never ran (`gen` was empty, so
         // `any(.a)` over `[]` is a clean backtrack whatever `cond` navigates),
-        // if it is inert, or if it is plain navigation that only ever ran on
+        // if it is inert, or if it is pure navigation that only ever ran on
         // the register (`any(.a)` over `[{"a":null}]` navigates and backtracks).
-        None => forward_drained_result(
-            flow,
-            answer,
-            drained_register_after::<S>(
-                trackable,
-                value,
-                decided
-                    || (probed > 0
-                        && !(S::TAG == EvalTag::Jq
-                            && trackable
-                            && (cannot_move_register(cond)
-                                || (all_tracked && is_plain_navigation_chain(cond))))),
-            ),
-            sink,
-        ),
+        None => {
+            let cond_cannot_have_raised = probed == 0
+                || (S::TAG == EvalTag::Jq
+                    && trackable
+                    && (cannot_move_register(cond) || (all_tracked && is_pure_navigation(cond))));
+            forward_drained_result(
+                flow,
+                answer,
+                drained_register_after::<S>(trackable, value, decided || !cond_cannot_have_raised),
+                sink,
+            )
+        }
     }
 }
 
