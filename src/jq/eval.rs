@@ -44929,6 +44929,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // #3734: "navigates" is the fold driver's own test, not the bind witness's
     // narrower one, which misses a computed key (`.[1+1]`) and so let the
     // slice rule accept `path(reduce .[1+1] as $a (.; .[0:]))` where jq refuses.
+    // #3710: a property of the `reduce`'s syntax, so answered once rather than per INIT fork.
+    let register_unmoved = S::TAG == EvalTag::Jq
+        && trackable
+        && reduce_cannot_move_register(patterns, input, init, update);
     let slice_ok = fold_slice_ok(patterns, input);
     // INIT resolved first, before SOURCE (#2031, reordered from the
     // original #1467/#1872 shape): confirmed live against jq 1.7.1 (via
@@ -45318,11 +45322,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // every by-value leaf does ([`leaf_register`]); the stage then takes
         // the stricter of that and its own verdict. A trackable entry only: an
         // untracked one carries its register on the stage.
-        if S::TAG == EvalTag::Jq
-            && trackable
-            && !emitted.trackable
-            && reduce_cannot_move_register(patterns, input, init, update)
-        {
+        if register_unmoved && !emitted.trackable {
             emitted = emitted.with_register(BranchRegister::Unmoved(Cow::Borrowed(value)));
         }
         if sink(emitted) == Demand::Stop {

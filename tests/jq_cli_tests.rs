@@ -94445,6 +94445,27 @@ fn test_reduce_with_a_computing_update_leaves_the_register_3710() -> Result<()> 
             "",
             0,
         ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"del(. as $x | reduce (1) as $i (.; 5) | try ($x | .k))",
+            "{\"a\":{\"b\":1},\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"del(. as $x | reduce (1) as $i (.; 5) | try ($x | .zz))",
+            "{\"a\":{\"b\":1},\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"path(. as $x | reduce (1) as $i (.; 5) | try ($x | .k))",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
     ])
 }
 
