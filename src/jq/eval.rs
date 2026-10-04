@@ -40378,22 +40378,22 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         snapshot,
         frame,
         Keep::AtMost(usize::MAX),
-        &mut |branch| match {
+        &mut |branch| {
             probed += 1;
             all_tracked &= branch.trackable;
-            any_all_probe_element::<S>(cond, &branch.value, target_truthy)
-        } {
-            Ok(true) => {
-                decided = true;
-                // Asked here, not on entry: only a deciding element needs the
-                // verdict, and most `any`s never decide.
-                if S::TAG == EvalTag::Jq && cannot_move_register(cond) {
-                    decided_at = Some(register_after(gen, branch, frame));
+            match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
+                Ok(true) => {
+                    decided = true;
+                    // Asked here, not on entry: only a deciding element needs
+                    // the verdict, and most `any`s never decide.
+                    if S::TAG == EvalTag::Jq && cannot_move_register(cond) {
+                        decided_at = Some(register_after(gen, branch, frame));
+                    }
+                    Demand::Stop
                 }
-                Demand::Stop
+                Ok(false) => Demand::Continue,
+                Err(control) => stop_with_escape(&mut probe_escape, control),
             }
-            Ok(false) => Demand::Continue,
-            Err(control) => stop_with_escape(&mut probe_escape, control),
         },
     );
     if let Some(control) = probe_escape {
