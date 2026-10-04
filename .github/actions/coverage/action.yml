@@ -109,6 +109,10 @@ runs:
         version: 0.43.0
         use-prebuilt-binary: ${{ inputs.use-prebuilt }}
         test-args: --features cli,simd,regex,serde --workspace
+        # #3750 A2, observation only: logs how many raw profile files the run
+        # left and how big they are, before the lcov step merges them. Delete
+        # this line and profraw-stats.sh once a run's log has been read.
+        extra-test-commands: bash "${{ github.action_path }}/profraw-stats.sh"
         fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
         # fail-under-patch left unset → report-only initially
         # Where the baseline is looked up: the newest *successful* run of this
