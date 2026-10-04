@@ -1894,12 +1894,17 @@ is the revert that established what the other one costs.
    navigates the computed array it is applied to (`path(walk(.a?))` on `[1]`, `path(walk(.[]?))`
    on `[]`, a nested `path(walk(walk(empty)))` on `[]`): jq raises there, even through a `?`,
    and a by-value `walk` never checks `f`'s navigation
-   ([#3723](https://github.com/rust-works/succinctly/issues/3723)). And the always-raises group
-   (`from_entries`, `unique`, `with_entries`, ...) is still accepted as a `reduce`/`foreach`
-   *source* (`path(reduce unique as $x (.; .))` on `[1]` answers `[]`; jq exits 5), which
-   predates #3360 and covers the whole group
-   ([#3726](https://github.com/rust-works/succinctly/issues/3726)). Both rules are jq mode
-   only, like the rest of the table.
+   ([#3723](https://github.com/rust-works/succinctly/issues/3723)). The always-raises group
+   (`from_entries`, `unique`, `with_entries`, ...) used to be accepted as a `reduce`/`foreach`
+   *source* too (`path(reduce unique as $x (.; .))` on `[1]` answered `[]`, and `del(...)`/`=`/
+   `|=` over it went through; jq exits 5): a source with no navigation step of its own was
+   driven by value and never reached the check. #3726 closed it, in `drive_fold_source`: a
+   source holding any construct `live_path_refusal` classifies, anywhere in it, now goes through
+   the resolver. It is pinned by
+   `test_reduce_foreach_source_that_always_raises_raises_in_path_position_3726`
+   (`tests/jq_cli_tests.rs`), and the by-value half (the same fold over values answers) stays
+   as it was. Both rules are jq mode only, like the rest of the table (the yq side is pinned by
+   `test_yq_reduce_source_that_jq_refuses_in_path_position_still_answers_3726`).
 
    **#2746's own fix introduced one further, separate divergence, on the register rather
    than on navigation**: `INDEX(gen;f)` (and, until

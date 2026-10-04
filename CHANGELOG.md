@@ -620,6 +620,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a `reduce`/`foreach` source that jq always refuses in path position now raises** (#3726).
+  `from_entries`, `unique`, `unique_by`, `with_entries`, `map_values`, `sub`/`gsub`, `ascii_downcase`/
+  `ascii_upcase` and the `match` family iterate a container their own jq definition builds, so jq raises
+  `Invalid path expression near attempt to iterate through` wherever one runs in path position. They already
+  raised as a pipe stage, in a `[E]` collect, bare, and under `del`/`=`/`|=`, but a fold source with no
+  navigation step of its own was driven by value and never reached the check, so `path(reduce unique as $x (.;
+  .))` on `[1]` answered `[]`, `del(reduce unique as $x (.; .))` answered `null`, `(reduce unique as $x (.; .))
+  = 5` answered `5`, and a `try path(...) catch` never caught, where jq exits 5 or catches. A source holding one
+  of these constructs anywhere (a `[E]` collect, a comma, an `if` arm, `first(...)`) now goes through the
+  resolver. jq mode only, as the rule is: yq has no `reduce`/`foreach`/`path` to check against and keeps
+  answering. A source that never runs it still answers, as in jq (`{a: unique}` is a subexp, `empty | unique`,
+  `limit(0; unique)`, `true or unique`, an untaken `if` arm). Every row matches jq 1.7.1, and the 26 cells of the
+  issue's table (13 constructs, `reduce` and `foreach`) went from 26 mismatches to none.
+
 - **jq/yq: `recurse(.[]?)` visits every node instead of stopping silently at 10,000** (#3703). jq defines
   `def recurse: recurse(.[]?);`, so the explicit spelling is bare `recurse`, a walk bounded by the tree it
   walks, but the node cap meant for a parameterised `f` that can be unbounded (`recurse(.a)` on `null`)
