@@ -60528,39 +60528,316 @@ fn test_any_all_gen_cond_exhausted_register_stays_at_entry_3749() -> Result<()> 
     ])
 }
 
-/// #3749, what is still refused. The decisive result is stated only while
-/// `cond` provably cannot move jq's register (`cannot_move_register`'s
-/// allowlist), because `cond` runs by value here and the arm cannot say where
-/// it left the register. So a `cond` that navigates (`.a`: `or`'s left operand
-/// is not a subexp, so jq answers `[0,"a"]`) refuses, and so does one jq leaves
-/// in place that the allowlist cannot prove (`select(.)`, `first(.)`: jq
-/// answers `[0]`), a loss either way (#3757). And a plain pipe stage does not
-/// yet read the backtracked-register verdict `any`/`all`/`isempty` state, so a
-/// frozen `$x` after an exhausted `any` refuses where jq answers `[]` -- the
-/// same gap the by-value `any | $x` has (#3758). Pinned as the current
-/// refusals, on both routes, so lifting any is a deliberate change; the jq
-/// answers are in each row.
+/// #3757: jq runs an `any`/`all` `cond` as `or`'s (`and`'s) left operand in
+/// `isempty(first(gen | (cond or empty)))`, which is not a subexp, so it is
+/// path-checked: a navigating `cond` moves the register onto its own node, and a
+/// `cond` that navigates a computed element raises a path error. The arm ran
+/// `cond` by value and could see neither. A `cond` that is not on
+/// `cannot_move_register`'s allowlist is now resolved as a pipe stage on each
+/// branch `gen` produced, which is `gen | cond`: `path(any(.[]; .a))` on
+/// `[{"a":true}]` is `[0,"a"]`, `select(.)`, `first(.)`, `..` and a `def` leave the
+/// register, `del`/`=`/`|=` write there. Every row captured from jq 1.7.1, on the
+/// stdin and `-n` routes.
 #[test]
-fn test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749() -> Result<()> {
-    for (input, filter, jq_answer, expected) in [
+fn test_any_all_navigating_cond_states_the_register_it_left_3757() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
         (
             r#"[{"a":true}]"#,
             r"path(any(.[]; .a))",
-            r#"[0,"a"]"#,
-            "Invalid path expression with result true",
+            "[0,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":false}]"#,
+            r"path(all(.[]; .a))",
+            "[0,\"a\"]\n",
+            "",
+            0,
+        ),
+        (r#"[{"a":true}]"#, r"del(any(.[]; .a))", "[{}]\n", "", 0),
+        (
+            r#"{"x":{"a":true}}"#,
+            r"path(any(.[]; .a))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":{"b":true}}]"#,
+            r"path(any(.[]; .a.b))",
+            "[0,\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (r#"[{"a":true}]"#, r"path(any(.a))", "[0,\"a\"]\n", "", 0),
+        (
+            r#"[{"a":true}]"#,
+            r"[path(any(.a))]",
+            "[[0,\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r"(any(.[]; .a)) = 5",
+            "[{\"a\":5}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r"(any(.[]; .a)) |= not",
+            "[{\"a\":false}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":false},{"a":true}]"#,
+            r"path(any(.[]; .a))",
+            "[1,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":true,"b":false}]"#,
+            r"path(all(.[]; .a, .b))",
+            "[0,\"b\"]\n",
+            "",
+            0,
+        ),
+        (r"[[true]]", r"path(any(.[]; .[0]))", "[0,0]\n", "", 0),
+        (
+            r#"[{"a":true}]"#,
+            r"path(any(.[]; .a?))",
+            "[0,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":true}]"#,
+            r"path(any(.[]; (.a)))",
+            "[0,\"a\"]\n",
+            "",
+            0,
         ),
         (
             r"[true,false]",
             r"path(any(.[]; select(.)))",
-            "[0]",
-            "Invalid path expression with result true",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (r"[true,false]", r"path(any(.[]; first(.)))", "[0]\n", "", 0),
+        (
+            r"[true,false]",
+            r"path(any(.[]; limit(1; .)))",
+            "[0]\n",
+            "",
+            0,
         ),
         (
             r"[true,false]",
-            r"path(any(.[]; first(.)))",
-            "[0]",
-            "Invalid path expression with result true",
+            r"path(any(.[]; getpath([])))",
+            "[0]\n",
+            "",
+            0,
         ),
+        (r"[true,false]", r"path(any(.[]; ..))", "[0]\n", "", 0),
+        (r"[true,false]", r"path(any(.[]; recurse))", "[0]\n", "", 0),
+        (
+            r"[true,false]",
+            r"path(any(.[]; def f: .; f))",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (r"[true,false]", r"path(any(.[]; [.[]?]))", "[0]\n", "", 0),
+        (r"[true,false]", r"del(any(select(.)))", "[false]\n", "", 0),
+    ])
+}
+
+/// #3757, the dangerous direction: `cond` on a *computed* element raises jq's
+/// path error (`any(1; .[]?)` is `near attempt to iterate through 1`; a postfix
+/// `?` does not catch it), and `unique_by(.)` and an update assignment raise
+/// theirs, so a surrounding `or`, `//`, `$x` rebind or `try` no longer accepts and
+/// writes where jq exits 5 or, under `try`, leaves the document
+/// (`(try (all(tostring; .a?))) |= 5` on `true` is `true`). The last rows are the
+/// undecided direction: a `cond` outside the allowlist that ran and raised
+/// nothing leaves the register at the entry, as jq's backtrack does. Every row
+/// captured from jq 1.7.1, on the stdin and `-n` routes; jq words its refusals
+/// `near attempt to ...` where this sometimes says `with result`, so the message
+/// check is the prefix both share.
+#[test]
+fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":true}"#,
+            r"del(((any(1; .[]?))) // .a)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"true",
+            r"path(any(1; .[]?) or true)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (r"true", r"del(try (all(tostring; .a?)))", "true\n", "", 0),
+        (r"true", r"(try (all(tostring; .a?))) |= 5", "true\n", "", 0),
+        (
+            r"null",
+            r"del(. as $x | (any(1; .[]?)) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[[1],[1]]",
+            r"del(. as $x | (all(unique_by(.)) or .a) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"path(any(.a += 1))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | (any(1; .a) or 1) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | (isempty(any(1; .[]?)) and 1) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(any(1; .[]?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"try path(any(1; .[]?)) catch "caught""#,
+            "\"caught\"\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del(. as $x | (all(.a += 1) or .a) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | (any((.b)?) or 1) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | (any(try .b) or 1) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | (any(first?) or 1) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | (all(select(.)) or 1) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | (all(limit(1; .[]?)) or 1) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | (all(true or .a?) or 1) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[null]]",
+            r"del(. as $x | (any(.[0.5]) and 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"path(any(.a) or .b?)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r"[]",
+            r"del(. as $x | (any(.a) and .b?) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":null}]"#,
+            r"del(. as $x | (any(.a) and 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (r"[]", r"path(any(.a | tostring) or .b?)", "", "", 0),
+        (
+            r"[]",
+            r"del(. as $x | (any(.a += 1) and .b?) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3749/#3757, what is still refused where jq answers, in the safe direction. A
+/// plain pipe stage does not read the backtracked-register verdict that
+/// `any`/`all`/`isempty` state, so a frozen `$x` after one that decided or did
+/// not refuses where jq answers `[]`, and so does `isempty(g)` as a `cond`
+/// (`any(.[]; isempty(empty))` is `[0]`) -- the same stage gap, #3758. And a
+/// computed `true`/`false`/`null` is `jv_identical` to the register by kind in
+/// jq, so `any(true; .[0]?)` on `true` raises no path error there (the `?`
+/// catches the type error and it answers `[]` under an `or`), where the
+/// resolver does not model that exemption on a plain index and refuses. Pinned
+/// on both routes so lifting any is a deliberate change; the jq answers are in
+/// each row.
+#[test]
+fn test_any_all_pipe_stage_verdict_and_identity_residuals_stay_refused_3757() -> Result<()> {
+    for (input, filter, jq_answer, expected) in [
         (
             r#"{"a":false}"#,
             r"path(. as $x | any(.[]; .) | $x)",
@@ -60573,16 +60850,6 @@ fn test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749() -> R
             "[]",
             r#"Invalid path expression with result {"a":true}"#,
         ),
-        // The bare spellings (#3763) share both gaps: `any(f)` is the same
-        // `cond` allowlist (#3757), and a frozen `$x` after an `any`, `all` or
-        // `isempty` that decided or did not still meets the pipe stage that
-        // does not read their verdict (#3758).
-        (
-            r#"[{"a":true}]"#,
-            r"path(any(.a))",
-            r#"[0,"a"]"#,
-            "Invalid path expression with result true",
-        ),
         (
             r#"{"a":false,"b":null}"#,
             r"path(. as $x | any | $x)",
@@ -60594,6 +60861,18 @@ fn test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749() -> R
             r"path(. as $x | isempty(.[]?) | $x)",
             "[]",
             "Invalid path expression with result {}",
+        ),
+        (
+            r"[true,false]",
+            r"path(any(.[]; isempty(empty)))",
+            "[0]",
+            "Invalid path expression with result true",
+        ),
+        (
+            r"true",
+            r"path(any(true; .[0]?) or true)",
+            "[]",
+            "Invalid path expression near attempt to access element 0 of true",
         ),
     ] {
         let routes = [
