@@ -41967,6 +41967,11 @@ impl FoldRegister {
     /// result still equals the register's value kept every element; an empty
     /// array is a fresh `jv_array()` and a string slice a fresh string, so
     /// neither qualifies ([`slice_witnesses_node`]).
+    ///
+    /// A slice under a postfix `?` (`.[0:]?`) is the same step: the wrapper only
+    /// prunes a failure to slice, and a branch resolved under it carries
+    /// `Optional(Slice)`, so each component is read through [`strip_optional`]
+    /// (#3734), as [`slice_witnesses_node`] already does for the last one.
     fn whole_array_slice_of_register(&self, b: &PathBranch<'_>) -> bool {
         if !slice_witnesses_node(&b.path, &b.value)
             || !matches!(&self.value, OwnedValue::Array(items) if !items.is_empty())
@@ -41979,7 +41984,10 @@ impl FoldRegister {
             parent, component, ..
         } = cur
         {
-            if !matches!(component, Expr::Slice { .. } | Expr::SliceExpr { .. }) {
+            if !matches!(
+                strip_optional(component),
+                Expr::Slice { .. } | Expr::SliceExpr { .. }
+            ) {
                 return false;
             }
             if Rc::ptr_eq(parent, &self.path) || **parent == *self.path {
@@ -42389,6 +42397,22 @@ fn is_fold_source_navigation(e: &Expr) -> bool {
                     | Builtin::GetPath(_)
             )
     )
+}
+
+/// Whether a fold SOURCE moves jq's path register: [`is_fold_source_navigation`],
+/// plus the bare `first`/`last`/`nth(n)` builtins, which are `.[0]`/`.[-1]`/`.[n]`.
+/// [`drive_fold_source`] cannot count those (nothing there tells them from a
+/// computed value, #3459), but the whole-array-slice rule (#3504) can: it only
+/// ever *refuses more* when this says yes, and `reduce first as $a (.; .[0:])`
+/// is refused by jq (#3734).
+fn fold_source_moves_register(source: &Expr) -> bool {
+    any_subexpr(source, &mut |e| {
+        is_fold_source_navigation(e)
+            || matches!(
+                e,
+                Expr::Builtin(Builtin::First | Builtin::Last | Builtin::Nth(_))
+            )
+    })
 }
 
 /// Drive a `reduce`/`foreach` SOURCE **by demand** in path context,
@@ -44808,8 +44832,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // #3504: whether a whole-array slice may keep the accumulator on the
     // register -- only for a plain-variable pattern over a source that does
     // not navigate (jq's register has moved off the accumulator otherwise).
-    let slice_ok = matches!(patterns, [Pattern::Var(_)])
-        && !any_subexpr(input, &mut |e| is_navigation_node(e));
+    // #3734: "navigates" is the fold driver's own test, not the bind witness's
+    // narrower one, which misses a computed key (`.[1+1]`) and so let the
+    // slice rule accept `path(reduce .[1+1] as $a (.; .[0:]))` where jq refuses.
+    let slice_ok = matches!(patterns, [Pattern::Var(_)]) && !fold_source_moves_register(input);
     // INIT resolved first, before SOURCE (#2031, reordered from the
     // original #1467/#1872 shape): confirmed live against jq 1.7.1 (via
     // `debug`-instrumented INIT/SOURCE/UPDATE clauses) that real jq
