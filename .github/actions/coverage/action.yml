@@ -27,6 +27,14 @@ inputs:
       to skip the step (#3750).
     required: false
     default: '75'
+  pool-profile-files:
+    description: >-
+      'true' merges the raw profile files of the processes the tests spawn into a pool of a few files
+      per binary instead of leaving one file per process (30,814 files, 47 GiB per run on 2026-10-04),
+      by setting LLVM_PROFILE_FILE_NAME for the coverage run. The default 'false' keeps cargo-llvm-cov's
+      per-process files (#3750).
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -97,6 +105,14 @@ runs:
     # a before/after of anything else unreadable. Go back to `@v1` once the pooling
     # decision is made.
     - uses: action-works/omni-dev-coverage-check@99cb840f1a614c83b3839b9d67b3c5caee227ae1 # v1.3
+      env:
+        # #3750 B1. cargo-llvm-cov's `show-env` (which every step of the action evals)
+        # ignores a preset LLVM_PROFILE_FILE but honours this name, which replaces its
+        # default `<package>-%p-%Nm.profraw`. Dropping the `%p` is what pools: the
+        # processes of one binary then merge, at exit, into `%4m` = four files (the slot
+        # is pid % 4), sized for four test threads. An empty value is treated as unset
+        # (checked against cargo-llvm-cov 0.9.1), so 'false' keeps the default pattern.
+        LLVM_PROFILE_FILE_NAME: ${{ inputs.pool-profile-files == 'true' && 'profile-%4m.profraw' || '' }}
       with:
         # Pin; we're a consumer. Must stay >= 0.38.0: that release added the
         # declarative `.omni-dev/coverage.yaml` ignore-list (omni-dev#1398),
