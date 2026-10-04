@@ -2416,7 +2416,22 @@ is the revert that established what the other one costs.
    carrying to a fold's UPDATE/EXTRACT body, whose own route (`FoldRegister::resolve`) passed
    its register to `resolve_seq_sink` explicitly under a frame that carried none: `del(foreach .a as
    $v (.; try ($v \| .b); .))` on `{"a":{"b":1}}` echoed the document and now writes
-   `{"a":{}}`, as jq does. It does not reach a fold whose INIT is untracked *after a literal
+   `{"a":{}}`, as jq does.
+   [#3738](https://github.com/rust-works/succinctly/issues/3738) extends it to a body that holds
+   a generator (`.[]`, `..`) when the body is one chain of stages: the fold used to withhold
+   the register from any such body (`fans_out`), so `try ($w \| .a[])` resolved register-less,
+   the `try` caught its own refusal, and the UPDATE yielded nothing -- `del(foreach .x as $w
+   (0; try ($w \| .a[]); .))` echoed the document where jq empties `.x.a`, and `(...) = 9` skipped
+   the write. A chain has no sibling branch to withhold it from (`is_single_path_chain`: navigation,
+   `..`, the bound variable, parentheses, `?` and `try` with no handler, joined by `|`); every
+   other shape keeps the old verdict. A body that *branches* -- a comma, `//` or `and`/`or` around
+   a generator, a `catch` handler -- still answers nothing or refuses where jq answers
+   ([#3770](https://github.com/rust-works/succinctly/issues/3770)): widening the exemption needs the
+   fold's null-identity relocation fixed first, since on a `null` document it answers the root path
+   for those bodies and `(foreach .a? as $k (0; try (($k \| .[]?) // $k); .)) = 9` would overwrite
+   the whole document. Pinned by `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`
+   and, for what stays, `test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`.
+   It does not reach a fold whose INIT is untracked *after a literal
    stage* — that fold re-seeds its register from the ambient value, so the marker is not
    recognised at all (the pre-existing `literal-then-fold-untracked-init` /
    `carried-register-passthrough` class), and with a generator source the enclosing `try` then
