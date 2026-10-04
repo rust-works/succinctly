@@ -94326,8 +94326,8 @@ fn test_reduce_whole_array_slice_under_optional_is_the_register_3734() -> Result
             "",
             0,
         ),
-        // A fractional bound stays a computed `SliceExpr`: the same wrapper,
-        // a different slice node.
+        // A fractional bound goes through the computed-slice resolver route
+        // rather than the literal one; the wrapper it comes back under is the same.
         (
             r"[10,20,30]",
             r"path(reduce 1 as $x (.; .[0.5:]?))",
@@ -94400,6 +94400,14 @@ fn test_reduce_whole_array_slice_under_optional_is_the_register_3734() -> Result
             "Invalid path expression with result \"abc\"",
             5,
         ),
+        // A source with several elements carries the register through every step.
+        (
+            r"[[1],[2],[3]]",
+            r"path(reduce (1,2) as $x (.; .[0:]?))",
+            "[]\n",
+            "",
+            0,
+        ),
         // A navigating source or a destructuring/`?//` pattern moves jq's
         // register off the accumulator, so the slice refuses there.
         (
@@ -94416,7 +94424,100 @@ fn test_reduce_whole_array_slice_under_optional_is_the_register_3734() -> Result
             "Invalid path expression near attempt to access element",
             5,
         ),
+        // A pattern over a source that does not navigate isolates the pattern
+        // half of that gate: `[$a]` indexes, so the register has moved.
+        (
+            r"[[1],[2],[3]]",
+            r"path(reduce ([1]) as [$a] (.; .[0:]?))",
+            "",
+            "Invalid path expression near attempt to access element 0 of [1]",
+            5,
+        ),
+        // A *computed* navigating source (`.[1+1]`, `.[0:(1+1)]`) and a bare
+        // `first` move the register as much as `.[0]` does. The gate once asked
+        // only the bind witness's narrower question, so these answered `[]`,
+        // with and without `?`, where jq refuses; reads and writes alike.
+        (
+            r"[[1],[2],[3]]",
+            r"path(reduce .[1+1] as $a (.; .[0:]?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[[1],[2],[3]]",
+            r"path(reduce .[1+1] as $a (.; .[0:]))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[[1],[2],[3]]",
+            r"path(reduce .[0:(1+1)] as $a (.; .[0:]?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[[1],[2],[3]]",
+            r"path(reduce first as $a (.; .[0:]?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[[1],[2],[3]]",
+            r"path(reduce first as $a (.; .[0:]))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[[1],[2],[3]]",
+            r"del(reduce .[1+1] as $a (.; .[0:]?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[[1],[2],[3]]",
+            r"(reduce .[1+1] as $a (.; .[0:]?)) = 9",
+            "",
+            "Invalid path expression",
+            5,
+        ),
     ])
+}
+
+/// #3734: what the `?` fix does not reach. A `?` over a *group* of slices
+/// resolves to one `Optional(Pipe([Slice, Slice]))` component, not two
+/// wrapped steps, so the chain walk still refuses it; jq answers `[]`, as it
+/// does for the unwrapped `(.[0:] | .[0:])`. Refuse-only (the safe direction),
+/// pinned here so closing it is a visible edit.
+#[test]
+fn test_reduce_whole_array_slice_group_under_optional_stays_refuse_only_3734() -> Result<()> {
+    // jq 1.7.1: `[]`, exit 0.
+    assert_path_rows_3289(&[(
+        r"[10,20,30]",
+        r"path(reduce 1 as $x (.; (.[0:] | .[0:])))",
+        "[]\n",
+        "",
+        0,
+    )])?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r"path(reduce 1 as $x (.; (.[0:] | .[0:])?))"],
+        Some(r"[10,20,30]"),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("", 5),
+        "answers now ({stderr:?}): move it to the accepting test"
+    );
+    assert!(
+        stderr.contains("Invalid path expression with result [10,20,30]"),
+        "{stderr:?}"
+    );
+    Ok(())
 }
 
 /// #3519 (mechanism 3): a fractional literal index or slice bound stays a
