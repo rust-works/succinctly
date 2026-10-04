@@ -44,6 +44,10 @@ find "$dir" -maxdepth 2 -name '*.profraw' -exec wc -c {} + 2>/dev/null |
 
 n=$(wc -l <"$list" | tr -d ' ')
 echo "dir: $dir"
+# What pattern this run's processes were told to write (#3750 B1): the second line
+# is only set when the action's `pool-profile-files` env reached the inner steps.
+echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE-<unset>}"
+echo "LLVM_PROFILE_FILE_NAME=${LLVM_PROFILE_FILE_NAME-<unset>}"
 if [ "$n" -eq 0 ]; then
   echo "no .profraw files found"
   echo "::endgroup::"
