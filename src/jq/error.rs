@@ -1165,10 +1165,10 @@ impl EvalError {
     /// with no state, so its whole accumulator is `null` from that path on.
     /// Never reaches the user -- `eval_update_impl` catches it at each path.
     pub(crate) fn update_collapse() -> Self {
-        Self::with_kind("update collapsed".to_string(), ErrorKind::UpdateCollapse)
+        Self::with_kind("update collapsed", ErrorKind::UpdateCollapse)
     }
 
-    /// Whether this is [`Self::update_collapse`] (#3663).
+    /// Whether this is the internal update-collapse signal (#3663).
     pub fn is_update_collapse(&self) -> bool {
         matches!(
             self.value,

@@ -28335,10 +28335,11 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         Ok(())
                     }
                     // #3663: `_modify`'s `reduce` ends with no state, so the
-                    // accumulator is `null` from here, with this path still
-                    // queued for the final `delpaths`.
+                    // whole accumulator -- the deletes queued by earlier
+                    // paths included -- is `null` from here; only this path
+                    // is queued again for the final `delpaths`.
                     Err(EvalEscape::Error(e)) if e.is_update_collapse() => {
-                        deletes.paths.truncate(pending_before);
+                        deletes.paths.clear();
                         deletes.record();
                         deletes.at.clear();
                         *result = OwnedValue::Null;
@@ -28521,6 +28522,7 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // #3663: see the streaming route above.
             Err(EvalEscape::Error(e)) if e.is_update_collapse() => {
                 if defer_deletes {
+                    deletes.paths.clear();
                     deletes.record();
                     deletes.at.clear();
                 }
@@ -80135,6 +80137,22 @@ mod tests {
                 r#"{"b":7}"#,
             ),
             (r#"{"a":5,"b":6}"#, format!("(.b, .a) |= {cond}"), "null"),
+            // The delete queued for `[0]` before the collapse is lost with
+            // the state; only the collapsing path's own delete survives.
+            (
+                "[1,2,5]",
+                format!(
+                    "(.[0], .[2], .[1]) |= (if . == 1 then empty elif . == 5 then {q} else 7 end)"
+                ),
+                "[null,7]",
+            ),
+            (
+                "[1,5]",
+                format!(
+                    "(.[0], .[1], .[0]) |= (if . == 1 then empty elif . == 5 then {q} else 7 end)"
+                ),
+                "[7]",
+            ),
         ] {
             let filter_expr = parse(&program).unwrap();
             let input = parse_complete_json(input, false).unwrap();
