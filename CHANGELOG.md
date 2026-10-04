@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a `foreach` UPDATE or EXTRACT that is a `try` around a chain with a generator no longer silently skips a write** (#3738).
+  `del(foreach .x as $w (0; try ($w | .a[]); .))` on `{"a":[{"b":1}],"x":{"a":[{"b":1}]}}` is `{"a":[{"b":1}],"x":{"a":[]}}`
+  in jq and echoed the document unchanged here (exit 0), and `(...) = 9` and `|= 9` skipped the write the same way;
+  `path(...)` printed nothing where jq prints `["x","a",0]`. The fold withheld jq's path register from any non-pipe body
+  that held a generator (`fans_out`), so `try ($w | .a[])` resolved register-less, the `try` caught the resulting refusal
+  as though jq had raised it, and the body yielded nothing. A body that is one chain of stages has no sibling branch to
+  withhold the register from, so it now keeps it (`is_single_path_chain`: a field, an index, a slice, `..`, `.[]`, the bound
+  variable, `.`, parentheses, `?` and `try` with no handler, joined by `|`); every other shape keeps the old verdict
+  (`getpath(...)`, a computed key even when literal, `select`, `first(...)`). The
+  rows that were silently skipped now match jq, including the ones where jq raises (`path(foreach .x as $w (0; try ($w |
+  .[]?); $w))`, a slice write). Bodies that branch (a comma, `//`, `and`/`or` around a generator, a `catch` handler) and
+  the non-branching shapes the allowlist does not name still answer nothing or refuse where jq answers (#3770); widening
+  the exemption needs the fold's null-identity relocation fixed first, since dropping the generator from `fans_out`
+  outright made `(foreach .a? as $k (0; try (($k | .[]?) // $k); .)) = 9` on `null` write `9` over the whole document.
+  Verified against jq 1.7.1: 33 pinned rows plus a characterization test for what stays; an oracle sweep of the new
+  `$k` operands (103,707 rows: 0 regressions, 90 rows now match), of every existing generator and fold operand over every
+  context (159,867 rows, identical to the parent) and of a 100,027-row seeded sample over every operand (0 regressions);
+  the fold-source sweep (83,328 cases, identical counts); and the fold-weighted bind-origin fuzz (8 seeds x 3,000 programs,
+  0 new divergences). Pinned by `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`.
+
+- **jq: `last(f)`'s wrappers and a `select`/type-filter stage keep jq's path register** (#3653).
+  `path(. as $x | 5 | select(.) | $x)` is `[]` in jq (and `del`, `=`, `|=` through such a `$x` write), but the resolver
+  dropped the register for every `select`/type-filter stage that followed a stage that stepped off it, and for any
+  wrapper around `last(f)`. `stage_leaves_register_in_place` now admits `last(f)`, `select(f)` and the nine type filters
+  as a pipe stage, read through `E?`, `try E` with no handler and `first(E)` (`last(.a)?`, `try numbers`,
+  `first(select(.))`): jq defines `select(f)` as `if f then . else empty end` with `f` in a subexp, and `last(f)` as a
+  `reduce`, so neither moves the register. jq mode only. Still refused where jq answers: `try ... catch`,
+  `limit`/`nth` around either, an `[E]` collect of a type filter, and either stage inside a compound stage (#3767).
+  Two older pins that recorded the refusal moved to the new test with jq's output. Found on the way, both older than
+  this change and pinned as characterization tests: `last($x)` under a `try` silently drops a write (#3766), and a
+  `foreach` EXTRACT ending in `limit(1; last(f))` answers the root path (#3769). Pinned by
+  `test_path_register_last_f_wrappers_and_select_keep_it_3653`.
+
 - **jq: `path(f)`'s own `?` arms no longer build the `Cannot iterate` error they drop for every
   scalar** (#3722, a #3689 follow-up). `path_walk_generic` and `path_step_generic` each have an
   `Expr::Optional` arm that stepped a scalar under a bare `.[]?` and dropped what it raised, except a

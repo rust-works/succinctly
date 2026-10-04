@@ -56,8 +56,8 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 1,430,000 rows (`--list-axes` prints the exact count:
-152 operands, each also swept as a bare pipe stage since #3361, across 27 contexts),
+**Size.** The full grid is about 2,059,000 rows (`--list-axes` prints the exact count:
+170 operands, each also swept as a bare pipe stage since #3361, across 37 contexts),
 which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
@@ -314,6 +314,31 @@ OPERANDS = [
     "booleans",
     "iterables",
     "scalars",
+    # (#3738) a fold's own loop variable used inside its UPDATE/EXTRACT, where the
+    # generator in the body (`.[]?`, `..`) used to make the fold decline to hand
+    # the body its register, so a `try` around it caught the resulting refusal
+    # and the UPDATE yielded nothing. The comma and `//` rows are the contrasts
+    # that must keep refusing (sibling branches see the register unevenly), and the
+    # Index/Slice chains that `is_single_path_chain` takes from `is_navigation_node`.
+    # A context that does not bind `$k` skips these rows (see `build_rows`).
+    "$k",
+    "($k | .[]?)",
+    "($k | ..)",
+    "($k | .[0])",
+    "($k | .a?)",
+    "($k | .[]? | .a?)",
+    "first($k | .[]?)",
+    "try ($k | .[]?)",
+    "try ($k | ..)",
+    "try ($k | .a)",
+    "($k, 1)",
+    "(($k | .[]?), $k)",
+    "($k | .[]?) // $k",
+    "($k | .[0] | .[]?)",
+    "($k | .[0:1])",
+    "($k | .[] | .[0:1])",
+    "try ($k | .a[0] | .[]?)",
+    "try ($k | .[] | .[0:1])",
     # (#3361) the rest of the by-value builtins jq defines over a backtracked
     # source or never lets touch the register: `walk(f)` and `map(f)` qualify
     # only for an `f` that navigates nothing (`walk(.a)` and `map(.a)` are the
@@ -435,6 +460,21 @@ CONTEXTS = [
     ("reduce-update-computed-key", "path(reduce .[1+1] as $k (.; {X}))"),
     ("reduce-update-first-source", "path(reduce first as $k (.; {X}))"),
     ("reduce-update-pattern", "path(reduce [1] as [$q] (.; {X}))"),
+    # (#3738) the fold's UPDATE under a `try`, with a source that navigates (so jq's
+    # register has moved) and EXTRACT either the loop variable or `.`; the plain
+    # row is the control without the `try`.
+    ("foreach-update-try-var", "path(foreach .a? as $k (0; try ({X}); $k))"),
+    ("foreach-update-try-dot", "path(foreach .a? as $k (0; try ({X}); .))"),
+    ("foreach-update-try-del", "del(foreach .a? as $k (0; try ({X}); .))"),
+    ("foreach-update-try-assign", "(foreach .a? as $k (0; try ({X}); .)) = 9"),
+    ("foreach-update-plain", "path(foreach .a? as $k (0; {X}; .))"),
+    # ...and the same body as the EXTRACT, and as a `reduce` UPDATE (every fold body
+    # goes through `FoldRegister::resolve_sink`).
+    ("foreach-extract-try-path", "path(foreach .a? as $k (0; .; try ({X})))"),
+    ("foreach-extract-try-del", "del(foreach .a? as $k (0; .; try ({X})))"),
+    ("foreach-extract-try-assign", "(foreach .a? as $k (0; .; try ({X}))) = 9"),
+    ("reduce-update-try-path", "path(reduce .a? as $k (0; try ({X})))"),
+    ("reduce-update-try-del", "del(reduce .a? as $k (0; try ({X})))"),
 ]
 
 # Long chains are the O(N^3) row: a timing axis, not a correctness one.
@@ -480,10 +520,16 @@ def build_rows(operands=None, stage_only=False):
     for operand in OPERANDS if operands is None else operands:
         for shape in shapes_for(operand, stage_only):
             for cname, template in CONTEXTS:
-                # An operand that names `$x` only means something where the context
-                # binds it; elsewhere jq and the build both fail to compile, a
-                # trivial MATCH that carries no signal (3.4% of the grid, #3653).
-                if "$x" in shape and "$x" not in template:
+                # An operand that uses `$x` or `$k` *free* only means something where the
+                # context binds it; elsewhere jq and the build both fail to compile, a
+                # trivial MATCH that carries no signal (3.4% of the grid, #3653; `$k` since
+                # #3738). An operand that binds its own (`reduce .[]? as $k ...`) is valid in
+                # every context and is never skipped: a substring test on `$k` alone dropped
+                # 15,120 such rows.
+                if any(
+                    v in shape and f"as {v}" not in shape and v not in template
+                    for v in ("$x", "$k")
+                ):
                     continue
                 program = template.replace("{X}", shape)
                 for doc in INPUTS:
