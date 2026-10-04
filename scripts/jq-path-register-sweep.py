@@ -162,6 +162,19 @@ OPERANDS = [
     # recursion, a comma, a `try` with a handler, and a pipe that navigates and
     # then computes.
     "(reduce .[]? as $k (.; .))",
+    # (#3710) a fold whose UPDATE computes: nothing in it moves the register, so a
+    # `$x` frozen before it still names the register after (`reduce 1 as $i (.;
+    # .a = $i) | $x.k` is `["k"]`). The contrasts jq raises on or this resolver
+    # still refuses: a SOURCE or INIT that navigates, a destructuring pattern.
+    "(reduce 1 as $i (.; .a = $i))",
+    "(reduce (1,2) as $i (.; 5))",
+    "(reduce 1 as $i (.; {a: 1}))",
+    "(reduce empty as $i (.; 5))",
+    "(reduce 1 as $i (.; del(.a)))",
+    "(reduce .[]? as $i (.; 5))",
+    "(reduce 1 as $i (.a; 5))",
+    "(reduce 1 as $i (.; .a))",
+    "(reduce 1 as [$i] (.; 5))",
     "(foreach .[]? as $k (.; .; .))",
     "(label $o | (.a, break $o))",
     "limit(2; .a, 1)",

@@ -41082,6 +41082,22 @@ fn patterns_all_bare(patterns: &[Pattern]) -> bool {
         .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
 }
 
+/// [`cannot_move_register`] for a `reduce`, shared with [`resolve_reduce`]'s
+/// final emission (#3710) so the two cannot disagree: a bare-variable pattern
+/// (a destructuring bind navigates, #2649) over a source, an `INIT` and an
+/// `UPDATE` none of which can move jq's register.
+fn reduce_cannot_move_register(
+    patterns: &[Pattern],
+    input: &Expr,
+    init: &Expr,
+    update: &Expr,
+) -> bool {
+    patterns_all_bare(patterns)
+        && cannot_move_register(input)
+        && cannot_move_register(init)
+        && cannot_move_register(update)
+}
+
 /// Whether evaluating `expr` as one pipe stage provably leaves jq's path
 /// register (`value_at_path`) exactly where it was (#1573).
 ///
@@ -41380,10 +41396,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
             // #2649's own reasoning: a destructuring pattern performs its
             // own tracked index steps while matching, which do move the
             // register (unlike a bare `$var` binding, which performs none).
-            patterns_all_bare(patterns)
-                && cannot_move_register(input)
-                && cannot_move_register(init)
-                && cannot_move_register(update)
+            reduce_cannot_move_register(patterns, input, init, update)
         }
         Expr::Foreach {
             input,
@@ -45024,6 +45037,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // #3734: "navigates" is the fold driver's own test, not the bind witness's
     // narrower one, which misses a computed key (`.[1+1]`) and so let the
     // slice rule accept `path(reduce .[1+1] as $a (.; .[0:]))` where jq refuses.
+    // #3710: a property of the `reduce`'s syntax, so answered once rather than per INIT fork.
+    let register_unmoved = S::TAG == EvalTag::Jq
+        && trackable
+        && reduce_cannot_move_register(patterns, input, init, update);
     let slice_ok = fold_slice_ok(patterns, input);
     // INIT resolved first, before SOURCE (#2031, reordered from the
     // original #1467/#1872 shape): confirmed live against jq 1.7.1 (via
@@ -45404,7 +45421,19 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // `identical()` must stay available here (see this call's own
         // surrounding doc comment for why a trackable-but-not-at-register
         // accumulator still needs it).
-        if sink(reg.relocate_one::<S>(final_branch, true)) == Demand::Stop {
+        let mut emitted = reg.relocate_one::<S>(final_branch, true);
+        // #3710: a computed accumulator is not the register, but when nothing in
+        // the fold can have moved it (`reduce_cannot_move_register`) jq's
+        // register is where the `reduce` entered, and the next pipe stage may
+        // still navigate from a variable frozen there (`path(. as $x | reduce
+        // (1) as $i (.; .a = $i) | $x.k)` is `["k"]`). The leaf states it, as
+        // every by-value leaf does ([`leaf_register`]); the stage then takes
+        // the stricter of that and its own verdict. A trackable entry only: an
+        // untracked one carries its register on the stage.
+        if register_unmoved && !emitted.trackable {
+            emitted = emitted.with_register(BranchRegister::Unmoved(Cow::Borrowed(value)));
+        }
+        if sink(emitted) == Demand::Stop {
             fork_outcome.stash(ResolveFlow::Stopped);
             return Demand::Stop;
         }
@@ -119505,15 +119534,16 @@ mod tests {
                 "path(.a | {b:1} | . as {b:$v} ?// $z | $z)",
                 Err(near("\"b\"", "{\"b\":1}")),
             ),
-            // Review: an opaque stage (`reduce`, a def call, `first(..)`)
-            // drops the carried register, so the walk has none and refuses
-            // unconditionally -- jq refuses the step too but retries onto
-            // `$v`; both refuse, differently worded (`main` echoed the
-            // document on the `del` twin, by the same ambient coincidence).
+            // Review: an opaque stage (a def call, `first(..)`) drops the carried
+            // register, so the walk has none and refuses unconditionally -- jq
+            // refuses the step too but retries onto `$v`; both refuse, differently
+            // worded (`main` echoed the document on the `del` twin, by the same
+            // ambient coincidence). A `reduce` is no longer one of them (#3710):
+            // it states its register, and the refusal is jq's own wording.
             (
                 "{\"a\":{\"b\":null}}",
                 "path(reduce 1 as $i (null; null) | . as [$v] ?// $v | $v)",
-                Err(near("0", "null")),
+                Err("Invalid path expression with result null".to_string()),
             ),
             // A nested pipe (inside `if`) carries no register, so with a
             // non-null register behind the literal it refuses as jq does...

@@ -648,6 +648,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a `reduce` that computes its accumulator leaves jq's path register where it entered** (#3710).
+  `path(. as $x | reduce (1) as $i (.; .a = $i) | $x.k)` on `{"k":1,"a":1}` is `["k"]` in jq (and so are `del`
+  and `=` through it): nothing in the fold navigates, so the register never moved, however the accumulator
+  changed. The `reduce` emission stated no register, so the next stage treated it as lost and refused. It now
+  states `Unmoved` when `reduce_cannot_move_register` (the predicate `cannot_move_register` already used for a
+  `reduce`) holds, jq mode, trackable entry. A navigating source or INIT, a destructuring pattern and a
+  navigating UPDATE still refuse. Swept with nine new `reduce` operands in `scripts/jq-path-register-sweep.py`
+  (74,547 rows: 0 regressions, `REFUSE_WRONG` 2,679 to 1,638, `ACCEPT_WRONG` unchanged at 2). Pinned by
+  `test_reduce_with_a_computing_update_leaves_the_register_3710`.
+
 - **jq: a `foreach` whose update is a full slice keeps its state on the register** (#3742).
   `path(foreach (1,2) as $x (.; .[0:]; .))` on `[10,20,30]` answered the first step and refused the second, where
   jq answers both: a slice that keeps every element of a non-empty array shares its parent's buffer, so `foreach`

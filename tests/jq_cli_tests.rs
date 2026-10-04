@@ -65371,21 +65371,14 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
-        // (`walk(.)` was one of these until #3361 and `reverse` until #3711:
-        // each backtracks its source, so it keeps the register and answers
-        // `["a"]` as jq does, pinned in
+        // (`walk(.)` was one of these until #3361, `reverse` until #3711 and a
+        // `reduce` that computes its accumulator until #3710: each leaves the
+        // register where it entered, so it answers `["a"]` as jq does, pinned in
         // `test_terminal_null_carve_out_keeps_its_answers_3579`; `rtrimstr` is
         // jq's too and still read as a loss)
         (
             r"null",
             r#"path(.a|rtrimstr("x")|null)"#,
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
-        (
-            r"null",
-            r"path(.a|reduce 1 as $i (.;5)|null)",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -65414,6 +65407,8 @@ fn test_terminal_null_carve_out_keeps_its_answers_3579() -> Result<()> {
         (r"null", r"path(.a|walk(.)|null)", "[\"a\"]\n", "", 0),
         // #3711: `reverse` is a collect that backtracks, so it keeps it too.
         (r"null", r"path(.a|reverse|null)", "[\"a\"]\n", "", 0),
+        // #3710: nothing in the `reduce` navigates, so it leaves the register on `.a`.
+        (r"null", r"path(.a|reduce 1 as $i (.;5)|null)", "[\"a\"]\n", "", 0),
         (r"null", r"path((.a | empty), null)", "[]\n", "", 0),
         (r"null", r"del(null)", "null\n", "", 0),
         (r"true", r"path(true)", "[]\n", "", 0),
@@ -81297,7 +81292,6 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         r#"del((. as $x | contains({"a":{}}) | $x | .a)?)"#,
         // And a value-position `?` around the whole write catches nothing.
         r#"[del(. as $x | contains({"a":{}}) | try ($x | .a))?]"#,
-        r"del(. as $x | reduce (1) as $i (.; 5) | try ($x | .k))",
         r"del(. as $x | foreach (1) as $i (.; 5) | try ($x | .k))",
         r"del(. as $x | (.zz // 5) | try ($x | .k))",
         r"del(. as $x | if .k then 5 else .a end | try ($x | .k))",
@@ -94424,6 +94418,116 @@ fn test_reduce_whole_array_slice_is_the_register_3504() -> Result<()> {
             "",
             "Invalid path expression",
             5,
+        ),
+    ])
+}
+
+/// #3710: a `reduce` none of whose parts can move jq's register leaves it where
+/// the `reduce` entered, whatever the accumulator became, so a `$x` frozen
+/// before it still names the register after (`reduce (1) as $i (.; .a = $i) |
+/// $x.k` is `["k"]`). The reduce's own emission states it, as every by-value
+/// leaf does. A navigating source or INIT, a destructuring pattern, and a UPDATE
+/// that navigates still refuse. Every row captured from jq 1.7.1.
+#[test]
+fn test_reduce_with_a_computing_update_leaves_the_register_3710() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"k":1,"a":1}"#,
+            r"path(. as $x | reduce (1) as $i (.; .a = $i) | $x.k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"k":1,"a":1}"#,
+            r"path(. as $x | reduce (1,2) as $i (.; .a = $i) | $x.k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"k":1,"a":1}"#,
+            r"path(. as $x | reduce (1) as $i (.; 5) | $x.k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"k":1,"a":1}"#,
+            r"path(. as $x | reduce empty as $i (.; 5) | $x.k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"k":1,"a":1}"#,
+            r"path(. as $x | reduce (1) as $i (.; .a = $i) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"k":1,"a":1}"#,
+            r"path(. as $x | [reduce (1) as $i (.; 5)] | $x.k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"k":1,"a":1}"#,
+            r"path(. as $x | reduce (1) as $i (.; .a = $i) | .k)",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r#"{"k":1,"a":1}"#,
+            r"path(. as $x | reduce (1) as $i (.a; 5) | $x.k)",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r#"{"k":1,"a":1}"#,
+            r"path(. as $x | reduce (1) as [$i] (.; 5) | $x.k)",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r#"{"k":1,"a":1}"#,
+            r"del(. as $x | reduce (1) as $i (.; .a = $i) | $x.k)",
+            "{\"a\":1}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"k":1,"a":1}"#,
+            r"(. as $x | reduce (1) as $i (.; 5) | $x.k) = 9",
+            "{\"k\":9,\"a\":1}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"del(. as $x | reduce (1) as $i (.; 5) | try ($x | .k))",
+            "{\"a\":{\"b\":1},\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"del(. as $x | reduce (1) as $i (.; 5) | try ($x | .zz))",
+            "{\"a\":{\"b\":1},\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"path(. as $x | reduce (1) as $i (.; 5) | try ($x | .k))",
+            "[\"k\"]\n",
+            "",
+            0,
         ),
     ])
 }

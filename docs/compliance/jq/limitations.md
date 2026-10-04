@@ -1193,8 +1193,11 @@ is the revert that established what the other one costs.
    in both tools. jq has more subexps than these four (a C-implemented builtin's arguments,
    so `path(. as $x \| contains({a:{}}) \| $x)` is `[]` in jq; `has` and `range` are named
    explicitly since [#3456](https://github.com/rust-works/succinctly/issues/3456)), and a
-   `reduce`/`foreach` stage or a `//` also leaves jq's register where it was on inputs this
-   predicate can't tell apart statically. Those still drop the register here. Before #3186 these refused, and under `try` the refusal was caught as if it
+   `foreach` stage or a `//` also leaves jq's register where it was on inputs this
+   predicate can't tell apart statically. Those still drop the register here. (A `reduce`
+   whose source, `INIT` and `UPDATE` cannot move it is no longer one of them:
+   [#3710](https://github.com/rust-works/succinctly/issues/3710) has it state its register, so
+   `path(. as $x \| reduce (1) as $i (.; .a = $i) \| $x.k)` is `["k"]` in both tools.) Before #3186 these refused, and under `try` the refusal was caught as if it
    were jq's own: `del(. as $v \| {k: .a} \| try ($v \| .[]?))` echoed the document where jq
    deletes every key. The register is also dropped **per stage, not per leaf**: a compound stage
    that mixes a leaf that navigates with one that does not (`(.a // 1)`, an `if` or a
@@ -1257,8 +1260,8 @@ is the revert that established what the other one costs.
    returns `{"k":1}`. A navigation refusal is now uncatchable when both hold:
 
    - a live register did not come out of a stage upstream that did not navigate (the stage is
-     one this resolver can't see inside, or its route hands back no register, like a `reduce`
-     stage);
+     one this resolver can't see inside, or its route hands back no register, like a `foreach`
+     stage or a `reduce` that navigates);
    - the value being refused is one jq could still have held as the register: a frozen
      `$var` snapshot or a `null`, equal to the lost register's last known value or to one
      inside it. jq's register only moves down from where it was lost, so a `$x` frozen from
@@ -1280,10 +1283,10 @@ is the revert that established what the other one costs.
    loudly, because the stage in between is opaque and might have moved the register there:
    - `del(.a as $y \| contains({z:1}) \| try ($y \| .b))` returns the document unchanged in jq, since
      `contains` left the register at the root, but `first(.a)` would have moved it onto `$y`;
-   - after a `reduce`/`foreach` stage, whose route hands back no register value, where the
-     register was lost isn't known at all, so every `$var` or `null` refusal after one is loud:
-     `path((.a \| ..) as $v0 \| reduce (1) as $i (.; $v0) \| ($v0 \| .b?)?)` is empty in jq
-     and refuses here.
+   - after a `foreach` stage or a `reduce` that navigates, whose route hands back no register
+     value, where the register was lost isn't known at all, so every `$var` or `null` refusal
+     after one is loud (a `reduce` that cannot move the register states it since
+     [#3710](https://github.com/rust-works/succinctly/issues/3710), and no longer refuses).
 
    A `def` call used to be a third, opaque-by-construction case here too (`del(. as $x \|
    (def f: .a; f) \| try ($x \| .k))` refused loudly where jq's own refusal is exact and
