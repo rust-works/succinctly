@@ -60264,6 +60264,336 @@ fn test_any_all_gen_cond_navigation_in_path_context_3349() -> Result<()> {
     Ok(())
 }
 
+/// #3749 (`-n` twin of [`assert_path_rows_3289`]): the same rows with the
+/// document as a literal, which runs the filter on the owned evaluator
+/// (`eval.rs`) instead of the cursor one the stdin rows take.
+fn assert_path_rows_both_routes_3749(rows: &[PathRow3289]) -> Result<()> {
+    assert_path_rows_3289(rows)?;
+    for &(input, filter, stdout, message, exit) in rows {
+        let program = format!("{input} | {filter}");
+        let (out, err, code) = run_jq_full(&["-nc", &program], None)?;
+        assert_eq!(
+            (out.as_str(), code),
+            (stdout, exit),
+            "`{program}` (-n): stderr {err:?}"
+        );
+        if message.is_empty() {
+            assert!(
+                err.is_empty(),
+                "`{program}` (-n): unexpected stderr {err:?}"
+            );
+        } else {
+            assert!(
+                err.contains(message),
+                "`{program}` (-n): stderr {err:?} lacks {message:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3749: `any(gen; cond)`/`all(gen; cond)` emit their boolean from inside
+/// `gen` when an element decides, so jq's path register is wherever `gen` left
+/// it, and `path()` accepts a result that is `jv_identical` to the register's
+/// value -- which for a boolean is any equal boolean. `any(.[]; .)` on
+/// `[true,false]` is `[0]`; `[1,2]` and `[null]` refuse (a truthy `1` is not
+/// `true`, `null` is not `false`), and so does a generator that never
+/// decided, whose register is back at the whole array. A later stage
+/// navigates natively from the accepted position (`| .b?` is empty, `| .x` is
+/// jq's own index error), and the write side lands on it. Every row captured
+/// from jq 1.7.1.
+#[test]
+fn test_any_all_gen_cond_decisive_result_sits_at_the_register_3749() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (r"[true,false]", r"path(any(.[]; .))", "[0]\n", "", 0),
+        (r"[true,false]", r"path(all(.[]; .))", "[1]\n", "", 0),
+        (r"[true,false]", r"del(any(.[]; .))", "[false]\n", "", 0),
+        (r"[true]", r"[path(any(.[]; .)?)]", "[[0]]\n", "", 0),
+        (r#"{"a":true}"#, r"path(any(.[]; .))", "[\"a\"]\n", "", 0),
+        (r"[false]", r"path(all(.[]; .))", "[0]\n", "", 0),
+        (
+            r#"{"a":[true,false]}"#,
+            r"path(any(.a[]; .))",
+            "[\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[true,false]}"#,
+            r"path(.a | any(.[]; .))",
+            "[\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[false],[true]]",
+            r"path(any(.[][]; .))",
+            "[1,0]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[true],[false]]",
+            r"path(all(.[][]; .))",
+            "[1,0]\n",
+            "",
+            0,
+        ),
+        (r"[true,false]", r"path(any(.[]; true))", "[0]\n", "", 0),
+        (r"[false,false]", r"path(all(.[]; false))", "[0]\n", "", 0),
+        (r"[true]", r"path(any(.[]; . == true))", "[0]\n", "", 0),
+        (
+            r"[true,false]",
+            r"[path(any(.[]; .), .[1])]",
+            "[[0],[1]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[true,false],[false]]",
+            r"[path(.[] | any(.[]; .))]",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"[[true,false],[false]]",
+            r"[path(.[] | all(.[]; .))]",
+            "[[0,1],[1,0]]\n",
+            "",
+            0,
+        ),
+        (r#"{"a":true}"#, r"path(any(.[]; .) | .b?)", "", "", 0),
+        (r"[true]", r"path(any(.[]; .) | .[0]?)", "", "", 0),
+        (
+            r"[true]",
+            r"path(any(.[]; .) | .x)",
+            "",
+            r#"Cannot index boolean with string "x""#,
+            5,
+        ),
+        (
+            r"[true]",
+            r#"try path(any(.[]; .) | .x) catch "caught""#,
+            "\"caught\"\n",
+            "",
+            0,
+        ),
+        (r"[true,false]", r"(any(.[]; .)) = 5", "[5,false]\n", "", 0),
+        (r"[false,true]", r"(all(.[]; .)) = 5", "[5,true]\n", "", 0),
+        (r"[true,false]", r"(all(.[]; .)) |= 5", "[true,5]\n", "", 0),
+        (
+            r"[1,2]",
+            r"path(any(.[]; .))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[null]",
+            r"path(all(.[]; .))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"[null,false]",
+            r"path(all(.[]; .))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(any(.[]; . == 1))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[1]",
+            r#"try path(any(.[]; .)) catch "caught""#,
+            "\"caught\"\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[path(any(.[]; .)?)]",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[false,false]",
+            r"path(any(.[]; .))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"[true,true]",
+            r"path(all(.[]; .))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(any(.[]; .))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(all(.[]; .))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+    ])
+}
+
+/// #3749: a generator that produced no deciding element backtracked every
+/// branch it explored, so jq's register is back where `any`/`all` entered and
+/// the boolean they compute is read there (`isempty`'s rule, #3456). The
+/// `and`/`or` arms are what observe it: their right operand runs on the
+/// restored input with the register wherever the left one left it, so
+/// `any(.[]; .) or .a` on `{"a":false}` is `["a"]` (the right operand's `.a`
+/// navigates from the register at the root), where a lost register refused.
+/// A decided `any` composes the same way, through the position it stopped at.
+/// Every row captured from jq 1.7.1.
+#[test]
+fn test_any_all_gen_cond_exhausted_register_stays_at_entry_3749() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":false}"#,
+            r"path(any(.[]; .) or .a)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(all(.[]; .) and .a)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false,"b":false}"#,
+            r"path(any(.[]; .) or .b)",
+            "[\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"b":true}"#,
+            r"path(all(.[]; .) and .b)",
+            "[\"b\"]\n",
+            "",
+            0,
+        ),
+        (r#"{"a":false}"#, r"del(any(.[]; .) or .a)", "{}\n", "", 0),
+        (r#"{"a":true}"#, r"del(all(.[]; .) and .a)", "{}\n", "", 0),
+        (
+            r#"{"a":true}"#,
+            r"path(any(.[]; .) or .a)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(all(.[]; .) and .a)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(any(.[]; .) or .a)",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+    ])
+}
+
+/// #3749, what is still refused: a `cond` that navigates moves jq's register
+/// itself (`or`'s left operand is not a subexp), so the register after
+/// `any(.[]; .a)` is on `.a` of the element and jq answers `[0,"a"]`; this
+/// arm runs `cond` by value and cannot say where it left the register, so it
+/// stays a loss and refuses (#3757). And a plain pipe stage does not yet read the
+/// backtracked-register verdict `any`/`all`/`isempty` state, so a frozen
+/// `$x` after an exhausted `any` refuses where jq answers `[]` -- the same
+/// gap the by-value `any | $x` has (#3758). Pinned as the current
+/// refusals so lifting either is a deliberate change; the jq answers are in
+/// each row.
+#[test]
+fn test_any_all_gen_cond_navigating_cond_and_pipe_stage_stay_refused_3749() -> Result<()> {
+    for (input, filter, jq_answer, expected) in [
+        (
+            r#"[{"a":true}]"#,
+            r"path(any(.[]; .a))",
+            r#"[0,"a"]"#,
+            "Invalid path expression with result true",
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any(.[]; .) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":false}"#,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | all(.[]; .) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":true}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "`{filter}` on {input} (jq answers {jq_answer}): stderr {stderr:?}"
+        );
+        assert!(
+            stderr.contains(expected),
+            "`{filter}` on {input}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3749, yq mode: the register verdict is jq mode only (ADR-0018). Real yq
+/// rejects the two-argument `any(gen; cond)` as a bad expression, so under
+/// `--jq-extensions` it is succinctly's own surface with no oracle, and a
+/// write through it still raises exactly as it did before the jq-mode rule.
+#[test]
+fn test_any_all_gen_cond_register_verdict_is_jq_mode_only_3749() -> Result<()> {
+    for filter in ["del(any(.[]; .))", "del(all(.[]; .))"] {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut cmd = Command::new(succinctly_bin());
+                cmd.arg("yq").args(["--jq-extensions", filter]);
+                cmd
+            },
+            Some(b"[true, false]\n"),
+        )?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert_eq!(stdout, "", "{filter}");
+        assert!(
+            stderr.contains("Invalid path expression with result"),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2746: `INDEX(gen;f)`'s own `idx_expr` error aborts the whole
 /// construction with no partial object, matching `reduce`'s "only the final
 /// value is observable" semantics -- the same rule `build_upper_index`'s own

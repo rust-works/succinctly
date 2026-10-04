@@ -37864,11 +37864,26 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // value is probed with `cond` exactly as value mode probes it
         // ([`any_all_probe_element`]), and the first decisive element stops
         // `gen`. `cond` itself runs by value, as in jq's `isempty(first(gen |
-        // cond or empty))` desugar, where `cond` is not a path position. The
-        // result is a computed boolean, never a path into the document.
+        // cond or empty))` desugar, where `cond` is not a path position.
+        //
+        // #3749: the result is a computed boolean, but jq's register is not
+        // where this arm entered, and `path()` accepts a result that is
+        // identical to it. A decisive element is emitted from inside `gen`,
+        // so the register is wherever `gen` left it, and `any(.[]; .)` on
+        // `[true,false]` is `[0]`: `true` is identical to the element it
+        // stopped at ([`register_after`], [`computed_at_register`], the
+        // `and`/`or` arms' rule). That holds only while `cond` cannot move
+        // the register itself (`any(.[]; .a)` is `[0,"a"]` in jq, which this
+        // arm still refuses), so a `cond` that might is a loss as before. A
+        // generator that produced no decisive element backtracked every
+        // branch, so the register is where the arm entered, like `isempty`.
+        // Both are jq mode only (ADR-0018), like the by-value leaf's verdict.
         Expr::Builtin(builtin @ (Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond))) => {
             let target_truthy = matches!(builtin, Builtin::AnyCond(..));
+            let states_register = S::TAG == EvalTag::Jq;
+            let cond_keeps_register = states_register && cannot_move_register(cond);
             let mut decided = false;
+            let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
             let mut probe_escape: Option<Control> = None;
             let flow = resolve_node_sink::<S>(
                 gen,
@@ -37880,6 +37895,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 &mut |branch| match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
                     Ok(true) => {
                         decided = true;
+                        if cond_keeps_register {
+                            decided_at = Some(register_after(gen, branch, frame));
+                        }
                         Demand::Stop
                     }
                     Ok(false) => Demand::Continue,
@@ -37889,17 +37907,23 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             if let Some(control) = probe_escape {
                 return ResolveFlow::Escaped(EvalEscape::from(control));
             }
-            let answer = if decided {
+            let answer = OwnedValue::Bool(if decided {
                 target_truthy
             } else {
                 !target_truthy
+            });
+            let result = match decided_at {
+                Some((path, register)) => computed_at_register(answer, path, register),
+                None => untracked_at_register(
+                    Cow::Owned(answer),
+                    if states_register && trackable && !decided {
+                        BranchRegister::Unmoved(Cow::Borrowed(value))
+                    } else {
+                        drained_register::<S>(trackable, value)
+                    },
+                ),
             };
-            forward_drained_result(
-                flow,
-                OwnedValue::Bool(answer),
-                drained_register::<S>(trackable, value),
-                sink,
-            )
+            forward_drained_branch(flow, result, sink)
         }
 
         Expr::Builtin(Builtin::UpperIndexStream(stream, idx_expr)) => {
@@ -40620,15 +40644,28 @@ fn forward_drained_result<'a>(
     register: BranchRegister<'a>,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    forward_drained_branch(
+        flow,
+        untracked_at_register(Cow::Owned(computed), register),
+        sink,
+    )
+}
+
+/// [`forward_drained_result`] for an arm that built the branch itself: the
+/// `any(gen; cond)`/`all(gen; cond)` arm emits its boolean at the register
+/// the decisive element left (#3749), which is not an untracked branch at the
+/// root.
+fn forward_drained_branch<'a>(
+    flow: ResolveFlow,
+    result: PathBranch<'a>,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
     match flow {
         ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
-        ResolveFlow::Exhausted | ResolveFlow::Stopped => {
-            let result = untracked_at_register(Cow::Owned(computed), register);
-            match sink(result) {
-                Demand::Continue => ResolveFlow::Exhausted,
-                Demand::Stop => ResolveFlow::Stopped,
-            }
-        }
+        ResolveFlow::Exhausted | ResolveFlow::Stopped => match sink(result) {
+            Demand::Continue => ResolveFlow::Exhausted,
+            Demand::Stop => ResolveFlow::Stopped,
+        },
     }
 }
 
