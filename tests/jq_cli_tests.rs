@@ -63218,6 +63218,468 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
     ])
 }
 
+/// #3653: the register `last(f)` leaves in place (#3643) survives the wrappers
+/// jq passes it through, and a `select(f)` / type-filter stage leaves it where
+/// the stage entered. `E?` and `try E` touch neither the path nor
+/// `value_at_path`; `first(E)` emits from inside `E`, where `last` left the
+/// register back where it entered; `select(f)` is `if f then . else empty end`
+/// and an `if` condition is a subexp, so `f` navigates nothing as far as the
+/// register is concerned, and every type filter is a `select` over a type test.
+/// Every row captured from jq 1.7.1 with `-c` on `{"a":{"b":1},"k":2}`; the
+/// rows under "Still refused where jq answers" pin this resolver's refusal where
+/// jq answers `[]` (exit 0), so they are the one group that is not jq's output.
+///
+/// The `select` rows enter the stage on an *untracked* value (a literal ran
+/// first), the only entry where the register is carried by the pipe and a stage
+/// outside the allowlist drops it. Entered on the register itself, a `select`
+/// already passed a trackable branch straight through.
+#[test]
+fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"k":2}"#;
+    let with_root = "Invalid path expression with result";
+    assert_path_rows_3289(&[
+        // `last(f)` through `?`, `try` (no handler) and `first(...)`.
+        (doc, r"path(. as $x | last(.a)? | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | (last(.a))? | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | try last(.a) | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | first(last(.a)) | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | first(last(.a))? | $x)", "[]\n", "", 0),
+        // `select(f)` after a stage that stepped off the register: a constant,
+        // an object construction, a `last`, and a condition that navigates.
+        (doc, r"path(. as $x | 5 | select(.) | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r#"path(. as $x | {"k":1} | select(.) | $x)"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | last(.a) | select(.) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | last(.a) | select(.b) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | {a:{b:1}} | select(.a.b) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | first(last(.a)) | select(.) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | last(.a) | select(.) | select(.b) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A condition that is false prunes the branch, and a generator
+        // condition forks it once per truthy output, each at the register.
+        (doc, r"path(. as $x | 5 | select(false) | $x)", "", "", 0),
+        (
+            doc,
+            r"path(. as $x | 5 | select((true,true)) | $x)",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        // Each type filter is a `select`: it keeps the register when the value
+        // is of the type and prunes the branch when it is not.
+        (doc, r"path(. as $x | 5 | numbers | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | null | nulls | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | [1] | arrays | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | true | booleans | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | scalars | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | last(.a) | objects | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r#"path(. as $x | "s" | strings | $x)"#, "[]\n", "", 0),
+        (doc, r"path(. as $x | [1] | iterables | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | values | $x)", "[]\n", "", 0),
+        // ...and a value of another type prunes it, leaving nothing to refuse.
+        (doc, r"path(. as $x | 5 | strings | $x)", "", "", 0),
+        (doc, r"path(. as $x | 5 | iterables | $x)", "", "", 0),
+        (doc, r"path(. as $x | null | values | $x)", "", "", 0),
+        // `$x` frozen at the root is the register again, so a navigation off it
+        // is a path, and below the root the register is still on `.a`.
+        (
+            doc,
+            r"path(. as $x | 5 | select(.) | $x | .k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.a | . as $x | 5 | select(.) | $x)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(.a | . as $x | last(.b) | select(.) | $x)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // #3272's nested pipe: `..`'s first output is its seed, which leaves the
+        // register where it was, and a `select` after it keeps it, so the seed is
+        // answered `[]` before the `.[]?` below it raises, as in jq.
+        (
+            r#"{"a":{"b":{"b":null}},"c":2}"#,
+            r"path(. as $x | 1 | (.. | select(true)) | $x)",
+            "[]\n",
+            "near attempt to iterate through 1",
+            5,
+        ),
+        // #3579's `select(true)` rows. A terminal `null` after a navigation was
+        // refused loudly there because a `select` stage dropped the register and
+        // the resolver could not say which node it was on. jq answers each, and
+        // so does a `select` that keeps it; the rows that still cannot be
+        // located (`first(7)` and friends) stay refused in
+        // `test_terminal_null_after_a_navigation_refuses_loudly_3579`.
+        (
+            "null",
+            r"path(.a | 5 | select(true) | null)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | select(true) | null)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"path(.a.b | 5 | select(true) | null)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"(.a | 5 | select(true) | null) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"(.a | 5 | select(true) | null) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"(.a.b | 5 | select(true) | null) = 9",
+            "{\"a\":{\"b\":9}}\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"del((.a | 5 | select(true) | null)?)",
+            "null\n",
+            "",
+            0,
+        ),
+        // The wrappers read through for `select` and the type filters too: `?`,
+        // `try` with no handler and `first(...)`.
+        (doc, r"path(. as $x | 5 | select(.)? | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | (select(.))? | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | 5 | try select(.) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | first(select(.)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | first(select(.))? | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(. as $x | 5 | (numbers)? | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | try numbers | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | 5 | first(numbers) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A `select` hands its input through as the very value it received, so a
+        // `$x` that reaches it is still the register afterwards and the
+        // navigation below it is a path, not a refusal a `try` could catch.
+        (
+            doc,
+            r"del(. as $x | try (5 | select(.) | $x | .k))",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | try (5 | $x | select(.) | .k)) = 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | 5 | select(.)? | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        // The write goes through for every wrapper and for `select`.
+        (
+            doc,
+            r"del(. as $x | 5 | select(.) | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | last(.a) | select(.) | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | last(.a)? | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | first(last(.a)) | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | 5 | select(.) | $x.k) = 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | 5 | select(.) | $x.k) |= 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        // Contrasts jq refuses too: the register moved before the `select`, so
+        // a `$x` frozen at the root is not it, and a navigation off a
+        // by-value result is checked against a register that is not on it.
+        (
+            doc,
+            r"path(. as $x | .a | select(.) | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | .a | last(.b) | select(.) | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | select(.) | .a)",
+            "",
+            r#"near attempt to access element "a" of 5"#,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | last(.a) | select(.) | .b)",
+            "",
+            r#"near attempt to access element "b" of {"b":1}"#,
+            5,
+        ),
+        (
+            doc,
+            r"del(. as $x | .a | select(.) | $x.k)",
+            "",
+            r#"near attempt to access element "k""#,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | .a | select(.)? | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | .a | first(select(.)) | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        // A wrapper around a `f` that navigates still moves the register: only
+        // a `last` leaves it where it entered.
+        (doc, r"path(. as $x | first(.a)? | $x)", "", with_root, 5),
+        (doc, r"path(. as $x | (.a)? | $x)", "", with_root, 5),
+        (doc, r"path(. as $x | try .a | $x)", "", with_root, 5),
+        (
+            doc,
+            r"path(. as $x | first(first(.a)) | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        // Still refused where jq answers `[]`: a `catch` handler runs on a
+        // caught error's payload, and `limit`/`nth` around a `last` are wrappers
+        // of their own. Pinned as today's (refuse-only) behaviour so lifting
+        // either is a deliberate change with rows of its own.
+        (
+            doc,
+            r"path(. as $x | try last(.a) catch . | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | limit(1; last(.a)) | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | nth(0; last(.a)) | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        // The same holds for `select`: a handler, a `limit` and an `[E]` collect
+        // of a type filter (the array allowlist names `select` but not the nine
+        // type filters) are still refused where jq answers `[]`.
+        (
+            doc,
+            r"path(. as $x | 5 | try select(.) catch . | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | limit(1; select(.)) | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (doc, r"path(. as $x | 5 | [numbers] | $x)", "", with_root, 5),
+    ])
+}
+
+/// #3766, characterization of a pre-existing bug: `last(f)` returns a copy of its
+/// output, so a `last` whose output *is* the register (`last($x)`, `last(.)`)
+/// loses its identity, and a `try` around the next navigation then catches a
+/// refusal jq never raises and drops the write with exit 0. jq 1.7.1 answers
+/// `{"a":9}` and `{}`. Verified identical on `main` before #3653 (which only
+/// extends where the register is carried across the wrappers), so this pins an
+/// existing defect rather than a regression. If #3766 is fixed, update the
+/// expectations to jq's answers.
+#[test]
+fn test_last_of_the_register_under_try_drops_the_write_characterize_preexisting_bug_3766(
+) -> Result<()> {
+    let doc = r#"{"a":1}"#;
+    for (filter, jq_answers, today) in [
+        (
+            r"(. as $x | try (last($x) | .a)) = 9",
+            "{\"a\":9}\n",
+            "{\"a\":1}\n",
+        ),
+        (r"del(. as $x | try (last($x) | .a))", "{}\n", "{\"a\":1}\n"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (today, 0),
+            "`{filter}` changed (jq answers {jq_answers:?}): if #3766 is fixed, update this pin; stderr {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3769, characterization of a pre-existing bug: a `foreach` whose EXTRACT
+/// navigates and then ends in `limit(1; last(f))` answers the root path, so a
+/// write through it replaces the whole document (exit 0). jq 1.7.1 answers
+/// `["a"]` twice and `{"a":9}`. Verified identical on `main` before #3653. If
+/// #3769 is fixed, update the expectations to jq's answers.
+#[test]
+fn test_foreach_extract_ending_in_limit_last_answers_the_root_characterize_preexisting_bug_3769(
+) -> Result<()> {
+    let extract = ".a? | limit(1; last(.a?))";
+    for (filter, jq_answers, today) in [
+        (
+            format!("path(foreach (1,2) as $i (.; .; {extract}))"),
+            "[\"a\"]\n[\"a\"]\n",
+            "[]\n[]\n",
+        ),
+        (
+            format!("(foreach (1,2) as $i (.; .; {extract})) = 9"),
+            "{\"a\":9}\n",
+            "9\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (today, 0),
+            "`{filter}` changed (jq answers {jq_answers:?}): if #3769 is fixed, update this pin; stderr {err:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3361: `add`, `flatten`, `map(f)` and `walk(f)` are jq-defined over a
 /// source they backtrack (`reduce .[] as $x ...`, `[.[] | f]`), `to_entries`
 /// keeps every step inside an `as` source or an object construction, and `sort`
@@ -66179,7 +66641,10 @@ fn assert_rows_3579(rows: &[(&str, &str, &str, &str, i32)]) -> Result<()> {
 /// message. The rows pin this resolver's *current refusal*, which must be loud
 /// everywhere. The first 19 answered silently on `main`, 15 of them wrongly. The
 /// refusal is the resolver's guess, not jq's verdict, so no `try`, `?` or
-/// `catch` turns it into a dropped write (#3267, ADR-0018 rule 4).
+/// `catch` turns it into a dropped write (#3267, ADR-0018 rule 4). The rows over
+/// a `select(true)` stage moved to
+/// `test_path_register_last_f_wrappers_and_select_keep_it_3653` once a `select`
+/// stage kept the register: they are answered now, exactly as jq answers them.
 #[test]
 fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
     assert_rows_3579(&[
@@ -66254,34 +66719,6 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
-        (
-            r"null",
-            r"(.a | 5 | select(true) | null) = 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
-        (
-            r"null",
-            r"(.a | 5 | select(true) | null) |= 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
-        (
-            r"null",
-            r"path(.a | 5 | select(true) | null)",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
-        (
-            r"null",
-            r"(.a.b | 5 | select(true) | null) = 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
         // a guess, not jq's verdict, so no `try`, `?` or `catch` turns it into a dropped write (jq writes there)
         (
             r"null",
@@ -66300,13 +66737,6 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
         (
             r"null",
             r#"try path(.a as $x | .a | 5 | first(7) | $x) catch "C""#,
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
-        (
-            r"null",
-            r"del((.a | 5 | select(true) | null)?)",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -82771,7 +83201,9 @@ fn test_recurse_seed_rule_leaves_other_shapes_unchanged_3272() -> Result<()> {
 
 /// #3272, residuals: shapes whose first output is not *provably* the recursion's
 /// seed stay refuse-only (`first(..)`, `limit(n; ..)`, a fork, a nested pipe,
-/// `//`: naming a call's body is what `cannot_move_register` declines to do),
+/// `//`: naming a call's body is what `cannot_move_register` declines to do;
+/// a nested pipe whose later stage is a `select` is answered since #3653,
+/// `test_path_register_last_f_wrappers_and_select_keep_it_3653`),
 /// and so does the output a `catch` handler adds after the seed. jq answers
 /// each read form; the rows pin the *current* refusal, and every write form
 /// must exit non-zero -- never 0 with the document unchanged, which is the
@@ -82784,7 +83216,6 @@ fn test_recurse_seed_residuals_stay_loud_3272() -> Result<()> {
         (r"path(. as $x | 1 | limit(2; ..) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | (., ..) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | if true then .. else 1 end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
-        (r"path(. as $x | 1 | (.. | select(true)) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | (try ..) // 3 | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         // jq: [] twice -- the handler's output is a second one, and that one still refuses
         (r"path(. as $x | 1 | try recurse(.a) catch 7 | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),

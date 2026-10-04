@@ -56,8 +56,8 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 919,000 rows (`--list-axes` prints the exact count:
-111 operands, each also swept as a bare pipe stage since #3361, across 23 contexts),
+**Size.** The full grid is about 1,430,000 rows (`--list-axes` prints the exact count:
+152 operands, each also swept as a bare pipe stage since #3361, across 27 contexts),
 which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
@@ -75,6 +75,8 @@ Usage:
   ./scripts/jq-path-register-sweep.py --candidate ... --sample 2000 --seed 7
   ./scripts/jq-path-register-sweep.py --candidate ... --list-axes
   ./scripts/jq-path-register-sweep.py --candidate ... --operand any --operand 'all'
+  ./scripts/jq-path-register-sweep.py --candidate ... --stage-only   # quick, not a gate
+  ./scripts/jq-path-register-sweep.py --candidate ... --json out.jsonl   # rows stream to out.jsonl.partial
 """
 
 import argparse
@@ -241,6 +243,65 @@ OPERANDS = [
     "first(.a)",
     "nth(0; .a)",
     "limit(1; .a)",
+    # (#3653) `last(f)` keeps jq's register through the wrappers that add no
+    # movement of their own: `?`, `try` with no `catch`, and `first(...)`
+    # (which emits from inside `last`, where the register is back where it
+    # entered). The contrasts are the wrappers that are not admitted, and so stay
+    # refused where jq answers (`try ... catch`, `limit`/`nth` of a `last`, a
+    # compound stage), and the same wrappers around a `f` that navigates, which
+    # move it and must stay refused.
+    "last(.a)?",
+    "(last(.a))?",
+    "try last(.a)",
+    "first(last(.a))",
+    "first(last(.a))?",
+    "last(.[]?)?",
+    "(try last(.a) catch .)",
+    "limit(1; last(.a))",
+    "nth(0; last(.a))",
+    "first(.a)?",
+    "first(first(.a))",
+    # (#3653) `select(f)` and the type filters are `if f then . else empty end`
+    # over a subexp condition: they pass their input through at the register
+    # whatever `f` navigates. `(.a | select(.))` is the contrast whose
+    # navigation precedes the select, which moved the register.
+    "select(.)",
+    "select(.a)",
+    "select(.a?)",
+    "select(false)",
+    "select((true, true))",
+    "select(first(.[]?))",
+    "(last(.a) | select(.))",
+    "(.a | select(.))",
+    # (#3653) the wrappers read through for `select` and the type filters too.
+    "select(.)?",
+    "try select(.)",
+    "first(select(.))",
+    "(numbers)?",
+    "try numbers",
+    "first(numbers)",
+    # (#3653 review) a `last`/`select` whose output *is* the register: `.` and, in
+    # the contexts that bind it, `$x`. `select` hands its input through as the
+    # very value it received, so the register keeps its identity; `last(f)`
+    # returns a copy, so `last(.)`/`last($x)` lose it (a defect older than
+    # #3653, #3643's arm). A context that does not bind `$x` makes both sides
+    # fail to compile, which is a MATCH.
+    "last(.)",
+    "last($x)",
+    "try last($x)",
+    "last($x)?",
+    "first(last($x))",
+    "select($x)",
+    "try select($x)",
+    "numbers",
+    "objects",
+    "arrays",
+    "strings",
+    "values",
+    "nulls",
+    "booleans",
+    "iterables",
+    "scalars",
     # (#3361) the rest of the by-value builtins jq defines over a backtracked
     # source or never lets touch the register: `walk(f)` and `map(f)` qualify
     # only for an `f` that navigates nothing (`walk(.a)` and `map(.a)` are the
@@ -332,6 +393,15 @@ CONTEXTS = [
     ("first-wrap", "del(first({X}))"),  # round 2: wrapper
     ("alt-wrap", "del(({X}) // .a)"),  # round 2: wrapper
     ("var-rebind", "del(. as $x | ({X}) | $x)"),
+    # (#3653) the stage is entered on an *untracked* value (a literal ran first),
+    # so the register is carried by the pipe and only a stage the resolver
+    # knows leaves it in place passes it on. `var-rebind` enters on the trackable
+    # root, where a pass-through stage never needed the register restated, so it
+    # cannot see a stage that drops it.
+    ("untracked-path-scalar", "path(. as $x | 1 | ({X}) | $x)"),
+    ("untracked-path-object", "path(. as $x | {a:{b:1}} | ({X}) | $x)"),
+    ("untracked-del-scalar", "del(. as $x | 1 | ({X}) | $x.a?)"),
+    ("untracked-del-object", "del(. as $x | {a:{b:1}} | ({X}) | $x.a?)"),
     ("var-rebind-nav", "del(.a? as $y | try ({X}) | try ($y | .b))"),  # round 2
     ("nested", "del(.a? | ({X}))"),
     ("alt-pattern", "del(. as [$q] ?// $q | ({X}))"),  # round 2: ?// retry
@@ -360,12 +430,24 @@ CHAIN_LENGTHS = [16, 64, 256]
 CHAIN_CONTEXTS = ["path", "del", "update"]
 
 
-def shapes_for(operand):
-    """Every combinator shape an operand takes part in."""
+def shapes_for(operand, stage_only=False):
+    """Every combinator shape an operand takes part in.
+
+    `stage_only` keeps just the operand as a bare pipe stage (and negated), about
+    1/15 of the rows: a quick run to repeat while iterating. It does **not**
+    bound a change to a stage-level rule (what `resolve_seq_stage` carries across
+    a stage: #3643, #3653). The right operand of an `and`/`or` is resolved as a
+    one-stage pipe seeded at the register (`resolve_from_restored_input`), so
+    those rules reach the `and`/`or` shapes too: #3653's seeded sample flipped
+    108 `and`/`or` rows beside 109 bare-stage ones. Judge a change on the full
+    shapes (or a seeded `--sample` over them).
+    """
     # (#3361) the operand alone, as a bare pipe stage: `. as $x | OP | $x` is
     # what the `var-rebind` context makes of it.
     yield f"({operand})"
     yield f"-({operand})"
+    if stage_only:
+        return
     for c in COMPANIONS:
         yield f"{operand} and {c}"
         yield f"{c} and {operand}"
@@ -373,7 +455,7 @@ def shapes_for(operand):
         yield f"{c} or {operand}"
 
 
-def build_rows(operands=None):
+def build_rows(operands=None, stage_only=False):
     """The grid and the chain rows, separately: (label, input, program).
 
     The chain rows are the timing axis and are never sampled away. `operands`
@@ -384,8 +466,13 @@ def build_rows(operands=None):
     rows = []
     chains = []
     for operand in OPERANDS if operands is None else operands:
-        for shape in shapes_for(operand):
+        for shape in shapes_for(operand, stage_only):
             for cname, template in CONTEXTS:
+                # An operand that names `$x` only means something where the context
+                # binds it; elsewhere jq and the build both fail to compile, a
+                # trivial MATCH that carries no signal (3.4% of the grid, #3653).
+                if "$x" in shape and "$x" not in template:
+                    continue
                 program = template.replace("{X}", shape)
                 for doc in INPUTS:
                     rows.append((f"{cname}|{shape}", doc, program))
@@ -492,7 +579,11 @@ def main():
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--show", type=int, default=25, help="max rows printed per section")
-    ap.add_argument("--json", metavar="PATH", help="write every non-MATCH row as JSON lines")
+    ap.add_argument(
+        "--json",
+        metavar="PATH",
+        help="write every non-MATCH row as JSON lines (they stream to PATH.partial while running)",
+    )
     ap.add_argument(
         "--operand",
         action="append",
@@ -500,13 +591,20 @@ def main():
         metavar="TEXT",
         help="restrict the grid to this operand (exact text from --list-axes); repeatable",
     )
+    ap.add_argument(
+        "--stage-only",
+        action="store_true",
+        help="only the operand as a bare pipe stage (and negated), about 1/15 of the "
+        "rows: a quick iteration run, not a gate (an and/or operand is a one-stage "
+        "pipe too)",
+    )
     ap.add_argument("--list-axes", action="store_true", help="print the grid's size and exit")
     args = ap.parse_args()
 
     unknown = [o for o in args.operand if o not in OPERANDS]
     if unknown:
         ap.error(f"--operand {unknown[0]!r} is not an operand; see --list-axes")
-    grid, chains = build_rows(args.operand or None)
+    grid, chains = build_rows(args.operand or None, args.stage_only)
     if args.list_axes:
         print(f"operands={len(OPERANDS)} companions={len(COMPANIONS)} inputs={len(INPUTS)} "
               f"contexts={len(CONTEXTS)}")
@@ -544,9 +642,16 @@ def main():
 
     started = time.time()
     records = []
+    # Non-MATCH rows stream to PATH.partial as they finish, so a run that is
+    # killed (an hour into the grid, #3653) keeps what it found; the final file
+    # is still written once the serial re-run of timed-out rows has settled.
+    partial = open(args.json + ".partial", "w") if args.json else None
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         for i, rec in enumerate(pool.map(lambda r: evaluate(r, builds, args.timeout), rows), 1):
             records.append(rec)
+            if partial and any(c != "MATCH" for c in rec["classes"].values()):
+                partial.write(json.dumps(rec) + "\n")
+                partial.flush()
             if i % 2000 == 0:
                 print(f"  {i}/{len(rows)} ({time.time() - started:.0f}s)", file=sys.stderr)
 
@@ -598,6 +703,8 @@ def main():
             for rec in records:
                 if any(c != "MATCH" for c in rec["classes"].values()):
                     fh.write(json.dumps(rec) + "\n")
+        partial.close()
+        os.remove(partial.name)
 
     if regressions:
         print(f"\nFAIL: {len(regressions)} regression(s) vs {base}")
