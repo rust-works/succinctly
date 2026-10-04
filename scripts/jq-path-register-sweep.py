@@ -56,8 +56,8 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 737,000 rows (`--list-axes` prints the exact count:
-89 operands, each also swept as a bare pipe stage since #3361, across 23 contexts),
+**Size.** The full grid is about 1,147,000 rows (`--list-axes` prints the exact count:
+118 operands, each also swept as a bare pipe stage since #3361, across 27 contexts),
 which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
@@ -215,6 +215,46 @@ OPERANDS = [
     "first(.a)",
     "nth(0; .a)",
     "limit(1; .a)",
+    # (#3653) `last(f)` keeps jq's register through the wrappers that add no
+    # movement of their own: `?`, `try` with no `catch`, and `first(...)`
+    # (which emits from inside `last`, where the register is back where it
+    # entered). The contrasts are the wrappers that are not admitted, and so stay
+    # refused where jq answers (`try ... catch`, `limit`/`nth` of a `last`, a
+    # compound stage), and the same wrappers around a `f` that navigates, which
+    # move it and must stay refused.
+    "last(.a)?",
+    "(last(.a))?",
+    "try last(.a)",
+    "first(last(.a))",
+    "first(last(.a))?",
+    "last(.[]?)?",
+    "(try last(.a) catch .)",
+    "limit(1; last(.a))",
+    "nth(0; last(.a))",
+    "first(.a)?",
+    "try .a",
+    "first(first(.a))",
+    # (#3653) `select(f)` and the type filters are `if f then . else empty end`
+    # over a subexp condition: they pass their input through at the register
+    # whatever `f` navigates. `(.a | select(.))` is the contrast whose
+    # navigation precedes the select, which moved the register.
+    "select(.)",
+    "select(.a)",
+    "select(.a?)",
+    "select(false)",
+    "select((true, true))",
+    "select(first(.[]?))",
+    "(last(.a) | select(.))",
+    "(.a | select(.))",
+    "numbers",
+    "objects",
+    "arrays",
+    "strings",
+    "values",
+    "nulls",
+    "booleans",
+    "iterables",
+    "scalars",
     # (#3361) the rest of the by-value builtins jq defines over a backtracked
     # source or never lets touch the register: `walk(f)` and `map(f)` qualify
     # only for an `f` that navigates nothing (`walk(.a)` and `map(.a)` are the
@@ -306,6 +346,15 @@ CONTEXTS = [
     ("first-wrap", "del(first({X}))"),  # round 2: wrapper
     ("alt-wrap", "del(({X}) // .a)"),  # round 2: wrapper
     ("var-rebind", "del(. as $x | ({X}) | $x)"),
+    # (#3653) the stage is entered on an *untracked* value (a literal ran first),
+    # so the register is carried by the pipe and only a stage the resolver
+    # knows leaves it in place passes it on. `var-rebind` enters on the trackable
+    # root, where a pass-through stage never needed the register restated, so it
+    # cannot see a stage that drops it.
+    ("untracked-path-scalar", "path(. as $x | 1 | ({X}) | $x)"),
+    ("untracked-path-object", "path(. as $x | {a:{b:1}} | ({X}) | $x)"),
+    ("untracked-del-scalar", "del(. as $x | 1 | ({X}) | $x.a?)"),
+    ("untracked-del-object", "del(. as $x | {a:{b:1}} | ({X}) | $x.a?)"),
     ("var-rebind-nav", "del(.a? as $y | try ({X}) | try ($y | .b))"),  # round 2
     ("nested", "del(.a? | ({X}))"),
     ("alt-pattern", "del(. as [$q] ?// $q | ({X}))"),  # round 2: ?// retry
