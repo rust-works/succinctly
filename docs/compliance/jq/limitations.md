@@ -1172,9 +1172,14 @@ is the revert that established what the other one costs.
      through 1`) would read as a clean backtrack, and a later `$x` would re-establish the root: the
      first push of #3763 deleted the whole document for
      `del(. as $x | (isempty(any(1; .[]?)) and 1) | $x)` on `{"a":1}`, and so did `main` for
-     `del(. as $x | (any(1; .[]?) or 1) | $x)` since #3749. Both claims, decided or not, therefore
-     need `cannot_move_register(cond)`
-     (`test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763`). Two shapes are still refused where jq
+     `del(. as $x | (any(1; .[]?) or 1) | $x)` since #3749. The decided claim therefore needs
+     `cannot_move_register(cond)`, and the undecided one needs `cond` not to have raised: it never
+     ran (`gen` was empty, so `any(.a)` over `[]` is a clean backtrack), or it is inert, or it is a
+     chain of plain navigation steps that only ran on the register (`any(.a)` over
+     `[{"key":"a","value":1}]` navigates to `null` and backtracks), where a path error cannot occur
+     (`test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763` and
+     `test_any_all_undecided_register_survives_a_cond_that_never_raised_3763`). The same navigation
+     on a computed element (`any(1; .a)`) raises in jq and stays refused. Two shapes are still refused where jq
      answers, pinned
      (`test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749`): the result is
      stated only while `cond` is on `cannot_move_register`'s allowlist, because `cond` runs by

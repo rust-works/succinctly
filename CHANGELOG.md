@@ -667,10 +667,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only sound when `cond` cannot raise a path error, and jq path-checks `cond` where this resolver runs it by value: on `main`,
   `del(. as $x | (any(1; .[]?) or 1) | $x)` on `{"a":1}` and `del(. as $x | (all(unique_by(.)) or .a) | $x)` on `[[1],[1]]`
   deleted the whole document (and `= 9` replaced it) where jq exits 5, and the first push of this fix did the same for
-  `isempty` over such an `any`. Both the decided and the undecided statement now need `cannot_move_register(cond)`, and the
-  by-value per-result verdict (`register_stays_on_result`, `LeafRegister`), which made the same claim for the one-argument
-  forms and never fires in jq mode now that every spelling has an arm, is removed. Pinned by
-  `test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763`; the sweep gained five operands that generate the shape.
+  `isempty` over such an `any`. The decided statement now needs `cannot_move_register(cond)`; the undecided one needs `cond`
+  not to have raised, which holds when it never ran (`gen` was empty), when it is inert, or when it is plain navigation that
+  only ran on the register (`any(.a)` over `[{"key":"a","value":1}]` navigates to `null` and backtracks, while the same
+  step on a computed element, `any(1; .a)`, raises in jq and stays refused). The by-value per-result verdict
+  (`register_stays_on_result`, `LeafRegister`), which made the same claim for the one-argument forms and never fires in jq
+  mode now that every spelling has an arm, is removed. Pinned by
+  `test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763` and
+  `test_any_all_undecided_register_survives_a_cond_that_never_raised_3763`; each clause fails a test when removed, and the
+  sweep gained five operands that generate the shape.
 
 - **jq: a `reduce` that computes its accumulator leaves jq's path register where it entered** (#3710).
   `path(. as $x | reduce (1) as $i (.; .a = $i) | $x.k)` on `{"k":1,"a":1}` is `["k"]` in jq (and so are `del`
