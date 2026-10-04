@@ -20,6 +20,13 @@ inputs:
       coverage-baseline.yml publishes it from a push-only run that concludes on coverage alone (#3649).
     required: false
     default: coverage-baseline.yml
+  reclaim-below-gib:
+    description: >-
+      x86_64 only: free the unused hosted toolchains before the run only when `/` has less than this
+      many GiB free (a whole number). The default leaves today's runner image, which starts with more,
+      to skip the step (#3750).
+    required: false
+    default: '75'
 
 runs:
   using: composite
@@ -32,13 +39,47 @@ runs:
     # hosted `ubuntu-latest` disk, so reclaim the multi-GB toolchains this job
     # never uses (the Rust toolchain lives under the runner's home and is
     # untouched) before the action starts. x86_64 only: ARM64 passes without it.
-    - name: Reclaim disk space (x86_64)
+    #
+    # #3750: the image has since regained room (86 GiB free before this step on
+    # 2026-10-04, 109 GiB after it), and the step cost 67-108 s of every x86_64
+    # run to free space the run did not need. A run grew used space by ~52 GiB,
+    # so it now reclaims only when less than `reclaim-below-gib` (75: that growth
+    # plus ~20 GiB of margin) is free. The two `df` lines stay either way, so a
+    # log still says how much room the run started with, and the sampler below
+    # still reports how close it came (and warns when it came within 25 GiB).
+    #
+    # That sizing covers the head run only. A pull request whose merge-base and
+    # first-parent ancestors have no published baseline makes the action build
+    # a second instrumented tree in a worktree on the same disk, a path no
+    # sampled run has taken, so its peak is not known. If one ever dies with
+    # `No space left on device`, raise `reclaim-below-gib` above the image's
+    # free space (100 reclaims every run, as before) and read the run's
+    # profile-file figures from profraw-stats.sh to size it properly.
+    - name: Reclaim disk space (x86_64, only when tight)
       if: inputs.name == 'x86_64'
       shell: bash
+      env:
+        RECLAIM_BELOW_GIB: ${{ inputs.reclaim-below-gib }}
       run: |
         df -h /
-        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-          /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift
+        # At most six digits: a longer number overflows the shell's 64-bit
+        # arithmetic below and wraps negative, which would silently skip.
+        case "$RECLAIM_BELOW_GIB" in
+          '' | *[!0-9]* | [0-9][0-9][0-9][0-9][0-9][0-9][0-9]*)
+            echo "::error::reclaim-below-gib must be a whole number of GiB with at most six digits, got '$RECLAIM_BELOW_GIB'"
+            exit 1
+            ;;
+        esac
+        avail_kb=$(df --output=avail -k / | tail -1 | tr -d ' ')
+        # 10#: a leading zero would otherwise read as octal.
+        threshold_kb=$((10#$RECLAIM_BELOW_GIB * 1048576))
+        if [ "$avail_kb" -ge "$threshold_kb" ]; then
+          echo "reclaim: skipped, $((avail_kb / 1048576)) GiB free on / is not below the $((10#$RECLAIM_BELOW_GIB)) GiB threshold"
+        else
+          echo "reclaim: running, $((avail_kb / 1048576)) GiB free on / is below the $((10#$RECLAIM_BELOW_GIB)) GiB threshold"
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift
+        fi
         df -h /
 
     # Sample the free space every 20 s so a passing run says how close it came.
@@ -75,9 +116,26 @@ runs:
         # `src/util/simd/x86.rs` mask its CPU-gated `detect_fast_bmi2` flap
         # (10 lines, net 9 covered, #2449) via an in-source marker instead
         # of a file-level exclusion.
-        version: 0.43.0
+        # Bumped to 0.46.0 for #3750: it is the first release with an
+        # `omni-dev-linux-arm64.tar.gz` (0.43.0-0.45.0 ship none), so the ARM64
+        # leg can download the binary instead of a ~4.5 min `cargo install` on
+        # every omni-dev cache miss. It also adds `coverage merge`, which a
+        # sharded run would need with the repeatable `--report` and
+        # `--fail-under-lines` that 0.45.0 added. `coverage diff`
+        # is unchanged for this repo's single-report use: 0.43.0 and 0.46.0
+        # rendered byte-identical markdown and json from the same inputs, over
+        # two pairs of real `main` reports and a third whose patch lines had
+        # their hit counts zeroed by hand to get uncovered lines and a per-file
+        # delta (#3750), and 0.46.0's `coverage lint-markers` accepts every
+        # marker in the tree. Still must stay >= 0.43.0 for the source markers
+        # above.
+        version: 0.46.0
         use-prebuilt-binary: ${{ inputs.use-prebuilt }}
         test-args: --features cli,simd,regex,serde --workspace
+        # #3750 A2, observation only: logs how many raw profile files the run
+        # left and how big they are, before the lcov step merges them. Delete
+        # this line and profraw-stats.sh once a run's log has been read.
+        extra-test-commands: bash "${{ github.action_path }}/profraw-stats.sh"
         fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
         # fail-under-patch left unset → report-only initially
         # Where the baseline is looked up: the newest *successful* run of this
@@ -97,5 +155,13 @@ runs:
       run: |
         df -h /
         if [ -s "$RUNNER_TEMP/df-avail-kb" ]; then
-          echo "lowest free space sampled: $(sort -n "$RUNNER_TEMP/df-avail-kb" | head -1 | awk '{printf "%.1f GiB", $1/1048576}')"
+          lowest_kb=$(sort -n "$RUNNER_TEMP/df-avail-kb" | head -1 | tr -d ' ')
+          echo "lowest free space sampled: $(awk -v k="$lowest_kb" 'BEGIN {printf "%.1f GiB", k/1048576}')"
+          # #3750: the reclaim above is skipped on most runs now, and the run's
+          # disk use grows with the number of spawned test processes, so the
+          # margin can erode without any run failing. Surface it on the checks
+          # page while a run still survives, not only after #3585 comes back.
+          if [ "$lowest_kb" -lt "$((25 * 1048576))" ] 2>/dev/null; then
+            echo "::warning::lowest free disk space was under 25 GiB; raise reclaim-below-gib in .github/actions/coverage/action.yml before this run's disk use causes ENOSPC (#3750)"
+          fi
         fi

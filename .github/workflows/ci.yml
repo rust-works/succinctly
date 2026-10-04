@@ -814,7 +814,7 @@ jobs:
             use-prebuilt: 'true'
           - name: ARM64
             runner: ubuntu-24.04-arm
-            use-prebuilt: 'false'   # no aarch64-linux prebuilt; build omni-dev from source
+            use-prebuilt: 'true'    # needs omni-dev >= 0.46.0 (aarch64-linux binary) and omni-dev-coverage-check >= v1.3 (picks it by arch) (#3750)
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
