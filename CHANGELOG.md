@@ -24,10 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the exemption needs the fold's null-identity relocation fixed first, since dropping the generator from `fans_out`
   outright made `(foreach .a? as $k (0; try (($k | .[]?) // $k); .)) = 9` on `null` write `9` over the whole document.
   Verified against jq 1.7.1: 33 pinned rows plus a characterization test for what stays; an oracle sweep of the new
-  `$k` operands (51,507 rows then, 0 regressions) and of every existing generator operand over every context (123,147
-  rows, identical to the parent); the fold-source sweep (83,328 cases, identical counts); and the fold-weighted bind-origin
-  fuzz (8 seeds x 3,000 programs, 0 new divergences). Pinned by
-  `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`.
+  `$k` operands (103,707 rows: 0 regressions, 90 rows now match), of every existing generator and fold operand over every
+  context (159,867 rows, identical to the parent) and of a 100,027-row seeded sample over every operand (0 regressions);
+  the fold-source sweep (83,328 cases, identical counts); and the fold-weighted bind-origin fuzz (8 seeds x 3,000 programs,
+  0 new divergences). Pinned by `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`.
 
 - **jq: `last(f)`'s wrappers and a `select`/type-filter stage keep jq's path register** (#3653).
   `path(. as $x | 5 | select(.) | $x)` is `[]` in jq (and `del`, `=`, `|=` through such a `$x` write), but the resolver
