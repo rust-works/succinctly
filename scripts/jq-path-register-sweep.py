@@ -56,8 +56,8 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 737,000 rows (`--list-axes` prints the exact count:
-89 operands, each also swept as a bare pipe stage since #3361, across 23 contexts),
+**Size.** The full grid is about 919,000 rows (`--list-axes` prints the exact count:
+111 operands, each also swept as a bare pipe stage since #3361, across 23 contexts),
 which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
@@ -154,6 +154,17 @@ OPERANDS = [
     "all(. == true)",
     "any(.a)",
     "all(.a)",
+    # (#3763 review) an any/all that decides nothing claims jq's register stayed
+    # at its entry, which is only sound when `cond` cannot raise a path error: jq
+    # path-checks `cond`, this resolver runs it by value. These put a `cond` that
+    # raises in jq (`.[]?` and `.a?` on a computed `1`, `unique_by(.)`) under a
+    # generator that decides nothing, bare and wrapped in `isempty`, which is
+    # what let a later `$x` re-establish the root and a `del` delete it.
+    "any(1; .[]?)",
+    "any(true; .[0]?)",
+    "all(unique_by(.))",
+    "isempty(any(1; .[]?))",
+    "isempty(all(1; .a?))",
     # wrappers and control flow around the above
     "try .a",
     "(.a // .b)",
