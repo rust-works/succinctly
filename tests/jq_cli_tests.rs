@@ -62751,6 +62751,71 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
             "",
             0,
         ),
+        // #3272's nested pipe: `..`'s first output is its seed, which leaves the
+        // register where it was, and a `select` after it keeps it, so the seed is
+        // answered `[]` before the `.[]?` below it raises, as in jq.
+        (
+            r#"{"a":{"b":{"b":null}},"c":2}"#,
+            r"path(. as $x | 1 | (.. | select(true)) | $x)",
+            "[]\n",
+            "near attempt to iterate through 1",
+            5,
+        ),
+        // #3579's `select(true)` rows. A terminal `null` after a navigation was
+        // refused loudly there because a `select` stage dropped the register and
+        // the resolver could not say which node it was on. jq answers each, and
+        // so does a `select` that keeps it; the rows that still cannot be
+        // located (`first(7)` and friends) stay refused in
+        // `test_terminal_null_after_a_navigation_refuses_loudly_3579`.
+        (
+            "null",
+            r"path(.a | 5 | select(true) | null)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(.a | 5 | select(true) | null)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"path(.a.b | 5 | select(true) | null)",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"(.a | 5 | select(true) | null) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"(.a | 5 | select(true) | null) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"(.a.b | 5 | select(true) | null) = 9",
+            "{\"a\":{\"b\":9}}\n",
+            "",
+            0,
+        ),
+        (
+            "null",
+            r"del((.a | 5 | select(true) | null)?)",
+            "null\n",
+            "",
+            0,
+        ),
         // The write goes through for every wrapper and for `select`.
         (
             doc,
@@ -65830,7 +65895,10 @@ fn assert_rows_3579(rows: &[(&str, &str, &str, &str, i32)]) -> Result<()> {
 /// message. The rows pin this resolver's *current refusal*, which must be loud
 /// everywhere. The first 19 answered silently on `main`, 15 of them wrongly. The
 /// refusal is the resolver's guess, not jq's verdict, so no `try`, `?` or
-/// `catch` turns it into a dropped write (#3267, ADR-0018 rule 4).
+/// `catch` turns it into a dropped write (#3267, ADR-0018 rule 4). The rows over
+/// a `select(true)` stage moved to
+/// `test_path_register_last_f_wrappers_and_select_keep_it_3653` once a `select`
+/// stage kept the register: they are answered now, exactly as jq answers them.
 #[test]
 fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
     assert_rows_3579(&[
@@ -65905,34 +65973,6 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
         ),
-        (
-            r"null",
-            r"(.a | 5 | select(true) | null) = 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
-        (
-            r"null",
-            r"(.a | 5 | select(true) | null) |= 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
-        (
-            r"null",
-            r"path(.a | 5 | select(true) | null)",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
-        (
-            r"null",
-            r"(.a.b | 5 | select(true) | null) = 9",
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
         // a guess, not jq's verdict, so no `try`, `?` or `catch` turns it into a dropped write (jq writes there)
         (
             r"null",
@@ -65951,13 +65991,6 @@ fn test_terminal_null_after_a_navigation_refuses_loudly_3579() -> Result<()> {
         (
             r"null",
             r#"try path(.a as $x | .a | 5 | first(7) | $x) catch "C""#,
-            "",
-            "jq: error (at <stdin>:1): Invalid path expression with result null\n",
-            5,
-        ),
-        (
-            r"null",
-            r"del((.a | 5 | select(true) | null)?)",
             "",
             "jq: error (at <stdin>:1): Invalid path expression with result null\n",
             5,
@@ -82422,7 +82455,9 @@ fn test_recurse_seed_rule_leaves_other_shapes_unchanged_3272() -> Result<()> {
 
 /// #3272, residuals: shapes whose first output is not *provably* the recursion's
 /// seed stay refuse-only (`first(..)`, `limit(n; ..)`, a fork, a nested pipe,
-/// `//`: naming a call's body is what `cannot_move_register` declines to do),
+/// `//`: naming a call's body is what `cannot_move_register` declines to do;
+/// a nested pipe whose later stage is a `select` is answered since #3653,
+/// `test_path_register_last_f_wrappers_and_select_keep_it_3653`),
 /// and so does the output a `catch` handler adds after the seed. jq answers
 /// each read form; the rows pin the *current* refusal, and every write form
 /// must exit non-zero -- never 0 with the document unchanged, which is the
@@ -82435,7 +82470,6 @@ fn test_recurse_seed_residuals_stay_loud_3272() -> Result<()> {
         (r"path(. as $x | 1 | limit(2; ..) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | (., ..) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | if true then .. else 1 end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
-        (r"path(. as $x | 1 | (.. | select(true)) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | (try ..) // 3 | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         // jq: [] twice -- the handler's output is a second one, and that one still refuses
         (r"path(. as $x | 1 | try recurse(.a) catch 7 | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
