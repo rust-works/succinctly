@@ -648,7 +648,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **jq: a `reduce` whose update is a full slice under `?` keeps its accumulator on the register** (#3734).
+- **jq: a `reduce` whose update is a full slice under `?` keeps its accumulator on the register, and a computed-key source no longer fabricates** (#3734).
   A slice that keeps every element of a non-empty array shares its parent's buffer in jq, so `.[0:]` hands the
   accumulator back as the same node (#3504), and `path(reduce 1 as $x (.; .[0:]?))` on `[1,2,3]` is `[]`. A
   slice under a postfix `?` is the same step (the wrapper only prunes a failure to slice), but the branch it
@@ -656,11 +656,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   component, so the `?` spelling refused (`Invalid path expression with result [1,2,3]`, exit 5) while the plain
   one answered, and `del(...)`/`(...) = 9`/`(...) |= f` refused alike. Each component is now read through
   `strip_optional`, as `slice_witnesses_node` already does for the last one (#3519). `.[0.5:]?`, `.[null:]?`,
-  a chain of them, and an accumulator seeded from a field (`reduce 1 as $x (.a; .[0:]?)` is `["a"]`) all match
-  jq 1.7.1. A partial slice, an empty array, a string, a navigating source and a destructuring pattern still
-  refuse, `?` or not. Pinned by `test_reduce_whole_array_slice_under_optional_is_the_register_3734`; the
-  path-register sweep gained `?`-slice operands and two `reduce` contexts whose source does not navigate,
-  the only place this rule applies and one no existing context reached.
+  a chain of them, a multi-element source and an accumulator seeded from a field (`reduce 1 as $x (.a; .[0:]?)`
+  is `["a"]`) all match jq 1.7.1.
+  The review of the fix found the rule's other gate too narrow, and widening the rule to `?` would have turned
+  that into new fabrications. The rule applies only where the source does not move jq's register, and asked
+  that with the bind witness's narrower predicate, which misses a computed key: `path(reduce .[1+1] as $a (.;
+  .[0:]))`, `.[0:(1+1)]` and a bare `first` as the source answered `[]` (and `del`/`=` wrote) where jq exits 5.
+  Those answered on `main` for the plain spelling already; they and their `?` twins now refuse, because the gate
+  uses the fold driver's own `is_fold_source_navigation` plus `first`/`last`/`nth(n)` (`fold_source_moves_register`).
+  A partial slice, an empty array, a string, a navigating source and a destructuring pattern still refuse, `?`
+  or not. Two refusals remain, both the safe direction and pinned: a `?` over a *group* of slices
+  (`(.[0:] | .[0:])?`, one `Optional(Pipe)` component) and `foreach`, which has no such rule at all (#3742).
+  Pinned by `test_reduce_whole_array_slice_under_optional_is_the_register_3734` and its group-under-`?` sibling;
+  the path-register sweep gained `?`-slice operands and five `reduce` contexts (a literal source, a computed
+  key, `first`, a destructuring pattern), the only place this rule applies and one no existing context reached.
 
 - **jq/yq: `recurse(f)` and `recurse(f; cond)` raise at the 10,000-node cap instead of ending silently
   short** (#3716). A walk that reached `RECURSE_MAX_ITEMS` with a node still to visit used to end as
