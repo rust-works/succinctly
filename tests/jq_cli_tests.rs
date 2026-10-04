@@ -61042,21 +61042,21 @@ fn test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757() -> Res
         // The live route: `.a` navigates the element.
         (
             r#"[{"a":true}]"#,
-            r#"path(any((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a))"#,
+            r"path(any((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a))",
             "[0,\"a\"]\n",
             "",
             0,
         ),
         (
             r#"[{"a":true}]"#,
-            r#"del(any((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a))"#,
+            r"del(any((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a))",
             "[{}]\n",
             "",
             0,
         ),
         (
             r#"[{"a":true}]"#,
-            r#"del(try any((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a) catch empty)"#,
+            r"del(try any((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a) catch empty)",
             "[{}]\n",
             "",
             0,
@@ -61065,7 +61065,7 @@ fn test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757() -> Res
         // from the retry's element rather than the abandoned one.
         (
             r#"[{"a":true}]"#,
-            r#"path(all((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a))"#,
+            r"path(all((.[0] | length) as $p ?// $q | if $p != null then $p else .[0] end; .a))",
             "",
             r"Invalid path expression with result true",
             5,
@@ -61098,7 +61098,7 @@ fn test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757() -> Res
         // (`false`'s path error, `late`) is the one raised.
         (
             r#"[{"a":true}]"#,
-            r#"path(any((.[0] | length) as $p ?// $q | if $p != null then $p else empty end; .a))"#,
+            r"path(any((.[0] | length) as $p ?// $q | if $p != null then $p else empty end; .a))",
             "",
             r"Invalid path expression with result false",
             5,
