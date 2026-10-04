@@ -51405,3 +51405,27 @@ fn yq_last_f_does_not_leave_the_path_register_in_place_3643() -> Result<()> {
     );
     Ok(())
 }
+
+/// #3713 resolves `walk(f)` over a scalar as `f` in path position in jq mode
+/// only. Real yq's lexer rejects `walk` and `path(...)` outright (v4.53.3), so
+/// both are succinctly extensions behind `--jq-extensions` with no oracle, and
+/// ADR-0018 keeps the mode from borrowing jq's answer: yq mode keeps the
+/// by-value route and every answer it gave before, including the root-path ones
+/// jq mode no longer gives.
+#[test]
+fn yq_walk_over_a_scalar_keeps_the_by_value_route_3713() -> Result<()> {
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    for (input, filter, want) in [
+        ("null", "path(walk(.a))", ""),
+        ("null", "[path(walk(.a?))]", "[]\n"),
+        ("null", "(walk(.a)) |= 9", "null\n"),
+        ("null", "del(walk(.a))", "null\n"),
+        ("[null, null]", "[path(walk(.a?))]", "[]\n"),
+        ("1", "path(walk(.))", ""),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, input, &args)?;
+        assert_eq!(code, 0, "#3713 yq: `{filter}` on {input}");
+        assert_eq!(stdout, want, "#3713 yq: `{filter}` on {input}");
+    }
+    Ok(())
+}

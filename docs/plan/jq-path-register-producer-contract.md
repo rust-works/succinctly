@@ -470,8 +470,10 @@ have changed that); and 38 over a by-value or compound right operand after a nav
 one on a `null` input (`del(. as $x | (.b? or isempty(.[]?)) | $x)` on `null`), where the
 earlier match was luck: the eager route answered the root path where jq answers `["b"]`, `del`
 of either leaves the same document, and #3579's rule now refuses a terminal `null` after a
-navigation. All are refuse-only. No row is newly accepted wrongly, and none newly differs; the
-36 that still accept are `.[0:] and R` and `.[0:0] and R` on `[]`, #3494's empty-slice rule, the
+navigation (#3713 closed the same hole for `walk(f)` over a scalar, which jq runs as `f` on the
+register: it now resolves as `f`, and `walk(f)` over a container refuses whenever jq does, even when
+`f` yields nothing). All are refuse-only. No row is newly accepted wrongly, and none newly differs;
+the 36 that still accept are `.[0:] and R` and `.[0:0] and R` on `[]`, #3494's empty-slice rule, the
 same rows `main` accepts (closed afterwards by #3647: the restored seed took `[]` for the input, see
 `restored_register_is_input`), and the 2 `DIFF` rows are `main`'s too (jq prints a path before it
 errors). The promotions commit on its own, measured on the 162,207-row

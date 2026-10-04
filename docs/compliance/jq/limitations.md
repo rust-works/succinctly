@@ -1906,11 +1906,13 @@ is the revert that established what the other one costs.
    exit 0 where jq exits 5. A `try`/`?` directly on it still catches it, as in jq. And a `walk(f)`
    over an input that reaches an object raises when `f` yields nothing too (`path(walk(empty))`
    on `{"a":1}`): its object arm is `map_values`, which raises once it runs at all, but the check
-   only ran on a value the call produced. **Still accepted wrongly:** a `walk(f)` whose `f`
-   navigates the computed array it is applied to (`path(walk(.a?))` on `[1]`, `path(walk(.[]?))`
-   on `[]`, a nested `path(walk(walk(empty)))` on `[]`): jq raises there, even through a `?`,
-   and a by-value `walk` never checks `f`'s navigation
-   ([#3723](https://github.com/rust-works/succinctly/issues/3723)). Both rules are jq mode
+   only ran on a value the call produced. A `walk(f)` whose `f` navigates the computed array it is
+   applied to (`path(walk(.a?))` on `[1]`, `path(walk(.[]?))` on `[]`, a nested
+   `path(walk(walk(empty)))` on `[]`) also raises in jq, even through a `?`, and a by-value `walk`
+   never checked `f`'s navigation
+   ([#3723](https://github.com/rust-works/succinctly/issues/3723)); #3713 closed those direct
+   shapes (its entry is below). **Still accepted wrongly**, and still #3723: the same navigation
+   inside a `[walk(f)]` collect whose refusal a later `try` swallows. Both rules are jq mode
    only, like the rest of the table. (The always-raises group as a `reduce`/`foreach` *source*
    was the same gap until [#3726](https://github.com/rust-works/succinctly/issues/3726); it is
    closed, pinned by
@@ -2942,8 +2944,60 @@ answers `["b"]` — and classified the two residuals appended below):
   `null`/`true`/`false` terminal, read and write forms) found no row where this build still answers a
   root path that jq does not; every difference from jq is a loud refusal.
   (`first(.a) | 5 | select(true) | null` is one: `first(.a)` extends the path, so it refuses.)
-  Should a stage ever move the register without extending the path, the answer would again be the
-  root, and the register-loss state (`Frame::register_loss`) would have to reach the terminal sink.
+  That fact has one exception, found by
+  [#3713](https://github.com/rust-works/succinctly/issues/3713): a by-value stage that navigates
+  inside jq without extending the path. jq defines `walk(f)` as `... else . end | f`, so on a scalar it
+  runs `f` on the register itself: `null | path(walk(.a))` is `["a"]` and `(walk(.a)) |= 9` is
+  `{"a":9}`. The resolver evaluated `walk` by value, so its `null` at depth 0 equalled the root's and it
+  answered `[]` and wrote `9` over the whole document (likewise `walk(first)`, `walk(.a?)`,
+  `walk(.a, .b)`, and through a pipe `walk(.a) | .`). A scalar `walk(f)` now resolves as `f` in path
+  position, as bare `first` resolves as `.[0]` (#3545), so each answers what jq answers,
+  `walk(.a) | .x` and `.x | walk(.a)` (refused until then) name `["a","x"]` and `["x","a"]`, and
+  `walk(.)` over a number or a string no longer refuses. An array or an object keeps the by-value
+  route, where jq refuses too (`map(w)` rebuilds the container, so the trailing `| f` runs on a
+  computed value), and that route now also refuses when `f` yields nothing, as jq does. An object, or
+  an array that reaches one, raises whatever `f` is (`{} | path(walk(empty))`, #3360). An array of
+  scalars raises when the trailing `f`, run on the rebuilt array, reaches a navigation, even under `?`
+  (`[null,null] | path(walk(.a?))`), while `walk(empty)`, `walk(select(false))`, `walk(try .a)`,
+  `walk(select(type == "object") | .a)` and `walk(getpath(["a"])?)` over it yield nothing in both.
+  That was not optional: with a scalar `walk` answering, `(..|walk(.a?)) |= 5` over `[null,null]`
+  reached the scalar leaves through the root array's silence and wrote where jq errors. The verdict is
+  asked, not guessed from `f`'s shape: `f` is resolved in path position against the array rebuilt at
+  every nesting level (jq's `map(w)` runs it on each), as an untracked value, as any stage after a
+  by-value one is, so the resolver's own untracked-navigation rules decide it and the refusal is
+  catchable like jq's (`try [path(walk(.a?))] catch "c"` is `"c"` in both). A syntactic "does `f`
+  navigate" scan was the first version and refused `walk(select(type == "object") | .a)`,
+  `walk(getpath(["a"])?)` and `walk(empty | .a)` over `[1,2]`, which jq answers `[]` and `main` did.
+  This closes the direct shapes of [#3723](https://github.com/rust-works/succinctly/issues/3723). Two
+  answers still differ from jq, pinned by `test_walk_over_an_array_residuals_differ_from_jq_3723`, which
+  a fix flips on purpose. First, a `[walk(f)]` collect: jq raises inside it, but the collect's contents
+  are an allowlist that admits only an `f` navigating nothing, so a later `try` catches the refusal of
+  the navigation after it (`[[1]] | path(. as $x | [walk(if type == "array" then .[0] else . end)] |
+  try .[0])` exits 5 in jq and 0 here; still #3723). Second, a body that can have an effect (`debug`,
+  `debug(msg)`, `stderr`, `input`, `inputs`, `halt`, `halt_error`, or a call whose body the tree does
+  not hold) cannot be asked, because the question runs `f` a second time and a probe must not duplicate
+  real evaluation's side effects (#2744): `path(walk(debug | empty))` over `[null]` prints two lines in
+  jq and does here (`test_walk_over_an_array_does_not_rerun_an_f_with_effects_3713`). Answering
+  silently would let `(..|walk(debug | .a?)) |= 5` over `[null,null]` write where jq errors, so such a
+  body that can navigate (`cannot_move_register` is false) is refused, uncatchably like every guess,
+  even when its navigation is guarded (`walk(debug | select(type == "object") | .a)` over `[null]`
+  answers in jq). The check costs a second walk of the array, on the empty-result path only. yq mode
+  keeps the by-value route: real yq's lexer rejects `walk`, so under `--jq-extensions` it is a
+  succinctly extension with no oracle to match (ADR-0018 rule 5), pinned by
+  `yq_walk_over_a_scalar_keeps_the_by_value_route_3713`.
+  A first attempt, a guard
+  that refused every by-value terminal whose producer does not say the register stayed at the root, was
+  wrong: it turned `walk(select(true))`, `walk(..)`, `walk(.a // .)`, `ltrimstr("a")`, `env | null` and
+  `until(true; .a)` from jq's `[]` into refusals, and the sweep's grid has none of those operands, so it
+  could not see it; the matrix in `test_walk_over_a_scalar_is_f_in_path_position_3713` covers them. On
+  `scripts/jq-path-register-sweep.py` over fourteen operands (90,747 rows) the 5 rows that differed from
+  jq now match, with 38 that were refusals, and nothing regressed; two seeded 20,027-row samples, which
+  carry #3360's `walk` operands, move 50 rows toward jq each (accepted-where-jq-refuses 46 and 47 become
+  1), and an 11,340-row differential over by-value builtins, nested `walk`s, non-root positions,
+  streams that mix containers and scalars and `f`s that navigate only conditionally has no row worse
+  than before (10,058 matches become 11,112, accepted-where-jq-refuses 444 becomes 0; what is left is
+  the string-identity family, `tostring`/`ltrimstr` of a string, which `main` refuses too).
+
 - **`getpath` is transparent to the path register, and succinctly now models it
   ([#2896](https://github.com/rust-works/succinctly/issues/2896),
   [#2978](https://github.com/rust-works/succinctly/issues/2978)).** The mechanism recorded

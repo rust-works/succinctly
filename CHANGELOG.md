@@ -648,6 +648,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: `walk(f)` over a scalar is `f` in path position** (#3713). jq defines `walk(f)` as `... else . end |
+  f`, so on a scalar it runs `f` on the path register itself: over `null`, `path(walk(.a))` is `["a"]` and
+  `(walk(.a)) |= 9` writes `{"a":9}`. succinctly evaluated `walk` by value and answered `[]` and wrote `9`
+  over the whole document, exit 0, because the by-value leaf's `null` at depth 0 matched the #3125
+  terminal carve-out. A scalar `walk(f)` now resolves as `f` (as bare `first` resolves as `.[0]`, #3545),
+  so `walk(.a)`, `walk(first)`, `walk(.a?)`, `walk(.a, .b)`, their pipe forms and their write forms
+  answer what jq answers, `walk(.a) | .x` and `.x | walk(.a)` (refused until now) name `["a","x"]` and
+  `["x","a"]`, and `walk(.)` over a number or a string no longer refuses; `walk(select(true))`,
+  `walk(..)` and `walk(null)` keep jq's `[]`. An array or an object keeps the by-value route, where jq
+  refuses too, and that route now also refuses when `f` yields nothing (`{} | path(walk(empty))`,
+  `[null,null] | path(walk(.a?))`), as jq does: without it, `(..|walk(.a?)) |= 5` over `[null,null]`
+  reached the scalar leaves through the root array's silence and wrote where jq errors. For an array the
+  verdict is asked of the resolver (the trailing `f` is resolved against the array rebuilt at every nesting
+  level, as an untracked value), so `walk(select(type == "object") | .a)` and `walk(getpath(["a"])?)`,
+  which never navigate there, stay silent as in jq. A body with a side effect (`debug`, `stderr`, `input`,
+  ...) cannot be asked without running it twice, so one that can navigate is refused instead.
+  On `scripts/jq-path-register-sweep.py` over fourteen operands (90,747 rows) the 5 rows that differed
+  from jq now match, along with 38 that were refusals, nothing regressed and accepted-where-jq-refuses
+  stays 0; two seeded 20,027-row samples move 50 rows toward jq each, and an 11,340-row differential over
+  by-value builtins, nested `walk`s, streams that mix containers and scalars and conditionally navigating
+  `f`s has no row worse than before (accepted-where-jq-refuses 444 becomes 0). This closes the direct
+  shapes of #3723 (an `f` that navigates the rebuilt array at any nesting level, bare in `path`, `del`,
+  `=` and `|=`, and a nested `walk(walk(empty))`); one shape stays open there, pinned as today's
+  behaviour: a `[walk(f)]` collect whose refusal a later `try` swallows.
+
 - **jq: a `reduce`/`foreach` source that jq always refuses in path position now raises** (#3726).
   `from_entries`, `unique`, `unique_by`, `with_entries`, `map_values`, `sub`/`gsub`, `ascii_downcase`/
   `ascii_upcase`, the `match` family, an update assignment (`|=`, `+=`, `//=`) and `fromstream` iterate a
