@@ -50899,6 +50899,32 @@ fn test_yq_from_entries_and_an_empty_walk_do_not_raise_in_path_position_3360() -
     Ok(())
 }
 
+/// #3726: a `reduce` source that is `unique` (or any of the constructs jq
+/// refuses in path position) raises in `succinctly jq`, but the rule derives from
+/// how *jq* defines those builtins, so it is jq-mode only (ADR-0018) and
+/// `succinctly yq` keeps answering. A write through the fold still lands, and
+/// the gated `path(f)` (reachable only through `--jq-extensions`) answers the
+/// root path instead of raising.
+#[test]
+fn test_yq_reduce_source_that_jq_refuses_in_path_position_still_answers_3726() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(
+        "(reduce unique as $x (.; .)) = 5",
+        "[1]",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout, "5\n");
+
+    let (stdout, code) = run_yq_stdin(
+        "[path(reduce unique as $x (.; .))]",
+        "[1]",
+        &["--jq-extensions", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout, "[[]]\n");
+    Ok(())
+}
+
 /// On a mapping real yq's `first` names the first *key*, and assigning through
 /// it renames that key (`first = 9` on `{a: 1}` is `{"9":1}`). There is no path
 /// component for a key rename here, so the write is refused loudly rather than

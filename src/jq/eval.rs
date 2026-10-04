@@ -42267,7 +42267,11 @@ fn is_fold_source_navigation(e: &Expr) -> bool {
 /// **Gated on `any_subexpr` finding an actual navigation step anywhere in
 /// `source`** -- a `Field`/`Index`/`Slice`/`Iterate`, a computed
 /// `IndexExpr`/`SliceExpr`/`ArrayKey`, or (#2159) the `..`/`recurse`/`walk`/
-/// `getpath` spellings that move jq's register without writing an `INDEX`.
+/// `getpath` spellings that move jq's register without writing an `INDEX`, or
+/// (#3726, jq mode) a construct [`live_path_refusal`] classifies -- `unique`,
+/// `from_entries`, `with_entries`, `map_values`, `sub`/`gsub`,
+/// `ascii_downcase`, the `match` family -- whose jq-defined body iterates a
+/// container it built, so it raises once it runs wherever it appears.
 /// Only such a step can ever reach one of the resolver's own raising arms, so
 /// a source with none (`range(n)`, `keys`, a literal, and critically
 /// `input`/`inputs`) is driven by value through [`eval_each_owned`] and
@@ -42316,8 +42320,15 @@ fn drive_fold_source<S: EvalSemantics>(
     relocate_base: Option<&Rc<PathPrefix>>,
     step: &mut dyn FnMut(FoldSourceValue) -> Demand,
 ) -> Flow {
-    // #2159: see [`is_fold_source_navigation`] for what counts.
-    let has_navigation = any_subexpr(source, &mut is_fold_source_navigation);
+    // #2159: see [`is_fold_source_navigation`] for what counts. #3726: so does a
+    // construct jq refuses outright in path position ([`live_path_refusal`]) --
+    // it spells no `INDEX` of its own, but its jq-defined body iterates a value
+    // it built, so `unique` as a source raises where a by-value drive answers.
+    // Jq mode only: yq has no `reduce`/`foreach`/`path` to check against, and
+    // the refusal itself is jq mode only ([`always_refuses_as_live_path`]).
+    let has_navigation = any_subexpr(source, &mut |e| {
+        is_fold_source_navigation(e) || (S::TAG == EvalTag::Jq && live_path_refusal(e).is_some())
+    });
     if !has_navigation {
         return drive_fold_source_by_value::<S>(source, ambient.value, ambient.trackable, step);
     }
