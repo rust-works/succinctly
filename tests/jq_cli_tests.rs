@@ -60937,7 +60937,9 @@ fn test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763() -> Resu
 /// (`any(.a)` over `[]`), and a chain of plain navigation steps run only on the
 /// register cannot raise a path error (`any(.a)` over `[{"key":"a","value":1}]`
 /// navigates to `null` and backtracks; the last four rows have a `cond` that is
-/// neither, and are clean only because `gen` was empty), so the register is where the construct
+/// neither, and are clean only because `gen` was empty; the last five are the other
+/// shapes of the shared `is_pure_navigation` grammar: a literal-key index, a
+/// parenthesised step, `.[]`, a slice and a comma), so the register is where the construct
 /// entered and a `$x` frozen before it re-establishes. The rows above are the
 /// converse: the same navigation on a computed element (`any(1; .a)`) raises in
 /// jq, so it stays refused. Every row captured from jq 1.7.1, on both routes.
@@ -61038,6 +61040,41 @@ fn test_any_all_undecided_register_survives_a_cond_that_never_raised_3763() -> R
             0,
         ),
         (r"[]", r"path(any(unique_by(.)) or .b?)", "", "", 0),
+        (
+            r"[[null]]",
+            r"del(. as $x | (any(.[0.5]) and 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"[[null]]",
+            r"del(. as $x | (any((.[0])) and 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"[[null]]",
+            r"del(. as $x | (any(.[]) and 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"[[null]]",
+            r"del(. as $x | (all(.[1:]) or 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"[{"a":null,"b":null}]"#,
+            r"del(. as $x | (any(.a, .b) and 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
     ])
 }
 
