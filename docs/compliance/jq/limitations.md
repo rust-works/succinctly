@@ -1894,12 +1894,12 @@ is the revert that established what the other one costs.
    navigates the computed array it is applied to (`path(walk(.a?))` on `[1]`, `path(walk(.[]?))`
    on `[]`, a nested `path(walk(walk(empty)))` on `[]`): jq raises there, even through a `?`,
    and a by-value `walk` never checks `f`'s navigation
-   ([#3723](https://github.com/rust-works/succinctly/issues/3723)). And the always-raises group
-   (`from_entries`, `unique`, `with_entries`, ...) is still accepted as a `reduce`/`foreach`
-   *source* (`path(reduce unique as $x (.; .))` on `[1]` answers `[]`; jq exits 5), which
-   predates #3360 and covers the whole group
-   ([#3726](https://github.com/rust-works/succinctly/issues/3726)). Both rules are jq mode
-   only, like the rest of the table.
+   ([#3723](https://github.com/rust-works/succinctly/issues/3723)). Both rules are jq mode
+   only, like the rest of the table. (The always-raises group as a `reduce`/`foreach` *source*
+   was the same gap until [#3726](https://github.com/rust-works/succinctly/issues/3726); it is
+   closed, pinned by
+   `test_reduce_foreach_source_that_always_raises_raises_in_path_position_3726`, and the yq side
+   by `test_yq_reduce_source_that_jq_refuses_in_path_position_still_answers_3726`.)
 
    **#2746's own fix introduced one further, separate divergence, on the register rather
    than on navigation**: `INDEX(gen;f)` (and, until

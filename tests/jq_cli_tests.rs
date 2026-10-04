@@ -62687,6 +62687,297 @@ fn test_from_entries_and_an_empty_walk_raise_in_path_position_3360() -> Result<(
     ])
 }
 
+/// #3726: a `reduce`/`foreach` SOURCE that is one of the constructs jq always
+/// refuses in path position (`from_entries`, `unique`, `unique_by`,
+/// `with_entries`, `map_values`, `sub`/`gsub`, `ascii_downcase`/`ascii_upcase`,
+/// the `match` family) raised everywhere else -- as a pipe stage, in a `[E]`
+/// collect, bare, under `del`/`=`/`|=` -- but not here, so `path(reduce unique
+/// as $x (.; .))` on `[1]` answered `[]` and `del(...)` answered `null` where jq
+/// exits 5. A fold source with no navigation step was driven by value and
+/// never reached the resolver's post-evaluation checks. Every expected value
+/// was captured from jq 1.7.1 with `-c`; the message is only the prefix, since
+/// the container a refusal names is the documented approximation of #3271.
+#[test]
+fn test_reduce_foreach_source_that_always_raises_raises_in_path_position_3726() -> Result<()> {
+    let iterate = "Invalid path expression near attempt to iterate through";
+    let access = "Invalid path expression near attempt to access element 0";
+    let access_x = r#"Invalid path expression near attempt to access element "x""#;
+    let sources: [(&str, &str, &str); 17] = [
+        (r#"[{"key":"a","value":1}]"#, "from_entries", iterate),
+        ("[1]", "unique", iterate),
+        ("[1]", "unique_by(.)", iterate),
+        (r#"{"a":1}"#, "with_entries(.)", iterate),
+        (r#"{"a":1}"#, "map_values(.)", access),
+        (r#""a""#, r#"sub("a";"b")"#, iterate),
+        (r#""a""#, r#"gsub("a";"b")"#, iterate),
+        (r#""A""#, "ascii_downcase", iterate),
+        (r#""a""#, "ascii_upcase", iterate),
+        (r#""abc""#, r#"match("b")"#, iterate),
+        (r#""abc""#, r#"scan("b")"#, iterate),
+        (r#""abc""#, r#"capture("(?<x>b)")"#, iterate),
+        (r#""abc""#, r#"splits("b")"#, iterate),
+        // The rest of `live_path_refusal`'s table: a bare update assignment has no
+        // navigation step of its own either, and `fromstream` is jq-defined over a
+        // `foreach` accumulator keyed `x`.
+        ("1", "(. |= 2)", access),
+        ("1", "(. += 1)", access),
+        ("1", "(. //= 2)", access),
+        ("[1]", "fromstream([[0],1],[[0]])", access_x),
+    ];
+    for (input, source, message) in sources {
+        for filter in [
+            format!("path(reduce {source} as $x (.; .))"),
+            format!("path(foreach {source} as $x (.; .; .))"),
+            format!("del(reduce {source} as $x (.; .))"),
+            format!("(reduce {source} as $x (.; .)) = 5"),
+            format!("(foreach {source} as $x (.; .; .)) |= 5"),
+        ] {
+            let (out, err, code) = run_jq_full(&["-c", &filter], Some(input))?;
+            assert_eq!(
+                (out.as_str(), code),
+                ("", 5),
+                "`{filter}` on {input}: stderr {err:?}"
+            );
+            assert!(
+                err.contains(message),
+                "`{filter}` on {input}: stderr {err:?} lacks {message:?}"
+            );
+        }
+        // The refusal is an ordinary, catchable error, as it is for the bare construct.
+        let filter = format!(r#"try path(reduce {source} as $x (.; .)) catch "caught""#);
+        let (out, err, code) = run_jq_full(&["-c", &filter], Some(input))?;
+        assert_eq!(
+            (out.as_str(), code),
+            ("\"caught\"\n", 0),
+            "`{filter}` on {input}: stderr {err:?}"
+        );
+    }
+
+    let bad = "Invalid path expression";
+    assert_path_rows_3289(&[
+        // The construct raises wherever it sits in the source, not only as its head.
+        ("[1]", r"path(reduce ([unique]) as $x (.; .))", "", bad, 5),
+        ("[1]", r"path(reduce (1, unique) as $x (.; .))", "", bad, 5),
+        ("[1]", r"path(reduce (unique, 1) as $x (.; .))", "", bad, 5),
+        (
+            "[1]",
+            r"path(reduce (unique | length) as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "[1]",
+            r"path(reduce (unique | empty) as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "[1]",
+            r"path(reduce (. as $y | unique) as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "[1]",
+            r"path(reduce first(unique) as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "[1]",
+            r"path(reduce limit(1; unique) as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "[1]",
+            r"path(reduce (label $out | unique) as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "[1]",
+            r"path(reduce (false or unique) as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "[1]",
+            r"path(reduce (null // unique) as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "[1]",
+            r"path(reduce (if true then unique else 1 end) as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "[[1]]",
+            r"path(.[] | reduce unique as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (to_entries | from_entries) as $x (.; .))",
+            "",
+            bad,
+            5,
+        ),
+        (
+            "[1]",
+            r#"path(reduce ("a" | ascii_downcase | ascii_upcase) as $x (.; .))"#,
+            "",
+            bad,
+            5,
+        ),
+        // A `match` family call that finds nothing produces no value, and still raises.
+        (
+            r#""abc""#,
+            r#"path(reduce match("z") as $x (.; .))"#,
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#""abc""#,
+            r#"path(reduce ([match("z")]) as $x (.; .))"#,
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#""abc""#,
+            r#"path(reduce capture("(?<x>z)") as $x (.; .))"#,
+            "",
+            bad,
+            5,
+        ),
+        (
+            r#""abc""#,
+            r#"path(reduce splits("z") as $x (.; .))"#,
+            "",
+            bad,
+            5,
+        ),
+        // A `try`/`?` directly on the construct catches it, as in jq.
+        ("[1]", r"path(reduce (unique?) as $x (.; .))", "[]\n", "", 0),
+        (
+            "[1]",
+            r"path(reduce (try unique catch 1) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        ("[1]", r"path(reduce unique as $x (.; .))?", "", "", 0),
+        ("[1]", r"[path(reduce unique as $x (.; .))?]", "[]\n", "", 0),
+        // Positions that are not path-checked never see it: an object value is a
+        // subexp, an untaken branch or a source that yields nothing never runs it.
+        (
+            "[1]",
+            r"path(reduce ({a: unique}) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[1]",
+            r"path(reduce (empty | unique) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[1]",
+            r"path(reduce (select(false) | unique) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[1]",
+            r"path(reduce (if false then unique else 1 end) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[1]",
+            r"path(reduce (true or unique) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[1]",
+            r"path(reduce (1 // unique) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[1]",
+            r"path(reduce limit(0; unique) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "[1]",
+            r"path(reduce (. as $y | 1) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A source with no refusing construct and no navigation is untouched.
+        ("[1]", r"path(reduce (length) as $x (.; .))", "[]\n", "", 0),
+        ("[1]", r"path(reduce range(3) as $x (.; .))", "[]\n", "", 0),
+        // Only path position checks: the same folds over values answer.
+        ("[1]", r"reduce unique as $x (.; .)", "[1]\n", "", 0),
+        ("[1]", r"foreach unique as $x (.; .; .)", "[1]\n", "", 0),
+        ("[1]", r"[reduce unique as $x (.; .)]", "[[1]]\n", "", 0),
+    ])
+}
+
+/// #3726: a fold source holding a refusing construct goes through the resolver,
+/// whose leaf collects a generator before delivering it, and `inputs` is the one
+/// source that must not be collected: it drains the shared reader. jq raises on
+/// the first document and reports it at line 1 of the three, which is what this
+/// pins (the position is jq 1.7.1's own, captured live); the plain
+/// `reduce inputs` source takes no such route and answers the root path.
+#[test]
+fn test_reduce_source_with_a_refusing_construct_does_not_drain_inputs_3726() -> Result<()> {
+    let docs = "[1]\n[2]\n[3]\n";
+    let (out, err, code) = run_jq_full(
+        &["-n", "-c", "path(reduce (inputs | unique) as $x (.; .))"],
+        Some(docs),
+    )?;
+    assert_eq!((out.as_str(), code), ("", 5), "stderr {err:?}");
+    assert!(
+        err.contains("(at <stdin>:1): Invalid path expression near attempt to iterate through"),
+        "stderr {err:?}"
+    );
+
+    let (out, err, code) = run_jq_full(
+        &["-n", "-c", "path(reduce inputs as $x (.; .))"],
+        Some(docs),
+    )?;
+    assert_eq!((out.as_str(), code), ("[]\n", 0), "stderr {err:?}");
+    Ok(())
+}
+
 /// #3456 (B2): the survival rule is decided per *stage*, not per leaf. A
 /// compound stage that mixes a leaf that navigates with one that does not
 /// loses the register as a whole, so these refuse where jq 1.7.1 answers `[]`
