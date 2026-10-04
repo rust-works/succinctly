@@ -7,6 +7,13 @@
 # platform. They are intrinsic to the check (ADR-0025's guard refuses once the
 # registered 2 GB stack is half spent), so the cost is moved, not reduced.
 #
+# The same two tests are also `#[ignore]`d under `cfg(coverage)` (the `cargo llvm-cov`
+# runs, CI's `Coverage` job included), by `#[cfg_attr(coverage, ignore = ...)]` on the
+# tests themselves, because they cover no line the rest of the suite does not
+# (#3750, B2). That is not driven by this list: a test moved here is NOT skipped from
+# Coverage unless it carries the attribute too, and it should only get it after the
+# same with/without comparison of the lcov line sets shows nothing unique is lost.
+#
 # This file is the single source of truth for the list, for both sides:
 #
 #   deep-recursion-tests.sh skip-args   prints `--exact --skip <name> ...`, which
