@@ -63,3 +63,7 @@ jobs:
         with:
           name: ${{ matrix.name }}
           use-prebuilt: ${{ matrix.use-prebuilt }}
+          # #3750 B1, stage 2: the pull-request jobs ran pooled first (PR #3764) and
+          # matched the unpooled baseline of the same commit line for line outside
+          # the two CPU-feature-flap files, so the published baseline is pooled too.
+          pool-profile-files: 'true'
