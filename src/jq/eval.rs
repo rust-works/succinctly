@@ -28334,6 +28334,61 @@ fn eval_update_no_vivify<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
+/// The concrete paths `|=` would update for `path_expr` over `doc`, spelled as
+/// static navigation (#3747): `path(path_expr)` evaluated on the document, each
+/// result re-spelled by [`static_path_expr`]. `None` when the paths cannot all
+/// be named that way or evaluating them raises -- the caller then keeps the
+/// route it would have taken without them.
+/// Whether `path_expr` is a plain fan-out: fields, indexes, `.[]`, `?` and
+/// grouping only, with at least one `.[]` (#3747). Nothing in it can run user
+/// code, so spelling its paths out ahead of the writes cannot reorder a side
+/// effect against the filter's (#2974).
+fn is_plain_fan_out_path(path_expr: &Expr) -> bool {
+    fn plain(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
+            Expr::Optional(inner) | Expr::Paren(inner) => plain(inner),
+            Expr::Pipe(stages) => stages.iter().all(plain),
+            _ => false,
+        }
+    }
+    plain(path_expr) && any_subexpr(path_expr, &mut |e| matches!(e, Expr::Iterate))
+}
+
+fn concrete_update_paths<S: EvalSemantics>(
+    path_expr: &Expr,
+    doc: &OwnedValue,
+) -> Option<Vec<Expr>> {
+    let paths = eval_owned_multi::<S>(
+        &Expr::Builtin(Builtin::Path(Box::new(path_expr.clone()))),
+        doc,
+    )
+    .ok()?;
+    // A slice descriptor needs the real container to resolve against; those
+    // keep the route they already took.
+    paths
+        .iter()
+        .map(|path| match path {
+            OwnedValue::Array(parts)
+                if parts.iter().any(|p| matches!(p, OwnedValue::Object(_))) =>
+            {
+                None
+            }
+            _ => static_path_expr(path),
+        })
+        .collect()
+}
+
+/// The `delpaths` entry for a write whose target is `path`, when every step
+/// is a plain field or index (#3747). A collapsing write unwinds the walk's
+/// own `DeferredUpdateDeletes::at` before its handler runs, so the entry is
+/// rebuilt from the target itself.
+fn static_delete_path(path: &Expr) -> Option<Vec<OwnedValue>> {
+    let mut steps = Vec::new();
+    push_path_components(&mut steps, path);
+    steps.iter().map(update_delete_component).collect()
+}
+
 fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     filter_expr: &Expr,
@@ -28387,10 +28442,13 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // path at a time can carry on from there -- the native `.[]` arms cannot
     // re-root onto the null state. `path(PATH)` over the document spells those
     // paths out; `None` keeps the route the shape already took.
-    let collapse_paths: Option<Vec<Expr>> =
-        (S::TAG == EvalTag::Jq && !skip_absent_paths && has_pattern_alternatives(filter_expr))
-            .then(|| concrete_update_paths::<S>(path_expr, &result))
-            .flatten();
+    let collapse_paths: Option<Vec<Expr>> = (S::TAG == EvalTag::Jq
+        && !skip_absent_paths
+        && !(positioned && reads_parent(filter_expr))
+        && is_plain_fan_out_path(path_expr)
+        && has_pattern_alternatives(filter_expr))
+    .then(|| concrete_update_paths::<S>(path_expr, &result))
+    .flatten();
     if S::TAG == EvalTag::Jq
         && !skip_absent_paths
         && !(positioned && reads_parent(filter_expr))
@@ -31857,45 +31915,6 @@ fn position_update_filter<S: EvalSemantics>(
 /// Same question [`is_effectively_identity`] already answers -- delegated
 /// rather than re-derived, so a future path-shape [`unwrap_path_component`]
 /// learns to unwrap reaches both call sites for free.
-/// The concrete paths `|=` would update for `path_expr` over `doc`, spelled as
-/// static navigation (#3747): `path(path_expr)` evaluated on the document, each
-/// result re-spelled by [`static_path_expr`]. `None` when the paths cannot all
-/// be named that way or evaluating them raises -- the caller then keeps the
-/// route it would have taken without them.
-fn concrete_update_paths<S: EvalSemantics>(
-    path_expr: &Expr,
-    doc: &OwnedValue,
-) -> Option<Vec<Expr>> {
-    let paths = eval_owned_multi::<S>(
-        &Expr::Builtin(Builtin::Path(Box::new(path_expr.clone()))),
-        doc,
-    )
-    .ok()?;
-    // A slice descriptor needs the real container to resolve against; those
-    // keep the route they already took.
-    paths
-        .iter()
-        .map(|path| match path {
-            OwnedValue::Array(parts)
-                if parts.iter().any(|p| matches!(p, OwnedValue::Object(_))) =>
-            {
-                None
-            }
-            _ => static_path_expr(path),
-        })
-        .collect()
-}
-
-/// The `delpaths` entry for a write whose target is `path`, when every step
-/// is a plain field or index (#3747). A collapsing write unwinds the walk's
-/// own `DeferredUpdateDeletes::at` before its handler runs, so the entry is
-/// rebuilt from the target itself.
-fn static_delete_path(path: &Expr) -> Option<Vec<OwnedValue>> {
-    let mut steps = Vec::new();
-    push_path_components(&mut steps, path);
-    steps.iter().map(update_delete_component).collect()
-}
-
 fn is_root_path(path: &Expr) -> bool {
     is_effectively_identity(path)
 }

@@ -93145,6 +93145,29 @@ fn test_update_collapse_mid_fan_out_matches_jq_3747() -> Result<()> {
         let (out, err, code) = run_jq_full(&["-nc", &program], None)?;
         assert_eq!((out.as_str(), code), (expected, 0), "`{program}`: {err:?}");
     }
+    // A path generator that runs user code keeps jq's interleaving of its side
+    // effects with the filter's (#2974): `p f p f`, not `p p f f`.
+    let (_, err, _) = run_jq_full(
+        &[
+            "-c",
+            r#".[(0,1)|debug("p")] |= (debug("f") | (if . == 1 then (1 as $x ?// $y | select($y == null) | $x) else 7 end))"#,
+        ],
+        Some("[1,2]"),
+    )?;
+    let debug_lines: Vec<&str> = err
+        .lines()
+        .filter(|l| l.starts_with("[\"DEBUG:\""))
+        .collect();
+    assert_eq!(
+        debug_lines,
+        [
+            r#"["DEBUG:","p"]"#,
+            r#"["DEBUG:","f"]"#,
+            r#"["DEBUG:","p"]"#,
+            r#"["DEBUG:","f"]"#
+        ],
+        "{err:?}"
+    );
     Ok(())
 }
 
