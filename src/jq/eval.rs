@@ -42017,6 +42017,32 @@ fn fans_out(expr: &Expr) -> bool {
     })
 }
 
+/// Whether `expr` is one chain of stages with no point at which it can split
+/// into sibling branches (#3738): navigation ([`is_navigation_node`]), the
+/// fold's bound variable (a `TrackedVar` once substituted), `.`, and the
+/// wrappers that add no branch of their own (parentheses, `?`, `try` with no
+/// `catch`) joined by `|`. Every node is vetted, the way
+/// [`is_pure_navigation`] vets a bind source, so a navigation node that
+/// carries an expression of its own is admitted only if that expression is in
+/// the list too: a field, an index, a slice, `..` and `.[]` are chains; a
+/// computed key (even a literal one, `.a[0.5]`) and `getpath(...)` are not,
+/// since their arguments are not. An allowlist, the safe direction: a shape it
+/// does not name keeps [`fans_out`]'s answer.
+fn is_single_path_chain(expr: &Expr) -> bool {
+    !any_subexpr(expr, &mut |e| {
+        !(is_navigation_node(e)
+            || matches!(
+                e,
+                Expr::Identity
+                    | Expr::TrackedVar(_)
+                    | Expr::Pipe(_)
+                    | Expr::Paren(_)
+                    | Expr::Optional(_)
+                    | Expr::Try { catch: None, .. }
+            ))
+    })
+}
+
 /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type
 /// that has no pointer to compare — the single definition shared by every
 /// site that has to answer "is this branch still sitting *on* the path
@@ -42573,7 +42599,8 @@ impl FoldRegister {
         // `(foreach .a as {a:$v} ?// {c:$v} (0; ($v[0]?, $v))) = 9` wrote
         // `.a.c`, a key jq never names, because only the second output
         // refused and drove a `?//` retry jq does not perform. A body with
-        // one output path cannot split that way. Widening the other
+        // one output path cannot split that way. (#3738 exempts a chain of stages,
+        // generator or not: see the call site below.) Widening the other
         // direction (re-establishing in `resolve_node`'s own arms) is
         // #2046's documented scope limit, not this fix's.
         let update_frame = if self.trackable {
@@ -42613,8 +42640,19 @@ impl FoldRegister {
                 &mut deliver,
             )
         } else {
+            // #3738: a body that is one chain of stages gets the register
+            // whether or not it holds a generator. `fans_out` guards sibling
+            // branches that would see the register unevenly; a generator inside
+            // one chain (`try ($v | .[]?)`) has no sibling to withhold it from,
+            // since every output comes through the same stages. Withholding it
+            // made such a body resolve register-less, so its own refusal was
+            // caught by the `try` as though jq had raised it and the UPDATE
+            // yielded nothing -- a write silently skipped where jq writes or
+            // raises. Anything `is_single_path_chain` does not name keeps the
+            // old verdict.
+            let carries_register = !fans_out(expr) || is_single_path_chain(expr);
             let update_frame = update_frame.with_register(
-                if S::TAG == EvalTag::Jq && self.trackable && !tr && !fans_out(expr) {
+                if S::TAG == EvalTag::Jq && self.trackable && !tr && carries_register {
                     Some(&self.value)
                 } else {
                     None

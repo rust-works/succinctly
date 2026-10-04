@@ -63717,6 +63717,387 @@ fn test_foreach_extract_ending_in_limit_last_answers_the_root_characterize_preex
     Ok(())
 }
 
+/// #3738: a `foreach` UPDATE that is one chain of stages under a `try`
+/// (`try ($w | .[]?)`, `try ($w | .a[])`, `try ($w | ..)`) keeps jq's path
+/// register. The fold used to withhold the register from any non-pipe body that
+/// held a generator (`fans_out`), so the body resolved register-less, the `try`
+/// caught its own refusal as though jq had raised it, and the UPDATE yielded
+/// nothing: `del(...)` and `(...) = 9` silently skipped the write where jq
+/// writes, or raises. A chain has no sibling branch to withhold the register
+/// from, so it is exempt (`is_single_path_chain`). Every row captured from jq
+/// 1.7.1 with `-c`; the branching bodies stay as they were
+/// (`test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`).
+#[test]
+fn test_foreach_update_under_try_over_a_generator_keeps_the_register_3738() -> Result<()> {
+    let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#;
+    assert_path_rows_3289(&[
+        // The issue's rows: jq raises where the write used to be skipped.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .[]?); $w))",
+            "",
+            "Invalid path expression with result {\"a\":[{\"b\":1}]}",
+            5,
+        ),
+        (
+            doc,
+            r"del(foreach .x as {a:$v} (0; try ($v | .[]?); $v))",
+            "",
+            "Invalid path expression with result [{\"b\":1}]",
+            5,
+        ),
+        (
+            doc,
+            r"(foreach .x as {a:$v} (0; try ($v | .[]?); $v)) = 9",
+            "",
+            "Invalid path expression with result [{\"b\":1}]",
+            5,
+        ),
+        (
+            doc,
+            r"path(foreach .x as {a:$v} (0; try ($v | .[]?); .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        // A plain variable, a destructuring pattern and a `?//` chain; `.[]?`, `.a[]`, `.a[]?` and `..`.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .[]?); .))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[]); .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[]?); .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | ..); .))",
+            "[\"x\"]\n[\"x\",\"a\"]\n[\"x\",\"a\",0]\n[\"x\",\"a\",0,\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as {a:$v} ?// {b:$v} (0; try ($v | .[]?); .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        // More stages in the chain, and the EXTRACT reading the state or the variable.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[] | .b); .))",
+            "[\"x\",\"a\",0,\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[] | .zz); .))",
+            "[\"x\",\"a\",0,\"zz\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[]); .a))",
+            "[\"x\",\"a\",0,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[]); $w))",
+            "",
+            "Invalid path expression with result {\"a\":[{\"b\":1}]}",
+            5,
+        ),
+        // The source is `.a`, or two sources: each element runs the fold.
+        (
+            doc,
+            r"path(foreach .a as $w (0; try ($w | .[]?); .))",
+            "[\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach (.x, .a) as $w (0; try ($w | .[]?); .))",
+            "[\"x\",\"a\"]\n[\"a\",0]\n",
+            "",
+            0,
+        ),
+        // The write forms land where jq writes them.
+        (
+            doc,
+            r"del(foreach .x as $w (0; try ($w | .a[]); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[]}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as $w (0; try ($w | .a[]); .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[9]}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as $w (0; try ($w | .a[]); .)) |= 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[9]}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (0; try ($w | .[]?); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as {a:$v} ?// {b:$v} (0; try ($v | .[]?); .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[9]}}\n",
+            "",
+            0,
+        ),
+        // A `.` stage, a trailing `?` and a parenthesised `try` are the same chain.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .[]? | .); .))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .[]?)?; .))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; (try ($w | .[]?)); .))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        // The same chain as the EXTRACT (every fold body goes through the same route).
+        (
+            doc,
+            r"path(foreach .x as $w (0; .; try ($w | .a[])))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (0; .; try ($w | .a[])))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[]}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as $w (0; .; try ($w | .a[] | .b))) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":9}]}}\n",
+            "",
+            0,
+        ),
+        // A chain through an index or a slice is a chain too (`is_navigation_node`); a slice
+        // write raises as jq's does instead of being silently skipped.
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"del(foreach .x as $w (0; try ($w | .a[0] | .[]?); .))",
+            "{\"x\":{\"a\":[[]]}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"(foreach .x as $w (0; try ($w | .a[0][]); .)) = 9",
+            "{\"x\":{\"a\":[[9]]}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"path(foreach .x as $w (0; try ($w | .a[0] | .[]?); .))",
+            "[\"x\",\"a\",0,0]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"(foreach .x as $w (0; try ($w | .a | .[] | .[0:1]); .)) = 9",
+            "",
+            "A slice of an array can only be assigned another array",
+            5,
+        ),
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"path(foreach .x as $w (0; try ($w | .a | .[] | .[0:1]); .))",
+            "[\"x\",\"a\",0,{\"start\":0,\"end\":1}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"path(foreach .x as $w (0; try ($w | .a[0:1][]); .))",
+            "[\"x\",\"a\",{\"start\":0,\"end\":1},0]\n",
+            "",
+            0,
+        ),
+        // Control: a body with no generator already agreed.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a); .))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3770, characterization of a pre-existing bug: a `foreach` UPDATE under a
+/// `try` whose body *branches* (a comma, `//`, `and`/`or` around a generator)
+/// still answers nothing, or the root path, where jq answers a path, so a write
+/// through it is silently skipped. The shapes are the siblings `fans_out` guards
+/// (#3145), and the fold's null-identity relocation makes widening it unsafe:
+/// dropping `Iterate` from `fans_out` outright turned the `null` rows below
+/// into `[]` and `= 9` into a write over the whole document, so #3738 exempts
+/// only single-chain bodies. Verified identical on `main` before #3738. jq 1.7.1's
+/// answers are in the comments; if #3770 is fixed, update the expectations.
+#[test]
+fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770(
+) -> Result<()> {
+    let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#;
+    assert_path_rows_3289(&[
+        // jq: ["x","a"] and ["x","b"]
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a, .b?); .))",
+            "",
+            "",
+            0,
+        ),
+        // jq: ["x","a",0] and ["x"]
+        (
+            doc,
+            r"path(foreach .x as $w (0; try (($w | .a[]), $w); .))",
+            "",
+            "",
+            0,
+        ),
+        // jq: {"a":[{"b":1}],"x":{}}
+        (
+            doc,
+            r"del(foreach .x as $w (0; try ($w | .a, .b?); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}]}}\n",
+            "",
+            0,
+        ),
+        // jq: {"a":[{"b":1}],"x":9}
+        (
+            doc,
+            r"(foreach .x as $w (0; try (($w | .a[]), $w); .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}]}}\n",
+            "",
+            0,
+        ),
+        // jq: ["x","a",0]
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[]) // $w; .))",
+            "",
+            "Invalid path expression with result {\"a\":[{\"b\":1}]}",
+            5,
+        ),
+        // jq: ["a"]
+        (
+            "null",
+            r"path(foreach .a? as $k (0; try (($k | .[]?) // $k); $k))",
+            "",
+            "",
+            0,
+        ),
+        // jq: {"a":9}
+        (
+            "null",
+            r"(foreach .a? as $k (0; try (($k | .[]?) // $k); .)) = 9",
+            "null\n",
+            "",
+            0,
+        ),
+        // The allowlist does not name a computed key, even a literal one, or `getpath`:
+        // jq: ["x","a",0.5,0]
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"path(foreach .x as $w (0; try ($w | .a[0.5] | .[]?); .))",
+            "",
+            "",
+            0,
+        ),
+        // jq: {"x":{"a":[[9]]}}
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"(foreach .x as $w (0; try ($w | .a[0.5][]); .)) = 9",
+            "{\"x\":{\"a\":[[1]]}}\n",
+            "",
+            0,
+        ),
+        // jq: ["x","a",0]
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r#"path(foreach .x as $w (0; try ($w | getpath(["a"]) | .[]?); .))"#,
+            "",
+            "",
+            0,
+        ),
+        // A `catch` handler is not a chain either: it runs on a caught error's payload.
+        // jq: ["x","a"]
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .[]?) catch .; .))",
+            "",
+            "Invalid path expression with result \"Invalid path",
+            5,
+        ),
+        // jq: {"a":[{"b":1}],"x":{"a":[9]}}
+        (
+            doc,
+            r"(foreach .x as $w (0; try ($w | .a[]) catch 1; .)) = 9",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        // jq: ["a",0]
+        (
+            "null",
+            r"path(foreach .a? as $k (0; try (($k | .[0]) and (.. | .a?)); $k))",
+            "",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3361: `add`, `flatten`, `map(f)` and `walk(f)` are jq-defined over a
 /// source they backtrack (`reduce .[] as $x ...`, `[.[] | f]`), `to_entries`
 /// keeps every step inside an `as` source or an object construction, and `sort`
