@@ -64,8 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `def`, which keeps its copy (a node remembers what evaluation did to it, #3148). Allocator calls over 2,000
   values: lone `.a` 24,058 to 22,058, lone `select(.a > 3 and .a < 100000)` 97,922 to 75,922, a parenthesized
   regex pipe 401,958 to 379,958; a two-stage rest (55,958) and `map(tostring)` (4,058) unchanged. Interleaved
-  wall clock on an Apple M4 Pro, min of 9: the lone `select` row -9.5% to -11.5% at 10 k, 45 k and 90 k values,
-  lone `.a` -4.9%, the regex pipe -1.7%, the unchanged rows -0.1%; output identical on all 7 configurations and on
+  wall clock on an Apple M4 Pro, min of 9: the lone `select` row -9.9%, -10.6% and -10.9% at 90 k, 45 k and 10 k
+  values, outside the noise (the baseline timed against a copy of itself reads -2.8% to +2.8% over the same rows);
+  lone `.a` (+0.1%), the regex pipe (-2.6%), a lone `def` stage, which now pays one walk before copying as before
+  (+2.0%), and the unchanged rows (+0.6%, -0.2%) are inside it. Output identical on all 8 configurations and on
   1,722 differential programs (owned stage x rest x context, jq `-n`). x86_64 was not timed: the 7950X bench box was
   unreachable, so its figure is the allocator counts above. A rest of two or more
   stages still copies, because each element is its own `eval_pipe` call and the AST has no slot to cache an owned
