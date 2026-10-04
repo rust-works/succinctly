@@ -62721,6 +62721,10 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
             "",
             0,
         ),
+        (doc, r#"path(. as $x | "s" | strings | $x)"#, "[]\n", "", 0),
+        (doc, r"path(. as $x | [1] | iterables | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | values | $x)", "[]\n", "", 0),
+        // ...and a value of another type prunes it, leaving nothing to refuse.
         (doc, r"path(. as $x | 5 | strings | $x)", "", "", 0),
         (doc, r"path(. as $x | 5 | iterables | $x)", "", "", 0),
         (doc, r"path(. as $x | null | values | $x)", "", "", 0),
