@@ -648,6 +648,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a non-inert `any`/`all` `cond` is resolved as `gen | cond`, so jq's path error and register movement inside it are seen** (#3757, a #3749/#3763 follow-up).
+  jq runs `cond` as `or`'s (`and`'s) left operand in `isempty(first(gen | (cond or empty)))`, which is not a subexp, so it is
+  path-checked: a navigating `cond` moves the register onto its own node (`path(any(.[]; .a))` on `[{"a":true}]` is `[0,"a"]`), and on a
+  *computed* element it raises (`any(1; .[]?)` is `near attempt to iterate through 1`; a postfix `?` does not catch a path error). The arm ran
+  `cond` by value and saw neither, so a surrounding `or`, `//`, `$x` rebind or `try` accepted and wrote where jq exits 5 or, under
+  `try`, leaves the document (`del(((any(1; .[]?))) // .a)` on `{"a":true}` deleted `a`; `(try (all(tostring; .a?))) |= 5` on `true` wrote
+  `5`; `main` since #3749 deleted the whole document for `del(. as $x | (any(1; .[]?) or 1) | $x)`). In jq mode a `cond` that
+  `cannot_move_register` still runs by value (it navigates nothing, so that is exact); any other is resolved with `resolve_seq_stage` on
+  each branch `gen` produced, which is `gen | cond`, so the resolver's own rules apply: an untracked element raises jq's
+  `near attempt to ...`, `unique_by(.)` and an update assignment raise as jq's do, `select(.)`/`first(.)`/`..` leave the register, a deciding
+  output carries the register `cond` left, and the undecided claim needs no extra condition because a `cond` that could raise already did.
+  The empty-generator, inert-`cond` and plain-navigation clauses #3763 added for the undecided claim are gone. yq mode is unchanged.
+  A computed `null`/`true`/`false` generator element over a register equal to it by kind *is* the register in jq (`jv_identical`), so
+  `any(true; .[0]?)` on `true` raises no path error there; the branch is re-established at the entry (trackable entry only). One shape
+  still refuses where jq answers, pinned: a plain pipe stage that drops the any/all/isempty verdict, which also hides `isempty(g)`
+  used as a `cond` (#3758). A twenty-three-operand sweep against a build of `main` without this change (223,587 programs at the grid's 27 contexts; reproduce with `--operand` for each of the any/all/isempty operands) goes from `ACCEPT_WRONG` 1,675 to 0, `REFUSE_WRONG` 5,495 to 2,278 and `DIFF` 8 to 0, with 0 regressions: the first sweep of this family to exit 0. Pinned by `test_any_all_navigating_cond_states_the_register_it_left_3757`,
+  `test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757` and `test_any_all_live_cond_is_jq_mode_only_3757` (the yq entry, since the
+  CLI's yq routes never reach the arm); each of the live route, the decisive register, the undecided register, the escape and the jq-mode
+  gate and the identity re-establish fails a test when removed. The sweep gained seven operands (`select`, `first`, a navigating chain, an update assignment,
+  `unique_by`, a computed generator under a navigating `cond`).
+
 - **jq: bare `any`/`all`, `any(f)`/`all(f)` and `isempty(g)` state jq's path register** (#3763, a #3749 follow-up).
   jq defines `any` as `any(.[]; .)`, `any(f)` as `any(.[]; f)` (`all` alike) and `isempty(g)` as `first((g | false), true)`,
   so in `path()` each emits its boolean from inside the generator once an element decides and `path()` accepts a result
@@ -663,28 +684,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over seven bare and one-argument operands of `scripts/jq-path-register-sweep.py` (four of them new; 57,987 programs at the
   grid's 23 contexts then, pre-change binary as base: 0 `ACCEPT_WRONG`, 0 regressions, `REFUSE_WRONG` 1,942 to 583). Pinned by `test_isempty_and_bare_any_all_state_the_register_3763`
   and `test_bare_any_all_and_isempty_keep_their_refusals_3763`; each arm and the jq-mode gate fail a test when removed.
-  **It also closes a hole #3749 left.** The claim that an `any`/`all` that decided nothing left jq's register at its entry is
-  only sound when `cond` cannot raise a path error, and jq path-checks `cond` where this resolver runs it by value: on `main`,
-  `del(. as $x | (any(1; .[]?) or 1) | $x)` on `{"a":1}` and `del(. as $x | (all(unique_by(.)) or .a) | $x)` on `[[1],[1]]`
-  deleted the whole document (and `= 9` replaced it) where jq exits 5, and the first push of this fix did the same for
-  `isempty` over such an `any`. The decided statement now needs `cannot_move_register(cond)`; the undecided one needs `cond`
-  not to have raised, which holds when it never ran (`gen` was empty), when it is inert, or when it is plain navigation that
-  only ran on the register (`any(.a)` over `[{"key":"a","value":1}]` navigates to `null` and backtracks, while the same
-  step on a computed element, `any(1; .a)`, raises in jq and stays refused). The by-value per-result verdict
-  (`register_stays_on_result`, `LeafRegister`), which made the same claim for the one-argument forms and never fires in jq
-  mode now that every spelling has an arm, is removed. Pinned by
-  `test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763` and
-  `test_any_all_undecided_register_survives_a_cond_that_never_raised_3763`; each clause fails a test when removed, and the
-  sweep gained five operands that generate the shape. **Still open (#3757, now Medium):** `cond` runs by value, so jq's path
-  error on a *computed* element is invisible, and `any(1; .[]?)` or `all(tostring; .a?)` under `or`, `//`, a `$x` rebind or a
-  `try` can still be accepted and written where jq exits 5 or, under `try`, leaves the document (`(try (all(tostring; .a?)))
-  |= 5` on `true` is `5` here and `true` in jq). A sixteen-operand sweep against a build of `main` without this change
-  (155,547 programs at the grid's 27 contexts; reproduce with `--operand` for the sixteen any/all/isempty operands) has
-  `ACCEPT_WRONG` 2,342 to 1,603, all on the five computed-generator operands: 739 closed, none new, none writing a different
-  document than before; `REFUSE_WRONG` 4,188 to 3,009, `MATCH` 148,985 to 150,929, and 156 safe-direction regressions, all on
-  those five operands, which `main` matched only because it was unsound.
-  The undecided statement is also refused, in the safe direction, for a `cond` outside its three clauses (`try .b`, `first?`,
-  `limit(1; .[]?)`), which `main` answered like jq.
+  **It also closes a hole #3749 left**: the claim that an `any`/`all` that decided nothing left jq's register at its entry was
+  made for a `cond` that could raise, so `del(. as $x | (any(1; .[]?) or 1) | $x)` on `{"a":1}` and
+  `del(. as $x | (all(unique_by(.)) or .a) | $x)` on `[[1],[1]]` deleted the whole document on `main` where jq exits 5, and the
+  first push of this fix did the same through `isempty`. This entry gated both claims on `cond` not having raised and removed
+  the by-value per-result verdict (`register_stays_on_result`, `LeafRegister`); #3757, above, replaces the gate by resolving
+  such a `cond` as `gen | cond`. Pinned by `test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763` and
+  `test_any_all_undecided_register_survives_a_cond_that_never_raised_3763`.
 
 - **jq: a `reduce` that computes its accumulator leaves jq's path register where it entered** (#3710).
   `path(. as $x | reduce (1) as $i (.; .a = $i) | $x.k)` on `{"k":1,"a":1}` is `["k"]` in jq (and so are `del`
@@ -714,7 +720,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned (without it `path(false | (any(empty; .) and 1))` answers `[]` and `del` of it writes `null`, where jq
   refuses). Pinned by `test_any_all_gen_cond_decisive_result_sits_at_the_register_3749`,
   `test_any_all_gen_cond_exhausted_register_stays_at_entry_3749` and
-  `test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749`; the path-register sweep gained four
+  `test_any_all_pipe_stage_verdict_and_identity_residuals_stay_refused_3757` (named `..._unprovable_cond_and_pipe_stage_stay_refused_3749` then); the path-register sweep gained four
   `any`/`all(gen; cond)` operands.
 
 - **jq: a `foreach` whose update is a full slice keeps its state on the register** (#3742).

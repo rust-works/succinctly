@@ -1151,60 +1151,39 @@ is the revert that established what the other one costs.
      non-empty array (`.[0:]` is the input itself to jq; an empty slice is a fresh `[]`, never
      identical -- #3494), so `path(.a as $v \| . as $w \| $v \| (($w \| .a)
      and .b))` refuses where jq answers.
-   - **`any(gen; cond)`/`all(gen; cond)` state the register since
-     [#3749](https://github.com/rust-works/succinctly/issues/3749), and so do bare `any`/`all`,
-     `any(f)`/`all(f)` and `isempty(g)` since
-     [#3763](https://github.com/rust-works/succinctly/issues/3763)**, in jq mode only. jq defines
-     the bare and one-argument spellings as `any(.[]; .)` and `any(.[]; f)` (`all` alike) and
-     `isempty(g)` as `first((g | false), true)`, so they take the same rules: `path(any)` on
-     `[true,false]` is `[0]`, `path(isempty(.[]?))` on `[false]` is `[0]`, and `del`/`=`/`|=` write
-     there; an untracked input still raises `near attempt to iterate through` from the `.[]`.
-     In yq mode `any`/`all` are real yq builtins and keep yq's own scalar error (`all only
-     supports arrays, was !!int`). A deciding
-     element is emitted from inside `gen`, so the result is a fresh boolean *at* the register `gen`
-     left, and `PATH_END` accepts it when it is `jv_identical` to it: `path(any(.[]; .))` on
-     `[true,false]` is `[0]`, `path(all(.[]; .))` is `[1]`, `del(any(.[]; .))` is `[false]`, and
-     `[1,2]`/`[null]` still refuse (a truthy `1` is not `true`, `null` is not `false`). A generator
-     that never decided backtracked every branch, so the register is where the construct entered
-     (`path(any(.[]; .) or .a)` on `{"a":false}` is `["a"]`) -- but only for a `cond` that cannot
-     raise a path error. jq path-checks `cond` (it is `or`'s left operand, not a subexp) and this
-     resolver runs it by value, so an `any(1; .[]?)` that jq raises on (`near attempt to iterate
-     through 1`) would read as a clean backtrack, and a later `$x` would re-establish the root: the
-     first push of #3763 deleted the whole document for
-     `del(. as $x | (isempty(any(1; .[]?)) and 1) | $x)` on `{"a":1}`, and so did `main` for
-     `del(. as $x | (any(1; .[]?) or 1) | $x)` since #3749. The decided claim therefore needs
-     `cannot_move_register(cond)`, and the undecided one needs `cond` not to have raised: it never
-     ran (`gen` was empty, so `any(.a)` over `[]` is a clean backtrack), or it is inert, or it is a
-     chain of plain navigation steps that only ran on the register (`any(.a)` over
-     `[{"key":"a","value":1}]` navigates to `null` and backtracks), where a path error cannot occur
-     (`test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763` and
-     `test_any_all_undecided_register_survives_a_cond_that_never_raised_3763`). The same navigation
-     on a computed element (`any(1; .a)`) raises in jq and stays refused. The converse is not closed
-     ([#3757](https://github.com/rust-works/succinctly/issues/3757)): `cond` runs by value, so jq's path
-     error on a *computed* element (`any(1; .[]?)`, `all(tostring; .a?)`) is invisible, and under `or`,
-     `//`, a `$x` rebind or a `try` the result can be accepted and written where jq exits 5 or, under
-     `try`, leaves the document (`(try (all(tostring; .a?))) |= 5` on `true` is `5` here, `true` in jq).
-     A sweep of the sixteen `any`/`all`/`isempty` operands against a build of `main` without #3763
-     (155,547 programs at 27 contexts) has 1,603 such rows, all on the five computed-generator operands,
-     down from 2,342: 739 closed, none new and none writing a different document than before. A `cond` outside the undecided claim's three clauses (`try .b`,
-     `first?`, `limit(1; .[]?)`) is refused in the safe direction where `main` answered like jq. Two shapes are still refused where jq
-     answers, pinned
-     (`test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749`): the result is
-     stated only while `cond` is on `cannot_move_register`'s allowlist, because `cond` runs by
-     value and the arm cannot say where it left the register. So a `cond` that navigates refuses
-     (`path(any(.[]; .a))` on `[{"a":true}]` is `[0,"a"]` in jq, since `or`'s left operand moves
-     the register), and so does one that jq leaves in place but the allowlist cannot prove
-     (`select(.)`, `first(.)`, `limit(1; .)`, `..`, a `def`: jq answers `[0]` on `[true,false]`)
-     ([#3757](https://github.com/rust-works/succinctly/issues/3757)); a plain pipe stage does
-     not read the backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any |
-     $x)` on `{"a":false,"b":null}` is `[]` in jq and refuses here, as do the by-value forms
-     ([#3758](https://github.com/rust-works/succinctly/issues/3758)); `any(.a)` is the first
-     shape again. The exhausted-generator
-     statement is `drained_register_after`, shared with `isempty(g)`, and it is made only on a
-     trackable entry: after `false |` the value is not jq's register, and stating it would let
-     `and` accept the `false` it computes (`path(false | (any(empty; .) and 1))` on `{"a":1}`).
-     Real yq rejects the two-argument form outright, so yq mode (`--jq-extensions`) keeps its
-     refusal.
+   - **`any(gen; cond)`/`all(gen; cond)`, the bare `any`/`all`, `any(f)`/`all(f)` and `isempty(g)` state
+     the register** ([#3749](https://github.com/rust-works/succinctly/issues/3749),
+     [#3763](https://github.com/rust-works/succinctly/issues/3763),
+     [#3757](https://github.com/rust-works/succinctly/issues/3757)), in jq mode only. jq defines `any(g; c)` as
+     `isempty(first(g | (c or empty))) | not`, the bare and one-argument spellings over `.[]`, and `isempty(g)` as
+     `first((g | false), true)`, so each emits its boolean from inside the generator once an element decides, the
+     register is wherever that left it, and `path()` accepts a result `jv_identical` to it: `path(any)` on
+     `[true,false]` is `[0]`, `path(isempty(.[]?))` on `[false]` is `[0]`, `del(any(.[]; .))` is `[false]`, and
+     `[1,2]`/`[null]` still refuse (a truthy `1` is not `true`, `null` is not `false`). A generator that never decided
+     backtracked every branch, so the register is where the construct entered (`path(any(.[]; .) or .a)` on
+     `{"a":false}` is `["a"]`), stated only on a trackable entry (`drained_register_after`): after `false |` the value
+     is not jq's register, and stating it would let `and` accept the `false` it computes. `cond` is `or`'s left
+     operand there, which is not a subexp, so jq path-checks it: a navigating `cond` moves the register onto its own
+     node (`any(.[]; .a)` on `[{"a":true}]` is `[0,"a"]`), and on a computed element it raises (`any(1; .[]?)` is `near
+     attempt to iterate through 1`; a postfix `?` does not catch a path error). A `cond` that provably navigates
+     nothing (`cannot_move_register`) runs by value; any other is resolved as a pipe stage on each branch `gen`
+     produced, which is `gen | cond`, so the stage rules apply: `select(.)` and `first(.)` leave the register,
+     `unique_by(.)` and an update assignment raise on a computed element, and an enclosing `or`, `//`, `$x` rebind or
+     `try` no longer accepts and writes where jq exits 5 (`del(((any(1; .[]?))) // .a)` on `{"a":true}`;
+     `(try (all(tostring; .a?))) |= 5` on `true` is `true`). Before #3757 `cond` ran by value everywhere: the undecided
+     claim was made for a `cond` that could raise, so `del(. as $x | (any(1; .[]?) or 1) | $x)` on `{"a":1}` deleted the
+     whole document on `main` since #3749. Pinned by `test_any_all_navigating_cond_states_the_register_it_left_3757`,
+     `test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757` and the `_3763` rows, each clause failing a test
+     when removed. A computed `null`/`true`/`false` generator element over a register that is equal by kind *is* the
+     register in jq (`jv_identical`), so `any(true; .[0]?)` on `true` raises no path error there, and the branch is
+     re-established at the entry on a trackable entry; over an untracked entry the register's position is not known
+     and the element is treated as computed. A sweep of the twenty-three `any`/`all`/`isempty` operands against a build of `main` without #3757 (223,587 programs at 27 contexts; `--operand` for each) has `ACCEPT_WRONG` 1,675 to 0, `REFUSE_WRONG` 5,495 to 2,278, `DIFF` 8 to 0 and no regression: the first sweep of this family to exit 0. One shape still refuses where jq answers, pinned
+     (`test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`): a plain pipe stage does not read the
+     backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any | $x)` on `{"a":false,"b":null}` is
+     `[]` in jq and refuses here, and so does `isempty(g)` as a `cond` (`any(.[]; isempty(empty))` is `[0]`)
+     ([#3758](https://github.com/rust-works/succinctly/issues/3758)). In yq mode `any`/`all` are real yq
+     builtins and keep yq's own scalar error (`all only supports arrays, was !!int`); real yq rejects the two-argument
+     form outright, so `--jq-extensions` keeps its refusal.
 
    A generated sweep (`scripts/jq-path-register-sweep.py`: 54 operands -- native navigation,
    literals, by-value builtins, `try`/`//`/`if`/`def` wrappers, folds, `label`, `limit`,

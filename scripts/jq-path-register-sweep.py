@@ -162,15 +162,13 @@ OPERANDS = [
     # raises in jq (`.[]?` and `.a?` on a computed `1`, `unique_by(.)`) under a
     # generator that decides nothing, bare and wrapped in `isempty`, which is
     # what let a later `$x` re-establish the root and a `del` delete it.
-    # Known residual (#3757): `cond` runs by value, so jq's path error on a
-    # *computed* element is invisible and `any(1; .[]?) or true`, `.. // .a`
-    # and friends still write where jq exits 5. On these five operands alone
-    # that is 1,603 ACCEPT_WRONG rows in a 155,547-program run over the sixteen
-    # any/all/isempty operands (`--operand` for each) at the grid's 27 contexts,
-    # against a build of `main` without #3763, down from 2,342: 739 closed, none
-    # new, none writes a different document. They are not regressions of a later
-    # change, and the older operands have none. The counts move with the grid:
-    # 1,087 and 1,826 at its 23 contexts, before #3653 added four.
+    # They were the by-value `cond` hole (#3757): jq's path error on a
+    # *computed* element was invisible, and `any(1; .[]?) or true` or
+    # `.. // .a` wrote where jq exits 5. #3757 resolves such a `cond` as
+    # `gen | cond`; `--operand` over the twenty-three any/all/isempty operands
+    # (223,587 programs at the grid's 27 contexts) went from 1,675 ACCEPT_WRONG
+    # on a build of `main` without it to 0, with 0 regressions. The counts move
+    # with the grid, so rerun rather than compare.
     "any(1; .[]?)",
     "any(true; .[0]?)",
     "all(unique_by(.))",
