@@ -40414,8 +40414,6 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     }
     let last_stage = stages.len().checked_sub(1);
     let mut decided = false;
-    // Set when a branch could not be run live: see the closure below.
-    let mut ran_by_value = false;
     let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
     let mut probe_escape: Option<Control> = None;
     let mut stage_escape: Option<EvalEscape> = None;
@@ -40441,45 +40439,41 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
                     Err(control) => stop_with_escape(&mut probe_escape, control),
                 };
             }
-            // jq's `path_intact` compares by `jv_identical`, which for `null`,
-            // `true` and `false` is equality: a computed `true` over a register
-            // that is `true` *is* the register, so `cond` navigates it with no
-            // path error (`any(true; .[0]?)` on `true` raises only the type
-            // error its `?` catches). Re-established at the entry, where the
-            // register is. Without it the stage raised a catchable path error
-            // jq never raises, and an enclosing `try` swallowed it.
-            let branch =
-                if trackable && !branch.trackable && null_bool_identical(&branch.value, value) {
-                    PathBranch::new(PathPrefix::root(), branch.value, true)
-                } else {
-                    branch
-                };
-            // The one case left undecided: a computed `null`/`true`/`false` over an
-            // *untracked* entry. Whether it is the register is whether it equals
-            // the carried register by kind, which is known only when the frame
-            // carries that register's value, and even then the register's
-            // position is not, so a live stage could neither raise as jq does
-            // (it does not, when equal) nor name where `cond` left it. Run
-            // `cond` by value as before this change and state no register.
-            // (On a trackable entry the register *is* `value`: an equal element was
-            // re-established above, and an unequal one raises as jq's does.)
-            let by_value = !trackable
-                && !branch.trackable
-                && matches!(&*branch.value, OwnedValue::Null | OwnedValue::Bool(_))
-                && frame.register().map_or(true, |register| {
-                    null_bool_identical(&branch.value, register)
-                });
-            if by_value {
-                ran_by_value = true;
-                return match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
-                    Ok(true) => {
-                        decided = true;
-                        Demand::Stop
+            // jq's `path_intact` compares by `jv_identical`: pointer identity for a
+            // string, array or object, equality for `null`, `true` and `false`. So
+            // an *untracked* element can still be the register -- a pass-through
+            // builtin hands back the very value it was given (`ltrimstr("x")` on a
+            // non-string, `tostring` on a string), and a computed `true` over a
+            // `true` register is it by kind -- and `cond` navigates it with no path
+            // error (`any(true; .[0]?)` on `true` raises only the type error its `?`
+            // catches), where over any other value it raises a path error that an
+            // enclosing `try` catches. Which of the two holds is decided exactly
+            // only when the producer vouches for where the register is
+            // (`Unmoved`): equal by kind, it is the register, re-established where
+            // that stands; unequal, it cannot be (identical implies equal), and the
+            // stage raises as jq does. Anything else -- an equal string or
+            // container that may be the same pointer, a producer that lost the
+            // register, an untracked entry, which states none -- is ambiguous: a
+            // live stage could raise an error jq does not (swallowed by a `try`, so
+            // a write goes through) or miss one it does. That is a guess, refused
+            // where nothing can catch it (#3267).
+            let branch = if branch.trackable {
+                branch
+            } else {
+                match branch.register.unmoved_value() {
+                    Some(register) if null_bool_identical(&branch.value, register) => {
+                        PathBranch::new(Rc::clone(&branch.path), branch.value, true)
                     }
-                    Ok(false) => Demand::Continue,
-                    Err(control) => stop_with_escape(&mut probe_escape, control),
-                };
-            }
+                    Some(register) if *branch.value != *register => branch,
+                    _ => {
+                        let refusal = EvalError::invalid_path_expression_guessed(&branch.value);
+                        return stop_with_eval_escape(
+                            &mut stage_escape,
+                            EvalEscape::Error(refusal),
+                        );
+                    }
+                }
+            };
             // `c or empty`: each output of `cond` that is truthy emits `true`
             // (`c and empty`: a falsy one emits `false`), the rest backtrack.
             let mut decide = |output: PathBranch<'a>| -> Demand {
@@ -40525,7 +40519,7 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         None => forward_drained_result(
             flow,
             answer,
-            drained_register_after::<S>(trackable, value, decided || ran_by_value),
+            drained_register_after::<S>(trackable, value, decided),
             sink,
         ),
     }
