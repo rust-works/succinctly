@@ -1079,8 +1079,8 @@ is the revert that established what the other one costs.
    ([#3456](https://github.com/rust-works/succinctly/issues/3456); the contract is in
    `docs/plan/jq-path-register-producer-contract.md`): the branch's own position when the
    operand navigated natively, the register it entered with when it provably left it alone
-   (`cannot_move_register`; for `any`/`all`/`isempty(g)` the result says whether they moved it;
-   for `add` and `map(f)`, `leaves_register_in_place`), and a *loss* otherwise. `R` then runs
+   (`cannot_move_register`; for `add` and `map(f)`, `leaves_register_in_place`; `any`, `all` and
+   `isempty(g)` state the register their own arms left, #3749 and #3763), and a *loss* otherwise. `R` then runs
    from a lost seed, so a navigation in it refuses -- loudly, because the refusal is the
    resolver's guess about where jq's register went (#3267), and a `try` or `?` around the
    `and` must not swallow a guess. Residuals:
@@ -1179,7 +1179,15 @@ is the revert that established what the other one costs.
      `[{"key":"a","value":1}]` navigates to `null` and backtracks), where a path error cannot occur
      (`test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763` and
      `test_any_all_undecided_register_survives_a_cond_that_never_raised_3763`). The same navigation
-     on a computed element (`any(1; .a)`) raises in jq and stays refused. Two shapes are still refused where jq
+     on a computed element (`any(1; .a)`) raises in jq and stays refused. The converse is not closed
+     ([#3757](https://github.com/rust-works/succinctly/issues/3757)): `cond` runs by value, so jq's path
+     error on a *computed* element (`any(1; .[]?)`, `all(tostring; .a?)`) is invisible, and under `or`,
+     `//`, a `$x` rebind or a `try` the result can be accepted and written where jq exits 5 or, under
+     `try`, leaves the document (`(try (all(tostring; .a?))) |= 5` on `true` is `5` here, `true` in jq).
+     A sweep of the sixteen `any`/`all`/`isempty` operands (132,507 programs at 23 contexts) has 1,087
+     such rows, all on the five computed-generator operands, down from 1,826 before #3763, none new
+     (265 change the document). A `cond` outside the undecided claim's three clauses (`try .b`,
+     `first?`, `limit(1; .[]?)`) is refused in the safe direction where `main` answered like jq. Two shapes are still refused where jq
      answers, pinned
      (`test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749`): the result is
      stated only while `cond` is on `cannot_move_register`'s allowlist, because `cond` runs by

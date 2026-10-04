@@ -301,7 +301,8 @@ Consequences:
   the `first(f)`/`nth`/`limit` contrasts.
 - `isempty(g)` is per-branch: it moves the register only when `g` emits (it breaks out of a
   `label` before backtracking). That is D4.4 and is the reason a static `Unmoved` cannot be
-  used for it.
+  used for it. Its arm states the register of the first branch `g` emitted (#3763), and the
+  entry register when `g` emitted nothing (#3456, `drained_register_after`).
 - `range(n)` and `paths` are not navigation, yet `cannot_move_register` said `false` for both
   (a builtin allowlist, deliberately; "add a variant only with an oracle row"). **Promoted in B3**
   with the rows in `test_path_register_range_and_paths_do_not_move_it_3456`. The two-argument
@@ -311,9 +312,15 @@ Consequences:
 - `any`, `all` and `isempty(g)` are D4.4's "did it" case and **are decided per value in B3**:
   jq 1.7.1 defines `isempty(g)` as `first((g | false), true)`, `any(g; c)` as
   `isempty(g | (c or empty)) | not` and `all(g; c)` as `isempty(g | (c and empty))` (read off
-  `--debug-dump-disasm`), so each moves the register exactly when the generator inside emitted, which the result says -- `any` is
-  `false`, `all` is `true` and `isempty` is `true` when it did not (`register_stays_on_result`).
-  The other result stays `LostAt`.
+  `--debug-dump-disasm`), so each moves the register exactly when the generator inside emitted.
+  B3 first decided that per value from the result (`register_stays_on_result`); that verdict is
+  gone. Every spelling now has its own arm (`resolve_any_all_gen_cond_sink`, #3749 and #3763;
+  the `isempty` arm), which states the register the *deciding branch* left, or the entry
+  register when nothing decided. Both claims are sound only for a `cond` that cannot raise a
+  path error: jq path-checks `cond` and the resolver runs it by value, so the decided claim
+  needs `cannot_move_register(cond)`, and the undecided one needs that, or an empty `gen`, or
+  pure navigation that only ran on the register. The per-result verdict made the claim for any
+  `cond` and wrote `null` over a document for `all(unique_by(.))`.
 
 ## 6. Delivery
 

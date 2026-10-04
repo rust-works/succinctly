@@ -660,8 +660,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows that recorded the old loud refusal now answer jq's: `del(try (any and .a))` on `{"a":true}` and
   `del(. as $x | isempty(.l[]) | try ($x | .a))` both leave the document. A `cond` outside `cannot_move_register`'s allowlist
   (#3757) and a plain pipe stage that does not read the verdict (#3758) still refuse, and `any(.a)` is the first of them. Swept
-  with four new one-argument operands in `scripts/jq-path-register-sweep.py` (57,987 programs, pre-change binary as base: 0
-  `ACCEPT_WRONG`, 0 regressions, `REFUSE_WRONG` 1,942 to 583). Pinned by `test_isempty_and_bare_any_all_state_the_register_3763`
+  over seven bare and one-argument operands of `scripts/jq-path-register-sweep.py` (four of them new; 57,987 programs at the
+  grid's 23 contexts then, pre-change binary as base: 0 `ACCEPT_WRONG`, 0 regressions, `REFUSE_WRONG` 1,942 to 583). Pinned by `test_isempty_and_bare_any_all_state_the_register_3763`
   and `test_bare_any_all_and_isempty_keep_their_refusals_3763`; each arm and the jq-mode gate fail a test when removed.
   **It also closes a hole #3749 left.** The claim that an `any`/`all` that decided nothing left jq's register at its entry is
   only sound when `cond` cannot raise a path error, and jq path-checks `cond` where this resolver runs it by value: on `main`,
@@ -675,7 +675,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mode now that every spelling has an arm, is removed. Pinned by
   `test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763` and
   `test_any_all_undecided_register_survives_a_cond_that_never_raised_3763`; each clause fails a test when removed, and the
-  sweep gained five operands that generate the shape.
+  sweep gained five operands that generate the shape. **Still open (#3757, now Medium):** `cond` runs by value, so jq's path
+  error on a *computed* element is invisible, and `any(1; .[]?)` or `all(tostring; .a?)` under `or`, `//`, a `$x` rebind or a
+  `try` can still be accepted and written where jq exits 5 or, under `try`, leaves the document (`(try (all(tostring; .a?)))
+  |= 5` on `true` is `5` here and `true` in jq). A sixteen-operand sweep (132,507 programs at 23 contexts) has 1,087 such
+  `ACCEPT_WRONG` rows, all on the five computed-generator operands, down from 1,826 on the build before this change, none new
+  and none writing a different document than before (265 change the document, 700 are no-ops, 122 are `path` answers).
+  The undecided statement is also refused, in the safe direction, for a `cond` outside its three clauses (`try .b`, `first?`,
+  `limit(1; .[]?)`), which `main` answered like jq.
 
 - **jq: a `reduce` that computes its accumulator leaves jq's path register where it entered** (#3710).
   `path(. as $x | reduce (1) as $i (.; .a = $i) | $x.k)` on `{"k":1,"a":1}` is `["k"]` in jq (and so are `del`
