@@ -25812,6 +25812,12 @@ fn test_self_call_nested_in_sibling_calls_args_is_installed_1371() -> Result<()>
 /// fix (`d1` and `d2` each individually complete at n=11000, only the
 /// composed call errors).
 #[test]
+#[cfg_attr(
+    coverage,
+    ignore = "fills a 2 GB native stack (~100-150 s); when measured (#3750) it covered no line the rest \
+              of the suite did not, docs/guides/developer.md says how to re-check; \
+              scripts/deep-recursion-tests.sh runs it in the deep-recursion CI leg"
+)]
 fn test_composed_recursion_across_two_defs_errors_not_aborts_1371() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
@@ -32079,6 +32085,12 @@ fn test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149() ->
 /// is read eagerly and runs far deeper, so the lazy links here carry a builtin
 /// (`select(true)`), which keeps them on the demand-driven path.
 #[test]
+#[cfg_attr(
+    coverage,
+    ignore = "fills a 2 GB native stack (~100-150 s); when measured (#3750) it covered no line the rest \
+              of the suite did not, docs/guides/developer.md says how to re-check; \
+              scripts/deep-recursion-tests.sh runs it in the deep-recursion CI leg"
+)]
 fn test_recursion_refuses_before_the_native_stack_runs_out_3262() -> Result<()> {
     let deep_arg = format!("n{} - 1", " - 0".repeat(200));
     for body in [

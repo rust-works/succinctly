@@ -76,6 +76,11 @@ cargo llvm-cov --features cli,simd,regex,serde --workspace --summary-only --fail
 omni-dev coverage diff
 ```
 
+The two `jq_cli_tests` listed in `scripts/deep-recursion-tests.sh` (each fills a 2 GB native
+stack) are `#[ignore]`d under `cfg(coverage)`, so `cargo llvm-cov` reports them as ignored:
+they cover no line the rest of the suite does not (#3750), and they still run in the
+`deep-recursion` CI leg and under a plain `cargo test`.
+
 ### CLI Tool
 
 ```bash

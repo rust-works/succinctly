@@ -328,6 +328,11 @@ harness = false
 # a rationale; introducing `unsafe` anywhere else is a deliberate, reviewed
 # change rather than an accident.
 unsafe_code = "deny"
+# `cfg(coverage)` is set by cargo-llvm-cov for the code it builds, and cargo does not
+# know the name, so a use of it warns `unexpected cfg condition name` (and fails
+# `clippy -D warnings`) unless it is declared. Used by the two deep-recursion tests in
+# tests/jq_cli_tests.rs, which are ignored under coverage only (#3750).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [lints.clippy]
 all      = { level = "warn", priority = -1 }
