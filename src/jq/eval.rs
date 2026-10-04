@@ -40407,6 +40407,9 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     let live = S::TAG == EvalTag::Jq && !cannot_move_register(cond);
+    // Whether `gen` provably leaves the register where this entered, so the
+    // frame's carried register is still the one `cond` meets.
+    let gen_inert = live && cannot_move_register(gen);
     // `gen | cond`'s second stage, flattened once rather than per branch.
     let mut stages = Vec::new();
     if live {
@@ -40460,11 +40463,23 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
             let branch = if branch.trackable {
                 branch
             } else {
-                match branch.register.unmoved_value() {
-                    Some(register) if null_bool_identical(&branch.value, register) => {
+                // The register the producer vouches for sits at the branch's own
+                // path. On an untracked entry a `gen` that provably moves nothing
+                // leaves the frame's carried register in place, whose value is
+                // known and whose position is not: enough to tell an unequal
+                // element (it cannot be it), not to re-establish an equal one.
+                let carried = if !trackable && gen_inert {
+                    frame.register()
+                } else {
+                    None
+                };
+                match (branch.register.unmoved_value(), carried) {
+                    (Some(register), _) if null_bool_identical(&branch.value, register) => {
                         PathBranch::new(Rc::clone(&branch.path), branch.value, true)
                     }
-                    Some(register) if *branch.value != *register => branch,
+                    (Some(register), _) | (None, Some(register)) if *branch.value != *register => {
+                        branch
+                    }
                     _ => {
                         let refusal = EvalError::invalid_path_expression_guessed(&branch.value);
                         return stop_with_eval_escape(
