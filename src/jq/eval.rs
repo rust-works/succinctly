@@ -37868,7 +37868,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 ),
                 // #3456: an empty generator backtracked every branch it
                 // explored, so jq's register is where it entered; an emitting
-                // one may have moved it ([`register_stays_on_result`]).
+                // one may have moved it ([`drained_register_after`]).
                 None => forward_drained_result(
                     flow,
                     OwnedValue::Bool(is_empty),
@@ -37919,44 +37919,22 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // used to fall to could only report a loss. An untracked input still
         // raises `near attempt to iterate through` from the `.[]` itself, as
         // `builtin_navigation` did, and the arm is jq mode only (ADR-0018):
-        // yq's `any`/`all` are real yq builtins with no oracle for this.
-        Expr::Builtin(Builtin::Any) if S::TAG == EvalTag::Jq => resolve_any_all_gen_cond_sink::<S>(
-            &Expr::Iterate,
-            &Expr::Identity,
-            true,
-            value,
-            trackable,
-            snapshot,
-            frame,
-            sink,
-        ),
-        Expr::Builtin(Builtin::All) if S::TAG == EvalTag::Jq => resolve_any_all_gen_cond_sink::<S>(
-            &Expr::Iterate,
-            &Expr::Identity,
-            false,
-            value,
-            trackable,
-            snapshot,
-            frame,
-            sink,
-        ),
-        Expr::Builtin(Builtin::AnyF(cond)) if S::TAG == EvalTag::Jq => {
+        // yq's `any`/`all` are real yq builtins with no oracle for this (a
+        // bare `all` on a scalar keeps yq's `all only supports arrays`).
+        Expr::Builtin(
+            builtin @ (Builtin::Any | Builtin::All | Builtin::AnyF(_) | Builtin::AllF(_)),
+        ) if S::TAG == EvalTag::Jq => {
+            let (cond, target_truthy) = match builtin {
+                Builtin::Any => (&Expr::Identity, true),
+                Builtin::All => (&Expr::Identity, false),
+                Builtin::AnyF(cond) => (&**cond, true),
+                Builtin::AllF(cond) => (&**cond, false),
+                _ => unreachable!("matched above"), // omni-dev: coverage tolerate-line reason="the arm's own pattern admits only Any, All, AnyF and AllF"
+            };
             resolve_any_all_gen_cond_sink::<S>(
                 &Expr::Iterate,
                 cond,
-                true,
-                value,
-                trackable,
-                snapshot,
-                frame,
-                sink,
-            )
-        }
-        Expr::Builtin(Builtin::AllF(cond)) if S::TAG == EvalTag::Jq => {
-            resolve_any_all_gen_cond_sink::<S>(
-                &Expr::Iterate,
-                cond,
-                false,
+                target_truthy,
                 value,
                 trackable,
                 snapshot,
@@ -39690,10 +39668,10 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
 
     let mut delivered = 0usize;
     let mut stopped_by_sink = false;
-    // One answer for every value this leaf delivers ([`LeafRegister`]),
+    // One answer for every value this leaf delivers ([`leaf_register`]),
     // worked out when the first one arrives: a leaf that delivers nothing
     // never pays for a `LostAt`'s `Rc`.
-    let mut register: Option<LeafRegister<'a>> = None;
+    let mut register: Option<BranchRegister<'a>> = None;
     // #3271: set the moment `expr` produces a value one of the five
     // always-refuses constructs recognizes -- checked on that produced
     // value, never before it exists. See `always_refuses_as_live_path`'s
@@ -39722,8 +39700,8 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
                 return Demand::Stop;
             }
             let state = register
-                .get_or_insert_with(|| LeafRegister::new::<S>(expr, trackable, value))
-                .of::<S>(&v);
+                .get_or_insert_with(|| leaf_register::<S>(expr, trackable, value))
+                .clone();
             let branch = untracked_at_register(Cow::Owned(v), state);
             // `untracked_branches`' own rule, applied one value at a time --
             // see its doc comment for why the register is recorded here.
@@ -40183,9 +40161,10 @@ fn untracked_at_register<'a>(
 /// where it entered ([`leaves_register_in_place`]); otherwise
 /// [`BranchRegister::LostAt`] `value`, where the register stood when the leaf
 /// ran. That is the leaf's own answer; the stage may still know better or
-/// worse ([`resolve_seq_stage`]'s stage-level rule), and takes the stricter. A
-/// leaf whose register follows its result ([`register_stays_on_result`])
-/// refines this per value in [`LeafRegister`].
+/// worse ([`resolve_seq_stage`]'s stage-level rule), and takes the stricter.
+/// (`any`, `all` and `isempty(g)` state theirs in their own arms, #3749 and
+/// #3763; a per-result verdict here claimed the entry register for a `cond`
+/// jq path-checks and this resolver does not, so it is gone.)
 ///
 /// `leaves_register_in_place` is read once per leaf call and only when
 /// `trackable`, never per emitted value. What it returns is cloned once per
@@ -40326,20 +40305,28 @@ fn lost_at<'a, S: EvalSemantics>(value: &OwnedValue) -> BranchRegister<'a> {
 /// jq (value mode, `each_any_all_gen_cond`, runs `gen` on the owned bridge and
 /// never reaches the resolver); each branch's value is probed with `cond`
 /// exactly as value mode probes it ([`any_all_probe_element`]), and the first
-/// decisive element stops `gen`. `cond` itself runs by value, as in jq's
-/// `isempty(first(gen | cond or empty))` desugar.
+/// decisive element stops `gen`.
+///
+/// `cond` runs by value here, but jq does not: it is `or`'s (or `and`'s) left
+/// operand in `isempty(first(gen | (cond or empty)))`, which is not a subexp, so
+/// jq path-checks it. A `cond` that navigates moves jq's register onto its own
+/// node (`any(.[]; .a)` is `[0,"a"]`), and one that navigates a computed value
+/// raises a path error this resolver never sees (`any(1; .[]?)` raises `near
+/// attempt to iterate through 1`, and so does `all(unique_by(.))`). So the
+/// register is stated only while `cannot_move_register(cond)` holds -- `cond`
+/// navigates nothing, so it can neither move the register nor raise -- and a
+/// `cond` outside that allowlist is a loss in both cases below (#3757).
 ///
 /// The result is a computed boolean, but jq's register is not where this
 /// entered, and `path()` accepts a result that is `jv_identical` to it. A
 /// decisive element is emitted from inside `gen`, so the register is wherever
 /// `gen` left it, and `any(.[]; .)` on `[true,false]` is `[0]`: `true` is
 /// identical to the element it stopped at ([`register_after`],
-/// [`computed_at_register`], the `and`/`or` arms' rule). That holds only while
-/// `cond` cannot move the register itself (`any(.[]; .a)` is `[0,"a"]` in jq,
-/// which this still refuses, #3757), so a `cond` that might is a loss. A
-/// generator that produced no decisive element backtracked every branch, so
-/// the register is where this entered ([`drained_register_after`]). Both are
-/// jq mode only (ADR-0018).
+/// [`computed_at_register`], the `and`/`or` arms' rule). A generator that
+/// produced no decisive element backtracked every branch, so the register is
+/// where this entered ([`drained_register_after`]) -- unless a `cond` that is
+/// not provably inert ran, whose path error jq would have raised instead. Both
+/// are jq mode only (ADR-0018).
 #[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambient state, plus the arm's two operands.
 fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     gen: &Expr,
@@ -40384,10 +40371,16 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         Some((path, register)) => {
             forward_drained_branch(flow, computed_at_register(answer, path, register), sink)
         }
+        // Nothing decided is `emitted == false`, but only when `cond` is inert:
+        // an undecided `any(1; .[]?)` is jq's path error, not a backtrack.
         None => forward_drained_result(
             flow,
             answer,
-            drained_register_after::<S>(trackable, value, decided),
+            drained_register_after::<S>(
+                trackable,
+                value,
+                decided || !(S::TAG == EvalTag::Jq && trackable && cannot_move_register(cond)),
+            ),
             sink,
         ),
     }
@@ -40433,79 +40426,6 @@ fn drained_register_after<S: EvalSemantics>(
         BranchRegister::Unmoved(Cow::Borrowed(value))
     } else {
         drained_register::<S>(trackable, value)
-    }
-}
-
-/// The result of a by-value leaf that says jq's register stayed where it
-/// entered (#3456): `Some(r)` when the register stayed exactly when the leaf's
-/// boolean result is `r`, `None` for every other leaf.
-///
-/// jq 1.7.1 defines `isempty(g)` as `first((g | false), true)`, `any(g; c)` as
-/// `isempty(g | (c or empty)) | not` and `all(g; c)` as `isempty(g | (c and
-/// empty))` (read off `--debug-dump-disasm`). Each leaves the register where
-/// it was whenever the generator inside produced nothing, because every
-/// branch it explored backtracked, and moves it when one did (the output is
-/// emitted from inside the generator). So the result says which: `any` is
-/// `false`, `all` is `true` and `isempty` is `true` exactly when nothing was
-/// emitted. The other result proves nothing -- an `isempty(1)` emits without
-/// navigating -- so it stays a loss ([`lost_at`]).
-///
-/// Captured against jq 1.7.1, `path(. as $x | OP | $x)`: `any` on
-/// `{"a":false,"b":null}` is `[]`, on `{"a":true,"b":null}` it refuses; `all`
-/// on `{"a":true,"b":true}` is `[]`, on `{"a":true,"b":false}` it refuses;
-/// `isempty(.[]?)` on `{}` is `[]`, on `{"a":1}` it refuses.
-fn register_stays_on_result(expr: &Expr) -> Option<bool> {
-    match expr {
-        Expr::Builtin(Builtin::Any | Builtin::AnyF(_) | Builtin::AnyCond(..)) => Some(false),
-        Expr::Builtin(Builtin::All | Builtin::AllF(_) | Builtin::AllCond(..)) => Some(true),
-        Expr::Builtin(Builtin::IsEmpty(_)) => Some(true),
-        _ => None,
-    }
-}
-
-/// What one by-value leaf call says about jq's register for each value it
-/// delivers: the leaf's static answer ([`leaf_register`]), read once, unless
-/// the leaf is one whose register follows its result
-/// ([`register_stays_on_result`]), in which case the answer is worked out per
-/// value from that value. `entry` is where the register stood entering the
-/// leaf, which is `value` itself on a trackable entry; there is nothing to
-/// state on an untracked one.
-struct LeafRegister<'a> {
-    /// The static answer, or [`BranchRegister::None`] when `stays_on` decides.
-    base: BranchRegister<'a>,
-    stays_on: Option<bool>,
-    entry: &'a OwnedValue,
-}
-
-impl<'a> LeafRegister<'a> {
-    fn new<S: EvalSemantics>(expr: &Expr, trackable: bool, value: &'a OwnedValue) -> Self {
-        // jq mode only, like every admission here (ADR-0018): yq has no oracle
-        // for `any`/`all`/`isempty`, and its lost registers carry no position.
-        let stays_on = if trackable && S::TAG == EvalTag::Jq {
-            register_stays_on_result(expr)
-        } else {
-            None
-        };
-        Self {
-            base: if stays_on.is_some() {
-                BranchRegister::None
-            } else {
-                leaf_register::<S>(expr, trackable, value)
-            },
-            stays_on,
-            entry: value,
-        }
-    }
-
-    /// The register to state for the value `result` this leaf delivered.
-    fn of<S: EvalSemantics>(&self, result: &OwnedValue) -> BranchRegister<'a> {
-        match self.stays_on {
-            Some(stays) if matches!(result, OwnedValue::Bool(b) if *b == stays) => {
-                BranchRegister::Unmoved(Cow::Borrowed(self.entry))
-            }
-            Some(_) => lost_at::<S>(self.entry),
-            None => self.base.clone(),
-        }
     }
 }
 
@@ -40845,15 +40765,12 @@ fn untracked_branches<'a, S: EvalSemantics>(
     if values.is_empty() {
         return Vec::new();
     }
-    // The same for every value this call produces unless the leaf's register
-    // follows its result: they all come from resolving `expr` against `value`.
-    let register = LeafRegister::new::<S>(expr, trackable, value);
+    // The same for every value this call produces: they all come from resolving
+    // `expr` against `value`.
+    let register = leaf_register::<S>(expr, trackable, value);
     values
         .into_iter()
-        .map(|v| {
-            let state = register.of::<S>(&v);
-            untracked_at_register(Cow::Owned(v), state)
-        })
+        .map(|v| untracked_at_register(Cow::Owned(v), register.clone()))
         .collect()
 }
 
@@ -117927,26 +117844,6 @@ mod tests {
                 leaves_register_in_place::<JqSemantics>(&expr),
                 array_contents_are_checked(&expr),
                 "`[{src}]`: the register verdict and the `[E]` claim disagree"
-            );
-        }
-        // The result decides for exactly `any`/`all`/`isempty`, in each of
-        // their spellings: `false` / `true` / `true` when nothing was emitted.
-        for (src, decides) in [
-            ("any", Some(false)),
-            ("any(.a)", Some(false)),
-            ("any(.[]; .)", Some(false)),
-            ("all", Some(true)),
-            ("all(.a)", Some(true)),
-            ("all(.[]; .)", Some(true)),
-            ("isempty(.[]?)", Some(true)),
-            ("first(.[])", None),
-            ("add", None),
-            ("length", None),
-        ] {
-            assert_eq!(
-                register_stays_on_result(&parse(src).unwrap()),
-                decides,
-                "register_stays_on_result({src})"
             );
         }
     }
