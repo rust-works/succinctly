@@ -28,11 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to 2,014 (below the `[.[] | path(.)]` twin's 6,024, since nothing flows past it),
   `path(.[]?, .[]?)` 26,014 to 2,014, `path(.[]? | .a)` 14,014 to 2,014 (a pipe stage, which is
   `path_step_generic`'s arm). Interleaved wall clock against the parent on an M4 Pro, 1 to 16 MB, min of
-  7, output identity 40/40: `[.[] | path(.[]?)]` is 48% to 54% faster over a flat array of scalars and
-  36% to 41% over an object, `path(.[]? | .a?)` 47% to 51% and 35% to 39%, `path(.[]?, .[]?)` 60% to
-  64% and 49% to 54%; over records, whose members are containers, they read -0.1% to +2.0%, against
-  -1.2% to +1.0% for the control run, and the controls (`path(.)`, `path(..)`) -2.0% to +1.9%. yq mode
-  (`--jq-extensions`, aliases, mappings, JSON) reads -1.8% to +1.2%. Not changed here:
+  7, output identity 40/40: `[.[] | path(.[]?)]` is 50% to 55% faster over a flat array of scalars and
+  38% to 42% over an object, `path(.[]? | .a?)` 50% to 54% and 36% to 41%, `path(.[]?, .[]?)` 62% to
+  65% and 52% to 56%; over records, whose members are containers, they read -0.9% to +2.5%, against
+  -1.6% to +2.2% for the control run, and the controls (`path(.)`, `path(..)`) -0.8% to +3.2%. yq mode
+  (`--jq-extensions`, aliases, mappings, JSON) reads -1.3% to +2.0%. Not changed here:
   `path(try .[] catch empty)` (66,004 over 2,000 members) runs through `eval.rs`'s path resolver and
   its `catch` handling, and `path(f)?`, `first(.[]?)`, `.[]? // .`, `paths(f)` and `del(.[]?)` use
   other walkers.
