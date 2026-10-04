@@ -60931,6 +60931,20 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
             "",
             0,
         ),
+        (
+            r#"{"a":true}"#,
+            r#"del(.a and any(true; select(.) | error("boom")))"#,
+            "",
+            "boom",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r#"try del(.a and any(true; select(.) | error("boom"))) catch ."#,
+            "\"boom\"\n",
+            "",
+            0,
+        ),
     ])
 }
 
@@ -60938,9 +60952,12 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
 /// plain pipe stage does not read the backtracked-register verdict that
 /// `any`/`all`/`isempty` state, so a frozen `$x` after one that decided or did
 /// not refuses where jq answers `[]`, and so does `isempty(g)` as a `cond`
-/// (`any(.[]; isempty(empty))` is `[0]`) -- the same stage gap, #3758. Pinned on
-/// both routes so lifting any is a deliberate change; the jq answers are in each
-/// row.
+/// (`any(.[]; isempty(empty))` is `[0]`) -- the same stage gap, #3758. And a
+/// computed `true` that decides under a navigating `cond` on an untracked entry
+/// (`.a and any(true; select(.))`, an `and` right operand) runs by value with no
+/// register stated, because its identity with the carried register is not
+/// known, so jq's `["a"]` is refused loudly. Pinned on both routes so lifting
+/// any is a deliberate change; the jq answers are in each row.
 #[test]
 fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
     for (input, filter, jq_answer, expected) in [
@@ -60972,6 +60989,18 @@ fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
             r"[true,false]",
             r"path(any(.[]; isempty(empty)))",
             "[0]",
+            "Invalid path expression with result true",
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(.a and any(true; select(.)))",
+            r#"["a"]"#,
+            "Invalid path expression with result true",
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(.a and any(true; select(.)))",
+            "{}",
             "Invalid path expression with result true",
         ),
     ] {

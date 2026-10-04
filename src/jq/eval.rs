@@ -40493,7 +40493,7 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
             };
             let Some(last) = last_stage else {
                 // `cond` flattened to nothing: it is the branch itself.
-                return decide(branch);
+                return decide(branch); // omni-dev: coverage tolerate-line reason="unreachable: a cond that flattens to no stages is `.` or a pipe of `.`, which cannot_move_register admits, so it never takes the live route (#3757)"
             };
             match resolve_seq_stage::<S>(
                 &stages,
