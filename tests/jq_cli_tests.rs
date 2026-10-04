@@ -94451,6 +94451,34 @@ fn test_foreach_whole_array_slice_is_the_register_3742() -> Result<()> {
             "Invalid path expression near attempt to access element",
             5,
         ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (1,2) as $x (.; .[0:]))",
+            "[{\"start\":0,\"end\":null}]\n[{\"start\":0,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (1,2) as $x (.; (.[1:], .[0:]); .))",
+            "[{\"start\":1,\"end\":null}]\n[{\"start\":0,\"end\":null}]\n[{\"start\":1,\"end\":null}]\n[{\"start\":0,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (1,2) as $x (.; (.[0:], .[1:]); .))",
+            "[{\"start\":0,\"end\":null}]\n[{\"start\":1,\"end\":null}]\n",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (first(1,2)) as $x (.; .[0:]; .))",
+            "[{\"start\":0,\"end\":null}]\n",
+            "",
+            0,
+        ),
     ])
 }
 

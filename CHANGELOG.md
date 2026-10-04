@@ -648,6 +648,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a `foreach` whose update is a full slice keeps its state on the register** (#3742).
+  `path(foreach (1,2) as $x (.; .[0:]; .))` on `[10,20,30]` answered the first step and refused the second, where
+  jq answers both: a slice that keeps every element of a non-empty array shares its parent's buffer, so `foreach`
+  hands the state back as the same node exactly as `reduce` does (#3504). `resolve_foreach` now carries UPDATE's
+  provenance with the `reduce` rule, behind the same gate (`fold_slice_ok`: a plain variable pattern over a source
+  that does not move the register). Pinned by `test_foreach_whole_array_slice_is_the_register_3742`.
+
 - **jq: a `reduce` whose update is a full slice under `?` keeps its accumulator on the register, and a computed-key source no longer fabricates** (#3734).
   A slice that keeps every element of a non-empty array shares its parent's buffer in jq, so `.[0:]` hands the
   accumulator back as the same node (#3504), and `path(reduce 1 as $x (.; .[0:]?))` on `[1,2,3]` is `[]`. A
