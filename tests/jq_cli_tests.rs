@@ -60630,12 +60630,11 @@ fn test_any_all_gen_cond_register_verdict_is_jq_mode_only_3749() -> Result<()> {
         ("del(any(.[]; .))", "[true, false]\n"),
         ("del(all(.[]; .))", "[true, false]\n"),
         ("del(any(.[]; .))", "[false, false]\n"),
-        // The bare spellings are jq mode only too (#3763). Real yq has `any`
-        // and `all` and answers the document unchanged here, so this is a
-        // pre-existing divergence of yq mode that the jq-mode rule must not
-        // move; it is pinned only to prove the gate.
-        ("del(any)", "[true, false]\n"),
-        ("del(all)", "[true, false]\n"),
+        // `isempty(g)`'s first-branch register is jq mode only too (#3763):
+        // real yq has no `isempty`, so under `--jq-extensions` this is
+        // succinctly's own surface. Without the guard in the arm it would write
+        // `[]` here.
+        ("del(isempty(.[]?))", "[false]\n"),
     ] {
         let (output, code) = spawn_with_signal_retry(
             || {
@@ -60793,6 +60792,117 @@ fn test_isempty_and_bare_any_all_state_the_register_3763() -> Result<()> {
             0,
         ),
         (r#"{"a":true}"#, r"del(try (all and .a))", "{}\n", "", 0),
+    ])
+}
+
+/// #3763 review: the claim that an `any`/`all` that decided nothing left jq's
+/// register at its entry is only sound when `cond` cannot raise a path error.
+/// jq path-checks `cond` (it is `or`'s left operand, not a subexp) and this
+/// resolver runs it by value, so `any(1; .[]?)` -- which jq raises on, `near
+/// attempt to iterate through 1` -- looked like a clean backtrack, and a later
+/// `$x` re-established the root: `del(. as $x | (isempty(any(1; .[]?)) and 1) |
+/// $x)` on `{"a":1}` deleted the whole document, `= 9` wrote `9`, and
+/// `[path(...)]` gave `[[]]`, where jq exits 5. The one-argument form was wrong
+/// the same way (`all(unique_by(.))`, a `cond` outside the allowlist), as was the
+/// two-argument form on `main` since #3749. The register is now stated only for
+/// a `cond` on `cannot_move_register`'s allowlist, decided or not. Every row
+/// captured from jq 1.7.1, on the stdin and `-n` routes; jq words its refusals
+/// `near attempt to iterate through`/`access element` where this says `with
+/// result`, so the message check is the prefix both share.
+#[test]
+fn test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | (isempty(any(1; .[]?)) and 1) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(. as $x | (isempty(any(1; .[]?)) and 1) | $x) = 9",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(. as $x | (isempty(any(1; .[]?)) and 1) | $x)]",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | (isempty(all(1; .a?)) and 1) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | (isempty(any(true; .[0]?)) and 1) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | (isempty(first(any(1; .[]?))) and 1) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | (isempty(isempty(any(1; .[]?))) and 1) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | (any(1; .[]?) or 1) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(any(1; .[]?))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[[1],[1]]",
+            r"del(. as $x | (all(unique_by(.)) or .a) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[[1],[1]]",
+            r"(. as $x | (all(unique_by(.)) or .a) | $x) |= 9",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r"del(. as $x | (all(.a += 1) or .a) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"del(. as $x | (isempty(any(.[]?; .)) and 1) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
     ])
 }
 
