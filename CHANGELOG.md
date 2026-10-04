@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that held a generator (`fans_out`), so `try ($w | .a[])` resolved register-less, the `try` caught the resulting refusal
   as though jq had raised it, and the body yielded nothing. A body that is one chain of stages has no sibling branch to
   withhold the register from, so it now keeps it (`is_single_path_chain`: a field, an index, a slice, `..`, `.[]`, the bound
-  variable, `.`, parentheses, `?` and `try` with no handler, joined by `|`); every other shape keeps the old verdict. The
+  variable, `.`, parentheses, `?` and `try` with no handler, joined by `|`); every other shape keeps the old verdict
+  (`getpath(...)`, a computed key even when literal, `select`, `first(...)`). The
   rows that were silently skipped now match jq, including the ones where jq raises (`path(foreach .x as $w (0; try ($w |
   .[]?); $w))`, a slice write). Bodies that branch (a comma, `//`, `and`/`or` around a generator, a `catch` handler) and
   the non-branching shapes the allowlist does not name still answer nothing or refuse where jq answers (#3770); widening

@@ -2436,11 +2436,12 @@ is the revert that established what the other one costs.
    register-less, the `try` caught its own refusal, and the UPDATE yielded nothing --
    `del(foreach .x as $w (0; try ($w \| .a[]); .))` echoed the document where jq empties `.x.a`,
    and `(...) = 9` skipped the write (as did the same body as the EXTRACT). A chain has no sibling
-   branch to withhold it from. `is_single_path_chain` admits every node `is_navigation_node` does
-   (a field, an index, a slice, `..`, `.[]`), the bound variable, `.`, parentheses, `?` and `try`
-   with no handler, joined by `|`; every other shape keeps the old verdict. That includes bodies
-   that branch (a comma, `//`, `and`/`or` around a generator, a `catch` handler) and non-branching
-   shapes the allowlist does not name (`select`, `first(...)`, `limit`, a call): they still answer
+   branch to withhold it from. `is_single_path_chain` admits a field, an index, a slice, `..` and
+   `.[]`, the bound variable, `.`, parentheses, `?` and `try` with no handler, joined by `|`; every
+   other shape keeps the old verdict. That includes bodies that branch (a comma, `//`, `and`/`or`
+   around a generator, a `catch` handler) and non-branching shapes the allowlist does not name
+   (`select`, `first(...)`, `limit`, a call, `getpath(...)`, a computed key even when literal such as
+   `.a[0.5]`): they still answer
    nothing or refuse where jq answers
    ([#3770](https://github.com/rust-works/succinctly/issues/3770)). Widening the exemption needs
    the fold's null-identity relocation fixed first, since on a `null` document it answers the root

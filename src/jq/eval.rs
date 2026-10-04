@@ -42023,9 +42023,11 @@ fn fans_out(expr: &Expr) -> bool {
 /// wrappers that add no branch of their own (parentheses, `?`, `try` with no
 /// `catch`) joined by `|`. Every node is vetted, the way
 /// [`is_pure_navigation`] vets a bind source, so a navigation node that
-/// carries an expression of its own (a computed key) is not admitted unless
-/// that expression is itself in the list. An allowlist, the safe direction: a
-/// shape it does not name keeps [`fans_out`]'s answer.
+/// carries an expression of its own is admitted only if that expression is in
+/// the list too: a field, an index, a slice, `..` and `.[]` are chains; a
+/// computed key (even a literal one, `.a[0.5]`) and `getpath(...)` are not,
+/// since their arguments are not. An allowlist, the safe direction: a shape it
+/// does not name keeps [`fans_out`]'s answer.
 fn is_single_path_chain(expr: &Expr) -> bool {
     !any_subexpr(expr, &mut |e| {
         !(is_navigation_node(e)

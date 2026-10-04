@@ -64045,6 +64045,31 @@ fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_
             "",
             0,
         ),
+        // The allowlist does not name a computed key, even a literal one, or `getpath`:
+        // jq: ["x","a",0.5,0]
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"path(foreach .x as $w (0; try ($w | .a[0.5] | .[]?); .))",
+            "",
+            "",
+            0,
+        ),
+        // jq: {"x":{"a":[[9]]}}
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r"(foreach .x as $w (0; try ($w | .a[0.5][]); .)) = 9",
+            "{\"x\":{\"a\":[[1]]}}\n",
+            "",
+            0,
+        ),
+        // jq: ["x","a",0]
+        (
+            r#"{"x":{"a":[[1]]}}"#,
+            r#"path(foreach .x as $w (0; try ($w | getpath(["a"]) | .[]?); .))"#,
+            "",
+            "",
+            0,
+        ),
         // A `catch` handler is not a chain either: it runs on a caught error's payload.
         // jq: ["x","a"]
         (
