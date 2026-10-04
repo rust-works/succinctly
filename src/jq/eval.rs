@@ -40240,13 +40240,80 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// for "navigates nothing, so a register not on this input is never checked"
 /// ([`resolve_from_restored_input`]), and `f` here does navigate.
 /// `first(f)`, `nth` and `limit` emit from inside the generator and *do* move
-/// the register, so they are not admitted. jq mode only, like every admission
-/// here (ADR-0018): yq has no oracle for it.
+/// the register when `f` navigates, so they are not admitted on their own.
+/// jq mode only, like every admission here (ADR-0018): yq has no oracle for it.
+///
+/// #3653: the stage may wrap the `last(f)` in a construct that adds no
+/// movement of its own -- `last(f)?`, `try last(f)` and `first(last(f))` --
+/// see [`register_keeping_last`].
 fn last_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
-    last_register_unmoved::<S>()
+    last_register_unmoved::<S>() && register_keeping_last(expr)
+}
+
+/// `expr` is a `last(f)`, or wraps one in a construct that passes the
+/// register through unchanged (#3653), each captured from jq 1.7.1 with
+/// `path(. as $x | W | $x)` on `{"a":{"b":1},"k":2}`, all `[]`:
+///
+/// - `E?` and `try E` (no `catch`): jq's `try` is a `FORK_OPT` that touches
+///   neither the path nor `value_at_path`; only the body can move them, so the
+///   register is where `E` left it (`last(.a)?`, `(last(.a))?`, `try
+///   last(.a)`). A handler is not admitted: it runs on a caught error's
+///   payload, a register of its own.
+/// - `first(E)` is `label $out | (E | ., break $out)`: it emits `E`'s output
+///   from inside `E`, with the register wherever `E` left it, and `last(f)`
+///   left it where it entered (`first(last(.a))`). With any other `E` that
+///   output moved the register (`first(.a)`), so `E` must itself be admitted.
+fn register_keeping_last(expr: &Expr) -> bool {
+    match unwrap_paren(expr) {
+        Expr::LastExpr(_) | Expr::Builtin(Builtin::LastStream(_)) => true,
+        Expr::Optional(inner)
+        | Expr::Try {
+            expr: inner,
+            catch: None,
+        }
+        | Expr::FirstExpr(inner)
+        | Expr::Builtin(Builtin::FirstStream(inner)) => register_keeping_last(inner),
+        _ => false,
+    }
+}
+
+/// Whether a pipe stage `expr` is `select(f)` or a type filter, which in jq
+/// mode leaves jq's register where the stage entered whatever `f` navigates
+/// (#3653). jq defines `select(f)` as `if f then . else empty end`, and an
+/// `if`'s condition is compiled between `SUBEXP_BEGIN` and `SUBEXP_END`, so `f`
+/// neither moves the register nor path-checks anything; the `.` it emits is the
+/// stage's own input. Every type filter is a `select` over a type test
+/// (`def numbers: select(type == "number");`, `values`, `nulls`, `booleans`,
+/// `strings`, `arrays`, `objects`, `iterables`, `scalars`), so they qualify on
+/// the same evidence. Captured against jq 1.7.1, `path(. as $x | S | $x)` on
+/// `{"a":{"b":1},"k":2}`: `5 | select(.)` is `[]`, `{k:1} | select(.)` is `[]`,
+/// `5 | select((true,true))` is `[]` twice, and `{a:{b:1}} | select(.a.b)` is
+/// `[]` -- a condition that navigates leaves it where it was.
+///
+/// A stage-level fact like [`last_leaves_register_in_place`], read by
+/// [`resolve_seq_stage`] beside [`cannot_move_register`] and not folded into
+/// it, for the same reason: that predicate also stands for "navigates nothing,
+/// so a register not on this input is never checked". Only the *stage* needs
+/// it. The resolver's own `select` arm passes a trackable branch straight
+/// through, so a stage entered on the register never needed the register
+/// restated; it is the register *carried* by an untracked entry that a stage
+/// outside this list drops. jq mode only (ADR-0018): yq has no oracle for it.
+fn select_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
+    S::TAG == EvalTag::Jq
         && matches!(
             unwrap_paren(expr),
-            Expr::LastExpr(_) | Expr::Builtin(Builtin::LastStream(_))
+            Expr::Builtin(
+                Builtin::Select(_)
+                    | Builtin::Values
+                    | Builtin::Nulls
+                    | Builtin::Booleans
+                    | Builtin::Numbers
+                    | Builtin::Strings
+                    | Builtin::Arrays
+                    | Builtin::Objects
+                    | Builtin::Iterables
+                    | Builtin::Scalars
+            )
         )
 }
 
@@ -49848,6 +49915,9 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // #3643: `last(f)` backtracks its source, so the register is where the
         // stage entered even though `f` navigates.
         || last_leaves_register_in_place::<S>(element)
+        // #3653: `select(f)` and the type filters pass their input through at
+        // the register, and `f` is a subexp.
+        || select_leaves_register_in_place::<S>(element)
         // #3361: a by-value stage jq defines over a backtracked source (`add`,
         // `flatten`, `map(f)`, `walk(f)`) or never lets touch the register
         // (`sort`, `to_entries`). The leaf states the same verdict
