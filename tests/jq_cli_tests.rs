@@ -63851,6 +63851,152 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
     ])
 }
 
+/// #3766: `last(f)` is `reduce f as $x (null; $x)`, so its result is the very
+/// value `f` last emitted and keeps that output's identity. `path()` accepts a
+/// result that is `jv_identical` to the register (pointer identity for an
+/// object), so `last(.)` and a `last($x)` over a `$x` frozen at the register
+/// hand the register itself back. The resolver used to forward a computed copy:
+/// the bare reads refused where jq answers `[]`, and because the copy was classed
+/// as computed, a `try` or `?` around the next navigation caught the refusal and
+/// `=`, `|=` and `del()` dropped the write at exit 0. Every row captured from
+/// jq 1.7.1 with `-c` on `{"a":{"b":1},"k":2}`, on both evaluators (the document
+/// on stdin, and as a `-n` literal). The last group is the contrast: an output
+/// that is not the register (`last(.a)` moved off it) is still refused.
+#[test]
+fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"k":2}"#;
+    let deleted_k = "{\"a\":{\"b\":1}}\n";
+    let set_k = "{\"a\":{\"b\":1},\"k\":9}\n";
+    assert_path_rows_both_routes_3749(&[
+        // The write the issue named: `$x` is the register, so `.k` is a path.
+        (
+            r#"{"a":1}"#,
+            r"(. as $x | try (last($x) | .a)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | try (last($x) | .a))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | try (5 | last($x) | .k)) = 9",
+            set_k,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | try (5 | last($x) | .k)) |= 9",
+            set_k,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | try (5 | last($x) | .k))",
+            deleted_k,
+            "",
+            0,
+        ),
+        (doc, r"del(. as $x | 5 | last($x) | .k)", deleted_k, "", 0),
+        (
+            doc,
+            r"path(. as $x | 5 | last($x) | try .k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        // The wrappers jq passes the register through (#3653).
+        (
+            doc,
+            r"del(. as $x | try (5 | last($x)? | .k))",
+            deleted_k,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | try (5 | try last($x) | .k))",
+            deleted_k,
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | try (5 | first(last($x)) | .k))",
+            deleted_k,
+            "",
+            0,
+        ),
+        // The bare reads: an output that is the entry node, trackable at the root.
+        (doc, r"path(last(.))", "[]\n", "", 0),
+        (doc, r"path(. as $x | last($x))", "[]\n", "", 0),
+        (doc, r"path(last(.a, .))", "[]\n", "", 0),
+        (doc, r"path(last(first(.)))", "[]\n", "", 0),
+        (doc, r"path(last(select(true)))", "[]\n", "", 0),
+        // Below the root the entry node is that node, and a navigation off it
+        // is a path.
+        (doc, r"path(.a | last(.))", "[\"a\"]\n", "", 0),
+        (doc, r"path(.a | last(.) | .b)", "[\"a\",\"b\"]\n", "", 0),
+        (
+            doc,
+            r"(.a | last(.) | .b) = 7",
+            "{\"a\":{\"b\":7},\"k\":2}\n",
+            "",
+            0,
+        ),
+        // Contrast: an output that is not the register is a copy, as before.
+        (
+            doc,
+            r"path(last(.a))",
+            "",
+            r#"Invalid path expression with result {"b":1}"#,
+            5,
+        ),
+        (
+            doc,
+            r"path(last(., .a))",
+            "",
+            r#"Invalid path expression with result {"b":1}"#,
+            5,
+        ),
+        (
+            doc,
+            r"path(last(.a, .k))",
+            "",
+            "Invalid path expression with result 2",
+            5,
+        ),
+        (
+            doc,
+            r"path(last(1))",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            doc,
+            r"path(last(empty))",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | last(.a) | .a)",
+            "",
+            r#"near attempt to access element "a" of {"b":1}"#,
+            5,
+        ),
+    ])
+}
+
 /// #3653: the register `last(f)` leaves in place (#3643) survives the wrappers
 /// jq passes it through, and a `select(f)` / type-filter stage leaves it where
 /// the stage entered. `E?` and `try E` touch neither the path nor
@@ -64250,36 +64396,6 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
         ),
         (doc, r"path(. as $x | 5 | [numbers] | $x)", "", with_root, 5),
     ])
-}
-
-/// #3766, characterization of a pre-existing bug: `last(f)` returns a copy of its
-/// output, so a `last` whose output *is* the register (`last($x)`, `last(.)`)
-/// loses its identity, and a `try` around the next navigation then catches a
-/// refusal jq never raises and drops the write with exit 0. jq 1.7.1 answers
-/// `{"a":9}` and `{}`. Verified identical on `main` before #3653 (which only
-/// extends where the register is carried across the wrappers), so this pins an
-/// existing defect rather than a regression. If #3766 is fixed, update the
-/// expectations to jq's answers.
-#[test]
-fn test_last_of_the_register_under_try_drops_the_write_characterize_preexisting_bug_3766(
-) -> Result<()> {
-    let doc = r#"{"a":1}"#;
-    for (filter, jq_answers, today) in [
-        (
-            r"(. as $x | try (last($x) | .a)) = 9",
-            "{\"a\":9}\n",
-            "{\"a\":1}\n",
-        ),
-        (r"del(. as $x | try (last($x) | .a))", "{}\n", "{\"a\":1}\n"),
-    ] {
-        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
-        assert_eq!(
-            (out.as_str(), code),
-            (today, 0),
-            "`{filter}` changed (jq answers {jq_answers:?}): if #3766 is fixed, update this pin; stderr {err:?}"
-        );
-    }
-    Ok(())
 }
 
 /// #3769, characterization of a pre-existing bug: a `foreach` whose EXTRACT

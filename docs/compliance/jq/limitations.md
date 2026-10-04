@@ -1285,10 +1285,12 @@ is the revert that established what the other one costs.
    `[E]` collect of a type filter, and either stage inside a compound stage (a comma, a `//`, a
    `def` call), which need the leaf-level verdict for a compound stage described above.
    `select` hands its input through as the very value it received, so a `$x` that reaches it
-   keeps its identity; `last(f)` returns a copy, so a `last` whose output *is* the register
-   (`last($x)`, `last(.)`) loses it, and a `try` around the next navigation then catches a
-   refusal jq never raises and drops the write
-   ([#3766](https://github.com/rust-works/succinctly/issues/3766), older than #3653).
+   keeps its identity, and so does `last(f)`'s result, which is the very value `f` last
+   emitted ([#3766](https://github.com/rust-works/succinctly/issues/3766)): a `last` whose
+   output *is* the register (`last($x)`, `last(.)`) hands it back, so `path(last(.))` is `[]`
+   and `(. as $x \| try (5 \| last($x) \| .k)) = 9` writes, as in jq, pinned by
+   `test_path_register_last_f_keeps_the_identity_of_its_output_3766`. An output that is not the
+   register (`last(.a)` moved off it) is still a copy that jq refuses.
    Nor is `isempty(g)` a drain producer that loses it any more:
    [#3763](https://github.com/rust-works/succinctly/issues/3763) states the register the first
    branch `g` emitted left (and the entry register when it emitted nothing), so

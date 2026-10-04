@@ -51443,6 +51443,26 @@ fn yq_last_f_does_not_leave_the_path_register_in_place_3643() -> Result<()> {
     Ok(())
 }
 
+/// #3766 lets `last(f)` keep the identity of `f`'s last output in jq mode only
+/// (ADR-0018: yq has no oracle for `last`). With the jq-only surface enabled, yq
+/// mode still refuses a navigation off a `last($x)` that jq accepts, exactly as
+/// before: the output stays a computed copy there.
+#[test]
+fn yq_last_f_output_does_not_keep_its_identity_3766() -> Result<()> {
+    let yaml = "a:\n  b: 1\nk: 2\n";
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        "del(. as $x | 5 | last($x) | .k)",
+        yaml,
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "stderr {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #3653 keeps jq's path register through `last(f)`'s wrappers (`?`, `try`,
 /// `first(...)`) and across a type-filter stage in jq mode only (ADR-0018). Real
 /// yq's lexer rejects `last(f)` and the type filters outright (v4.53.3), so there

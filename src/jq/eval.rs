@@ -37776,7 +37776,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // What each says about jq's register differs. `last(f)` leaves it where
         // it entered in jq mode (#3643; the arm's own comment below), while
         // `isempty` states it per branch and `INDEX` and `last` in yq mode lose
-        // it ([`drained_register`]).
+        // it ([`drained_register`]). (`last(f)` in jq mode is the one result that
+        // can *be* the register: it is `f`'s last output itself, so it keeps that
+        // output's identity -- #3766, the arm's own comment below.)
         //
         // `last`/`INDEX` need every one of the argument's outputs regardless
         // of what the *outer* consumer wants (`last` cannot know which output
@@ -40309,9 +40311,9 @@ fn is_last_stage(stage: &Expr) -> bool {
 /// Only the *stage* needs it. The resolver's own `select` arm passes a trackable
 /// branch straight through, so a stage entered on the register never needed the
 /// register restated; it is the register *carried* by an untracked entry that a
-/// stage outside this list drops. Unlike `last(f)`, a `select` hands its input
-/// through as the very value it received (the resolver forwards the branch's own
-/// snapshot mark), so a `$x` that reaches it keeps its identity.
+/// stage outside this list drops. A `select` hands its input through as the very
+/// value it received (the resolver forwards the branch's own snapshot mark), so a
+/// `$x` that reaches it keeps its identity, as does a `last(f)`'s result (#3766).
 fn is_select_stage(stage: &Expr) -> bool {
     matches!(
         stage,
