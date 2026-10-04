@@ -119,8 +119,9 @@ runs:
         # Bumped to 0.46.0 for #3750: it is the first release with an
         # `omni-dev-linux-arm64.tar.gz` (0.43.0-0.45.0 ship none), so the ARM64
         # leg can download the binary instead of a ~4.5 min `cargo install` on
-        # every omni-dev cache miss. It also adds `coverage merge` and the
-        # repeatable `--report`, which a sharded run would need. `coverage diff`
+        # every omni-dev cache miss. It also adds `coverage merge`, which a
+        # sharded run would need with the repeatable `--report` and
+        # `--fail-under-lines` that 0.45.0 added. `coverage diff`
         # is unchanged for this repo's single-report use: 0.43.0 and 0.46.0
         # rendered byte-identical markdown and json from the same inputs, over
         # three pairs of real `main` reports including one with uncovered patch
