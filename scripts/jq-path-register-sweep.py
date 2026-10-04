@@ -166,7 +166,7 @@ OPERANDS = [
     # *computed* element was invisible, and `any(1; .[]?) or true` or
     # `.. // .a` wrote where jq exits 5. #3757 resolves such a `cond` as
     # `gen | cond`; `--operand` over the twenty-three any/all/isempty operands
-    # (223,587 programs at the grid's 27 contexts) went from 1,675 ACCEPT_WRONG
+    # (223,587 programs at the grid's then 27 contexts; #3738 has since added ten) went from 1,675 ACCEPT_WRONG
     # on a build of `main` without it to 0, with 0 regressions. The counts move
     # with the grid, so rerun rather than compare.
     "any(1; .[]?)",

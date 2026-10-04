@@ -1177,7 +1177,7 @@ is the revert that established what the other one costs.
      when removed. A computed `null`/`true`/`false` generator element over a register that is equal by kind *is* the
      register in jq (`jv_identical`), so `any(true; .[0]?)` on `true` raises no path error there, and the branch is
      re-established at the entry on a trackable entry; over an untracked entry the register's position is not known
-     and the element is treated as computed. A sweep of the twenty-three `any`/`all`/`isempty` operands against a build of `main` without #3757 (223,587 programs at 27 contexts; `--operand` for each) has `ACCEPT_WRONG` 1,675 to 0, `REFUSE_WRONG` 5,495 to 2,278, `DIFF` 8 to 0 and no regression: the first sweep of this family to exit 0. One shape still refuses where jq answers, pinned
+     and the element is treated as computed. A sweep of the twenty-three `any`/`all`/`isempty` operands against a build of `main` without #3757 (223,587 programs at the grid's then 27 contexts, ten fewer than #3738 later added; `--operand` for each) has `ACCEPT_WRONG` 1,675 to 0, `REFUSE_WRONG` 5,495 to 2,278, `DIFF` 8 to 0 and no regression: the first sweep of this family to exit 0. One shape still refuses where jq answers, pinned
      (`test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`): a plain pipe stage does not read the
      backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any | $x)` on `{"a":false,"b":null}` is
      `[]` in jq and refuses here, and so does `isempty(g)` as a `cond` (`any(.[]; isempty(empty))` is `[0]`)
