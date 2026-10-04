@@ -2238,7 +2238,7 @@ is the revert that established what the other one costs.
    | `path(. as {a:$q} \| .a as $z \| $z)`             | `["a"]`            | a bind whose source navigates needs a trackable stage, and the pattern's body stage is untracked by construction                             |
    | `path(. as {a:$q} ?// $z \| .a)`                  | `["a"]`            | jq's fork catches the body's own near-access error and tries the next alternative; here that error is indistinguishable from a resolver artefact, so the guard refuses instead (a `PATH_END` refusal, by contrast, reaches the loop as a sink stop and does retry)                                                             |
    | `path(. as {a:$q} \| $q[0], $q)`                  | `["a",0]`, `["a"]` | pre-existing: a `$var` nested under `,`/`if` gets no register (the scope limit above) — `path(.a as $y \| .a \| 5 \| $y[0], $y)` refuses too |
-   | `path(. as {a:$q} \| select(true) \| $q)`          | `["a"]`            | pre-existing: a `select`/`label`/`first(.)`/`getpath([])` passthrough on an untracked stage re-seeds the carried register from the ambient value — `path(.a as $y \| .a \| 5 \| select(true) \| $y)` refuses too; `if`/`try`/`. as $q \| .` carry it |
+   | `path(. as {a:$q} \| first(.) \| $q)`             | `["a"]`            | pre-existing: a `first(.)` passthrough on an untracked stage re-seeds the carried register from the ambient value -- `path(.a as $y \| .a \| 5 \| first(.) \| $y)` refuses too; `if`/`try`/`. as $q \| .`/`label`/`getpath([])` carry it, and so do `select` and the type filters since [#3653](https://github.com/rust-works/succinctly/issues/3653) |
    | `path((., .) as {a:$q} \| $q)`                    | `["a"]`, `["a"]`   | the identity premise is decided from the source's spelling (`.`, a certified marker, null/bool by value); an identity-*equivalent* source (`(., .)`, `getpath([])`, `first(recurse)`, a `def` parameter bound to `.`) binds by value and the first step refuses |
    | `path(. as {a:$q} \| $q[($q\|length)-1])`          | `["a",2]`          | a computed index on a marker head resolves the key off the ambient input, so the marker never re-establishes; `$q \| .[length-1]` answers                                                                                   |
 
@@ -2971,8 +2971,12 @@ answers `["b"]` — and classified the two residuals appended below):
   pinned by `test_recurse_seed_residuals_stay_loud_3272`:
   - a recursion behind a call, a fork or a nested pipe, whose first output is not provably the
     seed: `path(. as $x | 1 | first(..) | $x)`, `limit(2; ..)`, `(., ..)`,
-    `if true then .. else 1 end`, `(.. | select(true))` and `(try ..) // 3` are `[]` in jq.
-    Naming a call's body is what `cannot_move_register` declines to do;
+    `if true then .. else 1 end` and `(try ..) // 3` are `[]` in jq.
+    Naming a call's body is what `cannot_move_register` declines to do. (`(.. | select(true))`
+    is no longer one: [#3653](https://github.com/rust-works/succinctly/issues/3653) made a `select`
+    stage keep the register, so the seed answers `[]` and the `.[]?` below it raises `near attempt
+    to iterate through 1`, as in jq; pinned by
+    `test_path_register_last_f_wrappers_and_select_keep_it_3653`);
   - the output a `catch` handler adds after the seed: `path(. as $x | 1 | try recurse(.a) catch 7
     | $x)` is `[]` twice in jq, and `[]` followed by the refusal here. Closing it needs "a caught
     untracked-navigation refusal did not move the register", a separate rule;
@@ -3000,6 +3004,11 @@ answers `["b"]` — and classified the two residuals appended below):
   refusal here can also pre-empt a later error jq raises itself: `del(.a as $x | .a | 5 | first(7) |
   $x, .b)` on `null` refuses in both, but jq's message is `near attempt to access element "b" of 7`
   (it accepted the first branch) and this resolver's is `with result null` (exit 5 either way).
+  A `select(f)` or type-filter stage is no longer one that may have dropped the register
+  ([#3653](https://github.com/rust-works/succinctly/issues/3653)): `path(.a | 5 | select(true) |
+  null)` on `null` is `["a"]` here as in jq, and so are the `=`, `|=` and `del` forms over it, so those
+  rows moved from the #3579 test to `test_path_register_last_f_wrappers_and_select_keep_it_3653`.
+  `first(7)` and the other stages that can drop it still refuse.
   `path(.a | null)`, `path(.a | 5 | null)`, `path(.a as $x | .a | 5 | $x)` and the rest of the
   carve-out's own cases are unchanged and still match jq. So is a path that ends in a bare iterate
   after such a terminal (`path(.a | 5 | select(true) | null | .[])`): `.[]` on `null` never yields, it
