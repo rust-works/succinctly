@@ -42001,6 +42001,16 @@ fn recurse_seed_keeps_register<S: EvalSemantics>(element: &Expr, branch_trackabl
 /// unevenly (#3145 review). `Comma` and the iterating/recursing shapes
 /// count; so does anything this predicate cannot see inside, since the
 /// answer must be "maybe" for those.
+///
+/// Except a body that is one chain of stages ([`is_single_path_chain`], #3738):
+/// a generator inside one chain (`try ($v | .[]?)`) has no sibling for the
+/// register to be withheld from, since every output comes through the same
+/// stages. Counting it made that body resolve register-less, so its own
+/// refusal was caught by the `try` and the UPDATE yielded nothing -- a write
+/// silently skipped where jq raises or answers a path. The exception is an
+/// allowlist and nothing else changed: `//`, `and`, `or` and `if` around a
+/// generator still count (the generator was what kept them from the register,
+/// and the fold's null-identity relocation answers the root path for them).
 fn fans_out(expr: &Expr) -> bool {
     any_subexpr(expr, &mut |e| {
         matches!(
@@ -42014,7 +42024,27 @@ fn fans_out(expr: &Expr) -> bool {
                 | Expr::FuncCall { .. }
                 | Expr::NamespacedCall { .. }
         )
-    })
+    }) && !is_single_path_chain(expr)
+}
+
+/// Whether `expr` is one chain of stages with no point at which it can split
+/// into sibling branches (#3738): navigation, the fold's bound variable (a
+/// `TrackedVar` once substituted), `..`, and the
+/// wrappers that add no branch of their own (parentheses, `?`, `try` with no
+/// `catch`) joined by `|`. An allowlist, the safe direction: a shape it does
+/// not name keeps [`fans_out`]'s answer.
+fn is_single_path_chain(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::TrackedVar(_) => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => is_single_path_chain(inner),
+        Expr::Try { expr, catch: None } => is_single_path_chain(expr),
+        Expr::Pipe(stages) => stages.iter().all(is_single_path_chain),
+        _ => false,
+    }
 }
 
 /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type
@@ -42573,7 +42603,8 @@ impl FoldRegister {
         // `(foreach .a as {a:$v} ?// {c:$v} (0; ($v[0]?, $v))) = 9` wrote
         // `.a.c`, a key jq never names, because only the second output
         // refused and drove a `?//` retry jq does not perform. A body with
-        // one output path cannot split that way. Widening the other
+        // one output path cannot split that way, and a generator inside one
+        // chain of stages (`try ($v | .[]?)`) is one output path (#3738). Widening the other
         // direction (re-establishing in `resolve_node`'s own arms) is
         // #2046's documented scope limit, not this fix's.
         let update_frame = if self.trackable {
