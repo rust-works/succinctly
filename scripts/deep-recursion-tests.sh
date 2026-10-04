@@ -87,7 +87,7 @@ run() {
 
   passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' "$output")"
   if [ "$passed" != "$expected" ]; then
-    echo "::error::expected $expected deep-recursion tests to pass, the harness reported ${passed:-none}; is one #[ignore]d or cfg'd out? (#3698)"
+    echo "::error::expected $expected deep-recursion tests to pass, the harness reported ${passed:-none}; is one #[ignore]d or cfg'd out? (cargo llvm-cov ignores them on purpose, #3750; #3698)"
     exit 1
   fi
 }

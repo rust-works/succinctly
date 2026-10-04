@@ -43,6 +43,8 @@ cargo llvm-cov --features cli,simd,regex,serde --workspace --summary-only --fail
 omni-dev coverage diff
 ```
 
+The two `jq_cli_tests` named in `scripts/deep-recursion-tests.sh` are `#[ignore]`d under `cfg(coverage)`, so `cargo llvm-cov` reports them as ignored; they still run in the `deep-recursion` CI leg and under a plain `cargo test` (`docs/guides/developer.md` says how that was checked and how to repeat it).
+
 Build the CLI with `cargo build --release --features cli`. The binary's `jq` and `yq` subcommands also have `sjq` and `syq` aliases. Use files under `.ai/scratch/` for manual CLI experiments; tracked examples are not scratch files.
 
 ## Documentation and skills
