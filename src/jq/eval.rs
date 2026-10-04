@@ -40414,6 +40414,8 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
     }
     let last_stage = stages.len().checked_sub(1);
     let mut decided = false;
+    // Set when a branch could not be run live: see the closure below.
+    let mut ran_by_value = false;
     let mut decided_at: Option<(Rc<PathPrefix>, BranchRegister<'a>)> = None;
     let mut probe_escape: Option<Control> = None;
     let mut stage_escape: Option<EvalEscape> = None;
@@ -40452,6 +40454,29 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
                 } else {
                     branch
                 };
+            // The one case left undecided: a computed `null`/`true`/`false` over an
+            // *untracked* entry. Whether it is the register is whether it equals
+            // the carried register by kind, which is known only when the frame
+            // carries that register's value, and even then the register's
+            // position is not, so a live stage could neither raise as jq does
+            // (it does not, when equal) nor name where `cond` left it. Run
+            // `cond` by value as before this change and state no register.
+            let by_value = !branch.trackable
+                && matches!(&*branch.value, OwnedValue::Null | OwnedValue::Bool(_))
+                && frame.register().map_or(true, |register| {
+                    null_bool_identical(&branch.value, register)
+                });
+            if by_value {
+                ran_by_value = true;
+                return match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
+                    Ok(true) => {
+                        decided = true;
+                        Demand::Stop
+                    }
+                    Ok(false) => Demand::Continue,
+                    Err(control) => stop_with_escape(&mut probe_escape, control),
+                };
+            }
             // `c or empty`: each output of `cond` that is truthy emits `true`
             // (`c and empty`: a falsy one emits `false`), the rest backtrack.
             let mut decide = |output: PathBranch<'a>| -> Demand {
@@ -40497,7 +40522,7 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
         None => forward_drained_result(
             flow,
             answer,
-            drained_register_after::<S>(trackable, value, decided),
+            drained_register_after::<S>(trackable, value, decided || ran_by_value),
             sink,
         ),
     }
