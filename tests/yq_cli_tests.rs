@@ -45243,6 +45243,31 @@ fn test_recurse_structural_descent_over_alias_fanout_completes_3719() -> Result<
     Ok(())
 }
 
+/// #3719: the rerouted `recurse(.[]?)` answers what `..` answers, node for
+/// node, on a document with anchors, aliases, merge keys, tags and duplicate
+/// keys -- including what a later stage reads off each node's position.
+#[test]
+fn test_recurse_structural_descent_matches_recursive_descent_3719() -> Result<()> {
+    let doc = "base: &b {x: 1, y: [1, 2]}\nd: {<<: *b, z: !!str 5}\ne: [*b, \"s\", null, 3.5, {k: v}]\ndup: {a: 1, a: 2}\n";
+    for tail in [
+        "",
+        "| [., key, path, parent] | tojson",
+        "| tag",
+        "| select(type == \"!!map\") | keys",
+    ] {
+        let spelled = format!("[recurse(.[]?){tail}]");
+        let dots = format!("[..{tail}]");
+        let (want, e1, c1) =
+            run_yq_stdin_with_stderr(&dots, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
+        let (got, e2, c2) =
+            run_yq_stdin_with_stderr(&spelled, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
+        assert_eq!((c1, c2), (0, 0), "`{tail}` -- stderr: {e1:?} {e2:?}");
+        assert!(!want.trim().is_empty(), "`{tail}` produced nothing");
+        assert_eq!(got, want, "`{tail}`");
+    }
+    Ok(())
+}
+
 /// #2476's one behaviour change: #1804's accepted trade-off, now shared by
 /// `and`/`or`.
 ///

@@ -101252,3 +101252,20 @@ fn test_any_all_condition_retry_preserves_answer_then_control_3810() -> Result<(
     assert_retry_rows_3293(Some(doc), "", rows)?;
     assert_retry_rows_3293(None, &format!("{doc} | "), rows)
 }
+
+/// #3719: jq defines bare `recurse` as `recurse(.[]?)`, so the spelled-out form
+/// takes the same cursor walk and answers what `..` and `recurse` answer,
+/// including the position a later stage reads off each node.
+#[test]
+fn test_recurse_structural_descent_matches_recursive_descent_3719() -> Result<()> {
+    let input = r#"{"a":[1,{"b":2}],"c":null,"d":"s","e":{}}"#;
+    for tail in ["", "| path(.)? ", "| select(type == \"object\") | keys"] {
+        let (want, c1) = run_jq_stdin(&format!("[..{tail}]"), input, &["-c"])?;
+        let (rec, c2) = run_jq_stdin(&format!("[recurse{tail}]"), input, &["-c"])?;
+        let (got, c3) = run_jq_stdin(&format!("[recurse(.[]?){tail}]"), input, &["-c"])?;
+        assert_eq!((c1, c2, c3), (0, 0, 0), "`{tail}`");
+        assert_eq!(got, want, "`{tail}` vs `..`");
+        assert_eq!(got, rec, "`{tail}` vs `recurse`");
+    }
+    Ok(())
+}
