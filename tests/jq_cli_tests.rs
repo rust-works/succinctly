@@ -55848,9 +55848,10 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
 /// jq defines `def recurse: recurse(.[]?);` (`jq --debug-dump-disasm` shows the
 /// lambda as `EACH_OPT`), so the walk is structural descent of a finite tree
 /// and its node count is the tree's own. `RECURSE_MAX_ITEMS` is there for a
-/// parameterised `f` that can be unbounded, and it answers silently short; it
-/// was applied to this `f` too, and to bare `recurse` on an owned input (`-n`),
-/// stopping at 10,000 nodes with exit 0. A write through the same walk lost
+/// parameterised `f` that can be unbounded (it raises since #3716, and ended the
+/// walk silently short before); it was applied to this `f` too, and to bare
+/// `recurse` on an owned input (`-n`), stopping at 10,000 nodes with exit 0. A
+/// write through the same walk lost
 /// what lay past the cap: on this 12,001-node document `recurse(.[]?) |= ...`
 /// left 1,001 numbers un-incremented and `del(recurse(.[]?) | ...)` left 1,001
 /// of them in place.

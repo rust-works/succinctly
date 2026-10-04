@@ -765,10 +765,14 @@ a write through the walk (`|=`, `=`, `del`, `pick`) raises instead of finishing 
 that stops first never meets it (`first`, `limit(10000; ...)`, `isempty`, `nth(9999; ...)`), and the
 boundary is exact: a 10,000-node document answers, a 10,001-node one raises, because the cap fires only
 when a node remains. It replaces a deferred `f`/`cond` error rather than the other way round, since the
-cap is the error the walk's size decided. jq's `paths(f)` is `path(..|select(f)) | select(length > 0)`, so it runs `f` on the root too and
-discards that output: `[paths(recurse(.[]?; true))] | length` over a document past the cap raises here,
-where the silent truncation of the discarded root walk used to leave jq's count intact by luck. Both evaluators and both modes share the one walker (yq's
+cap is the error the walk's size decided. Both evaluators and both modes share the one walker (yq's
 `recurse` is a succinctly extension behind `--jq-extensions`, real yq's lexer rejects it).
+
+**`paths(f)` is a walk whose output is thrown away.** jq 1.7.1 defines it as `path(..|select(f)) |
+select(length > 0)`, so it runs `f` on the root too and discards that output. A `recurse` as the filter
+argument over a document past the cap (`[paths(recurse(.[]?; true))] | length`, 18000 in jq) therefore
+raises here, where the silent truncation of the discarded root walk used to leave jq's count intact by
+luck.
 
 `.[]?` is the exception, and is lifted since #3703: jq defines `def recurse: recurse(.[]?);`
 (`jq --debug-dump-disasm` shows the lambda as `EACH_OPT`), so `recurse(.[]?)`, bare `recurse` and `..`
