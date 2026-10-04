@@ -80156,15 +80156,16 @@ mod tests {
         ] {
             let filter_expr = parse(&program).unwrap();
             let input = parse_complete_json(input, false).unwrap();
-            match eval_owned_input::<Vec<u64>, JqSemantics>(
+            let got = eval_owned_input::<Vec<u64>, JqSemantics>(
                 &filter_expr,
                 &input,
                 false,
                 Reentry::REBUILT,
-            ) {
-                QueryResult::Owned(v) => assert_eq!(v.to_json(), expected, "{program}"),
-                _ => panic!("{program}: not an owned result"),
-            }
+            );
+            assert!(
+                matches!(&got, QueryResult::Owned(v) if v.to_json() == expected),
+                "{program}"
+            );
         }
     }
 
