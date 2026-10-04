@@ -137,6 +137,15 @@ OPERANDS = [
     "limit(1; .[]?)",
     "isempty(.[]?)",
     "[.[]?]",
+    # (#3749) `any(gen; cond)`/`all(gen; cond)`: a deciding element leaves jq's
+    # register where `gen` put it and `path()` accepts a boolean identical to
+    # it, so the resolver now accepts these where it used to refuse. That is the
+    # dangerous direction, so the arm needs rows: a `cond` that cannot move the
+    # register (the verdict is stated) and one that can (a loss, still refused).
+    "any(.[]?; .)",
+    "all(.[]?; .)",
+    "any(.[]?; .a)",
+    "all(.[]?; .a)",
     # wrappers and control flow around the above
     "try .a",
     "(.a // .b)",
