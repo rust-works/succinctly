@@ -91,7 +91,12 @@ runs:
         samples="$RUNNER_TEMP/df-avail-kb"
         nohup bash -c "while :; do df --output=avail -k / | tail -1 >> '$samples'; sleep 20; done" >/dev/null 2>&1 &
 
-    - uses: action-works/omni-dev-coverage-check@v1
+    # #3750: pinned to v1.3 rather than the floating `@v1` while profile-file
+    # pooling is timed. `@v1` moved to v1.3 between two runs on 2026-10-04 with no
+    # commit here, and the job shortened by 5-8 minutes: a change like that makes
+    # a before/after of anything else unreadable. Go back to `@v1` once the pooling
+    # decision is made.
+    - uses: action-works/omni-dev-coverage-check@99cb840f1a614c83b3839b9d67b3c5caee227ae1 # v1.3
       with:
         # Pin; we're a consumer. Must stay >= 0.38.0: that release added the
         # declarative `.omni-dev/coverage.yaml` ignore-list (omni-dev#1398),
