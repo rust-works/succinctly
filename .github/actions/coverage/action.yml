@@ -20,6 +20,13 @@ inputs:
       coverage-baseline.yml publishes it from a push-only run that concludes on coverage alone (#3649).
     required: false
     default: coverage-baseline.yml
+  reclaim-below-gib:
+    description: >-
+      x86_64 only: free the unused hosted toolchains before the run only when `/` has less than this
+      many GiB free (a whole number). The default leaves today's runner image, which starts with more,
+      to skip the step (#3750).
+    required: false
+    default: '75'
 
 runs:
   using: composite
@@ -32,13 +39,37 @@ runs:
     # hosted `ubuntu-latest` disk, so reclaim the multi-GB toolchains this job
     # never uses (the Rust toolchain lives under the runner's home and is
     # untouched) before the action starts. x86_64 only: ARM64 passes without it.
-    - name: Reclaim disk space (x86_64)
+    #
+    # #3750: the image has since regained room (86 GiB free before this step on
+    # 2026-10-04, 109 GiB after it), and the step cost 67-108 s of every x86_64
+    # run to free space the run did not need. A run grew used space by ~52 GiB,
+    # so it now reclaims only when less than `reclaim-below-gib` (75: that growth
+    # plus ~20 GiB of margin) is free. The two `df` lines stay either way, so a
+    # log still says how much room the run started with, and the sampler below
+    # still reports how close it came.
+    - name: Reclaim disk space (x86_64, only when tight)
       if: inputs.name == 'x86_64'
       shell: bash
+      env:
+        RECLAIM_BELOW_GIB: ${{ inputs.reclaim-below-gib }}
       run: |
         df -h /
-        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-          /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift
+        case "$RECLAIM_BELOW_GIB" in
+          '' | *[!0-9]*)
+            echo "::error::reclaim-below-gib must be a whole number of GiB, got '$RECLAIM_BELOW_GIB'"
+            exit 1
+            ;;
+        esac
+        avail_kb=$(df --output=avail -k / | tail -1 | tr -d ' ')
+        # 10#: a leading zero would otherwise read as octal.
+        threshold_kb=$((10#$RECLAIM_BELOW_GIB * 1048576))
+        if [ "$avail_kb" -ge "$threshold_kb" ]; then
+          echo "reclaim: skipped, $((avail_kb / 1048576)) GiB free on / is not below the $((10#$RECLAIM_BELOW_GIB)) GiB threshold"
+        else
+          echo "reclaim: running, $((avail_kb / 1048576)) GiB free on / is below the $((10#$RECLAIM_BELOW_GIB)) GiB threshold"
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift
+        fi
         df -h /
 
     # Sample the free space every 20 s so a passing run says how close it came.
