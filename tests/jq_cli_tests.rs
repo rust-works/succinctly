@@ -93071,6 +93071,16 @@ fn test_computed_slice_and_index_target_is_lazy_3520() -> Result<()> {
         ("[(., (1|stderr))[(0+1)]] | length", "", "1", 5),
         ("[(., 5)[(0+1):]?]", "[[20,30]]\n", "", 0),
         ("[(., .)[(0,1)]]", "[10,10,20,20]\n", "", 0),
+        // A `?//` retry inside the target, a `break` out of it, and a `halt`
+        // after its first output (which `first` never reaches the end of).
+        (
+            "[limit(1; (1 as $x ?// $y | .)[(0+1):])]",
+            "[[20,30],[20,30]]\n",
+            "",
+            0,
+        ),
+        ("[label $o | (., break $o, 5)[(0+1)]]", "[20]\n", "", 0),
+        ("[first((., halt)[(0+1)])]", "[20]\n", "", 0),
     ] {
         // The document read, and the owned route (`-n`) that has its own twin.
         for (args, input, prefix) in [

@@ -14698,6 +14698,10 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
             false,
             cursor,
             &mut MaterializesLazyItems(|item: GenericItem<V>| {
+                // A re-invocation after a stop is a `?//` retry inside the
+                // target (#3293): it supersedes the retried-past call.
+                own_escape = None;
+                stopped = false;
                 let t = match generic_item_into_owned::<V, S>(item) {
                     Ok(t) => t,
                     Err(control) => {
@@ -18850,6 +18854,10 @@ fn slice_pair_streaming<S: EvalSemantics, V: DocumentValue>(
         false,
         cursor,
         &mut MaterializesLazyItems(|item: GenericItem<V>| {
+            // A re-invocation after a stop is a `?//` retry inside the target
+            // (#3293): it supersedes the retried-past call.
+            escape = None;
+            stopped = false;
             let t = match generic_item_into_owned::<V, S>(item) {
                 Ok(t) => t,
                 Err(control) => {
@@ -18873,8 +18881,12 @@ fn slice_pair_streaming<S: EvalSemantics, V: DocumentValue>(
             }
         }),
     );
-    if let (None, false, Flow::Escaped(control)) = (&escape, stopped, flow) {
-        escape = Some(control);
+    match flow {
+        Flow::Escaped(control) if escape.is_none() && !stopped => escape = Some(control),
+        // A stop the consumer did not issue is a stale enclosing driver's
+        // (#3293); the pair ends, as the index twin's does.
+        Flow::Stopped { .. } if escape.is_none() => stopped = true,
+        _ => {}
     }
     (escape, stopped)
 }

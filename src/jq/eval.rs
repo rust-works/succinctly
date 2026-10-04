@@ -8176,6 +8176,10 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut own_escape: Option<Control> = None;
             let mut stopped = false;
             let target_flow = eval_each::<W, S>(target, value.clone(), false, &mut |t_item| {
+                // A re-invocation after a stop is a `?//` retry inside the
+                // target (#3293): it supersedes the retried-past call.
+                own_escape = None;
+                stopped = false;
                 let t = match t_item.into_owned::<S>() {
                     Ok(t) => t,
                     Err(err) => {
@@ -25949,6 +25953,10 @@ fn slice_pair_streaming<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut escape: Option<Control> = None;
     let mut stopped = false;
     let flow = eval_each::<W, S>(target, value, false, &mut |item| {
+        // A re-invocation after a stop is a `?//` retry inside the target
+        // (#3293): it supersedes the retried-past call.
+        escape = None;
+        stopped = false;
         let t = match item.into_owned::<S>() {
             Ok(t) => t,
             Err(err) => {
@@ -25971,8 +25979,12 @@ fn slice_pair_streaming<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
     });
-    if let (None, false, Flow::Escaped(control)) = (&escape, stopped, flow) {
-        escape = Some(control);
+    match flow {
+        Flow::Escaped(control) if escape.is_none() && !stopped => escape = Some(control),
+        // A stop the consumer did not issue is a stale enclosing driver's
+        // (#3293); the pair ends, as the index twin's does.
+        Flow::Stopped { .. } if escape.is_none() => stopped = true,
+        _ => {}
     }
     (escape, stopped)
 }
