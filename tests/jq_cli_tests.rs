@@ -61015,6 +61015,13 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
             "",
             0,
         ),
+        (
+            r#"{"a":true}"#,
+            r#"del(try (.a and any(2; .a?)))"#,
+            "{\"a\":true}\n",
+            "",
+            0,
+        ),
     ])
 }
 
@@ -61027,8 +61034,11 @@ fn test_any_all_cond_on_a_computed_element_raises_as_jq_does_3757() -> Result<()
 /// (`.a and any(true; select(.))`, an `and` right operand) is ambiguous -- it
 /// may be the carried register, whose position is not known -- so jq's `["a"]`
 /// is refused as an uncatchable guess, and so is a `cond` that raises there
-/// (`try ... catch .` would answer `"boom"` in jq). Pinned on both routes so
-/// lifting any is a deliberate change; the jq answers are in each row.
+/// (`try ... catch .` would answer `"boom"` in jq). And a generator the allowlist
+/// cannot prove leaves the register in place (`first(2, 3)`) is not trusted to
+/// have left the frame's carried register, where a literal (`2`) is: jq answers
+/// the document for both. Pinned on both routes so lifting any is a deliberate
+/// change; the jq answers are in each row.
 #[test]
 fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
     for (input, filter, jq_answer, expected) in [
@@ -61079,6 +61089,12 @@ fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
             r#"try del(.a and any(true; select(.) | error("boom"))) catch ."#,
             r#""boom""#,
             "Invalid path expression with result true",
+        ),
+        (
+            r#"{"a":true}"#,
+            r#"del(try (.a and any(first(2, 3); .a?)))"#,
+            r#"{"a":true}"#,
+            "Invalid path expression with result 2",
         ),
     ] {
         let routes = [
