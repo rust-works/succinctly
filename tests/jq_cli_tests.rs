@@ -93045,6 +93045,69 @@ fn test_slice_bound_retry_reaches_consumer_stop_3471() -> Result<()> {
     )
 }
 
+/// #3520: a computed slice's or index's target is pulled one output at a time,
+/// so a consumer that stops after its first output never runs the target's
+/// later ones. jq 1.7.1, captured live: nothing reaches stderr for the first
+/// two rows (the target's `1|stderr` is never reached), and an error on a later
+/// target output comes after the outputs before it.
+#[test]
+fn test_computed_slice_and_index_target_is_lazy_3520() -> Result<()> {
+    for (filter, expected_out, expected_err, expected_code) in [
+        (
+            "[first((., (1|stderr))[(0+1):]), 9]",
+            "[[20,30],9]\n",
+            "",
+            0,
+        ),
+        ("[first((., (1|stderr))[(0+1)]), 9]", "[20,9]\n", "", 0),
+        ("[isempty((., (1|stderr))[(0+1):])]", "[false]\n", "", 0),
+        (
+            r#"[limit(1; (., error("x"))[(0+1):])]"#,
+            "[[20,30]]\n",
+            "",
+            0,
+        ),
+        (r#"[limit(1; (., error("x"))[(0+1)])]"#, "[20]\n", "", 0),
+        ("[(., (1|stderr))[(0+1)]] | length", "", "1", 5),
+        ("[(., 5)[(0+1):]?]", "[[20,30]]\n", "", 0),
+        ("[(., .)[(0,1)]]", "[10,10,20,20]\n", "", 0),
+        // A `?//` retry inside the target, a `break` out of it, and a `halt`
+        // after its first output (which `first` never reaches the end of).
+        (
+            "[limit(1; (1 as $x ?// $y | .)[(0+1):])]",
+            "[[20,30],[20,30]]\n",
+            "",
+            0,
+        ),
+        ("[label $o | (., break $o, 5)[(0+1)]]", "[20]\n", "", 0),
+        ("[first((., halt)[(0+1)])]", "[20]\n", "", 0),
+        // A target that raises after its first output: the output before it
+        // is still delivered, then the error ends the pair.
+        (r#"[(., error("x"))[(0+1)]]"#, "", "jq: error", 5),
+        (r#"(., error("x"))[(0+1):]"#, "[20,30]\n", "jq: error", 5),
+        (r#"(., error("x"))[(0+1)]"#, "20\n", "jq: error", 5),
+    ] {
+        // The document read, and the owned route (`-n`) that has its own twin.
+        for (args, input, prefix) in [
+            (vec!["-c"], Some("[10,20,30]"), ""),
+            (vec!["-nc"], None, "[10,20,30] | "),
+        ] {
+            let program = format!("{prefix}{filter}");
+            let mut full = args.clone();
+            full.push(&program);
+            let (out, err, code) = run_jq_full(&full, input)?;
+            assert_eq!(out, expected_out, "`{program}`");
+            if expected_code == 0 {
+                assert_eq!((err.as_str(), code), (expected_err, 0), "`{program}`");
+            } else {
+                assert_eq!(code, expected_code, "`{program}`");
+                assert!(err.starts_with(expected_err), "`{program}`: {err:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// #3471, owned route: the tables above again with the target built under `-n`
 /// (`eval.rs`'s evaluator, which has its own `each_slice_expr`), and once more
 /// with an `input` builtin inside the bound, which forces that evaluator for an
