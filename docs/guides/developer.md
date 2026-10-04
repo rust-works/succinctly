@@ -173,6 +173,28 @@ cargo llvm-cov --features cli,simd,regex,serde --workspace --summary-only --fail
 omni-dev coverage diff
 ```
 
+The two `jq_cli_tests` listed in `scripts/deep-recursion-tests.sh` are `#[ignore]`d under
+`cfg(coverage)` (an attribute on each; cargo-llvm-cov sets the cfg), so `cargo llvm-cov` and the CI
+`Coverage` job report them as ignored. They still run in the `deep-recursion` leg and under a plain
+`cargo test`. When measured (#3750) they covered no line the rest of the suite did not: 4,605 lines on
+their own, none outside the 145,475 the other tests cover. That is a point-in-time result, so repeat it
+before giving another test the same attribute, or if a PR touching the native-stack guard shows
+uncovered lines. Run both from one checkout (the lcov files hold absolute paths) and compare the two
+line sets. (`cargo llvm-cov` does not run doctests on stable, which CI's `cargo test` does; the 52 of them
+added no covered line when this was measured.)
+
+```bash
+F=cli,simd,regex,serde
+A=test_composed_recursion_across_two_defs_errors_not_aborts_1371
+B=test_recursion_refuses_before_the_native_stack_runs_out_3262
+cargo llvm-cov --features $F --workspace --lcov --output-path rest.info   # Coverage's tests, less its doctests
+cargo llvm-cov --features $F --test jq_cli_tests --lcov --output-path two.info \
+  -- --ignored --exact $A $B                                              # only the two
+
+covered() { awk '/^SF:/{f=$0} /^DA:/{split(substr($0,4),a,","); if (a[2]>0) print f":"a[1]}' "$1" | sort -u; }
+comm -13 <(covered rest.info) <(covered two.info)   # lines only the two cover; empty = nothing lost
+```
+
 #### `warning: N functions have mismatched data`
 
 `cargo llvm-cov report` prints this on every run (41 on a local macOS build, 56 on x86_64

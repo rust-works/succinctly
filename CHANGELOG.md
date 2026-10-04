@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jq answers `[]`. Jq mode only (ADR-0018: yq has no oracle for `last`). Pinned by `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both
   evaluators) and `yq_last_f_output_does_not_keep_its_identity_3766`; it replaces the characterization test #3653 left.
 
+- **jq: a `foreach` whose EXTRACT navigates and then ends on an untracked `null` no longer answers the root path** (#3769).
+  `(foreach (1,2) as $i (.; .; .a? | limit(1; last(.a?)))) = 9` on `null` is `{"a":9}` in jq and replaced the whole
+  document with `9` here (exit 0), and `path(...)` answered `[]` twice where jq answers `["a"]`. The same held for any
+  non-navigating tail after a navigation (`.a | first(null)`, `.a | (.b // null)`). The fold rebuilt the demoted branch from
+  the root, erasing the navigation that `resolve_terminal`'s `null` carve-out reads (#3579), so the terminal took the
+  register to be at the root. The branch now keeps its path and the fold refuses loudly, as the same pipe already does
+  outside a fold; jq answers these rows, so the refusal is a guess and no `try` turns it into a dropped write. A fold that
+  never navigated still answers `[]`. Pinned by `test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769`.
+
 - **jq: a `foreach` UPDATE or EXTRACT that is a `try` around a chain with a generator no longer silently skips a write** (#3738).
   `del(foreach .x as $w (0; try ($w | .a[]); .))` on `{"a":[{"b":1}],"x":{"a":[{"b":1}]}}` is `{"a":[{"b":1}],"x":{"a":[]}}`
   in jq and echoed the document unchanged here (exit 0), and `(...) = 9` and `|= 9` skipped the write the same way;
