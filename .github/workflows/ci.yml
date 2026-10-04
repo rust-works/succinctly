@@ -871,6 +871,11 @@ jobs:
         with:
           name: ${{ matrix.name }}
           use-prebuilt: ${{ matrix.use-prebuilt }}
+          # #3750 B1, stage 1: pooled profile files on pull requests only. A pull
+          # request run publishes no baseline, so an unexpected result here costs one
+          # red job and not phantom deltas on every later PR; coverage-baseline.yml
+          # stays on per-process files until this has been read.
+          pool-profile-files: 'true'
 
   # Drift detector for the yq golden fixtures (tests/data/yq-golden/): the
   # goldens are frozen oracle output, so this is the one job that re-checks
