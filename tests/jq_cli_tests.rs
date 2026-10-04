@@ -62701,7 +62701,8 @@ fn test_from_entries_and_an_empty_walk_raise_in_path_position_3360() -> Result<(
 fn test_reduce_foreach_source_that_always_raises_raises_in_path_position_3726() -> Result<()> {
     let iterate = "Invalid path expression near attempt to iterate through";
     let access = "Invalid path expression near attempt to access element 0";
-    let sources: [(&str, &str, &str); 13] = [
+    let access_x = r#"Invalid path expression near attempt to access element "x""#;
+    let sources: [(&str, &str, &str); 17] = [
         (r#"[{"key":"a","value":1}]"#, "from_entries", iterate),
         ("[1]", "unique", iterate),
         ("[1]", "unique_by(.)", iterate),
@@ -62715,6 +62716,13 @@ fn test_reduce_foreach_source_that_always_raises_raises_in_path_position_3726() 
         (r#""abc""#, r#"scan("b")"#, iterate),
         (r#""abc""#, r#"capture("(?<x>b)")"#, iterate),
         (r#""abc""#, r#"splits("b")"#, iterate),
+        // The rest of `live_path_refusal`'s table: a bare update assignment has no
+        // navigation step of its own either, and `fromstream` is jq-defined over a
+        // `foreach` accumulator keyed `x`.
+        ("1", "(. |= 2)", access),
+        ("1", "(. += 1)", access),
+        ("1", "(. //= 2)", access),
+        ("[1]", "fromstream([[0],1],[[0]])", access_x),
     ];
     for (input, source, message) in sources {
         for filter in [
@@ -62941,6 +62949,33 @@ fn test_reduce_foreach_source_that_always_raises_raises_in_path_position_3726() 
         ("[1]", r"foreach unique as $x (.; .; .)", "[1]\n", "", 0),
         ("[1]", r"[reduce unique as $x (.; .)]", "[[1]]\n", "", 0),
     ])
+}
+
+/// #3726: a fold source holding a refusing construct goes through the resolver,
+/// whose leaf collects a generator before delivering it, and `inputs` is the one
+/// source that must not be collected: it drains the shared reader. jq raises on
+/// the first document and reports it at line 1 of the three, which is what this
+/// pins (the position is jq 1.7.1's own, captured live); the plain
+/// `reduce inputs` source takes no such route and answers the root path.
+#[test]
+fn test_reduce_source_with_a_refusing_construct_does_not_drain_inputs_3726() -> Result<()> {
+    let docs = "[1]\n[2]\n[3]\n";
+    let (out, err, code) = run_jq_full(
+        &["-n", "-c", "path(reduce (inputs | unique) as $x (.; .))"],
+        Some(docs),
+    )?;
+    assert_eq!((out.as_str(), code), ("", 5), "stderr {err:?}");
+    assert!(
+        err.contains("(at <stdin>:1): Invalid path expression near attempt to iterate through"),
+        "stderr {err:?}"
+    );
+
+    let (out, err, code) = run_jq_full(
+        &["-n", "-c", "path(reduce inputs as $x (.; .))"],
+        Some(docs),
+    )?;
+    assert_eq!((out.as_str(), code), ("[]\n", 0), "stderr {err:?}");
+    Ok(())
 }
 
 /// #3456 (B2): the survival rule is decided per *stage*, not per leaf. A

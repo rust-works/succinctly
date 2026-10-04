@@ -50902,9 +50902,13 @@ fn test_yq_from_entries_and_an_empty_walk_do_not_raise_in_path_position_3360() -
 /// #3726: a `reduce` source that is `unique` (or any of the constructs jq
 /// refuses in path position) raises in `succinctly jq`, but the rule derives from
 /// how *jq* defines those builtins, so it is jq-mode only (ADR-0018) and
-/// `succinctly yq` keeps answering. A write through the fold still lands, and
-/// the gated `path(f)` (reachable only through `--jq-extensions`) answers the
-/// root path instead of raising.
+/// `succinctly yq` keeps answering. There is no yq oracle for either row: yq
+/// v4.53.3 rejects `reduce` and `foreach` in its lexer and `path(f)` as a bad
+/// expression, so both are succinctly extensions (`path(f)` gated behind
+/// `--jq-extensions`) and this pins today's
+/// behaviour, not a verified yq answer. A write through the fold still lands,
+/// and `path(f)` answers the root path instead of raising; if the extension is
+/// ever made to follow jq, this is the pin that says it changed.
 #[test]
 fn test_yq_reduce_source_that_jq_refuses_in_path_position_still_answers_3726() -> Result<()> {
     let (stdout, code) = run_yq_stdin(

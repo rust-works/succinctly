@@ -622,8 +622,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **jq: a `reduce`/`foreach` source that jq always refuses in path position now raises** (#3726).
   `from_entries`, `unique`, `unique_by`, `with_entries`, `map_values`, `sub`/`gsub`, `ascii_downcase`/
-  `ascii_upcase` and the `match` family iterate a container their own jq definition builds, so jq raises
-  `Invalid path expression near attempt to iterate through` wherever one runs in path position. They already
+  `ascii_upcase`, the `match` family, an update assignment (`|=`, `+=`, `//=`) and `fromstream` iterate a
+  container their own jq definition builds, so jq raises `Invalid path expression` (near attempt to iterate
+  through it, or to access an element of it, for `map_values`, the assignments and `fromstream`) wherever one
+  runs in path position. They already
   raised as a pipe stage, in a `[E]` collect, bare, and under `del`/`=`/`|=`, but a fold source with no
   navigation step of its own was driven by value and never reached the check, so `path(reduce unique as $x (.;
   .))` on `[1]` answered `[]`, `del(reduce unique as $x (.; .))` answered `null`, `(reduce unique as $x (.; .))

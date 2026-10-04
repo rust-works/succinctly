@@ -42264,22 +42264,25 @@ fn is_fold_source_navigation(e: &Expr) -> bool {
 /// (`Expr::Alternative`'s unfiltered escape prefix was the one such arm,
 /// fixed alongside).
 ///
-/// **Gated on `any_subexpr` finding an actual navigation step anywhere in
-/// `source`** -- a `Field`/`Index`/`Slice`/`Iterate`, a computed
+/// **Gated on `any_subexpr` finding, anywhere in `source`, a step that can
+/// reach one of the resolver's own raising arms.** Two kinds count. A
+/// navigation step: a `Field`/`Index`/`Slice`/`Iterate`, a computed
 /// `IndexExpr`/`SliceExpr`/`ArrayKey`, or (#2159) the `..`/`recurse`/`walk`/
-/// `getpath` spellings that move jq's register without writing an `INDEX`, or
-/// (#3726, jq mode) a construct [`live_path_refusal`] classifies -- `unique`,
-/// `from_entries`, `with_entries`, `map_values`, `sub`/`gsub`,
-/// `ascii_downcase`, the `match` family -- whose jq-defined body iterates a
-/// container it built, so it raises once it runs wherever it appears.
-/// Only such a step can ever reach one of the resolver's own raising arms, so
-/// a source with none (`range(n)`, `keys`, a literal, and critically
-/// `input`/`inputs`) is driven by value through [`eval_each_owned`] and
-/// never resolved here at all. `input`/`inputs` is why the gate is not just
-/// an optimisation: the resolver's leaf collects a generator before
-/// delivering it, which would drain the shared input reader
-/// (`reduce input as $x (0; $x)` over `10\n20\n30\n` names `10` in jq),
-/// where the value-mode `each_inputs` pulls one document per demand.
+/// `getpath` spellings that move jq's register without writing an `INDEX`.
+/// And (#3726, jq mode only) a construct [`live_path_refusal`] classifies --
+/// `unique`, `from_entries`, `with_entries`, `map_values`, `sub`/`gsub`,
+/// `ascii_downcase`, the `match` family, an update assignment, `fromstream` --
+/// which spells no `INDEX` but whose jq-defined body iterates a container it
+/// built, so it raises once it runs, wherever it appears. A source with
+/// neither (`range(n)`, `keys`, a literal, and critically `input`/`inputs`)
+/// is driven by value through [`eval_each_owned`] and never resolved here at
+/// all. `input`/`inputs` is why the gate is not just an optimisation: the
+/// resolver's leaf collects a generator before delivering it, which would
+/// drain the shared input reader (`reduce input as $x (0; $x)` over
+/// `10\n20\n30\n` names `10` in jq), where the value-mode `each_inputs` pulls
+/// one document per demand. A source holding both `inputs` and a refusing
+/// construct is resolved anyway and reports jq's own position, the first
+/// document (`test_reduce_source_with_a_refusing_construct_does_not_drain_inputs_3726`).
 ///
 /// [`Keep::AtMost`] is the dial that keeps a multi-output leaf whole:
 /// `Keep::First` would narrow `range(3)` to its first value, which is not
