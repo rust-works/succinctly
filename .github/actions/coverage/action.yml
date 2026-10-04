@@ -46,7 +46,15 @@ runs:
     # so it now reclaims only when less than `reclaim-below-gib` (75: that growth
     # plus ~20 GiB of margin) is free. The two `df` lines stay either way, so a
     # log still says how much room the run started with, and the sampler below
-    # still reports how close it came.
+    # still reports how close it came (and warns when it came within 25 GiB).
+    #
+    # That sizing covers the head run only. A pull request whose merge-base and
+    # first-parent ancestors have no published baseline makes the action build
+    # a second instrumented tree in a worktree on the same disk, a path no
+    # sampled run has taken, so its peak is not known. If one ever dies with
+    # `No space left on device`, raise `reclaim-below-gib` above the image's
+    # free space (100 reclaims every run, as before) and read the run's
+    # profile-file figures from profraw-stats.sh to size it properly.
     - name: Reclaim disk space (x86_64, only when tight)
       if: inputs.name == 'x86_64'
       shell: bash
@@ -54,9 +62,11 @@ runs:
         RECLAIM_BELOW_GIB: ${{ inputs.reclaim-below-gib }}
       run: |
         df -h /
+        # At most six digits: a longer number overflows the shell's 64-bit
+        # arithmetic below and wraps negative, which would silently skip.
         case "$RECLAIM_BELOW_GIB" in
-          '' | *[!0-9]*)
-            echo "::error::reclaim-below-gib must be a whole number of GiB, got '$RECLAIM_BELOW_GIB'"
+          '' | *[!0-9]* | [0-9][0-9][0-9][0-9][0-9][0-9][0-9]*)
+            echo "::error::reclaim-below-gib must be a whole number of GiB with at most six digits, got '$RECLAIM_BELOW_GIB'"
             exit 1
             ;;
         esac
@@ -143,5 +153,13 @@ runs:
       run: |
         df -h /
         if [ -s "$RUNNER_TEMP/df-avail-kb" ]; then
-          echo "lowest free space sampled: $(sort -n "$RUNNER_TEMP/df-avail-kb" | head -1 | awk '{printf "%.1f GiB", $1/1048576}')"
+          lowest_kb=$(sort -n "$RUNNER_TEMP/df-avail-kb" | head -1 | tr -d ' ')
+          echo "lowest free space sampled: $(awk -v k="$lowest_kb" 'BEGIN {printf "%.1f GiB", k/1048576}')"
+          # #3750: the reclaim above is skipped on most runs now, and the run's
+          # disk use grows with the number of spawned test processes, so the
+          # margin can erode without any run failing. Surface it on the checks
+          # page while a run still survives, not only after #3585 comes back.
+          if [ "$lowest_kb" -lt "$((25 * 1048576))" ] 2>/dev/null; then
+            echo "::warning::lowest free disk space was under 25 GiB; raise reclaim-below-gib in .github/actions/coverage/action.yml before this run's disk use causes ENOSPC (#3750)"
+          fi
         fi
