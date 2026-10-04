@@ -51444,18 +51444,23 @@ fn yq_last_f_does_not_leave_the_path_register_in_place_3643() -> Result<()> {
 }
 
 /// #3653 keeps jq's path register through `last(f)`'s wrappers (`?`, `try`,
-/// `first(...)`) and across a `select(f)` or type-filter stage in jq mode only
-/// (ADR-0018: yq has no oracle for it). With the jq-only surface enabled, yq
-/// mode still refuses every one of them exactly as before.
+/// `first(...)`) and across a type-filter stage in jq mode only (ADR-0018). Real
+/// yq's lexer rejects `last(f)` and the type filters outright (v4.53.3), so there
+/// is no oracle for them, and the mode does not borrow jq's answer: with the
+/// jq-only surface enabled, yq mode still refuses every one of them exactly as
+/// before. `select` is deliberately not pinned here: real yq answers it (a
+/// `del(. as $x | 1 | select(.) | $x.k)` leaves the document unchanged, exit 0)
+/// where succinctly's yq mode refuses, which is an older divergence this change
+/// leaves alone.
 #[test]
-fn yq_last_f_wrappers_and_select_do_not_keep_the_path_register_3653() -> Result<()> {
+fn yq_last_f_wrappers_and_type_filters_do_not_keep_the_path_register_3653() -> Result<()> {
     let yaml = "a:\n  b: 1\nk: 2\n";
     for filter in [
         "del(. as $x | last(.a)? | $x.k)",
         "del(. as $x | try last(.a) | $x.k)",
         "del(. as $x | first(last(.a)) | $x.k)",
-        "del(. as $x | 1 | select(.) | $x.k)",
         "del(. as $x | 1 | numbers | $x.k)",
+        "del(. as $x | 1 | (numbers)? | $x.k)",
     ] {
         let (stdout, stderr, code) =
             run_yq_stdin_with_stderr(filter, yaml, &["-o=json", "-I=0", "--jq-extensions"])?;

@@ -62635,7 +62635,9 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
 /// register back where it entered; `select(f)` is `if f then . else empty end`
 /// and an `if` condition is a subexp, so `f` navigates nothing as far as the
 /// register is concerned, and every type filter is a `select` over a type test.
-/// Every row captured from jq 1.7.1 with `-c` on `{"a":{"b":1},"k":2}`.
+/// Every row captured from jq 1.7.1 with `-c` on `{"a":{"b":1},"k":2}`; the
+/// rows under "Still refused where jq answers" pin this resolver's refusal where
+/// jq answers `[]` (exit 0), so they are the one group that is not jq's output.
 ///
 /// The `select` rows enter the stage on an *untracked* value (a literal ran
 /// first), the only entry where the register is carried by the pipe and a stage
@@ -62816,6 +62818,64 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
             "",
             0,
         ),
+        // The wrappers read through for `select` and the type filters too: `?`,
+        // `try` with no handler and `first(...)`.
+        (doc, r"path(. as $x | 5 | select(.)? | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | (select(.))? | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | 5 | try select(.) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | first(select(.)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | first(select(.))? | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(. as $x | 5 | (numbers)? | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | try numbers | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | 5 | first(numbers) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A `select` hands its input through as the very value it received, so a
+        // `$x` that reaches it is still the register afterwards and the
+        // navigation below it is a path, not a refusal a `try` could catch.
+        (
+            doc,
+            r"del(. as $x | try (5 | select(.) | $x | .k))",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | try (5 | $x | select(.) | .k)) = 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | 5 | select(.)? | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
         // The write goes through for every wrapper and for `select`.
         (
             doc,
@@ -62897,6 +62957,20 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
             r#"near attempt to access element "k""#,
             5,
         ),
+        (
+            doc,
+            r"path(. as $x | .a | select(.)? | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | .a | first(select(.)) | $x)",
+            "",
+            with_root,
+            5,
+        ),
         // A wrapper around a `f` that navigates still moves the register: only
         // a `last` leaves it where it entered.
         (doc, r"path(. as $x | first(.a)? | $x)", "", with_root, 5),
@@ -62934,6 +63008,24 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
             with_root,
             5,
         ),
+        // The same holds for `select`: a handler, a `limit` and an `[E]` collect
+        // of a type filter (the array allowlist names `select` but not the nine
+        // type filters) are still refused where jq answers `[]`.
+        (
+            doc,
+            r"path(. as $x | 5 | try select(.) catch . | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | limit(1; select(.)) | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (doc, r"path(. as $x | 5 | [numbers] | $x)", "", with_root, 5),
     ])
 }
 

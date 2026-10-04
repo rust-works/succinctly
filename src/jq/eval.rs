@@ -37221,17 +37221,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 }
             })
         }
-        Expr::Builtin(
-            builtin @ (Builtin::Values
-            | Builtin::Nulls
-            | Builtin::Booleans
-            | Builtin::Numbers
-            | Builtin::Strings
-            | Builtin::Arrays
-            | Builtin::Objects
-            | Builtin::Iterables
-            | Builtin::Scalars),
-        ) => {
+        Expr::Builtin(builtin) if is_type_filter(builtin) => {
             if type_filter_matches(builtin, value) {
                 emit_passthrough(value, trackable, snapshot, sink)
             } else {
@@ -40244,37 +40234,14 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// jq mode only, like every admission here (ADR-0018): yq has no oracle for it.
 ///
 /// #3653: the stage may wrap the `last(f)` in a construct that adds no
-/// movement of its own -- `last(f)?`, `try last(f)` and `first(last(f))` --
-/// see [`register_keeping_last`].
+/// movement of its own (`last(f)?`, `try last(f)`, `first(last(f))`), see
+/// [`peel_register_transparent`].
 fn last_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
-    last_register_unmoved::<S>() && register_keeping_last(expr)
-}
-
-/// `expr` is a `last(f)`, or wraps one in a construct that passes the
-/// register through unchanged (#3653), each captured from jq 1.7.1 with
-/// `path(. as $x | W | $x)` on `{"a":{"b":1},"k":2}`, all `[]`:
-///
-/// - `E?` and `try E` (no `catch`): jq's `try` is a `FORK_OPT` that touches
-///   neither the path nor `value_at_path`; only the body can move them, so the
-///   register is where `E` left it (`last(.a)?`, `(last(.a))?`, `try
-///   last(.a)`). A handler is not admitted: it runs on a caught error's
-///   payload, a register of its own.
-/// - `first(E)` is `label $out | (E | ., break $out)`: it emits `E`'s output
-///   from inside `E`, with the register wherever `E` left it, and `last(f)`
-///   left it where it entered (`first(last(.a))`). With any other `E` that
-///   output moved the register (`first(.a)`), so `E` must itself be admitted.
-fn register_keeping_last(expr: &Expr) -> bool {
-    match unwrap_paren(expr) {
-        Expr::LastExpr(_) | Expr::Builtin(Builtin::LastStream(_)) => true,
-        Expr::Optional(inner)
-        | Expr::Try {
-            expr: inner,
-            catch: None,
-        }
-        | Expr::FirstExpr(inner)
-        | Expr::Builtin(Builtin::FirstStream(inner)) => register_keeping_last(inner),
-        _ => false,
-    }
+    last_register_unmoved::<S>()
+        && matches!(
+            peel_register_transparent(expr),
+            Expr::LastExpr(_) | Expr::Builtin(Builtin::LastStream(_))
+        )
 }
 
 /// Whether a pipe stage `expr` is `select(f)` or a type filter, which in jq
@@ -40283,12 +40250,13 @@ fn register_keeping_last(expr: &Expr) -> bool {
 /// `if`'s condition is compiled between `SUBEXP_BEGIN` and `SUBEXP_END`, so `f`
 /// neither moves the register nor path-checks anything; the `.` it emits is the
 /// stage's own input. Every type filter is a `select` over a type test
-/// (`def numbers: select(type == "number");`, `values`, `nulls`, `booleans`,
-/// `strings`, `arrays`, `objects`, `iterables`, `scalars`), so they qualify on
-/// the same evidence. Captured against jq 1.7.1, `path(. as $x | S | $x)` on
-/// `{"a":{"b":1},"k":2}`: `5 | select(.)` is `[]`, `{k:1} | select(.)` is `[]`,
-/// `5 | select((true,true))` is `[]` twice, and `{a:{b:1}} | select(.a.b)` is
-/// `[]` -- a condition that navigates leaves it where it was.
+/// (`numbers` is `select(type == "number")`, `values` is `select(. != null)`;
+/// see [`is_type_filter`]), so they qualify on the same evidence, all read off
+/// `/usr/bin/jq --debug-dump-disasm`. Captured against jq 1.7.1, `path(. as $x
+/// | S | $x)` on `{"a":{"b":1},"k":2}`: `5 | select(.)` is `[]`, `{"k":1} |
+/// select(.)` is `[]`, `5 | select((true,true))` is `[]` twice, and `{a:{b:1}} |
+/// select(.a.b)` is `[]` -- a condition that navigates leaves it where it was.
+/// The wrappers [`peel_register_transparent`] reads through apply here too.
 ///
 /// A stage-level fact like [`last_leaves_register_in_place`], read by
 /// [`resolve_seq_stage`] beside [`cannot_move_register`] and not folded into
@@ -40297,24 +40265,45 @@ fn register_keeping_last(expr: &Expr) -> bool {
 /// it. The resolver's own `select` arm passes a trackable branch straight
 /// through, so a stage entered on the register never needed the register
 /// restated; it is the register *carried* by an untracked entry that a stage
-/// outside this list drops. jq mode only (ADR-0018): yq has no oracle for it.
+/// outside this list drops. Unlike `last(f)`, a `select` hands its input
+/// through as the very value it received (the resolver forwards the branch's
+/// own snapshot mark), so a `$x` that reaches it keeps its identity.
+/// jq mode only (ADR-0018): yq has no oracle for it.
 fn select_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
     S::TAG == EvalTag::Jq
         && matches!(
-            unwrap_paren(expr),
-            Expr::Builtin(
-                Builtin::Select(_)
-                    | Builtin::Values
-                    | Builtin::Nulls
-                    | Builtin::Booleans
-                    | Builtin::Numbers
-                    | Builtin::Strings
-                    | Builtin::Arrays
-                    | Builtin::Objects
-                    | Builtin::Iterables
-                    | Builtin::Scalars
-            )
+            peel_register_transparent(expr),
+            Expr::Builtin(builtin) if matches!(builtin, Builtin::Select(_)) || is_type_filter(builtin)
         )
+}
+
+/// `expr` with the wrappers that pass jq's path register through unchanged
+/// peeled off (#3653), so [`last_leaves_register_in_place`] and
+/// [`select_leaves_register_in_place`] judge the construct underneath. Each was
+/// captured from jq 1.7.1 with `path(. as $x | 5 | W | $x)` on
+/// `{"a":{"b":1},"k":2}`, all `[]`, for `W` over both `last(.a)` and
+/// `select(.)`/`numbers`:
+///
+/// - `E?` and `try E` with no `catch` touch neither the path nor
+///   `value_at_path`; only the body can move them, so the register is where `E`
+///   left it (`last(.a)?`, `(select(.))?`, `try numbers`). A handler is not
+///   peeled: it runs on a caught error's payload, a register of its own.
+/// - `first(E)` emits `E`'s output from inside `E`, so the register is wherever
+///   `E` left it: back where it entered for `last(f)` and `select(f)` (`first(
+///   last(.a))`, `first(select(.))`), but moved for any other `E` (`first(.a)`).
+///   The caller then asks whether what is underneath is one of the two, which is
+///   what keeps `first(.a)` refused.
+fn peel_register_transparent(expr: &Expr) -> &Expr {
+    match unwrap_paren(expr) {
+        Expr::Optional(inner)
+        | Expr::Try {
+            expr: inner,
+            catch: None,
+        }
+        | Expr::FirstExpr(inner)
+        | Expr::Builtin(Builtin::FirstStream(inner)) => peel_register_transparent(inner),
+        other => other,
+    }
 }
 
 /// The one place the mode half of `last(f)`'s register promotion is stated
@@ -47671,6 +47660,27 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
 
         queue_recurse_children(stack, next, deferred_error, pending_error);
     }
+}
+
+/// Whether `builtin` is one of the nine type filters (`values`, `nulls`,
+/// `booleans`, `numbers`, `strings`, `arrays`, `objects`, `iterables`,
+/// `scalars`): the one list the resolver's pass-through arm and
+/// [`select_leaves_register_in_place`] both read, so they cannot drift (#3653).
+/// [`type_filter_matches`] decides what each keeps; a test pins that it answers
+/// for exactly these.
+fn is_type_filter(builtin: &Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Values
+            | Builtin::Nulls
+            | Builtin::Booleans
+            | Builtin::Numbers
+            | Builtin::Strings
+            | Builtin::Arrays
+            | Builtin::Objects
+            | Builtin::Iterables
+            | Builtin::Scalars
+    )
 }
 
 /// Does `builtin` (one of `values`/`nulls`/`booleans`/.../`scalars`) keep
@@ -82346,6 +82356,126 @@ mod tests {
             assert!(is_owned_pure_expr(&expr), "{expr:?}");
             assert!(!produces_fresh_value(&expr), "{expr:?}");
             assert!(!is_owned_pure_composite(&expr), "{expr:?}");
+        }
+    }
+
+    /// #3653: the nine type filters are one list ([`is_type_filter`]) that the
+    /// resolver's pass-through arm and the stage predicate both read, and
+    /// [`type_filter_matches`] answers for exactly those: each keeps some
+    /// sample (so it is not the matcher's catch-all `false`) and nothing else
+    /// does. A tenth filter added to one place and not the others fails here
+    /// instead of drifting. The wrappers a stage may sit under are pinned too:
+    /// `?`, `try` with no handler and `first(...)` are read through, a handler
+    /// and a navigating `first(.a)` are not, and neither predicate holds in yq
+    /// mode (ADR-0018).
+    #[test]
+    fn type_filters_are_one_list_the_matcher_and_the_stage_predicate_share_3653() {
+        let samples: Vec<OwnedValue> = ["null", "true", "1", "1.5", "\"s\"", "[1]", "{\"a\":1}"]
+            .iter()
+            .map(|json| {
+                let mut pos = 0;
+                parse_json_value(json.as_bytes(), &mut pos).expect("sample parses")
+            })
+            .collect();
+        let filters = [
+            Builtin::Values,
+            Builtin::Nulls,
+            Builtin::Booleans,
+            Builtin::Numbers,
+            Builtin::Strings,
+            Builtin::Arrays,
+            Builtin::Objects,
+            Builtin::Iterables,
+            Builtin::Scalars,
+        ];
+        for filter in &filters {
+            assert!(is_type_filter(filter), "{filter:?}");
+            assert!(
+                samples.iter().any(|v| type_filter_matches(filter, v)),
+                "{filter:?} keeps no sample: it fell to the matcher's catch-all"
+            );
+            let stage = Expr::Builtin(filter.clone());
+            assert!(select_leaves_register_in_place::<JqSemantics>(&stage));
+            assert!(!select_leaves_register_in_place::<YqSemantics>(&stage));
+        }
+        for other in [
+            Builtin::Length,
+            Builtin::Type,
+            Builtin::Keys,
+            Builtin::ToString,
+        ] {
+            assert!(!is_type_filter(&other), "{other:?}");
+            assert!(
+                !samples.iter().any(|v| type_filter_matches(&other, v)),
+                "{other:?}"
+            );
+            assert!(!select_leaves_register_in_place::<JqSemantics>(
+                &Expr::Builtin(other)
+            ));
+        }
+
+        let stage = |filter: &str| parse(filter).expect("filter parses");
+        for admitted in [
+            "select(.)",
+            "select(.)?",
+            "(select(.))?",
+            "try numbers",
+            "first(select(.))",
+            "first(numbers)?",
+        ] {
+            let expr = stage(admitted);
+            assert!(
+                select_leaves_register_in_place::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !select_leaves_register_in_place::<YqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !last_leaves_register_in_place::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+        }
+        for admitted in [
+            "last(.a)",
+            "last(.a)?",
+            "(last(.a))?",
+            "try last(.a)",
+            "first(last(.a))",
+        ] {
+            let expr = stage(admitted);
+            assert!(
+                last_leaves_register_in_place::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !last_leaves_register_in_place::<YqSemantics>(&expr),
+                "{admitted}"
+            );
+            assert!(
+                !select_leaves_register_in_place::<JqSemantics>(&expr),
+                "{admitted}"
+            );
+        }
+        for refused in [
+            "try select(.) catch .",
+            "try last(.a) catch .",
+            "first(.a)",
+            "first(.a)?",
+            "limit(1; last(.a))",
+            "nth(0; select(.))",
+            "(last(.a), select(.))",
+        ] {
+            let expr = stage(refused);
+            assert!(
+                !select_leaves_register_in_place::<JqSemantics>(&expr),
+                "{refused}"
+            );
+            assert!(
+                !last_leaves_register_in_place::<JqSemantics>(&expr),
+                "{refused}"
+            );
         }
     }
 
