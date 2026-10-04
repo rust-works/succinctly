@@ -648,6 +648,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: bare `any`/`all`, `any(f)`/`all(f)` and `isempty(g)` state jq's path register** (#3763, a #3749 follow-up).
+  jq defines `any` as `any(.[]; .)`, `any(f)` as `any(.[]; f)` (`all` alike) and `isempty(g)` as `first((g | false), true)`,
+  so in `path()` each emits its boolean from inside the generator once an element decides and `path()` accepts a result
+  identical to the register: `path(any)` on `[true,false]` is `[0]`, `path(all)` is `[1]`, `path(isempty(.[]?))` on `[false]` is
+  `[0]`, and `del`, `=` and `|=` write there. These spellings answered an untracked boolean at the root and exited 5, while
+  `path(any(.[]; .))` already answered `[0]` since #3749. jq mode now resolves the first four through the same helper
+  (`resolve_any_all_gen_cond_sink`) with `.[]` as the generator, so an untracked input still raises
+  `near attempt to iterate through` from that `.[]`; `isempty(g)` emits at the register its first branch left (the entry
+  register when `g` emitted nothing, #3456). yq mode is unchanged (`all only supports arrays, was !!int`, pinned). Two
+  rows that recorded the old loud refusal now answer jq's: `del(try (any and .a))` on `{"a":true}` and
+  `del(. as $x | isempty(.l[]) | try ($x | .a))` both leave the document. A `cond` outside `cannot_move_register`'s allowlist
+  (#3757) and a plain pipe stage that does not read the verdict (#3758) still refuse, and `any(.a)` is the first of them. Swept
+  over seven bare and one-argument operands of `scripts/jq-path-register-sweep.py` (four of them new; 57,987 programs at the
+  grid's 23 contexts then, pre-change binary as base: 0 `ACCEPT_WRONG`, 0 regressions, `REFUSE_WRONG` 1,942 to 583). Pinned by `test_isempty_and_bare_any_all_state_the_register_3763`
+  and `test_bare_any_all_and_isempty_keep_their_refusals_3763`; each arm and the jq-mode gate fail a test when removed.
+  **It also closes a hole #3749 left.** The claim that an `any`/`all` that decided nothing left jq's register at its entry is
+  only sound when `cond` cannot raise a path error, and jq path-checks `cond` where this resolver runs it by value: on `main`,
+  `del(. as $x | (any(1; .[]?) or 1) | $x)` on `{"a":1}` and `del(. as $x | (all(unique_by(.)) or .a) | $x)` on `[[1],[1]]`
+  deleted the whole document (and `= 9` replaced it) where jq exits 5, and the first push of this fix did the same for
+  `isempty` over such an `any`. The decided statement now needs `cannot_move_register(cond)`; the undecided one needs `cond`
+  not to have raised, which holds when it never ran (`gen` was empty), when it is inert, or when it is plain navigation that
+  only ran on the register (`any(.a)` over `[{"key":"a","value":1}]` navigates to `null` and backtracks, while the same
+  step on a computed element, `any(1; .a)`, raises in jq and stays refused). The by-value per-result verdict
+  (`register_stays_on_result`, `LeafRegister`), which made the same claim for the one-argument forms and never fires in jq
+  mode now that every spelling has an arm, is removed. Pinned by
+  `test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763` and
+  `test_any_all_undecided_register_survives_a_cond_that_never_raised_3763`; each clause fails a test when removed, and the
+  sweep gained five operands that generate the shape. **Still open (#3757, now Medium):** `cond` runs by value, so jq's path
+  error on a *computed* element is invisible, and `any(1; .[]?)` or `all(tostring; .a?)` under `or`, `//`, a `$x` rebind or a
+  `try` can still be accepted and written where jq exits 5 or, under `try`, leaves the document (`(try (all(tostring; .a?)))
+  |= 5` on `true` is `5` here and `true` in jq). A sixteen-operand sweep against a build of `main` without this change
+  (155,547 programs at the grid's 27 contexts; reproduce with `--operand` for the sixteen any/all/isempty operands) has
+  `ACCEPT_WRONG` 2,342 to 1,603, all on the five computed-generator operands: 739 closed, none new, none writing a different
+  document than before; `REFUSE_WRONG` 4,188 to 3,009, `MATCH` 148,985 to 150,929, and 156 safe-direction regressions, all on
+  those five operands, which `main` matched only because it was unsound.
+  The undecided statement is also refused, in the safe direction, for a `cond` outside its three clauses (`try .b`, `first?`,
+  `limit(1; .[]?)`), which `main` answered like jq.
+
 - **jq: a `reduce` that computes its accumulator leaves jq's path register where it entered** (#3710).
   `path(. as $x | reduce (1) as $i (.; .a = $i) | $x.k)` on `{"k":1,"a":1}` is `["k"]` in jq (and so are `del`
   and `=` through it): nothing in the fold navigates, so the register never moved, however the accumulator
@@ -666,12 +704,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result is now emitted with `register_after`/`computed_at_register`, the rule the `and`/`or` arms use, so `[1,2]`
   (`1` is not `true`) and `[null]` (`null` is not `false`) still refuse; a generator that never decided backtracked
   every branch and states its register as unmoved, which `and`/`or` read (`path(any(.[]; .) or .a)` on `{"a":false}`
-  is `["a"]`). jq mode only. Three shapes still refuse where jq answers, each tracked: a `cond` outside
+  is `["a"]`). jq mode only. Three shapes were left refusing where jq answers, each tracked: a `cond` outside
   `cannot_move_register`'s allowlist, whether it navigates (`path(any(.[]; .a))` on `[{"a":true}]` is `[0,"a"]`, as
   `or`'s left operand moves jq's register) or not (`select(.)`, `first(.)`, `..` are `[0]`) (#3757); a plain pipe stage,
   which does not read the backtracked-register verdict of `any`/`all`/`isempty` (`path(. as $x | any | $x)`, #3758); and
-  the bare `any`/`all`, `any(f)`/`all(f)` and `isempty(g)` spellings, which have no such arm (`path(any)` on
-  `[true,false]` is `[0]`, #3763). 28 of 42 oracle rows differed from jq before the change on both the stdin and `-n`
+  the bare `any`/`all`, `any(f)`/`all(f)` and `isempty(g)` spellings, which had no such arm (`path(any)` on
+  `[true,false]` is `[0]`; fixed by #3763, above). 28 of 42 oracle rows differed from jq before the change on both the stdin and `-n`
   routes, none after. The shared exhausted-register rule is `drained_register_after`; its `trackable` condition is
   pinned (without it `path(false | (any(empty; .) and 1))` answers `[]` and `del` of it writes `null`, where jq
   refuses). Pinned by `test_any_all_gen_cond_decisive_result_sits_at_the_register_3749`,

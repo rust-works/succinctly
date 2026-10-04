@@ -56,8 +56,8 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 1,342,000 rows (`--list-axes` prints the exact count:
-143 operands, each also swept as a bare pipe stage since #3361, across 27 contexts),
+**Size.** The full grid is about 1,430,000 rows (`--list-axes` prints the exact count:
+152 operands, each also swept as a bare pipe stage since #3361, across 27 contexts),
 which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
@@ -148,6 +148,34 @@ OPERANDS = [
     "all(.[]?; .)",
     "any(.[]?; .a)",
     "all(.[]?; .a)",
+    # (#3763) the bare and one-argument spellings jq defines over `.[]`, and
+    # `isempty(g)` (already above), now take the same arm: a `cond` that cannot
+    # move the register (`. == true`, the verdict is stated) and one that can
+    # (`.a`, a loss), for each of any and all. `any` and `all` are above.
+    "any(. == true)",
+    "all(. == true)",
+    "any(.a)",
+    "all(.a)",
+    # (#3763 review) an any/all that decides nothing claims jq's register stayed
+    # at its entry, which is only sound when `cond` cannot raise a path error: jq
+    # path-checks `cond`, this resolver runs it by value. These put a `cond` that
+    # raises in jq (`.[]?` and `.a?` on a computed `1`, `unique_by(.)`) under a
+    # generator that decides nothing, bare and wrapped in `isempty`, which is
+    # what let a later `$x` re-establish the root and a `del` delete it.
+    # Known residual (#3757): `cond` runs by value, so jq's path error on a
+    # *computed* element is invisible and `any(1; .[]?) or true`, `.. // .a`
+    # and friends still write where jq exits 5. On these five operands alone
+    # that is 1,603 ACCEPT_WRONG rows in a 155,547-program run over the sixteen
+    # any/all/isempty operands (`--operand` for each) at the grid's 27 contexts,
+    # against a build of `main` without #3763, down from 2,342: 739 closed, none
+    # new, none writes a different document. They are not regressions of a later
+    # change, and the older operands have none. The counts move with the grid:
+    # 1,087 and 1,826 at its 23 contexts, before #3653 added four.
+    "any(1; .[]?)",
+    "any(true; .[0]?)",
+    "all(unique_by(.))",
+    "isempty(any(1; .[]?))",
+    "isempty(all(1; .a?))",
     # wrappers and control flow around the above
     "try .a",
     "(.a // .b)",

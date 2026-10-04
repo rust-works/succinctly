@@ -1079,8 +1079,8 @@ is the revert that established what the other one costs.
    ([#3456](https://github.com/rust-works/succinctly/issues/3456); the contract is in
    `docs/plan/jq-path-register-producer-contract.md`): the branch's own position when the
    operand navigated natively, the register it entered with when it provably left it alone
-   (`cannot_move_register`; for `any`/`all`/`isempty(g)` the result says whether they moved it;
-   for `add` and `map(f)`, `leaves_register_in_place`), and a *loss* otherwise. `R` then runs
+   (`cannot_move_register`; for `add` and `map(f)`, `leaves_register_in_place`; `any`, `all` and
+   `isempty(g)` state the register their own arms left, #3749 and #3763), and a *loss* otherwise. `R` then runs
    from a lost seed, so a navigation in it refuses -- loudly, because the refusal is the
    resolver's guess about where jq's register went (#3267), and a `try` or `?` around the
    `and` must not swallow a guess. Residuals:
@@ -1106,14 +1106,17 @@ is the revert that established what the other one costs.
      `del(foreach .[]? as $k (.; flatten(1) and (.a)?; .b?))` on `[true]` where jq raises
      (#3712).
    - **A refusal jq makes and catches is loud here.** jq catches its own path error inside a
-     `try`: `del(try (any and .a))` on `{"a":true}` leaves the document. Where an operand may have
-     moved the register this resolver cannot tell which error jq would raise, so its refusal is a
-     guess, uncatchable by design (#3267), and the row exits 5. The same holds for a right operand
+     `try`. Where an operand may have moved the register this resolver cannot tell which error jq
+     would raise, so its refusal is a guess, uncatchable by design (#3267), and the row exits 5.
+     `any`, `all` and `isempty(g)` were the examples (`del(try (any and .a))` on `{"a":true}`
+     leaves the document in jq); since #3749 and #3763 a deciding or emitting generator states the
+     register it left, so the refusal of `.a` is exact and a `try` catches it as jq's does, and
+     the row now leaves the document here too. The same holds for a right operand
      wrapped in `?`: a bare `.a?` is jq's `INDEX_OPT`, which suppresses a type error but not a
      path error, so on the node the register may still be on its refusal is a guess even when the
-     step could never succeed (`del(try (any and .a?))` on `{"a":true}` is the document in jq),
-     and a `(.a)?`/`(.a | .b)?` first step is no longer pruned silently there. Refuse-only, and
-     pinned (`test_and_or_path_by_value_operands_track_the_register_3428`). The same holds for
+     step could never succeed, and a `(.a)?`/`(.a | .b)?` first step is no longer pruned silently
+     there. Refuse-only, and pinned
+     (`test_and_or_path_by_value_operands_track_the_register_3428`). The same holds for
      the refusal of an untracked iteration: `path(. as $x | ["a"] | try join(",") catch . | $x)`
      is `[]` in jq and exits 5 here, for `add`, `flatten` and `flatten(n)`/`join(s)` alike (the
      refusal is a guess where the register may have been lost, #3267). The ordering inside
@@ -1149,13 +1152,42 @@ is the revert that established what the other one costs.
      identical -- #3494), so `path(.a as $v \| . as $w \| $v \| (($w \| .a)
      and .b))` refuses where jq answers.
    - **`any(gen; cond)`/`all(gen; cond)` state the register since
-     [#3749](https://github.com/rust-works/succinctly/issues/3749)**, in jq mode only. A deciding
+     [#3749](https://github.com/rust-works/succinctly/issues/3749), and so do bare `any`/`all`,
+     `any(f)`/`all(f)` and `isempty(g)` since
+     [#3763](https://github.com/rust-works/succinctly/issues/3763)**, in jq mode only. jq defines
+     the bare and one-argument spellings as `any(.[]; .)` and `any(.[]; f)` (`all` alike) and
+     `isempty(g)` as `first((g | false), true)`, so they take the same rules: `path(any)` on
+     `[true,false]` is `[0]`, `path(isempty(.[]?))` on `[false]` is `[0]`, and `del`/`=`/`|=` write
+     there; an untracked input still raises `near attempt to iterate through` from the `.[]`.
+     In yq mode `any`/`all` are real yq builtins and keep yq's own scalar error (`all only
+     supports arrays, was !!int`). A deciding
      element is emitted from inside `gen`, so the result is a fresh boolean *at* the register `gen`
      left, and `PATH_END` accepts it when it is `jv_identical` to it: `path(any(.[]; .))` on
      `[true,false]` is `[0]`, `path(all(.[]; .))` is `[1]`, `del(any(.[]; .))` is `[false]`, and
      `[1,2]`/`[null]` still refuse (a truthy `1` is not `true`, `null` is not `false`). A generator
      that never decided backtracked every branch, so the register is where the construct entered
-     (`path(any(.[]; .) or .a)` on `{"a":false}` is `["a"]`). Two shapes are still refused where jq
+     (`path(any(.[]; .) or .a)` on `{"a":false}` is `["a"]`) -- but only for a `cond` that cannot
+     raise a path error. jq path-checks `cond` (it is `or`'s left operand, not a subexp) and this
+     resolver runs it by value, so an `any(1; .[]?)` that jq raises on (`near attempt to iterate
+     through 1`) would read as a clean backtrack, and a later `$x` would re-establish the root: the
+     first push of #3763 deleted the whole document for
+     `del(. as $x | (isempty(any(1; .[]?)) and 1) | $x)` on `{"a":1}`, and so did `main` for
+     `del(. as $x | (any(1; .[]?) or 1) | $x)` since #3749. The decided claim therefore needs
+     `cannot_move_register(cond)`, and the undecided one needs `cond` not to have raised: it never
+     ran (`gen` was empty, so `any(.a)` over `[]` is a clean backtrack), or it is inert, or it is a
+     chain of plain navigation steps that only ran on the register (`any(.a)` over
+     `[{"key":"a","value":1}]` navigates to `null` and backtracks), where a path error cannot occur
+     (`test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763` and
+     `test_any_all_undecided_register_survives_a_cond_that_never_raised_3763`). The same navigation
+     on a computed element (`any(1; .a)`) raises in jq and stays refused. The converse is not closed
+     ([#3757](https://github.com/rust-works/succinctly/issues/3757)): `cond` runs by value, so jq's path
+     error on a *computed* element (`any(1; .[]?)`, `all(tostring; .a?)`) is invisible, and under `or`,
+     `//`, a `$x` rebind or a `try` the result can be accepted and written where jq exits 5 or, under
+     `try`, leaves the document (`(try (all(tostring; .a?))) |= 5` on `true` is `5` here, `true` in jq).
+     A sweep of the sixteen `any`/`all`/`isempty` operands against a build of `main` without #3763
+     (155,547 programs at 27 contexts) has 1,603 such rows, all on the five computed-generator operands,
+     down from 2,342: 739 closed, none new and none writing a different document than before. A `cond` outside the undecided claim's three clauses (`try .b`,
+     `first?`, `limit(1; .[]?)`) is refused in the safe direction where `main` answered like jq. Two shapes are still refused where jq
      answers, pinned
      (`test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749`): the result is
      stated only while `cond` is on `cannot_move_register`'s allowlist, because `cond` runs by
@@ -1166,10 +1198,8 @@ is the revert that established what the other one costs.
      ([#3757](https://github.com/rust-works/succinctly/issues/3757)); a plain pipe stage does
      not read the backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any |
      $x)` on `{"a":false,"b":null}` is `[]` in jq and refuses here, as do the by-value forms
-     ([#3758](https://github.com/rust-works/succinctly/issues/3758)); and the bare `any`/`all`,
-     `any(f)`/`all(f)` and `isempty(g)` spellings have no such arm, so `path(any)` on
-     `[true,false]` is `[0]` in jq and refuses here
-     ([#3763](https://github.com/rust-works/succinctly/issues/3763)). The exhausted-generator
+     ([#3758](https://github.com/rust-works/succinctly/issues/3758)); `any(.a)` is the first
+     shape again. The exhausted-generator
      statement is `drained_register_after`, shared with `isempty(g)`, and it is made only on a
      trackable entry: after `false |` the value is not jq's register, and stating it would let
      `and` accept the `false` it computes (`path(false | (any(empty; .) and 1))` on `{"a":1}`).
@@ -1192,7 +1222,7 @@ is the revert that established what the other one costs.
    0 rows are newly accepted wrongly; the 36 that
    still accept are all `.[0:] and R` and `.[0:0] and R` on `[]` (an empty slice is a fresh
    array, #3494's identity rule; unchanged by this work). yq mode is unchanged: the per-result
-   and `add`/`map` verdicts are gated on jq mode, and 1,400 yq-mode runs of
+   (since moved into the `any`/`all`/`isempty` arms, #3749/#3763) and `add`/`map` verdicts are gated on jq mode, and 1,400 yq-mode runs of
    `has`/`range`/`paths`/`add`/`map`/`any` and friends in write contexts (610 succeed, the rest
    fail identically) answer the same before and after; five of them are pinned
    (`test_yq_by_value_stages_keep_no_path_register_3456`).
@@ -1236,7 +1266,7 @@ is the revert that established what the other one costs.
    the leaf is a deliberate change with rows of its own. The drain builtins are the same kind of
    case: jq backtracks `INDEX(s; f)`'s source, so `path(. as $x \| INDEX(.l[]; .) \| $x)` on
    `{"l":[1,2]}` is `[]` in jq, while here the register is lost at the drain and the later `$x`
-   is refused -- and, since #3267, uncatchably (`isempty(g)` moves it only when `g` emits).
+   is refused -- and, since #3267, uncatchably.
    Pinned by `test_path_register_drain_producers_lose_the_register_uncatchably_3456`. `last(f)`
    is no longer one of them: [#3643](https://github.com/rust-works/succinctly/issues/3643)
    states its register as unmoved (jq mode), so `path(. as $x \| last(.l[]) \| $x)` is `[]`
@@ -1264,6 +1294,11 @@ is the revert that established what the other one costs.
    (`last($x)`, `last(.)`) loses it, and a `try` around the next navigation then catches a
    refusal jq never raises and drops the write
    ([#3766](https://github.com/rust-works/succinctly/issues/3766), older than #3653).
+   Nor is `isempty(g)` a drain producer that loses it any more:
+   [#3763](https://github.com/rust-works/succinctly/issues/3763) states the register the first
+   branch `g` emitted left (and the entry register when it emitted nothing), so
+   `del(. as $x \| isempty(.l[]) \| try ($x \| .a))` leaves the document here as in jq, pinned by
+   `test_isempty_and_bare_any_all_state_the_register_3763`.
    An array is different: jq collects it without a subexp, so its contents
    are path-checked (`path(. as $x \| {k:.a} \| [.k] \| $x)` raises on the `.k`), and then
    backtracks the register to where the collect began. Since
