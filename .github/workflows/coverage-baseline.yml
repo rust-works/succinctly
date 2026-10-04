@@ -52,7 +52,7 @@ jobs:
             use-prebuilt: 'true'
           - name: ARM64
             runner: ubuntu-24.04-arm
-            use-prebuilt: 'false'   # no aarch64-linux prebuilt; build omni-dev from source
+            use-prebuilt: 'true'    # omni-dev >= 0.46.0 publishes an aarch64-linux binary (#3750)
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
