@@ -37841,7 +37841,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             let keeps_identity = last_register_unmoved::<S>() && cannot_move_register(inner);
             let result = match last {
                 Some(branch) if keeps_identity => {
-                    if branch.trackable && branch.path.depth() == 0 {
+                    if branch.trackable {
+                        // `f` navigates nothing, so a trackable output is the entry node.
+                        debug_assert_eq!(branch.path.depth(), 0);
                         branch
                     } else {
                         PathBranch::demoted(branch.snapshot, Cow::Owned(branch.value.into_owned()))
