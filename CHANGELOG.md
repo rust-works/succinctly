@@ -16,8 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `?` around the next navigation caught the refusal and `=`, `|=` and `del()` silently dropped the write at exit 0
   (`(. as $x | try (5 | last($x) | .k)) = 9` on `{"a":{"b":1},"k":2}` left the document unchanged where jq sets `k`). An output that is
   the entry node (trackable at the root) is now forwarded as that node, and an untracked output keeps the snapshot mark that names
-  its node, as a bare `5 | $x` does; any other output is still a copy, so `last(.a)` stays refused as jq refuses it. Jq mode only
-  (ADR-0018: yq has no oracle for `last`). Pinned by `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both
+  its node, as a bare `5 | $x` does; any other output is still a copy, so `last(.a)` stays refused as jq refuses it. Only for an `f` that
+  provably navigates nothing (`last(.)`, `last($x)`): a navigating `f` inside a reduce UPDATE runs against a register the navigating source
+  already moved, where jq raises and the fold resolves it as though the accumulator sat on the register, so forwarding the root there made
+  `del(reduce .[]? as $k (.; last(.k, .)))` delete the document. That hole is older than this change and also accepts the bare
+  `del(reduce .[]? as $k (.; (.k, .)))` (filed separately); `last(.a, .)`, `last(first(.))` and `last(select(true))` stay refused where
+  jq answers `[]`. Jq mode only (ADR-0018: yq has no oracle for `last`). Pinned by `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both
   evaluators) and `yq_last_f_output_does_not_keep_its_identity_3766`; it replaces the characterization test #3653 left.
 
 - **jq: a `foreach` UPDATE or EXTRACT that is a `try` around a chain with a generator no longer silently skips a write** (#3738).

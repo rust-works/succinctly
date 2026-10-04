@@ -37829,8 +37829,18 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             // a copy that is not the register, as before: `last(.a)` moved off
             // it and jq refuses it. Jq mode only, like the register (ADR-0018:
             // yq has no oracle for either).
+            //
+            // Only for an `f` that provably navigates nothing
+            // ([`cannot_move_register`]): a navigating `f` inside a reduce/foreach
+            // UPDATE runs against a register jq's source already moved, where jq
+            // raises on the navigation and the fold resolves it as though the
+            // accumulator sat on the register (`del(reduce .[]? as $k (.; (.k,
+            // .)))` deletes the document on `main`, where jq exits 5). Forwarding
+            // the root there would hand that hole `last(.k, .)` as well, so a
+            // navigating `f` keeps the copy it always had.
+            let keeps_identity = last_register_unmoved::<S>() && cannot_move_register(inner);
             let result = match last {
-                Some(branch) if last_register_unmoved::<S>() => {
+                Some(branch) if keeps_identity => {
                     if branch.trackable && branch.path.depth() == 0 {
                         branch
                     } else {

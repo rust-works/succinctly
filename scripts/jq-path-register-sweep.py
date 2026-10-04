@@ -327,7 +327,10 @@ OPERANDS = [
     "last($x)?",
     "first(last($x))",
     # (#3766) which of a generator's outputs is the register: only the last one
-    # decides, and only when it is the entry node itself.
+    # decides, and only when it is the entry node itself. The first and third are
+    # the shapes a navigating `f` in a reduce UPDATE would turn into an accepted
+    # root (`del(reduce .[]? as $k (.; last(.a, .)))` deleted the document before
+    # the arm was restricted to an `f` that navigates nothing).
     "last(.a, .)",
     "last(., .a)",
     "last(first(.))",

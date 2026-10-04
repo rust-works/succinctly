@@ -1290,7 +1290,11 @@ is the revert that established what the other one costs.
    output *is* the register (`last($x)`, `last(.)`) hands it back, so `path(last(.))` is `[]`
    and `(. as $x \| try (5 \| last($x) \| .k)) = 9` writes, as in jq, pinned by
    `test_path_register_last_f_keeps_the_identity_of_its_output_3766`. An output that is not the
-   register (`last(.a)` moved off it) is still a copy that jq refuses.
+   register (`last(.a)` moved off it) is still a copy that jq refuses. Only an `f` that provably
+   navigates nothing gets this (`cannot_move_register`): `last(.a, .)`, `last(first(.))` and
+   `last(select(true))` still refuse where jq answers `[]`, because a navigating `f` inside a
+   reduce/foreach UPDATE runs against a register jq's source already moved and the fold does not
+   see that.
    Nor is `isempty(g)` a drain producer that loses it any more:
    [#3763](https://github.com/rust-works/succinctly/issues/3763) states the register the first
    branch `g` emitted left (and the entry register when it emitted nothing), so

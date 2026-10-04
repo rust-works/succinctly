@@ -63937,9 +63937,6 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
         // The bare reads: an output that is the entry node, trackable at the root.
         (doc, r"path(last(.))", "[]\n", "", 0),
         (doc, r"path(. as $x | last($x))", "[]\n", "", 0),
-        (doc, r"path(last(.a, .))", "[]\n", "", 0),
-        (doc, r"path(last(first(.)))", "[]\n", "", 0),
-        (doc, r"path(last(select(true)))", "[]\n", "", 0),
         // Below the root the entry node is that node, and a navigation off it
         // is a path.
         (doc, r"path(.a | last(.))", "[\"a\"]\n", "", 0),
@@ -63992,6 +63989,51 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
             r"path(. as $x | last(.a) | .a)",
             "",
             r#"near attempt to access element "a" of {"b":1}"#,
+            5,
+        ),
+        // Still refused where jq answers `[]` (refuse-only), pinned so lifting it is a
+        // deliberate change: an `f` that navigates (`last(.a, .)`) or that the
+        // `cannot_move_register` allowlist cannot prove navigates nothing
+        // (`first(.)`, `select(true)`) keeps the copy it always had.
+        (
+            doc,
+            r"path(last(.a, .))",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        (
+            doc,
+            r"path(last(first(.)))",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        (
+            doc,
+            r"path(last(select(true)))",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        // The reason for that restriction. A navigating `f` in a reduce UPDATE runs
+        // against a register the navigating source already moved, so jq raises on
+        // the navigation; the fold resolves it as though the accumulator sat on the
+        // register, and forwarding the root from `last(.k, .)` made the update an
+        // accepted `[]` that `del` turned into deleting the document (exit 0). Its
+        // bare twin `(.k, .)` is the same hole, older than this change.
+        (
+            r#"{"a":true,"k":2}"#,
+            r"del(reduce .[]? as $k (.; last(.k, .)))",
+            "",
+            r#"near attempt to access element "k""#,
+            5,
+        ),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"(reduce .[]? as $k (.; last(.k, .))) = 9",
+            "",
+            r#"near attempt to access element "k""#,
             5,
         ),
     ])
