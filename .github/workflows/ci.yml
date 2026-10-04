@@ -489,6 +489,19 @@ jobs:
   # of test CPU) into a `deep-recursion` leg: a fourth macOS job per run, spent to shorten
   # `cli-gated`, which is the critical path above. Whether it is worth the slot is what
   # that issue's decision gate (macOS queue wait under weekday load) is measuring.
+  #
+  # #3649 then split `simd-variants` into its three invocations, one leg each. The
+  # chain had become the longest macOS job (~9 min; merge-group run 37191637704), and
+  # ~70% of it was recompiling for each feature set: ~3.4, ~2.7 and ~2.75 min per
+  # invocation. Nothing is lost by running them apart -- ARM64 Linux always has -- but
+  # the second and third no longer reuse the ~85 third-party crates the first built
+  # (~35 s each) and each job pays ~20 s of checkout and toolchain setup, so a run
+  # spends ~1.8 more macOS-minutes (~11 against ~9) for a critical path that falls from
+  # ~9 min to `deep-recursion`'s ~5.5. That is a wall-clock win while slots are free and
+  # roughly neutral when all five are taken, so re-measure the queue wait on a weekday.
+  # If it saturates, the cheaper relief is not more splitting but dropping
+  # `portable-popcount` and `no-std` here (#3655 found no signal in them that ARM64
+  # Linux lacks, ~5 macOS-minutes per run) -- a policy call recorded on #3649.
   test-macos-arm:
     name: Test (macOS ARM64)
     needs: [gate, test-macos-arm-matrix]
@@ -530,21 +543,25 @@ jobs:
             testCmd: |
               cargo test --features cli,bench-runner --test orchestrate_cli_tests
               cargo test --verbose
-          # The three remaining feature sets are independent of the CLI binary
-          # and of each other, so they share one leg without a build step.
-          #
-          # Same no_std cargo-test rationale as test-x86 (#2114) applies to
-          # the last line -- macOS ARM64 is the only leg that builds the
-          # target_arch="aarch64"-gated NEON test modules under Apple's own
-          # toolchain rather than Linux's; a #2083-class std-only-symbol bug
-          # reachable only there was invisible to every CI leg until this
-          # one (#2123).
-          - name: simd-variants
+          # The next three feature sets shared one `simd-variants` leg until #3649
+          # (#3655 made it). They are independent of the CLI binary and of each other
+          # -- the ARM64 Linux matrix runs them as separate legs too -- so each gets
+          # its own runner and no build step. See the comment above `test-macos-arm`
+          # for what the split costs and buys.
+          - name: simd
             buildCli: false
-            testCmd: |
-              cargo test --verbose --features simd
-              cargo test --verbose --features portable-popcount
-              cargo test --no-default-features --verbose
+            testCmd: cargo test --verbose --features simd
+          - name: portable-popcount
+            buildCli: false
+            testCmd: cargo test --verbose --features portable-popcount
+          # Same no_std cargo-test rationale as test-x86 (#2114) -- macOS ARM64 is
+          # the only leg that builds the target_arch="aarch64"-gated NEON test
+          # modules under Apple's own toolchain rather than Linux's; a
+          # #2083-class std-only-symbol bug reachable only there was invisible to
+          # every CI leg until this one (#2123).
+          - name: no-std
+            buildCli: false
+            testCmd: cargo test --no-default-features --verbose
           # #3698: the two slowest jq_cli_tests, split out of `cli-gated`; same list and
           # guards as the x86_64 leg's (see the comment on its `cli-gated` entry).
           - name: deep-recursion
