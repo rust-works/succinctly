@@ -1455,7 +1455,7 @@ is the revert that established what the other one costs.
    answers `["c"]` on both
    ([#3136](https://github.com/rust-works/succinctly/issues/3136)).
 
-   Nine rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
+   Eight rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
    (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
 
    #3049 moved `path(.a as $y | .a | tojson | fromjson | $y)` to the accepting
@@ -1466,6 +1466,19 @@ is the revert that established what the other one costs.
    `Expr::FuncDef` arm, so a `def` declared inside `path()` is bound and resolved in path mode
    instead of falling to the eager value fallback as an opaque leaf.
 
+   [#3519](https://github.com/rust-works/succinctly/issues/3519) moved
+   `path(.a? as $y \| .a \| $y)` there as well: a postfix `?` on a navigation step is jq's
+   `INDEX_OPT`/`EACH_OPT`, which swallows a type error but never a path error, so it cannot catch the
+   resolver's own refusal and the source stays on the witness grammar (`is_postfix_optional_navigation`,
+   `src/jq/eval.rs`). `try`-style groups stay out (`(.a)? as $y` is a syntax error in jq 1.7.1 anyway), and a
+   `?` after a construction (`([$q] \| .[0]?) as $y`) still binds by value.
+
+   One consequence is recorded as [#3732](https://github.com/rust-works/succinctly/issues/3732): a `?` source now
+   behaves like the plain spelling under a `try` that catches a near-access refusal after a construction
+   (`path(.a as $v \| {k: .a} \| ($v \| select(true)) \| try ($v \| .b?))` refuses where jq's `try` answers), which the
+   `?` spelling used to match only because it bound by value. Three programs in about 75,000 fuzzed against the
+   pre-change binary, each with a plain twin that already refused on `main`, and none in a 21,600-case grid.
+
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
    | `.a as $y \| path(.a \| $y)`                             | `["a"]`                     | value-mode binding — `eval_as` never resolves its source in path position; the *positional* half of #3037 (its root-of-invocation half is closed)                                                                                                          |
@@ -1473,7 +1486,6 @@ is the revert that established what the other one costs.
    | `path((.a \| select(.b)) as $y \| .a \| $y)`             | `["a"]`                     | the witness grammar is pure navigation; a `select`-wrapped source binds by value                                                                                                                                          |
    | `path((.a // 1) as $y \| .a \| $y)`                      | `["a"]`                     | same: a `//` source binds by value                                                                                                                                                                                        |
    | `path((if .a then .a else .b end) as $y \| .a \| $y)`    | `["a"]`                     | same: an `if` source binds by value                                                                                                                                                                                       |
-   | `path(.a? as $y \| .a \| $y)`                            | `["a"]`                     | a `?` on the bind *source* is outside the witness grammar, so it binds by value (a `?` on a later step agrees since #3464)                                                                                                |
    | `path(.a[0:3] as $y \| .a \| $y)` on `{"a":[1,2,3]}`     | `["a"]`                     | jq's full slice *is* the array; the bind path ends in a slice component and `.a` does not                                                                                                                                 |
    | `path(.a as $y \| (.c \| $y \| .b) as $w \| .a.b \| $w)` | `["a","b"]`                 | a marker is re-rooted only at the head of a source (`$y.b as $w`, `(($y \| .b) \| .c) as $w`); elsewhere it is certified against the ambient position                                                                     |
    | `path(.a as $y \| .a \| 5 \| reduce (1) as $i (0; $y))`  | `["a"]`                     | after a literal the register is only *carried*, and a fold whose INIT is untracked seeds its own register from the ambient literal — pre-existing: `path(. as $x \| 5 \| reduce (1) as $i (0; $x))` refuses too (jq `[]`) |
@@ -1491,11 +1503,11 @@ is the revert that established what the other one costs.
    answers too. A slice is never folded onto its container (#3494), and an empty range never agrees
    (`path(.x[5:] as $y | .x[6:] | $y)` refuses in jq too). The emitted path is unchanged. Pinned in
    `test_resolver_frame_position_is_spelling_insensitive_3464` and
-   `test_resolver_frame_position_spelling_controls_refuse_3464`. What stays refuse-only is not a
-   spelling comparison and refuses with identical spelling on both sides:
-   `first`/`last` (the resolver does not track them), a `?` on the bind *source*, a fractional
-   index on the bind side, and a full-range fractional slice
-   ([#3519](https://github.com/rust-works/succinctly/issues/3519)).
+   `test_resolver_frame_position_spelling_controls_refuse_3464`. What was left over was not a
+   spelling comparison and refused with identical spelling on both sides: `first`/`last` (the
+   resolver did not track them, closed by #3545), a fractional index on the bind side and a
+   full-range fractional slice (closed by #3677), and a `?` on the bind *source*
+   ([#3519](https://github.com/rust-works/succinctly/issues/3519), closed).
 
    Two related divergences were pre-existing and out of scope for #2042, tracked separately:
    **[#2642](https://github.com/rust-works/succinctly/issues/2642), now closed.** The *root*
