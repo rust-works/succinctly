@@ -1494,8 +1494,14 @@ fn scalar_leaf_iteration<S: EvalSemantics, V: DocumentValue>(
 /// which only a library embedder in jq mode reaches).
 ///
 /// `Some(Err(e))` carries what [`scalar_leaf_iteration`] decides, which is a decode
-/// failure today; a caller whose old arm re-raised only a decode failure narrows
-/// it to that (the `path(f)` walkers do), so the two rules cannot drift apart.
+/// failure today and all the old `path(f)` arms ever re-raised. Every caller now
+/// follows one rule, the one `?` follows everywhere else: an error that is
+/// uncatchable at a value position (a decode failure, a resource limit) escapes. The
+/// old arms re-raised only a decode failure, so a resource-limit error from a leaf
+/// check would have been swallowed there; none can arise from one, and the shared
+/// rule is the right one if it ever does. (Narrowing it again per caller, with a
+/// closure in each arm, cost +4% to +5% on a container-heavy `path(.[]?, .[]?)`
+/// through code generation alone, for a branch no container reaches.)
 ///
 /// One definition for the path-context step ([`path_context_step_try`]) and the
 /// `path(f)` walkers' own `Optional` arms ([`path_walk_generic`],
@@ -20219,14 +20225,7 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
             // it, so the `Cannot iterate` message the step would format and
             // this arm would drop is never built (see [`swallowed_path_leaf`]).
             if let Some(settled) = swallowed_path_leaf::<S, V>(inner, None, node) {
-                // This arm re-raises only a decode failure, as it always did.
-                return settled.or_else(|e| {
-                    if e.is_decode_failure() {
-                        Err(e)
-                    } else {
-                        Ok(())
-                    }
-                });
+                return settled;
             }
             let mut branch = Vec::new();
             let result = path_walk_generic::<S, V>(inner, node, path, &mut branch);
@@ -20680,14 +20679,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
             // #3722: a bare `.[]?` over a scalar settles here without stepping
             // it, as in `path_walk_generic` (see [`swallowed_path_leaf`]).
             if let Some(settled) = swallowed_path_leaf::<S, V>(inner, None, node) {
-                // This arm re-raises only a decode failure, as it always did.
-                return settled.or_else(|e| {
-                    if e.is_decode_failure() {
-                        Err(e)
-                    } else {
-                        Ok(())
-                    }
-                });
+                return settled;
             }
             let mut branch = Vec::new();
             let result = path_step_generic::<S, V, T>(
