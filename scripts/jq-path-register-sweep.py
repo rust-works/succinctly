@@ -176,6 +176,18 @@ OPERANDS = [
     "all(unique_by(.))",
     "isempty(any(1; .[]?))",
     "isempty(all(1; .a?))",
+    # (#3757) a `cond` outside the by-value allowlist is resolved as `gen | cond`
+    # in jq mode: the stage rules for `select`/`first`, a navigating chain, an
+    # update assignment and `unique_by` (which raises on a computed element), and
+    # a computed generator under a navigating `cond`, the shape that wrote where
+    # jq exits 5.
+    "any(.[]?; select(.))",
+    "all(.[]?; first(.))",
+    "any(.[]?; .a | .b)",
+    "all(.[]?; .a += 1)",
+    "any(.[]?; unique_by(.))",
+    "any(1; .a)",
+    "any(true; select(.))",
     # wrappers and control flow around the above
     "try .a",
     "(.a // .b)",
