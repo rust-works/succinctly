@@ -678,9 +678,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sweep gained five operands that generate the shape. **Still open (#3757, now Medium):** `cond` runs by value, so jq's path
   error on a *computed* element is invisible, and `any(1; .[]?)` or `all(tostring; .a?)` under `or`, `//`, a `$x` rebind or a
   `try` can still be accepted and written where jq exits 5 or, under `try`, leaves the document (`(try (all(tostring; .a?)))
-  |= 5` on `true` is `5` here and `true` in jq). A sixteen-operand sweep (132,507 programs at 23 contexts) has 1,087 such
-  `ACCEPT_WRONG` rows, all on the five computed-generator operands, down from 1,826 on the build before this change, none new
-  and none writing a different document than before (265 change the document, 700 are no-ops, 122 are `path` answers).
+  |= 5` on `true` is `5` here and `true` in jq). A sixteen-operand sweep against a build of `main` without this change
+  (155,547 programs at the grid's 27 contexts; reproduce with `--operand` for the sixteen any/all/isempty operands) has
+  `ACCEPT_WRONG` 2,342 to 1,603, all on the five computed-generator operands: 739 closed, none new, none writing a different
+  document than before; `REFUSE_WRONG` 4,188 to 3,009, `MATCH` 148,985 to 150,929, and 156 safe-direction regressions, all on
+  those five operands, which `main` matched only because it was unsound.
   The undecided statement is also refused, in the safe direction, for a `cond` outside its three clauses (`try .b`, `first?`,
   `limit(1; .[]?)`), which `main` answered like jq.
 

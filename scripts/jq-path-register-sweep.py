@@ -165,13 +165,12 @@ OPERANDS = [
     # Known residual (#3757): `cond` runs by value, so jq's path error on a
     # *computed* element is invisible and `any(1; .[]?) or true`, `.. // .a`
     # and friends still write where jq exits 5. On these five operands alone
-    # that is 1,087 ACCEPT_WRONG rows (700 no-ops, 265 changed documents, 122
-    # `path` answers) in a 132,507-program run over the sixteen any/all/isempty
-    # operands at the grid's 23 contexts (before #3653 added four), down from
-    # 1,826 on the build before #3763; none are new and none writes a different
-    # document. They are not regressions of a later change, and the older
-    # operands have none. The row counts change with the grid: `--operand` over
-    # these operands at today's 27 contexts gives different denominators.
+    # that is 1,603 ACCEPT_WRONG rows in a 155,547-program run over the sixteen
+    # any/all/isempty operands (`--operand` for each) at the grid's 27 contexts,
+    # against a build of `main` without #3763, down from 2,342: 739 closed, none
+    # new, none writes a different document. They are not regressions of a later
+    # change, and the older operands have none. The counts move with the grid:
+    # 1,087 and 1,826 at its 23 contexts, before #3653 added four.
     "any(1; .[]?)",
     "any(true; .[0]?)",
     "all(unique_by(.))",

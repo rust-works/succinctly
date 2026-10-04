@@ -1184,9 +1184,9 @@ is the revert that established what the other one costs.
      error on a *computed* element (`any(1; .[]?)`, `all(tostring; .a?)`) is invisible, and under `or`,
      `//`, a `$x` rebind or a `try` the result can be accepted and written where jq exits 5 or, under
      `try`, leaves the document (`(try (all(tostring; .a?))) |= 5` on `true` is `5` here, `true` in jq).
-     A sweep of the sixteen `any`/`all`/`isempty` operands (132,507 programs at 23 contexts) has 1,087
-     such rows, all on the five computed-generator operands, down from 1,826 before #3763, none new
-     (265 change the document). A `cond` outside the undecided claim's three clauses (`try .b`,
+     A sweep of the sixteen `any`/`all`/`isempty` operands against a build of `main` without #3763
+     (155,547 programs at 27 contexts) has 1,603 such rows, all on the five computed-generator operands,
+     down from 2,342: 739 closed, none new and none writing a different document than before. A `cond` outside the undecided claim's three clauses (`try .b`,
      `first?`, `limit(1; .[]?)`) is refused in the safe direction where `main` answered like jq. Two shapes are still refused where jq
      answers, pinned
      (`test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749`): the result is
