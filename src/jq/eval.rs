@@ -42890,7 +42890,18 @@ impl FoldRegister {
             // still recognise the value (confirmed live,
             // `path(. as $x | reduce (1) as $i (0; reduce (1) as $j
             // (0; $x)))` is `[]`). #1466.
-            PathBranch::demoted(b.snapshot, b.value)
+            // #3769: keep the path the branch already navigated. `demoted`
+            // starts from the root, and `resolve_terminal`'s `null`/`bool`
+            // carve-out answers `[]` only for a branch whose path is empty
+            // ("nothing before the terminal navigated", #3579) -- so an EXTRACT
+            // that navigated and then ended on an untracked `null`
+            // (`foreach (1,2) as $i (.; .; .a? | limit(1; last(.a?)))`) read
+            // as the root and a write through it replaced the whole document
+            // where jq's register sits at `["a"]`. With the path kept it
+            // declines the way the same pipe does outside a fold.
+            let mut demoted = PathBranch::demoted(b.snapshot, b.value);
+            demoted.path = PathPrefix::extend_many(&self.path, b.path.to_vec());
+            demoted
         }
     }
 

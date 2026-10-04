@@ -64282,32 +64282,76 @@ fn test_last_of_the_register_under_try_drops_the_write_characterize_preexisting_
     Ok(())
 }
 
-/// #3769, characterization of a pre-existing bug: a `foreach` whose EXTRACT
-/// navigates and then ends in `limit(1; last(f))` answers the root path, so a
-/// write through it replaces the whole document (exit 0). jq 1.7.1 answers
-/// `["a"]` twice and `{"a":9}`. Verified identical on `main` before #3653. If
-/// #3769 is fixed, update the expectations to jq's answers.
+/// #3769: a `foreach` whose EXTRACT navigates and then ends on an untracked
+/// `null` (`limit(1; last(f))`, `first(null)`, `(.b // null)`) used to answer the
+/// *root* path, so a write through it replaced the whole document silently
+/// (exit 0): jq 1.7.1 answers `["a"]` twice and `{"a":9}`. `relocate_one` rebuilt
+/// the demoted branch from the root, erasing the navigation `resolve_terminal`'s
+/// `null` carve-out reads (#3579: it answers `[]` only while nothing before the
+/// terminal navigated). It now keeps the path, so the fold refuses loudly the way
+/// the same pipe does outside a fold. The refusal is this resolver's guess, not
+/// jq's verdict (jq answers), so no `try` turns it into a dropped write. A fold
+/// that never navigated still answers `[]`, as jq does.
 #[test]
-fn test_foreach_extract_ending_in_limit_last_answers_the_root_characterize_preexisting_bug_3769(
-) -> Result<()> {
+fn test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769() -> Result<()> {
+    let refusal = "jq: error (at <stdin>:1): Invalid path expression with result null\n";
     let extract = ".a? | limit(1; last(.a?))";
-    for (filter, jq_answers, today) in [
+    for (filter, stdout, stderr, code) in [
         (
             format!("path(foreach (1,2) as $i (.; .; {extract}))"),
-            "[\"a\"]\n[\"a\"]\n",
-            "[]\n[]\n",
+            "",
+            refusal,
+            5,
         ),
         (
             format!("(foreach (1,2) as $i (.; .; {extract})) = 9"),
-            "{\"a\":9}\n",
-            "9\n",
+            "",
+            refusal,
+            5,
+        ),
+        (
+            format!("(foreach (1,2) as $i (.; .; {extract})) |= 9"),
+            "",
+            refusal,
+            5,
+        ),
+        (
+            format!("del(foreach (1,2) as $i (.; .; {extract}))"),
+            "",
+            refusal,
+            5,
+        ),
+        (
+            "path(foreach (1) as $i (.; .; .a | first(null)))".to_string(),
+            "",
+            refusal,
+            5,
+        ),
+        (
+            "path(foreach (1) as $i (.; .; .a | (.b // null)))".to_string(),
+            "",
+            refusal,
+            5,
+        ),
+        // a register that never left the root, and a fold after a navigation
+        (
+            "path(foreach (1) as $i (.; .; null))".to_string(),
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            "path(.x | foreach (1) as $i (.; .; null))".to_string(),
+            "[\"x\"]\n",
+            "",
+            0,
         ),
     ] {
-        let (out, err, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+        let (out, err, got) = run_jq_full(&["-c", &filter], Some("null\n"))?;
         assert_eq!(
-            (out.as_str(), code),
-            (today, 0),
-            "`{filter}` changed (jq answers {jq_answers:?}): if #3769 is fixed, update this pin; stderr {err:?}"
+            (out.as_str(), err.as_str(), got),
+            (stdout, stderr, code),
+            "{filter}"
         );
     }
     Ok(())
