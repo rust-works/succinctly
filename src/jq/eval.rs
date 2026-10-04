@@ -37648,16 +37648,13 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 snapshot,
                 frame,
                 Keep::AtMost(usize::MAX),
-                &mut |branch| {
-                    let elem = branch.value.into_owned();
-                    match any_all_probe_element::<S>(cond, &elem, target_truthy) {
-                        Ok(true) => {
-                            decided = true;
-                            Demand::Stop
-                        }
-                        Ok(false) => Demand::Continue,
-                        Err(control) => stop_with_escape(&mut probe_escape, control),
+                &mut |branch| match any_all_probe_element::<S>(cond, &branch.value, target_truthy) {
+                    Ok(true) => {
+                        decided = true;
+                        Demand::Stop
                     }
+                    Ok(false) => Demand::Continue,
+                    Err(control) => stop_with_escape(&mut probe_escape, control),
                 },
             );
             if let Some(control) = probe_escape {
