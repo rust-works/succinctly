@@ -42009,14 +42009,14 @@ impl FoldRegister {
         (at_register, snapshot)
     }
 
-    /// [`FoldRegister::branch_provenance`] for a `reduce` accumulator, which
-    /// also counts a whole-array slice of the register as still on it
-    /// (#3504, jq mode). `slice_ok` is false for a fold whose source navigates
+    /// [`FoldRegister::branch_provenance`] for a `reduce` accumulator or a
+    /// `foreach` state (#3742), which also counts a whole-array slice of the
+    /// register as still on it (#3504, jq mode). `slice_ok` is false for a fold whose source navigates
     /// (jq's register has moved off the accumulator by then) or whose pattern
     /// is not a plain variable (a destructuring bind navigates, and after a
     /// failed `?//` alternative jq's state is `null`); value equality below
     /// cannot see either.
-    fn reduce_branch_provenance<S: EvalSemantics>(
+    fn fold_branch_provenance<S: EvalSemantics>(
         &self,
         branch: Option<&PathBranch<'_>>,
         fold_frame: &Frame,
@@ -42469,6 +42469,15 @@ fn is_fold_source_navigation(e: &Expr) -> bool {
                     | Builtin::GetPath(_)
             )
     )
+}
+
+/// Whether a fold's accumulator or state may stay on the register through a
+/// whole-array slice (#3504, #3742): a plain variable pattern (a destructuring
+/// bind navigates, and after a failed `?//` alternative jq's state is `null`)
+/// over a source that does not move the register. The one definition
+/// `resolve_reduce` and `resolve_foreach` share, so the gate cannot drift.
+fn fold_slice_ok(patterns: &[Pattern], source: &Expr) -> bool {
+    matches!(patterns, [Pattern::Var(_)]) && !fold_source_moves_register(source)
 }
 
 /// Whether a fold SOURCE moves jq's path register: [`is_fold_source_navigation`],
@@ -44907,7 +44916,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // #3734: "navigates" is the fold driver's own test, not the bind witness's
     // narrower one, which misses a computed key (`.[1+1]`) and so let the
     // slice rule accept `path(reduce .[1+1] as $a (.; .[0:]))` where jq refuses.
-    let slice_ok = matches!(patterns, [Pattern::Var(_)]) && !fold_source_moves_register(input);
+    let slice_ok = fold_slice_ok(patterns, input);
     // INIT resolved first, before SOURCE (#2031, reordered from the
     // original #1467/#1872 shape): confirmed live against jq 1.7.1 (via
     // `debug`-instrumented INIT/SOURCE/UPDATE clauses) that real jq
@@ -45205,8 +45214,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                 // starting point purely from this step's own output
                                 // branch, same as before #2632.
                                 let last = branches.into_iter().last();
-                                (acc_at_register, acc_snapshot) = reg
-                                    .reduce_branch_provenance::<S>(last.as_ref(), frame, slice_ok);
+                                (acc_at_register, acc_snapshot) =
+                                    reg.fold_branch_provenance::<S>(last.as_ref(), frame, slice_ok);
                                 acc = last.map(|b| b.value.into_owned());
                                 Demand::Continue
                             }
@@ -45217,8 +45226,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                 // Some(control); break;`, and nothing past this
                                 // element is ever pulled from the source.
                                 let last = prefix.into_iter().last();
-                                (acc_at_register, acc_snapshot) = reg
-                                    .reduce_branch_provenance::<S>(last.as_ref(), frame, slice_ok);
+                                (acc_at_register, acc_snapshot) =
+                                    reg.fold_branch_provenance::<S>(last.as_ref(), frame, slice_ok);
                                 acc = last.map(|b| b.value.into_owned());
                                 outcome = Some(fold_escape_outcome(e, is_last, &aborted));
                                 Demand::Stop
@@ -45380,6 +45389,9 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
     // #2388: see `resolve_reduce`'s identical hoist.
     let null_ambient = OwnedValue::Null;
+    // #3742: jq's `foreach` hands UPDATE's result back as the next state through
+    // the same buffer-sharing slice `reduce` does (#3504).
+    let slice_ok = fold_slice_ok(patterns, input);
     // #2979: see `resolve_reduce`'s identical hoist.
     let alternative_names = (patterns.len() > 1).then(|| pattern_alternatives_var_names(patterns));
     let alternatives = alternative_names.as_deref();
@@ -45593,8 +45605,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             // then 1 else 2 end) as $v (.; if $v == 2 then . else (1, 2)
                             // end))` answers `[]` at exit 0 where jq 1.7.1 refuses with
                             // "result 1" -- a wrong accept, the write-side hazard class.
-                            (state_at_register, state_snapshot) =
-                                reg.branch_provenance::<S>(Some(update_branch), frame);
+                            (state_at_register, state_snapshot) = reg.fold_branch_provenance::<S>(
+                                Some(update_branch),
+                                frame,
+                                slice_ok,
+                            );
                             state = update_branch.value.clone().into_owned();
                             if let Some(ext_expr) = &bound_extract {
                                 if let Some(control) = charge_budget(&mut budget, "foreach") {
