@@ -56,8 +56,9 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is 427,680 rows (72 operands, each also swept as a bare pipe
-stage since #3361), which takes hours on a loaded machine. Judge a change with
+**Size.** The full grid is about 737,000 rows (`--list-axes` prints the exact count:
+89 operands, each also swept as a bare pipe stage since #3361, across 23 contexts),
+which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
 the whole grid only when the change reaches every operand.
@@ -294,6 +295,16 @@ CONTEXTS = [
     # the source or is not a fold, so none of them reached it.
     ("reduce-update-path", "path(reduce 1 as $k (.; {X}))"),
     ("reduce-update-del", "del(reduce 1 as $k (.; {X}))"),
+    # ...and the SOURCE shapes that decide whether the rule may apply, which the
+    # two above (a literal source) never reach: a computed key (`.[1+1]` moves
+    # jq's register though no `Field`/`Iterate` is spelled), a bare `first`
+    # (`.[0]` to jq, opaque to the fold driver), and a destructuring pattern
+    # (it navigates). The review of #3734 found the first two accepting where jq
+    # refuses, with and without a `?`: a context list that fixes the source
+    # cannot see the gate that depends on it.
+    ("reduce-update-computed-key", "path(reduce .[1+1] as $k (.; {X}))"),
+    ("reduce-update-first-source", "path(reduce first as $k (.; {X}))"),
+    ("reduce-update-pattern", "path(reduce [1] as [$q] (.; {X}))"),
 ]
 
 # Long chains are the O(N^3) row: a timing axis, not a correctness one.
