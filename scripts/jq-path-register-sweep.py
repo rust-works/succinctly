@@ -108,6 +108,13 @@ OPERANDS = [
     "..",
     ".[0:]",
     ".[0:0]",
+    # (#3734) a slice under a postfix `?`: a branch resolved under it carries
+    # `Optional(Slice)`, which the reduce accumulator's whole-array-slice rule
+    # (#3504) must read through. The three cover the full slice (the register),
+    # a partial one and an empty one (fresh values), the shapes that rule splits.
+    ".[0:]?",
+    ".[1:]?",
+    ".[0:0]?",
     "getpath([\"a\"])",
     "select(true)",
     # cannot navigate / cannot move the register
@@ -282,6 +289,11 @@ CONTEXTS = [
     ("alt-pattern-pipe", "del(. as [$q] ?// $q | ({X}) | .c)"),  # round 2: stale downstream
     ("reduce-source", "del(reduce .[]? as $k (.; {X}))"),  # round 2: SOURCE navigates
     ("foreach-source", "del(foreach .[]? as $k (.; {X}; .b?))"),  # round 2
+    # (#3734) a fold whose SOURCE does not navigate: the whole-array-slice rule
+    # (#3504) only applies there, and every context above either navigates in
+    # the source or is not a fold, so none of them reached it.
+    ("reduce-update-path", "path(reduce 1 as $k (.; {X}))"),
+    ("reduce-update-del", "del(reduce 1 as $k (.; {X}))"),
 ]
 
 # Long chains are the O(N^3) row: a timing axis, not a correctness one.
