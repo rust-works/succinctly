@@ -93081,6 +93081,11 @@ fn test_computed_slice_and_index_target_is_lazy_3520() -> Result<()> {
         ),
         ("[label $o | (., break $o, 5)[(0+1)]]", "[20]\n", "", 0),
         ("[first((., halt)[(0+1)])]", "[20]\n", "", 0),
+        // A target that raises after its first output: the output before it
+        // is still delivered, then the error ends the pair.
+        (r#"[(., error("x"))[(0+1)]]"#, "", "jq: error", 5),
+        (r#"(., error("x"))[(0+1):]"#, "[20,30]\n", "jq: error", 5),
+        (r#"(., error("x"))[(0+1)]"#, "20\n", "jq: error", 5),
     ] {
         // The document read, and the owned route (`-n`) that has its own twin.
         for (args, input, prefix) in [
