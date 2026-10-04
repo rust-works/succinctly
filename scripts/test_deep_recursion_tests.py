@@ -9,6 +9,7 @@ The guards matter because libtest exits 0 with `running 0 tests` when `--exact` 
 nothing (#3698): without them a renamed test would leave the `deep-recursion` leg green
 and the test running nowhere. `CiWiringTests` pins the other half: that on every platform
 the tests the `cli-gated` leg skips are the ones a `deep-recursion` leg runs.
+`CoverageIgnoreTests` pins that a test ignored under `cfg(coverage)` (#3750) is one of them.
 
 It is run by the `deep-recursion` legs themselves (ci.yml), so it sits on the required
 path: weakening a guard fails `Test (...)`, not just a side job.
@@ -25,6 +26,7 @@ import unittest
 _SCRIPTS = pathlib.Path(__file__).resolve().parent
 SCRIPT = _SCRIPTS / "deep-recursion-tests.sh"
 CI_YML = _SCRIPTS.parent / ".github" / "workflows" / "ci.yml"
+JQ_CLI_TESTS = _SCRIPTS.parent / "tests" / "jq_cli_tests.rs"
 MATRIX_JOBS = ("test-x86-matrix", "test-arm-matrix", "test-macos-arm-matrix")
 
 # Records each invocation, then answers `--list` or a run from the environment.
@@ -228,6 +230,47 @@ class CiWiringTests(unittest.TestCase):
                 for name, leg in matrix_legs(job).items():
                     if name != "cli-gated":
                         self.assertNotIn("--test jq_cli_tests", leg, name)
+
+
+def coverage_ignored_names():
+    """The `fn` each `#[cfg_attr(coverage, ignore ...)]` in jq_cli_tests.rs sits on.
+
+    The pattern is deliberately loose about the attribute's layout (rustfmt may re-wrap it),
+    and a match with no `fn` close behind it is returned as `None` so the test below fails
+    instead of quietly checking nothing. The window is wide enough for the attribute's
+    reason string and narrow enough not to reach a later function.
+    """
+    text = JQ_CLI_TESTS.read_text()
+    names = []
+    for found in re.finditer(r"cfg_attr\(\s*coverage\s*,\s*ignore\b", text):
+        after = text[found.end() : found.end() + 600]
+        fn = re.search(r"\bfn\s+(\w+)\s*\(", after)
+        names.append(fn.group(1) if fn else None)
+    return names
+
+
+class CoverageIgnoreTests(unittest.TestCase):
+    """The coverage ignore (#3750, B2) is an attribute on each test, not driven by this list.
+
+    Its reason string says the test runs in the `deep-recursion` leg, which is only true of
+    the tests in DEEP_RECURSION_TESTS. The other direction is deliberately not required:
+    moving a test into the list does not make it safe to skip from Coverage; that needs the
+    with/without lcov comparison in docs/guides/developer.md.
+    """
+
+    def test_every_test_ignored_under_coverage_is_one_this_script_lists(self):
+        names = coverage_ignored_names()
+        self.assertNotIn(
+            None, names, "a coverage ignore with no `fn` after it: is the attribute mangled?"
+        )
+        unlisted = sorted(set(names) - set(listed_names()))
+        self.assertEqual(
+            unlisted,
+            [],
+            "ignored under cfg(coverage) but not in DEEP_RECURSION_TESTS, so the attribute's "
+            "reason (`runs in the deep-recursion CI leg`) is stale for them: add them to the "
+            "list, or drop or reword the attribute",
+        )
 
 
 if __name__ == "__main__":
