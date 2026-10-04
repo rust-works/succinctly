@@ -146,6 +146,14 @@ OPERANDS = [
     "all(.[]?; .)",
     "any(.[]?; .a)",
     "all(.[]?; .a)",
+    # (#3763) the bare and one-argument spellings jq defines over `.[]`, and
+    # `isempty(g)` (already above), now take the same arm: a `cond` that cannot
+    # move the register (`. == true`, the verdict is stated) and one that can
+    # (`.a`, a loss), for each of any and all. `any` and `all` are above.
+    "any(. == true)",
+    "all(. == true)",
+    "any(.a)",
+    "all(.a)",
     # wrappers and control flow around the above
     "try .a",
     "(.a // .b)",

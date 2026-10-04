@@ -60573,6 +60573,28 @@ fn test_any_all_gen_cond_unprovable_cond_and_pipe_stage_stay_refused_3749() -> R
             "[]",
             r#"Invalid path expression with result {"a":true}"#,
         ),
+        // The bare spellings (#3763) share both gaps: `any(f)` is the same
+        // `cond` allowlist (#3757), and a frozen `$x` after an `any`, `all` or
+        // `isempty` that decided or did not still meets the pipe stage that
+        // does not read their verdict (#3758).
+        (
+            r#"[{"a":true}]"#,
+            r"path(any(.a))",
+            r#"[0,"a"]"#,
+            "Invalid path expression with result true",
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"path(. as $x | any | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":false,"b":null}"#,
+        ),
+        (
+            r"{}",
+            r"path(. as $x | isempty(.[]?) | $x)",
+            "[]",
+            "Invalid path expression with result {}",
+        ),
     ] {
         let routes = [
             ("stdin", run_jq_full(&["-c", filter], Some(input))?),
@@ -60608,6 +60630,12 @@ fn test_any_all_gen_cond_register_verdict_is_jq_mode_only_3749() -> Result<()> {
         ("del(any(.[]; .))", "[true, false]\n"),
         ("del(all(.[]; .))", "[true, false]\n"),
         ("del(any(.[]; .))", "[false, false]\n"),
+        // The bare spellings are jq mode only too (#3763). Real yq has `any`
+        // and `all` and answers the document unchanged here, so this is a
+        // pre-existing divergence of yq mode that the jq-mode rule must not
+        // move; it is pinned only to prove the gate.
+        ("del(any)", "[true, false]\n"),
+        ("del(all)", "[true, false]\n"),
     ] {
         let (output, code) = spawn_with_signal_retry(
             || {
@@ -60626,7 +60654,329 @@ fn test_any_all_gen_cond_register_verdict_is_jq_mode_only_3749() -> Result<()> {
             "{filter}: {stderr:?}"
         );
     }
+    // The gate itself (#3763): in yq mode a bare `all` on a scalar keeps yq's
+    // own error, `all only supports arrays, was !!int` (real yq v4.53.3, same
+    // wording), where the jq-mode arm would raise the `.[]` it is defined over
+    // (`Cannot iterate over number (1)` / `near attempt to iterate through`).
+    for (filter, input, expected) in [
+        (
+            "[path(.a | all)]",
+            "a: 1\n",
+            "all only supports arrays, was !!int",
+        ),
+        (
+            "[path(true | all)]",
+            "[true, false]\n",
+            "all only supports arrays, was !!bool",
+        ),
+    ] {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut cmd = Command::new(succinctly_bin());
+                cmd.arg("yq").args(["--jq-extensions", filter]);
+                cmd
+            },
+            Some(input.as_bytes()),
+        )?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(stderr.contains(expected), "{filter}: {stderr:?}");
+    }
     Ok(())
+}
+
+/// #3763: jq defines bare `any` as `any(.[]; .)`, `any(f)` as `any(.[]; f)`
+/// (`all` alike) and `isempty(g)` as `first((g | false), true)`, so in
+/// `path()` each emits its boolean from inside the generator once an element
+/// decides, and the register is wherever the generator left it. #3749 made
+/// that true for the two-argument form; these spellings answered an untracked
+/// boolean at the root and refused: `path(any)` on `[true,false]` is `[0]`,
+/// `path(isempty(.[]?))` on `[false]` is `[0]`, and `del`/`=`/`|=` write
+/// there. A generator that never emits leaves the register where it entered,
+/// which the `and`/`or` rows read, and an emitting `isempty` no longer loses
+/// it for a `$x` frozen before it (`try ($x | .a)` is caught, as in jq). Every
+/// row captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_isempty_and_bare_any_all_state_the_register_3763() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (r"[true,false]", r"path(any)", "[0]\n", "", 0),
+        (r"[true,false]", r"path(all)", "[1]\n", "", 0),
+        (r"[true,false]", r"path(any(.))", "[0]\n", "", 0),
+        (r"[true,false]", r"path(all(.))", "[1]\n", "", 0),
+        (r"[true,false]", r"del(any)", "[false]\n", "", 0),
+        (r"[true,false]", r"(any) = 5", "[5,false]\n", "", 0),
+        (r"[true,false]", r"(all) |= 5", "[true,5]\n", "", 0),
+        (r#"{"a":true}"#, r"path(any)", "[\"a\"]\n", "", 0),
+        (
+            r"[[true],[false]]",
+            r"[path(.[] | any)]",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r#"{"a":[true,false]}"#,
+            r"path(.a | any)",
+            "[\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[true,false]}"#,
+            r"path(.a | all)",
+            "[\"a\",1]\n",
+            "",
+            0,
+        ),
+        (r"[true,false]", r"path(any(. == true))", "[0]\n", "", 0),
+        (r"[true,false]", r"path(any(true))", "[0]\n", "", 0),
+        (r"[false,false]", r"path(all(false))", "[0]\n", "", 0),
+        (r"[true]", r"[path(any?)]", "[[0]]\n", "", 0),
+        (r"[false]", r"path(isempty(.[]?))", "[0]\n", "", 0),
+        (r"[false]", r"path(isempty(.[]))", "[0]\n", "", 0),
+        (r"[[false]]", r"path(isempty(.[][]))", "[0,0]\n", "", 0),
+        (r#"{"a":false}"#, r"path(isempty(.a))", "[\"a\"]\n", "", 0),
+        (r"[false]", r"del(isempty(.[]?))", "[]\n", "", 0),
+        (r"[false]", r"(isempty(.[]?)) = 5", "[5]\n", "", 0),
+        (r"[false,true]", r"path(isempty(.[]?))", "[0]\n", "", 0),
+        (
+            r#"{"a":[false]}"#,
+            r"path(.a | isempty(.[]?))",
+            "[\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(isempty(.[]?) | .x?)",
+            "",
+            r#"Invalid path expression near attempt to access element "x" of false"#,
+            5,
+        ),
+        (r#"{"a":false}"#, r"path(any or .a)", "[\"a\"]\n", "", 0),
+        (r#"{"a":true}"#, r"path(all and .a)", "[\"a\"]\n", "", 0),
+        (
+            r#"{"a":false}"#,
+            r"path(isempty(.[]?) or .a)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":false}"#,
+            5,
+        ),
+        (r#"{"a":true}"#, r"del(all and .a)", "{}\n", "", 0),
+        (
+            r#"{"a":false}"#,
+            r"path(false | (any and 1))",
+            "",
+            r"Invalid path expression near attempt to iterate through false",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(false | (isempty(.[]?) and 1))",
+            "",
+            r"Invalid path expression near attempt to iterate through false",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"del(. as $x | isempty(.l[]) | try ($x | .a))",
+            "{\"a\":{\"b\":1},\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(try (any and .a))",
+            "{\"a\":true}\n",
+            "",
+            0,
+        ),
+        (r#"{"a":true}"#, r"del(try (all and .a))", "{}\n", "", 0),
+    ])
+}
+
+/// #3763: what still refuses after the bare spellings state the register, and
+/// the wording they must keep. A boolean that is not identical to the register
+/// (`1` for `true`, `null` for `false`, an array for a result that was never
+/// decided) is refused with jq's own "with result", and an untracked input
+/// still raises `near attempt to iterate through` or jq's own type error from
+/// the `.[]` the definition starts with, so the move off the by-value leaf
+/// loses none of `builtin_navigation`'s refusals. Every row captured from jq
+/// 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_bare_any_all_and_isempty_keep_their_refusals_3763() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r"[1,2]",
+            r"path(any)",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[null]",
+            r"path(all)",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"[null,false]",
+            r"path(all)",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"[false,false]",
+            r"path(any)",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"[true,true]",
+            r"path(all)",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(any)",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(all)",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[true]",
+            r"path(isempty(.[]?))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"{}",
+            r"path(isempty(.[]?))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(isempty(.[]?))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"null",
+            r"path(isempty(.[]?))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[true]",
+            r"path(isempty(.[]))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"{}",
+            r"path([1] | any)",
+            "",
+            r"Invalid path expression near attempt to iterate through [1]",
+            5,
+        ),
+        (
+            r"{}",
+            r"path(1 | any)",
+            "",
+            r"Invalid path expression near attempt to iterate through 1",
+            5,
+        ),
+        (
+            r"{}",
+            r"path(null | any)",
+            "",
+            r"Invalid path expression near attempt to iterate through null",
+            5,
+        ),
+        (
+            r"{}",
+            r"try path([true] | all) catch .",
+            "\"Invalid path expression near attempt to iterate through [true]\"\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"[path(.[] | any)]",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"{}",
+            r"path([1] | any(.))",
+            "",
+            r"Invalid path expression near attempt to iterate through [1]",
+            5,
+        ),
+        (
+            r"{}",
+            r#"path({"a":true} | any)"#,
+            "",
+            r#"Invalid path expression near attempt to iterate through {"a":true}"#,
+            5,
+        ),
+        (r"1", r"path(any)", "", r"Cannot iterate over number (1)", 5),
+        (
+            r#""s""#,
+            r"path(all)",
+            "",
+            r#"Cannot iterate over string ("s")"#,
+            5,
+        ),
+        (
+            r"{}",
+            r"path(false | isempty(.[]?))",
+            "",
+            r"Invalid path expression near attempt to iterate through false",
+            5,
+        ),
+        (
+            r"{}",
+            r"path([1] | isempty(.[]))",
+            "",
+            r"Invalid path expression near attempt to iterate through [1]",
+            5,
+        ),
+        (
+            r"null",
+            r"path(any)",
+            "",
+            r"Cannot iterate over null (null)",
+            5,
+        ),
+        (
+            r"null",
+            r"try path(any) catch .",
+            "\"Cannot iterate over null (null)\"\n",
+            "",
+            0,
+        ),
+    ])
 }
 
 /// #2746: `INDEX(gen;f)`'s own `idx_expr` error aborts the whole
@@ -62426,7 +62776,7 @@ fn test_path_register_long_and_chain_is_bounded_3456() -> Result<()> {
     Ok(())
 }
 
-/// #3456 (B2): the drain producers -- `isempty(g)`, `INDEX(s; f)` and an
+/// #3456 (B2): the drain producers -- `INDEX(s; f)` and an
 /// `[E]` whose contents the resolver does not check -- compute a value
 /// without navigating to it, so they cannot say jq's register is where it
 /// entered. A later refusal of the frozen `$x` is therefore a guess, and a
@@ -62435,20 +62785,15 @@ fn test_path_register_long_and_chain_is_bounded_3456() -> Result<()> {
 /// (or the unchanged document) in jq 1.7.1, which keeps the register where it
 /// was for `INDEX`/`[E]` -- a promotion step's rows, not a fix here. `last(f)`
 /// was promoted out of this list by #3643
-/// (`test_path_register_last_f_does_not_move_it_3643`).
+/// (`test_path_register_last_f_does_not_move_it_3643`), and `isempty(g)` by
+/// #3763 (`test_isempty_and_bare_any_all_state_the_register_3763`): an emitting
+/// generator leaves the register on the node it navigated to.
 #[test]
 fn test_path_register_drain_producers_lose_the_register_uncatchably_3456() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":1,"l":[1,2]}"#;
     let access_a = r#"Invalid path expression near attempt to access element "a""#;
     let access_k = r#"Invalid path expression near attempt to access element "k""#;
     assert_path_rows_3289(&[
-        (
-            doc,
-            r"del(. as $x | isempty(.l[]) | try ($x | .a))",
-            "",
-            access_a,
-            5,
-        ),
         (
             doc,
             r"del(. as $x | INDEX(.l[]; .) | try ($x | .a))",
@@ -64080,15 +64425,18 @@ fn test_and_or_path_by_value_operands_track_the_register_3428() -> Result<()> {
             "",
             0,
         ),
-        // The resolver's guess is uncatchable (#3267): jq catches its own
-        // error inside `try` and leaves the document, this refuses -- loudly,
-        // and never by writing.
+        // jq catches its own path error inside `try` and leaves the document.
+        // This refused loudly (#3267: a guess about where `any` left the
+        // register is uncatchable by design) until #3763 had `any` state the
+        // register that decided -- `.a`, where it is `true` -- so the refusal
+        // of `.a` run against the root is exact, and a `try` catches it as jq's
+        // does.
         (
             r#"{"a":true}"#,
             r"del(try (any and .a))",
+            "{\"a\":true}\n",
             "",
-            "Invalid path expression",
-            5,
+            0,
         ),
         // `add` and `map(f)` navigate their source and backtrack it before they
         // emit, so as `L` they leave `R` a register it can navigate; as `R`
