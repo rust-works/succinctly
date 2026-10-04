@@ -63029,6 +63029,67 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
     ])
 }
 
+/// #3766, characterization of a pre-existing bug: `last(f)` returns a copy of its
+/// output, so a `last` whose output *is* the register (`last($x)`, `last(.)`)
+/// loses its identity, and a `try` around the next navigation then catches a
+/// refusal jq never raises and drops the write with exit 0. jq 1.7.1 answers
+/// `{"a":9}` and `{}`. Verified identical on `main` before #3653 (which only
+/// extends where the register is carried across the wrappers), so this pins an
+/// existing defect rather than a regression. If #3766 is fixed, update the
+/// expectations to jq's answers.
+#[test]
+fn test_last_of_the_register_under_try_drops_the_write_characterize_preexisting_bug_3766(
+) -> Result<()> {
+    let doc = r#"{"a":1}"#;
+    for (filter, jq_answers, today) in [
+        (
+            r"(. as $x | try (last($x) | .a)) = 9",
+            "{\"a\":9}\n",
+            "{\"a\":1}\n",
+        ),
+        (r"del(. as $x | try (last($x) | .a))", "{}\n", "{\"a\":1}\n"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (today, 0),
+            "`{filter}` changed (jq answers {jq_answers:?}): if #3766 is fixed, update this pin; stderr {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3769, characterization of a pre-existing bug: a `foreach` whose EXTRACT
+/// navigates and then ends in `limit(1; last(f))` answers the root path, so a
+/// write through it replaces the whole document (exit 0). jq 1.7.1 answers
+/// `["a"]` twice and `{"a":9}`. Verified identical on `main` before #3653. If
+/// #3769 is fixed, update the expectations to jq's answers.
+#[test]
+fn test_foreach_extract_ending_in_limit_last_answers_the_root_characterize_preexisting_bug_3769(
+) -> Result<()> {
+    let extract = ".a? | limit(1; last(.a?))";
+    for (filter, jq_answers, today) in [
+        (
+            format!("path(foreach (1,2) as $i (.; .; {extract}))"),
+            "[\"a\"]\n[\"a\"]\n",
+            "[]\n[]\n",
+        ),
+        (
+            format!("(foreach (1,2) as $i (.; .; {extract})) = 9"),
+            "{\"a\":9}\n",
+            "9\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (today, 0),
+            "`{filter}` changed (jq answers {jq_answers:?}): if #3769 is fixed, update this pin; stderr {err:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3361: `add`, `flatten`, `map(f)` and `walk(f)` are jq-defined over a
 /// source they backtrack (`reduce .[] as $x ...`, `[.[] | f]`), `to_entries`
 /// keeps every step inside an `as` source or an object construction, and `sort`
