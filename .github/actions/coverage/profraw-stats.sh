@@ -6,14 +6,19 @@
 # been read.
 #
 # It answers what the issue needs before deciding anything about the merge step:
-# how many files (thousands, per #3649), how big, which binary writes them, and
-# whether they dominate the disk the run consumes. Run it after the tests and
-# before the first `cargo llvm-cov report`, which merges them and then removes
-# them.
+# how many files (thousands, per #3649), how big, and which binary writes them.
+# Whether they dominate the disk the run consumes is the total below against the
+# growth in used space between the two `df -h /` lines of the reclaim step and
+# the one at the end of this block. Run it after the tests and before the first
+# `cargo llvm-cov report`, which merges them and then removes them.
 #
 # Where: the action evals `cargo llvm-cov show-env --sh` before the tests, and
 # that points the profiles at $CARGO_LLVM_COV_TARGET_DIR (`target/` with the
 # cargo-llvm-cov in use when this was written), not `target/llvm-cov-target/`.
+# The pattern is an absolute `<dir>/<package>-%p-%Nm.profraw`, so the files sit
+# directly in that directory (or one level down, in the `llvm-cov-target/` the
+# issue expected): the search stops at depth 2 rather than walking a target dir
+# of hundreds of thousands of build files on every run.
 #
 # Names are `<package>-<pid>-<binary signature>_<pool slot>.profraw`, so the
 # signature field groups the files by instrumented binary, without a per-binary
@@ -34,7 +39,7 @@ trap 'rm -f "$list"' EXIT
 echo "::group::profraw stats (#3750 A2)"
 
 # `<bytes>\t<path>` per file. `wc -c ... +` may print several `total` lines.
-find "$dir" -name '*.profraw' -exec wc -c {} + 2>/dev/null |
+find "$dir" -maxdepth 2 -name '*.profraw' -exec wc -c {} + 2>/dev/null |
   awk '{ size = $1; sub(/^ *[0-9]+ +/, ""); if ($0 != "total") print size "\t" $0 }' >"$list"
 
 n=$(wc -l <"$list" | tr -d ' ')
@@ -48,7 +53,8 @@ fi
 # Size distribution: count, total, and percentiles of the file size.
 sort -n "$list" | awk -F'\t' '
   { a[NR] = $1; total += $1 }
-  function pct(p,   i) { i = int(NR * p); if (i < 1) i = 1; return a[i] }
+  # Nearest rank: the smallest value with at least p of the files at or below it.
+  function pct(p,   r, i) { r = NR * p; i = int(r); if (i < r) i++; if (i < 1) i = 1; return a[i] }
   END {
     printf "files: %d  total: %.0f bytes (%.2f GiB)\n", NR, total, total / 1073741824
     printf "size bytes: min=%.0f p50=%.0f p90=%.0f p99=%.0f max=%.0f\n", a[1], pct(0.50), pct(0.90), pct(0.99), a[NR]
@@ -85,9 +91,7 @@ awk -F'\t' '
   sort -rn | head -10 |
   awk -F'\t' '{ printf "  %-22s %7d files  %10.1f MiB  avg %9.1f KiB\n", $3, $2, $1 / 1048576, $1 / $2 / 1024 }'
 
-# What share of the disk the run took: the profile files against the whole
-# target dir (build artifacts included) and what is left.
-echo "target dir: $(du -sk "$dir" 2>/dev/null | awk '{ printf "%.2f GiB", $1 / 1048576 }') on disk"
+# Free disk now, at the run's peak before the merge, for the comparison above.
 df -h / 2>/dev/null || true
 
 echo "::endgroup::"
