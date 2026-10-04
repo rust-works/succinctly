@@ -28334,6 +28334,18 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         }
                         Ok(())
                     }
+                    // #3663: `_modify`'s `reduce` ends with no state, so the
+                    // whole accumulator -- the deletes queued by earlier
+                    // paths included -- is `null` from here; only this path
+                    // is queued again for the final `delpaths`.
+                    Err(EvalEscape::Error(e)) if e.is_update_collapse() => {
+                        deletes.paths.clear();
+                        deletes.record();
+                        deletes.at.clear();
+                        *result = OwnedValue::Null;
+                        untouched = false;
+                        Ok(())
+                    }
                     Err(escape) => {
                         deletes.at.clear();
                         deletes.paths.truncate(pending_before);
@@ -28506,6 +28518,16 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 if wrote {
                     untouched = false;
                 }
+            }
+            // #3663: see the streaming route above.
+            Err(EvalEscape::Error(e)) if e.is_update_collapse() => {
+                if defer_deletes {
+                    deletes.paths.clear();
+                    deletes.record();
+                    deletes.at.clear();
+                }
+                result = OwnedValue::Null;
+                untouched = false;
             }
             Err(escape) => {
                 return match escape {
@@ -33412,6 +33434,14 @@ fn eval_owned_multi_first<S: EvalSemantics>(
         // `.[] |= (1 as $x ?// $y | if $y == null then $x else error("boom")
         // end)` raises `boom` in jq.
         (Some(_), Flow::Escaped(control)) => Err(control.into()),
+        // #3663: a stop the generator honoured comes back `Stopped`; coming
+        // back `Exhausted` after the first output means a `?//` chain caught
+        // the stop in its retry frame and the retry then yielded nothing. In
+        // jq's `_modify` that ends the `reduce` with no state -- the whole
+        // update's accumulator is `null` from this path on.
+        (Some(_), Flow::Exhausted) if S::TAG == EvalTag::Jq => {
+            Err(EvalError::update_collapse().into())
+        }
         (Some(v), _) => Ok(Some(v)),
         // A control with nothing produced before it has no prefix to fall
         // back to, so it escapes: a bare `Error`, a bare `break` (#824) and
@@ -80073,6 +80103,69 @@ mod tests {
                     assert!(e.contains(msg), "{filter}: {e}");
                 }
             }
+        }
+    }
+
+    // #3663: jq 1.7.1, captured live: when the retry after the update's first
+    // output yields nothing, `_modify`'s `reduce` ends with no state, so the
+    // whole accumulator is `null` from that path on -- the paths still to come
+    // write into it, and the paths queued for `delpaths` still apply.
+    #[test]
+    fn update_rhs_alt_chain_retry_yielding_nothing_nulls_the_update_3663() {
+        let q = "(1 as $x ?// $y | select($y == null) | $x)";
+        let cond = format!("(if . == 5 then {q} else 7 end)");
+        for (input, program, expected) in [
+            ("[5]", format!(".[] |= {q}"), "null"),
+            (r#"{"a":5}"#, format!(".a |= {q}"), "null"),
+            (r#"{"a":[5],"b":[6]}"#, format!(".a[] |= {q}"), "null"),
+            (r#"{"a":5,"b":6}"#, format!("(.a, .b) |= {q}"), "null"),
+            ("5", format!(". |= {q}"), "null"),
+            (
+                "[5]",
+                String::from(".[] |= (1 as $x ?// $y | if $y == null then $x else empty end)"),
+                "null",
+            ),
+            (
+                r#"{"a":[5]}"#,
+                format!(".a |= (.[] |= {q})"),
+                r#"{"a":null}"#,
+            ),
+            ("[[5]]", format!(".[][] |= {q}"), "null"),
+            (
+                r#"{"a":5,"b":6}"#,
+                format!("(.a, .b) |= {cond}"),
+                r#"{"b":7}"#,
+            ),
+            (r#"{"a":5,"b":6}"#, format!("(.b, .a) |= {cond}"), "null"),
+            // The delete queued for `[0]` before the collapse is lost with
+            // the state; only the collapsing path's own delete survives.
+            (
+                "[1,2,5]",
+                format!(
+                    "(.[0], .[2], .[1]) |= (if . == 1 then empty elif . == 5 then {q} else 7 end)"
+                ),
+                "[null,7]",
+            ),
+            (
+                "[1,5]",
+                format!(
+                    "(.[0], .[1], .[0]) |= (if . == 1 then empty elif . == 5 then {q} else 7 end)"
+                ),
+                "[7]",
+            ),
+        ] {
+            let filter_expr = parse(&program).unwrap();
+            let input = parse_complete_json(input, false).unwrap();
+            let got = eval_owned_input::<Vec<u64>, JqSemantics>(
+                &filter_expr,
+                &input,
+                false,
+                Reentry::REBUILT,
+            );
+            assert!(
+                matches!(&got, QueryResult::Owned(v) if v.to_json() == expected),
+                "{program}"
+            );
         }
     }
 
