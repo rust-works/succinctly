@@ -93872,6 +93872,30 @@ fn test_postfix_optional_bind_source_gets_a_marker_3519() -> Result<()> {
             "",
             0,
         ),
+        // A fractional literal stays a computed index/slice (jq truncates it
+        // at evaluation), admitted under `?` by its literal key alone; a
+        // different slot still refuses.
+        (
+            input,
+            r"path(.x[1.7]? as $y | .x[1.7] | $y)",
+            "[\"x\",1.7]\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"path(.x[0.5:]? as $y | .x[0.5:] | $y)",
+            "[\"x\",{\"start\":0.5,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            input,
+            r"path(.x[1.7]? as $y | .x[0] | $y)",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
         // A marker-headed source reroots its `?` continuation the same way.
         (
             input,
