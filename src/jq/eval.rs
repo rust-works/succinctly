@@ -40439,6 +40439,19 @@ fn resolve_any_all_gen_cond_sink<'a, S: EvalSemantics>(
                     Err(control) => stop_with_escape(&mut probe_escape, control),
                 };
             }
+            // jq's `path_intact` compares by `jv_identical`, which for `null`,
+            // `true` and `false` is equality: a computed `true` over a register
+            // that is `true` *is* the register, so `cond` navigates it with no
+            // path error (`any(true; .[0]?)` on `true` raises only the type
+            // error its `?` catches). Re-established at the entry, where the
+            // register is. Without it the stage raised a catchable path error
+            // jq never raises, and an enclosing `try` swallowed it.
+            let branch =
+                if trackable && !branch.trackable && null_bool_identical(&branch.value, value) {
+                    PathBranch::new(PathPrefix::root(), branch.value, true)
+                } else {
+                    branch
+                };
             // `c or empty`: each output of `cond` that is truthy emits `true`
             // (`c and empty`: a falsy one emits `false`), the rest backtrack.
             let mut decide = |output: PathBranch<'a>| -> Demand {
