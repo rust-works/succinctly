@@ -45351,6 +45351,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     // #2388: see `resolve_reduce`'s identical hoist.
     let null_ambient = OwnedValue::Null;
     // #2979: see `resolve_reduce`'s identical hoist.
+    // #3742: the same gate `resolve_reduce` puts on #3504's whole-array-slice
+    // rule. jq's `foreach` hands UPDATE's result back as the next state through
+    // the same buffer-sharing slice, so `.[0:]` stays on the register here too.
+    let slice_ok = matches!(patterns, [Pattern::Var(_)]) && !fold_source_moves_register(input);
     let alternative_names = (patterns.len() > 1).then(|| pattern_alternatives_var_names(patterns));
     let alternatives = alternative_names.as_deref();
     let mut drive_fork = |init_branch: PathBranch<'a>| -> Demand {
@@ -45563,8 +45567,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             // then 1 else 2 end) as $v (.; if $v == 2 then . else (1, 2)
                             // end))` answers `[]` at exit 0 where jq 1.7.1 refuses with
                             // "result 1" -- a wrong accept, the write-side hazard class.
-                            (state_at_register, state_snapshot) =
-                                reg.branch_provenance::<S>(Some(update_branch), frame);
+                            (state_at_register, state_snapshot) = reg
+                                .reduce_branch_provenance::<S>(
+                                    Some(update_branch),
+                                    frame,
+                                    slice_ok,
+                                );
                             state = update_branch.value.clone().into_owned();
                             if let Some(ext_expr) = &bound_extract {
                                 if let Some(control) = charge_budget(&mut budget, "foreach") {

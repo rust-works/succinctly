@@ -94365,6 +94365,95 @@ fn test_reduce_whole_array_slice_is_the_register_3504() -> Result<()> {
     ])
 }
 
+/// #3742: #3504's whole-array-slice rule for a `foreach` UPDATE. jq hands the
+/// state back through the same buffer-sharing slice `reduce` does, so
+/// `.[0:]`/`.[null:]` of a non-empty array stays on the register from the
+/// second step on. Partial slices, an empty array, a string, a navigating
+/// source and a destructuring pattern still refuse. Every row captured from
+/// jq 1.7.1.
+#[test]
+fn test_foreach_whole_array_slice_is_the_register_3742() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r"[10,20,30]",
+            r"path(foreach (1,2) as $x (.; .[0:]; .))",
+            "[{\"start\":0,\"end\":null}]\n[{\"start\":0,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (1,2) as $x (.; .[null:]; .))",
+            "[{\"start\":null,\"end\":null}]\n[{\"start\":null,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (1,2,3) as $x (.; .[0:]; .[0:]))",
+            "[{\"start\":0,\"end\":null},{\"start\":0,\"end\":null}]\n[{\"start\":0,\"end\":null},{\"start\":0,\"end\":null}]\n[{\"start\":0,\"end\":null},{\"start\":0,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (1,2) as $x (.; .[0:]?; .))",
+            "[{\"start\":0,\"end\":null}]\n[{\"start\":0,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach 1 as $x (.; .[0:]; .))",
+            "[{\"start\":0,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (1,2) as $x (.; .[1:]; .))",
+            "[{\"start\":1,\"end\":null}]\n",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (1,2) as $x (.; .[null:1]; .))",
+            "[{\"start\":null,\"end\":1}]\n",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r"[]",
+            r"path(foreach (1,2) as $x (.; .[0:]; .))",
+            "[{\"start\":0,\"end\":null}]\n",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r#""abc""#,
+            r"path(foreach (1,2) as $x (.; .[0:]; .))",
+            "[{\"start\":0,\"end\":null}]\n",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (.[]) as $x (.; .[0:]; .))",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r"[10,20,30]",
+            r"path(foreach (1,2) as [$x] (.; .[0:]; .))",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+    ])
+}
+
 /// #3734: the #3504 rule through a postfix `?`. A branch resolved under `?`
 /// carries `Optional(Slice)`, and the chain walk that decides whether a `reduce`
 /// accumulator is still the register matched the raw component, so `.[0:]?`
