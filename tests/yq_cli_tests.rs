@@ -51450,16 +51450,20 @@ fn yq_last_f_does_not_leave_the_path_register_in_place_3643() -> Result<()> {
 #[test]
 fn yq_last_f_output_does_not_keep_its_identity_3766() -> Result<()> {
     let yaml = "a:\n  b: 1\nk: 2\n";
-    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+    for filter in [
         "del(. as $x | 5 | last($x) | .k)",
-        yaml,
-        &["-o=json", "-I=0", "--jq-extensions"],
-    )?;
-    assert_ne!(code, 0, "stdout {stdout:?}");
-    assert!(
-        stderr.contains("Invalid path expression"),
-        "stderr {stderr:?}"
-    );
+        "del(. as $x | last($x) | .k)",
+        "del(last(.) | .k)",
+        "(last(.) | .k) = 9",
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, yaml, &["-o=json", "-I=0", "--jq-extensions"])?;
+        assert_ne!(code, 0, "`{filter}` stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "`{filter}` stderr {stderr:?}"
+        );
+    }
     Ok(())
 }
 
