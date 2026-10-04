@@ -124,10 +124,11 @@ runs:
         # `--fail-under-lines` that 0.45.0 added. `coverage diff`
         # is unchanged for this repo's single-report use: 0.43.0 and 0.46.0
         # rendered byte-identical markdown and json from the same inputs, over
-        # three pairs of real `main` reports including one with uncovered patch
-        # lines and a per-file delta (#3750), and 0.46.0's `coverage lint-markers`
-        # accepts every marker in the tree. Still must stay >= 0.43.0 for the
-        # source markers above.
+        # two pairs of real `main` reports and a third whose patch lines had
+        # their hit counts zeroed by hand to get uncovered lines and a per-file
+        # delta (#3750), and 0.46.0's `coverage lint-markers` accepts every
+        # marker in the tree. Still must stay >= 0.43.0 for the source markers
+        # above.
         version: 0.46.0
         use-prebuilt-binary: ${{ inputs.use-prebuilt }}
         test-args: --features cli,simd,regex,serde --workspace
