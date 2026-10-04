@@ -60936,7 +60936,8 @@ fn test_any_all_undecided_register_needs_a_cond_that_cannot_raise_3763() -> Resu
 /// jq backtracks cleanly. A generator that produced nothing never ran `cond`
 /// (`any(.a)` over `[]`), and a chain of plain navigation steps run only on the
 /// register cannot raise a path error (`any(.a)` over `[{"key":"a","value":1}]`
-/// navigates to `null` and backtracks), so the register is where the construct
+/// navigates to `null` and backtracks; the last four rows have a `cond` that is
+/// neither, and are clean only because `gen` was empty), so the register is where the construct
 /// entered and a `$x` frozen before it re-establishes. The rows above are the
 /// converse: the same navigation on a computed element (`any(1; .a)`) raises in
 /// jq, so it stays refused. Every row captured from jq 1.7.1, on both routes.
@@ -61021,6 +61022,22 @@ fn test_any_all_undecided_register_survives_a_cond_that_never_raised_3763() -> R
             r"Cannot index object with number",
             5,
         ),
+        (r"[]", r"path(any(.a | tostring) or .b?)", "", "", 0),
+        (
+            r"[]",
+            r"del(. as $x | (any(.a += 1) and .b?) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"{}",
+            r"del(. as $x | (all(.a |= 1) or .b?) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (r"[]", r"path(any(unique_by(.)) or .b?)", "", "", 0),
     ])
 }
 
