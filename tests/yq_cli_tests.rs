@@ -122,6 +122,43 @@ fn test_dom_route_union_over_a_generator_follows_yq_3479() -> Result<()> {
 /// (`!!null foo`, `!!bool "yes"`, `!!int abc`, `!!str true`, `!!str null`).
 const TAGGED_KINDS: &str = "a: !!null foo\nb: !!bool \"yes\"\nc: !!seq [1]\nd: ~\ne: true\nf: [1, 2]\ng: !!str true\nh: !!str null\ni: !!int abc\nj: 5\nk: {m: !!bool \"false\"}\n";
 
+/// #3716: the `recurse` cap raises in yq mode too, like every evaluator cap.
+///
+/// Real yq's lexer rejects `recurse` (v4.53.3), so it is a succinctly extension
+/// behind `--jq-extensions` that follows jq's definition and shares the walker
+/// with jq mode: a walk that reaches `RECURSE_MAX_ITEMS` with a node still to
+/// visit raises instead of ending as though it had finished, which answered a
+/// finite document silently short. yq reports it as `Error: ...`, exit 1.
+#[test]
+fn test_yq_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
+    // 6,000 one-element sequences: 12,001 nodes, past the cap.
+    let doc = "- - 1\n".repeat(6000);
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    for filter in [
+        "[recurse(.[]?; true)] | length",
+        "[path(recurse(.[]?; true))] | length",
+        "(recurse(.[]?; true) | select(type == \"!!int\")) |= . + 1",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &args)?;
+        assert_eq!(code, 1, "`{filter}` -- stdout: {stdout:?}");
+        assert_eq!(stdout, "", "`{filter}`");
+        assert!(
+            stderr.contains("recurse: maximum nodes exceeded"),
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    // A bare `.[]?` is uncapped (#3703), and a consumer that stops first never
+    // meets the cap.
+    for (filter, want) in [
+        ("[recurse(.[]?)] | length", "12001\n"),
+        ("[limit(3; recurse(.[]?; true))] | length", "3\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, &doc, &args)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #3703: `recurse(.[]?)` visits every node in yq mode too.
 ///
 /// No oracle exists: real yq's lexer rejects `recurse` outright (`Error: 1:2:

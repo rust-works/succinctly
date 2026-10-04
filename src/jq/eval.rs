@@ -42464,13 +42464,13 @@ fn is_fold_source_navigation(e: &Expr) -> bool {
 /// consumer *inside* the source still narrows it (`first(range(2e9))`
 /// contributes one element, not two billion).
 ///
-/// Six places below this call launder an `Err` into a short `Ok` --
+/// Five places below this call launder an `Err` into a short `Ok` --
 /// `Expr::Optional`'s blanket arm, `resolve_catch`'s no-`catch` case,
 /// `Expr::Label` on a matching break, `resolve_bounded_sink`'s
-/// satisfied-bound fold to `Exhausted`, `resolve_recurse_sink`'s
-/// `RECURSE_MAX_ITEMS` cap, and `resolve_repeat_sink`'s round cap. The
-/// values they deliver are a fold's values here, so anyone changing one of
-/// those is changing a fold's values too.
+/// satisfied-bound fold to `Exhausted`, and `resolve_repeat_sink`'s round cap
+/// (`resolve_recurse_sink`'s `RECURSE_MAX_ITEMS` cap was a sixth until #3716,
+/// which raises it). The values they deliver are a fold's values here, so
+/// anyone changing one of those is changing a fold's values too.
 ///
 /// A source with a `?//` re-enters `step` after a stop has been reported
 /// (#1519's retry, seen from the consuming side): the caller keeps a
@@ -45881,6 +45881,13 @@ fn eval_recurse_cond<S: EvalSemantics>(
 /// "duplicated predicates diverge silently"). Not applied to
 /// [`is_structural_descent`]'s `f`: the value walker hands that to
 /// [`walk_descendants`], and the path walker takes [`recurse_item_cap`].
+///
+/// Reaching it with a node still to visit **raises** an uncatchable
+/// [`EvalError::resource_limit`] ([`recurse_cap_abort`], #3716), like every other
+/// evaluator cap (`range`, `until`, `while`, `reduce`/`foreach`, `repeat`: #2132).
+/// It used to end the walk as though it had finished, which answered a finite
+/// walk over a larger document silently short and left a write through it
+/// silently partial.
 const RECURSE_MAX_ITEMS: usize = 10000;
 
 /// Whether `recurse(f)` / `recurse(f; cond)` is bare `recurse` (#3703).
@@ -45903,9 +45910,10 @@ fn is_structural_descent(f: &Expr, cond: Option<&Expr>) -> bool {
 ///
 /// [`RECURSE_MAX_ITEMS`] exists because a parameterised `f` can be unbounded
 /// -- jq's own `recurse(.a)` on `null` never terminates -- so a collecting
-/// consumer would otherwise grow until the host runs out of memory. It
-/// answers silently short, which is a divergence of its own (still open for
-/// every `f` but [`is_structural_descent`]'s).
+/// consumer would otherwise grow until the host runs out of memory. A walk that
+/// reaches it raises ([`recurse_cap_abort`], #3716) instead of ending silently
+/// short, but a finite walk over a larger document is still refused, for every
+/// `f` but [`is_structural_descent`]'s.
 ///
 /// The value walker needs no cap for that `f`: [`each_recurse_walk`] hands it
 /// to [`walk_descendants`]. The path walker still runs `f` through the
@@ -45972,12 +45980,13 @@ fn walk_descendants(
 /// Finalize `builtin_recurse_f`/`builtin_recurse_cond`'s collected
 /// `outputs` into a `QueryResult` — the two functions' identical tail
 /// (#1023 review of #897, echoing #106): a `pending_error` only surfaces
-/// once `stack` drains naturally, not when [`RECURSE_MAX_ITEMS`] cuts the
-/// loop short instead. This matches the pre-existing `MAX_ITEMS` silent-
-/// truncation convention everywhere else in this file, rather than
-/// surfacing an error whose presence would otherwise depend on where the
-/// arbitrary cap happened to land — see `resolve_recurse_sink`'s own matching
-/// check for the fuller rationale (#842 review).
+/// once the walk ended in an escape or `stack` drained naturally, not when the
+/// consumer's stop cut the loop short. The [`RECURSE_MAX_ITEMS`] cap is one of
+/// those escapes since #3716 ([`recurse_cap_abort`]), so it is raised, with the
+/// outputs delivered before it kept as the partial prefix, like every other cap
+/// in this file; before, it ended the walk silently and dropped a deferred
+/// escape rather than let its presence depend on where the arbitrary cap
+/// landed (#842 review).
 #[inline]
 fn finish_recurse_walk<'a, W>(
     outputs: Vec<OwnedValue>,
@@ -45995,9 +46004,9 @@ fn finish_recurse_walk<'a, W>(
 
 /// How a [`each_recurse_walk`] traversal ended.
 pub(crate) struct RecurseWalkEnd {
-    /// The stack drained naturally -- neither cut short by
-    /// [`RECURSE_MAX_ITEMS`] nor stopped by the sink. [`finish_recurse_walk`]
-    /// surfaces `pending_error` only in this case.
+    /// The walk ended without the sink stopping it: the stack drained, or an
+    /// escape ended it (`f`'s or `cond`'s own, or the [`RECURSE_MAX_ITEMS`] cap's,
+    /// #3716). [`finish_recurse_walk`] surfaces `pending_error` only in this case.
     pub(crate) drained: bool,
     /// An `f`/`cond` escape, deferred by [`queue_recurse_children`] so the
     /// siblings it already approved still get their own descent (#842/#854).
@@ -46016,7 +46025,7 @@ pub(crate) struct RecurseWalkEnd {
 /// [`each_recurse`], the lazy arm. That matters beyond deduplication: this
 /// loop carries #490's "one output, one child", #635's DFS order, #636's
 /// abort-on-`f`-error, #842/#854's deferred escapes and
-/// [`RECURSE_MAX_ITEMS`]' silent cap, and a lazy copy of it would be a
+/// [`RECURSE_MAX_ITEMS`]' cap (raised, #3716), and a lazy copy of it would be a
 /// second place every one of those has to be maintained.
 ///
 /// **`.[]?` with no `cond` takes none of that** (#3703): it is jq's bare
@@ -46104,18 +46113,36 @@ pub(crate) fn each_recurse_walk<S: EvalSemantics>(
     RecurseAbort::walk_end(abort)
 }
 
-/// Why a `recurse` walk ended before every node was visited -- the three
+/// Why a `recurse` walk ended before every node was visited -- the two
 /// ways [`RecurseWalkEnd`] can come out other than "drained, no error".
 enum RecurseAbort {
     /// The sink answered [`Demand::Stop`], carrying any escape an earlier
     /// node had already deferred (see [`RecurseWalkEnd::pending_error`]).
     Stopped(Option<EvalEscape>),
-    /// [`RECURSE_MAX_ITEMS`] was reached with nodes still to visit. A
-    /// deferred escape is dropped, never raised (#842 review).
-    Capped,
     /// `f` or `cond` ended in an escape, raised once every child it had
-    /// already approved has had its own descent (#842/#854).
+    /// already approved has had its own descent (#842/#854). The
+    /// [`RECURSE_MAX_ITEMS`] cap is one too ([`recurse_cap_abort`]).
     Escaped(EvalEscape),
+}
+
+/// What a `recurse` walk ends in when it reaches [`RECURSE_MAX_ITEMS`] with a
+/// node still to visit (#3716): an uncatchable resource-limit error, no
+/// different from `range`'s or `until`'s cap.
+///
+/// It used to be its own abort, mapped to an ordinary end, so the walk
+/// delivered 10,000 nodes and finished with exit 0: `[recurse(.[]?; true)] |
+/// length` on a 12,001-node document answered `10000`, and `recurse(f) |= ...`
+/// left everything past the cap untouched. Being an escape, it rides the same
+/// plumbing as any other: the nodes delivered before it stay delivered, a
+/// collecting consumer raises instead of answering, a write through the walk
+/// raises instead of finishing partially, and [`stop_on_abort`] keeps a `?//`
+/// from retrying past it (a resource limit is never retryable,
+/// [`is_retryable_control`]). It replaces a deferred escape, which a cap used to
+/// drop: either is an error, and the cap is the one the walk's size decided.
+fn recurse_cap_abort() -> RecurseAbort {
+    RecurseAbort::Escaped(EvalEscape::from(Control::Error(EvalError::resource_limit(
+        "recurse: maximum nodes exceeded",
+    ))))
 }
 
 impl RecurseAbort {
@@ -46130,11 +46157,6 @@ impl RecurseAbort {
                 drained: false,
                 pending_error,
                 stopped: true,
-            },
-            Some(Self::Capped) => RecurseWalkEnd {
-                drained: false,
-                pending_error: None,
-                stopped: false,
             },
             Some(Self::Escaped(e)) => RecurseWalkEnd {
                 drained: true,
@@ -46151,8 +46173,9 @@ impl RecurseAbort {
 ///
 /// The stop carries its reason to a `?//` inside the generator the same way
 /// [`stop_with_escape`] does: a `Halt` or an uncatchable error from a deeper
-/// level, and the [`RECURSE_MAX_ITEMS`] cap, must not read as an ordinary
-/// stop a `?//` alternative retries past. Without it,
+/// level, including the [`RECURSE_MAX_ITEMS`] cap's resource limit
+/// ([`recurse_cap_abort`]), must not read as an ordinary stop a `?//`
+/// alternative retries past. Without it,
 /// `recurse(. as [$a] ?// $a | if type == "number" then ("h"|halt_error(3))
 /// else .[] end)` on `[1]` halted twice where jq halts once.
 fn stop_on_abort(slot: &StashedVerdict<RecurseAbort>, end: Option<RecurseAbort>) -> Demand {
@@ -46165,20 +46188,16 @@ fn stop_on_abort(slot: &StashedVerdict<RecurseAbort>, end: Option<RecurseAbort>)
             mark_nonretryable_escape(&control);
             RecurseAbort::Escaped(control.into())
         }
-        RecurseAbort::Capped => {
-            nonretryable_stop::set();
-            RecurseAbort::Capped
-        }
         stopped @ RecurseAbort::Stopped(_) => stopped,
     };
     slot.stash(abort);
     Demand::Stop
 }
 
-/// A `recurse` abort a `?//` retry may not supersede (#3293): the
-/// [`RECURSE_MAX_ITEMS`] cap, and an escape that is a `halt` or a decode
-/// failure, whether raised (`Escaped`) or deferred behind a consumer's stop
-/// (`Stopped(Some(..))`). [`stop_on_abort`] also marks the first two in the
+/// A `recurse` abort a `?//` retry may not supersede (#3293): an escape that is
+/// a `halt`, a decode failure or a resource limit (the [`RECURSE_MAX_ITEMS`] cap
+/// among them, #3716), whether raised (`Escaped`) or deferred behind a consumer's
+/// stop (`Stopped(Some(..))`). [`stop_on_abort`] also marks a raised one in the
 /// side channel; a deferred one is only kept here, never dropped by a later
 /// retry, which is what it did before #3293 too.
 impl Nonretryable for RecurseAbort {
@@ -46186,7 +46205,6 @@ impl Nonretryable for RecurseAbort {
         let escape_is_nonretryable =
             |escape: &EvalEscape| Control::from(escape.clone()).is_nonretryable();
         match self {
-            Self::Capped => true,
             Self::Escaped(escape) => escape_is_nonretryable(escape),
             Self::Stopped(pending) => pending.as_ref().is_some_and(escape_is_nonretryable),
         }
@@ -46484,7 +46502,7 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
     fn visit(&mut self, node: OwnedValue, level: u32) -> Option<RecurseAbort> {
         let _scope = self.budget.scope();
         if self.emitted >= RECURSE_MAX_ITEMS {
-            return Some(RecurseAbort::Capped);
+            return Some(recurse_cap_abort());
         }
         self.emitted += 1;
         if (self.sink)(node.clone()) == Demand::Stop {
@@ -46566,7 +46584,7 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
         }
 
         if !stack.is_empty() {
-            Some(RecurseAbort::Capped)
+            Some(recurse_cap_abort())
         } else {
             pending_error.map(RecurseAbort::Escaped)
         }
@@ -46658,7 +46676,7 @@ fn each_recurse<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Map a [`RecurseWalkEnd`] onto a [`Flow`] -- shared with
 /// `eval_generic`'s own `each_recurse_generic` so the two lazy arms answer a
-/// stop, a cap and a deferred escape identically.
+/// stop, a cap (an escape, #3716) and a deferred escape identically.
 pub(crate) fn recurse_walk_flow(end: RecurseWalkEnd) -> Flow {
     if end.stopped {
         // An escape an earlier node already computed rides out as `pending`,
@@ -46669,9 +46687,9 @@ pub(crate) fn recurse_walk_flow(end: RecurseWalkEnd) -> Flow {
         };
     }
     match (end.drained, end.pending_error) {
-        // `finish_recurse_walk`'s own rule: a deferred escape surfaces only
-        // when the stack drained naturally, never when `RECURSE_MAX_ITEMS`
-        // cut the loop short (#842 review).
+        // `finish_recurse_walk`'s own rule: an escape (the `RECURSE_MAX_ITEMS`
+        // cap's among them, #3716) surfaces when the walk ended in it or the
+        // stack drained, never behind the consumer's own stop (#842 review).
         (true, Some(e)) => Flow::Escaped(Control::from(e)),
         _ => Flow::Exhausted,
     }
@@ -46838,7 +46856,7 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
     // [`recurse_family_root_seed`] -- every subsequent node comes from `f`
     // instead, and that is `child_snapshot`'s own job below, not this seed's.
     match walk.visit(recurse_family_root_seed(value, trackable, snapshot), 0) {
-        None | Some(RecurseAbort::Capped) => ResolveFlow::Exhausted,
+        None => ResolveFlow::Exhausted,
         // A deferred escape the sink stopped before is dropped: jq never
         // resumes a generator once its consumer is satisfied (see
         // [`ResolveFlow::Stopped`]).
@@ -46868,7 +46886,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
     fn visit(&mut self, node: PathBranch<'a>, level: u32) -> Option<RecurseAbort> {
         let _scope = self.budget.scope();
         if self.emitted >= self.cap {
-            return Some(RecurseAbort::Capped);
+            return Some(recurse_cap_abort());
         }
         self.emitted += 1;
         if (self.sink)(Self::delivered(&node)) == Demand::Stop {
@@ -47014,11 +47032,11 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
         }
 
         // Same pending_error/stack-drain rule `finish_recurse_walk` documents
-        // (#842, #1023). Hitting `RECURSE_MAX_ITEMS` with the stack still
-        // non-empty silently truncates without raising `pending_error`,
-        // exactly as the collecting version always did.
+        // (#842, #1023). Hitting the cap with the stack still non-empty raises
+        // it (#3716), in place of a `pending_error`, as the collecting version
+        // does.
         if !stack.is_empty() {
-            Some(RecurseAbort::Capped)
+            Some(recurse_cap_abort())
         } else {
             pending_error.map(RecurseAbort::Escaped)
         }
@@ -109629,18 +109647,17 @@ mod tests {
     }
 
     #[test]
-    fn test_recurse_f_max_items_truncation_suppresses_a_pending_error_842() {
+    fn test_recurse_f_max_items_cap_replaces_a_pending_error_842() {
         // Review of #842's fix: a `pending_error` deferred past `MAX_ITEMS`
         // items must not surface just because of where the (internal,
         // non-jq-semantic) 10000-item safety cap happened to land relative
-        // to it — that would make two structurally identical large fan-outs
-        // (this one, vs. the same shape with no trailing error at all)
-        // diverge on whether an error appears, purely as an accident of the
-        // cap. `builtin_recurse_f` already silently truncates at
-        // `MAX_ITEMS` with no error for a non-erroring fan-out (unrelated
-        // to #842, pre-existing convention); this pins that a *deferred*
-        // error is suppressed the same way once the cap truncates the
-        // drain, rather than resurfacing as `QueryResult::Partial`.
+        // to it -- two structurally identical large fan-outs (this one, vs.
+        // the same shape with no trailing error at all) must not diverge on
+        // which error appears, purely as an accident of the cap. The cap used
+        // to end the walk silently and drop the deferred error with it; since
+        // #3716 it raises, so the same rule reads: the *cap's* error is the
+        // one raised, `recurse: maximum nodes exceeded`, never `bad[0]`'s own,
+        // with the 10000 nodes delivered before it kept as the prefix.
         let large_doc = format!(
             r#"{{"items":[{}],"bad":5}}"#,
             (0..15000)
@@ -109651,19 +109668,20 @@ mod tests {
         query!(
             large_doc.as_bytes(),
             r#"recurse(if type=="object" then (.items[], .bad[0]) else empty end)"#,
-            QueryResult::ManyOwned(vs) => {
-                assert_eq!(vs.len(), 10000);
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix.len(), 10000);
+                assert!(e.is_resource_limit(), "{e:?}");
+                assert_eq!(e.message, "recurse: maximum nodes exceeded");
             }
         );
     }
 
     #[test]
-    fn test_resolve_recurse_sink_max_items_truncation_suppresses_a_pending_error_842() {
+    fn test_resolve_recurse_sink_max_items_cap_replaces_a_pending_error_842() {
         // Path-position sibling of the previous test: `resolve_recurse_sink`'s
         // own `stack.is_empty()` check (its `else` branch, hit only when
-        // `MAX_ITEMS` truncates the drain before a `pending_error` would
-        // otherwise surface) needs the same coverage as
-        // `builtin_recurse_f`'s.
+        // the cap stops the drain before a `pending_error` would otherwise
+        // surface) needs the same coverage as `builtin_recurse_f`'s.
         let large_doc = format!(
             r#"{{"items":[{}],"bad":5}}"#,
             (0..15000)
@@ -109674,8 +109692,10 @@ mod tests {
         query!(
             large_doc.as_bytes(),
             r#"path(recurse(if type=="object" then (.items[], .bad[0]) else empty end))"#,
-            QueryResult::ManyOwned(vs) => {
-                assert_eq!(vs.len(), 10000);
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix.len(), 10000);
+                assert!(e.is_resource_limit(), "{e:?}");
+                assert_eq!(e.message, "recurse: maximum nodes exceeded");
             }
         );
     }
@@ -109683,14 +109703,16 @@ mod tests {
     /// #1023: cross-check that `finish_recurse_walk`'s `stack_is_empty` gate
     /// (now shared by `builtin_recurse_f`/`builtin_recurse_cond`) and
     /// `resolve_recurse_sink`'s own independent `stack.is_empty()` gate still
-    /// agree on the MAX_ITEMS-truncates-a-pending-error edge case, rather
-    /// than relying only on the two sibling tests above individually
-    /// matching their own hand-picked expectations -- an invariant test
-    /// over duplicated logic, per this repo's testing skill: a future edit
-    /// that flips one gate's polarity but not the other's fails *this* test
-    /// even if both individual sibling tests above happened to still pass
-    /// in isolation (e.g. via a compensating change to their own
-    /// expectations).
+    /// agree on the cap-meets-a-pending-error edge case, rather than relying
+    /// only on the two sibling tests above individually matching their own
+    /// hand-picked expectations -- an invariant test over duplicated logic,
+    /// per this repo's testing skill: a future edit that flips one gate's
+    /// polarity but not the other's fails *this* test even if both individual
+    /// sibling tests above happened to still pass in isolation (e.g. via a
+    /// compensating change to their own expectations). Since #3716 the edge
+    /// is an error in both positions (the cap's, not the deferred one), and
+    /// the two are compared against each other: the same count of nodes
+    /// delivered before it, and the same error.
     #[test]
     fn test_recurse_family_max_items_gate_agrees_across_value_and_path_position_1023() {
         let large_doc = format!(
@@ -109702,29 +109724,30 @@ mod tests {
         );
 
         // `query!` panics on any variant other than the one named, so this
-        // fails loudly (not silently) if either gate started surfacing the
-        // deferred error as `Partial` instead of suppressing it -- and the
-        // two counts are compared against *each other*, not just each
+        // fails loudly (not silently) if either gate stopped raising the cap
+        // -- and the two are compared against *each other*, not just each
         // against its own hardcoded literal, so a compensating edit to both
         // sibling tests' expectations above couldn't hide a real divergence
         // here the way two independently-asserted literals could.
-        let value_count = query!(
+        let (value_count, value_error) = query!(
             large_doc.as_bytes(),
             r#"recurse(if type=="object" then (.items[], .bad[0]) else empty end)"#,
-            QueryResult::ManyOwned(vs) => vs.len()
+            QueryResult::Partial(prefix, Control::Error(e)) => (prefix.len(), e.message)
         );
-        let path_count = query!(
+        let (path_count, path_error) = query!(
             large_doc.as_bytes(),
             r#"path(recurse(if type=="object" then (.items[], .bad[0]) else empty end))"#,
-            QueryResult::ManyOwned(vs) => vs.len()
+            QueryResult::Partial(prefix, Control::Error(e)) => (prefix.len(), e.message)
         );
 
         assert_eq!(value_count, 10000, "value-position gate diverged");
+        assert_eq!(value_error, "recurse: maximum nodes exceeded");
         assert_eq!(
             path_count, value_count,
             "path-position gate ({path_count}) disagrees with value-position gate \
              ({value_count})"
         );
+        assert_eq!(path_error, value_error);
     }
 
     #[test]
@@ -109958,14 +109981,15 @@ mod tests {
     }
 
     #[test]
-    fn test_recurse_cond_max_items_truncation_suppresses_a_pending_error_854() {
+    fn test_recurse_cond_max_items_cap_replaces_a_pending_error_854() {
         // Review of #842's fix, now exercised via `cond`'s own deferred
         // error rather than `f`'s: a `pending_error` sourced from `cond`
         // and deferred past `MAX_ITEMS` items must not surface just because
         // of where the (internal, non-jq-semantic) 10000-item safety cap
         // happened to land -- same rationale as
-        // `test_recurse_f_max_items_truncation_suppresses_a_pending_error_842`,
-        // now pinning `builtin_recurse_cond`'s own `deferred_error` source.
+        // `test_recurse_f_max_items_cap_replaces_a_pending_error_842`, now
+        // pinning `builtin_recurse_cond`'s own `deferred_error` source: the
+        // cap's error is the one raised (#3716), not `cond`'s `boom`.
         // `.items?[]?` (not `.items[]?`) so a leaf value (e.g. `0`) recurses
         // to empty rather than erroring on the `.items` field access itself
         // (confirmed against real jq 1.7.1: `.items[]?` on a bare number
@@ -109982,14 +110006,16 @@ mod tests {
         query!(
             large_doc.as_bytes(),
             r#"recurse(.items?[]?; if . == -1 then error("boom") else true end)"#,
-            QueryResult::ManyOwned(vs) => {
-                assert_eq!(vs.len(), 10000);
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix.len(), 10000);
+                assert!(e.is_resource_limit(), "{e:?}");
+                assert_eq!(e.message, "recurse: maximum nodes exceeded");
             }
         );
     }
 
     #[test]
-    fn test_resolve_recurse_cond_max_items_truncation_suppresses_a_pending_error_854() {
+    fn test_resolve_recurse_cond_max_items_cap_replaces_a_pending_error_854() {
         // Path-position sibling of the previous test: `resolve_recurse_sink`'s
         // own `stack.is_empty()` check needs the same coverage when the
         // deferred error is sourced from `cond` rather than `f`.
@@ -110000,8 +110026,10 @@ mod tests {
         query!(
             large_doc.as_bytes(),
             r#"path(recurse(.items?[]?; if . == -1 then error("boom") else true end))"#,
-            QueryResult::ManyOwned(vs) => {
-                assert_eq!(vs.len(), 10000);
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix.len(), 10000);
+                assert!(e.is_resource_limit(), "{e:?}");
+                assert_eq!(e.message, "recurse: maximum nodes exceeded");
             }
         );
     }
