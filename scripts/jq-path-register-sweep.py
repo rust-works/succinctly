@@ -56,8 +56,8 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 1,264,000 rows (`--list-axes` prints the exact count:
-130 operands, each also swept as a bare pipe stage since #3361, across 27 contexts),
+**Size.** The full grid is about 1,342,000 rows (`--list-axes` prints the exact count:
+143 operands, each also swept as a bare pipe stage since #3361, across 27 contexts),
 which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
@@ -75,6 +75,8 @@ Usage:
   ./scripts/jq-path-register-sweep.py --candidate ... --sample 2000 --seed 7
   ./scripts/jq-path-register-sweep.py --candidate ... --list-axes
   ./scripts/jq-path-register-sweep.py --candidate ... --operand any --operand 'all'
+  ./scripts/jq-path-register-sweep.py --candidate ... --stage-only   # quick, not a gate
+  ./scripts/jq-path-register-sweep.py --candidate ... --json out.jsonl   # rows stream to out.jsonl.partial
 """
 
 import argparse
@@ -440,6 +442,11 @@ def build_rows(operands=None, stage_only=False):
     for operand in OPERANDS if operands is None else operands:
         for shape in shapes_for(operand, stage_only):
             for cname, template in CONTEXTS:
+                # An operand that names `$x` only means something where the context
+                # binds it; elsewhere jq and the build both fail to compile, a
+                # trivial MATCH that carries no signal (3.4% of the grid, #3653).
+                if "$x" in shape and "$x" not in template:
+                    continue
                 program = template.replace("{X}", shape)
                 for doc in INPUTS:
                     rows.append((f"{cname}|{shape}", doc, program))
