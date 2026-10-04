@@ -74875,6 +74875,24 @@ mod tests {
         }};
     }
 
+    /// #3757: resolving an `any`/`all` `cond` as `gen | cond` and stating the
+    /// register it left is jq mode only (ADR-0018): real yq has no two-argument
+    /// `any`, so under `--jq-extensions` the shape is succinctly's own surface
+    /// with no oracle. The CLI's yq routes take the cursor evaluator for these
+    /// shapes and never reach the arm, so this entry is the only one that does:
+    /// `(any(.[]; .a)) = 5` writes `[{"a":5}]` in jq mode, and yq mode leaves the
+    /// document as it was (its no-op convention for a path the resolver cannot
+    /// name), so a build that resolves `cond` live in yq mode too would write.
+    #[test]
+    fn test_any_all_live_cond_is_jq_mode_only_3757() {
+        let bytes: &[u8] = br#"[{"a":true}]"#;
+        yq_query!(bytes, r"(any(.[]; .a)) = 5",
+            QueryResult::Owned(value) => {
+                assert_eq!(format!("{value:?}"), r#"Array([Object({"a": Bool(true)})])"#);
+            }
+        );
+    }
+
     /// #1755: the sort/unique/group_by/min/max family of builtins
     /// (`eval.rs`'s own `to_owned_lossy`-based materialization, reachable only
     /// through the public `succinctly::jq::eval` library API, not the
