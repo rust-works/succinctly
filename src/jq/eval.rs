@@ -37791,7 +37791,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // three they interleave a per-element `cond` probe with `gen`'s own
         // consumption to decide when to stop (#3349).
         Expr::LastExpr(inner) | Expr::Builtin(Builtin::LastStream(inner)) => {
-            let mut last: Option<OwnedValue> = None;
+            let mut last: Option<PathBranch<'a>> = None;
             let flow = resolve_node_sink::<S>(
                 inner,
                 value,
@@ -37800,7 +37800,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 frame,
                 Keep::AtMost(usize::MAX),
                 &mut |branch| {
-                    last = Some(branch.value.into_owned());
+                    last = Some(branch);
                     Demand::Continue
                 },
             );
@@ -37815,7 +37815,33 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             } else {
                 drained_register::<S>(trackable, value)
             };
-            forward_drained_result(flow, last.unwrap_or(OwnedValue::Null), register, sink)
+            // #3766: the result is `$x`, the very `jv` `f` last emitted, so it
+            // keeps that output's identity: `jv_identical` (what `path()` checks
+            // the result with) is pointer identity for a string, array or object,
+            // and a `last($x)` over a `$x` frozen at the register, or `last(.)`,
+            // hands the register itself back (`path(last(.))` is `[]`, and
+            // `. as $x | 5 | last($x) | .k` navigates it). So an output that *is*
+            // the entry node (trackable at the root) is forwarded as that node,
+            // and an untracked output keeps the snapshot mark that says which
+            // node it is, exactly as a bare `5 | $x` would. Any other output is
+            // a copy that is not the register, as before: `last(.a)` moved off
+            // it and jq refuses it. Jq mode only, like the register (ADR-0018:
+            // yq has no oracle for either).
+            let result = match last {
+                Some(branch) if last_register_unmoved::<S>() => {
+                    if branch.trackable && branch.path.depth() == 0 {
+                        branch
+                    } else {
+                        PathBranch::demoted(branch.snapshot, Cow::Owned(branch.value.into_owned()))
+                            .with_register(register)
+                    }
+                }
+                Some(branch) => {
+                    untracked_at_register(Cow::Owned(branch.value.into_owned()), register)
+                }
+                None => untracked_at_register(Cow::Owned(OwnedValue::Null), register),
+            };
+            forward_drained_branch(flow, result, sink)
         }
 
         Expr::Builtin(Builtin::IsEmpty(inner)) => {
