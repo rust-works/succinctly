@@ -629,10 +629,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer what jq answers, `walk(.a) | .x` and `.x | walk(.a)` (refused until now) name `["a","x"]` and
   `["x","a"]`, and `walk(.)` over a number or a string no longer refuses; `walk(select(true))`,
   `walk(..)` and `walk(null)` keep jq's `[]`. An array or an object keeps the by-value route, where jq
-  refuses too. On `scripts/jq-path-register-sweep.py` over nine operands (53,487 rows) the 5 rows that
-  differed from jq now match, along with 38 that were refusals, nothing regressed and
-  accepted-where-jq-refuses stays 0; two seeded 20,027-row samples gain 2 matches each, and a 4,620-row
-  differential over by-value builtins and nested `walk`s has no row worse than before.
+  refuses too, and that route now also refuses when `f` yields nothing (`{} | path(walk(empty))`,
+  `[null,null] | path(walk(.a?))`), as jq does: without it, `(..|walk(.a?)) |= 5` over `[null,null]`
+  reached the scalar leaves through the root array's silence and wrote where jq errors. For an array the
+  verdict is asked of the resolver (the trailing `f` is resolved against the array rebuilt at every nesting
+  level, as an untracked value), so `walk(select(type == "object") | .a)` and `walk(getpath(["a"])?)`,
+  which never navigate there, stay silent as in jq. A body with a side effect (`debug`, `stderr`, `input`,
+  ...) cannot be asked without running it twice, so one that can navigate is refused instead.
+  On `scripts/jq-path-register-sweep.py` over fourteen operands (90,747 rows) the 5 rows that differed
+  from jq now match, along with 38 that were refusals, nothing regressed and accepted-where-jq-refuses
+  stays 0; two seeded 20,027-row samples move 50 rows toward jq each, and an 11,340-row differential over
+  by-value builtins, nested `walk`s, streams that mix containers and scalars and conditionally navigating
+  `f`s has no row worse than before (accepted-where-jq-refuses 444 becomes 0). This closes the direct
+  shapes of #3723 (an `f` that navigates the rebuilt array at any nesting level, bare in `path`, `del`,
+  `=` and `|=`, and a nested `walk(walk(empty))`); one shape stays open there, pinned as today's
+  behaviour: a `[walk(f)]` collect whose refusal a later `try` swallows.
 
 - **jq: a `reduce`/`foreach` source that jq always refuses in path position now raises** (#3726).
   `from_entries`, `unique`, `unique_by`, `with_entries`, `map_values`, `sub`/`gsub`, `ascii_downcase`/
@@ -666,7 +677,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cap lifted, 0.90 GB capped at the old 10,000 nodes, and `..`'s 0.46 GB. Any other `f`, and any `cond`, still
   stops at 10,000 (#3716), and `path(recurse(.[]?))` still runs `.[]?` at every node, about 1.8 times
   `path(..)`'s time (2.9 s against 1.6 s over 1.15 M nodes, #3717); see `docs/compliance/jq/limitations.md`.
-
 
 - **jq: an `and`/`or` whose left operand is a full or empty slice of `[]` no longer accepts an optional
   index on its right in path position** (#3647, a #3494 residual). `[] | del(.[0:0] and .b?)`,
