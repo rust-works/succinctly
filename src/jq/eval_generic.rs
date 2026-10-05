@@ -45969,6 +45969,13 @@ mod tests {
             .map(|i| format!("- a:\n    b: {i}\n"))
             .collect::<String>();
         let index = crate::yaml::YamlIndex::build(yaml.as_bytes()).unwrap();
+        // The default: a format that does not resume has no element chain.
+        let first_item = index
+            .root(yaml.as_bytes())
+            .first_child()
+            .and_then(|sequence| sequence.first_child())
+            .expect("the document's first item");
+        assert!(first_item.next_element().is_none());
         let expr = parse("[.[] | .[] | tostring | [key]]").unwrap();
         let before = slot_memo::work();
         let mut out = Vec::new();
