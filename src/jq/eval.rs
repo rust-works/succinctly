@@ -40458,6 +40458,24 @@ fn is_select_stage(stage: &Expr) -> bool {
 ///   last(.a))`, `first(select(.))`), but moved for any other `E` (`first(.a)`).
 ///   The caller then asks whether what is underneath is one of the two, which is
 ///   what keeps `first(.a)` refused.
+/// - `limit(n; E)` and `nth(n; E)` (#3767) are `first(E)`'s wider siblings: they
+///   emit `E`'s outputs from inside `E` as well, so the register is wherever `E`
+///   left it and the inner stage decides. Only the spellings the parser builds
+///   are read (`Expr::Limit`, `Builtin::NthStream`); `Builtin::Limit` and
+///   `Expr::NthExpr` are constructible but parser-unreachable, as in
+///   [`may_alias_register`]. Captured the same way, for every `n'
+///   (`limit(1; E)`, `limit(2; E)` and `limit(-1; E)`, which is `E`, and
+///   `nth(0; E)`) and nested in each other and in `try`/`first`, `[]` for `E` over
+///   `last(.a)`, `select(.)`, `numbers` and `values`, and still refused for `.a`
+///   (`limit(1; .a)` moves it). The count `n` is bound as a subexp, so it moves and
+///   path-checks nothing whatever it navigates. `limit(0; E)` and `nth(1; E)` over
+///   a one-output `E` emit nothing at all, which both sides agree on.
+///
+/// This list answers "does this wrapper add no movement of its own?". It is not
+/// [`is_transparent_bind_source`]'s ("does nothing in this source navigate?") nor
+/// [`may_alias_register`]'s ("may this forward the register by pointer?"): the
+/// three differ on purpose (`limit` is read here and by the first, `nth` here and
+/// by the second), so a wrapper added to one is not owed to the others.
 fn peel_register_transparent(expr: &Expr) -> &Expr {
     match unwrap_paren(expr) {
         Expr::Optional(inner)
@@ -40466,7 +40484,10 @@ fn peel_register_transparent(expr: &Expr) -> &Expr {
             catch: None,
         }
         | Expr::FirstExpr(inner)
-        | Expr::Builtin(Builtin::FirstStream(inner)) => peel_register_transparent(inner),
+        | Expr::Limit { expr: inner, .. }
+        | Expr::Builtin(Builtin::FirstStream(inner) | Builtin::NthStream(_, inner)) => {
+            peel_register_transparent(inner)
+        }
         other => other,
     }
 }
@@ -41477,7 +41498,10 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         | Expr::Slice { .. }
         | Expr::Iterate
         | Expr::RecursiveDescent => true,
-        Expr::Builtin(Builtin::Select(_)) => true,
+        // `select(f)` and, since #3767, the type filters: every one is a `select`
+        // over a type test ([`is_select_stage`], one definition), whose condition is
+        // a subexp, so none of them navigates anything for jq to path-check.
+        Expr::Builtin(_) if is_select_stage(inner) => true,
         // #2764: the resolver resolves `f` live against every node, and
         // `cond` runs as `select(cond)`'s condition, a subexp in jq.
         Expr::Builtin(Builtin::RecurseF(f) | Builtin::RecurseCond(f, _)) => {
@@ -83599,6 +83623,15 @@ mod tests {
             "try numbers",
             "first(select(.))",
             "first(numbers)?",
+            // #3767: `limit`/`nth` emit from inside `E`, so the inner stage decides.
+            "limit(1; select(.))",
+            "limit(2; numbers)",
+            "limit(-1; values)",
+            "nth(0; select(.))",
+            "nth(0; strings)?",
+            "limit(1; try select(.))",
+            "first(limit(1; numbers))",
+            "nth(0; limit(1; select(.)))",
         ] {
             let expr = stage(admitted);
             let peeled = peel_register_transparent(&expr);
@@ -83621,6 +83654,11 @@ mod tests {
             "(last(.a))?",
             "try last(.a)",
             "first(last(.a))",
+            "limit(1; last(.a))",
+            "limit(2; last(.a, .k))",
+            "nth(0; last(.a))",
+            "limit(1; first(last(.a)))",
+            "(limit(1; last(.a)))?",
         ] {
             let expr = stage(admitted);
             let peeled = peel_register_transparent(&expr);
@@ -83642,9 +83680,15 @@ mod tests {
             "try last(.a) catch .",
             "first(.a)",
             "first(.a)?",
-            "limit(1; last(.a))",
-            "nth(0; select(.))",
             "(last(.a), select(.))",
+            // #3767: a wrapper over a stage that navigates still moves the register
+            // (`limit(1; .a)` is a path error in jq), and a handler is not peeled.
+            "limit(1; .a)",
+            "limit(2; first(.a))",
+            "nth(0; .a)",
+            "nth(0; try .a)",
+            "limit(1; try last(.a) catch .)",
+            "limit(1; (last(.a), select(.)))",
         ] {
             let expr = stage(refused);
             assert!(

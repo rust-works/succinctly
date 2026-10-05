@@ -518,12 +518,23 @@ Each turns a refusal into an answer and needs its own oracle rows:
   pass the inner register on. A `select` entered on the register already passed a trackable
   branch through; only the register *carried* by an untracked entry was dropped, so the sweep
   gained contexts that enter the stage on a literal (`untracked-*`). Still refused where jq
-  answers, tracked by #3767: `try ... catch H`, `limit(n; E)`, `nth(n; E)`, an `[E]` collect of a
-  type filter, and either stage inside a compound stage. Not a promotion but found on the way,
+  answers, tracked by #3767: `try ... catch H` and either stage inside a compound stage
+  (`limit`/`nth` and an `[E]` collect of a type filter were lifted by #3767 Part 1, below). Not a
+  promotion but found on the way,
   #3766 (fixed): `last(f)` returned a copy, so a `last` whose output is the register itself
   (`last($x)`, `last(.)`) lost its identity; the arm now forwards the last branch itself when
   it is the entry node, and keeps an untracked output's snapshot mark, so it states the
   identity of the value `f` last emitted.
+- ~~`limit(n; E)` and `nth(n; E)` around a register-keeping stage, and an `[E]` collect of a type
+  filter.~~ Done by #3767 Part 1. Both emit from inside `E` like `first(E)`, so
+  `peel_register_transparent` reads them through (`Expr::Limit`, `Builtin::NthStream`: the
+  spellings the parser builds) and the inner stage decides: `last(f)`, `select(f)` and the type filters
+  leave the register where it entered, `.a` still moves it. The count is a subexp. And
+  `array_contents_are_checked` asks `is_select_stage` (select or a type filter), where it named
+  only `select`. Still open under #3767: a `catch` handler, a compound inner stage (`,` `//`
+  `if`, a pipe, a `def` call), an `[E]` of a navigating `f` or of a wrapper around a type filter
+  (`[first(numbers)]`), and a wrapper over an inner stage that navigates nothing (`first(.)`,
+  `limit(1; .)`, `limit(1; 5)`), which jq leaves in place and the allowlist does not read through.
 - The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
   turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`
   into jq's `[]`. Cheap now, because the producers already say it.
