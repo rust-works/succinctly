@@ -128,12 +128,7 @@ runs:
             ;;
         esac
 
-    # #3750 (2026-10-04): pinned to v1.3 rather than the floating `@v1` while profile-file
-    # pooling is timed. `@v1` moved to v1.3 between two runs that day with no
-    # commit here, and the job shortened by 5-8 minutes: a change like that makes
-    # a before/after of anything else unreadable. Go back to `@v1` once the pooling
-    # decision is made; nothing but this comment and #3750 reminds anyone.
-    - uses: action-works/omni-dev-coverage-check@99cb840f1a614c83b3839b9d67b3c5caee227ae1 # v1.3
+    - uses: action-works/omni-dev-coverage-check@v1
       with:
         # Pin; we're a consumer. Must stay >= 0.38.0: that release added the
         # declarative `.omni-dev/coverage.yaml` ignore-list (omni-dev#1398),
@@ -174,9 +169,11 @@ runs:
         version: 0.46.0
         use-prebuilt-binary: ${{ inputs.use-prebuilt }}
         test-args: --features cli,simd,regex,serde --workspace
-        # #3750 A2, observation only: logs how many raw profile files the run
-        # left and how big they are, before the lcov step merges them. Delete
-        # this line and profraw-stats.sh once a run's log has been read.
+        # #3750: logs how many raw profile files the run left and how big they
+        # are, before the lcov step merges them, and fails a run that asked for
+        # pooling (`pool-profile-files`) whose files are not pooled. While pooling
+        # is on this is the only check that it took effect: delete this line and
+        # profraw-stats.sh only together with that input.
         extra-test-commands: bash "${{ github.action_path }}/profraw-stats.sh"
         fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
         # fail-under-patch left unset → report-only initially
