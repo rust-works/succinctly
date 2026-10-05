@@ -8223,45 +8223,30 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #3520: a target that can fan out is pulled one output at a time --
         // see `eval_generic::process_index_key`.
         if S::TAG == EvalTag::Jq && !yields_at_most_one_value(target) {
-            let mut own_escape: Option<Control> = None;
-            let mut stopped = false;
+            let drive = TargetDrive::new();
             let target_flow = eval_each::<W, S>(target, value.clone(), false, &mut |t_item| {
                 // A re-invocation after a stop is a `?//` retry inside the
                 // target (#3293): it supersedes the retried-past call.
-                own_escape = None;
-                stopped = false;
+                drive.begin();
                 let t = match t_item.into_owned::<S>() {
                     Ok(t) => t,
-                    Err(err) => {
-                        own_escape = Some(Control::Error(err));
-                        return Demand::Stop;
-                    }
+                    Err(err) => return drive.stop_with_escape(Control::Error(err)),
                 };
                 match index_one_owned::<S>(&t, &k, optional) {
                     Ok(Some(v)) => {
                         if sink(Item::Owned(v)) == Demand::Stop {
-                            stopped = true;
-                            return Demand::Stop;
+                            return drive.consumer_stop();
                         }
                         Demand::Continue
                     }
                     Ok(None) => Demand::Continue,
-                    Err(err) => {
-                        own_escape = Some(Control::Error(err));
-                        Demand::Stop
-                    }
+                    Err(err) => drive.stop_with_escape(Control::Error(err)),
                 }
             });
-            if stopped {
-                return Demand::Stop;
-            }
-            if let Some(control) = own_escape {
-                return escape.stop(control);
-            }
-            return match target_flow {
-                Flow::Exhausted => Demand::Continue,
-                Flow::Stopped { .. } => Demand::Stop,
-                Flow::Escaped(control) => escape.stop(control),
+            return match drive.finish(target_flow, direct_pattern_retry(target)) {
+                TargetEnd::Stopped => Demand::Stop,
+                TargetEnd::Escape(control) => escape.stop(control),
+                TargetEnd::Exhausted => Demand::Continue,
             };
         }
         let literal_key = owned_to_expr(&k);
@@ -26156,43 +26141,31 @@ fn slice_pair_streaming<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> (Option<Control>, bool) {
-    let mut escape: Option<Control> = None;
-    let mut stopped = false;
+    let drive = TargetDrive::new();
     let flow = eval_each::<W, S>(target, value, false, &mut |item| {
         // A re-invocation after a stop is a `?//` retry inside the target
         // (#3293): it supersedes the retried-past call.
-        escape = None;
-        stopped = false;
+        drive.begin();
         let t = match item.into_owned::<S>() {
             Ok(t) => t,
-            Err(err) => {
-                escape = Some(Control::Error(err));
-                return Demand::Stop;
-            }
+            Err(err) => return drive.stop_with_escape(Control::Error(err)),
         };
         match slice_owned_value_read_computed::<S>(&t, s, e, optional) {
             Ok(Some(v)) => {
                 if sink(v) == Demand::Stop {
-                    stopped = true;
-                    return Demand::Stop;
+                    return drive.consumer_stop();
                 }
                 Demand::Continue
             }
             Ok(None) => Demand::Continue,
-            Err(err) => {
-                escape = Some(Control::Error(err));
-                Demand::Stop
-            }
+            Err(err) => drive.stop_with_escape(Control::Error(err)),
         }
     });
-    match flow {
-        Flow::Escaped(control) if escape.is_none() && !stopped => escape = Some(control),
-        // A stop the consumer did not issue is a stale enclosing driver's
-        // (#3293); the pair ends, as the index twin's does.
-        Flow::Stopped { .. } if escape.is_none() => stopped = true,
-        _ => {}
+    match drive.finish(flow, direct_pattern_retry(target)) {
+        TargetEnd::Stopped => (None, true),
+        TargetEnd::Escape(control) => (Some(control), false),
+        TargetEnd::Exhausted => (None, false),
     }
-    (escape, stopped)
 }
 
 /// One `(s, e)` pair's worth of [`each_slice_expr`]'s work: evaluate `target`
@@ -55419,6 +55392,84 @@ impl StashedVerdict<Flow> {
         self.at.set(pipe_retry_generation());
         self.slot.set(slot);
         demand
+    }
+}
+
+/// The out-of-band state of a computed index's or slice's *target* drive
+/// (`(G)[K]`, `(G)[a:b]`, #3807), shared by the four drivers that pull a target
+/// that can fan out one output at a time (#3520).
+///
+/// Each driver's closure answers `Stop` for two reasons -- the consumer
+/// stopped, or an index/slice of this output raised -- and either can be
+/// retried past by a `?//` inside `G` (#1519). A retry that produces another
+/// output re-invokes the closure, which [`Self::begin`] resets; one that
+/// produces nothing or raises never does, so [`Self::finish`] compares the
+/// retry generation at the stop with the drive's own verdict
+/// ([`retry_superseded`]) instead of returning whichever is stashed. Captured
+/// against jq 1.7.1: `null | ([{"x":1}] as [$q] ?// $q | $q |
+/// select(type=="array"|not))[(0|.+0)]` is empty, not the first alternative's
+/// "Cannot index object with number".
+pub(crate) struct TargetDrive {
+    escape: StashedEscape,
+    stopped_at: core::cell::Cell<Option<u64>>,
+}
+
+/// How a [`TargetDrive`] ended.
+pub(crate) enum TargetEnd {
+    /// The target stopped: the consumer's own stop, or a stale enclosing
+    /// driver's (#3293) -- either way the pull ends and the caller's own exit
+    /// judges which.
+    Stopped,
+    /// The target raised, whether an index/slice of one of its outputs that no
+    /// retry superseded, or its own generator's trailing control.
+    Escape(Control),
+    /// The target ran dry.
+    Exhausted,
+}
+
+impl TargetDrive {
+    pub(crate) const fn new() -> Self {
+        Self {
+            escape: StashedEscape::new(),
+            stopped_at: core::cell::Cell::new(None),
+        }
+    }
+
+    /// Call at the top of every invocation of the drive's closure.
+    pub(crate) fn begin(&self) {
+        self.escape.begin();
+        self.stopped_at.set(None);
+    }
+
+    /// An index/slice of this output raised: stash it and stop the target.
+    pub(crate) fn stop_with_escape(&self, control: Control) -> Demand {
+        self.escape.stop(control)
+    }
+
+    /// The consumer stopped on this output.
+    pub(crate) fn consumer_stop(&self) -> Demand {
+        self.stopped_at.set(Some(pipe_retry_generation()));
+        Demand::Stop
+    }
+
+    /// Resolve the drive against the verdict `flow` it returned. `direct_retry`
+    /// is [`direct_pattern_retry`] of the target expression.
+    pub(crate) fn finish(self, flow: Flow, direct_retry: bool) -> TargetEnd {
+        if self
+            .stopped_at
+            .get()
+            .is_some_and(|at| !retry_superseded(&flow, at, direct_retry))
+        {
+            return TargetEnd::Stopped;
+        }
+        if let Some(control) = self.escape.take(&flow, direct_retry) {
+            return TargetEnd::Escape(control);
+        }
+        match flow {
+            Flow::Exhausted => TargetEnd::Exhausted,
+            Flow::Stopped { .. } => TargetEnd::Stopped,
+            Flow::Escaped(control) => TargetEnd::Escape(control),
+        }
     }
 }
 
@@ -111305,6 +111356,74 @@ mod tests {
                 };
                 let got: Vec<_> = values.iter().map(OwnedValue::to_json).collect();
                 assert_eq!(format!("[{}]", got.join(",")), expected, "`{filter}`");
+            }
+        }
+    }
+
+    /// #3807: the library route's streaming index/slice drivers raise an
+    /// index/slice error no retry superseded, and the decode failure of an
+    /// undecodable target output (which no `?//` retries). `first` makes the
+    /// consumer the streaming sink, so `each_index_expr` and
+    /// `slice_pair_streaming` run rather than the eager collectors.
+    #[test]
+    fn test_index_and_slice_target_errors_raise_3807() {
+        for (input, filter, message) in [
+            (
+                "1",
+                "first((.,.)[(0|.+0)])",
+                "Cannot index number with number",
+            ),
+            (
+                "1",
+                "first((.,.)[(0|.+0):(1|.+0)])",
+                "Cannot index number with object",
+            ),
+            (r#""\ud800""#, "first((.,.)[(0|.+0)])", "unicode"),
+            (r#""\ud800""#, "first((.,.)[(0|.+0):(1|.+0)])", "unicode"),
+        ] {
+            let index = JsonIndex::build(input.as_bytes());
+            let expr = parse(filter).unwrap();
+            let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(input.as_bytes()));
+            let QueryResult::Error(error) = result else {
+                panic!("`{filter}` over {input}: expected an error: {result:?}");
+            };
+            assert!(
+                error.to_string().contains(message),
+                "`{filter}` over {input}: {error}"
+            );
+        }
+    }
+
+    /// #3807: a direct `?//` target whose retry produces nothing, or raises
+    /// after a consumer's stop, on the library route and without std's
+    /// thread-local retry generation (`direct_pattern_retry` stands in).
+    /// Captured from jq 1.7.1 with `-nc` over `null`: the first alternative's
+    /// index/slice error is retried past, so the empty retry answers nothing;
+    /// and `first` stopping on the first alternative's answer is followed by the
+    /// retry's `E2`.
+    #[test]
+    fn test_direct_retry_in_index_and_slice_target_3807() {
+        let empty = r#"([{"x":1}] as [$q] ?// $q | $q | select(type=="array"|not))"#;
+        let raise =
+            r#"([[1]] as [$a] ?// $a | $a | if (.[0]|type)=="number" then . else error("E2") end)"#;
+        for (target, key, answers) in [
+            (empty, "(0|.+0)", None),
+            (empty, "(0|.+0):(1|.+0)", None),
+            (raise, "(0|.+0)", Some("1")),
+            (raise, "(0|.+0):(1|.+0)", Some("[1]")),
+        ] {
+            let filter = format!("first({target}[{key}])");
+            let index = JsonIndex::build(b"null");
+            let expr = parse(&filter).unwrap();
+            let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(b"null"));
+            match (answers, result) {
+                (None, QueryResult::None) => {}
+                (Some(want), QueryResult::Partial(values, Control::Error(error))) => {
+                    let got: Vec<_> = values.iter().map(OwnedValue::to_json).collect();
+                    assert_eq!(got, [want], "`{filter}`");
+                    assert!(error.to_string().contains("E2"), "`{filter}`: {error}");
+                }
+                (_, result) => panic!("`{filter}`: unexpected {result:?}"),
             }
         }
     }

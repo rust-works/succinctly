@@ -103035,3 +103035,455 @@ fn test_any_all_condition_retry_extra_verdicts_3819() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3807: a `?//` in a computed index's or slice's target. Each group is a target
+/// whose first alternative's index/slice error, or consumer-stopped answer, a retry
+/// then supersedes by yielding nothing, raising, answering, or failing to
+/// destructure; every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+const RETRY_ROWS_TARGET_RETRY_3807: &[RetryRow3293] = &[
+    (
+        r#"([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else error("E2") end)[(0|.+0)]"#,
+        "1\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else error("E2") end)[(0|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; ([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else error("E2") end)[(0|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else error("E2") end)[(0|.+0)])"#,
+        "1\n",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else error("E2") end)[(0|.+0):(1|.+0)]"#,
+        "[1]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else error("E2") end)[(0|.+0):(1|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; ([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else error("E2") end)[(0|.+0):(1|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else error("E2") end)[(0|.+0):(1|.+0)])"#,
+        "[1]\n",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else empty end)[(0|.+0)]"#,
+        "1\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else empty end)[(0|.+0)]), 9]"#,
+        "[1,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else empty end)[(0|.+0)]), 9]"#,
+        "[1,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else empty end)[(0|.+0)])"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else empty end)[(0|.+0):(1|.+0)]"#,
+        "[1]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else empty end)[(0|.+0):(1|.+0)]), 9]"#,
+        "[[1],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else empty end)[(0|.+0):(1|.+0)]), 9]"#,
+        "[[1],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else empty end)[(0|.+0):(1|.+0)])"#,
+        "[1]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else [7] end)[(0|.+0)]"#,
+        "1\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else [7] end)[(0|.+0)]), 9]"#,
+        "[1,7,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else [7] end)[(0|.+0)]), 9]"#,
+        "[1,7,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else [7] end)[(0|.+0)])"#,
+        "1\n7\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else [7] end)[(0|.+0):(1|.+0)]"#,
+        "[1]\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else [7] end)[(0|.+0):(1|.+0)]), 9]"#,
+        "[[1],[7],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else [7] end)[(0|.+0):(1|.+0)]), 9]"#,
+        "[[1],[7],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else [7] end)[(0|.+0):(1|.+0)])"#,
+        "[1]\n[7]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0)]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0)], 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0):(1|.+0)]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0):(1|.+0)], 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0):(1|.+0)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0):(1|.+0)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0)], 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0):(1|.+0)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0):(1|.+0)], 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0):(1|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0):(1|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0)]"#,
+        "5\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0)], 9]"#,
+        "[5,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0)]), 9]"#,
+        "[5,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0)]), 9]"#,
+        "[5,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0):(1|.+0)]"#,
+        "[5]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0):(1|.+0)], 9]"#,
+        "[[5],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0):(1|.+0)]), 9]"#,
+        "[[5],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0):(1|.+0)]), 9]"#,
+        "[[5],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0)], 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0):(1|.+0)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0):(1|.+0)], 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0):(1|.+0)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0):(1|.+0)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r"1 | [(.,.)[(0|.+0)]]",
+        "",
+        "",
+        "Cannot index number with number",
+        5,
+    ),
+    (
+        r"1 | [(.,.)[(0|.+0):(1|.+0)]]",
+        "",
+        "",
+        "Cannot index number with object",
+        5,
+    ),
+];
+
+/// #3807: a `?//` inside a computed index's or slice's *target* (`(G)[K]`,
+/// `(G)[a:b]`). The drive of `G` stashes the first alternative's index/slice
+/// error and answers `Stop`; the retry then produces nothing, raises, answers,
+/// or fails to destructure. A retry that never re-invokes the closure left the
+/// abandoned alternative's error to outrank it (and a consumer's stop to outrank
+/// a retry's raise). Rows cover all four endings for the index and slice forms,
+/// bare and under `first`/`limit`/an array collector, on the owned route and the
+/// document route. Every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+#[test]
+fn test_retry_in_computed_index_and_slice_target_3807() -> Result<()> {
+    // Owned route (`eval.rs`): the input is built under `-n`.
+    assert_retry_rows_3293(None, "null | ", RETRY_ROWS_TARGET_RETRY_3807)?;
+    // Document route (`eval_generic.rs`): the input stays on the cursor.
+    assert_retry_rows_3293(Some("null"), "", RETRY_ROWS_TARGET_RETRY_3807)
+}
+
+/// #3807: an output of a computed index's or slice's target that cannot be
+/// decoded raises its decode failure, which no `?//` retries. jq rejects the
+/// input at parse time, so there is no oracle row: this pins that both forms
+/// raise the failure (exit 5, nothing on stdout) rather than answering.
+#[test]
+fn test_undecodable_target_output_in_computed_index_and_slice_3807() -> Result<()> {
+    let input = r#"{"a":1,"b":"\ud800"}"#;
+    for filter in [
+        ".b | [(.,.)[(0|.+0)]]",
+        ".b | first((.,.)[(0|.+0)])",
+        ".b | [(.,.)[(0|.+0):(1|.+0)]]",
+        ".b | (.,.)[(0|.+0):(1|.+0)]",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!((out.as_str(), code), ("", 5), "`{filter}`: {err:?}");
+        assert!(
+            err.contains("invalid unicode escape sequence"),
+            "`{filter}`: {err:?}"
+        );
+    }
+    Ok(())
+}
