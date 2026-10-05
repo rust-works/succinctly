@@ -1135,6 +1135,19 @@ JSON-sourced input at all) is tracked separately as
 `.5`, was the other half of #2279's original scope note — closed separately below by
 [#2778](https://github.com/rust-works/succinctly/issues/2778).)
 
+**Closed by [#3394](https://github.com/rust-works/succinctly/issues/3394):
+JSON escape introducers.** Measured against yq v4.53.3 for every byte 0–255
+following a backslash (with `0061` supplied after `u`): only `"`, `\`, `/`,
+`b`, `f`, `n`, `r`, `t`, and `u` succeed. In particular, backslash followed
+by raw LF, CR, or CRLF errors, even in an unselected value or an object key.
+`Parser::parse_double_quoted` now enforces that boundary under `json_strict`
+before lazy decoding or streaming output can reinterpret the break as a YAML
+line continuation and silently discard it. Genuine YAML retains its line
+continuations and YAML-only escapes. Raw *unescaped* control bytes in JSON
+strings retain yq's leniency and are preserved by #3380; this check applies
+only immediately after a backslash. Error wording uses succinctly's existing
+structured parser diagnostic rather than Go's decoder message.
+
 **Closed by [#2778](https://github.com/rust-works/succinctly/issues/2778): scalar grammar
 at every value position.** #2279 above closed *delimiters*; every scalar `-p json` accepted
 that real yq rejects survived it, because delimiter checks never look at scalar text. The
