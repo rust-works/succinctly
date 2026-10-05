@@ -618,6 +618,24 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   raises `Invalid path expression near attempt to access element "z" of [1]` where succinctly
   raises `Cannot index array with string "z"`. Both raise after one attempt; only the wording
   differs.
+- **A fold's own `?//` pattern over a source that is the register: which refusals retry**
+  ([#3743](https://github.com/rust-works/succinctly/issues/3743)). The walk compares the element
+  with the register by value, where jq compares nodes, so a refusal of its first step is a *guess*
+  at jq's `path_intact` and does not retry (jq may find the step intact and carry on with that
+  alternative). A literal-keyed pattern that raises when destructured by value
+  (`pattern_walk_fails_by_value`: `reduce . as [$a] ?// $a (0; .)` over an object, or `[[$a]]`
+  over `[1]`) raises in jq whatever the register is, so its refusal is exact: it retries, and a
+  `try` around it behaves as jq's does (`path(foreach (try ((reduce . as [$a] ?// $a (0; .)),
+  .b[0]) catch 1) as $x (.; .; .))` is two paths, was one, with the reduce's `0` lost at exit 0). A
+  refusal that remains a guess (`reduce . as {a:$a} ?// [$a] (0; .)` over a document that has `a`)
+  is uncatchable like every other guess (ADR-0018 rule 4), so it is loud where it was silently
+  wrong; jq answers it, pinned by `test_fold_pattern_guessed_refusal_is_not_caught_3743`. **Left
+  as it was**: a pattern with a computed key is not judged (running its generator again would
+  repeat its effects), so a `try` around `reduce . as {("a"):[$x]} ?// $x (0; .)` still runs its
+  handler where jq fails with the reduce's own `0`
+  (`test_fold_pattern_computed_key_is_not_run_twice_3743`); and a `reduce` operand of `and`/`or`
+  states no register (#3646), so rows that matched jq only because the guess was swallowed by a
+  wrapper (`try`, `?`) now refuse.
 
 ## Path-mode slice bounds and a `?//` retry (#3293)
 
