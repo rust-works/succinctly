@@ -51086,6 +51086,30 @@ fn test_yq_any_all_stage_keeps_no_path_register_3758() -> Result<()> {
     Ok(())
 }
 
+/// #3767: an `[E]` collect holding `last(f)` carries the register in jq mode only
+/// (ADR-0018; `last` is a gated jq builtin, reachable through `--jq-extensions`): a
+/// `$x` frozen before it is not re-established in yq mode, the scalar write is the
+/// no-op yq's convention makes it, and `del` raises rather than writing.
+#[test]
+fn test_yq_collect_last_f_keeps_no_path_register_3767() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"k":2}"#;
+    let (stdout, code) = run_yq_stdin(
+        "(. as $x | [last(.a)] | $x) = 5",
+        doc,
+        &["--jq-extensions", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout, "{\"a\":{\"b\":1},\"k\":2}\n");
+    let (stdout, code) = run_yq_stdin(
+        "del(. as $x | [last(.a)] | $x.k)",
+        doc,
+        &["--jq-extensions", "-o", "json", "-I0"],
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(stdout.is_empty(), "stdout {stdout:?}");
+    Ok(())
+}
+
 /// #3360: `from_entries` always raising in path position, and an empty `walk`
 /// over an object raising, are jq-mode rules (ADR-0018): jq derives them from
 /// how *jq* defines the builtins, and yq's implementation shares none of it, so

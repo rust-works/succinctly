@@ -41830,7 +41830,9 @@ fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool 
 /// resolves natively; `.` and `select`, which pass their input through; an
 /// `if`'s branches (its condition is a subexp in jq); a computed index or
 /// slice's target (its keys are subexps); pipes, commas and parens of
-/// those; and anything [`cannot_move_register`] admits, which neither moves
+/// those; `last(f)`, whose claim is `f`'s own (#3767: it is `reduce f as $x
+/// (null; $x)`, so `f` is a source jq path-checks as the resolver's `last` arm
+/// does); and anything [`cannot_move_register`] admits, which neither moves
 /// jq's register nor is path-checked inside. Everything else -- every other
 /// builtin call, an assignment, a `def`, a fold -- keeps the array
 /// refusing, the safe direction.
@@ -41852,6 +41854,13 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
             array_contents_are_checked(f)
         }
         Expr::Paren(e) => array_contents_are_checked(e),
+        // #3767: `last(f)` is `reduce f as $x (null; $x)`, so `f` is the source of
+        // a reduce and jq path-checks it exactly as it would in a pipe, which is
+        // what the resolver's `LastExpr` arm does (it resolves `f` live and
+        // refuses an untracked navigation as jq does). The claim is therefore
+        // whatever it is for `f` itself; the output is demoted, so a navigation
+        // after it inside the brackets still refuses.
+        Expr::LastExpr(f) | Expr::Builtin(Builtin::LastStream(f)) => array_contents_are_checked(f),
         // #3289: `resolve_node_sink` resolves `and`/`or`/unary minus live in
         // jq mode, checking each operand's navigation against the register
         // as jq does. Since #3428 it does so for every operand; this claim

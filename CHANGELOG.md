@@ -876,6 +876,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a pipe stage reads the backtracked-register verdict of `any`/`all`/`isempty(g)`, on a tracked or an untracked entry** (#3758, #3826, the plain-stage residual of #3757).
+  `path(. as $x | any | $x)` on `{"a":false,"b":null}` is `[]` in jq: these builtins are defined over a generator jq backtracks, so when nothing inside
+  emitted the register is back where the stage entered. The leaf already stated that per result; `resolve_seq_stage` dropped it, so a `$x` frozen
+  before the stage refused, on `path`, `del`, `=` and `|=` alike. The stage now trusts the step's own statement (`Unmoved`, or the carried copy on an
+  untracked entry unless the step states a loss), through `?`, `try`, `first`, `limit` and `nth`; a decided result is unchanged
+  (`{"a":true,"b":null}` still refuses, as in jq), and `any(.[]; isempty(empty))` is now `[0]`. jq mode only; yq rows pinned unchanged. Against a
+  clean build of `main`, the sweep's any/all/isempty operands (60,027 and 40,027 sampled rows) and full-grid samples (25,027 rows twice) showed
+  0 regressions and no new `ACCEPT_WRONG`. Still refused where jq answers, pinned: a verdict stage behind a `def` call or a `reduce`, inside a
+  compound stage (#3644), and over a generator the allowlist cannot prove leaves the register in place on an untracked entry (#3826).
+- **jq: an `[E]` collect holds `last(f)`, so `path(. as $x | [last(.a)] | $x)` is `[]`** (#3767 part 2).
+  `last(f)` is `reduce f as $x (null; $x)` and the collect backtracks, so the register is where the array entered. The `[E]` allowlist reads
+  through `last(f)` to `f`: an `f` jq path-checks on a computed value still raises (`[last(1 | .a)]`), the output is demoted so a navigation after
+  it inside the brackets refuses, and a `last` over `first(f)`, `//` or `limit` stays refused. Against a clean build of `main`, the collect-operand
+  sample (60,027 rows) had 0 regressions and 532 refuse-to-match flips, and the full-grid sample (30,027 rows) 0 regressions. jq mode only.
 - **jq: a non-inert `any`/`all` `cond` is resolved as `gen | cond`, so jq's path error and register movement inside it are seen** (#3757, a #3749/#3763 follow-up).
   jq runs `cond` as `or`'s (`and`'s) left operand in `isempty(first(gen | (cond or empty)))`, which is not a subexp, so it is
   path-checked: a navigating `cond` moves the register onto its own node (`path(any(.[]; .a))` on `[{"a":true}]` is `[0,"a"]`), and on a

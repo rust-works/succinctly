@@ -1306,8 +1306,12 @@ is the revert that established what the other one costs.
    need the leaf-level verdict for a compound stage described above; a wrapper over an inner
    stage that merely navigates nothing (`first(.)`, `limit(1; .)`, `limit(1; 5)`), which jq leaves
    in place and the allowlist does not read through; and an `[E]` collect of a *wrapper* around a
-   type filter or `last` (`[first(numbers)]`, `[limit(1; numbers)]`, `[last(numbers)]`), since the
-   array allowlist reads the stage, not its wrappers. Under a `try` the refusal of such a
+   type filter (`[first(numbers)]`, `[limit(1; numbers)]`), since the array allowlist reads the
+   stage, not its wrappers. Part 2 lets an `[E]` collect hold `last(f)` (`[last(.a)]`: the claim
+   reads through to `f`, which the resolver's `last` arm resolves live, so `[last(1 \| .a)]` still raises
+   as jq does and the output is demoted, so `[last(.a)] \| .k` still refuses), pinned by
+   `test_collect_last_f_keeps_the_register_3767`; a `last` over `first(f)`, `//` or `limit` inside the
+   brackets stays refused. Under a `try` the refusal of such a
    shape inside a lost-register `and`/`or` operand is caught, so the write jq makes is
    **silently skipped** (`del(.a? as $y \| try ((.a)? and limit(1; 5)) \| try ($y \| .b))` on
    `{"a":{"b":1},"k":2}` leaves the document unchanged where jq gives `{"a":{},"k":2}`); the
@@ -1350,7 +1354,7 @@ is the revert that established what the other one costs.
    backtracks the register to where the collect began. Since
    [#3263](https://github.com/rust-works/succinctly/issues/3263) an array carries the register
    too when the resolver both resolves it live and checks everything jq checks inside it:
-   navigation, `..`, `select` and (since #3767) the type filters, an `if`'s branches, both of jq's `?`s and `try`/`catch`,
+   navigation, `..`, `select` and (since #3767) the type filters and `last(f)`, an `if`'s branches, both of jq's `?`s and `try`/`catch`,
    `recurse(f)`/`recurse(f; cond)` (#2764), `and`/`or`/unary minus over checked operands
    ([#3289](https://github.com/rust-works/succinctly/issues/3289)), and pipes, commas and
    subexp shapes of those.
