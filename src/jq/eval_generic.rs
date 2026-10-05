@@ -68,19 +68,20 @@ use super::eval::{
     numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
     owned_to_expr, owned_to_string, pattern_alternatives_var_names, prefer_pending_control,
     probe_def_call, range_from_literal_override, range_max_exceeded_error, range_num,
-    range_values_f64, range_values_int, recurse_walk_flow, reduce_forks, reroot_for_reentry,
-    reroot_markers, resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty,
-    select_emits, settle_then_replay, settles_before_consumer, shared_arg_depth_refusal,
-    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
-    stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
-    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
-    tostring_owned, try_handler_root, vec_with_capacity, yq_absent_key_read_is_empty,
-    yq_assign_rhs_document, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
-    yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
-    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RestPipe, RootWitness,
-    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    range_values_f64, range_values_int, reads_parent, recurse_walk_flow, reduce_forks,
+    reroot_for_reentry, reroot_markers, resolve_computed_slice_bounds, resume_from_escape,
+    reverse_length_is_empty, select_emits, settle_then_replay, settles_before_consumer,
+    shared_arg_depth_refusal, slice_component_value, slice_object_as_yq_children,
+    slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
+    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
+    substitute_vars, suppresses, tonumber_from_str, tostring_owned, try_handler_root,
+    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
+    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, RangeNum, Reentry, RestPipe, RootWitness, SliceTargetKind, StashedEscape,
+    StashedVerdict, YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -21390,6 +21391,59 @@ fn path_context_item_to_owned<V: DocumentValue, S: EvalSemantics>(
     }
 }
 
+/// How many items a collected body emits before [`SharedAncestors`] starts
+/// asking whether it climbs: an array that small cannot repeat a node often
+/// enough for the build to matter, and it spares every short collection the
+/// body walk and the map.
+const SHARE_ANCESTORS_AFTER: usize = 64;
+
+/// The ancestors a `[... | parent]` collection has already built, so that a
+/// container emitted again is shared rather than built again (#3815).
+///
+/// `[.. | parent?]` emits each inner array's parent -- the one root -- once
+/// per child, and every emission was a fresh build of the whole document: the
+/// nodes built grew with children times document size, 26.8 s at 24,000
+/// nodes. Sharing is keyed by (document, node), never by value, the same rule
+/// as [`to_owned_all_cursors_shared`] (#3477), so two distinct nodes that
+/// happen to be equal stay separate.
+///
+/// Only a body that can climb pays for the map ([`reads_parent`]): `key` and
+/// `path` emit a node once, and a collection that names each node once would
+/// only be charged an insert per container.
+#[derive(Default)]
+struct SharedAncestors {
+    /// Whether the collected body climbs; unasked until the collection is
+    /// long enough to matter.
+    climbs: Option<bool>,
+    built: alloc::collections::BTreeMap<(usize, usize), OwnedValue>,
+}
+
+/// [`path_context_item_to_owned`] for an array's collected body: a container
+/// the body emits more than once is built once and shared (#3815).
+fn path_context_item_to_owned_shared<V: DocumentValue, S: EvalSemantics>(
+    item: GenericItem<V>,
+    body: &Expr,
+    emitted: usize,
+    shared: &mut SharedAncestors,
+) -> Result<OwnedValue, EvalError> {
+    let GenericItem::OneCursor(cursor) = &item else {
+        return path_context_item_to_owned::<_, S>(item);
+    };
+    if emitted < SHARE_ANCESTORS_AFTER || !*shared.climbs.get_or_insert_with(|| reads_parent(body))
+    {
+        return path_context_item_to_owned::<_, S>(item);
+    }
+    let key = (cursor.document_token(), cursor.node_id());
+    if let Some(built) = shared.built.get(&key) {
+        return Ok(built.clone());
+    }
+    let value = to_owned_cursor::<S, _>(cursor)?;
+    if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+        shared.built.insert(key, value.clone());
+    }
+    Ok(value)
+}
+
 /// Materialize a walked prefix in order, stopping at the first item that
 /// cannot be: the caller decides what that failure means for the escape it
 /// was already carrying.
@@ -23226,8 +23280,14 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::Array(inner) => {
             let mut items = Vec::new();
             let mut failure = None;
+            let mut shared = SharedAncestors::default();
             let walked = path_context_walk_generic::<S, V>(inner, pos, &mut |item| {
-                match path_context_item_to_owned::<_, S>(item) {
+                match path_context_item_to_owned_shared::<_, S>(
+                    item,
+                    inner,
+                    items.len(),
+                    &mut shared,
+                ) {
                     Ok(v) => {
                         items.push(v);
                         Demand::Continue
@@ -42777,6 +42837,64 @@ mod tests {
         let items = materialize("[.a, .b]");
         assert_eq!(items[0], items[1]);
         assert!(!items[0].shares_storage_with(&items[1]));
+    }
+
+    /// #3815: `[.. | parent?]` emits the root once per child, and the
+    /// collection builds it once and shares it, by node and never by value.
+    // Storage identity is what `unshared-containers` removes: a clone there
+    // deep-copies, so the pins below would read `false` for the wrong reason.
+    #[cfg(not(feature = "unshared-containers"))]
+    #[test]
+    fn test_collected_parent_shares_a_repeated_ancestor_3815() {
+        // Seventy inner arrays hold the root at the collection's 64-item
+        // threshold; each inner array's own parent is emitted per child.
+        let inner = "[1,2,3]";
+        let doc = format!("[{}]", vec![inner; 70].join(","));
+        let collect = |query: &str| -> Vec<OwnedValue> {
+            let index = JsonIndex::build(doc.as_bytes());
+            let expr = parse(query).unwrap();
+            // The streaming entry the CLI runs; `eval_with_cursor_using`
+            // collects through a different route that never reaches the walk.
+            let mut out = None;
+            let control = eval_each_with_cursor_using::<JqSemantics, _>(
+                &expr,
+                index.root(doc.as_bytes()),
+                &mut |result| {
+                    out = result.into_owned::<JqSemantics>().unwrap();
+                    true
+                },
+            );
+            assert!(control.is_none());
+            let Some(OwnedValue::Array(items)) = out else {
+                panic!("{query} did not collect an array"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: reports a failed test invariant (#3815)"
+            };
+            items.iter().cloned().collect()
+        };
+        // The array is a pipe stage's input: a bare top-level collection
+        // is delivered through the batch route, which this change leaves.
+        let items = collect("[.. | parent?] | .");
+        // 1 root (no parent) + 70 inner arrays (parent = root) + 210 scalars
+        // (parent = their own inner array).
+        assert_eq!(items.len(), 280);
+        let roots: Vec<&OwnedValue> = items
+            .iter()
+            .filter(|v| v.as_array().is_some_and(|a| a.len() == 70))
+            .collect();
+        assert_eq!(roots.len(), 70);
+        // Past the threshold every root is the one build; before it the
+        // collection has not yet asked whether the body climbs.
+        let shared = roots[64..]
+            .windows(2)
+            .all(|w| w[0].shares_storage_with(w[1]));
+        assert!(shared, "the repeated root was rebuilt for each child");
+        // Equal values at two *nodes* stay two builds: the 70 identical inner
+        // arrays are 70 distinct nodes.
+        let inners: Vec<&OwnedValue> = items
+            .iter()
+            .filter(|v| v.as_array().is_some_and(|a| a.len() == 3))
+            .collect();
+        assert_eq!(inners.len(), 210);
+        assert!(!inners[150].shares_storage_with(inners[0]));
     }
 
     /// #3477: what the `length` bypass does not answer keeps the bridge, and
