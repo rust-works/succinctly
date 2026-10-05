@@ -6039,6 +6039,41 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// [`drain_result`] for unary `any(cond)`/`all(cond)` (#3810, #3819).
+///
+/// Their only multi-value results are answers a condition's `?//` retry
+/// produced: each one follows a `break` that retry swallowed, so a consumer's
+/// [`Demand::Stop`] on one is the very break that made the next answer
+/// happen, and every answer is delivered -- `first(any(cond))` over a retry
+/// that decides twice is `true`, `true` in jq 1.7.1, like the binary form's
+/// streaming arm. The control of a [`QueryResult::Partial`] is kept even when
+/// the consumer stopped on an answer.
+fn drain_any_all_probe<'a, W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'a, W>,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match result {
+        QueryResult::Partial(values, control) => {
+            for value in values {
+                sink(Item::Owned(value));
+            }
+            Flow::Escaped(control)
+        }
+        QueryResult::ManyOwned(values) => {
+            let mut stopped = false;
+            for value in values {
+                stopped = sink(Item::Owned(value)) == Demand::Stop;
+            }
+            if stopped {
+                Flow::Stopped { pending: None }
+            } else {
+                Flow::Exhausted
+            }
+        }
+        result => drain_result(result, sink),
+    }
+}
+
 /// Push every output of `expr` into `sink`, stopping as soon as `sink` says to.
 ///
 /// Native lazy arms: `Comma`, `Pipe`, `Paren`, `Builtin::PathsFilter`
@@ -6446,20 +6481,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Expr::Builtin(builtin @ (Builtin::AnyF(_) | Builtin::AllF(_))) => {
             let result = eval_builtin::<W, S>(builtin, value, optional);
-            // #3810: unary probes' only partial result is a decision followed
-            // by a condition retry's control. That retry consumed the probe's
-            // stop, so even a stopping consumer must see the control.
-            match result {
-                QueryResult::Partial(values, control) => {
-                    for value in values {
-                        if sink(Item::Owned(value)) == Demand::Stop {
-                            break;
-                        }
-                    }
-                    Flow::Escaped(control)
-                }
-                result => drain_result(result, sink),
-            }
+            drain_any_all_probe(result, sink)
         }
         Expr::Builtin(Builtin::AnyCond(gen, cond)) => {
             each_any_all_gen_cond::<W, S>(gen, cond, value, optional, true, sink)
@@ -7822,15 +7844,25 @@ fn each_any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #3293: reset per invocation -- see `each_limit`.
         outer_stopped = false;
         match any_all_probe_element_verdict::<S>(cond, &elem, target_truthy) {
-            Ok(ElementProbe::Decided(then_raise)) => {
+            Ok(ElementProbe::Decided { verdicts, after }) => {
                 probe_escape = None;
-                if sink(Item::Owned(OwnedValue::Bool(target_truthy))) == Demand::Stop {
-                    outer_stopped = true;
+                // #3819: one answer per decisive output. A consumer's stop on
+                // one is the same `break` the condition's `?//` swallowed to
+                // decide again, so every answer is delivered; the last one's
+                // verdict is what stays with the terminal rule.
+                for _ in 0..verdicts {
+                    outer_stopped =
+                        sink(Item::Owned(OwnedValue::Bool(target_truthy))) == Demand::Stop;
                 }
-                // #3810: the answer is out; a `?//` retry's raise follows it.
-                match then_raise {
-                    Some(control) => stop_with_escape(&mut probe_escape, control),
-                    None => Demand::Stop,
+                match after {
+                    // #3810: the answer is out; a `?//` retry's raise follows it.
+                    AfterVerdict::Raise(control) => stop_with_escape(&mut probe_escape, control),
+                    AfterVerdict::Stop => Demand::Stop,
+                    // #3819: the swallowed break leaves `gen` running.
+                    AfterVerdict::Resume => {
+                        outer_stopped = false;
+                        Demand::Continue
+                    }
                 }
             }
             Ok(ElementProbe::Undecided) => Demand::Continue,
@@ -15476,52 +15508,90 @@ fn any_all_probe_element<S: EvalSemantics>(
     target_truthy: bool,
 ) -> Result<bool, Control> {
     any_all_probe_element_verdict::<S>(cond, elem, target_truthy)
-        .map(|verdict| matches!(verdict, ElementProbe::Decided(_)))
+        .map(|verdict| matches!(verdict, ElementProbe::Decided { .. }))
 }
 
-/// What probing one element's `cond` found (#3810).
+/// What probing one element's `cond` found (#3810, #3819).
 pub(crate) enum ElementProbe {
     /// `cond` ran dry without a decisive output.
     Undecided,
-    /// A decisive output. The `Option` is the control a `?//` retry raised
-    /// *after* it: the decisive output's `Stop` is what makes the `?//` try
-    /// its next alternative (#1519), and that alternative's raise or `halt`
-    /// is real in jq 1.7.1 -- the answer is delivered first and the control
-    /// follows it (`any(.; (1 as $x ?// $y | if $x then true else
-    /// error("E2") end))` prints `true`, then fails with `E2`). Dropping it
-    /// answered `true` and exit 0.
-    Decided(Option<Control>),
+    /// At least one decisive output. jq's `any`/`all` answer from inside the
+    /// pipeline and then `break`, and a `?//` in `cond` catches that break
+    /// and retries its next alternative (#1519): each decisive output is one
+    /// answer, and `after` says how the drive ended.
+    Decided {
+        /// How many decisive outputs `cond` produced. Always at least 1, and
+        /// above 1 only when an earlier alternative's break was swallowed
+        /// and the retry decided again: `any(.; (. as {a:$q} ?// {b:$z} | if
+        /// $q != null then true else .b end))` on `{"a":[1],"b":[2]}` is
+        /// `true`, `true` in jq 1.7.1.
+        verdicts: usize,
+        /// What followed the last decisive output.
+        after: AfterVerdict,
+    },
 }
 
-/// [`any_all_probe_element`] with the trailing control kept (#3810). Only a
-/// retry that began after the decisive output can supersede it
-/// ([`retry_superseded`]); an escape with no retry since cannot follow a
-/// stop at all.
-pub(crate) fn any_all_probe_element_verdict<S: EvalSemantics>(
-    cond: &Expr,
-    elem: &OwnedValue,
-    target_truthy: bool,
+/// What followed a probed element's last decisive output (#3819).
+pub(crate) enum AfterVerdict {
+    /// Nothing did: no retry superseded the stop, so `gen` stops too.
+    Stop,
+    /// The control a `?//` retry raised *after* the decisive output
+    /// (#3810): the retry's raise or `halt` is real in jq 1.7.1, so the
+    /// answer is delivered first and the control follows it (`any(.; (1 as
+    /// $x ?// $y | if $x then true else error("E2") end))` prints `true`,
+    /// then fails with `E2`). Dropping it answered `true` and exit 0.
+    Raise(Control),
+    /// A retry ran dry -- empty, or only undecided outputs -- so jq's
+    /// swallowed `break` leaves `gen` running on to its next element and,
+    /// once `gen` is exhausted, the identity element (`any(.; (. as {a:$q}
+    /// ?// {b:$z} | if $q != null then true else empty end))` is `true`,
+    /// `false`).
+    Resume,
+}
+
+/// Classify a probed element from how its drive ended (#3819), the one rule
+/// both evaluators share. `decided` is the count of decisive outputs and the
+/// retry generation at the last one; only a retry that began after that
+/// output can have swallowed its stop ([`retry_superseded`]) -- an escape or
+/// exhaustion with no retry since cannot follow a stop at all.
+pub(crate) fn element_probe_outcome(
+    flow: Flow,
+    decided: Option<(usize, u64)>,
+    direct_retry: bool,
 ) -> Result<ElementProbe, Control> {
-    let mut decided_at: Option<u64> = None;
-    let flow = eval_each_owned::<S>(cond, elem, false, Reentry::REBUILT, &mut |out| {
-        if out.is_truthy() == target_truthy {
-            decided_at = Some(pipe_retry_generation());
-            Demand::Stop
-        } else {
-            Demand::Continue
-        }
-    });
-    if let Some(at) = decided_at {
-        let superseded = retry_superseded(&flow, at, direct_pattern_retry(cond));
-        return Ok(ElementProbe::Decided(match flow {
-            Flow::Escaped(control) if superseded => Some(control),
-            _ => None,
-        }));
+    if let Some((verdicts, at)) = decided {
+        let superseded = retry_superseded(&flow, at, direct_retry);
+        let after = match flow {
+            Flow::Escaped(control) if superseded => AfterVerdict::Raise(control),
+            Flow::Exhausted if superseded => AfterVerdict::Resume,
+            _ => AfterVerdict::Stop,
+        };
+        return Ok(ElementProbe::Decided { verdicts, after });
     }
     match flow {
         Flow::Escaped(control) => Err(control),
         Flow::Exhausted | Flow::Stopped { .. } => Ok(ElementProbe::Undecided),
     }
+}
+
+/// [`any_all_probe_element`] with the trailing verdicts and control kept
+/// (#3810, #3819).
+pub(crate) fn any_all_probe_element_verdict<S: EvalSemantics>(
+    cond: &Expr,
+    elem: &OwnedValue,
+    target_truthy: bool,
+) -> Result<ElementProbe, Control> {
+    let mut decided: Option<(usize, u64)> = None;
+    let flow = eval_each_owned::<S>(cond, elem, false, Reentry::REBUILT, &mut |out| {
+        if out.is_truthy() == target_truthy {
+            let verdicts = decided.map_or(0, |(n, _)| n) + 1;
+            decided = Some((verdicts, pipe_retry_generation()));
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+    element_probe_outcome(flow, decided, direct_pattern_retry(cond))
 }
 
 fn control_to_result<'a, W: Clone + AsRef<[u64]>>(control: Control) -> QueryResult<'a, W> {
@@ -15586,24 +15656,58 @@ fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
     elements: impl Iterator<Item = StandardJson<'a, W>>,
     target_truthy: bool,
 ) -> QueryResult<'a, W> {
+    // #3819: a count, as in `any_all_gen_cond` -- a `?//` in `cond` that
+    // swallows the decisive output's break makes the next alternative answer
+    // too, and the elements after it stay in play.
+    let mut matches = 0usize;
     for cursor_elem in elements {
         let elem = match to_owned::<S, _>(&cursor_elem) {
             Ok(v) => v,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => {
+                return counted_bool_flow_to_result(
+                    matches,
+                    target_truthy,
+                    !target_truthy,
+                    Flow::Escaped(Control::Error(e)),
+                );
+            }
         };
         match any_all_probe_element_verdict::<S>(cond, &elem, target_truthy) {
-            Ok(ElementProbe::Decided(None)) => {
-                return QueryResult::Owned(OwnedValue::Bool(target_truthy));
-            }
-            // #3810: the answer, then the `?//` retry's raise.
-            Ok(ElementProbe::Decided(Some(control))) => {
-                return partial(vec![OwnedValue::Bool(target_truthy)], control);
+            Ok(ElementProbe::Decided { verdicts, after }) => {
+                matches += verdicts;
+                match after {
+                    AfterVerdict::Stop => {
+                        return counted_bool_flow_to_result(
+                            matches,
+                            target_truthy,
+                            !target_truthy,
+                            Flow::Stopped { pending: None },
+                        );
+                    }
+                    // #3810: the answer, then the `?//` retry's raise.
+                    AfterVerdict::Raise(control) => {
+                        return counted_bool_flow_to_result(
+                            matches,
+                            target_truthy,
+                            !target_truthy,
+                            Flow::Escaped(control),
+                        );
+                    }
+                    AfterVerdict::Resume => {}
+                }
             }
             Ok(ElementProbe::Undecided) => {}
-            Err(control) => return control_to_result(control),
+            Err(control) => {
+                return counted_bool_flow_to_result(
+                    matches,
+                    target_truthy,
+                    !target_truthy,
+                    Flow::Escaped(control),
+                );
+            }
         }
     }
-    QueryResult::Owned(OwnedValue::Bool(!target_truthy))
+    counted_bool_flow_to_result(matches, target_truthy, !target_truthy, Flow::Exhausted)
 }
 
 /// Builtin: `any(cond)` - true if cond is truthy for any element of `.[]`.
@@ -15694,13 +15798,16 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // the demoting entry.
     let flow = eval_each_owned::<S>(gen, &owned, optional, Reentry::Proven, &mut |elem| {
         match any_all_probe_element_verdict::<S>(cond, &elem, target_truthy) {
-            Ok(ElementProbe::Decided(then_raise)) => {
-                matches += 1;
+            Ok(ElementProbe::Decided { verdicts, after }) => {
+                // #3819: one answer per decisive output.
+                matches += verdicts;
                 probe_escape = None;
-                // #3810: the answer counts; a `?//` retry's raise follows it.
-                match then_raise {
-                    Some(control) => stop_with_escape(&mut probe_escape, control),
-                    None => Demand::Stop,
+                match after {
+                    // #3810: the answer counts; a `?//` retry's raise follows it.
+                    AfterVerdict::Raise(control) => stop_with_escape(&mut probe_escape, control),
+                    AfterVerdict::Stop => Demand::Stop,
+                    // #3819: the swallowed break leaves `gen` running.
+                    AfterVerdict::Resume => Demand::Continue,
                 }
             }
             Ok(ElementProbe::Undecided) => Demand::Continue,

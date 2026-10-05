@@ -102261,3 +102261,569 @@ fn test_recurse_structural_descent_matches_recursive_descent_3719() -> Result<()
     }
     Ok(())
 }
+
+/// #3819 rows over `{"a":[1],"b":[2]}`
+const RETRY_ROWS_ANY_ALL_CLEAN_OBJ_3819: &[RetryRow3293] = &[
+    (
+        r#"any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end))"#,
+        "true\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end)), 9]"#,
+        "[true,false,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end)))"#,
+        "true\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end)))]"#,
+        "[true,false]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else false end))"#,
+        "true\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else false end)), 9]"#,
+        "[true,false,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else false end)))"#,
+        "true\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else false end)))]"#,
+        "[true,false]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else false end)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else null end))"#,
+        "true\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else null end)), 9]"#,
+        "[true,false,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else null end)))"#,
+        "true\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else null end)))]"#,
+        "[true,false]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else null end)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end))"#,
+        "true\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end)), 9]"#,
+        "[true,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end)))"#,
+        "true\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end)))]"#,
+        "[true,true]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end))"#,
+        "false\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end)), 9]"#,
+        "[false,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end)))"#,
+        "false\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end)))]"#,
+        "[false,true]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end))"#,
+        "false\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end)), 9]"#,
+        "[false,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end)))"#,
+        "false\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end)))]"#,
+        "[false,true]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else false end))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else false end)), 9]"#,
+        "[false,false,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else false end)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else false end)))]"#,
+        "[false,false]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else false end)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else .a end))"#,
+        "false\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else .a end)), 9]"#,
+        "[false,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else .a end)))"#,
+        "false\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else .a end)))]"#,
+        "[false,true]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"isempty(all(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else .a end)))"#,
+        "false\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any(.; (. as {a:$q} ?// {b:$z} ?// {c:$y} | ("A"|stderr) as $m | if $q != null then true elif $z != null then true else empty end))"#,
+        "true\ntrue\nfalse\n",
+        "AAA",
+        "",
+        0,
+    ),
+    (
+        r#"any(.; (. as {a:$q} ?// {b:$z} ?// {c:$y} | ("A"|stderr) as $m | if $q != null then true elif $z != null then true else .c end))"#,
+        "true\ntrue\nfalse\n",
+        "AAA",
+        "",
+        0,
+    ),
+    (
+        r#"any(.; (. as {a:$q} ?// {b:$z} ?// {c:$y} | ("A"|stderr) as $m | if $q != null then true elif $z != null then true else error("E3") end))"#,
+        "true\ntrue\n",
+        "AAA",
+        "E3",
+        5,
+    ),
+    (
+        r#"[any(.; (. as {a:$q} ?// {b:$z} ?// {c:$y} | ("A"|stderr) as $m | if $q != null then true elif $z != null then true else empty end)), 9]"#,
+        "[true,true,false,9]\n",
+        "AAA",
+        "",
+        0,
+    ),
+];
+
+/// #3819 rows over `[{"a":[1],"b":[2]}]`
+const RETRY_ROWS_ANY_ALL_CLEAN_ARR_3819: &[RetryRow3293] = &[
+    (
+        r#"any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end))"#,
+        "true\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end)), 9]"#,
+        "[true,false,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end)))"#,
+        "true\nfalse\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end))"#,
+        "true\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end)), 9]"#,
+        "[true,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end)))"#,
+        "true\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end))"#,
+        "false\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[all((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end)), 9]"#,
+        "[false,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(all((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end)))"#,
+        "false\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end))"#,
+        "false\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[all((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end)), 9]"#,
+        "[false,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(all((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end)))"#,
+        "false\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+/// #3819 rows over two decisive elements
+const RETRY_ROWS_ANY_ALL_CLEAN_ARR2_3819: &[RetryRow3293] = &[
+    (
+        r#"any(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end))"#,
+        "true\ntrue\nfalse\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end))"#,
+        "true\ntrue\nfalse\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[any(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end)), 9]"#,
+        "[true,true,false,9]\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"any(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end))"#,
+        "true\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end))"#,
+        "true\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[any(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else .b end)), 9]"#,
+        "[true,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else 0 end))"#,
+        "true\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else 0 end))"#,
+        "true\ntrue\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[any(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else 0 end)), 9]"#,
+        "[true,true,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end))"#,
+        "false\nfalse\ntrue\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"all((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end))"#,
+        "false\nfalse\ntrue\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[all(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end)), 9]"#,
+        "[false,false,true,9]\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"all(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end))"#,
+        "false\nfalse\ntrue\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"all((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end))"#,
+        "false\nfalse\ntrue\n",
+        "AAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[all(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else true end)), 9]"#,
+        "[false,false,true,9]\n",
+        "AAAA",
+        "",
+        0,
+    ),
+];
+
+/// #3819 rows over a decisive then an undecided element
+const RETRY_ROWS_ANY_ALL_CLEAN_ARR2B_3819: &[RetryRow3293] = &[
+    (
+        r#"any(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end))"#,
+        "true\nfalse\n",
+        "AAA",
+        "",
+        0,
+    ),
+    (
+        r#"all(.[]; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then false else empty end))"#,
+        "false\ntrue\n",
+        "AAA",
+        "",
+        0,
+    ),
+    (
+        r#"any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then true else empty end))"#,
+        "true\nfalse\n",
+        "AAA",
+        "",
+        0,
+    ),
+];
+
+/// #3819: a `?//` retry inside `any`/`all`'s `cond` that yields nothing or
+/// answers cleanly after the first alternative decided. jq's `isempty`-based
+/// definition emits the answer and then `break`s, the `?//` swallows that
+/// `break` and retries its next alternative (#1519), and the retry's own
+/// outputs flow on: a second decisive output is a second answer, and a retry
+/// that runs dry leaves the generator running on to its next element and,
+/// once it is exhausted, the identity element -- `true` then `false` for
+/// `any`. A consumer's own `break` (`first`, `limit`, `isempty`) is the same
+/// swallowed `break`, so it never withholds the later answers. Rows cover
+/// `any`/`all`, the `(gen; cond)` and unary forms, two- and three-alternative
+/// chains, and every consumer shape, on the owned route and the document
+/// route. Every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+#[test]
+fn test_any_all_condition_retry_extra_verdicts_3819() -> Result<()> {
+    let obj = r#"{"a":[1],"b":[2]}"#;
+    let arr = r#"[{"a":[1],"b":[2]}]"#;
+    let arr2 = r#"[{"a":[1],"b":[2]},{"a":[3],"b":[4]}]"#;
+    let arr2b = r#"[{"a":[1],"b":[2]},{"a":null,"b":null}]"#;
+    for (input, rows) in [
+        (obj, RETRY_ROWS_ANY_ALL_CLEAN_OBJ_3819),
+        (arr, RETRY_ROWS_ANY_ALL_CLEAN_ARR_3819),
+        (arr2, RETRY_ROWS_ANY_ALL_CLEAN_ARR2_3819),
+        (arr2b, RETRY_ROWS_ANY_ALL_CLEAN_ARR2B_3819),
+    ] {
+        // Owned route (`eval.rs`): the input is built under `-n`.
+        assert_retry_rows_3293(None, &format!("{input} | "), rows)?;
+        // Document route (`eval_generic.rs`): the input stays on the cursor.
+        assert_retry_rows_3293(Some(input), "", rows)?;
+    }
+    Ok(())
+}

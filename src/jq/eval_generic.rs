@@ -13732,8 +13732,8 @@ fn any_all_probe_item_generic<S: EvalSemantics, V: DocumentValue>(
     item: GenericItem<V>,
     target_truthy: bool,
 ) -> Result<crate::jq::eval::ElementProbe, Control> {
-    use crate::jq::eval::ElementProbe;
-    let mut decided_at: Option<u64> = None;
+    use crate::jq::eval::element_probe_outcome;
+    let mut decided: Option<(usize, u64)> = None;
     let mut escape: Option<Control> = None;
     let mut probe = |out: GenericItem<V>| {
         // Each invocation belongs to the current attempt, not an abandoned
@@ -13741,7 +13741,9 @@ fn any_all_probe_item_generic<S: EvalSemantics, V: DocumentValue>(
         escape = None;
         match generic_item_truthiness::<_, S>(out) {
             Ok(truthy) if truthy == target_truthy => {
-                decided_at = Some(crate::jq::eval::pipe_retry_generation());
+                // #3819: a count -- a retry that decides again answers again.
+                let verdicts = decided.map_or(0, |(n, _)| n) + 1;
+                decided = Some((verdicts, crate::jq::eval::pipe_retry_generation()));
                 Demand::Stop
             }
             Ok(_) => Demand::Continue,
@@ -13769,25 +13771,9 @@ fn any_all_probe_item_generic<S: EvalSemantics, V: DocumentValue>(
     if let Some(control) = escape {
         return Err(control);
     }
-    if let Some(at) = decided_at {
-        // #3810: a `?//` retry that began after the decisive output and
-        // raised supersedes the stop, and its control follows the answer
-        // (see [`ElementProbe::Decided`]). The same rule as
-        // `eval::any_all_probe_element_verdict`, which this mirrors.
-        let superseded = crate::jq::eval::retry_superseded(
-            &flow,
-            at,
-            crate::jq::eval::direct_pattern_retry(cond),
-        );
-        return Ok(ElementProbe::Decided(match flow {
-            Flow::Escaped(control) if superseded => Some(control),
-            _ => None,
-        }));
-    }
-    match flow {
-        Flow::Escaped(control) => Err(control),
-        Flow::Exhausted | Flow::Stopped { .. } => Ok(ElementProbe::Undecided),
-    }
+    // #3810/#3819: the same rule as `eval::any_all_probe_element_verdict`,
+    // which this mirrors.
+    element_probe_outcome(flow, decided, crate::jq::eval::direct_pattern_retry(cond))
 }
 
 /// Generic twin of `eval::each_any_all_gen_cond` (#2968) -- `any(gen;
@@ -13818,15 +13804,23 @@ fn each_any_all_gen_cond_generic<S: EvalSemantics, V: DocumentValue>(
         // #3293: reset per invocation -- see `eval::each_limit`.
         outer_stopped = false;
         match any_all_probe_item_generic::<S, V>(cond, item, target_truthy) {
-            Ok(crate::jq::eval::ElementProbe::Decided(then_raise)) => {
+            Ok(crate::jq::eval::ElementProbe::Decided { verdicts, after }) => {
+                use crate::jq::eval::AfterVerdict;
                 probe_escape = None;
-                if sink.push(GenericItem::Owned(OwnedValue::Bool(target_truthy))) == Demand::Stop {
-                    outer_stopped = true;
+                // #3819: one answer per decisive output; see
+                // `eval::each_any_all_gen_cond`.
+                for _ in 0..verdicts {
+                    outer_stopped = sink.push(GenericItem::Owned(OwnedValue::Bool(target_truthy)))
+                        == Demand::Stop;
                 }
-                // #3810: the answer is out; a `?//` retry's raise follows it.
-                match then_raise {
-                    Some(control) => stop_with_escape(&mut probe_escape, control),
-                    None => Demand::Stop,
+                match after {
+                    // #3810: the answer is out; a `?//` retry's raise follows it.
+                    AfterVerdict::Raise(control) => stop_with_escape(&mut probe_escape, control),
+                    AfterVerdict::Stop => Demand::Stop,
+                    AfterVerdict::Resume => {
+                        outer_stopped = false;
+                        Demand::Continue
+                    }
                 }
             }
             Ok(crate::jq::eval::ElementProbe::Undecided) => Demand::Continue,
@@ -13947,9 +13941,11 @@ fn each_skip_generic<S: EvalSemantics, V: DocumentValue>(
     })
 }
 
-/// Unary probes only produce a partial answer when a condition's `?//`
-/// retry raised after the decision (#3810). Preserve that control even if
-/// the consumer stops on the boolean, matching the binary streaming arm.
+/// Generic twin of `eval::drain_any_all_probe` (#3810, #3819): unary
+/// probes' only multi-value results are answers a condition's `?//` retry
+/// produced, each following a `break` that retry swallowed, so a consumer's
+/// stop on one never withholds the next -- nor the control of a
+/// [`GenericResult::Partial`].
 fn drain_any_all_probe_generic<V: DocumentValue>(
     result: GenericResult<V>,
     sink: &mut dyn Sink<V>,
@@ -13957,13 +13953,42 @@ fn drain_any_all_probe_generic<V: DocumentValue>(
     match result {
         GenericResult::Partial(values, control) => {
             for value in values {
-                if sink.push(GenericItem::Owned(value)) == Demand::Stop {
-                    break;
-                }
+                sink.push(GenericItem::Owned(value));
             }
             Flow::Escaped(control)
         }
+        GenericResult::ManyOwned(values) => {
+            let mut stopped = false;
+            for value in values {
+                stopped = sink.push(GenericItem::Owned(value)) == Demand::Stop;
+            }
+            if stopped {
+                Flow::Stopped { pending: None }
+            } else {
+                Flow::Exhausted
+            }
+        }
         result => drain_result_generic(result, sink),
+    }
+}
+
+/// Generic twin of `eval::counted_bool_flow_to_result` for the unary probes
+/// (#3819): `count` answers, then the identity on exhaustion, or the control
+/// behind them on an escape.
+fn counted_bool_flow_to_generic_result<V: DocumentValue>(
+    count: usize,
+    true_val: bool,
+    false_val: bool,
+    flow: Flow,
+) -> GenericResult<V> {
+    let mut out = vec![OwnedValue::Bool(true_val); count];
+    match flow {
+        Flow::Exhausted => {
+            out.push(OwnedValue::Bool(false_val));
+            owned_vec_to_generic_result(out)
+        }
+        Flow::Stopped { .. } => owned_vec_to_generic_result(out),
+        Flow::Escaped(control) => partial_generic(out, control),
     }
 }
 
@@ -14009,13 +14034,34 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: V::Cursor,
     target_truthy: bool,
 ) -> GenericResult<V> {
-    use crate::jq::eval::ElementProbe;
-    let answer = |b: bool| GenericResult::Owned(OwnedValue::Bool(b));
-    // One probe for both container arms: decisive -> the answer, undecided
-    // -> keep walking, an escape before any decision -> propagate it.
-    let probe = |elem_cursor: V::Cursor| {
-        any_all_probe_item_generic::<S, V>(cond, GenericItem::OneCursor(elem_cursor), target_truthy)
+    use crate::jq::eval::{AfterVerdict, ElementProbe};
+    let counted = |matches: usize, flow: Flow| {
+        counted_bool_flow_to_generic_result(matches, target_truthy, !target_truthy, flow)
     };
+    // One probe for both container arms: decisive -> the answers (a count,
+    // #3819), undecided -> keep walking, an escape before any decision ->
+    // propagate it. `Some` ends the walk with that result.
+    let probe = |elem_cursor: V::Cursor, matches: &mut usize| {
+        match any_all_probe_item_generic::<S, V>(
+            cond,
+            GenericItem::OneCursor(elem_cursor),
+            target_truthy,
+        ) {
+            Ok(ElementProbe::Decided { verdicts, after }) => {
+                *matches += verdicts;
+                match after {
+                    AfterVerdict::Stop => Some(counted(*matches, Flow::Stopped { pending: None })),
+                    // #3810: the answer, then the `?//` retry's raise.
+                    AfterVerdict::Raise(control) => Some(counted(*matches, Flow::Escaped(control))),
+                    // #3819: the swallowed break leaves the walk running.
+                    AfterVerdict::Resume => None,
+                }
+            }
+            Ok(ElementProbe::Undecided) => None,
+            Err(control) => Some(counted(*matches, Flow::Escaped(control))),
+        }
+    };
+    let mut matches = 0usize;
     if let Some(elements) = value.as_array() {
         // #2594: the zero-element `[,]` the walk below cannot see -- the
         // `.[]` arm's own check, since these are `.[]`'s elements.
@@ -14024,18 +14070,12 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
         }
         let mut elems = elements;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
-            match probe(elem_cursor) {
-                Ok(ElementProbe::Decided(None)) => return answer(target_truthy),
-                // #3810: the answer, then the `?//` retry's raise.
-                Ok(ElementProbe::Decided(Some(control))) => {
-                    return partial_generic(vec![OwnedValue::Bool(target_truthy)], control);
-                }
-                Ok(ElementProbe::Undecided) => {}
-                Err(control) => return partial_generic(Vec::new(), control),
+            if let Some(result) = probe(elem_cursor, &mut matches) {
+                return result;
             }
             elems = rest;
         }
-        answer(!target_truthy)
+        counted(matches, Flow::Exhausted)
     } else if let Some(fields) = value.as_object() {
         if let Err(err) = empty_fields_tail_gap_ok(&fields, Some(&cursor)) {
             return GenericResult::Error(err);
@@ -14049,17 +14089,11 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
         match effective_fields_checked(&fields, true) {
             Ok(fields) => {
                 for field in fields {
-                    match probe(field.value_cursor) {
-                        Ok(ElementProbe::Decided(None)) => return answer(target_truthy),
-                        // #3810: the answer, then the `?//` retry's raise.
-                        Ok(ElementProbe::Decided(Some(control))) => {
-                            return partial_generic(vec![OwnedValue::Bool(target_truthy)], control);
-                        }
-                        Ok(ElementProbe::Undecided) => {}
-                        Err(control) => return partial_generic(Vec::new(), control),
+                    if let Some(result) = probe(field.value_cursor, &mut matches) {
+                        return result;
                     }
                 }
-                answer(!target_truthy)
+                counted(matches, Flow::Exhausted)
             }
             Err(err) => GenericResult::Error(err),
         }
