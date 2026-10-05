@@ -103431,14 +103431,14 @@ const RETRY_ROWS_TARGET_RETRY_3807: &[RetryRow3293] = &[
         5,
     ),
     (
-        r#"1 | [(.,.)[(0|.+0)]]"#,
+        r"1 | [(.,.)[(0|.+0)]]",
         "",
         "",
         "Cannot index number with number",
         5,
     ),
     (
-        r#"1 | [(.,.)[(0|.+0):(1|.+0)]]"#,
+        r"1 | [(.,.)[(0|.+0):(1|.+0)]]",
         "",
         "",
         "Cannot index number with object",

@@ -111361,6 +111361,40 @@ mod tests {
         }
     }
 
+    /// #3807: the library route's streaming index/slice drivers raise an
+    /// index/slice error no retry superseded, and the decode failure of an
+    /// undecodable target output (which no `?//` retries). `first` makes the
+    /// consumer the streaming sink, so `each_index_expr` and
+    /// `slice_pair_streaming` run rather than the eager collectors.
+    #[test]
+    fn test_index_and_slice_target_errors_raise_3807() {
+        for (input, filter, message) in [
+            (
+                "1",
+                "first((.,.)[(0|.+0)])",
+                "Cannot index number with number",
+            ),
+            (
+                "1",
+                "first((.,.)[(0|.+0):(1|.+0)])",
+                "Cannot index number with object",
+            ),
+            (r#""\ud800""#, "first((.,.)[(0|.+0)])", "unicode"),
+            (r#""\ud800""#, "first((.,.)[(0|.+0):(1|.+0)])", "unicode"),
+        ] {
+            let index = JsonIndex::build(input.as_bytes());
+            let expr = parse(filter).unwrap();
+            let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(input.as_bytes()));
+            let QueryResult::Error(error) = result else {
+                panic!("`{filter}` over {input}: expected an error: {result:?}");
+            };
+            assert!(
+                error.to_string().contains(message),
+                "`{filter}` over {input}: {error}"
+            );
+        }
+    }
+
     /// #3293 slice 8b: `recurse`'s native walkers (`ValueRecurseWalk` and
     /// `PathRecurseWalk`, `expand` and `gate`) stash the abort a deeper node
     /// raised, and a `?//` in `f` retries past it. A retry that answers
