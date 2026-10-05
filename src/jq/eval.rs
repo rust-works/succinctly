@@ -43626,9 +43626,33 @@ fn fold_source_moves_register(source: &Expr) -> bool {
     })
 }
 
-/// Whether `e` is a bare `.` (parens aside).
-fn is_bare_identity(e: &Expr) -> bool {
-    matches!(unwrap_paren(e), Expr::Identity)
+/// Whether a `foreach` SOURCE destructures the register itself (`.`) with an array
+/// or object pattern (#3744): `foreach (. as {a:$a} | .) as $x (...)`, or a nested
+/// `foreach . as [$q] (...)` over `.`. The pattern's tracked index steps move jq's
+/// register onto the matched member and the source is not backtracked past it,
+/// so EXTRACT is checked against a register it is no longer at, which only the
+/// resolver models (the by-value drive answered the root).
+///
+/// Not under a nested `reduce`: jq restores the register when it backtracks a
+/// `reduce`'s source, so what a `reduce` destructures never reaches the outer
+/// fold, and its by-value drive is right (`foreach (reduce . as {a:$a} (0; .)) as
+/// $x (.; .; .)`). That subtree is skipped whole. A `?//` chain is left to the
+/// by-value drive as for a fresh source ([`routes_destructuring`]).
+fn foreach_source_destructures_register(source: &Expr) -> bool {
+    use crate::jq::walk::{search_subexpr, Visit};
+    let is_dot = |e: &Expr| matches!(unwrap_paren(e), Expr::Identity);
+    search_subexpr(source, &mut |e| match e {
+        Expr::Reduce { .. } => Visit::Skip,
+        Expr::AsPattern { expr, patterns, .. }
+            if routes_destructuring(patterns) && is_dot(expr) =>
+        {
+            Visit::Found
+        }
+        Expr::Foreach {
+            input, patterns, ..
+        } if routes_destructuring(patterns) && is_dot(input) => Visit::Found,
+        _ => Visit::Descend,
+    })
 }
 
 /// Whether `e` destructures a *freshly built* value (#3489): an `[1] as [$a] |
@@ -43650,21 +43674,17 @@ fn is_bare_identity(e: &Expr) -> bool {
 /// accept for a wrong refusal (`path(reduce (select(true) as [$x] | $x) as $k
 /// (.; .))` is `[]` in jq and was refused). A bare `$var` bind performs no step
 /// and stays by value too.
-fn is_fold_source_destructuring(e: &Expr, foreach_source: bool) -> bool {
+fn is_fold_source_destructuring(e: &Expr) -> bool {
     match e {
         Expr::AsPattern { expr, patterns, .. } => {
-            routes_destructuring(patterns)
-                && (yields_only_fresh_values(expr) || (foreach_source && is_bare_identity(expr)))
+            routes_destructuring(patterns) && yields_only_fresh_values(expr)
         }
         Expr::Reduce {
             input, patterns, ..
         }
         | Expr::Foreach {
             input, patterns, ..
-        } => {
-            routes_destructuring(patterns)
-                && (yields_only_fresh_values(input) || (foreach_source && is_bare_identity(input)))
-        }
+        } => routes_destructuring(patterns) && yields_only_fresh_values(input),
         _ => false,
     }
 }
@@ -43860,9 +43880,10 @@ fn drive_fold_source<S: EvalSemantics>(
     let has_navigation = any_subexpr(source, &mut |e| {
         is_fold_source_navigation(e)
             || (S::TAG == EvalTag::Jq
-                && (live_path_refusal(e).is_some()
-                    || is_fold_source_destructuring(e, foreach_source)))
-    });
+                && (live_path_refusal(e).is_some() || is_fold_source_destructuring(e)))
+    }) || (S::TAG == EvalTag::Jq
+        && foreach_source
+        && foreach_source_destructures_register(source));
     if !has_navigation {
         return drive_fold_source_by_value::<S>(source, ambient.value, ambient.trackable, step);
     }

@@ -364,6 +364,13 @@ OPERANDS = [
     "(reduce (. as [$a] | .) as $k (.; .))",
     "(reduce (. as {a:$a} | $a) as $k (.; .))",
     "try (foreach (. as {a:$a} | .) as $k (.; .; .)) catch 7",
+    # ...and the same inside a nested fold: a nested `foreach` over `.` moves the register
+    # for the outer one, a nested `reduce` does not (it is backtracked), so the latter is
+    # the contrast that must keep the by-value drive.
+    "(foreach (foreach . as {a:$a} (0; .; .)) as $k (.; .; .))",
+    "(foreach (reduce . as {a:$a} (0; .)) as $k (.; .; .))",
+    "(foreach (foreach . as [$a] (.; .; .)) as $k (.; .; .))",
+    "(reduce (foreach . as {a:$a} (.; .; .)) as $k (.; .))",
     "(reduce . as [[$a]] (0; .))",
     "try (reduce . as [[$a]] (0; .)) catch 7",
     "(reduce . as [[$a]] ?// [$a] (0; .))",
