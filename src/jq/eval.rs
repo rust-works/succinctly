@@ -43205,6 +43205,21 @@ fn yields_only_fresh_values(e: &Expr) -> bool {
     match e {
         Expr::Literal(Literal::Null | Literal::Bool(_)) => false,
         Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) => true,
+        // #3745: a builtin whose every output is a container it builds itself --
+        // jq defines each over a fresh `[]`/`{}` (`reduce`/`[... | f]`), so its
+        // result is never `jv_identical` to the register (an empty one is a fresh
+        // `jv_array()`, #3494). Each captured against jq 1.7.1: `keys as [$a]` and
+        // the rest raise "near attempt to access element 0". Nothing that can hand
+        // back its input or one of its elements belongs here (`add`, `first`,
+        // `select`, `.[0]`, `getpath`): `[.] | add` can be the register.
+        Expr::Builtin(
+            Builtin::Keys
+            | Builtin::KeysUnsorted
+            | Builtin::ToEntries
+            | Builtin::Map(_)
+            | Builtin::Paths
+            | Builtin::Flatten,
+        ) => true,
         Expr::Paren(inner) => yields_only_fresh_values(inner),
         Expr::Comma(items) => !items.is_empty() && items.iter().all(yields_only_fresh_values),
         Expr::Pipe(stages) => stages.last().is_some_and(yields_only_fresh_values),

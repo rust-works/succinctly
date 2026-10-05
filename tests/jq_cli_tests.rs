@@ -67084,6 +67084,120 @@ fn test_fold_source_destructuring_bind_is_path_tracked_3489() -> Result<()> {
     ])
 }
 
+/// #3745: #3489's allow-list of sources that cannot be jq's register
+/// (`yields_only_fresh_values`) now names the builtins that build their result
+/// themselves -- `keys`, `keys_unsorted`, `to_entries`, `map(f)`, `paths`,
+/// `flatten` -- so a destructuring bind over one in a `reduce`/`foreach` source
+/// is path-tracked like a literal one. `path(reduce (keys as [$a] | $a) as $k (.;
+/// .))` on `{"a":1}` answered `[]`, `del(...)` answered `null` and `|= 5` answered
+/// `5`, where jq exits 5 ("near attempt to access element 0 of [\"a\"]"). The
+/// register-preserving sources the by-value drive already answers like jq
+/// (`select(true)`, `first(.)`, `limit(1; .)`, a bare `.`) are pinned unchanged.
+/// Every row captured from jq 1.7.1.
+#[test]
+fn test_fold_source_destructuring_over_a_builtin_that_builds_a_fresh_value_3745() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (keys as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (keys_unsorted as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (to_entries as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (map(.) as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (paths as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (flatten as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (keys as [$a] | $a) as $k (.; .; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(reduce (keys as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(reduce (to_entries as [$a] | $a) as $k (.; .)) |= 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(reduce (keys as [$a] | $a) as $k (.; .)) = 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1,2]",
+            r"path(reduce (select(true) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"path(reduce (first(.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"path(reduce (limit(1; .) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"path(reduce (. as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3489: a destructuring source that also reads `inputs` goes through the
 /// resolver, whose collecting leaf would drain the shared input reader if the
 /// pattern did not raise first. It does, so jq's own position holds: the error
