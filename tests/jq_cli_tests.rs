@@ -64073,7 +64073,8 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
 /// jq 1.7.1 with `-c` on the document in each row (mostly `{"a":{"b":1},"k":2}`),
 /// on both evaluators (the document on stdin, and as a `-n` literal). The
 /// contrast rows are an output that is not the register (`last(.a)` moved off
-/// it), still refused.
+/// it), still refused. #3786 lifted the first version's restriction to an `f` that
+/// navigates nothing, once #3780 and #3797 closed the reduce-update hole it guarded.
 #[test]
 fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -64257,37 +64258,44 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
             "",
             0,
         ),
-        // Still refused where jq answers `[]` (refuse-only), pinned so lifting it is a
-        // deliberate change: an `f` that navigates (`last(.a, .)`) or that the
-        // `cannot_move_register` allowlist cannot prove navigates nothing
-        // (`first(.)`, `select(true)`) keeps the copy it always had.
+        // Every `f` (#3786): the output decides, not the `f` that produced it, so an
+        // `f` that navigates before it ends on `.`, and one the old
+        // `cannot_move_register` allowlist could not prove navigates nothing
+        // (`first(.)`, `select(true)`), hand the register back as well. A bare read
+        // answers `[]`, and under a `try` or `?` the write is no longer dropped.
+        (doc, r"path(last(.a, .))", "[]\n", "", 0),
+        (doc, r"path(last(first(.)))", "[]\n", "", 0),
+        (doc, r"path(last(select(true)))", "[]\n", "", 0),
+        (doc, r"path(last(last(.)))", "[]\n", "", 0),
+        (doc, r"path(last(getpath([])))", "[]\n", "", 0),
+        (doc, r"path(last(limit(1; .)))", "[]\n", "", 0),
+        (doc, r"del(try (last(first(.)) | .k))", deleted_k, "", 0),
+        (doc, r"del(try (last(select(true)) | .k))", deleted_k, "", 0),
+        (doc, r"del(try (last(last(.)) | .k))", deleted_k, "", 0),
+        (doc, r"del(try (last(.a, .) | .k))", deleted_k, "", 0),
+        (doc, r"del(try (last(getpath([])) | .k))", deleted_k, "", 0),
+        (doc, r"del(try (last(limit(1; .)) | .k))", deleted_k, "", 0),
         (
             doc,
-            r"path(last(.a, .))",
+            r"(. as $x | try (5 | last(last($x)) | .k)) = 9",
+            set_k,
             "",
-            "Invalid path expression with result",
-            5,
+            0,
         ),
+        // The output that is not the register stays a copy: `last(., .a)` ends on
+        // `.a`, which moved off it.
         (
             doc,
-            r"path(last(first(.)))",
+            r"path(last(., .a))",
             "",
-            "Invalid path expression with result",
+            r#"Invalid path expression with result {"b":1}"#,
             5,
         ),
-        (
-            doc,
-            r"path(last(select(true)))",
-            "",
-            "Invalid path expression with result",
-            5,
-        ),
-        // The reason for that restriction. A navigating `f` in a reduce UPDATE runs
-        // against a register the navigating source already moved, so jq raises on
-        // the navigation; the fold resolves it as though the accumulator sat on the
-        // register, and forwarding the root from `last(.k, .)` made the update an
-        // accepted `[]` that `del` turned into deleting the document (exit 0). Its
-        // bare twin `(.k, .)` is the same hole, older than this change (#3780).
+        // The guard the old restriction stood in for. A navigating `f` in a reduce
+        // UPDATE runs against a register the navigating source already moved, so jq
+        // raises on the navigation; the fold now reads the per-step register for an
+        // UPDATE that navigates (#3780, #3797), so `last(.k, .)` refuses like its
+        // bare twin `(.k, .)`.
         (
             r#"{"a":true,"k":2}"#,
             r"del(reduce .[]? as $k (.; last(.k, .)))",
@@ -64302,6 +64310,114 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
             r#"near attempt to access element "k""#,
             5,
         ),
+    ])
+}
+
+/// #3797: a navigating `reduce` source moves jq's register onto its element before
+/// UPDATE runs (`gen_reduce` has no `SUBEXP` around the source), so any navigation
+/// UPDATE *executes* is checked against that element, and a frozen `$x` after it is no
+/// longer the register. #3787 read the per-step register only for an UPDATE the
+/// resolver was sure navigates (a bare navigation, a `,`, a pipe's first stage), so a
+/// navigation inside a collect, the left of a `//`, `first(f)` or `last(f)` kept the
+/// persistent register, `$x` re-established it, and `del` deleted the whole document
+/// (`null`, exit 0) and `=` overwrote it where jq exits 5. Those four run their body
+/// whatever it yields; the right of a `//` and `limit(n; f)` are not read. Every row
+/// captured from jq 1.7.1 on `{"a":true,"k":2}`, on both evaluators.
+#[test]
+fn test_reduce_update_navigating_inside_a_collect_or_alternative_refuses_3797() -> Result<()> {
+    let doc = r#"{"a":true,"k":2}"#;
+    let near_k = r#"near attempt to access element "k""#;
+    assert_path_rows_both_routes_3749(&[
+        // The hole.
+        (
+            doc,
+            r"del(. as $x | reduce .[]? as $k (.; [.k] | $x))",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            doc,
+            r"(. as $x | reduce .[]? as $k (.; [.k] | $x)) = 9",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | reduce .[]? as $k (.; [.k] | $x))",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            doc,
+            r"del(. as $x | reduce .[]? as $k (.; (.k // .) | $x))",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            doc,
+            r"del(. as $x | reduce .[]? as $k (.; first(.k) | $x))",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            doc,
+            r"del(. as $x | reduce .[]? as $k (.; last([.k]) | $x))",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            doc,
+            r"del(. as $x | reduce .[]? as $k (.; last((.k // .)) | $x))",
+            "",
+            near_k,
+            5,
+        ),
+        // What must not move: a source that does not navigate leaves the register
+        // where it was, a caught error and a construction's value are jq's own
+        // answers, and a body that does not navigate keeps the persistent register.
+        (
+            doc,
+            r"del(. as $x | reduce (1,2) as $k (.; [.k] | $x))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | reduce .[]? as $k (.; try .k catch 1 | $x))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | reduce .[]? as $k (.; {a: .k} | $x))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | reduce .[]? as $k (.; (. // .k) | $x))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(reduce .[]? as $k (.; (. // .k)))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(reduce .[]? as $k (.; first(.)))", "[]\n", "", 0),
+        (doc, r"del(reduce .[]? as $k (.; last(.)))", "null\n", "", 0),
     ])
 }
 
