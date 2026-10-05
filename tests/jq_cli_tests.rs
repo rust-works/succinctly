@@ -77785,6 +77785,110 @@ fn test_try_wrapped_if_bind_source_keeps_register_3279() -> Result<()> {
     Ok(())
 }
 
+/// #3781: in a `?//` destructuring bind whose body navigates under `try`/`?`, jq
+/// takes the object pattern's first step on the register when the source passes `.`
+/// through (`select(true)`, `(.|.)`, `first(.)`), so the body's navigation is refused
+/// and caught: no paths, and `del`/`=`/`|=` leave the document alone. succinctly saw
+/// an off-register value, took that step's refusal for jq's, retried onto the bare
+/// `$v0` alternative, and resolved `try .a` as a tracked path -- `del(select(true) as
+/// {a:$v0} ?// $v0 | try .a)` printed `{}` (exit 0) where jq prints the document. A
+/// retry that rests on that guess now refuses a *tracked* output of a later
+/// alternative (uncatchable, exit 5): a write needs a path, and a retry that yields
+/// none says what jq says. The bare `.` source, a navigated source, an array pattern
+/// whose step is a type error, a body without a swallowed error, and a source
+/// whose pattern cannot match by type are unchanged and still match jq. Every
+/// jq-side row was captured from jq 1.7.1.
+#[test]
+fn test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781() -> Result<()> {
+    let doc = r#"{"a":{"b":1}}"#;
+    for filter in [
+        r"del(select(true) as {a:$v0} ?// $v0 | try .a)",
+        r"del((.|.) as {a:$v0} ?// $v0 | try .a)",
+        r"del(first(.) as {a:$v0} ?// $v0 | try .a)",
+        r"del(first(.) as {a:$v0} ?// $v0 | (.a)?)",
+        r"(first(.) as {a:$v0} ?// $v0 | try .a) |= 5",
+        r"(first(.) as {a:$v0} ?// $v0 | try .a) = 5",
+        r"[path(select(true) as {a:$v0} ?// $v0 | try .a)]",
+        r"[path(first(.) as {a:$v0} ?// $v0 | try .b)]",
+        r"[path(select(true) as {a:{b:$v0}} ?// $v0 | try .a)]",
+        r"del(select(.a) as {a:$v0} ?// $v0 | try .a)",
+        r"del(limit(1; .) as {a:$v0} ?// $v0 | try .a)",
+        r"del(last(.) as {a:$v0} ?// $v0 | try .a)",
+        r"del(select(true) as {a:$v0} ?// {b:$v0} ?// $v0 | try .a)",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{doc}\n")))?;
+        assert_eq!((out.as_str(), code), ("", 5), "{filter}: stderr {err:?}");
+        assert!(
+            err.contains("Invalid path expression"),
+            "{filter}: stderr {err:?}"
+        );
+    }
+    // unchanged and matching jq
+    for (input, filter, expected) in [
+        (
+            doc,
+            r"del(. as {a:$v0} ?// $v0 | try .a)",
+            r#"{"a":{"b":1}}"#,
+        ),
+        (doc, r"del(first(.) as {a:$v0} ?// $v0 | .a)", "{}"),
+        (
+            doc,
+            r"[path(first(.) as [$v0] ?// $v0 | try .a)]",
+            r#"[["a"]]"#,
+        ),
+        (doc, r"[path(.a as {b:$v0} ?// $v0 | try .a)]", r#"[["a"]]"#),
+        (
+            r#"{"a":1}"#,
+            r"[path(select(true) as {a:{b:$v0}} ?// $v0 | try .a)]",
+            r#"[["a"]]"#,
+        ),
+        ("[1]", r"del(first(.) as {a:$v0} ?// $v0 | try .a)", "[1]"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
+        assert_eq!(
+            (out.trim_end(), code),
+            (expected, 0),
+            "{filter} on {input}: {err:?}"
+        );
+    }
+    // the array register: the same shape through an array pattern
+    for filter in [
+        r"[path(first(.) as [$v0] ?// $v0 | try .[0])]",
+        r"del(first(.) as [$v0] ?// $v0 | try .[0])",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some("[[1]]\n"))?;
+        assert_eq!((out.as_str(), code), ("", 5), "{filter}: stderr {err:?}");
+    }
+    // a refusal that is provably exact (the head is a copy, not the register), a
+    // nested pattern that is a certain type error, and a postfix `?` on a bare
+    // navigation keep jq's answer
+    for (input, filter, expected) in [
+        (
+            doc,
+            r#"del((. + {"z":1}) as {a:$v0} ?// $v0 | try .a)"#,
+            "{}",
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(select(true) as {a:[$x]} ?// $v0 | try .a)",
+            "{}",
+        ),
+        (
+            "[1]",
+            r"[path(select(true) as [$v0] ?// $v0 | .[0]?)]",
+            "[[0]]",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
+        assert_eq!(
+            (out.trim_end(), code),
+            (expected, 0),
+            "{filter} on {input}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3279 review: the widening must neither write where jq refuses nor
 /// start refusing where jq and `main` answer. A marker routed through `//`
 /// (`(if true then $x else . end) // B`, `$x | (. // B)`) with a null/false
