@@ -43786,7 +43786,6 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
                 && origin.is_none()
                 && !identity_passthrough(source, true)
                 && !is_provably_fresh_source(source)
-                && var_reaches_path_position(body, var)
                 && if trackable {
                     bound == *value
                 } else {
