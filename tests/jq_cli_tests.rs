@@ -104134,6 +104134,86 @@ fn test_retry_before_a_lazy_last_stage_3806() -> Result<()> {
     assert_retry_rows_3293(None, &format!("{input} | "), RETRY_ROWS_LAZY_STAGE_3806)
 }
 
+/// #3806: the same `?//` before a lazy `map(f)`, with the failing element *after* a good one and the
+/// stage under `try`/`?`, a `def`, a `halt_error` and a `break`; every value from `/usr/bin/jq` 1.7.1.
+/// (`first(.. | map(f) | .[])` is left out: its bounded-consumer laziness is the accepted #1565 divergence.)
+const RETRY_ROWS_LAZY_STAGE_LATE_3806: &[RetryRow3293] = &[
+    (
+        r#"(. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else .b end) | map(if . == 1 then error("E") else . end)"#,
+        "[3]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[(. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else .b end) | map(if . == 1 then error("E") else . end)]"#,
+        "[[3]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"try ((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else .b end) | map(if . == 1 then error("E") else . end)) catch "c""#,
+        "[3]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else .b end) | map(if . == 1 then error("E") else . end))?"#,
+        "[3]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else .b end) | map(if . == 1 then error("E") else . end))?]"#,
+        "[[3]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"def f: (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else .b end); f | map(if . == 1 then error("E") else . end)"#,
+        "[3]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"def f(g): g | map(if . == 1 then error("E") else . end); f((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else .b end))"#,
+        "[3]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else .b end) | map(if . == 1 then ("H"|halt_error(4)) else . end)"#,
+        "",
+        "A",
+        "H",
+        4,
+    ),
+    (
+        r#"(. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else .b end) | map(if . == 1 then (label $f | break $f) else . end)"#,
+        "[2]\n",
+        "A",
+        "",
+        0,
+    ),
+];
+
+#[test]
+fn test_retry_before_a_lazy_last_stage_late_failure_3806() -> Result<()> {
+    let input = r#"{"a":[2,1],"b":[3]}"#;
+    assert_retry_rows_3293(Some(input), "", RETRY_ROWS_LAZY_STAGE_LATE_3806)?;
+    assert_retry_rows_3293(
+        None,
+        &format!("{input} | "),
+        RETRY_ROWS_LAZY_STAGE_LATE_3806,
+    )
+}
+
 /// #3807: an output of a computed index's or slice's target that cannot be
 /// decoded raises its decode failure, which no `?//` retries. jq rejects the
 /// input at parse time, so there is no oracle row: this pins that both forms

@@ -15209,6 +15209,13 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     // own `Flow::Escaped`, which `stop_with_downstream` stashes and
     // `pipe_terminal_after_retry` lets the retry supersede -- the route an
     // owned item already takes.
+    //
+    // Only a `LazySeq` is forced: the other lazy items (`LazyKeys`, `LazyIndexRange`)
+    // can only fail with a decode failure, which `stop_with_escape` marks
+    // nonretryable, so no retry could supersede it wherever it is raised. A
+    // `LazySeq` is the one that can raise an ordinary, retryable error.
+    // Forcing is atomic, as jq's `map` is -- a bounded consumer behind it gets
+    // the whole sequence, but only for a pipe whose source holds a `?//`.
     let force_lazy = crate::jq::eval::contains_retrying_pattern_bind(first);
     let upstream = {
         let mut driver = forward_lazy(outer_budget, |item: GenericItem<V>| -> Demand {
