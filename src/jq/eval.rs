@@ -43626,6 +43626,17 @@ fn fold_source_moves_register(source: &Expr) -> bool {
     })
 }
 
+/// Whether every output of `e` is the register itself: a bare `.`, or a comma or
+/// pipe of them (parens aside). `.` does not move jq's register, so a `foreach`
+/// source of these emits elements that are the register's own node (#3790).
+fn yields_only_the_register(e: &Expr) -> bool {
+    match unwrap_paren(e) {
+        Expr::Identity => true,
+        Expr::Comma(items) | Expr::Pipe(items) => items.iter().all(yields_only_the_register),
+        _ => false,
+    }
+}
+
 /// Whether a `foreach` SOURCE destructures the register itself (`.`) with an array
 /// or object pattern (#3744): `foreach (. as {a:$a} | .) as $x (...)`. The pattern's tracked index steps move jq's
 /// register onto the matched member and the source is not backtracked past it,
@@ -43907,6 +43918,33 @@ fn drive_fold_source_with<S: EvalSemantics>(
     }) || (S::TAG == EvalTag::Jq
         && foreach_source
         && foreach_source_destructures_register(source));
+    // #3790: a `foreach` whose source is the register itself (`.`) emits it as
+    // jq's register-derived element at the root: `.` does not move the register
+    // and `$k` is bound to that very node, so the element carries the root path
+    // (rebased like a resolved branch's) instead of the by-value drive's none.
+    if S::TAG == EvalTag::Jq
+        && foreach_source
+        && ambient.trackable
+        && yields_only_the_register(source)
+    {
+        let path = match relocate_base {
+            Some(base) => Rc::clone(base),
+            None => PathPrefix::root(),
+        };
+        return eval_each_owned::<S>(
+            source,
+            ambient.value,
+            false,
+            Reentry::at_register(true),
+            &mut |value| {
+                step(FoldSourceValue {
+                    value,
+                    register_path: Some(Rc::clone(&path)),
+                    moved: MovedRegister::Unmoved,
+                })
+            },
+        );
+    }
     if !has_navigation {
         return drive_fold_source_by_value::<S>(source, ambient.value, ambient.trackable, step);
     }
