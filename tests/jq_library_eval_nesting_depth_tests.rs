@@ -99,13 +99,13 @@ fn test_public_eval_accepts_depth_under_limit_2627() {
 /// test thread leaves them only a ~1.4x margin. 8 MiB keeps these tests off
 /// that edge on any platform's frame sizes: they pin the ceiling, not the
 /// margin.
-fn run_on_big_stack(json: String, filter: &'static str) -> Result<Vec<String>, (bool, String)> {
+fn run_on_big_stack(json: String, filter: String) -> Result<Vec<String>, (bool, String)> {
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let bytes = json.as_bytes();
             let index = JsonIndex::build(bytes);
-            let expr = parse(filter).expect("parse failed");
+            let expr = parse(&filter).expect("parse failed");
             let result: QueryResult<Vec<u64>> =
                 eval::<Vec<u64>, JqSemantics>(&expr, index.root(bytes));
             match result {
@@ -147,7 +147,7 @@ fn test_public_eval_path_family_over_depth_is_a_clean_error_3457() {
         ("[path(..)] | length", &[256, 300, 384, 1000][..], 256),
     ] {
         for &depth in depths {
-            let outcome = run_on_big_stack(nested_arrays(depth), filter);
+            let outcome = run_on_big_stack(nested_arrays(depth), filter.to_string());
             let (decode_failure, message) =
                 outcome.expect_err(&format!("{filter} @ {depth}: expected an error"));
             assert!(decode_failure, "{filter} @ {depth}: {message}");
@@ -172,7 +172,7 @@ fn test_public_eval_path_family_under_depth_answers_3457() {
             ("[.. | path] | length", depth + 1),
         ] {
             assert_eq!(
-                run_on_big_stack(nested_arrays(depth), filter),
+                run_on_big_stack(nested_arrays(depth), filter.to_string()),
                 Ok(vec![expected.to_string()]),
                 "{filter} @ {depth}"
             );
@@ -180,7 +180,7 @@ fn test_public_eval_path_family_under_depth_answers_3457() {
     }
     // The materializing form is still bounded by the lower ceiling.
     assert_eq!(
-        run_on_big_stack(nested_arrays(255), "[path(..)] | length"),
+        run_on_big_stack(nested_arrays(255), "[path(..)] | length".to_string()),
         Ok(vec!["256".to_string()])
     );
 }
@@ -192,9 +192,7 @@ fn test_public_eval_path_family_under_depth_answers_3457() {
 #[test]
 fn test_public_eval_static_path_chain_ceiling_3429() {
     let doc = format!("{}{{}}{}", "{\"k\":".repeat(400), "}".repeat(400));
-    let chain = |n: usize| -> &'static str {
-        Box::leak(format!("path({}) | length", ".k".repeat(n)).into_boxed_str())
-    };
+    let chain = |n: usize| format!("path({}) | length", ".k".repeat(n));
     assert_eq!(
         run_on_big_stack(doc.clone(), chain(384)),
         Ok(vec!["384".to_string()])

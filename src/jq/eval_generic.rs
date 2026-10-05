@@ -258,13 +258,16 @@ pub fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Opt
         .then(|| text.to_string())
 }
 
-/// The path walkers' depth guard (#3457): [`assert_nesting_depth`]'s
+/// The materializers' depth guard (#3457): [`assert_nesting_depth`]'s
 /// ceiling, reported as a `decode_failure`-tagged `Err` instead of a panic.
 ///
-/// The walkers (`collect_paths_generic`, `path_walk_generic` and the
-/// `path_*step*` family) already return a `Result`, so -- like
-/// [`to_owned`] after #2627 -- only the signalling needed to change, not
-/// the signatures. The tag keeps the property the panic was chosen for: a
+/// Used by the walks that build an owned tree (`to_owned_with_comments_at_depth`,
+/// `owned_from_standard_json_at_depth`, `owned_identity_recurse_step`). The
+/// path walkers (`collect_paths_generic`, `path_walk_generic` and the
+/// `path_*step*` family) report the same way against their own, higher ceiling
+/// through [`guard_path_walk_depth`] (#3429). Both already return a `Result`,
+/// so -- like [`to_owned`] after #2627 -- only the signalling needed to change,
+/// not the signatures. The tag keeps the property the panic was chosen for: a
 /// stack-safety guard must not be swallowed by a `try`/`catch` in the
 /// running filter (see [`check_nesting_depth`], whose plain error would be).
 /// It also means a library caller of `jq::eval` gets a `QueryResult::Error`
@@ -300,9 +303,16 @@ pub(crate) fn guard_nesting_depth(depth: usize) -> Result<(), EvalError> {
 /// 256 ceiling), so it is accepted; the CLI's own thread is 256 MB-2 GB.
 /// The materializer itself does *not* clear 384 -- it would abort a 2 MiB
 /// debug thread before reaching its own guard -- so it keeps
-/// [`MAX_NESTING_DEPTH`], and a route that materializes the document
-/// (`path(..)`, `path(recurse(f; c))`, `path(getpath(p))`) still refuses past
-/// 256; see `docs/compliance/jq/limitations.md`.
+/// [`MAX_NESTING_DEPTH`], and a route that materializes the document first
+/// (`path(..)`, `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among
+/// others) still refuses past 256; see `docs/compliance/jq/limitations.md`.
+///
+/// The guard is `depth < ceiling` and the walkers count differently, so state
+/// the boundary in what a caller can observe: `paths`/`leaf_paths` and
+/// `.. | path` take a *document* nested up to 383 levels (a path as long as the
+/// document is deep must stay under the ceiling), and a static chain
+/// (`path(.a.a...)`) takes up to 384 *components*, because the guard runs
+/// before each stage's step.
 pub const MAX_PATH_WALK_DEPTH: usize = super::value::MAX_VALUE_TREE_DEPTH;
 
 /// [`guard_nesting_depth`]'s sibling for the path walkers: a
@@ -19815,10 +19825,12 @@ fn slice_one_generic_computed<S: EvalSemantics, V: DocumentValue>(
 /// duplicate-key concept to reconcile, so there's nothing `effective_fields`
 /// buys here that a plain cons-list walk doesn't already give for free.
 ///
-/// Panics past [`MAX_NESTING_DEPTH`] levels of nesting, the same guard
-/// `to_owned`/`to_owned_cursor` already carry -- `current_path.len()` tracks
-/// depth without a separate counter, same shape as `collect_paths`'s own
-/// `#1021` guard.
+/// Returns a decode-failure-tagged `Err` past [`MAX_PATH_WALK_DEPTH`] levels of
+/// nesting (a panic at [`MAX_NESTING_DEPTH`] before #3457/#3429) --
+/// `current_path.len()` tracks depth without a separate counter, same shape as
+/// `collect_paths`'s own `#1021` guard. A path as long as the document is deep
+/// must stay under the ceiling, so a document nested 383 levels is the deepest
+/// this walk takes.
 ///
 /// #1829: `effective_fields_checked`, not the infallible `effective_fields`
 /// -- this is the CLI's own native `Builtin::Paths`/`Builtin::LeafPaths`
@@ -20430,7 +20442,7 @@ fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
 /// `Clone` shares the trail (an `Rc` bump) for a step that keeps the position.
 trait StepTrail<V: DocumentValue>: Clone {
     /// Steps taken by native recursion since this walk's own root; O(1) --
-    /// what [`assert_nesting_depth`] guards against a Rust stack overflow,
+    /// what [`guard_path_walk_depth`] guards against a Rust stack overflow,
     /// not the trail's distance from the *document* root (#3020). `PathTrail`
     /// never starts anywhere but empty, so the two coincide for it; a
     /// [`PathContextTrail`] can start already seeded with a nested input's
@@ -20467,7 +20479,7 @@ impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
 /// link nor the component it would have named.
 ///
 /// Its depth is always 0, which is what the walk it replaces reported too: it
-/// restarted from [`PathTrail::root`] at every node. [`guard_nesting_depth`]
+/// restarted from [`PathTrail::root`] at every node. [`guard_path_walk_depth`]
 /// therefore never has anything to refuse here, and the walk is iterative
 /// (#3457), so no native recursion is left for it to bound.
 #[derive(Clone, Copy)]
@@ -20785,10 +20797,11 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
     path: &Rc<PathTrail>,
     out: &mut Vec<OwnedValue>,
 ) -> Result<(), EvalError> {
-    // Errors past `MAX_NESTING_DEPTH` levels (code review on #2058; a
-    // `decode_failure`-tagged `Err` rather than a panic since #3457), the
-    // same guard `collect_paths_generic` already carries for its own
-    // recursive path-array walk in this file. `PathTrail` has no depth cap
+    // Errors past `MAX_PATH_WALK_DEPTH` levels (code review on #2058; a
+    // `decode_failure`-tagged `Err` rather than a panic since #3457, and a
+    // 384 rather than 256 ceiling since #3429), the same guard
+    // `collect_paths_generic` already carries for its own recursive
+    // path-array walk in this file. `PathTrail` has no depth cap
     // of its own -- a static chain (`path(.a.a.a...)`) recurses this
     // function's own call graph (`path_walk_pipe_generic`/`path_step_
     // generic`/`path_step_pipe_generic` below all funnel back through it)

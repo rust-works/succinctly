@@ -9239,7 +9239,7 @@ narrowing:
   answered up to 384, did not have. `paths`, `leaf_paths` and the cursor-native `path(f)`
   walkers stop at 384 ([#3429](https://github.com/rust-works/succinctly/issues/3429) raised
   them from 256); the forms that materialize the whole document first (`path(..)`,
-  `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`) stop at 256, the materializers'
+  `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among others) stop at 256, the materializers'
   ceiling, chosen for native-stack safety. Past the ceiling they return
   `nesting depth exceeds limit of 384` (or `256`) as a `QueryResult::Error`, tagged as a decode
   failure so a `try` in the filter does not swallow it, and never as an unwinding panic: the
