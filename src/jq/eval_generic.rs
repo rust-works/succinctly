@@ -23880,6 +23880,10 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
         }
         Expr::Label { body, .. } => step_can_yield_absent(body, incoming),
         Expr::Shared(inner) => step_can_yield_absent(inner, incoming),
+        // #3773: a structural `recurse(.[]?)` is deliberately not listed with `..`
+        // here or in `path_context_stage_preserves_node`: both fall to the
+        // conservative arm, which only sends such a pipe down the owned route
+        // and answers identically, so an arm could not be pinned.
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => incoming,
         Expr::Break(_)
         | Expr::Error(_)

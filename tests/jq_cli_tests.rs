@@ -100679,6 +100679,29 @@ fn test_register_limit_nth_wrappers_and_type_filter_collect_3767() -> Result<()>
     ])
 }
 
+/// #3773: the position-reading routes deliver every node of a structural
+/// `recurse(.[]?)`, as `..` does, past `RECURSE_MAX_ITEMS` (10,000) -- the cap
+/// that applies to a parameterised `f` must not come back on the cursor route.
+#[test]
+fn test_recurse_structural_descent_position_walk_has_no_node_cap_3773() -> Result<()> {
+    // 1 root + 1,200 arrays + 10,800 numbers = 12,001 nodes. Narrow arrays:
+    // `key` over one wide array costs time per sibling, for `..` as well.
+    let input = format!("[{}]", vec!["[1,2,3,4,5,6,7,8,9]"; 1200].join(","));
+    for filter in [
+        "[recurse(.[]?) | key?] | length",
+        "[.a?, (recurse(.[]?) | key?)] | length",
+        "last(recurse(.[]?) | key?)",
+    ] {
+        let (want, c1) = run_jq_stdin(&filter.replace("recurse(.[]?)", ".."), &input, &["-c"])?;
+        let (got, c2) = run_jq_stdin(filter, &input, &["-c"])?;
+        assert_eq!((c1, c2), (0, 0), "`{filter}`");
+        assert_eq!(got, want, "`{filter}` vs `..`");
+    }
+    let (out, code) = run_jq_stdin("[recurse(.[]?) | key?] | length", &input, &["-c"])?;
+    assert_eq!((out.as_str(), code), ("12000\n", 0));
+    Ok(())
+}
+
 /// #3773: `recurse(.[]?)` is jq's own definition of bare `recurse`, so a stage
 /// after it reads the same position (`key`, `parent`, `path`) off each node
 /// that it reads after `..` and `recurse`. Inside a collect, and in every
