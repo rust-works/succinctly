@@ -180,10 +180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable, `.`, parentheses, `?` and `try` with no handler, joined by `|`); every other shape keeps the old verdict
   (`getpath(...)`, a computed key even when literal, `select`, `first(...)`). The
   rows that were silently skipped now match jq, including the ones where jq raises (`path(foreach .x as $w (0; try ($w |
-  .[]?); $w))`, a slice write). Bodies that branch (a comma, `//`, `and`/`or` around a generator, a `catch` handler) and
-  the non-branching shapes the allowlist does not name still answer nothing or refuse where jq answers (#3770); widening
-  the exemption needs the fold's null-identity relocation fixed first, since dropping the generator from `fans_out`
-  outright made `(foreach .a? as $k (0; try (($k | .[]?) // $k); .)) = 9` on `null` write `9` over the whole document.
+  .[]?); $w))`, a slice write). Bodies that branch, and the non-branching shapes the allowlist did not name, were
+  left to #3770, which replaced the allowlist once #3769's fix had made widening safe.
   Verified against jq 1.7.1: 33 pinned rows plus a characterization test for what stays; an oracle sweep of the new
   `$k` operands (103,707 rows: 0 regressions, 90 rows now match), of every existing generator and fold operand over every
   context (159,867 rows, identical to the parent) and of a 100,027-row seeded sample over every operand (0 regressions);

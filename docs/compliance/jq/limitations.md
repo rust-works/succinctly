@@ -2470,24 +2470,23 @@ is the revert that established what the other one costs.
    then $x else . end) as $y` on an untracked stage, which binds `Untracked` because the
    condition is not evaluated where jq evaluates it and binds the marker.
 
-   [#3738](https://github.com/rust-works/succinctly/issues/3738) extends that carrying to a fold
-   body that holds a generator (`.[]`, `..`) when the body is one chain of stages: the fold used
-   to withhold the register from any such body (`fans_out`), so `try ($w \| .a[])` resolved
-   register-less, the `try` caught its own refusal, and the UPDATE yielded nothing --
-   `del(foreach .x as $w (0; try ($w \| .a[]); .))` echoed the document where jq empties `.x.a`,
-   and `(...) = 9` skipped the write (as did the same body as the EXTRACT). A chain has no sibling
-   branch to withhold it from. `is_single_path_chain` admits a field, an index, a slice, `..` and
-   `.[]`, the bound variable, `.`, parentheses, `?` and `try` with no handler, joined by `|`; every
-   other shape keeps the old verdict. That includes bodies that branch (a comma, `//`, `and`/`or`
-   around a generator, a `catch` handler) and non-branching shapes the allowlist does not name
-   (`select`, `first(...)`, `limit`, a call, `getpath(...)`, a computed key even when literal such as
-   `.a[0.5]`): they still answer
-   nothing or refuse where jq answers
-   ([#3770](https://github.com/rust-works/succinctly/issues/3770)). Widening the exemption needs
-   the fold's null-identity relocation fixed first, since on a `null` document it answers the root
-   path for those bodies and `(foreach .a? as $k (0; try (($k \| .[]?) // $k); .)) = 9` would
-   overwrite the whole document. Pinned by
-   `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738` and, for what stays,
+   [#3738](https://github.com/rust-works/succinctly/issues/3738) and
+   [#3770](https://github.com/rust-works/succinctly/issues/3770) extend that carrying to a fold
+   body that holds a generator (`.[]`, `..`): the fold used to withhold the register from any such
+   body (`fans_out`), so `try ($w \| .a[])` resolved register-less, the `try` caught its own
+   refusal, and the UPDATE yielded nothing -- `del(foreach .x as $w (0; try ($w \| .a[]); .))`
+   echoed the document where jq empties `.x.a`, and `(...) = 9` skipped the write (as did the
+   same body as the EXTRACT). #3738 exempted one chain of stages; #3770 stopped counting a
+   generator as a split at all, so `//`, `select`, `first(...)`, `limit`, `if`, `getpath(...)`, a
+   computed key and a `catch` handler around one keep the register too. `fans_out` still counts
+   a comma, a destructuring bind, a fold and a call, and a comma body still answers nothing
+   where jq answers, so a write through it is silently skipped (`path(foreach .x as $w (0; try ($w \| .a, .b?); .))` is `["x","a"]`, `["x","b"]` in jq).
+   On a `null` document, `//` around a generator (`(foreach .a? as $k (0; try (($k \| .[]?) //
+   $k); .)) = 9`, `{"a":9}` in jq) now refuses loudly where it used to skip the write: the bare
+   `$k` alternate cannot relocate to the register once the body navigates anywhere
+   ([#3788](https://github.com/rust-works/succinctly/issues/3788)). Pinned by
+   `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`,
+   `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770` and, for what stays,
    `test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`.
 
    **`resolve_as_pattern`'s own first-step identity test recognizes every

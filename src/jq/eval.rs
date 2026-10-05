@@ -42308,7 +42308,7 @@ fn recurse_seed_keeps_register<S: EvalSemantics>(element: &Expr, branch_trackabl
 /// Whether `expr` can split into sibling branches that would see the fold's
 /// register unevenly -- a syntactic over-approximation, used by
 /// [`FoldRegister::resolve`] to decline carrying the register into such a body
-/// (#3145 review). A comma, a destructuring alternation and the shapes this
+/// (#3145 review). A comma, a destructuring bind and the shapes this
 /// predicate cannot see inside (a fold, a call) count, since the answer must be
 /// "maybe" for those.
 ///
