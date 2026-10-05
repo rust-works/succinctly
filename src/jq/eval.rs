@@ -38013,22 +38013,17 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             // it and jq refuses it. Jq mode only, like the register (ADR-0018:
             // yq has no oracle for either).
             //
-            // Only for an `f` that provably navigates nothing
-            // ([`cannot_move_register`]): a navigating `f` inside a reduce/foreach
-            // UPDATE runs against a register jq's source already moved, where jq
-            // raises on the navigation and the fold resolves it as though the
-            // accumulator sat on the register (`del(reduce .[]? as $k (.; (.k,
-            // .)))` deletes the document on `main`, where jq exits 5, #3780).
-            // Forwarding the root there would hand that hole `last(.k, .)` as
-            // well, so a navigating `f` keeps the copy it always had, and so does
-            // an `f` the allowlist cannot prove navigates nothing (`first(.)`,
-            // `select(true)`): those still refuse a bare read, and under a `try`
-            // or `?` they drop the write exactly as before (tracked with #3780).
+            // For every `f` (#3786): an `f` that navigates leaves a trackable output
+            // below the root (`last(.a)` is `.a`'s node, which is not the register jq
+            // keeps at the entry), so only a trackable output *at the root* is the
+            // entry node, and everything else is the copy it always was. This used to
+            // be gated on `cannot_move_register(f)` because a navigating `f` inside a
+            // reduce UPDATE ran against a register the source had already moved, which
+            // the fold resolved as though the accumulator sat on it (#3780, #3797);
+            // those are fixed, so `last(.k, .)` refuses there like `(.k, .)` does.
             let result = match last {
-                Some(branch) if last_register_unmoved::<S>() && cannot_move_register(inner) => {
-                    if branch.trackable {
-                        // `f` navigates nothing, so a trackable output is the entry node.
-                        debug_assert_eq!(branch.path.depth(), 0);
+                Some(branch) if last_register_unmoved::<S>() => {
+                    if branch.trackable && branch.path.depth() == 0 {
                         branch
                     } else {
                         PathBranch::demoted(branch.snapshot, branch.value).with_register(register)
