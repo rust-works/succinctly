@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `path(last(first(.)))` and `path(last(select(true)))` answer `[]` as in jq, and `del(try (last(first(.)) | .k))` deletes `k` where it dropped
   the write. `last(f)` counts an `f` that merely *may* move the register (`last(limit(2; .k, .))`, `last(nth(1; .k, .))`, `last(label $l | .k, .)`,
   `last(def f: .k, .; f)`), because the walk cannot read those and the root they end on is not the register the source moved off; a bare UPDATE of
-  those shapes is the still-open #3811.
+  those shapes is the still-open #3811. `first(f)` reads only the first output of `f` (`first(., .k)` never runs `.k` and keeps jq's answer).
   Pinned by `test_reduce_update_navigating_inside_a_collect_or_alternative_refuses_3797` and
   `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both evaluators).
 

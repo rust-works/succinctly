@@ -64350,6 +64350,30 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
             "",
             0,
         ),
+        // Recorded refusals where jq answers `null` (exit 0), as before #3786: a
+        // passthrough `f` outside `cannot_move_register`'s allowlist is read as one
+        // that may navigate, because the walk cannot tell it from `limit(2; .k, .)`.
+        (
+            r#"{"a":true,"k":2}"#,
+            r"del(reduce .[]? as $k (.; last(first(.))))",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"del(reduce .[]? as $k (.; last(select(true))))",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"del(reduce .[]? as $k (.; last(limit(1; .))))",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
     ])
 }
 
@@ -64458,6 +64482,51 @@ fn test_reduce_update_navigating_inside_a_collect_or_alternative_refuses_3797() 
         ),
         (doc, r"path(reduce .[]? as $k (.; first(.)))", "[]\n", "", 0),
         (doc, r"del(reduce .[]? as $k (.; last(.)))", "null\n", "", 0),
+        // `first(f)` stops at its first output, so a navigation after it never runs:
+        // the walk reads only the first output of `f`, not every comma item.
+        (
+            doc,
+            r"path(reduce .[]? as $k (.; first(., .k)))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(reduce .[]? as $k (.; first(., .k)))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(reduce .[]? as $k (.; first((., .k) | .)))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(reduce .[]? as $k (.; first(if true then (., .k) else . end)))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(reduce .[]? as $k (.; first(first(., .k))))",
+            "[]\n",
+            "",
+            0,
+        ),
+        // ...while a navigation that *is* the first output still refuses.
+        (
+            doc,
+            r"del(reduce .[]? as $k (.; first(.k, .)))",
+            "",
+            near_k,
+            5,
+        ),
     ])
 }
 

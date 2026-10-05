@@ -46147,23 +46147,40 @@ fn foreach_step_register<S: EvalSemantics>(
 /// `nth`, a `label`, a `def` call, a `try` -- so those keep the persistent register
 /// and their existing verdict, which matches jq for the passthrough forms (`first(.)`,
 /// `limit(1; .)`, `. // .k`, `((.k)?, .)` are all `[]` in jq). A shallow, conservative
-/// rule on purpose: the cost of a miss is the old behaviour, never a new refusal --
-/// and that old behaviour is the open hole for a bare navigating `limit`/`nth`/`label`/
-/// `def` UPDATE (`limit(2; .k, .)`), which `last(f)` must not extend, so it reads an
-/// `f` that merely *may* navigate.
+/// rule on purpose: a miss keeps the old behaviour -- which is the open hole for a
+/// bare navigating `limit`/`nth`/`label`/`def` UPDATE (`limit(2; .k, .)`, #3811) -- and
+/// the one deliberate over-approximation is `last(f)`, which reads an `f` that merely
+/// *may* navigate so that it does not extend that hole (it then refuses a passthrough
+/// `f` outside [`cannot_move_register`]'s allowlist, `last(first(.))`, as `main` did).
 fn update_definitely_navigates(expr: &Expr) -> bool {
+    update_navigates_within(expr, false)
+}
+
+/// [`update_definitely_navigates`] for the outputs a consumer reads: every output
+/// (`first_only` false, a `reduce` takes the last) or only the first (`first(f)`
+/// stops at it, so `first(., .k)` never runs `.k` and is `[]` in jq).
+fn update_navigates_within(expr: &Expr, first_only: bool) -> bool {
     match expr {
-        Expr::Paren(inner) => update_definitely_navigates(inner),
-        Expr::Pipe(stages) => stages.first().is_some_and(update_definitely_navigates),
-        Expr::Comma(items) => items.iter().any(update_definitely_navigates),
+        Expr::Paren(inner) => update_navigates_within(inner, first_only),
+        Expr::Pipe(stages) => stages
+            .first()
+            .is_some_and(|stage| update_navigates_within(stage, first_only)),
+        Expr::Comma(items) if first_only => items
+            .first()
+            .is_some_and(|item| update_navigates_within(item, true)),
+        Expr::Comma(items) => items
+            .iter()
+            .any(|item| update_navigates_within(item, false)),
         // #3797: a collect, the left of a `//`, `first(f)` and `last(f)` run their
         // body whatever it yields, and jq path-checks what it navigates, so
         // `[.k] | $x`, `(.k // .) | $x` and `first(.k) | $x` raise as `.k | $x` does.
         // The right of a `//` runs only when the left yields nothing truthy, and
-        // `limit(n; f)` may not run `f` at all (`n` of 0), so neither is read.
-        Expr::Array(inner) | Expr::FirstExpr(inner) | Expr::Alternative(inner, _) => {
-            update_definitely_navigates(inner)
-        }
+        // `limit(n; f)` may not run `f` at all (`n` of 0), so neither is read. A
+        // collect and `last(f)` drain their body, so they read every output of it;
+        // `first(f)` reads only the first.
+        Expr::Array(inner) => update_navigates_within(inner, false),
+        Expr::FirstExpr(inner) => update_navigates_within(inner, true),
+        Expr::Alternative(inner, _) => update_navigates_within(inner, first_only),
         // `last(f)` hands its *last* output back, which for `last(limit(2; .k, .))`
         // is the root: an `f` this function cannot read (`limit`, `nth`, a `label`, a
         // user `def`) may still navigate before it gets there, and the root it then
@@ -46171,25 +46188,28 @@ fn update_definitely_navigates(expr: &Expr) -> bool {
         // the register at all counts, which is what `last(f)` did before #3786 lifted
         // its restriction; a refusal where jq answers is the safe direction, a root
         // accepted against a moved register deletes the document.
-        Expr::LastExpr(inner) => update_definitely_navigates(inner) || !cannot_move_register(inner),
+        Expr::LastExpr(inner) => {
+            update_navigates_within(inner, false) || !cannot_move_register(inner)
+        }
         Expr::Optional(inner) if is_postfix_optional_primitive(inner) => {
-            update_definitely_navigates(inner)
+            update_navigates_within(inner, first_only)
         }
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => match unwrap_paren(cond) {
-            Expr::Literal(Literal::Bool(true)) => update_definitely_navigates(then_branch),
+            Expr::Literal(Literal::Bool(true)) => update_navigates_within(then_branch, first_only),
             Expr::Literal(Literal::Bool(false) | Literal::Null) => {
-                update_definitely_navigates(else_branch)
+                update_navigates_within(else_branch, first_only)
             }
             // A computed condition: either branch may run, and refusing a passthrough
             // whose navigating branch is not taken is the safe direction, where
             // accepting the root for one that is taken deletes the document
             // (`if .a then (.k, .) else . end`).
             _ => {
-                update_definitely_navigates(then_branch) || update_definitely_navigates(else_branch)
+                update_navigates_within(then_branch, first_only)
+                    || update_navigates_within(else_branch, first_only)
             }
         },
         other => is_fold_source_navigation(other),

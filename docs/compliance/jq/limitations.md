@@ -1318,6 +1318,12 @@ is the revert that established what the other one costs.
    (`last(limit(2; .k, .))`) counts as navigating there and refuses; a *bare* UPDATE of those
    shapes (`limit(2; .k, .)`) still keeps the persistent register and `del` deletes the document
    where jq exits 5, tracked as [#3811](https://github.com/rust-works/succinctly/issues/3811).
+   Recorded divergence (a refusal, where the alternative deletes the document): inside that
+   same reduce UPDATE, a `last(f)` whose passthrough `f` lies outside `cannot_move_register`'s
+   allowlist (`last(first(.))`, `last(select(true))`, `last(limit(1; .))`) is read as an `f`
+   that may navigate and refuses with `Invalid path expression with result ...`, where jq
+   answers (`del(reduce .[]? as $k (.; last(first(.))))` is `null`); `main` refused the same
+   rows. Pinned by `test_path_register_last_f_keeps_the_identity_of_its_output_3766`.
    Nor is `isempty(g)` a drain producer that loses it any more:
    [#3763](https://github.com/rust-works/succinctly/issues/3763) states the register the first
    branch `g` emitted left (and the entry register when it emitted nothing), so
