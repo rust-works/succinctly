@@ -9445,21 +9445,21 @@ pub(crate) fn owned_path_door<S: EvalSemantics>(
     // doors decline and its one plain stage must keep the copy for
     // ([`lone_stage_can_go_bare`], #3682, #3692).
     let mut rest_pipe = RestPipe::new(rest);
-    let mut downstream: Option<Flow> = None;
-    let upstream =
-        path_over_owned::<S>(
-            path_expr,
-            input,
-            &root,
-            optional,
-            &mut |path| match rest_pipe.run_owned::<S>(&path, optional, Reentry::REBUILT, sink) {
-                Flow::Exhausted => Demand::Continue,
-                other => stop_with_downstream(&mut downstream, other),
-            },
-        )?;
+    let downstream: StashedVerdict<Flow> = StashedVerdict::new();
+    let upstream = path_over_owned::<S>(path_expr, input, &root, optional, &mut |path| {
+        downstream.begin();
+        match rest_pipe.run_owned::<S>(&path, optional, Reentry::REBUILT, sink) {
+            Flow::Exhausted => Demand::Continue,
+            other => downstream.stop_with_downstream(other),
+        }
+    })?;
     // Downstream decided: its verdict wins over the resolver's `Stopped`,
     // which is only the echo of our own driver answering `Stop`.
-    Some(downstream.unwrap_or(upstream))
+    Some(
+        downstream
+            .take(&upstream, direct_pattern_retry(path_expr))
+            .unwrap_or(upstream),
+    )
 }
 
 /// [`owned_path_door`] for the eager re-entries: every output collected,
@@ -29774,17 +29774,31 @@ fn stream_path_writes<S: EvalSemantics>(
         !alias_identity::active(),
         "alias identity is yq-only (#1351); jq mode must not reach the streaming write"
     );
-    let mut parked: Option<Control> = None;
+    let parked = StashedEscape::new();
     let resolved = resolve_dynamic_indexes_sink::<S>(path_expr, pristine, false, &mut |path| {
         // A path arriving after a stop means a `?//` in `path_expr` retried
         // the next alternative (#2974 review): see [`RetryResumes`].
         if retry_resumes == RetryResumes::Yes {
-            parked = None;
+            parked.begin();
         }
         match write(result, &path) {
             Ok(()) => Demand::Continue,
-            Err(escape) => stop_with_escape(&mut parked, escape.into()),
+            Err(escape) => parked.stop(escape.into()),
         }
+    });
+    // An empty or raising retry does not re-enter the closure. Only `=`
+    // lets that retry consume a failed write; update assignments deliberately
+    // accumulate the write error (see `RetryResumes`).
+    let parked = parked.take_unless(|at| {
+        retry_resumes == RetryResumes::Yes
+            && retry_superseded(
+                &match &resolved {
+                    Ok(()) => Flow::Exhausted,
+                    Err(escape) => Flow::Escaped(escape.clone().into()),
+                },
+                at,
+                direct_pattern_retry(path_expr),
+            )
     });
     // Reclaim the parked escape, clearing the side channel it set.
     let parked = match resume_from_escape(parked, Flow::Exhausted) {
@@ -38290,7 +38304,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             // own "no partial object" rule without its second pass over
             // already-collected rows.
             let mut obj = IndexMap::new();
-            let mut idx_escape: Option<EvalEscape> = None;
+            let idx_escape = StashedEscape::new();
             let flow = resolve_node_sink::<S>(
                 stream,
                 value,
@@ -38299,6 +38313,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 frame,
                 Keep::AtMost(usize::MAX),
                 &mut |branch| {
+                    idx_escape.begin();
                     let row = branch.value.into_owned();
                     match eval_owned_multi::<S>(idx_expr, &row) {
                         Ok(keys) => {
@@ -38316,15 +38331,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                             }
                             Demand::Continue
                         }
-                        Err(e) => {
-                            idx_escape = Some(e);
-                            Demand::Stop
-                        }
+                        Err(e) => idx_escape.stop(e.into()),
                     }
                 },
             );
-            if let Some(escape) = idx_escape {
-                return ResolveFlow::Escaped(escape);
+            if let Some(escape) = idx_escape
+                .take_unless(|at| resolve_retry_superseded(&flow, at, direct_pattern_retry(stream)))
+            {
+                return ResolveFlow::Escaped(escape.into());
             }
             forward_drained_result(
                 flow,
@@ -51790,9 +51804,9 @@ fn resolve_terminal<'a, S: EvalSemantics>(
 /// wrote three lines where jq writes one, and a `foreach` source ran every
 /// element for one requested path.
 ///
-/// The refusal rule is unchanged and still takes precedence: an untracked
-/// branch records the violation and stops, and that is an error for the
-/// whole call however much the downstream consumer had already accepted.
+/// An untracked branch records a violation and stops. It refuses the whole
+/// call, even after accepted paths, unless a `?//` retry consumes that
+/// alternative's refusal (#3808).
 fn resolve_terminal_sink<'a, S: EvalSemantics>(
     expr: &Expr,
     input: &'a OwnedValue,
@@ -51800,11 +51814,7 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
     mut untracked: Untracked<'_>,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> Result<(), EvalEscape> {
-    let mut violation: Option<EvalEscape> = None;
-    // The retry generation current when this sink last refused a branch,
-    // `Some` only between that refusal and the next invocation -- see the
-    // `debug_assert!` below and `terminal_retry` (#2691).
-    let mut refused_at: Option<u64> = None;
+    let violation: StashedVerdict<ResolveFlow> = StashedVerdict::new();
     // `input` is the call's own fresh document root — never itself a
     // frozen `$x` snapshot, so ambient `snapshot` starts `false` (#1591),
     // and the document `path()`/`=`/`|=`/`del()` were actually called on is
@@ -51831,35 +51841,9 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
         &frame,
         Keep::First,
         &mut |branch| {
-            // #2691: the reset just below discards a violation this sink
-            // already recorded. That is correct for exactly one caller -- a
-            // `?//` alternative that stopped on the refusal and is now
-            // trying the next alternative through this same sink -- and
-            // would be a silent false success for any other producer that
-            // kept driving past `Demand::Stop` (the refused write would go
-            // through). So a re-invocation after a refusal must have seen a
-            // retry begin. Checked, not assumed: the full suite plus 10,400
-            // generated `path`/`del`/`=`/`|=` shapes without a `?//` never
-            // re-invoke here, and the one `?//` retry that does is the
-            // shape this admits.
-            //
-            // This reset covers only a retry that *re-enters* the sink. One
-            // that resolves no branch, or raises, never does, and the exit
-            // `match` below has no `retry_superseded` check, so the
-            // refusal outranks it (#3517 audit, tracked in #3808).
-            if let Some(generation) = refused_at.take() {
-                debug_assert!(
-                    terminal_retry::began_since(generation),
-                    concat!(
-                        "resolve_terminal's sink was re-invoked after refusing a branch, but no ",
-                        "`?//` alternative retry began in between -- a producer drove past ",
-                        "`Demand::Stop`, and the refusal it just cleared would have been a ",
-                        "false success (#2691): expr={:?}"
-                    ),
-                    expr
-                );
-            }
-            violation = None;
+            // A retry may re-enter here, or finish without another branch.
+            // `begin` and the exit check cover both endings (#2691, #3808).
+            violation.begin();
             if !branch.trackable {
                 let refusal = || -> EvalEscape {
                     if near_iterate {
@@ -51950,20 +51934,22 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                 // *identical* to this terminal and answers. Caught, the guess
                 // silently lost the write jq makes, so it is uncatchable, as
                 // every other guessed refusal is (#3267, ADR-0018 rule 4).
-                violation = Some(if identical {
+                violation.stash(ResolveFlow::Escaped(if identical {
                     EvalError::invalid_path_expression_guessed(&branch.value).into()
                 } else {
                     refusal()
-                });
-                refused_at = Some(terminal_retry::current());
+                }));
                 return Demand::Stop;
             }
             sink(branch)
         },
     );
-    match (violation, flow) {
-        (Some(e), _) | (None, ResolveFlow::Escaped(e)) => Err(e),
-        (None, ResolveFlow::Exhausted | ResolveFlow::Stopped) => Ok(()),
+    let verdict = violation
+        .take_unless(|at| resolve_retry_superseded(&flow, at, direct_pattern_retry(expr)))
+        .unwrap_or(flow);
+    match verdict {
+        ResolveFlow::Escaped(e) => Err(e),
+        ResolveFlow::Exhausted | ResolveFlow::Stopped => Ok(()),
     }
 }
 
@@ -54807,35 +54793,21 @@ mod nonretryable_stop {
     }
 }
 
-/// The `?//` retry generation [`resolve_terminal`]'s sink checks before it
-/// discards a refusal it already recorded (#2691).
+/// The `?//` retry generation used by [`StashedVerdict`] to discard a
+/// verdict from an abandoned alternative (#2691, #3293, #3808).
 ///
-/// That sink resets its captured violation on every invocation. The reset
-/// exists for one kind of caller: a `?//` alternative loop that stopped on
-/// the refusal and then drives the *next* alternative through the same
-/// sink, at which point the earlier alternative's refusal must not stand.
-/// The loop is not always the resolver's own [`resolve_as_pattern`] -- when
-/// the `?//` sits in a demand-pulled `foreach`/`reduce` source, the sink's
-/// `Demand::Stop` unwinds into the *value-mode* loop, which retries and
-/// feeds the sink again (see [`clear_nonretryable_stop`]). Any other
-/// producer that re-invoked the sink after `Demand::Stop` would clear a
-/// real refusal and let `del`/`=`/`|=` write where jq refuses -- a false
-/// success, not a wrong message. Nothing at the sink can tell the two apart
-/// from the branch alone, so the retry announces itself here:
-/// [`begin_attempt`] bumps a generation on entry to every alternative
-/// attempt (from [`clear_nonretryable_stop`], which every such loop already
-/// calls, and from [`begin_pattern_alternative`] for a retry whose pattern
-/// yields no binding set, #3293), the sink records the generation when it
-/// refuses, and a
-/// re-invocation asserts the generation moved.
+/// A sink may be re-invoked after `Demand::Stop` only when a `?//` retries.
+/// [`StashedVerdict::begin`] asserts that a retry began before dropping the
+/// previous verdict; its exit check also handles retries that produce no
+/// further branch or raise. Without that distinction a rogue producer could
+/// clear a real refusal and let `del`/`=`/`|=` write where jq refuses.
 ///
-/// The check is a `debug_assert!`: it fires in the suite and every debug
-/// build, which is where the invariant is exercised, and costs a release
-/// build nothing beyond the `Option<u64>` the sink already keeps. Sound in
-/// the direction that matters -- a legitimate retry always bumps before it
-/// re-invokes, so it can never fire spuriously; a rogue re-invocation
-/// *inside* a nested `?//` that happened to bump first would be missed, not
-/// misreported.
+/// The loop need not be the resolver's own [`resolve_as_pattern`]: a
+/// demand-pulled `foreach`/`reduce` source retries through its value-mode
+/// loop. [`clear_nonretryable_stop`] and [`begin_pattern_alternative`]
+/// announce attempts here, including retries whose patterns yield no binding
+/// set. In a `std` build the generation lets the assertion distinguish an
+/// actual retry from a producer driving past a stop.
 ///
 /// Rides beside the stack the way [`nonretryable_stop`] does, with the same
 /// `#[cfg(feature = "std")]` split for the same reason.
@@ -70116,7 +70088,7 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
         // indexing fails). Pulled one output at a time, so the walk under
         // each output runs before the next is ever produced.
         ObjectKey::Expr(key_expr) => {
-            let mut ended: Option<Flow> = None;
+            let ended: StashedVerdict<Flow> = StashedVerdict::new();
             let tracked = mode.key_input_tracked(&reg, first);
             let key_flow = eval_each_owned::<S>(
                 key_expr,
@@ -70124,22 +70096,19 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
                 false,
                 Reentry::at_register(tracked),
                 &mut |key| {
+                    ended.begin();
                     match per_key(PatternKey::Computed(&key), out) {
                         Flow::Exhausted => Demand::Continue,
                         // Classified on the way out (`stop_with_downstream`), so
                         // a `?//` *inside the key expression* never retries past
                         // a halt or an uncatchable error the walk below raised.
-                        other => stop_with_downstream(&mut ended, other),
+                        other => ended.stop_with_downstream(other),
                     }
                 },
             );
-            match ended {
-                Some(flow) => flow,
-                // The key generator's own verdict: exhausted, or its own
-                // trailing error/break/halt, raised only after every match
-                // its earlier outputs completed has already been offered.
-                None => key_flow,
-            }
+            ended
+                .take(&key_flow, direct_pattern_retry(key_expr))
+                .unwrap_or(key_flow)
         }
     };
     out.truncate(mark);
@@ -121438,24 +121407,18 @@ mod tests {
             "[path(5 | 5 as {a: $v} ?// $v | empty)]",
             Ok(&["[]"]),
         ),
-        // third refuse-only case (review): a bare-`$var` alternative bound
-        // to a SOURCE value that is itself not register-derived (here a
-        // literal, not navigation) refuses on its own `$x` reference rather
-        // than retrying into `[$z]`. Live jq 1.7.1 retries here, naming
-        // `[$z]`'s own destructuring failure ("near attempt to access
-        // element 0 of 1") -- but only for this exact non-navigated-source
-        // shape: with a realistic `.`-navigated source both agree
-        // (`path(foreach .a as $x ?// [$z] (null; .; $x))` on `{"a":1}` is
-        // `["a"]` in both). `is_resolver_refusal` treats a bare-var's own
-        // untrackable-navigation error the same as a walk-step artefact
-        // (limitations.md's already-documented `$q[0]`-inside-`if` case, an
-        // UPDATE/EXTRACT-body refusal that correctly does not retry) and
-        // that rule is what stands here too, rather than special-casing
-        // this one shape and risking that documented case regressing.
+        // #3808: the terminal refusal from the bare `$x` is superseded
+        // by the retry's own destructuring failure, as jq 1.7.1 reports.
+        // no_std has no generation for this nested foreach retry and
+        // retains the documented refusal (only direct retries are detected).
         (
             "null",
             "[path(foreach (1) as $x ?// [$z] (null; .; $x))]",
-            Err("Invalid path expression with result 1"),
+            Err(if cfg!(feature = "std") {
+                "Invalid path expression near attempt to access element 0 of 1"
+            } else {
+                "Invalid path expression with result 1"
+            }),
         ),
         ];
 

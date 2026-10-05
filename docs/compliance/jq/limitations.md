@@ -2358,8 +2358,8 @@ is the revert that established what the other one costs.
    output it emits, so `path(foreach .a as {a:$v} ?// $v (.c; .; empty))` exited 0 where jq
    refuses partway through the construct, and `del`/`=`/`\|=` wrote through it.
 
-   Two refusals remain where jq might answer, and one refuses with different wording, all
-   deliberate: the resolver's *own* refusals
+   Two refusals remain where jq might answer, and in `no_std` one refuses with different
+   wording, all deliberate: the resolver's *own* refusals
    never retry (before #3133 a nested pipe carried no register, so `$q[0]` inside an `if`
    refused here where jq navigates, and retrying on that artefact would have bound a different
    alternative than jq and written through it; the rule stays for the artefacts that remain),
@@ -2370,18 +2370,15 @@ is the revert that established what the other one costs.
    `path(foreach .a as {a:$v} ?// $v (.c; .; $v))` on `{"a":2,"c":2}` refuses on both, jq at
    the pattern step and succinctly without retrying `$v`.
 
-   The third is the same "resolver's own refusal never retries" rule landing on a bare
+   The third was a stale terminal refusal on a bare
    `$var` alternative instead of a destructuring one: `path(foreach (1) as $x ?// [$z]
-   (null; .; $x))` refuses here on `$x`'s own refusal ("with result 1"; `$x` is bound to a
-   SOURCE value that is not itself register-derived — here a literal, not navigation), where
-   live jq 1.7.1 retries into `[$z]`'s own destructuring failure against the same value and
-   refuses there ("near attempt to access element 0 of 1"): both exit 5, and only the wording
-   differs. Confirmed narrow: with a realistic
-   `.`-navigated source both agree (`path(foreach .a as $x ?// [$z] (null; .; $x))` on
-   `{"a":1}` is `["a"]` in both) — the divergence needs a SOURCE that is genuinely not
-   navigation-derived at all. Loosening `is_resolver_refusal`'s retry-suppression to special
-   case this one shape would risk the already-verified `$q[0]`-inside-`if` case above
-   regressing, since both are the same rule; not planned for closure on that basis.
+   (null; .; $x))` used to report `Invalid path expression with result 1`.
+   Since #3808, `std` builds discard that stale terminal refusal and report jq
+   1.7.1's `Invalid path expression near attempt to access element 0 of 1` from
+   the final alternative. `no_std` retains the earlier message: its direct-retry
+   fallback cannot detect a nested `foreach` retry without the thread-local
+   generation. With a `.`-navigated source both builds agree with jq
+   (`path(foreach .a as $x ?// [$z] (null; .; $x))` on `{"a":1}` is `["a"]`).
 
    A `?//` chain of a plain `as` bind on an *untracked* stage no longer falls to the
    by-value catch-all either: `path(5 \| . as {a:$v} ?// $v \| .b?)` refuses on both (it
@@ -5092,7 +5089,20 @@ cannot be added`, here after firing the target twice), which keeps jq's exit cod
 different in jq, and succinctly follows it: `_assign`'s `reduce` carries on with the retried
 alternative, so `(. as $x ?// $y | .[if $x == null then 0 else -5 end]) = 1` on `[1]` is `[1]`
 (it raised `Out of bounds negative array index` here before #2974's review). A retry that
-resolves no path at all is a jq quirk too, `null` for `=`, and is not reproduced.
+resolves no path at all is a jq quirk too, `null` for `=`, and is not reproduced:
+`(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) = 1`
+on `[1]` retains `[1]`, writes `AA`, and exits 0 (pinned jq 1.7.1 writes `AA`,
+returns `null`, and exits 0). Before #3808 the abandoned alternative's
+`Out of bounds negative array index` incorrectly survived that empty retry.
+
+#3808 also stamps the verdicts at path-mode `INDEX`, terminal path refusal,
+computed-key object patterns, and owned `path()` continuations. An empty or raising
+`?//` retry now supersedes the abandoned alternative's error even when it never
+re-enters the sink; a clean retry no longer returns the previous computed-key or
+continuation error. `test_path_sink_retry_*_3808` checks stdout, attempt traces,
+errors and exit status on document and owned inputs, with `path`/`del`/`=`/`|=`
+read/write probes. Update assignments retain their documented accumulated write
+error; a retry's own raise or halt still takes precedence.
 
 That interleave has a price, and it is charged only where it buys something. The
 streaming route keeps two documents where the eager one keeps one, so on a 1.5 MB /

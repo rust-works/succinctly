@@ -101226,6 +101226,534 @@ fn test_recurse_structural_descent_reads_position_like_recursive_descent_3773() 
     Ok(())
 }
 
+/// #3808 needs the complete diagnostic: a stale error beside the retry's
+/// own error, or a halt marker written twice, must fail the comparison.
+fn assert_path_retry_rows_3808(
+    input: Option<&str>,
+    prefix: &str,
+    rows: &[RetryRow3293],
+) -> Result<()> {
+    for &(filter, stdout, trace, message, exit) in rows {
+        let filter = format!("{prefix}{filter}");
+        let flag = if input.is_some() { "-c" } else { "-nc" };
+        let (out, err, code) = run_jq_full(&[flag, &filter], input)?;
+        assert_eq!((out.as_str(), code), (stdout, exit), "`{filter}`: {err:?}");
+        let rest = err
+            .strip_prefix(trace)
+            .unwrap_or_else(|| panic!("`{filter}`: stderr {err:?} lacks trace {trace:?}"));
+        let actual = if exit == 5 {
+            // The location differs for stdin and -n; everything after it
+            // must be exactly the expected error, with no second diagnostic.
+            rest.strip_prefix("jq: error (at ")
+                .and_then(|s| s.split_once("): ").map(|(_, message)| message))
+                .unwrap_or_else(|| panic!("`{filter}`: malformed diagnostic {err:?}"))
+        } else {
+            // halt_error writes its input directly, without a location.
+            rest
+        };
+        assert_eq!(actual.trim_end(), message, "`{filter}`: stderr {err:?}");
+    }
+    Ok(())
+}
+
+// #3808: expectations captured from /usr/bin/jq 1.7.1. Each table runs
+// on the document route and again on an owned value built under -n.
+#[test]
+fn test_path_sink_retry_terminal_3808() -> Result<()> {
+    let rows: &[RetryRow3293] = &[
+        (
+            r#"path(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else empty end)"#,
+            "",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"del(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else empty end)"#,
+            "[[0]]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else empty end) = 9"#,
+            "[[0]]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else empty end) |= 9"#,
+            "[[0]]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"path(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else error("E2") end)"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"del(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else error("E2") end)"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else error("E2") end) = 9"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else error("E2") end) |= 9"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"path(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else .[0] end)"#,
+            "",
+            "AA",
+            "Invalid path expression near attempt to access element 0 of null",
+            5,
+        ),
+        (
+            r#"del(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else .[0] end)"#,
+            "",
+            "AA",
+            "Invalid path expression near attempt to access element 0 of null",
+            5,
+        ),
+        (
+            r#"(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else .[0] end) = 9"#,
+            "",
+            "AA",
+            "Invalid path expression near attempt to access element 0 of null",
+            5,
+        ),
+        (
+            r#"(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else .[0] end) |= 9"#,
+            "",
+            "AA",
+            "Invalid path expression near attempt to access element 0 of null",
+            5,
+        ),
+        (
+            r#"path(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else halt_error(3) end)"#,
+            "",
+            "AA",
+            "",
+            3,
+        ),
+        (
+            r#"del(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else halt_error(3) end)"#,
+            "",
+            "AA",
+            "",
+            3,
+        ),
+        (
+            r#"(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else halt_error(3) end) = 9"#,
+            "",
+            "AA",
+            "",
+            3,
+        ),
+        (
+            r#"(. as [$q] ?// $b | ("A"|stderr) | $q | if type=="array" then 1 else halt_error(3) end) |= 9"#,
+            "",
+            "AA",
+            "",
+            3,
+        ),
+    ];
+    assert_path_retry_rows_3808(Some("[[0]]"), "", rows)?;
+    assert_path_retry_rows_3808(None, "[[0]] | ", rows)
+}
+#[test]
+fn test_path_sink_retry_index_3808() -> Result<()> {
+    let rows: &[RetryRow3293] = &[
+        (
+            r#"path(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else empty end); if type=="array" then error("E1") else tostring end)|empty)"#,
+            "",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"del(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else empty end); if type=="array" then error("E1") else tostring end)|empty)"#,
+            "[[\"a\"]]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else empty end); if type=="array" then error("E1") else tostring end)|empty) = 9"#,
+            "[[\"a\"]]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else empty end); if type=="array" then error("E1") else tostring end)|empty) |= 9"#,
+            "[[\"a\"]]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"path(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else error("E2") end); if type=="array" then error("E1") else tostring end)|empty)"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"del(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else error("E2") end); if type=="array" then error("E1") else tostring end)|empty)"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else error("E2") end); if type=="array" then error("E1") else tostring end)|empty) = 9"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else error("E2") end); if type=="array" then error("E1") else tostring end)|empty) |= 9"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"path(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else tostring end); if type=="array" then error("E1") else tostring end)|empty)"#,
+            "",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"del(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else tostring end); if type=="array" then error("E1") else tostring end)|empty)"#,
+            "[[\"a\"]]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else tostring end); if type=="array" then error("E1") else tostring end)|empty) = 9"#,
+            "[[\"a\"]]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else tostring end); if type=="array" then error("E1") else tostring end)|empty) |= 9"#,
+            "[[\"a\"]]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"path(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else halt_error(3) end); if type=="array" then error("E1") else tostring end)|empty)"#,
+            "",
+            "AA",
+            "a",
+            3,
+        ),
+        (
+            r#"del(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else halt_error(3) end); if type=="array" then error("E1") else tostring end)|empty)"#,
+            "",
+            "AA",
+            "a",
+            3,
+        ),
+        (
+            r#"(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else halt_error(3) end); if type=="array" then error("E1") else tostring end)|empty) = 9"#,
+            "",
+            "AA",
+            "a",
+            3,
+        ),
+        (
+            r#"(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else halt_error(3) end); if type=="array" then error("E1") else tostring end)|empty) |= 9"#,
+            "",
+            "AA",
+            "a",
+            3,
+        ),
+    ];
+    assert_path_retry_rows_3808(Some(r#"[["a"]]"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"[["a"]] | "#, rows)
+}
+#[test]
+fn test_path_sink_retry_key_3808() -> Result<()> {
+    let rows: &[RetryRow3293] = &[
+        (
+            r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else empty end)): $v} | $v"#,
+            "",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else error("E2") end)): $v} | $v"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else . end)): $v} | $v"#,
+            "1\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q | if type=="array" then . else halt_error(3) end)): $v} | $v"#,
+            "",
+            "AA",
+            "a",
+            3,
+        ),
+    ];
+    assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)
+}
+#[test]
+fn test_path_sink_retry_door_3808() -> Result<()> {
+    let rows: &[RetryRow3293] = &[
+        (
+            r#"path(1 as $a ?// $b | ("A"|stderr) as $_ | if $a then .a else empty end) | if . == ["a"] then error("D") else . end"#,
+            "",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"path(1 as $a ?// $b | ("A"|stderr) as $_ | if $a then .a else error("E2") end) | if . == ["a"] then error("D") else . end"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"path(1 as $a ?// $b | ("A"|stderr) as $_ | if $a then .a else .b end) | if . == ["a"] then error("D") else . end"#,
+            "[\"b\"]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"path(1 as $a ?// $b | ("A"|stderr) as $_ | if $a then .a else halt_error(3) end) | if . == ["a"] then error("D") else . end"#,
+            "",
+            "AA",
+            r#"{"a":[[1]],"b":2}"#,
+            3,
+        ),
+    ];
+    assert_path_retry_rows_3808(Some(r#"{"a":[[1]],"b":2}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":[[1]],"b":2} | "#, rows)
+}
+#[test]
+fn test_path_sink_retry_write_3808() -> Result<()> {
+    // Deliberate divergence: empty-path = retains the input; update
+    // assignments keep the write error instead of jq's accumulator error.
+    let rows: &[RetryRow3293] = &[
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) = 1"#,
+            "[1]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) |= 1"#,
+            "",
+            "AA",
+            "Out of bounds negative array index",
+            5,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) += 1"#,
+            "",
+            "AA",
+            "Out of bounds negative array index",
+            5,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) //= 1"#,
+            "",
+            "AA",
+            "Out of bounds negative array index",
+            5,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then error("E2") else .[-5] end) = 1"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then error("E2") else .[-5] end) |= 1"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then error("E2") else .[-5] end) += 1"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then error("E2") else .[-5] end) //= 1"#,
+            "",
+            "AA",
+            "E2",
+            5,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then .[0] else .[-5] end) = 1"#,
+            "[1]\n",
+            "AA",
+            "",
+            0,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then .[0] else .[-5] end) |= 1"#,
+            "",
+            "AA",
+            "Out of bounds negative array index",
+            5,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then .[0] else .[-5] end) += 1"#,
+            "",
+            "AA",
+            "Out of bounds negative array index",
+            5,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then .[0] else .[-5] end) //= 1"#,
+            "",
+            "AA",
+            "Out of bounds negative array index",
+            5,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then halt_error(3) else .[-5] end) = 1"#,
+            "",
+            "AA",
+            "[1]",
+            3,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then halt_error(3) else .[-5] end) |= 1"#,
+            "",
+            "AA",
+            "[1]",
+            3,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then halt_error(3) else .[-5] end) += 1"#,
+            "",
+            "AA",
+            "[1]",
+            3,
+        ),
+        (
+            r#"(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then halt_error(3) else .[-5] end) //= 1"#,
+            "",
+            "AA",
+            "[1]",
+            3,
+        ),
+    ];
+    assert_path_retry_rows_3808(Some("[1]"), "", rows)?;
+    assert_path_retry_rows_3808(None, "[1] | ", rows)
+}
+
+#[test]
+fn test_path_sink_retry_controls_3808() -> Result<()> {
+    // Non-retried failures, nonretryable halts and consumer stop/break.
+    let rows: &[RetryRow3293] = &[(
+        "path(1)",
+        "",
+        "",
+        "Invalid path expression with result 1",
+        5,
+    )];
+    assert_path_retry_rows_3808(Some("[[0]]"), "", rows)?;
+    assert_path_retry_rows_3808(None, "[[0]] | ", rows)?;
+    let rows: &[RetryRow3293] = &[(r#"path(INDEX(.[]; error("E1")) | empty)"#, "", "", "E1", 5)];
+    assert_path_retry_rows_3808(Some(r#"[["a"]]"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"[["a"]] | "#, rows)?;
+    let rows: &[RetryRow3293] = &[(
+        r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)): $v} | ("H"|halt_error(3))"#,
+        "",
+        "AA",
+        "H",
+        3,
+    )];
+    assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)?;
+    let rows: &[RetryRow3293] = &[(
+        r#"path(1 as $a ?// $b | ("A"|stderr) as $_ | .a) | ("H"|halt_error(3))"#,
+        "",
+        "A",
+        "H",
+        3,
+    )];
+    assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)?;
+    let rows: &[RetryRow3293] = &[(
+        r#"path(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q); "H"|halt_error(3)) | empty)"#,
+        "",
+        "A",
+        "H",
+        3,
+    )];
+    assert_path_retry_rows_3808(Some(r#"[["a"]]"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"[["a"]] | "#, rows)?;
+    let rows: &[RetryRow3293] = &[(".[-5] = 1", "", "", "Out of bounds negative array index", 5)];
+    assert_path_retry_rows_3808(Some("[1]"), "", rows)?;
+    assert_path_retry_rows_3808(None, "[1] | ", rows)?;
+    let rows: &[RetryRow3293] = &[(
+        r#"[first(path(1 as $a ?// $b | ("A"|stderr) as $_ | if $a then .a else error("E2") end))]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    )];
+    assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)?;
+    let rows: &[RetryRow3293] = &[(
+        r#"label $done | path(1 as $a ?// $b | ("A"|stderr) as $_ | if $a then .a else empty end) | break $done"#,
+        "",
+        "AA",
+        "",
+        0,
+    )];
+    assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)?;
+    Ok(())
+}
+
 /// #3809: decoding a slice bound must terminate before a ?// retries it.
 /// Invalid JSON has no jq evaluation oracle; assert our decode-failure contract.
 #[test]
