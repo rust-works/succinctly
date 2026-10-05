@@ -53618,7 +53618,10 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
         // #3842: a `?//` inside a computed key that retried past the stop which
         // recorded `outcome`, and produced nothing or raised, never re-entered
         // the sink to reset it; the matcher's own verdict (`walk`) stands then.
-        // A `halt` or decode failure is never retried past, so it is kept.
+        // A `halt` or decode failure is never retried past, so it is kept. Without
+        // std there is no retry generation, so `retry_superseded` answers `false`
+        // (the matcher gives it no direct-retry hint) and only the reset above is in
+        // force there.
         let nonretryable = matches!(
             &outcome,
             Some(StepOutcome::Return(control)) if !is_retryable_control(control, false)
@@ -56001,7 +56004,10 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
         // #3842: a `?//` inside a computed key that retried past the stop which
         // recorded `outcome`, and produced nothing or raised, never re-entered
         // the sink to reset it; the matcher's own verdict (`walk`) stands then.
-        // A `halt` or decode failure is never retried past, so it is kept.
+        // A `halt` or decode failure is never retried past, so it is kept. Without
+        // std there is no retry generation, so `retry_superseded` answers `false`
+        // (the matcher gives it no direct-retry hint) and only the reset above is in
+        // force there.
         let nonretryable = matches!(
             &outcome,
             Some(AlternativeOutcome::Return(Flow::Escaped(control))) if !is_retryable_control(control, false)
