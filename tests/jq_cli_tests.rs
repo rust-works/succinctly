@@ -99557,3 +99557,220 @@ fn test_path_f_swallowed_scalar_iteration_answers_what_it_did_3722() -> Result<(
     ])?;
     Ok(())
 }
+
+// ============================================================================
+// #3789: a foreach whose bound element is an empty array must answer its
+// path through `$k`
+// ============================================================================
+
+/// `foreach .a as $k (0; $k; .)` on `{"a":[]}` is `["a"]` in jq: `$k` is the
+/// very node `.a` navigated to, so it is `jv_identical` to the path register.
+/// An empty array is the one value a position-less marker cannot vouch for
+/// (#3494: `[] | .[0:]` is a *fresh* `[]`), so the fold's bare `$k` has to name
+/// the element's position, which needs the frame to track one. Every answer
+/// row below refused with "Invalid path expression with result []" (exit 5)
+/// and `=`/`|=`/`del()` wrote nothing. The refusal rows are the contrast jq
+/// itself gives: a `$k` after the register moved, a `$k` rebuilt into a
+/// container, a `reduce` (which restores the register), and a computed element
+/// all still refuse, so the position is only ever a proof of identity, never a
+/// widening. Every row captured from jq 1.7.1 with `-c`, on both evaluators.
+#[test]
+fn test_foreach_bound_empty_array_element_answers_its_path_3789() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        // The rows the issue names.
+        (
+            r#"{"a":[]}"#,
+            r"path(foreach .a as $k (0; $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[[]]}"#,
+            r"path(foreach .a[] as $k (0; $k; .))",
+            "[\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"(foreach .a as $k (0; $k; .)) = 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"(foreach .a as $k (0; $k; .)) |= 9",
+            "{\"a\":9}\n",
+            "",
+            0,
+        ),
+        // EXTRACT, an INIT that is the root, and a `try` around the variable.
+        (
+            r#"{"a":[]}"#,
+            r"path(foreach .a as $k (0; .; $k))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(foreach .a as $k (.; $k; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"del(foreach .a as $k (0; try $k; .))",
+            "{}\n",
+            "",
+            0,
+        ),
+        // Each element is its own position.
+        (
+            r#"{"a":[],"b":[]}"#,
+            r"path(foreach (.a,.b) as $k (0; $k; .))",
+            "[\"a\"]\n[\"b\"]\n",
+            "",
+            0,
+        ),
+        // A stage that passes the variable through keeps the register.
+        (
+            r#"{"a":[]}"#,
+            r"path(foreach .a as $k (0; ($k, $k); .))",
+            "[\"a\"]\n[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(foreach .a as $k (0; $k | getpath([]); .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(foreach .a as $k (0; $k | .[0:]; .))",
+            "[\"a\",{\"start\":0,\"end\":null}]\n",
+            "",
+            0,
+        ),
+        // Still refused, as jq refuses: the register is not at `$k`'s node.
+        (
+            r#"{"a":[],"b":[]}"#,
+            r"path(foreach .a as $k (.b; $k; .))",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of {\"a\":[],\"b\":[]}",
+            5,
+        ),
+        (
+            r#"{"a":[],"b":[]}"#,
+            r"path(foreach .a as $k (0; .b; $k))",
+            "",
+            "Invalid path expression near attempt to access element \"b\" of 0",
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(foreach .a as $k (0; [$k][0]; .))",
+            "",
+            "Invalid path expression near attempt to access element 0 of [[]]",
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(foreach (.a|tostring) as $k (0; $k; .))",
+            "",
+            "Invalid path expression with result \"[]\"",
+            5,
+        ),
+        // `reduce` restores the register when it backtracks its source, so it
+        // never had this shape.
+        (
+            r#"{"a":[]}"#,
+            r"path(reduce .a as $k (0; $k))",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(reduce .a as $k (.a; $k))",
+            "",
+            "Invalid path expression near attempt to access element \"a\" of {\"a\":[]}",
+            5,
+        ),
+    ])
+}
+
+// ============================================================================
+// #3789 (review): the element's position composes with the frame's, and a
+// reduce keeps the marker it always had
+// ============================================================================
+
+/// The position a foreach element's `$k` names is the frame's own position extended
+/// by the element's path, so it has to hold below the invocation root: after a
+/// navigation (`.x |`), a `getpath`, a fan-out (`.x[] |`) and a deeper path. At the
+/// root `extend` just clones the element's path, so the answer rows in
+/// [`test_foreach_bound_empty_array_element_answers_its_path_3789`] cannot see a
+/// position that ignores the frame. A `reduce` re-seeds no per-step register, so even
+/// with the frame tracking positions for another reason (`. as $_`) it still refuses,
+/// as jq does; those rows pin the behaviour, not the marker a `reduce` binds, which no
+/// query tells apart. Every row captured from jq 1.7.1 with `-c`, on both evaluators.
+#[test]
+fn test_foreach_bound_empty_array_element_composes_with_the_frame_3789() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"x":{"a":[]}}"#,
+            r"path(.x | foreach .a as $k (0; $k; .))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[]}}"#,
+            r#"path(getpath(["x"]) | foreach .a as $k (0; $k; .))"#,
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":[{"a":[]},{"a":[]}]}"#,
+            r"path(.x[] | foreach .a as $k (0; $k; .))",
+            "[\"x\",0,\"a\"]\n[\"x\",1,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[]}}"#,
+            r"(.x | foreach .a as $k (0; $k; .)) = 9",
+            "{\"x\":{\"a\":9}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"y":{"a":[]}}}"#,
+            r"path(.x.y | foreach .a as $k (0; $k; .))",
+            "[\"x\",\"y\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(. as $_ | reduce .a as $k (.; $k))",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(. as $_ | reduce .a as $k (0; $k))",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+    ])
+}

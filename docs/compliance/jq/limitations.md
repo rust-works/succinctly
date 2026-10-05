@@ -1572,6 +1572,13 @@ is the revert that established what the other one costs.
    `as` source can no longer block carrying the register through it, because it was never the
    register moving in the first place.
 
+   The string half is not modelled at the stage: a string slice is a fresh string in jq, but
+   `Frame::certifies_value` applies the slice rule to arrays only, so `path(. as $k \| .[0:] \| $k)` on
+   `"s"` answers `[{"start":0,"end":null}]` where jq refuses (and so does `path(foreach .a as $k
+   (0; $k\|.[0:]; $k))` on `{"a":"s"}`). Observable through `path()` only: `=`, `|=` and `del()` raise
+   on a string slice either way
+   ([#3793](https://github.com/rust-works/succinctly/issues/3793)).
+
    `path(.a as $y \| .a \| $y)` on `{"a":{"b":1},"c":{"b":1}}` now answers jq's `["a"]`; the
    equal-valued sibling `path(.a as $y \| .c \| $y)` still refuses — exactly the #1466 class
    the frame witness exists to keep closed, now for navigated bindings too. yq mode is
@@ -2870,6 +2877,17 @@ answers `["b"]` — and classified the two residuals appended below):
     (`path(foreach (.b|tostring) as $k (.; $k))` on `{"b":"s"}` is `["b"]`), and a full slice
     is the same `jv` as its input. Refusals; each predates #2159. Tracked as
     [#3460](https://github.com/rust-works/succinctly/issues/3460).
+  - **A `foreach`'s bare `$k` over a navigated element names that element's position** (jq mode,
+    `Origin::SnapshotAt`), which is what lets an empty array certify against the step register:
+    `path(foreach .a as $k (0; $k; .))` on `{"a":[]}` is jq's `["a"]`
+    ([#3789](https://github.com/rust-works/succinctly/issues/3789); an empty array certifies only
+    by position, #3494, and `Frame::at` is switched on for a `foreach` that reads `$k` in path
+    position, `foreach_var_reaches_path_position`). `reduce` is unchanged and jq refuses the same
+    shape. What remains, all refusals: a source with no navigation step is driven by value, so its
+    element has no position -- `path(foreach . as $k (0; $k; .))` refuses for every value but
+    `null` where jq answers `[]` -- and `first($k)` in UPDATE refuses for every value
+    (`path(foreach .a as $k (0; first($k); .))` on `{"a":{}}`; cause not traced). Tracked as
+    [#3790](https://github.com/rust-works/succinctly/issues/3790).
 
 - ~~**A generator the resolver reaches only through an eager arm is still collected before
   its first element is folded.**~~ **Closed by
