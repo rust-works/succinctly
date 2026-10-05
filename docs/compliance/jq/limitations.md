@@ -2989,7 +2989,14 @@ answers `["b"]` — and classified the two residuals appended below):
   keeps the persistent register, which is what the *final* re-entry check needs
   (`path(reduce (.[]) as $k (.; .))` on `{"a":[1,2]}` is `[]` in both, jq's own
   path-restoring `FORK`/`BACKTRACK` at the exit boundary). A destructuring pattern walks its
-  own register and is not touched. What remains unmodelled is a dual provenance for an UPDATE
+  own register, whose at-register flag is read the same way. Only the *flag* is per-step:
+  UPDATE is still resolved and relocated against the persistent register, so two adjacent
+  shapes keep wording that differs from jq's, both exit 5 and neither a write:
+  `path(reduce .a as $k (.; $k | .b))` on `{"a":{"b":1}}` (jq says `with result 1`, this says
+  `near attempt to access element "b"`), and `path(reduce .[]? as $k (.; .k |= 1))` on
+  `{"a":true,"k":2}` (jq quotes `[{"a":true,"k":1},[]]`). A `?//` chain after a failed first
+  alternative quotes the document where jq quotes `null` (`path(reduce .a as [$x] ?// $x (.;
+  (.k, .)))` on `{"a":[1],"k":2}`). What remains unmodelled is a dual provenance for an UPDATE
   that navigates *and* hands back the accumulator it started from.
 - **A recursion's first output keeps the path register; the later ones move it
   ([#3272](https://github.com/rust-works/succinctly/issues/3272)).** jq defines every spelling

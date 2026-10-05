@@ -30,9 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Invalid path expression near attempt to access element "k"`; `path(...)` answered `[]`. A navigating source moves jq's register onto its element
   before UPDATE runs, so UPDATE's own navigation of the accumulator is checked against that element, but `resolve_reduce` checked it against the
   fold's INIT register and its last output (`.`) relocated to the root. An UPDATE that can navigate is now resolved with the accumulator's
-  at-register flag taken from the element (`foreach_step_register`, as `resolve_foreach` does), jq mode and bare `$var` only. This also closes
+  at-register flag taken from the element (`foreach_step_register`, as `resolve_foreach` does), jq mode only. This also closes
   #2732's message-only residual: `path(reduce .[] as $k (.; .a))` now quotes the same node as jq. A passthrough UPDATE keeps the persistent register
-  (`path(reduce .[]? as $k (.; .))` stays `[]`). Pinned by `test_reduce_navigating_update_ending_on_the_accumulator_refuses_3780`.
+  (`path(reduce .[]? as $k (.; .))` stays `[]`). A destructuring pattern (and a `?//` chain) is covered the same way, since its walk is the register; the wording of two adjacent shapes and of a `?//` after a failed alternative still differs from jq's (exit 5 either way, `limitations.md`). Pinned by `test_reduce_navigating_update_ending_on_the_accumulator_refuses_3780` and `test_reduce_destructuring_navigating_update_refuses_3780`.
 - **jq: a `foreach` whose UPDATE is `true or <navigating operand>` and whose EXTRACT is the bound variable no longer answers the root path** (#3775).
   `path(foreach .a? as $k (0; (true or .[]?); $k))` on `null` is `["a"]` in jq and answered `[]` here, and `(...) = 9` replaced the
   whole document with `9` (exit 0) where jq writes `{"a":9}`. `FoldRegister::advance` rebuilt the register of a stage it cannot see

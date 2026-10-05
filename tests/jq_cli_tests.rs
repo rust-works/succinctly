@@ -59199,6 +59199,35 @@ fn test_reduce_navigating_update_ending_on_the_accumulator_refuses_3780() -> Res
     Ok(())
 }
 
+/// #3780 (review): a destructuring pattern walks its own register, and the same
+/// `(.k, .)` UPDATE used to delete the document through it too. Each row now
+/// refuses with exit 5, as jq does; the `?//` rows differ from jq only in the node
+/// the message quotes (jq quotes `null` after the first alternative failed), which
+/// `docs/compliance/jq/limitations.md` records.
+#[test]
+fn test_reduce_destructuring_navigating_update_refuses_3780() -> Result<()> {
+    let doc = "{\"a\":[1],\"k\":2}\n";
+    for filter in [
+        r"path(reduce .a as [$x] (.; (.k, .)))",
+        r"del(reduce .a as [$x] (.; (.k, .)))",
+        r"(reduce .a as [$x] (.; (.k, .))) = 9",
+        r"(reduce .a as [$x] (.; (.k, .))) |= 9",
+        r"path(reduce .a as [$x] ?// $x (.; (.k, .)))",
+        r"del(reduce .a as $x ?// [$x] (.; (.k, .)))",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!((out.as_str(), code), ("", 5), "{filter}: stderr {err:?}");
+        assert!(
+            err.contains("Invalid path expression near attempt to access element \"k\""),
+            "{filter}: stderr {err:?}"
+        );
+    }
+    // a passthrough UPDATE through a destructuring pattern is still the root
+    let (out, _, code) = run_jq_full(&["-c", r"path(reduce .a as [$x] (.; .))"], Some(doc))?;
+    assert_eq!((out.as_str(), code), ("[]\n", 0));
+    Ok(())
+}
+
 /// #1576 moved every shape `can_use_m2_streaming` admits onto the cursor
 /// streamer, which quietly took the *existing* suite's only coverage of
 /// `print_json`'s own pretty-container, empty-container, `null`/`true`,
