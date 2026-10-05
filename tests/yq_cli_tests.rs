@@ -520,6 +520,59 @@ fn test_yq_raw_cr_lf_in_json_string_value_not_folded_3380() -> Result<()> {
     Ok(())
 }
 
+/// Captured against yq v4.53.3: JSON rejects YAML line continuations,
+/// including in keys and values the query never selects (#3394).
+#[test]
+fn test_yq_json_escape_line_breaks_rejected_3394() -> Result<()> {
+    let args = &["-p=json", "-o=json", "-I=0"];
+    for line_break in ["\n", "\r", "\r\n"] {
+        for input in [
+            format!("{{\"a\":\"x\\{line_break}  y\"}}"),
+            format!("{{\"x\\{line_break}y\":1}}"),
+            format!("{{\"a\":1,\"b\":\"x\\{line_break}y\"}}"),
+        ] {
+            for filter in [".", ".a"] {
+                let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &input, args)?;
+                assert_eq!(code, 1, "{input:?} | {filter}: {stderr}");
+                assert!(stdout.is_empty(), "invalid input emitted {stdout:?}");
+                assert!(
+                    stderr.contains("escape sequence in JSON string"),
+                    "{stderr}"
+                );
+            }
+        }
+        // Genuine YAML still skips the line break and indentation.
+        let input = format!("a: \"x\\{line_break}  y\"");
+        assert_eq!(
+            run_yq_stdin_with_stderr(".a", &input, &["-o=json", "-I=0"])?,
+            ("\"xy\"\n".into(), String::new(), 0),
+            "{input:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yq_json_valid_escapes_preserved_3394() -> Result<()> {
+    let input = r#"{"a":"\"\\\/\b\f\n\r\t\u0061"}"#;
+    let expected = "\"\\\"\\\\/\\u0008\\u000c\\n\\r\\ta\"\n";
+    // Identity exercises streaming transcode, while concatenation reads
+    // the decoded value through the evaluator.
+    for filter in [".a", r#".a + """#] {
+        assert_eq!(
+            run_yq_stdin_with_stderr(filter, input, &["-p=json", "-o=json", "-I=0"])?,
+            (expected.into(), String::new(), 0),
+            "{filter}"
+        );
+    }
+    // YAML-only escapes remain supported by the ordinary YAML reader.
+    assert_eq!(
+        run_yq_stdin_with_stderr(".a", r#"a: "\x61\U00000062""#, &["-o=json", "-I=0"])?,
+        ("\"ab\"\n".into(), String::new(), 0)
+    );
+    Ok(())
+}
+
 /// Captured from yq v4.53.3 with JSON input and compact JSON output.
 #[test]
 fn test_pick_keys_on_json_cli_3026() -> Result<()> {

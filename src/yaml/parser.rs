@@ -3041,7 +3041,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     }
                     Some(b'\\') => {
                         self.advance(); // Skip backslash
-                        if self.peek().is_some() {
+                        if let Some(escaped) = self.peek() {
+                            // JSON input must not inherit YAML-only escapes,
+                            // especially line continuations that discard bytes
+                            // before the value is ever read (#3394).
+                            if self.json_strict
+                                && !matches!(
+                                    escaped,
+                                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u'
+                                )
+                            {
+                                return Err(self.err_unexpected_char(
+                                    self.pos,
+                                    "escape sequence in JSON string",
+                                ));
+                            }
                             self.advance(); // Skip escaped char
                         } else {
                             return Err(YamlError::UnexpectedEof {
@@ -8103,6 +8117,48 @@ mod tests {
         let yaml = b"name: 'Alice'";
         let result = build_semi_index(yaml);
         assert!(result.is_ok());
+    }
+
+    /// Escape introducer boundary captured against yq v4.53.3 (#3394).
+    #[test]
+    fn test_json_strict_escape_byte_matrix_3394() {
+        for byte in 0..=u8::MAX {
+            // Exercise both quoted mapping keys and values. A raw CR outside
+            // the string selects HAS_CR even when the escape byte is not CR.
+            for prefix in [b"".as_slice(), b"\r".as_slice()] {
+                for (head, tail) in [
+                    (b"{\"a\":\"x\\".as_slice(), b"y\"}".as_slice()),
+                    (b"{\"x\\".as_slice(), b"y\":1}".as_slice()),
+                ] {
+                    let mut input = prefix.to_vec();
+                    input.extend_from_slice(head);
+                    input.push(byte);
+                    if byte == b'u' {
+                        input.extend_from_slice(b"0061");
+                    }
+                    input.extend_from_slice(tail);
+                    let result = build_semi_index_json_strict(&input);
+                    let valid = matches!(
+                        byte,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u'
+                    );
+                    if valid {
+                        // Decoding/output of accepted escapes is checked by
+                        // the CLI regression; here we test the parser boundary.
+                        assert!(result.is_ok(), "byte {byte:#04x}: {result:?}");
+                    } else {
+                        assert!(
+                            matches!(result, Err(YamlError::UnexpectedCharacter {
+                            offset,
+                            context: "escape sequence in JSON string",
+                            ..
+                        }) if offset == prefix.len() + head.len()),
+                            "byte {byte:#04x}: {result:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// #2778: `json_strict_plain_scalar_ok`'s accept/reject boundary, copied
