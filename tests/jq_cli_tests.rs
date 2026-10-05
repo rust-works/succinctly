@@ -97831,6 +97831,31 @@ fn test_update_collapse_through_front_slice_matches_jq_3756() -> Result<()> {
     Ok(())
 }
 
+/// #3756: a slice path `resolve_slice_components` cannot spell as plain indexes
+/// keeps its old route and stays equal to jq: a descriptor that is last, one that
+/// starts past the front, a descriptor after a descriptor, and a back-counted or
+/// out-of-range index after one. jq 1.7.1, captured live.
+#[test]
+fn test_update_collapse_through_unspellable_slice_declines_3756() -> Result<()> {
+    let q = "(1 as $x ?// $y | select($y == null) | $x)";
+    let cond = format!("(if . == 5 then {q} else 7 end)");
+    for (filter, expected) in [
+        (format!(".[0:2] |= {q}"), "null\n"),
+        (format!(".[0:2][-1] |= {cond}"), "[5,7,7]\n"),
+        (format!(".[0:2][5] |= {cond}"), "[5,6,null,null,null,7,7]\n"),
+        (format!(".[0:2][1:2][] |= {cond}"), "[5,7,7]\n"),
+        (format!(".[1:3][] |= {cond}"), "[5,7,7]\n"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", &filter], Some("[5,6,7]"))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (expected, 0),
+            "`{filter}` on [5,6,7]: {err:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3471, owned route: the tables above again with the target built under `-n`
 /// (`eval.rs`'s evaluator, which has its own `each_slice_expr`), and once more
 /// with an `input` builtin inside the bound, which forces that evaluator for an

@@ -28457,6 +28457,10 @@ fn resolve_slice_components(parts: &[OwnedValue], doc: &OwnedValue) -> Option<Ve
     while i < parts.len() {
         let part = &parts[i];
         if let OwnedValue::Object(desc) = part {
+            let idx = match parts.get(i + 1)? {
+                OwnedValue::Int(n) => *n,
+                _ => return None,
+            };
             let OwnedValue::Array(items) = cur? else {
                 return None;
             };
@@ -28470,10 +28474,6 @@ fn resolve_slice_components(parts: &[OwnedValue], doc: &OwnedValue) -> Option<Ve
             if range.start != 0 || !["start", "end"].iter().all(|k| front_bound(desc.get(*k))) {
                 return None;
             }
-            let idx = match parts.get(i + 1)? {
-                OwnedValue::Int(n) => *n,
-                _ => return None,
-            };
             // A back-counted index resolves against the slice as it stands when
             // written, which an earlier collapse may have shortened.
             let len = i64::try_from(range.len()).ok()?;
