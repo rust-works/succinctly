@@ -220,6 +220,18 @@ pub enum Origin {
     /// and, like every other `Origin`, by storage identity where the
     /// resolver stands on the marker's own `Rc` (#3177, `marker_identical`).
     Untracked,
+    /// Bound by value from a source the resolver neither certified nor knows to be
+    /// fresh, whose output was value-equal to the register (#3423): a pass-through
+    /// of `.` or of a frozen `$var` through a head the grammars do not name (`(., 1)
+    /// | .`, `if c then (., 1) else . end`, `try (., 1) catch 2`) is jq's own
+    /// register by pointer, and a fresh copy equal to it is not, and the value
+    /// cannot say which. It certifies exactly as [`Origin::Untracked`] does
+    /// (nothing, bar the null/bool carve-out and storage identity), but a
+    /// refusal of it is the resolver's *guess* where the register is known too:
+    /// the branch a reference resolves to states the register lost, so the
+    /// refusal is uncatchable and a `try` cannot turn it into a silently dropped
+    /// write.
+    Unproven,
 }
 
 impl Tracked {

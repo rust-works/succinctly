@@ -34209,7 +34209,7 @@ impl Frame {
         match origin {
             Origin::Snapshot | Origin::SnapshotAt { .. } => true,
             Origin::At { invocation, path } => self.names(*invocation, path),
-            Origin::Untracked => false,
+            Origin::Untracked | Origin::Unproven => false,
         }
     }
 
@@ -34243,7 +34243,7 @@ impl Frame {
             Origin::At { invocation, path } | Origin::SnapshotAt { invocation, path } => {
                 self.names(*invocation, path)
             }
-            Origin::Snapshot | Origin::Untracked => false,
+            Origin::Snapshot | Origin::Untracked | Origin::Unproven => false,
         }
     }
 
@@ -35438,7 +35438,7 @@ impl Snapshot {
                 Origin::At { invocation, path } | Origin::SnapshotAt { invocation, path } => {
                     Some((*invocation, path))
                 }
-                Origin::Snapshot | Origin::Untracked => None,
+                Origin::Snapshot | Origin::Untracked | Origin::Unproven => None,
             },
         }
     }
@@ -38390,10 +38390,31 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                 // creates its own fresh snapshot fact from `marker_value`,
                 // independent of whatever `value` it's being compared
                 // against (#1591).
+                //
+                // #3423: an `Unproven` marker whose value equals the register may be
+                // that register's own node, which nothing here can certify and
+                // nothing refutes; the branch it resolves to states the register
+                // lost, so the next stage's refusal is the guess it is.
+                let unproven = matches!(marker.origin, Origin::Unproven)
+                    && if trackable {
+                        Some(value)
+                    } else {
+                        frame.register()
+                    }
+                    .is_some_and(|reg| marker.value == *reg);
                 resolve_leaf::<S>(expr, value, trackable, snapshot, frame, keep).map(|branches| {
                     branches
                         .into_iter()
-                        .map(|b| b.into_marked(&marker.origin))
+                        .map(|b| {
+                            let b = b.into_marked(&marker.origin);
+                            if unproven {
+                                b.with_register(BranchRegister::LostAt(Rc::new(
+                                    marker.value.clone(),
+                                )))
+                            } else {
+                                b
+                            }
+                        })
                         .collect()
                 })
             }
@@ -43751,9 +43772,9 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
             // copy equal to the register is exactly the rebuilt copy #2642 closed --
             // but binding it by value hands `$x` no mark, so a refusal off it reads as
             // jq's verdict and a `try` catches it where jq navigates and writes. Bind
-            // it with the non-certifying marker instead, and resolve the body with the
-            // register's identity unknown, so that refusal is the guess it is (loud,
-            // uncatchable: #3267).
+            // it with the `Unproven` marker instead: it certifies nothing, but a
+            // reference to it states the register lost, so that refusal is the guess
+            // it is (loud, uncatchable: #3267).
             let ambiguous = S::TAG == EvalTag::Jq
                 && origin.is_none()
                 && !identity_passthrough(source, true)
@@ -43771,7 +43792,7 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
                 &bound,
                 identity_at.clone(),
                 if ambiguous {
-                    Some(Origin::Untracked)
+                    Some(Origin::Unproven)
                 } else {
                     origin
                 },
@@ -43779,13 +43800,6 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
                 S::TAG == EvalTag::Jq,
                 false,
             );
-            let lost_frame;
-            let frame = if ambiguous {
-                lost_frame = frame.with_register_loss(RegisterLoss::LostSomewhere);
-                &*lost_frame
-            } else {
-                frame
-            };
             resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
         },
     )
@@ -51956,7 +51970,7 @@ fn identity_bind_position<S: EvalSemantics>(
             // travels with it, whatever stage the rebind happens on.
             Expr::TrackedVar(marker) => match &marker.origin {
                 Origin::SnapshotAt { .. } => Some(marker.origin.clone()),
-                Origin::Snapshot | Origin::At { .. } | Origin::Untracked => None,
+                Origin::Snapshot | Origin::At { .. } | Origin::Untracked | Origin::Unproven => None,
             },
             Expr::If {
                 then_branch,
