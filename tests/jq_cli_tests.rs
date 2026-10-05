@@ -76694,6 +76694,243 @@ fn test_try_wrapped_if_bind_source_yq_unchanged_3279() -> Result<()> {
 }
 
 // ============================================================================
+// #3402: a transparent bind source (`select`, `first`, `limit`, a `try`-
+// wrapped `if` with a raising condition) binds `.` when it passes `.` through
+// ============================================================================
+
+/// A bind source on the transparent grammar (`select(c)`, `first(S)`,
+/// `limit(n; S)`, and `if`/`try`/`//`/`?`/pipes over them) is resolved in
+/// path mode, so an output that *is* the register binds as `. as $v` would,
+/// and `$v.b` under `try` writes instead of being silently discarded. An
+/// output the source computed beside it -- a `catch` handler's value, a
+/// fresh literal -- still binds by value and refuses as jq does, and so does
+/// a `$v` used after the register moved. Every row captured live against jq
+/// 1.7.1.
+#[test]
+fn test_transparent_bind_source_keeps_register_3402() -> Result<()> {
+    for (input, filter, expected) in [
+        // The fuzz row (#3279's seed 11): `.a` may raise, but not here.
+        (
+            r#"{"a":1,"c":1,"d":2,"x":{"a":1,"c":"s"}}"#,
+            "((try (if .a then . else . end) catch 1) as $v0 | (null + .) | try ($v0 | .b?)) = 9",
+            r#"{"a":1,"c":1,"d":2,"x":{"a":1,"c":"s"},"b":9}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del((try (if .a then . else . end) catch 1) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del(select(true) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del(first(.) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del(limit(1; .) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del((. | select(true)) as $v | ($v | .b)?)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del((.?) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del((select(false) // .) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"del((select(false) // {"a":1,"b":2}) as $v | try $v.b)"#,
+            r#"{"a":1,"b":2}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "path(select(true) as $v | $v.b)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "(select(.a == 1) as $v | $v.b) = 9",
+            r#"{"a":1,"b":9}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "(select(.a == 2) as $v | $v.b) = 9",
+            r#"{"a":1,"b":2}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(limit(3; .) as $v | $v.b)]",
+            r#"[["b"]]"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(select(false) as $v | $v.b)]",
+            "[]",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(.a | select(true) as $v | try $v.b)",
+            r#"{"a":{}}"#,
+        ),
+        (
+            r#"{"a":5}"#,
+            "path(.a | select(true) as $v | $v)",
+            r#"["a"]"#,
+        ),
+        ("null", "path(select(true) as $v | $v)", "[]"),
+        // The register is lost (`1 |`), and `$v0` is still the root's node.
+        (
+            r#"{"a":{"b":1},"c":{"b":1},"d":false}"#,
+            "del(select(true) as $v0 | 1 | try ($v0 | .[]? | .b?))",
+            r#"{"a":{},"c":{},"d":false}"#,
+        ),
+        // `$v` is `.a`'s node, which the register still holds after `$c`.
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            "del(.c as $c | .a | select(true) as $v | $c | try $v.b)",
+            r#"{"a":{},"c":{"b":1}}"#,
+        ),
+        // Unchanged: jq refuses each `$v.b` and the `try` catches it -- a
+        // fresh literal, a handler's value, a register that moved on, a
+        // rebuilt root.
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"del(({"a":1,"b":2}) as $v | try $v.b)"#,
+            r#"{"a":1,"b":2}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"del((try (if .a.q then . else . end) catch {"b":5}) as $v | try $v.b)"#,
+            r#"{"a":1,"b":2}"#,
+        ),
+        (
+            r#"{"a":{"b":1},"b":3}"#,
+            "del(select(true) as $v | .a | try $v.b)",
+            r#"{"a":{"b":1},"b":3}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del({"b":1} | select(true) as $v | try $v.b)"#,
+            r#"{"a":{"b":1}}"#,
+        ),
+        // The grammar is closed against navigation: a navigated output is
+        // `.a`'s node, not `.`, and marking it as `.`'s snapshot certified it
+        // by value against the equal `.c` (an open grammar, or a `//` whose
+        // right side went unchecked, deleted `.c.b`).
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            "del((select(false) // .a) as $v | .c | try ($v | .b))",
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            "del((.a | select(true)) as $v | .c | try ($v | .b))",
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+        ),
+        // A source with an effect keeps the by-value route: the witness may
+        // decline (`catch .b` navigates the error value) and re-run it, and
+        // a second `input` would read the document the outer `input` needs.
+        (
+            r#"{"a":1,"b":2} {"x":1} {"x":2}"#,
+            r#"[del((try (if (input | error({"b":1})) then . else . end) catch .b) as $v | try $v.b), input]"#,
+            r#"[{"a":1,"b":2},{"x":2}]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3402: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    for (input, filter, message) in [
+        (
+            "5",
+            r#"path((try (if error("x") then . else . end) catch 5) as $v | $v)"#,
+            "Invalid path expression with result 5",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"path((try (if .a.q then . else . end) catch {"b":5}) as $v | $v.b)"#,
+            r#"Invalid path expression near attempt to access element "b" of {"b":5}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"path({"b":1} | select(true) as $v | $v.b)"#,
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            "[path((select(false) // .a) as $v | .c | $v | .b)]",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3402: `{filter}` on {input} must still refuse: stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(message),
+            "#3402: `{filter}` on {input}: expected {message:?}, stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3402: an effect in a transparent bind source runs once, as in jq. The
+/// witness declines when a `catch` handler navigates its error value, and
+/// re-running the source by value printed `debug`'s line twice.
+#[test]
+fn test_transparent_bind_source_effect_runs_once_3402() -> Result<()> {
+    let filter =
+        r#"del((try (if (debug | error({"b":1})) then . else . end) catch .b) as $v | try $v.b)"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        (r#"{"a":1,"b":2}"#, 0),
+        "stderr={stderr:?}"
+    );
+    assert_eq!(stderr.matches("DEBUG").count(), 1, "stderr={stderr:?}");
+    Ok(())
+}
+
+/// #3402: `select(true) as $v` behaves exactly as `. as $v` downstream --
+/// including where the `.` spelling itself still differs from jq (a later
+/// `(if true then $v else . end) as $w` binds by value; jq deletes
+/// `.a.b`/`.c.b` in both). Marking the witness's output with a position
+/// rather than `.`'s own snapshot made the `select` spelling go silent here
+/// while the `.` spelling refuses.
+#[test]
+fn test_transparent_bind_source_matches_identity_bind_3402() -> Result<()> {
+    let input = r#"{"a":{"b":1},"c":{"b":1},"d":false}"#;
+    let tail = "([$v0] | path(.[0] | $v0)) | (if true then $v0 else . end) as $v1 | try (($v1 | .[]?) | .b?)";
+    let identity = run_jq_full(&["-c", &format!("del(. as $v0 | {tail})")], Some(input))?;
+    let select = run_jq_full(
+        &["-c", &format!("del(select(true) as $v0 | {tail})")],
+        Some(input),
+    )?;
+    assert_eq!(select, identity);
+    // Never the silent discard: the document unchanged at exit 0.
+    assert_ne!((select.0.trim_end(), select.2), (input, 0), "{select:?}");
+    Ok(())
+}
+
+// ============================================================================
 // #3036: #2642's fabrication through the routes that never cross a funnel
 // ============================================================================
 

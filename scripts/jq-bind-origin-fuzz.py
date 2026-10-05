@@ -86,6 +86,16 @@ The trap is a variable read at a node it does not sit at, which must keep
 refusing. Off by default (`--destructure-bind-p`) so existing seeds keep
 their stream.
 
+#3402 adds the TRANSPARENT_SOURCES family: bind sources that pass `.`
+through without navigating (`select`, `first`, `limit`, and `if`/`try`/`//`/
+`?`/pipes over them) but that `is_identity_passthrough` cannot prove are `.`
+-- an `if` condition that may raise into a `catch` handler, a `select` -- which
+the witness now resolves in path mode. Mixed with the traps the grammar must
+keep binding by value: a navigation inside the spine or on a `//`'s right
+side (`.a`'s node marked as `.`'s snapshot certifies against an equal
+sibling), a handler or arm whose value copies a document leaf, and a marker.
+Off by default (`--transparent-source-p`) so existing seeds keep their stream.
+
 Usage:
     cargo build --release --features cli
     ./scripts/jq-bind-origin-fuzz.py [--bin PATH] [--jq PATH] [-n N] [--seed S] [--show K]
@@ -623,6 +633,30 @@ OPTIONAL_SOURCES = [
 def optional_source_program(rng):
     return program(rng, OPTIONAL_SOURCES)
 
+# #3402: see the module docstring. The handler values copy the document's own
+# leaves (`{"b":1}`, `1`, `"s"`) so a value-blind rule would certify them.
+TRANSPARENT_SOURCES = [
+    ("select(true)", False), ("select(.a)", False), ("select(.a == .c)", False),
+    ("first(.)", False), ("limit(1; .)", False), ("limit(2; .)", False), ("(.?)", False),
+    ("(. | select(true))", False), ("(select(true) | .)", False), ("first(select(.a))", False),
+    ("(select(false) // .)", False), ("(select(.d) // .)", False),
+    ("(try (if .a then . else . end) catch 1)", False),
+    ("(try (if .a.b then . else . end) catch {\"b\":1})", False),
+    ("(try (if .x.c.b then . else . end) catch \"s\")", False),
+    ("(try (if .a then . else . end))", False), ("((try (if .a.b then . else . end)) // .)", False),
+    ("(if .a then select(true) else first(.) end)", False), ("(try select(.a.b) catch 1)", False),
+    ("limit(1; select(.a.b?))", False),
+    # Traps: a navigation, a fresh value or a marker where `.` would go.
+    ("(select(false) // .a)", False), ("(select(.d) // .c)", False), ("(.a | select(true))", False),
+    ("(select(true) | .a)", False), ("(first(.) | .c)", False), ("(if .a then . else .c end)", False),
+    ("(select(false) // {\"b\":1})", False), ("(if .d then . else {\"b\":1} end)", False),
+    ("(try (if .a.b then . else . end) catch $p)", True), ("(select(true) // $p)", True),
+    ("first($p)", True),
+]
+
+def transparent_source_program(rng):
+    return program(rng, TRANSPARENT_SOURCES)
+
 def stage(rng, v):
     r = rng.random()
     if r < 0.4: return rng.choice(NAV)
@@ -733,6 +767,11 @@ def main():
                          "SOURCES pool draws one in ~1 program in 3000, so a regression in the witness "
                          "grammar's `?` admission is invisible to a stock run. Off by default so "
                          "existing seeds keep their stream; run at 1.0 to weight the sweep onto it")
+    ap.add_argument("--transparent-source-p", type=float, default=0.0,
+                    help="probability a program binds from a transparent source (#3402): `select`, "
+                         "`first`, `limit`, `if`/`try`/`//` over `.`, which the witness resolves in "
+                         "path mode. Off by default so existing seeds keep their stream; run at 1.0 "
+                         "to weight the sweep onto it")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     pin = open("tests/data/jq-golden/JQ_VERSION").read().strip()
@@ -756,7 +795,8 @@ def main():
                            ("POSITIONAL_WRAPS", POSITIONAL_WRAPS),
                            ("DESTRUCTURE_BIND_SOURCES", DESTRUCTURE_BIND_SOURCES),
                            ("DESTRUCTURE_BIND_STAGES", DESTRUCTURE_BIND_STAGES),
-                           ("OPTIONAL_SOURCES", [src for src, _ in OPTIONAL_SOURCES])]:
+                           ("OPTIONAL_SOURCES", [src for src, _ in OPTIONAL_SOURCES]),
+                           ("TRANSPARENT_SOURCES", [src for src, _ in TRANSPARENT_SOURCES])]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
@@ -783,6 +823,8 @@ def main():
             f = positional_bind_program(rng)
         elif a.optional_source_p and rng.random() < a.optional_source_p:
             f = optional_source_program(rng)
+        elif a.transparent_source_p and rng.random() < a.transparent_source_p:
+            f = transparent_source_program(rng)
         elif a.embed_write_p and rng.random() < a.embed_write_p:
             f = embed_write_program(rng)
         elif a.destructure_bind_p and rng.random() < a.destructure_bind_p:

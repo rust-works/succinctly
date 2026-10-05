@@ -43423,6 +43423,18 @@ type BindSourceWitness = (Vec<(OwnedValue, Option<Origin>)>, Option<Control>);
 ///   the resolver's own prefix and escape, whose partial-prefix contract
 ///   already mirrors `eval_owned_expr_fork`'s (`path((.a, error("x")) as
 ///   $y | .a | $y)` prints `["a"]` before raising `x`, as jq does);
+/// - #3402: a source on the closed *transparent* grammar
+///   ([`is_transparent_bind_source`]: `select`, `first`, `limit`, and `if`/
+///   `try`/`//`/`?`/pipes over them, none of which navigates) that
+///   [`is_identity_passthrough`] cannot prove is `.` -- typically because an
+///   `if` condition may raise into a `catch` handler. Each output is either
+///   the register itself, passed through, or a value computed beside it (a
+///   handler's, an `if` arm's that is not `.`), and the resolver tells the two
+///   apart on this input: the first is bound as a `.` bind would be
+///   ([`Origin::SnapshotAt`]), the second by value. A source with effects
+///   ([`walk_body_may_have_effects`]) keeps the by-value route, because the
+///   witness may still decline -- a handler navigating its error value is a
+///   resolver refusal -- and the by-value re-run would repeat the effect;
 /// - a source headed by a navigated marker (`$y as $z`, `$y.b as $z`,
 ///   `(($y | .b) | .c) as $w`, [`marker_headed`]) binds the marker's own
 ///   node, or a pure-navigation continuation from it: the rest is resolved
@@ -43457,32 +43469,93 @@ fn resolve_bind_source_witness<S: EvalSemantics>(
                 return None;
             }
             let rerooted = Frame::at(*invocation, Rc::clone(&path.0));
-            return resolve_bind_source_in::<S>(&rest, &marker.value, true, &rerooted);
+            return resolve_bind_source_in::<S>(&rest, &marker.value, true, &rerooted, false);
         }
     }
     if !trackable || frame.at.is_none() {
         return None;
     }
+    if is_transparent_bind_source(source)
+        && !is_identity_passthrough::<S>(source)
+        && !walk_body_may_have_effects(source)
+    {
+        return resolve_bind_source_in::<S>(source, value, trackable, frame, true);
+    }
     let (pure_navigation, navigates) = classify_navigation(source);
     if !pure_navigation || !navigates {
         return None;
     }
-    resolve_bind_source_in::<S>(source, value, trackable, frame)
+    resolve_bind_source_in::<S>(source, value, trackable, frame, false)
+}
+
+/// The sources [`resolve_bind_source_witness`] resolves in path mode to learn
+/// whether each output *is* the register (#3402): `.`, and `select(c)`,
+/// `first(S)`, `limit(n; S)`, `if c then S else S end`, `try S catch h`,
+/// `S // S`, `S?` and `S | S` over them. Nothing here navigates, so every
+/// output the resolver keeps trackable is the frame's own node, passed
+/// through by pointer as jq passes it; an output it does not keep trackable
+/// (a `catch` handler's value) binds by value as before.
+///
+/// The slots that are *not* sources -- a condition, a count, a handler --
+/// are arbitrary: the resolver evaluates conditions and counts by value, as
+/// jq's subexps do, and a handler's output is untracked. What keeps the
+/// grammar closed is that no other node may produce an output: a literal, a
+/// construction, a navigation, a call or a variable each falls to the
+/// by-value route, so a value the resolver cannot place is never certified.
+///
+/// Measured against `/usr/bin/jq` 1.7.1 with `scripts/jq-bind-origin-fuzz.py`
+/// (25 runs of 3,000 programs over every family) and
+/// `scripts/jq-bind-origin-oracle-sweep.sh`: no row that agreed before moves.
+/// Widening it to any source wrote where jq refuses
+/// (`(.a | tostring | .[0:1])? as $v`), which is why it is a grammar.
+fn is_transparent_bind_source(source: &Expr) -> bool {
+    match unwrap_bind_source(source) {
+        Expr::Identity | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Optional(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::Limit { expr: inner, .. }
+        | Expr::Try { expr: inner, .. } => is_transparent_bind_source(inner),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => is_transparent_bind_source(then_branch) && is_transparent_bind_source(else_branch),
+        Expr::Alternative(left, right) => {
+            is_transparent_bind_source(left) && is_transparent_bind_source(right)
+        }
+        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_transparent_bind_source),
+        _ => false,
+    }
 }
 
 /// [`resolve_bind_source_witness`]'s path-mode resolution proper, against
 /// `value` sitting at `frame`. `None` is "the witness declines" -- an
 /// untracked navigation the resolver refuses but jq's suspended tracking
 /// evaluates -- which sends the caller to the by-value route.
+///
+/// `passthrough` is the #3402 transparent route: a trackable output is the
+/// frame's own `.`, so it gets the [`Origin::SnapshotAt`] a `. as $x` bind
+/// gets ([`identity_bind_position`]) rather than an [`Origin::At`]. The two
+/// certify the same node, but [`is_identity_passthrough`] admits only the
+/// `Snapshot` family as `.`, so an `At` would make `select(true) as $v` behave
+/// unlike `. as $v` after it: a later `(if true then $v else . end) as $w`
+/// bound `$w` by value, and `try ($w | ...)` then went silent where the `.`
+/// spelling refuses.
 fn resolve_bind_source_in<S: EvalSemantics>(
     source: &Expr,
     value: &OwnedValue,
     trackable: bool,
     frame: &Frame,
+    passthrough: bool,
 ) -> Option<BindSourceWitness> {
     let bind = |b: PathBranch<'_>| {
         let origin = if b.trackable && slice_witnesses_node(&b.path, &b.value) {
-            frame.origin_at(&b.path)
+            frame.origin_at(&b.path).map(|origin| match origin {
+                Origin::At { invocation, path } if passthrough => {
+                    Origin::SnapshotAt { invocation, path }
+                }
+                origin => origin,
+            })
         } else {
             None
         };
