@@ -74,7 +74,7 @@ use super::eval::{
     slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
     stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
     streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
-    tostring_owned, try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty,
+    tostring_owned, try_handler_root, vec_with_capacity, yq_absent_key_read_is_empty,
     yq_assign_rhs_document, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
     yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
     yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
@@ -9686,7 +9686,7 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
     let run_catch = |payload: &OwnedValue| -> GenericResult<V> {
         match catch {
             Some(catch_expr) => {
-                let root = try_payload_root(inner);
+                let root = try_handler_root(inner, catch_expr);
                 eval_each_owned_collect::<S, V>(
                     catch_expr,
                     payload,
@@ -12713,7 +12713,7 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
             Some(catch_expr) => run_try_handler_generic::<S, V>(
                 catch_expr,
                 e.payload(),
-                &try_payload_root(expr),
+                &try_handler_root(expr, catch_expr),
                 optional,
                 cursor,
                 sink,
