@@ -61324,11 +61324,380 @@ fn test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757() -> Res
     ])
 }
 
+/// #3758: a plain pipe stage reads the backtracked-register verdict that `any`,
+/// `all` and `isempty(g)` state. jq defines each over a generator it backtracks,
+/// so when nothing inside it was emitted the register is back where the stage
+/// entered and a `$x` frozen there is the register again (`path(. as $x | any |
+/// $x)` on `{"a":false,"b":null}` is `[]`); when an element decided, the register
+/// is where the deciding branch left it, and the same `$x` is a path error
+/// (`{"a":true,"b":null}`). The stage used to drop the producer's statement, so
+/// the first kind refused, on `path`, `del`, `=` and `|=` alike. Read through the
+/// wrappers that add no movement of their own (`?`, `try`, `first`, `limit`,
+/// `nth`), and a result that navigated nothing but whose generator emitted
+/// (`isempty(1)`) states the register as well. Every row captured from jq
+/// 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_pipe_stage_reads_the_backtracked_register_verdict_3758() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        // `isempty(g)` as the `cond` of an `any`: a stage of `gen | cond`.
+        (
+            r"[true,false]",
+            r"path(any(.[]; isempty(empty)))",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true,false]",
+            r"del(any(.[]; isempty(empty)))",
+            "[false]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true,false]",
+            r"(any(.[]; isempty(empty))) = 5",
+            "[5,false]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true,false]",
+            r"path(all(.[]; isempty(empty)))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[true,false]",
+            r"path(any(.[]; isempty(.)))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"path(. as $x | any | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"b":true}"#,
+            r"path(. as $x | all | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"{}", r"path(. as $x | isempty(.[]?) | $x)", "[]\n", "", 0),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any(.[]; .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | all(.[]; .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any(.[]; .a?) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"[false]", r"path(. as $x | any(.) | $x)", "[]\n", "", 0),
+        (r"[true]", r"path(. as $x | all(.) | $x)", "[]\n", "", 0),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any(. == true) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"path(. as $x | all(. == true) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"[]", r"path(. as $x | any | $x)", "[]\n", "", 0),
+        (r"[]", r"path(. as $x | all | $x)", "[]\n", "", 0),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any(empty; .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | all(empty; .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | isempty(empty) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | isempty(1) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"false", r"path(isempty(1))", "[]\n", "", 0),
+        (
+            r"null",
+            r"path(isempty(1))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"null",
+            r"path(isempty(empty))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"true",
+            r"path(. as $x | isempty(empty) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any? | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | try any | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | first(any) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | limit(1; any) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | nth(0; any) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any | $x | .a)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any | $x | .b)",
+            "[\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | all | $x | .a)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":false}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | isempty(empty) | $x | .a)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"del(. as $x | any | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (r#"{"a":false}"#, r"(. as $x | any | $x) |= 5", "5\n", "", 0),
+        (r#"{"a":false}"#, r"(. as $x | any | $x) = 5", "5\n", "", 0),
+        (
+            r#"{"a":false}"#,
+            r"del(. as $x | all | $x)",
+            "",
+            r#"Invalid path expression with result {"a":false}"#,
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"del(. as $x | isempty(empty) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"(. as $x | any | $x | .a) |= 5",
+            "{\"a\":5}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"try ((. as $x | any | $x | .a?) |= 5) catch .",
+            "{\"a\":5}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"b":null}"#,
+            r"path(. as $x | any | $x)",
+            "",
+            r#"Invalid path expression with result {"a":true,"b":null}"#,
+            5,
+        ),
+        (
+            r#"{"a":true,"b":null}"#,
+            r"path(. as $x | all | $x)",
+            "",
+            r#"Invalid path expression with result {"a":true,"b":null}"#,
+            5,
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"path(. as $x | all | $x)",
+            "",
+            r#"Invalid path expression with result {"a":false,"b":null}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | isempty(.[]?) | $x)",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any(.a) | $x)",
+            "",
+            r#"Cannot index boolean with string "a""#,
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any | .a)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of false"#,
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | isempty(1) | .a)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of false"#,
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any | any)",
+            "",
+            r"Invalid path expression near attempt to iterate through false",
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | any(.[]; .) | any | $x)",
+            "",
+            r"Invalid path expression near attempt to iterate through false",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(. as $x | any | $x)",
+            "",
+            r#"Invalid path expression with result {"a":true}"#,
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"(. as $x | any | $x) |= 5",
+            "",
+            r#"Invalid path expression with result {"a":true}"#,
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(try (. as $x | any | $x))",
+            "",
+            r#"Invalid path expression with result {"a":true}"#,
+            5,
+        ),
+        (
+            r"[true,false]",
+            r"path(. as $x | any | $x)",
+            "",
+            r"Invalid path expression with result [true,false]",
+            5,
+        ),
+        (
+            r"[true,false]",
+            r"path(. as $x | all | $x)",
+            "",
+            r"Invalid path expression with result [true,false]",
+            5,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | isempty(.[]?) | $x)",
+            "",
+            r"Invalid path expression with result [true]",
+            5,
+        ),
+        (
+            r"[false]",
+            r"path(. as $x | isempty(.[]) | $x)",
+            "",
+            r"Invalid path expression with result [false]",
+            5,
+        ),
+    ])
+}
+
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
-/// plain pipe stage does not read the backtracked-register verdict that
-/// `any`/`all`/`isempty` state, so a frozen `$x` after one that decided or did
-/// not refuses where jq answers `[]`, and so does `isempty(g)` as a `cond`
-/// (`any(.[]; isempty(empty))` is `[0]`) -- the same stage gap, #3758. And a
+/// verdict stage on an untracked entry (`1 | isempty(empty) | $x`) and one inside a compound stage
+/// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758, see
+/// [`test_pipe_stage_reads_the_backtracked_register_verdict_3758`]). And a
 /// computed `true` that decides under a `cond` on an untracked entry
 /// (`.a and any(true; select(.))`, an `and` right operand) is ambiguous -- it
 /// may be the carried register, whose position is not known -- so jq's `["a"]`
@@ -61341,35 +61710,55 @@ fn test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757() -> Res
 #[test]
 fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
     for (input, filter, jq_answer, expected) in [
+        // #3758: the verdict is read on a trackable entry only. After a stage
+        // that computed (`1 | ...`, `tostring | ...`) the register is carried by
+        // the stage, no leaf producer states it, and `isempty(empty)` /
+        // `any(empty; .)` over it stay refused as they were.
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | isempty(empty) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":1}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | any(empty; .) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":1}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | tostring | isempty(empty) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":1}"#,
+        ),
+        // #3758: a verdict stage the resolver cannot see as one: behind a `def`
+        // call or a `reduce`, which hand back no register statement.
         (
             r#"{"a":false}"#,
-            r"path(. as $x | any(.[]; .) | $x)",
+            r"path(. as $x | def f: any; f | $x)",
             "[]",
             r#"Invalid path expression with result {"a":false}"#,
         ),
         (
-            r#"{"a":true}"#,
-            r"path(. as $x | all(.[]; .) | $x)",
+            r#"{"a":false}"#,
+            r"path(. as $x | reduce 1 as $i (.; any) | $x)",
             "[]",
-            r#"Invalid path expression with result {"a":true}"#,
+            r#"Invalid path expression with result {"a":false}"#,
+        ),
+        // #3758: the same stage gap for a compound stage that mixes the verdict
+        // stage with another branch (#3644's whole-stage refusal).
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | (any, any) | $x)",
+            "[] []",
+            r#"Invalid path expression with result {"a":false}"#,
         ),
         (
-            r#"{"a":false,"b":null}"#,
-            r"path(. as $x | any | $x)",
+            r#"{"a":false}"#,
+            r"path(. as $x | (any // 1) | $x)",
             "[]",
-            r#"Invalid path expression with result {"a":false,"b":null}"#,
-        ),
-        (
-            r"{}",
-            r"path(. as $x | isempty(.[]?) | $x)",
-            "[]",
-            "Invalid path expression with result {}",
-        ),
-        (
-            r"[true,false]",
-            r"path(any(.[]; isempty(empty)))",
-            "[0]",
-            "Invalid path expression with result true",
+            r#"Invalid path expression with result {"a":false}"#,
         ),
         (
             r#"{"a":true}"#,

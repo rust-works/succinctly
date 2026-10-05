@@ -1194,12 +1194,21 @@ is the revert that established what the other one costs.
      untracked generator element is jq's register, the arm now refuses where `main` happened to match, all in the safe
      direction. A `?//` inside `gen` that retries after a failed alternative supersedes the escape the abandoned
      alternative stashed (the `and`/`or`/negate arms' rule, #3293), pinned by
-     `test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757`. One shape still refuses where jq
-     answers, pinned (`test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`): a plain pipe stage does not read
-     the backtracked-register verdict of `any`/`all`/`isempty`, so `path(. as $x | any | $x)` on
-     `{"a":false,"b":null}` is `[]` in jq and refuses here, and so does `isempty(g)` as a `cond`
-     (`any(.[]; isempty(empty))` is `[0]`)
-     ([#3758](https://github.com/rust-works/succinctly/issues/3758)). In yq mode `any`/`all` are real yq
+     `test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757`. A plain pipe stage reads the
+     backtracked-register verdict of `any`/`all`/`isempty` ([#3758](https://github.com/rust-works/succinctly/issues/3758),
+     `stage_states_register_per_result`): the verdict is per *result*, so a static predicate cannot state it, and
+     `resolve_seq_stage` instead trusts the producer's `Unmoved` on a result that navigated nothing, on a trackable
+     entry. `path(. as $x | any | $x)` on `{"a":false,"b":null}` is `[]` (nothing decided, the register is back at the
+     entry) and refuses on `{"a":true,"b":null}` (`.a` decided and moved it), as in jq, on `path`, `del`, `=` and
+     `|=`, through `?`, `try`, `first`, `limit` and `nth`, and for `isempty(g)` as a `cond` (`any(.[]; isempty(empty))`
+     is `[0]`). Pinned by `test_pipe_stage_reads_the_backtracked_register_verdict_3758` (including
+     `any(.[]; isempty(empty))`), and in yq mode, where it is not admitted (ADR-0018), by
+     `test_yq_any_all_stage_keeps_no_path_register_3758`. Shapes that still refuse where jq answers, in the safe
+     direction (a sample, not an exhaustive list), pinned by
+     `test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`: the verdict stage on an untracked entry
+     (`1 | isempty(empty) | $x`, where the register is carried by the stage and no leaf states it), inside a
+     compound stage (`(any, any)`, `any // 1`, `any? // 1`), which is refused as a whole (#3644), and behind a
+     `def` call or a `reduce` (`def f: any; f | $x`), which state no register. In yq mode `any`/`all` are real yq
      builtins and keep yq's own scalar error (`all only supports arrays, was !!int`); real yq rejects the two-argument
      form outright, so `--jq-extensions` keeps its refusal.
 

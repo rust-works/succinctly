@@ -332,6 +332,11 @@ Consequences:
   uncatchable guess, which also keeps a lost-register state out of the stage's entry assertion.
   The per-result verdict made the claim for any `cond` and wrote `null` over a document for
   `all(unique_by(.))`; #3749's undecided claim did the same for `any(1; .[]?) or 1`.
+  #3758: the pipe stage reads the arm's statement (`stage_states_register_per_result`, jq mode only):
+  per result, a result that navigated nothing and whose leaf says `Unmoved` came from a generator
+  that backtracked every branch, so `. as $x | any | $x` is the register again. A decided result
+  navigated (`.[]`'s own index) and was already read through `reports_register`. The stage rule
+  only *admits reading* the leaf's statement; the claim itself stays the arm's.
 
 ## 6. Delivery
 
