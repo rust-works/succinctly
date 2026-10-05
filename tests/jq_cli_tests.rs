@@ -99444,3 +99444,72 @@ fn test_foreach_bound_empty_array_element_answers_its_path_3789() -> Result<()> 
         ),
     ])
 }
+
+// ============================================================================
+// #3789 (review): the element's position composes with the frame's, and a
+// reduce keeps the marker it always had
+// ============================================================================
+
+/// The position a foreach element's `$k` names is the frame's own position extended
+/// by the element's path, so it has to hold below the invocation root: after a
+/// navigation (`.x |`), a `getpath`, a fan-out (`.x[] |`) and a deeper path. At the
+/// root `extend` just clones the element's path, so the answer rows in
+/// [`test_foreach_bound_empty_array_element_answers_its_path_3789`] cannot see a
+/// position that ignores the frame. A `reduce` re-seeds no per-step register, so even
+/// with the frame tracking positions for another reason (`. as $_`) it keeps its
+/// position-less marker and refuses, as jq does. Every row captured from jq 1.7.1
+/// with `-c`, on both evaluators.
+#[test]
+fn test_foreach_bound_empty_array_element_composes_with_the_frame_3789() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"x":{"a":[]}}"#,
+            r"path(.x | foreach .a as $k (0; $k; .))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[]}}"#,
+            r#"path(getpath(["x"]) | foreach .a as $k (0; $k; .))"#,
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":[{"a":[]},{"a":[]}]}"#,
+            r"path(.x[] | foreach .a as $k (0; $k; .))",
+            "[\"x\",0,\"a\"]\n[\"x\",1,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"a":[]}}"#,
+            r"(.x | foreach .a as $k (0; $k; .)) = 9",
+            "{\"x\":{\"a\":9}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":{"y":{"a":[]}}}"#,
+            r"path(.x.y | foreach .a as $k (0; $k; .))",
+            "[\"x\",\"y\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(. as $_ | reduce .a as $k (.; $k))",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+        (
+            r#"{"a":[]}"#,
+            r"path(. as $_ | reduce .a as $k (0; $k))",
+            "",
+            "Invalid path expression with result []",
+            5,
+        ),
+    ])
+}

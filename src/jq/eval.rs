@@ -43709,12 +43709,11 @@ fn resolve_bind_source_in<S: EvalSemantics>(
 ) -> Option<BindSourceWitness> {
     let bind = |b: PathBranch<'_>| {
         let origin = if b.trackable && slice_witnesses_node(&b.path, &b.value) {
-            frame.origin_at(&b.path).map(|origin| match origin {
-                Origin::At { invocation, path } if passthrough => {
-                    Origin::SnapshotAt { invocation, path }
-                }
-                origin => origin,
-            })
+            if passthrough {
+                frame.snapshot_origin_at(&b.path)
+            } else {
+                frame.origin_at(&b.path)
+            }
         } else {
             None
         };
@@ -44917,9 +44916,11 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
 /// Whether a destructured binding keeps the origin its pattern walk gave it
 /// when a fold substitutes it (#2676, #2979).
 ///
-/// Only a destructuring pattern's bindings carry a walk origin: a bare
+/// Only a destructuring pattern's bindings carry a walk origin. A bare
 /// `$var` is substituted tracked exactly when the source element is
-/// register-derived (#2031), for both folds, whichever this is.
+/// register-derived (#2031), for both folds; under `Keep` that marker also
+/// names the element's position when it is provable (#3789), under `Drop` it
+/// is the position-less snapshot.
 #[derive(Clone, Copy)]
 enum WalkOrigins {
     /// `foreach`: each binding keeps its [`Origin`], so a `$var` read in
@@ -44974,16 +44975,17 @@ impl FoldBind<'_> {
             FoldBinding::Var {
                 name,
                 value,
-                origin: Some(Origin::Snapshot),
-            } => substitute_var_tracked(expr, name, value),
-            FoldBinding::Var {
-                name,
-                value,
                 origin: Some(origin),
-            } => {
-                let marker = LazyMarker::new(value, origin.clone(), None);
-                substitute_var_impl(expr, name, value, Some(&marker))
-            }
+            } => match origins {
+                // `reduce` re-seeds no per-step register, so a position would
+                // admit nothing: it keeps the position-less marker it always
+                // had, whether or not `Frame::at` is on for another reason.
+                WalkOrigins::Drop => substitute_var_tracked(expr, name, value),
+                WalkOrigins::Keep => {
+                    let marker = LazyMarker::new(value, origin.clone(), None);
+                    substitute_var_impl(expr, name, value, Some(&marker))
+                }
+            },
             FoldBinding::Var {
                 name,
                 value,
@@ -45019,7 +45021,9 @@ impl FoldBind<'_> {
 /// A destructuring pattern is walked the way #2676 walks it, seeded by
 /// [`fold_pattern_seed`]; a bare `$var` performs no step (its walked
 /// register is `None`) and is substituted tracked exactly when the element
-/// is register-derived (#2031).
+/// is register-derived (#2031). In jq mode its marker names the element's
+/// position when the frame can prove it (#3789, see [`FoldBind::apply`] for
+/// which fold reads it).
 ///
 /// `alternatives` names every variable the chain binds, or is `None` for a
 /// single pattern: then there is nothing to null-fill, and the duplicate-name
@@ -45058,11 +45062,15 @@ fn each_fold_bind<S: EvalSemantics>(
             )
         }
         Pattern::Var(name) => {
-            // #3789: the element is the register's node at `register_path`,
-            // so in jq mode its marker names that position -- the only thing
+            // #3789: the element is the register's node at `register_path`, so in
+            // jq mode its marker names that position -- the only thing
             // `Frame::certifies_value` accepts for an empty array, which a
-            // position-less `Snapshot` never certifies. The value rule is
-            // `Snapshot`'s own; yq has no pointer identity to model and keeps it.
+            // position-less `Snapshot` never certifies. Minted for every value,
+            // not only an empty array, so which values need a position stays
+            // `certifies_value`'s rule alone. The value rule is `Snapshot`'s own.
+            // yq never gets here with a `register_path` (its sources are driven by
+            // value), and the tag check keeps `SnapshotAt` out of it by
+            // construction (ADR-0018), as `identity_bind_position` does.
             let origin = elem.register_path.as_ref().map(|path| {
                 (S::TAG == EvalTag::Jq)
                     .then(|| frame.snapshot_origin_at(path))
@@ -121437,9 +121445,9 @@ mod tests {
     /// #3789: a `foreach` whose bare `$var` can reach a path position in UPDATE
     /// or EXTRACT turns `Frame::at` on, because an empty-array element
     /// certifies against the step register only by position (#3494). A
-    /// variable read by value only, a variable the body never names, a
-    /// variable another binding shadows, and every `reduce` (which re-seeds no
-    /// per-step register) leave `at` free for the ordinary write workloads.
+    /// variable read by value only, a variable the body never names, and every
+    /// `reduce` (which re-seeds no per-step register) leave `at` free for the
+    /// ordinary write workloads.
     #[test]
     fn test_frame_enter_gate_admits_a_foreach_variable_in_path_position_3789() {
         let gated = |filter: &str| Frame::enter(&parse(filter).unwrap()).at.is_some();
