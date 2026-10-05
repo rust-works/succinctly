@@ -62184,6 +62184,39 @@ fn test_fold_pattern_guessed_refusal_is_not_caught_3743() -> Result<()> {
     Ok(())
 }
 
+/// #3743: a computed key is not judged by value, because running its generator a
+/// second time would repeat its effects: `stderr` in the key writes once, as in jq
+/// (`a`, then the error), and the pattern keeps the refusal it had. Its guessed
+/// refusal stays catchable, as before this change, so a `try` around it still runs
+/// its handler (`with result 7`) where jq reaches the reduce's own `0` and fails
+/// with `with result 0` -- a documented residual, not a fix.
+#[test]
+fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
+    let input = r#"{"a":1}"#;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(reduce . as {("a"|stderr):$x} ?// $x (0; .))"#],
+        Some(input),
+    )?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "stderr {stderr:?}");
+    assert!(
+        stderr.starts_with("ajq: error"),
+        "the key's `stderr` ran once: {stderr:?}"
+    );
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(try (reduce . as {("a"|stderr):[$x]} ?// $x (0; .)) catch 7)"#,
+        ],
+        Some(input),
+    )?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "stderr {stderr:?}");
+    assert!(
+        stderr.contains("with result 7"),
+        "residual: the handler still runs: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
 /// verdict stage behind a `def` call or a `reduce` and one inside a compound stage
 /// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758 and the
