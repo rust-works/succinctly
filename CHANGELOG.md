@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a string slice in path position is no longer certified as the register by value** (#3793).
+  `"s" | path(. as $k | .[0:] | $k)` answered `[{"start":0,"end":null}]` where jq refuses with `Invalid path expression with result "s"`, and
+  `path(.a | . as $k | .[0:] | $k)` and `path(foreach .a as $k (0; $k|.[0:]; $k))` on `{"a":"s"}` did the same. jq's string slice is a copy and
+  `jv_identical` compares string pointers; `Frame::certifies_value` applied that rule to arrays only (#3494). A string whose marker names a position now
+  certifies only where that position is the register's, while a position-less marker keeps the by-value rule (the node jq holds: `input | . as $x | ($x) =
+  9` still answers). `=`/`|=`/`del()` through the shape already raised, with a different message, so the observable change is `path()`/`paths()`.
+  Pinned by `test_string_slice_is_not_the_register_3793`.
 - **jq: a bind or destructuring source that may be the register's own node refuses loudly instead of silently dropping a write under `try`** (#3423).
   A source jq may pass the register through by pointer, through control flow no grammar names (`(., 1) | .`, `if c then (., 1) else . end`,
   `try (., 1) catch 2`, `first($orig)`, `($orig?)`, `label $l | $orig`), was bound by value with no mark (`as $x`) or classified by a head

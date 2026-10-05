@@ -34295,15 +34295,26 @@ impl Frame {
     /// comparison, which yq has no counterpart of, so yq keeps the by-value
     /// rule it always had.
     fn certifies_value<S: EvalSemantics>(&self, origin: &Origin, value: &OwnedValue) -> bool {
+        // #3793: a string is the same hazard as an empty array -- jq's string slice
+        // is a copy (`jv_identical` compares string pointers), so `"s" | path(. as $k
+        // | .[0:] | $k)` refuses `with result "s"` where certifying by value answers
+        // `[{"start":0,"end":null}]`. Unlike an empty array it is *only* a hazard once a
+        // position says the marker's node and the register's differ: a position-less
+        // marker (`input | . as $x | ($x) = 9`, a scalar bound mid-pipe) is the very
+        // node jq holds, so it keeps the by-value rule.
+        let is_string = matches!(value, OwnedValue::String(_));
         let empty_array = matches!(value, OwnedValue::Array(_)) && !slice_is_same_array(value);
-        if S::TAG != EvalTag::Jq || !empty_array {
+        let needs_position = empty_array || is_string;
+        if S::TAG != EvalTag::Jq || !needs_position {
             return self.certifies(origin);
         }
         match origin {
             Origin::At { invocation, path } | Origin::SnapshotAt { invocation, path } => {
                 self.names(*invocation, path)
             }
-            Origin::Snapshot | Origin::Untracked | Origin::Unproven => false,
+            Origin::Snapshot | Origin::Untracked | Origin::Unproven => {
+                !empty_array && self.certifies(origin)
+            }
         }
     }
 
