@@ -16,6 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped it and the later refusal became this resolver's guess, which no `?` or `try` can catch. It now states the register on
   every untracked emission when nothing in SOURCE, INIT, UPDATE or EXTRACT can navigate (`foreach_cannot_move_register`). Pinned by
   `test_foreach_keeps_the_register_for_a_frozen_variable_after_it_3761`.
+
+- **jq: a bind source that passes `.` through (`select`, `first`, `limit`, a `try`-wrapped `if`) no longer silently skips a write under `try`** (#3402).
+  `del(select(true) as $v | try $v.b)` on `{"a":1,"b":2}` is `{"a":1}` in jq and echoed the document unchanged here
+  (exit 0), and so did `first(.)`, `limit(1; .)` and `(try (if .a then . else . end) catch 1)` as the source; without the
+  `try` they refused (`path(select(true) as $v | $v.b)`, jq `["b"]`). The static passthrough grammar cannot prove such a
+  source is `.` -- an `if` condition like `.a` raises into the handler on some inputs and not others -- so `$v` bound a
+  plain value, and the `try` caught its refusal. A source on a closed *transparent* grammar (`select(c)`, `first(S)`,
+  `limit(n; S)`, and `if`/`try`/`//`/`?`/pipes over them, nothing that navigates or computes in a source position) is now
+  resolved in path mode on the input: an output that is the register binds exactly as `. as $v` does, and a `catch`
+  handler's value still binds by value and refuses. A source with an effect keeps the old route, since the witness can
+  decline and re-run it (a doubled `input` turned a program jq answers into exit 5). Not covered: `last(.)` (#3766) and
+  the other shapes of #3423. Because the source now binds as `. as $v`, it shares that spelling's divergences after it:
+  one fuzz row that agreed only through the caught refusal now refuses loudly, and one behind a `?//` destructuring
+  head writes where jq does not, as the `.` spelling already did (#3781). Verified against jq 1.7.1: 30 pinned rows,
+  plus a test that an effect runs once and one that the `select(true)` spelling matches the `.` one; a mutation of each of the grammar's arms and guards fails a pin; `scripts/jq-bind-origin-fuzz.py` gained a
+  `--transparent-source-p` family (7 seeds x 3,000 programs: fabricate/mismatch rows 94 -> 17, the one new-only row is
+  #3781's), and 25 stock-family runs of 3,000 programs and `scripts/jq-bind-origin-oracle-sweep.sh` move no row that
+  agreed. Pinned by `test_transparent_bind_source_keeps_register_3402`.
+
 - **jq: a `foreach` whose EXTRACT navigates and then ends on an untracked `null` no longer answers the root path** (#3769).
   `(foreach (1,2) as $i (.; .; .a? | limit(1; last(.a?)))) = 9` on `null` is `{"a":9}` in jq and replaced the whole
   document with `9` here (exit 0), and `path(...)` answered `[]` twice where jq answers `["a"]`. The same held for any

@@ -3200,13 +3200,33 @@ answers `["b"]` — and classified the two residuals appended below):
     head keep the pre-#3279 grammar and stay refuse-only, because widening them wrote where jq
     refuses (a null/false marker made `//` bind its right side; a `?//` chain deleted the
     whole document).
-    A condition outside the grammar (`.a`, `.x == 1`, a call) still binds a plain value, and
-    so do sources the grammar cannot see at all (`select(true)`, `first(.)`, `. as $y | $y`).
-    When such a `$x` is then navigated *inside* a `try`
-    (`del((try (if .a then . else . end) catch 1) as $v | try $v.b)`, jq `{"a":1}`), the plain
-    value's refusal is caught by that `try` exactly as jq's own path errors are, and the write
-    jq performs is **silently skipped** rather than refused — tracked as
-    [#3402](https://github.com/rust-works/succinctly/issues/3402);
+    A condition outside the grammar (`.a`, `.x == 1`, a call) cannot be proved statically,
+    because whether it raises depends on the input. Since
+    [#3402](https://github.com/rust-works/succinctly/issues/3402) such a source is decided on the
+    input instead, when it is *transparent*: `select(c)`, `first(S)`, `limit(n; S)`, and
+    `if`/`try`/`//`/`?`/pipes over them, with nothing that navigates or computes in a source
+    position (`is_transparent_bind_source`). The witness resolves it in path mode, and an output
+    that is the register binds exactly as `. as $x` does, so
+    `del((try (if .a then . else . end) catch 1) as $v | try $v.b)` is jq's `{"a":1}` and
+    `path(select(true) as $v | $v.b)` is jq's `["b"]`; a `catch` handler's value still binds by
+    value and refuses. What it leaves:
+    - a transparent source with an effect (`debug`, `stderr`, `input`, `halt`, a call;
+      `walk_body_may_have_effects`) keeps the by-value route, because the witness can decline
+      after running it (a `catch .b` navigating the error value is a resolver refusal) and the
+      by-value re-run would repeat the effect. Under a `try`, such a `$x`'s refusal is still
+      caught and the write jq performs is **silently skipped**
+      (`del(select(debug) as $v | try $v.b)`);
+    - every other non-`.` source (`last(.)`, [#3766](https://github.com/rust-works/succinctly/issues/3766);
+      a comma or `label` head; a marker head after the register is lost) is the general class
+      [#3423](https://github.com/rust-works/succinctly/issues/3423) tracks, with the same silent
+      skip under `try`;
+    - a transparent source binds as `. as $x`, so it inherits that spelling's own divergences
+      after it. Two rows that agreed with jq only because the plain value's refusal was caught
+      now take the `.` spelling's answer: a loud refusal (`path((select(.d) // .) as $v | getpath([])
+      | ... | foreach ...)`), and -- the one exception to this list's "never a fabricated path",
+      pre-existing for the `.` spelling -- behind a `?//` destructuring head that is not `.`,
+      the write jq does not make that [#3781](https://github.com/rust-works/succinctly/issues/3781)
+      tracks;
   - an `if` bind source whose arms sit at *different* positions —
     `path(. as $p | .a | (if true then $p else . end) as $x | $x | getpath(["a"]) | .b)`,
     `["a","b"]` in jq. `identity_bind_position` is static (the condition is not evaluated),
