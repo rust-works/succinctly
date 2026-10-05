@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a bind or destructuring source that may be the register's own node refuses loudly instead of silently dropping a write under `try`** (#3423).
+  A source jq may pass the register through by pointer, through a head the grammars do not name (`(., 1) | .`, `if c then (., 1) else . end`,
+  `try (., 1) catch 2`, `first($orig)`, `($orig?)`, `label $l | $orig`), was bound by value with no mark (`as $x`) or classified by a head
+  grammar that said "not frozen" (`as {a:{b:$q}}`), so the refusal off it read as jq's verdict and a `try` caught it: `del`, `=` and `|=`
+  left the document unchanged at exit 0 where jq writes (`del(((., 1) | .) as $x | try $x.a)` on `{"a":{"b":1}}` is `{}` in jq). A source
+  *value-equal to the register* that nothing proves fresh (a literal, a construction, or a `,`/`if`/pipe of them) now refuses as the
+  resolver's guess, uncatchable (exit 5): a destructuring walk stands the loss state in for the known register, a plain bind uses a new
+  non-certifying `Origin::Unproven` marker whose reference states the register lost, and an untracked-entry stage does the same for the
+  register it carries. A fresh value stays exact and catchable, `. as $x`, `first(.)`, `select(...)` and a top-level comma split per leaf
+  still write as jq does, a source that differs from the register by value cannot be it, and a literal or construction is now a
+  transparent leaf (`select(false) // {"a":1}`). The price, in the safe direction: a fresh copy equal to the register that no grammar proves
+  fresh (`(. | tojson | fromjson) as $x | try $x.a`) refuses where jq catches its own refusal. Jq mode only. A 3,000-program fuzz of the new
+  `--ambiguous-source-p` family went from 5 fabricated and 11 mismatching rows to none, with 13 new refusals (11 of them rows that were
+  silently wrong). Pinned by `test_bind_source_that_may_be_the_register_refuses_loudly_3423` and `yq_ambiguous_bind_source_keeps_the_caught_refusal_3423`.
+
 - **jq: `last(f)` keeps the identity of `f`'s last output, so a result that is jq's path register stays one** (#3766, a #3643 follow-up).
   jq defines `last(f)` as `reduce f as $x (null; $x)`, so the result is the very value `f` last emitted, and `path()` accepts a result
   that is `jv_identical` to the register (pointer identity for an object or array). The resolver forwarded a computed copy, so
