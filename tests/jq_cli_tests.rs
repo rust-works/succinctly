@@ -64917,9 +64917,8 @@ fn test_foreach_true_or_update_extracting_the_variable_never_answers_the_root_37
 /// caught its own refusal as though jq had raised it, and the UPDATE yielded
 /// nothing: `del(...)` and `(...) = 9` silently skipped the write where jq
 /// writes, or raises. A chain has no sibling branch to withhold the register
-/// from, so it is exempt (`is_single_path_chain`). Every row captured from jq
-/// 1.7.1 with `-c`; the branching bodies stay as they were
-/// (`test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`).
+/// from. Every row captured from jq 1.7.1 with `-c`; #3770 widened this to any body around a generator
+/// (`test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`).
 #[test]
 fn test_foreach_update_under_try_over_a_generator_keeps_the_register_3738() -> Result<()> {
     let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#;
@@ -65168,15 +65167,149 @@ fn test_foreach_update_under_try_over_a_generator_keeps_the_register_3738() -> R
     ])
 }
 
-/// #3770, characterization of a pre-existing bug: a `foreach` UPDATE under a
-/// `try` whose body *branches* (a comma, `//`, `and`/`or` around a generator)
-/// still answers nothing, or the root path, where jq answers a path, so a write
-/// through it is silently skipped. The shapes are the siblings `fans_out` guards
-/// (#3145), and the fold's null-identity relocation makes widening it unsafe:
-/// dropping `Iterate` from `fans_out` outright turned the `null` rows below
-/// into `[]` and `= 9` into a write over the whole document, so #3738 exempts
-/// only single-chain bodies. Verified identical on `main` before #3738. jq 1.7.1's
-/// answers are in the comments; if #3770 is fixed, update the expectations.
+/// #3770: a `foreach` UPDATE whose body holds a generator keeps jq's path
+/// register whatever wraps the generator -- `//`, `select`, `first(...)`,
+/// `limit`, `if`, `getpath(...)`, a computed key or a `catch` handler. `fans_out`
+/// used to count `.[]` and `..` as a split, so such a body resolved
+/// register-less, the `try` caught its own refusal and a write through it was
+/// silently skipped (#3738 exempted only a single chain of stages). Every row
+/// captured from jq 1.7.1 with `-c`; what still differs is
+/// `test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`.
+#[test]
+fn test_foreach_update_under_try_around_a_generator_keeps_the_register_3770() -> Result<()> {
+    let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#;
+    let nested = r#"{"x":{"a":[[1]]}}"#;
+    assert_path_rows_3289(&[
+        // `//` around a generator, with and without `try`, as path() and as a write.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[]) // $w; .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as $w (0; try ($w | .a[]) // $w; .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[9]}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[] | .b) // $w; .))",
+            "[\"x\",\"a\",0,\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; ($w | .a[]) // $w; .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[]) // empty; .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        // Non-branching wrappers the #3738 allowlist did not name.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[] | select(.b)); .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try first($w | .a[]); .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try limit(1; $w | .a[]); .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try (if true then $w | .a[] else $w end); .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"def f: .a[]; path(foreach .x as $w (0; try ($w | f); .))",
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        // A computed key, even a literal one, and `getpath(...)`.
+        (
+            nested,
+            r"path(foreach .x as $w (0; try ($w | .a[0.5] | .[]?); .))",
+            "[\"x\",\"a\",0.5,0]\n",
+            "",
+            0,
+        ),
+        (
+            nested,
+            r"(foreach .x as $w (0; try ($w | .a[0.5][]); .)) = 9",
+            "{\"x\":{\"a\":[[9]]}}\n",
+            "",
+            0,
+        ),
+        (
+            nested,
+            r#"path(foreach .x as $w (0; try ($w | getpath(["a"]) | .[]?); .))"#,
+            "[\"x\",\"a\",0]\n",
+            "",
+            0,
+        ),
+        // A `catch` handler: the generator's own refusal is a path error jq does not raise.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .[]?) catch .; .))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as $w (0; try ($w | .a[]) catch 1; .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[9]}}\n",
+            "",
+            0,
+        ),
+        // `and` around a generator on `null`: jq raises on the `false` the UPDATE yields,
+        // and so do we now (the write used to be skipped, exit 0).
+        (
+            "null",
+            r"(foreach .a? as $k (0; try (($k | .[0]) and (.. | .a?)); .)) = 9",
+            "",
+            "Invalid path expression with result false",
+            5,
+        ),
+    ])
+}
+
+/// #3770, characterization of what remains of a pre-existing bug. A `foreach`
+/// UPDATE whose body has a comma still answers nothing where jq answers a path,
+/// so a write through it is silently skipped: a comma is the split `fans_out`
+/// really guards (#3145: `(foreach .a as {a:$v} ?// {c:$v} (0; ($v[0]?, $v))) =
+/// 9` wrote `.a.c`). On `null`, `//` around a generator now refuses loudly where
+/// it used to answer nothing: a bare `$k` alternate cannot relocate to the
+/// register once the body navigates anywhere (#3788), and an `and` body leaves
+/// the EXTRACT's `$k` with no register. jq 1.7.1's answers are in the comments;
+/// update the expectations when these are fixed.
 #[test]
 fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770(
 ) -> Result<()> {
@@ -65198,6 +65331,14 @@ fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_
             "",
             0,
         ),
+        // jq: ["x","a",0,"b"] and ["x","a",0,"c"]
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[] | (.b, .c)); .))",
+            "",
+            "",
+            0,
+        ),
         // jq: {"a":[{"b":1}],"x":{}}
         (
             doc,
@@ -65214,70 +65355,28 @@ fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_
             "",
             0,
         ),
-        // jq: ["x","a",0]
-        (
-            doc,
-            r"path(foreach .x as $w (0; try ($w | .a[]) // $w; .))",
-            "",
-            "Invalid path expression with result {\"a\":[{\"b\":1}]}",
-            5,
-        ),
-        // jq: ["a"]
+        // #3788. jq: ["a"]
         (
             "null",
             r"path(foreach .a? as $k (0; try (($k | .[]?) // $k); $k))",
             "",
-            "",
-            0,
+            "Invalid path expression with result null",
+            5,
         ),
-        // jq: {"a":9}
+        // #3788. jq: {"a":9}
         (
             "null",
             r"(foreach .a? as $k (0; try (($k | .[]?) // $k); .)) = 9",
-            "null\n",
             "",
-            0,
-        ),
-        // The allowlist does not name a computed key, even a literal one, or `getpath`:
-        // jq: ["x","a",0.5,0]
-        (
-            r#"{"x":{"a":[[1]]}}"#,
-            r"path(foreach .x as $w (0; try ($w | .a[0.5] | .[]?); .))",
-            "",
-            "",
-            0,
-        ),
-        // jq: {"x":{"a":[[9]]}}
-        (
-            r#"{"x":{"a":[[1]]}}"#,
-            r"(foreach .x as $w (0; try ($w | .a[0.5][]); .)) = 9",
-            "{\"x\":{\"a\":[[1]]}}\n",
-            "",
-            0,
-        ),
-        // jq: ["x","a",0]
-        (
-            r#"{"x":{"a":[[1]]}}"#,
-            r#"path(foreach .x as $w (0; try ($w | getpath(["a"]) | .[]?); .))"#,
-            "",
-            "",
-            0,
-        ),
-        // A `catch` handler is not a chain either: it runs on a caught error's payload.
-        // jq: ["x","a"]
-        (
-            doc,
-            r"path(foreach .x as $w (0; try ($w | .[]?) catch .; .))",
-            "",
-            "Invalid path expression with result \"Invalid path",
+            "Invalid path expression with result null",
             5,
         ),
-        // jq: {"a":[{"b":1}],"x":{"a":[9]}}
+        // #3788. jq: null (a no-op write the old silent skip happened to match)
         (
-            doc,
-            r"(foreach .x as $w (0; try ($w | .a[]) catch 1; .)) = 9",
+            "null",
+            r"del(foreach .a? as $k (0; try (($k | .[]?) // $k); .))",
             "",
-            "Invalid path expression with result 1",
+            "Invalid path expression with result null",
             5,
         ),
         // jq: ["a",0]
@@ -65285,8 +65384,8 @@ fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_
             "null",
             r"path(foreach .a? as $k (0; try (($k | .[0]) and (.. | .a?)); $k))",
             "",
-            "",
-            0,
+            "Invalid path expression with result null",
+            5,
         ),
     ])
 }
