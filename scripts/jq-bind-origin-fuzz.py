@@ -96,6 +96,16 @@ side (`.a`'s node marked as `.`'s snapshot certifies against an equal
 sibling), a handler or arm whose value copies a document leaf, and a marker.
 Off by default (`--transparent-source-p`) so existing seeds keep their stream.
 
+#3423 adds the AMBIGUOUS_SOURCES family: sources that may pass `.` (or a `$var`
+frozen at the register) through by pointer but sit outside both the identity
+grammar and the transparent one -- a comma nested under a pipe, `if`, `try` or
+`//`, a `label`, a rebind, a `first`/`?` over a marker. Whether such a source
+*is* the register is unknowable from the value, so a refusal off its `$x` or
+pattern must be loud, never caught: the trap is the silent drop of a write jq
+makes. Mixed with sources that build or derive a value (a construction, `walk`,
+`with_entries`, `del(.zz)`, a no-op `del(.[5])`) or that navigate, which must keep
+their exact, catchable refusal. Off by default (`--ambiguous-source-p`).
+
 Usage:
     cargo build --release --features cli
     ./scripts/jq-bind-origin-fuzz.py [--bin PATH] [--jq PATH] [-n N] [--seed S] [--show K]
@@ -657,6 +667,31 @@ TRANSPARENT_SOURCES = [
 def transparent_source_program(rng):
     return program(rng, TRANSPARENT_SOURCES)
 
+# #3423: see the module docstring. The first group may be the register (a
+# pass-through the grammars do not name); the second is provably a fresh copy or
+# a navigation, whose refusal is jq's own and stays catchable.
+AMBIGUOUS_SOURCES = [
+    ("((., 1) | .)", False), ("(if .a then (., 1) else . end)", False),
+    ("(try (., 1) catch 2)", False), ("((., 1) // 2)", False), ("((., 1)?)", False),
+    ("(label $l | .)", False), ("(. as $q | $q)", False), ("((., .) | .)", False),
+    ("first((., 1))", False), ("((.a, .) | select(true))", False),
+    ("(if .d then 1 else (., 2) end)", False), ("((1, .) | select(. != 1))", False),
+    ("last(., 1, .)", False), ("(limit(2; ., 1))", False), ("(select(true) | (., 1))", False),
+    ("(label $l | $p)", True), ("($p?)", True), ("($p | .)", True), ("($p as $q | $q)", True),
+    ("(($p, 1) | .)", True), ("(if .a then $p else (., 1) end)", True),
+    # Fresh or navigating: jq refuses these itself, so the refusal stays exact.
+    ("({a:.a})", False), ("([.])", False), ("([.] | .[0])", False), ("(.a, 1)", False),
+    ("(.x | .)", False), ("({\"a\":{\"b\":1}})", False), ("(. | tojson | fromjson)", False),
+    # Derived copies (#3791 review): equal to the register by value, never it by pointer.
+    # A bind through one must keep its exact, catchable refusal, and the no-op deletes
+    # hand back the input's own storage in succinctly where jq builds a fresh array.
+    ("with_entries(.)", False), ("walk(.)", False), ("del(.zz)", False), ("del(.[5])", False),
+    ("to_entries", False), ("(. + {})", False), ("(.d |= .)", False), ("([.] | .[0])", False),
+]
+
+def ambiguous_source_program(rng):
+    return program(rng, AMBIGUOUS_SOURCES)
+
 def stage(rng, v):
     r = rng.random()
     if r < 0.4: return rng.choice(NAV)
@@ -772,6 +807,11 @@ def main():
                          "`first`, `limit`, `if`/`try`/`//` over `.`, which the witness resolves in "
                          "path mode. Off by default so existing seeds keep their stream; run at 1.0 "
                          "to weight the sweep onto it")
+    ap.add_argument("--ambiguous-source-p", type=float, default=0.0,
+                    help="probability a program binds from a source that may pass the register "
+                         "through by pointer outside the grammars (#3423): a comma nested under a "
+                         "pipe/`if`/`try`/`//`, `label`, a rebind. Off by default so existing "
+                         "seeds keep their stream; run at 1.0 to weight the sweep onto it")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     pin = open("tests/data/jq-golden/JQ_VERSION").read().strip()
@@ -796,7 +836,8 @@ def main():
                            ("DESTRUCTURE_BIND_SOURCES", DESTRUCTURE_BIND_SOURCES),
                            ("DESTRUCTURE_BIND_STAGES", DESTRUCTURE_BIND_STAGES),
                            ("OPTIONAL_SOURCES", [src for src, _ in OPTIONAL_SOURCES]),
-                           ("TRANSPARENT_SOURCES", [src for src, _ in TRANSPARENT_SOURCES])]:
+                           ("TRANSPARENT_SOURCES", [src for src, _ in TRANSPARENT_SOURCES]),
+                           ("AMBIGUOUS_SOURCES", [src for src, _ in AMBIGUOUS_SOURCES])]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
@@ -825,6 +866,8 @@ def main():
             f = optional_source_program(rng)
         elif a.transparent_source_p and rng.random() < a.transparent_source_p:
             f = transparent_source_program(rng)
+        elif a.ambiguous_source_p and rng.random() < a.ambiguous_source_p:
+            f = ambiguous_source_program(rng)
         elif a.embed_write_p and rng.random() < a.embed_write_p:
             f = embed_write_program(rng)
         elif a.destructure_bind_p and rng.random() < a.destructure_bind_p:
