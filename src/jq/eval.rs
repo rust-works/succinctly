@@ -41857,7 +41857,9 @@ fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool 
 /// resolves natively; `.` and `select`, which pass their input through; an
 /// `if`'s branches (its condition is a subexp in jq); a computed index or
 /// slice's target (its keys are subexps); pipes, commas and parens of
-/// those; and anything [`cannot_move_register`] admits, which neither moves
+/// those; `last(f)`, whose claim is `f`'s own (#3767: it is `reduce f as $x
+/// (null; $x)`, so `f` is a source jq path-checks as the resolver's `last` arm
+/// does); and anything [`cannot_move_register`] admits, which neither moves
 /// jq's register nor is path-checked inside. Everything else -- every other
 /// builtin call, an assignment, a `def`, a fold -- keeps the array
 /// refusing, the safe direction.
