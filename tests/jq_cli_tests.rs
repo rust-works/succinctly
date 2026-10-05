@@ -61902,20 +61902,20 @@ fn test_verdict_stage_on_an_untracked_entry_3826() -> Result<()> {
     ])
 }
 
-/// #3743: a fold's destructuring `?//` over the document itself retries when its
-/// first step can never succeed on the element. `reduce . as [$a] ?// $a (0; .)`
-/// binds `.` (the register's own node) to `[$a]`, which is "Cannot index object
-/// with number" in jq whether or not `.` is the register, and `?//` retries the
-/// next alternative. The resolver called that refusal a guess (the element equals
-/// the register by value, so jq "might" have carried on) and did not retry, so a
-/// `try` around it ran its handler for an error jq never raised: `path(foreach
-/// (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))` lost
-/// the reduce's `0` and answered one path where jq answers two. The first step is
-/// judged by what it indexes (an array pattern by position, an object pattern by a
-/// literal key) against what the element is, via `NavKind::would_succeed_on`.
-/// Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+/// #3743: a fold's destructuring `?//` over the document itself retries when the
+/// pattern fails by value. `reduce . as [$a] ?// $a (0; .)` binds `.` (the
+/// register's own node) to `[$a]`, which is "Cannot index object with number" in
+/// jq whether or not `.` is the register, and `?//` retries the next alternative.
+/// The resolver called that refusal a guess (the element equals the register by
+/// value, so jq "might" have carried on) and did not retry, so a `try` around it
+/// ran its handler for an error jq never raised: `path(foreach (try ((reduce . as
+/// [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))` lost the reduce's `0`
+/// and answered one path where jq answers two. A literal-keyed pattern that
+/// raises when destructured by value (`pattern_walk_fails_by_value`), at any step
+/// (`[[$a]]` over `[1]`), is exact. Every row captured from jq 1.7.1, on the stdin
+/// and `-n` routes.
 #[test]
-fn test_fold_pattern_first_step_that_cannot_succeed_retries_3743() -> Result<()> {
+fn test_fold_pattern_that_fails_by_value_retries_3743() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
         (
             r#"{"a":[1],"b":"abc"}"#,
@@ -62079,12 +62079,57 @@ fn test_fold_pattern_first_step_that_cannot_succeed_retries_3743() -> Result<()>
             "",
             0,
         ),
+        // A later step that cannot succeed: the walk fails by value, so jq raises whatever the register is.
+        (
+            r"[1]",
+            r"path(try (reduce . as [[$a]] (0; .)) catch 7)",
+            "",
+            r"Invalid path expression with result 7",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(try (reduce . as [[$a]] ?// $a (0; .)) catch 7)",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(try (reduce . as {a:[[$a]]} (0; .)) catch 7)",
+            "",
+            r"Invalid path expression with result 7",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(reduce . as {a:{b:$a}} ?// $a (0; .))",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(foreach . as [[$a]] ?// $a (0; .; .))",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(try (foreach . as [[$a]] (0; .; .)) catch 7)",
+            "",
+            r"Invalid path expression with result 7",
+            5,
+        ),
     ])
 }
 
-/// #3743: the shapes where the first step *could* succeed on the element (`{a:$a}`
-/// over a document that has `a`, a computed key) stay the walk's guess at jq's
-/// `path_intact`: not retried, and not catchable either. They answered silently
+/// #3743: the shapes where the pattern does *not* fail by value on the element
+/// (`{a:$a}` over a document that has `a`) stay the walk's guess at jq's
+/// `path_intact`: not retried, and not catchable either. (A computed key is not
+/// judged and keeps its refusal as it was: `{("a"):$a} ?// $a` still loses the
+/// handler's output inside a `try`, documented as a residual.) They answered silently
 /// wrong through a `try` (its handler's output in place of the alternative's); they
 /// are now the loud refusal every other guess site makes (ADR-0018 rule 4), where
 /// jq answers the rows' third column.
@@ -62103,11 +62148,6 @@ fn test_fold_pattern_guessed_refusal_is_not_caught_3743() -> Result<()> {
         ),
         (
             r#"{"a":[1],"b":"abc"}"#,
-            r#"path(foreach (try ((reduce . as {("a"):$a} ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))"#,
-            "[] []",
-        ),
-        (
-            r#"{"a":[1],"b":"abc"}"#,
             r"path(reduce . as {b:$a} ?// $a (.; .))",
             "[]",
         ),
@@ -62115,6 +62155,11 @@ fn test_fold_pattern_guessed_refusal_is_not_caught_3743() -> Result<()> {
             r"[1,2]",
             r"path(foreach (try ((reduce . as [$a] ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))",
             "[] []",
+        ),
+        (
+            r"[[1]]",
+            r"path(try (reduce . as [[$a]] (0; .)) catch 7)",
+            "an error, `with result 0`",
         ),
     ] {
         let routes = [
