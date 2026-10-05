@@ -93813,6 +93813,14 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
             doc,
             r#"del(. as $orig | has("k") | try (($orig as $p | $p) as {a:{b:$q}} | $q))"#,
         ),
+        // The forwarders the alias grammar reads through: `select` inside a comma,
+        // and a `catch` handler that names the frozen `$orig` (its `.` is the error
+        // payload, so only the `$var` counts there).
+        (doc, r"del(((select(true), 1) | .) as $x | try $x.a)"),
+        (
+            doc,
+            r#"del(. as $o | has("k") | try ((try error(1) catch $o) as {a:{b:$q}} | $q))"#,
+        ),
         // The source's output equal to the register by value, off the register:
         // the stage the bind is read in is untracked and carries it.
         (doc, r"del(((., 1) | .) as $x | 5 | try $x.a)"),
@@ -93950,6 +93958,14 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
             "{\"a\":{\"b\":1}}\n",
         ),
         (doc, r"del(. as $x | try $x.a)", "{}\n"),
+        // The marker keeps its mark only while it equals the register at the use
+        // site: here the register has moved onto `.a`, which `$x` (the root) cannot
+        // be, so jq's own refusal is caught.
+        (
+            doc,
+            r"del(((., 1) | .) as $x | .a | try ($x | .b))",
+            "{\"a\":{\"b\":1}}\n",
+        ),
         // A later step's refusal is jq's own, so it stays catchable: the source IS the
         // register here, the first step passes, and `{a:$q, b:$r}` refuses at `b`.
         (
