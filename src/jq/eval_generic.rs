@@ -1437,6 +1437,37 @@ pub(crate) fn swallowed_scalar_iteration<S: EvalSemantics, V: DocumentValue>(
     Some(scalar_decode_error(value).map_or(Ok(()), Err))
 }
 
+/// What `try .[] catch LITERAL` settles for a scalar `value` without raising
+/// the `Cannot iterate over ...` error its handler would be handed (#3704), or
+/// `None` when it must evaluate: `Some(Ok(v))` is the handler's one output,
+/// the literal, and `Some(Err(e))` the failure `try` never catches
+/// ([`scalar_decode_error`]), as in [`swallowed_scalar_iteration`], whose
+/// sibling this is.
+///
+/// The handler ignores its input, so building the payload (a preview string
+/// and an owned copy of the scalar) and running the handler over a re-indexed
+/// one-scalar document only to read a constant is the whole cost of the
+/// boundary. Not taken in yq mode, where `.[]` over a scalar never built the
+/// message; the shape test is the same O(1) match on the AST, run before the
+/// value is probed.
+pub(crate) fn caught_scalar_iteration<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    catch: Option<&Expr>,
+    value: &V,
+) -> Option<Result<OwnedValue, EvalError>> {
+    if S::TAG == EvalTag::Yq {
+        return None;
+    }
+    let literal = crate::jq::eval::try_catches_scalar_iteration_with_literal(expr, catch)?;
+    if value.as_array().is_some() || value.as_object().is_some() {
+        return None;
+    }
+    Some(match scalar_decode_error(value) {
+        Some(e) => Err(e),
+        None => Ok(literal_to_owned(literal)),
+    })
+}
+
 /// Whether the swallowed-`.[]` shortcut may be taken at all for a `?`/`try`
 /// boundary over `expr` with this handler, in this mode (#3689): the body is a
 /// bare `.[]` ([`try_swallows_scalar_iteration`](crate::jq::eval::try_swallows_scalar_iteration))
@@ -9664,6 +9695,10 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
     if let Some(settled) = swallowed_scalar_iteration::<S, V>(inner, catch, &value) {
         return settled.map_or_else(GenericResult::Error, |()| GenericResult::None);
     }
+    // #3704: a constant handler over a scalar `.[]` answers itself.
+    if let Some(caught) = caught_scalar_iteration::<S, V>(inner, catch, &value) {
+        return caught.map_or_else(GenericResult::Error, GenericResult::Owned);
+    }
     // A handler that reads path context stands at this stage's position
     // (spine 2416, identity pass): the sink route's `each_try_generic` runs
     // it from the cursor, so delegate to it rather than growing a second
@@ -12693,6 +12728,16 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
     // here.
     if let Some(settled) = swallowed_scalar_iteration::<S, V>(expr, catch, &value) {
         return settled.map_or_else(|e| Flow::Escaped(Control::Error(e)), |()| Flow::Exhausted);
+    }
+    // #3704: a constant handler over a scalar `.[]` answers itself.
+    if let Some(caught) = caught_scalar_iteration::<S, V>(expr, catch, &value) {
+        return match caught {
+            Ok(v) => match sink.push(GenericItem::Owned(v)) {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            },
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        };
     }
     let lazy_fault = StashedEscape::new();
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
@@ -42900,6 +42945,91 @@ mod tests {
             .collect();
         assert_eq!(inners.len(), 210);
         assert!(!inners[150].shares_storage_with(inners[0]));
+    }
+
+    /// #3704: `try .[] catch LITERAL` over a scalar settles in
+    /// `try_single_generic` and `each_try_generic` as the evaluated boundary
+    /// did. The reference is the handler spelled `LITERAL | .`, which is not a
+    /// `Literal` and so never takes the shortcut; both generic entries are
+    /// driven in both modes, with and without a sink that stops after the first
+    /// output, over a scalar of every kind, a container, and the scalars `try`
+    /// never catches.
+    #[test]
+    fn test_constant_handler_over_scalar_iteration_matches_the_evaluated_boundary_3704() {
+        fn run<S: EvalSemantics>(json: &[u8], filter: &str, stop_after: usize) -> String {
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap();
+            let mut out: Vec<String> = Vec::new();
+            let mut failure = None;
+            let control =
+                eval_each_with_cursor_using::<S, _>(&expr, index.root(json), &mut |result| {
+                    match result.into_owned::<S>() {
+                        Ok(Some(v)) => out.push(v.to_json()),
+                        Ok(None) => {}
+                        Err(e) => failure = Some(e.is_decode_failure()),
+                    }
+                    out.len() < stop_after
+                });
+            let single =
+                match eval_with_cursor_using::<S, _>(&expr, index.root(json)).into_owned::<S>() {
+                    Ok(v) => format!("{:?}", v.map(|v| v.to_json())),
+                    Err(e) => format!("decode={}", e.is_decode_failure()),
+                };
+            let control = control.map(|c| match c {
+                Control::Error(e) => format!("error decode={}", e.is_decode_failure()),
+                Control::Break(_) => "break".to_owned(),
+                Control::Halt(code) => format!("halt {code}"),
+            });
+            format!("{out:?} {failure:?} {control:?} | {single}")
+        }
+        let documents: [&[u8]; 9] = [
+            b"5",
+            br#""abc""#,
+            b"null",
+            b"true",
+            b"[1,2]",
+            b"{}",
+            br#""\ud800""#,
+            b"1.2.3",
+            b"1e999",
+        ];
+        for literal in [
+            "\"c\"",
+            "1",
+            "null",
+            "false",
+            "-1",
+            "1.000",
+            "100000000000000000000",
+        ] {
+            let constant = format!("try .[] catch {literal}");
+            let evaluated = format!("try .[] catch ({literal} | .)");
+            for json in documents {
+                for stop_after in [1, usize::MAX] {
+                    assert_eq!(
+                        run::<JqSemantics>(json, &constant, stop_after),
+                        run::<JqSemantics>(json, &evaluated, stop_after),
+                        "{constant} on {json:?}, stop after {stop_after}"
+                    );
+                    assert_eq!(
+                        run::<YqSemantics>(json, &constant, stop_after),
+                        run::<YqSemantics>(json, &evaluated, stop_after),
+                        "{constant} on {json:?}, yq, stop after {stop_after}"
+                    );
+                }
+            }
+        }
+        // The shortcut is not a no-op: a catchable scalar answers the literal
+        // without the re-index the evaluated handler pays, on both entries.
+        let reindexes = |filter: &str| {
+            let before = crate::jq::value::reindex_count::get();
+            let answer = run::<JqSemantics>(b"5", filter, usize::MAX);
+            (answer, crate::jq::value::reindex_count::get() - before)
+        };
+        let (answer, constant) = reindexes(r#"try .[] catch "c""#);
+        assert!(answer.contains(r#""\"c\"""#), "{answer}");
+        assert_eq!(constant, 0);
+        assert!(reindexes(r#"try .[] catch ("c" | .)"#).1 > 0);
     }
 
     /// #3477: what the `length` bypass does not answer keeps the bridge, and
