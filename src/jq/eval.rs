@@ -44304,6 +44304,39 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     let head_resolves_to_register =
         register.is_some_and(|reg| resolves_to_register::<S>(head, trackable, reg, frame));
     let bound_is_frozen = head_may_be_frozen(head, snapshot);
+    // #3781: a head this arm cannot place -- not a bare `.`/marker it recognises, not
+    // provably fresh (#3489) -- may still be jq's register itself (`select(true)`,
+    // `first(.)`, `(.|.)`, `limit(1; .)` pass `.` through with its path). jq then
+    // takes the pattern's first step *on* the register and moves it, so a body
+    // that navigates under `try` is refused and yields nothing. This arm saw an
+    // off-register value, took the step's refusal for jq's and retried onto the
+    // next alternative, whose `try .a` resolved as a tracked path:
+    // `del(select(true) as {a:$v0} ?// $v0 | try .a)` wrote `{}` where jq leaves
+    // the document alone. The retry is kept (it is jq's answer whenever the head
+    // really was a copy, and a body without a swallowed error retries in jq too),
+    // but once one rests on that guess a *tracked* output of a later alternative is
+    // refused instead of delivered: a write needs a path, and a retry that yields
+    // none, or only values, says what jq says either way.
+    let head_may_be_register = S::TAG == EvalTag::Jq
+        && !head_resolves_to_register
+        && !matches!(head, Expr::Identity | Expr::TrackedVar(_))
+        && !yields_only_fresh_values(head)
+        // a head that navigates is a navigated source, which `identical`/the walk
+        // already model (`.a as {b:$v0} ?// $v0 | try .a` matches jq)
+        && !fold_source_moves_register(head)
+        && any_subexpr(body, &mut |e| {
+            matches!(e, Expr::Try { .. } | Expr::Optional(_))
+        });
+    let suspect_retry = core::cell::Cell::new(false);
+    let tripped = core::cell::Cell::new(false);
+    let mut guarded = |branch: PathBranch<'a>| -> Demand {
+        if suspect_retry.get() && branch.trackable {
+            tripped.set(true);
+            return Demand::Stop;
+        }
+        sink(branch)
+    };
+    let sink: &mut dyn FnMut(PathBranch<'a>) -> Demand = &mut guarded;
     for bound in &sources {
         // A shape `resolves_to_register` refuses (including one it was
         // never asked about, for `Expr::Identity`/`TrackedVar`) still gets
@@ -44454,6 +44487,11 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                     }
                 },
             );
+            if tripped.get() {
+                return ResolveFlow::Escaped(EvalEscape::Error(
+                    EvalError::invalid_path_expression_guessed(bound),
+                ));
+            }
             match outcome {
                 Some(BranchOutcome::Retry) => continue,
                 Some(BranchOutcome::Return(flow)) => return flow,
@@ -44479,6 +44517,12 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 // #3112).
                 Flow::Escaped(control) => {
                     if walk_escape_retries(&control, is_last, !trackable && !refusal_is_exact) {
+                        // #3781: this retry rests on a guess when the head may be
+                        // jq's register and the pattern's first step could have
+                        // succeeded on it -- see `suspect_retry`.
+                        if head_may_be_register && first_step_can_succeed(pattern, bound) {
+                            suspect_retry.set(true);
+                        }
                         continue;
                     }
                     // #3267: a first-step refusal is of `bound` itself, frozen
@@ -44528,6 +44572,39 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
         None => ResolveFlow::Exhausted,
         Some(control) => ResolveFlow::Escaped(control.into()),
     }
+}
+
+/// Whether an object `pattern` could match `bound` by type, at every level: an object
+/// or `null` allows indexing by string, and a literal key's value (`null` when absent)
+/// is matched against its sub-pattern in turn. When a level cannot, jq's own step is a
+/// real type error (`Cannot index number with string`), so a `?//` retry onto the next
+/// alternative is certain whatever the source was (#3781). A computed key counts as
+/// able to match. An array pattern is left out: the wrong writes found are all object
+/// patterns, and jq's behaviour for an array pattern whose step succeeds is not
+/// captured (the `[$v0]` rows with a swallowed body answer on `main` and in jq alike).
+fn first_step_can_succeed(pattern: &Pattern, bound: &OwnedValue) -> bool {
+    fn matches_by_type(pattern: &Pattern, bound: &OwnedValue) -> bool {
+        match pattern {
+            Pattern::Var(_) => true,
+            Pattern::Object(entries) => {
+                let fields = match bound {
+                    OwnedValue::Object(fields) => Some(fields),
+                    OwnedValue::Null => None,
+                    _ => return false,
+                };
+                entries.iter().all(|entry| match &entry.key {
+                    ObjectKey::Literal(key) => {
+                        let value = fields.and_then(|f| f.get(key.as_str()));
+                        matches_by_type(&entry.pattern, value.unwrap_or(&OwnedValue::Null))
+                    }
+                    _ => true,
+                })
+            }
+            // not modelled: treated as matching, so the caller stays conservative
+            Pattern::Array(_) => true,
+        }
+    }
+    matches!(pattern, Pattern::Object(_)) && matches_by_type(pattern, bound)
 }
 
 /// Splice one branch's bindings into `body` for [`resolve_as_pattern`].
