@@ -10,20 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **jq: a bind or destructuring source that may be the register's own node refuses loudly instead of silently dropping a write under `try`** (#3423).
-  A source jq may pass the register through by pointer, through a head the grammars do not name (`(., 1) | .`, `if c then (., 1) else . end`,
+  A source jq may pass the register through by pointer, through control flow no grammar names (`(., 1) | .`, `if c then (., 1) else . end`,
   `try (., 1) catch 2`, `first($orig)`, `($orig?)`, `label $l | $orig`), was bound by value with no mark (`as $x`) or classified by a head
   grammar that said "not frozen" (`as {a:{b:$q}}`), so the refusal off it read as jq's verdict and a `try` caught it: `del`, `=` and `|=`
   left the document unchanged at exit 0 where jq writes (`del(((., 1) | .) as $x | try $x.a)` on `{"a":{"b":1}}` is `{}` in jq). A source
-  *value-equal to the register* that nothing proves fresh (a literal, a construction, or a `,`/`if`/pipe of them) now refuses as the
-  resolver's guess, uncatchable (exit 5): a destructuring walk stands the loss state in for the known register, a plain bind uses a new
-  non-certifying `Origin::Unproven` marker whose reference states the register lost, and an untracked-entry stage does the same for the
-  register it carries. A fresh value stays exact and catchable, `. as $x`, `first(.)`, `select(...)` and a top-level comma split per leaf
-  still write as jq does, a source that differs from the register by value cannot be it, and a literal or construction is now a
-  transparent leaf (`select(false) // {"a":1}`). The price, in the safe direction: a fresh copy equal to the register that no grammar proves
-  fresh (`(. | tojson | fromjson) as $x | try $x.a`) refuses where jq catches its own refusal. Jq mode only. The bind-origin fuzz gained an
-  `--ambiguous-source-p` family: on seed 7 (3,000 programs) `main` fabricated 5 rows and mismatched 11, the change none; across 16
-  runs of 3,000 programs over every family, and a 60,000-row seeded register sweep, nothing new fabricates or mismatches and the sweep is
-  unchanged, and of the 30 refusals the three source families add 23 are rows `main` answered wrongly (a silent drop or a lost path).
+  that can hand the register back by pointer -- a closed grammar of forwarders (`,`, `if`, `//`, `try`/`?`, `first`/`last`/`limit`/`nth`,
+  `label`, a rebind, `select`, a pipe) over aliasing leaves (`.` and a `$var` marker), `may_alias_register` -- whose output equals the
+  register in hand now refuses as the resolver's guess, uncatchable (exit 5): a destructuring walk stands the loss state in for the known
+  register at a *first-step* refusal whose identity was not proven, and a plain bind uses a new non-certifying `Origin::Unproven` marker
+  that keeps its mark only while its value still equals the register at the use site (`guess_refusal` then reads the mark). A value the
+  source derives or builds (`walk(.)`, `with_entries(.)`, `del(.zz)`, `tojson | fromjson`, a construction, arithmetic) is never the
+  register, so those keep their exact, catchable refusal, `. as $x`, `first(.)`, `select(...)` and a top-level comma split per leaf still
+  write as jq does, and a literal or construction is a transparent leaf of the #3402 witness grammar (`select(false) // {"a":1}`). Jq mode
+  only. Residual, unchanged from before and tracked in #3795: a source whose output is a descendant node the register later
+  moves onto (`((.a // .) as $x | .a | try $x.b) = 9`), a `?//` bare `$x` alternative, a call or fold that forwards its input, a `reduce`/`foreach`
+  element bind, and a register already recorded lost when the bind is made. The first version of this change refused every value-equal
+  copy no grammar proved fresh; review found that it fabricated a write through storage identity for a no-op `del(.[5])`
+  (`(del(.[5]) as $x | try $x[0]) = 9` on `["a"]`), poisoned later re-establishment, and refused read-only `walk(.)` and `with_entries(.)`
+  copies, so it was reworked onto the alias grammar. The bind-origin fuzz gained an `--ambiguous-source-p` family; against a build of
+  `main`, nothing new fabricates or mismatches in any family and the new refusals in it are overwhelmingly rows `main` answered wrongly.
   Pinned by `test_bind_source_that_may_be_the_register_refuses_loudly_3423` and `yq_ambiguous_bind_source_keeps_the_caught_refusal_3423`.
 
 - **jq: `last(f)` keeps the identity of `f`'s last output, so a result that is jq's path register stays one** (#3766, a #3643 follow-up).
