@@ -876,21 +876,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **jq: a fold's `?//` pattern retries when it fails by value, and a guessed refusal is no longer catchable** (#3743).
+- **jq: a fold's `?//` pattern retries when it fails by value** (#3743).
   `reduce . as [$a] ?// $a (0; .)` over the document itself raised "near attempt to access element 0" and did not retry: the walk called the
   refusal a guess (the element equals the register by value, so jq "might" have carried on), but an array pattern's first step can never
   succeed on an object, so jq raises there whether or not the element is the register and `?//` retries. Inside a `try` the refusal ran the
   handler instead, so `path(foreach (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))` lost the reduce's `0` at exit 0. A
   literal-keyed pattern that raises when destructured by value (`pattern_walk_fails_by_value`: `[$a]` over an object, `[[$a]]` over `[1]`) raises in
-  jq whatever the register is, so its refusal is exact. A refusal that is still only a guess (`reduce . as {a:$a} ?// [$a] (0; .)` over a document that
-  has `a`) does not retry and is now uncatchable like every other guess site (ADR-0018 rule 4), so it is loud where it was silently wrong; jq answers
-  those, pinned in `test_fold_pattern_guessed_refusal_is_not_caught_3743`. A pattern with a computed key is not judged (running it would repeat its
-  effects) and keeps its old behaviour, recorded in `docs/compliance/jq/limitations.md`. Against a clean `main` build, the path-register sweep (21 new fold-pattern
-  operands, 80,027 sampled rows) went from 866 `ACCEPT_WRONG` rows to 86 (all of them the computed-key operand, which keeps its old behaviour), and a
-  30,027-row full-grid sample from 30 to 2. It is not regression-free: 797 and 29 rows that matched now refuse, all of them the new fold-pattern
-  operands, where `main` matched only because a wrapper (`try`, `?`) swallowed the walk's guessed refusal or because the guess landed on jq's answer
-  by luck (a `reduce` operand of `and`/`or` states no register, #3646). `scripts/jq-bind-origin-fuzz.py` (6,000 programs stock and 6,000 at
-  `--fold-p 1.0`) showed no fabricated, mismatching or newly refusing rows beyond the baseline's own.
+  jq whatever the register is, so its refusal is now exact and retries. Refusals that remain a guess (`reduce . as {a:$a} ?// [$a] (0; .)` over a
+  document that has `a`) and patterns with a computed key (running the key again would repeat its effects) are unchanged, recorded in
+  `docs/compliance/jq/limitations.md`. The rule can only turn a refusal into a retry, never the reverse: against a clean `main` build the
+  path-register sweep (21 new fold-pattern operands, 80,027 sampled rows, and a 30,027-row full-grid sample) is reported in the pull request, and
+  `scripts/jq-bind-origin-fuzz.py` (6,000 programs stock and 6,000 at `--fold-p 1.0`) showed no fabricated or mismatching rows beyond the baseline's.
 - **jq: a pipe stage reads the backtracked-register verdict of `any`/`all`/`isempty(g)`, on a tracked or an untracked entry** (#3758, #3826, the plain-stage residual of #3757).
   `path(. as $x | any | $x)` on `{"a":false,"b":null}` is `[]` in jq: these builtins are defined over a generator jq backtracks, so when nothing inside
   emitted the register is back where the stage entered. The leaf already stated that per result; `resolve_seq_stage` dropped it, so a `$x` frozen

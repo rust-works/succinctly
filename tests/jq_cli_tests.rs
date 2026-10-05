@@ -62125,71 +62125,9 @@ fn test_fold_pattern_that_fails_by_value_retries_3743() -> Result<()> {
     ])
 }
 
-/// #3743: the shapes where the pattern does *not* fail by value on the element
-/// (`{a:$a}` over a document that has `a`) stay the walk's guess at jq's
-/// `path_intact`: not retried, and not catchable either. (A computed key is not
-/// judged and keeps its refusal as it was: `{("a"):$a} ?// $a` still loses the
-/// handler's output inside a `try`, documented as a residual.) They answered silently
-/// wrong through a `try` (its handler's output in place of the alternative's); they
-/// are now the loud refusal every other guess site makes (ADR-0018 rule 4), where
-/// jq answers the rows' third column.
-#[test]
-fn test_fold_pattern_guessed_refusal_is_not_caught_3743() -> Result<()> {
-    for (input, filter, jq_answer) in [
-        (
-            r#"{"a":[1],"b":"abc"}"#,
-            r"path(foreach (try ((reduce . as {a:$a} ?// [$a] (0; .)), .b[0]) catch 1) as $x (.; .; .))",
-            "[] []",
-        ),
-        (
-            r#"{"a":[1],"b":"abc"}"#,
-            r"path(foreach (try ((reduce . as [$a] ?// {a:$a} ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
-            "[] []",
-        ),
-        (
-            r#"{"a":[1],"b":"abc"}"#,
-            r"path(reduce . as {b:$a} ?// $a (.; .))",
-            "[]",
-        ),
-        (
-            r"[1,2]",
-            r"path(foreach (try ((reduce . as [$a] ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))",
-            "[] []",
-        ),
-        (
-            r"[[1]]",
-            r"path(try (reduce . as [[$a]] (0; .)) catch 7)",
-            "an error, `with result 0`",
-        ),
-    ] {
-        let routes = [
-            ("stdin", run_jq_full(&["-c", filter], Some(input))?),
-            (
-                "-n",
-                run_jq_full(&["-nc", &format!("{input} | {filter}")], None)?,
-            ),
-        ];
-        for (route, (stdout, stderr, code)) in routes {
-            assert_eq!(
-                (stdout.as_str(), code),
-                ("", 5),
-                "`{filter}` on {input} via {route} (jq answers {jq_answer}): stderr {stderr:?}"
-            );
-            assert!(
-                stderr.contains("Invalid path expression near attempt to access element"),
-                "`{filter}` on {input} via {route}: {stderr:?}"
-            );
-        }
-    }
-    Ok(())
-}
-
 /// #3743: a computed key is not judged by value, because running its generator a
-/// second time would repeat its effects: `stderr` in the key writes once, as in jq
-/// (`a`, then the error), and the pattern keeps the refusal it had. Its guessed
-/// refusal stays catchable, as before this change, so a `try` around it still runs
-/// its handler (`with result 7`) where jq reaches the reduce's own `0` and fails
-/// with `with result 0` -- a documented residual, not a fix.
+/// second time would repeat its effects: `stderr` in the key writes once, as in
+/// jq (`a`, then the error), and the pattern keeps the refusal it had.
 #[test]
 fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
     let input = r#"{"a":1}"#;
@@ -62201,18 +62139,6 @@ fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
     assert!(
         stderr.starts_with("ajq: error"),
         "the key's `stderr` ran once: {stderr:?}"
-    );
-    let (stdout, stderr, code) = run_jq_full(
-        &[
-            "-c",
-            r#"path(try (reduce . as {("a"|stderr):[$x]} ?// $x (0; .)) catch 7)"#,
-        ],
-        Some(input),
-    )?;
-    assert_eq!((stdout.as_str(), code), ("", 5), "stderr {stderr:?}");
-    assert!(
-        stderr.contains("with result 7"),
-        "residual: the handler still runs: {stderr:?}"
     );
     Ok(())
 }

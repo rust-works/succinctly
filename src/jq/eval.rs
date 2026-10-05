@@ -45790,6 +45790,14 @@ fn each_fold_bind<S: EvalSemantics>(
 /// does, and `del`/`=` would write through it. That refusal propagates
 /// instead: a refusal where jq might answer, never an answer jq would not
 /// give.
+///
+/// **The one exemption** (#3743): a literal-keyed `pattern` that raises when
+/// destructured by value ([`pattern_walk_fails_by_value`]) raises in jq too, at
+/// the step it fails at or earlier, whatever the register is, so there is no
+/// verdict a lost or equal register could change and its refusal is jq's own.
+/// This is a fold-only rule: [`resolve_as_pattern`] keeps its own
+/// `refusal_is_exact`, so `. as [$a] ?// $a` over the same object still reads the
+/// equal-by-value element as a guess there.
 fn fold_walk_refusal_is_guess<S: EvalSemantics>(
     pattern: &Pattern,
     elem: &FoldSourceValue,
@@ -46311,28 +46319,15 @@ fn settle_fold_alternative<S: EvalSemantics>(
             unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, returned just above (#2872)"
         }
         Flow::Escaped(control) => {
-            let guessed = fold_walk_refusal_is_guess::<S>(pattern, elem, reg);
+            // Asked only of a refusal that could retry: the by-value walk inside
+            // [`fold_walk_refusal_is_guess`] is not free (#3743), and
+            // [`walk_escape_retries`] reads `guessed` for nothing else.
+            let guessed = !is_last
+                && matches!(&control, Control::Error(e) if is_resolver_refusal(e))
+                && fold_walk_refusal_is_guess::<S>(pattern, elem, reg);
             if walk_escape_retries(&control, is_last, guessed) {
                 FoldStepOutcome::Retry
             } else {
-                // #3743: a refusal that is only the walk's guess at jq's
-                // `path_intact` does not retry (jq may find the step intact and
-                // carry on with *this* alternative), and it must not be catchable
-                // either: an enclosing `try` turned it into its handler's output
-                // where jq produced the alternative's own (ADR-0018 rule 4, as
-                // [`guess_refusal`] does at every other site).
-                // A computed key's own errors are not step refusals (the walk
-                // cannot tell them apart), so a pattern with one keeps the error as is.
-                let control = match control {
-                    Control::Error(e)
-                        if guessed
-                            && is_resolver_refusal(&e)
-                            && !pattern_has_computed_key(pattern) =>
-                    {
-                        Control::Error(e.into_guessed_path_refusal())
-                    }
-                    other => other,
-                };
                 FoldStepOutcome::Return(aborted.stop(control))
             }
         }

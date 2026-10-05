@@ -329,6 +329,9 @@ OPERANDS = [
     # retries whether or not the element is the register's node. The contrasts are a
     # source that is not the register (`.a`, a literal), a first step that can succeed
     # (`[$a]` over an array), no alternatives, and a computed key (no kind to judge).
+    # The operands whose pattern succeeds by value (`{a:$a}` over a document with `a`,
+    # `[[$a]]` over `[[1]]`) and the computed-key one are the known-refused class: the
+    # walk's guess still refuses them where jq answers, so a delta there is expected.
     "(reduce . as [$a] ?// $a (0; .))",
     "(reduce . as {a:$a} ?// $a (0; .))",
     "(reduce . as {a:$a} ?// [$a] (0; .))",
