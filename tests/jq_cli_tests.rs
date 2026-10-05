@@ -61859,6 +61859,46 @@ fn test_verdict_stage_on_an_untracked_entry_3826() -> Result<()> {
             "",
             0,
         ),
+        // A result identical by kind (`true`/`false`/`null`) to the carried register is it.
+        (r"true", r"path(1 | isempty(empty))", "[]\n", "", 0),
+        (
+            r"true",
+            r"path(1 | any(empty; .))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (r"true", r"path(1 | all(empty; .))", "[]\n", "", 0),
+        (r"false", r"path(1 | isempty(1))", "[]\n", "", 0),
+        (
+            r"null",
+            r"path(1 | isempty(empty))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"null",
+            r"path(1 | any(empty; .))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"true",
+            r"path(. as $x | 1 | isempty(empty) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"true", r"del(1 | isempty(empty))", "null\n", "", 0),
+        (
+            r"null",
+            r"path(1 | isempty(.[]?))",
+            "",
+            r"Invalid path expression near attempt to iterate through 1",
+            5,
+        ),
     ])
 }
 

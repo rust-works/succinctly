@@ -1210,8 +1210,10 @@ is the revert that established what the other one costs.
      `test_verdict_stage_on_an_untracked_entry_3826`. Shapes that still refuse where jq answers, in the safe
      direction (a sample, not an exhaustive list), pinned by
      `test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`: inside a compound stage (`(any, any)`,
-     `any // 1`, `any? // 1`), which is refused as a whole (#3644), and behind a `def` call or a `reduce`
-     (`def f: any; f | $x`), which state no register. In yq mode `any`/`all` are real yq
+     `any // 1`, `any? // 1`), which is refused as a whole (#3644), behind a `def` call or a `reduce`
+     (`def f: any; f | $x`), which state no register, and on an untracked entry over a generator the allowlist
+     cannot prove leaves the register in place (`1 | isempty(first(2,3))`, `1 | any(first(2,3); .)`: the step
+     states a loss, which the stage does not override). In yq mode `any`/`all` are real yq
      builtins and keep yq's own scalar error (`all only supports arrays, was !!int`); real yq rejects the two-argument
      form outright, so `--jq-extensions` keeps its refusal.
 
