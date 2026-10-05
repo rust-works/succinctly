@@ -93873,6 +93873,23 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
             r#"del(. as $orig | has("k") | try (({a:{b:1}}) as {a:{b:$q}} | $q))"#,
             "{\"a\":{\"b\":1}}\n",
         ),
+        // A pipe or a comma whose every output is a construction is fresh too, though
+        // the value it yields equals the register's.
+        (
+            doc,
+            r"del((.a | {a:{b:1}}) as $x | try $x.a)",
+            "{\"a\":{\"b\":1}}\n",
+        ),
+        (
+            doc,
+            r"del((1 | ({a:{b:1}}, {a:{b:1}})) as $x | try $x.a)",
+            "{\"a\":{\"b\":1}}\n",
+        ),
+        (
+            doc,
+            r#"del(. as $orig | has("k") | try ((.a | {a:{b:1}}) as {a:{b:$q}} | $q))"#,
+            "{\"a\":{\"b\":1}}\n",
+        ),
         (doc, r"del(. as $x | try $x.a)", "{}\n"),
         (doc, r"del(first(.) as $x | try $x.a)", "{}\n"),
         (doc, r"del(select(true) as $x | try $x.a)", "{}\n"),
