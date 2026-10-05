@@ -59128,24 +59128,74 @@ fn test_fold_source_null_bool_document_wellformed_unaffected_2732() -> Result<()
     Ok(())
 }
 
-/// #2732 (Shape 2, known residual): `reduce`'s mid-step register position
-/// is message-only wrong -- see `resolve_reduce`'s own doc comment and
-/// `docs/compliance/jq/limitations.md` for the full mechanism. Exit codes
-/// and values already agree with jq; only the error text differs. Pinned
-/// so a future change to this area notices if the wording either
-/// coincidentally starts matching (worth promoting) or drifts further.
+/// #2732 (Shape 2) closed by #3780: `reduce`'s UPDATE is checked against the
+/// register a navigating SOURCE left, as jq's `gen_reduce` does (no `SUBEXP`
+/// around the source), so the error wording now matches jq 1.7.1 exactly, not
+/// just the exit code. See `docs/compliance/jq/limitations.md`.
 #[test]
-fn test_reduce_mid_step_register_position_is_a_known_message_only_residual_2732() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(
-        &["-c", "path(reduce .[] as $k (.; .a))"],
-        Some(r#"{"a":1}"#),
-    )?;
-    assert_eq!(stdout, "", "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("Invalid path expression with result 1"),
-        "stderr: {stderr:?}"
-    );
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+fn test_reduce_mid_step_register_position_matches_jq_2732_3780() -> Result<()> {
+    for (filter, want) in [
+        (
+            "path(reduce .[] as $k (.; .a))",
+            "Invalid path expression near attempt to access element \"a\" of {\"a\":1}",
+        ),
+        (
+            "path(reduce .[] as $k (.; try .a catch \"x\"))",
+            "Invalid path expression with result \"x\"",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(stdout, "", "{filter}: stderr: {stderr:?}");
+        assert!(stderr.contains(want), "{filter}: stderr: {stderr:?}");
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #3780: a `reduce` whose SOURCE navigates and whose UPDATE navigates the
+/// accumulator before ending on it was accepted as the root, so `del` deleted
+/// the whole document and `=` overwrote it (exit 0) where jq raises on the
+/// navigation. The UPDATE is now checked against the register the source left
+/// (see `test_reduce_mid_step_register_position_matches_jq_2732_3780`), so each
+/// row refuses with jq's message. Rows jq answers are pinned too: a
+/// passthrough UPDATE keeps the accumulator on the register (`[]`), a source
+/// that never navigates leaves it at the root, and `foreach` was already right.
+#[test]
+fn test_reduce_navigating_update_ending_on_the_accumulator_refuses_3780() -> Result<()> {
+    let doc = "{\"a\":true,\"k\":2}\n";
+    let near_k = "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"k\" of {\"a\":true,\"k\":2}\n";
+    let near_zz = "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"zz\" of {\"a\":true,\"k\":2}\n";
+    for (filter, stdout, stderr, code) in [
+        (r"path(reduce .[]? as $k (.; (.k, .)))", "", near_k, 5),
+        (r"del(reduce .[]? as $k (.; (.k, .)))", "", near_k, 5),
+        (r"(reduce .[]? as $k (.; (.k, .))) = 9", "", near_k, 5),
+        (r"(reduce .[]? as $k (.; (.k, .))) |= 9", "", near_k, 5),
+        (r"path(reduce .[]? as $k (.; (.k, .) | .))", "", near_k, 5),
+        (
+            r"path(reduce .[]? as $k (.; ((.k | empty), .)))",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            r"path(reduce .[]? as $k (.; if true then (.k, .) else . end))",
+            "",
+            near_k,
+            5,
+        ),
+        (r"path(reduce .[]? as $k (.; (.k?, .)))", "", near_k, 5),
+        (r"path(reduce .[]? as $k (.; (.zz?, .)))", "", near_zz, 5),
+        (r"path(reduce .[]? as $k (.; .))", "[]\n", "", 0),
+        (r"path(reduce (1,2) as $k (.; (.k, .)))", "[]\n", "", 0),
+        (r"path(foreach .[]? as $k (.; (.k, .)))", "", near_k, 5),
+    ] {
+        let (out, err, got) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), got),
+            (stdout, stderr, code),
+            "{filter}"
+        );
+    }
     Ok(())
 }
 

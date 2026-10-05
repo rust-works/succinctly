@@ -120,6 +120,12 @@ OPERANDS = [
     ".[0:0]?",
     "getpath([\"a\"])",
     "select(true)",
+    # (#3780) a navigation of the accumulator that then hands the accumulator
+    # back: under a navigating `reduce` source jq raises on the navigation, and
+    # the last output (`.`) used to relocate to the root, so `del` deleted the
+    # document. Neither operand was covered before.
+    "(.a, .)",
+    "(.b, .)",
     # cannot navigate / cannot move the register
     "true",
     "null",

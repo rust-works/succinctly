@@ -45897,7 +45897,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     &reg,
                     frame,
                     alternatives,
-                    &mut |_walked, bind| {
+                    &mut |walked, bind| {
                         let substituted = bind.apply(update, WalkOrigins::Drop);
                         // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
                         // (#2161) — `acc_at_register` alone is the previous step's
@@ -45937,6 +45937,48 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                 &acc_snapshot,
                                 S::TAG == EvalTag::Jq,
                             );
+                        // #3780: a source that navigated moved jq's register onto its
+                        // element *before* UPDATE runs (backtracking restores it only after
+                        // the step), so UPDATE's own navigation of the accumulator is checked
+                        // against that element, not the fold's INIT-seeded register. The
+                        // accumulator is at that register only when it is still the element's
+                        // own value (`foreach_step_register`'s verdict, which `resolve_foreach`
+                        // already acts on): `reduce .[]? as $k (.; (.k, .))` on `{"a":true,
+                        // "k":2}` raises in jq, and resolved as trackable here its last output
+                        // (`.`) relocated to the root, so `del` deleted the document and `=`
+                        // overwrote it. Only an UPDATE that can navigate is affected: a
+                        // passthrough (`.`, a literal, `$var`, `select(f)`, a type filter) keeps the accumulator on the
+                        // register it was identical to, which the final check relies on
+                        // (`reduce .a as $k (.; .)` is `[]`). Only the flag UPDATE is
+                        // resolved with changes -- the
+                        // carry-forward below still derives provenance from the persistent
+                        // register, which is what the final emission is checked against. jq
+                        // mode and a bare `$var` only: a destructuring pattern walks its own
+                        // register (`walked`), which this does not touch.
+                        let source_moved = S::TAG == EvalTag::Jq
+                            && walked.is_none()
+                            && !cannot_move_register(&substituted)
+                            && !stage_leaves_register_in_place::<S>(&substituted)
+                            && !leaves_register_in_place::<S>(&substituted)
+                            && match (&elem.register_path, &elem.moved) {
+                                (Some(path), _) => **path != *reg.path,
+                                (None, MovedRegister::At { .. } | MovedRegister::Lost) => true,
+                                (None, MovedRegister::Unmoved) => false,
+                            };
+                        let update_at_register = if source_moved {
+                            foreach_step_register::<S>(
+                                None,
+                                &elem,
+                                &reg,
+                                frame,
+                                acc_effective,
+                                &acc_snapshot,
+                                acc_at_register,
+                            )
+                            .1
+                        } else {
+                            acc_at_register
+                        };
                         let acc_input = acc.take().unwrap_or(OwnedValue::Null);
                         if let Some(control) =
                             charge_alternative_update(&mut budget, &mut ran_update, "reduce")
@@ -45947,7 +45989,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                         match reg.resolve::<S>(
                             &substituted,
                             acc_input,
-                            acc_at_register,
+                            update_at_register,
                             &acc_snapshot,
                             keep,
                         ) {
