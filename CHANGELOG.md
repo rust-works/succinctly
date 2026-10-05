@@ -42,6 +42,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Over 76,000 jq-differential rows (`scripts/jq-alt-passthrough-sweep.py`) no new accept-where-jq-refuses row appears, 817 wrong answers become
   refusals, and 77 rows that matched jq become refusals, all of them a `del`/`=` over a document where the wrong write changes nothing (`{}`,
   `{"a":null}`); recorded in `limitations.md`. Pinned by `test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781`.
+
+- **jq: `limit`/`nth` around `last(f)`, `select(f)` or a type filter keep jq's path register, and an `[E]` collect holds the type filters** (#3767, part 1).
+  jq's `limit(n; E)` and `nth(n; E)` emit `E`'s outputs from inside `E`, like `first(E)`, so the register is wherever `E` left it and
+  the inner stage decides. `path(. as $x | limit(1; last(.a)) | $x)`, `path(. as $x | nth(0; last(.a)) | $x)` and
+  `path(. as $x | 5 | limit(1; select(.)) | $x)` are `[]` in jq (and `del`, `=`, `|=` through such a `$x` write) and refused here,
+  and so did `path(. as $x | 5 | [numbers] | $x)`, because the `[E]` allowlist named `select` but not the nine type filters.
+  `peel_register_transparent` now reads `limit` and `nth` through beside `first`, `?` and `try` with no handler; the count is bound as a
+  subexp, so it moves nothing whatever it navigates. `limit(1; .a)`, `nth(0; .a)` and `first(.a)` still move the register and still
+  refuse, as in jq. Over a 3,150-program grid (15 wrappers x 14 inner stages x 5 contexts x `path`/`=`/`del`) 288 of the 414 rows jq
+  answers and the build refused now agree, with no new accept-where-jq-refuses row; the rest are a `catch` handler and the identity
+  stage under a wrapper (`first(.)`, `limit(1; .)`), which stay refused. It also lifts #3769's `foreach` EXTRACT rows
+  (`.a? | limit(1; last(.a?))`) to jq's own answers (`["a"]` twice, `{"a":9}`). jq mode only (ADR-0018). Still refused where jq answers:
+  a `catch` handler and a compound inner stage, tracked by #3767. Pinned by `test_register_limit_nth_wrappers_and_type_filter_collect_3767`
+  and the stage-rule unit test `type_filters_are_defined_once_and_the_stage_rule_reads_them_3653`; three of #3653's refuse-only rows and
+  #3769's pin moved to jq's answers.
+
 - **jq: a `foreach` whose bound element is an empty array answers that element's path through `$k`** (#3789).
   `path(foreach .a as $k (0; $k; .))` on `{"a":[]}` is `["a"]` in jq and refused here (`Invalid path expression with result []`, exit 5),
   and `(foreach .a as $k (0; $k; .)) = 9`, `|=` and `del(foreach .a as $k (0; try $k; .))` wrote nothing. `$k` is the very node `.a`

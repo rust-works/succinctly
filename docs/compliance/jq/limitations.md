@@ -1279,11 +1279,16 @@ is the revert that established what the other one costs.
    `test_path_register_last_f_wrappers_and_select_keep_it_3653`, with the yq side by
    `yq_last_f_wrappers_and_type_filters_do_not_keep_the_path_register_3653` (real yq rejects
    `last`, `try` and the type filters in its lexer, and answers `select` differently, an older
-   divergence this leaves alone). Still refused where jq answers `[]`
-   ([#3767](https://github.com/rust-works/succinctly/issues/3767)): a `catch` handler (it runs
-   on a caught error's payload), `limit(n; E)` and `nth(n; E)` (wrappers of their own), an
-   `[E]` collect of a type filter, and either stage inside a compound stage (a comma, a `//`, a
-   `def` call), which need the leaf-level verdict for a compound stage described above.
+   divergence this leaves alone). [#3767](https://github.com/rust-works/succinctly/issues/3767)
+   Part 1 reads `limit(n; E)` and `nth(n; E)` through to the stage under them as well (they emit
+   from inside `E` like `first(E)`, so `limit(1; last(.a))` and `5 | nth(0; select(.))` keep the
+   register and `limit(1; .a)` still moves it; the count is a subexp), and lets an `[E]` collect
+   hold a type filter (`[numbers]`, as `[select(.)]` already did), pinned by
+   `test_register_limit_nth_wrappers_and_type_filter_collect_3767`. Still refused where jq
+   answers `[]`: a `catch` handler (it runs on a caught error's payload), either stage inside a
+   compound stage (a comma, a `//`, a `def` call), which need the leaf-level verdict for a
+   compound stage described above, and the identity stage under a wrapper (`first(.)`,
+   `limit(1; .)`), which jq leaves in place and the allowlist does not read through.
    `select` hands its input through as the very value it received, so a `$x` that reaches it
    keeps its identity, and so does `last(f)`'s result, which is the very value `f` last
    emitted ([#3766](https://github.com/rust-works/succinctly/issues/3766)): a `last` whose
