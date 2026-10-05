@@ -44851,6 +44851,8 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 Return(ResolveFlow),
             }
             let mut outcome: Option<BranchOutcome> = None;
+            // #3843: the retry generation `outcome` was recorded at.
+            let mut outcome_at = 0u64;
             // #2872: one body run per branch of the walk, as it completes --
             // a computed key's outputs branch the register, and the `?//`
             // rules below apply per branch, partway through the stream:
@@ -44863,6 +44865,17 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 frame,
                 invert_dedup,
                 &mut |reg, bindings| {
+                    // #3843: a re-invocation after a stop is a `?//` retry inside a
+                    // computed key, which supersedes what the retried-past branch
+                    // decided -- except a `halt` or decode failure, which no retry
+                    // passes: that stop is final, so no further body runs past it.
+                    if matches!(
+                        &outcome,
+                        Some(BranchOutcome::Return(flow)) if flow.is_nonretryable()
+                    ) {
+                        return Demand::Stop;
+                    }
+                    outcome = None;
                     let substituted = bind_pattern_body(
                         source,
                         body,
@@ -44937,6 +44950,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                     match flow {
                         ResolveFlow::Exhausted => Demand::Continue,
                         ResolveFlow::Stopped => {
+                            outcome_at = pipe_retry_generation();
                             outcome = Some(if is_retryable_stop(is_last) {
                                 BranchOutcome::Retry
                             } else {
@@ -44945,6 +44959,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                             Demand::Stop
                         }
                         ResolveFlow::Escaped(escape) => {
+                            outcome_at = pipe_retry_generation();
                             outcome = Some(if path_alternative_retries(&escape, is_last) {
                                 BranchOutcome::Retry
                             } else {
@@ -44959,6 +44974,18 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 return ResolveFlow::Escaped(EvalEscape::Error(
                     EvalError::invalid_path_expression_guessed(bound),
                 ));
+            }
+            // #3843: a `?//` inside a computed key that retried past the stop which
+            // recorded `outcome`, and produced nothing or raised, never re-entered
+            // the sink to reset it; the walk's own verdict stands then. A `halt` or
+            // decode failure is never retried past, so it is kept. Without std there
+            // is no retry generation, so only the reset above is in force there.
+            let nonretryable = matches!(
+                &outcome,
+                Some(BranchOutcome::Return(flow)) if flow.is_nonretryable()
+            );
+            if outcome.is_some() && !nonretryable && retry_superseded(&walk, outcome_at, false) {
+                outcome = None;
             }
             match outcome {
                 Some(BranchOutcome::Retry) => continue,
