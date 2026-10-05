@@ -30567,9 +30567,13 @@ fn eval_owned_identity_try<S: EvalSemantics, V: DocumentValue>(
 /// (`false` for `any`, `true` for `all`); a `cond` escape before any
 /// decision is reported after nothing (no output was produced), and one
 /// after the decision never runs, since the probe stopped. There is no
-/// `?//` retry inside this pipe (`owned_identity_pipe_supported` admits a
-/// single pattern only), so the per-attempt `probe_escape` channel the
-/// sink twins carry collapses to a plain escape here.
+/// `?//` retry *written as a pattern stage* inside this pipe
+/// (`owned_identity_pipe_supported` admits a single pattern only), but that
+/// is not the only way to reach a retry: a `?//` inside a ruled stage in
+/// `gen`, or inside an `if` condition in `gen`, still re-invokes the closure
+/// below, and `probe_escape`, `rest_flow` and `decided` are then stale (the
+/// #3517 audit, tracked in #3805). The per-attempt channel the sink twins
+/// carry does not collapse to a plain escape here.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: the pipe's own stage/rest/value/id/tail list
 fn eval_owned_identity_any_all<S: EvalSemantics, V: DocumentValue>(
     gen: &Expr,

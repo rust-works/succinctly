@@ -196,11 +196,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   register to be at the root. The branch now keeps its path and the fold refuses loudly, as the same pipe already does
   outside a fold; jq answers these rows, so the refusal is a guess and no `try` turns it into a dropped write. A fold that
   never navigated still answers `[]`. Pinned by `test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769`.
+
 - **jq: a `?//` collapse inside a `|=` through a front-anchored slice (`.[0:2][] |= f`) no longer aborts to `null`** (#3756).
   `[5,6,7] | .[0:2][] |= (if . == 5 then (1 as $x ?// $y | select($y == null) | $x) else 7 end)` is `[7]` in jq and
   was `null` here: #3747's per-path write declined any path with a slice component. A slice that starts at the front with
   no bound counted from the back is now spelled out as plain indexes. A slice jq resolves against the state the write
-  has reached (a start past the front, a negative bound) keeps its old route.
+  has reached (a start past the front, a negative bound) keeps its old route, as does a bound that is not a plain
+  integer literal (`.[null:2][]`, `.[0:2.7][]`), which parses as a computed slice.
+  Pinned by `test_update_collapse_through_front_slice_matches_jq_3756` and
+  `test_update_collapse_through_unspellable_slice_declines_3756`.
+
 - **jq: a `foreach` UPDATE or EXTRACT that is a `try` around a chain with a generator no longer silently skips a write** (#3738).
   `del(foreach .x as $w (0; try ($w | .a[]); .))` on `{"a":[{"b":1}],"x":{"a":[{"b":1}]}}` is `{"a":[{"b":1}],"x":{"a":[]}}`
   in jq and echoed the document unchanged here (exit 0), and `(...) = 9` and `|= 9` skipped the write the same way;
