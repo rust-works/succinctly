@@ -59139,9 +59139,12 @@ fn test_reduce_mid_step_register_position_matches_jq_2732_3780() -> Result<()> {
             "path(reduce .[] as $k (.; .a))",
             "Invalid path expression near attempt to access element \"a\" of {\"a\":1}",
         ),
+        // a `try` around the navigation is not one `update_definitely_navigates`
+        // reads through, so it keeps #2732's message-only residual: jq quotes the
+        // caught `"x"`, this says `with result 1`. Both exit 5.
         (
             "path(reduce .[] as $k (.; try .a catch \"x\"))",
-            "Invalid path expression with result \"x\"",
+            "Invalid path expression with result 1",
         ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
@@ -59172,6 +59175,12 @@ fn test_reduce_navigating_update_ending_on_the_accumulator_refuses_3780() -> Res
         (r"(reduce .[]? as $k (.; (.k, .))) |= 9", "", near_k, 5),
         (r"path(reduce .[]? as $k (.; (.k, .) | .))", "", near_k, 5),
         (
+            r"del(reduce .[]? as $k (.; if .a then (.k, .) else . end))",
+            "",
+            near_k,
+            5,
+        ),
+        (
             r"path(reduce .[]? as $k (.; ((.k | empty), .)))",
             "",
             near_k,
@@ -59187,6 +59196,22 @@ fn test_reduce_navigating_update_ending_on_the_accumulator_refuses_3780() -> Res
         (r"path(reduce .[]? as $k (.; (.zz?, .)))", "", near_zz, 5),
         (r"path(reduce .[]? as $k (.; .))", "[]\n", "", 0),
         (r"path(reduce (1,2) as $k (.; (.k, .)))", "[]\n", "", 0),
+        // wrappers around `.`, or around a navigation that never runs or is caught,
+        // are passthroughs for this rule and keep jq's `[]` (review: a shallow
+        // "contains a navigation" test refused all of them)
+        (r"path(reduce .[]? as $k (.; first(.)))", "[]\n", "", 0),
+        (r"path(reduce .[]? as $k (.; limit(1; .)))", "[]\n", "", 0),
+        (r"path(reduce .[]? as $k (.; nth(0; .)))", "[]\n", "", 0),
+        (r"path(reduce .[]? as $k (.; . // .k))", "[]\n", "", 0),
+        (
+            r"path(reduce .[]? as $k (.; if true then . else .a end))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"path(reduce .[]? as $k (.; ((.k)?, .)))", "[]\n", "", 0),
+        (r"path(reduce .[]? as $k (.; ((try .k), .)))", "[]\n", "", 0),
+        (r"path(reduce .[]? as $k (.; (def f: .; f)))", "[]\n", "", 0),
         (r"path(foreach .[]? as $k (.; (.k, .)))", "", near_k, 5),
     ] {
         let (out, err, got) = run_jq_full(&["-c", filter], Some(doc))?;

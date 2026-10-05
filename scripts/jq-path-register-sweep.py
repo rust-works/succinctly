@@ -126,6 +126,13 @@ OPERANDS = [
     # document. Neither operand was covered before.
     "(.a, .)",
     "(.b, .)",
+    # ... and the wrappers around `.` that must NOT be refused for it: jq answers
+    # `[]` for each (review of #3780: a "contains a navigation" test refused them)
+    "first(.)",
+    "limit(1; .)",
+    "(. // .a)",
+    "((.a)?, .)",
+    "if true then . else .a end",
     # cannot navigate / cannot move the register
     "true",
     "null",

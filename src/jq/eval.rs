@@ -45582,6 +45582,44 @@ fn foreach_step_register<S: EvalSemantics>(
     }
 }
 
+/// Whether a `reduce` UPDATE navigates the accumulator itself on a path that always
+/// runs (#3780): a bare navigation (`.k`, `.[]?`, `.[0]`), a `,` with such an output,
+/// a `|` whose first stage is one, parentheses, or an `if` whose literal condition
+/// picks a branch that is (a computed condition counts when either branch does).
+/// Everything else answers `false` -- including every wrapper that merely *contains*
+/// a navigation (`first(.k)`, `. // .k`, a `try`) -- so those keep the persistent register and their
+/// existing verdict, which matches jq for the passthrough forms (`first(.)`,
+/// `limit(1; .)`, `. // .k`, `((.k)?, .)` are all `[]` in jq). A shallow, conservative
+/// rule on purpose: the cost of a miss is the old behaviour, never a new refusal.
+fn update_definitely_navigates(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => update_definitely_navigates(inner),
+        Expr::Pipe(stages) => stages.first().is_some_and(update_definitely_navigates),
+        Expr::Comma(items) => items.iter().any(update_definitely_navigates),
+        Expr::Optional(inner) if is_postfix_optional_primitive(inner) => {
+            update_definitely_navigates(inner)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => match unwrap_paren(cond) {
+            Expr::Literal(Literal::Bool(true)) => update_definitely_navigates(then_branch),
+            Expr::Literal(Literal::Bool(false) | Literal::Null) => {
+                update_definitely_navigates(else_branch)
+            }
+            // A computed condition: either branch may run, and refusing a passthrough
+            // whose navigating branch is not taken is the safe direction, where
+            // accepting the root for one that is taken deletes the document
+            // (`if .a then (.k, .) else . end`).
+            _ => {
+                update_definitely_navigates(then_branch) || update_definitely_navigates(else_branch)
+            }
+        },
+        other => is_fold_source_navigation(other),
+    }
+}
+
 /// Whether `reduce`'s accumulator is at jq's register for this step's UPDATE (#3780).
 ///
 /// A source that navigated -- or a destructuring pattern, which walks its own
@@ -45591,10 +45629,12 @@ fn foreach_step_register<S: EvalSemantics>(
 /// only when it is still the element's own value ([`foreach_step_register`]'s
 /// verdict). `reduce .[]? as $k (.; (.k, .))` on `{"a":true,"k":2}` raises in jq;
 /// resolved as trackable, its last output (`.`) relocated to the root and `del`
-/// deleted the document. `update_navigates` is false for a passthrough UPDATE
-/// (`.`, a literal, `$var`, `select(f)`, a type filter), which keeps `persistent`
-/// -- the flag the final re-entry check relies on (`reduce .a as $k (.; .)` is
-/// `[]`). jq mode only: `update_navigates` carries the gate.
+/// deleted the document. `update_navigates` ([`update_definitely_navigates`]) is
+/// false for every UPDATE that does not provably navigate the accumulator on a path
+/// that always runs -- `.`, a literal, `$var`, `first(.)`, `. // .k`, a `try` -- and
+/// those keep `persistent`, the flag the final re-entry check relies on
+/// (`reduce .a as $k (.; .)` is `[]`). jq mode only: `update_navigates` carries the
+/// gate.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `foreach_step_register`'s ambient
 fn reduce_update_at_register<S: EvalSemantics>(
     update_navigates: bool,
@@ -45606,13 +45646,16 @@ fn reduce_update_at_register<S: EvalSemantics>(
     acc_snapshot: &Snapshot,
     persistent: bool,
 ) -> bool {
+    if !update_navigates {
+        return persistent;
+    }
     let moved = walked.is_some()
         || match (&elem.register_path, &elem.moved) {
             (Some(path), _) => **path != *reg.path,
             (None, MovedRegister::At { .. } | MovedRegister::Lost) => true,
             (None, MovedRegister::Unmoved) => false,
         };
-    if !update_navigates || !moved {
+    if !moved {
         return persistent;
     }
     // `&&`, never a replacement: the per-step verdict may only *narrow* what the
@@ -45721,12 +45764,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         && trackable
         && reduce_cannot_move_register(patterns, input, init, update);
     let slice_ok = fold_slice_ok(patterns, input);
-    // #3780: whether UPDATE can move jq's register at all -- syntactic, so decided
-    // once, not per source element ([`reduce_update_at_register`]).
-    let update_navigates = S::TAG == EvalTag::Jq
-        && !cannot_move_register(update)
-        && !stage_leaves_register_in_place::<S>(update)
-        && !leaves_register_in_place::<S>(update);
+    // #3780: whether UPDATE navigates the accumulator on a path that always runs --
+    // syntactic, so decided once, not per source element
+    // ([`reduce_update_at_register`]).
+    let update_navigates = S::TAG == EvalTag::Jq && update_definitely_navigates(update);
     // INIT resolved first, before SOURCE (#2031, reordered from the
     // original #1467/#1872 shape): confirmed live against jq 1.7.1 (via
     // `debug`-instrumented INIT/SOURCE/UPDATE clauses) that real jq

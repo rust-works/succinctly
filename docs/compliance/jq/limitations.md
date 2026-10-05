@@ -2985,8 +2985,17 @@ answers `["b"]` — and classified the two residuals appended below):
   `del(reduce .[]? as $k (.; (.k, .)))` refuses where it used to delete the document).
   `resolve_reduce` therefore resolves such an UPDATE with the accumulator's at-register flag
   recomputed from the element (`foreach_step_register`'s verdict, jq mode, bare `$var` only).
-  An UPDATE that cannot navigate (`.`, a literal, `$var`, arithmetic: `cannot_move_register`)
-  keeps the persistent register, which is what the *final* re-entry check needs
+  Only an UPDATE that provably navigates the accumulator on a path that always runs
+  (`update_definitely_navigates`: a bare navigation, a `,`/`|` with one, an `if` whose
+  literal condition picks one, or whose computed condition has one in either branch) is
+  affected. Everything else -- `.`, a literal, `$var`, and every wrapper that merely contains a
+  navigation (`first(.)`, `. // .k`, a `try`) -- keeps the persistent register, so those forms
+  keep their answers (and, for a `try` around the navigation, #2732's wording: `path(reduce .[]
+  as $k (.; try .a catch "x"))` on `{"a":1}` is jq's `with result "x"` and this `with result 1`,
+  both exit 5). Two consequences, both recorded rather than fixed: a navigating wrapper
+  whose navigation does run (`first((.k, .))`) keeps the old verdict, and an `if` over a computed condition refuses when only its *untaken* branch
+  navigates, where jq answers `[]`. The persistent register is what the *final* re-entry check
+  needs
   (`path(reduce (.[]) as $k (.; .))` on `{"a":[1,2]}` is `[]` in both, jq's own
   path-restoring `FORK`/`BACKTRACK` at the exit boundary). A destructuring pattern walks its
   own register, whose at-register flag is read the same way. Only the *flag* is per-step:
