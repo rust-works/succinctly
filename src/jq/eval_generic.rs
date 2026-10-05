@@ -7174,8 +7174,9 @@ pub(crate) enum AnchorScope {
 /// evaluation (#3702).
 ///
 /// `cursor_slot` finds where a node sits in its parent by scanning the
-/// parent's members, so the slot of the `i`th element of an array costs
-/// `O(i)`. A pipe that reads a position at every element of one fan-out
+/// parent's members, so the slot of the `i`th element of an array, or the
+/// `i`th member of an object, costs `O(i)`. A pipe that reads a position at
+/// every element of one fan-out
 /// (`.[] | ... | [key]`) asks for the elements in document order, and the
 /// scans summed over `n` of them are `O(n^2)`. Remembering where the last
 /// scan of a wide parent stopped lets the next one start there, and answers
@@ -7207,6 +7208,9 @@ mod slot_memo {
         index: i64,
         /// The node id of the element after it, if there is one.
         next: Option<usize>,
+        /// A mapping's members, not a sequence's elements: `last` and `next`
+        /// are the ids of member *values*, and `index` is unused.
+        members: bool,
     }
 
     struct State {
@@ -7286,7 +7290,11 @@ mod slot_memo {
 
     /// The element of `parent` the last scan found -- its node id and index --
     /// when `target` comes after it.
-    pub(crate) fn resume(document: usize, parent: usize, target: usize) -> Option<(usize, i64)> {
+    pub(crate) fn resume(
+        document: usize,
+        parent: usize,
+        target: usize,
+    ) -> Option<(usize, i64, bool)> {
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
             let state = m.as_mut().filter(|s| s.document == document)?;
@@ -7295,7 +7303,7 @@ mod slot_memo {
                 .iter()
                 .position(|s| s.parent == parent && s.last < target)?;
             let scan = state.scans.remove(at);
-            let found = (scan.last, scan.index);
+            let found = (scan.last, scan.index, scan.members);
             state.scans.push(scan);
             Some(found)
         })
@@ -7306,16 +7314,14 @@ mod slot_memo {
     /// `f` must not call back into this module.
     pub(crate) fn find<R>(
         document: usize,
-        mut f: impl FnMut(usize, usize, i64, Option<usize>) -> Option<R>,
+        mut f: impl FnMut(usize, usize, i64, Option<usize>, bool) -> Option<R>,
     ) -> Option<R> {
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
             let state = m.as_mut().filter(|s| s.document == document)?;
-            let (at, found) = state
-                .scans
-                .iter()
-                .enumerate()
-                .find_map(|(at, s)| f(s.parent, s.last, s.index, s.next).map(|r| (at, r)))?;
+            let (at, found) = state.scans.iter().enumerate().find_map(|(at, s)| {
+                f(s.parent, s.last, s.index, s.next, s.members).map(|r| (at, r))
+            })?;
             let scan = state.scans.remove(at);
             state.scans.push(scan);
             Some(found)
@@ -7328,6 +7334,7 @@ mod slot_memo {
         last: usize,
         index: i64,
         next: Option<usize>,
+        members: bool,
     ) {
         MEMO.with(|m| {
             let mut m = m.borrow_mut();
@@ -7344,6 +7351,7 @@ mod slot_memo {
                 last,
                 index,
                 next,
+                members,
             });
         });
     }
@@ -7359,13 +7367,17 @@ mod slot_memo {
         Guard
     }
 
-    pub(crate) fn resume(_document: usize, _parent: usize, _target: usize) -> Option<(usize, i64)> {
+    pub(crate) fn resume(
+        _document: usize,
+        _parent: usize,
+        _target: usize,
+    ) -> Option<(usize, i64, bool)> {
         None
     }
 
     pub(crate) fn find<R>(
         _document: usize,
-        _f: impl FnMut(usize, usize, i64, Option<usize>) -> Option<R>,
+        _f: impl FnMut(usize, usize, i64, Option<usize>, bool) -> Option<R>,
     ) -> Option<R> {
         None
     }
@@ -7376,6 +7388,7 @@ mod slot_memo {
         _last: usize,
         _index: i64,
         _next: Option<usize>,
+        _members: bool,
     ) {
     }
 
@@ -24012,18 +24025,36 @@ fn cursor_slot<C: DocumentCursor>(c: &C) -> Result<Option<CursorSlot<C>>, EvalEr
 fn cursor_parent_and_slot<C: DocumentCursor>(
     c: &C,
 ) -> Result<Option<(C, CursorSlot<C>)>, EvalError> {
-    if let Some((parent_id, index, advanced)) = remembered_neighbour(c) {
+    if let Some((parent_id, index, advanced, members)) = remembered_neighbour(c) {
         if let Some(parent) = c.at_node_id(parent_id) {
-            if advanced {
-                slot_memo::remember(
-                    c.document_token(),
-                    parent_id,
-                    c.node_id(),
-                    index,
-                    c.next_element().map(|n| n.node_id()),
-                );
+            if members {
+                // A member value read again, or the one after the remembered
+                // member's. A key that does not decode is left to the scan,
+                // which names the malformed member.
+                if let Some(slot) = c.prev_sibling().and_then(|k| member_slot(k, true)) {
+                    if advanced {
+                        remember_member(c.document_token(), parent_id, c);
+                    }
+                    return Ok(Some((parent, slot)));
+                }
+            } else {
+                if advanced {
+                    slot_memo::remember(
+                        c.document_token(),
+                        parent_id,
+                        c.node_id(),
+                        index,
+                        c.next_element().map(|n| n.node_id()),
+                        false,
+                    );
+                }
+                return Ok(Some((parent, CursorSlot::Element(index))));
             }
-            return Ok(Some((parent, CursorSlot::Element(index))));
+        }
+    }
+    if let Some(parent_id) = remembered_member_key(c) {
+        if let (Some(parent), Some(slot)) = (c.at_node_id(parent_id), member_slot(*c, false)) {
+            return Ok(Some((parent, slot)));
         }
     }
     let Some(parent) = c.document_parent() else {
@@ -24036,6 +24067,9 @@ fn cursor_parent_and_slot<C: DocumentCursor>(
 fn scan_for_slot<C: DocumentCursor>(c: &C, parent: &C) -> Result<Option<CursorSlot<C>>, EvalError> {
     let parent_value = parent.value();
     if let Some(fields) = parent_value.as_object() {
+        if C::RESUMABLE_ELEMENT_SCAN {
+            return member_slot_resumable(c, parent, &fields);
+        }
         let mut f = fields.clone();
         while let Some((field, rest)) = f.uncons() {
             let is_value = field.value_cursor.same_node(c);
@@ -24078,25 +24112,27 @@ fn scan_for_slot<C: DocumentCursor>(c: &C, parent: &C) -> Result<Option<CursorSl
 /// An array scan shorter than this is cheaper to redo than to remember.
 const SLOT_MEMO_MIN_SCAN: i64 = 32;
 
-/// The parent's node id and the index of `c`, and whether `c` is a new element
-/// rather than the remembered one itself, when `c` is a remembered element or
-/// the one right after it ([`slot_memo`], #3702): a fan-out reading each
+/// The parent's node id and the index of `c`, whether `c` is a new element
+/// rather than the remembered one itself, and whether the parent is a mapping
+/// (then `c` is a member *value* and the index is unused), when `c` is a
+/// remembered element or the one right after it ([`slot_memo`], #3702,
+/// #3839): a fan-out reading each
 /// element in turn finds every one after the first this way, with no scan and
 /// no `document_parent` -- `enclose` is a backward scan of the balanced
 /// parentheses, `O(distance to the parent's open)`, so for the `i`th element
 /// of a wide array it is `O(i)` as well. Integer comparisons only: each
 /// remembered scan carries the node id of the element after its last.
-fn remembered_neighbour<C: DocumentCursor>(c: &C) -> Option<(usize, i64, bool)> {
+fn remembered_neighbour<C: DocumentCursor>(c: &C) -> Option<(usize, i64, bool, bool)> {
     if !C::RESUMABLE_ELEMENT_SCAN {
         return None;
     }
     let id = c.node_id();
-    let found = slot_memo::find(c.document_token(), |parent, last, index, next| {
+    let found = slot_memo::find(c.document_token(), |parent, last, index, next, members| {
         if id == last {
             // The same element read again (`key`, then `path`, at one position).
-            Some((parent, index, false))
+            Some((parent, index, false, members))
         } else if next == Some(id) {
-            Some((parent, index + 1, true))
+            Some((parent, index + 1, true, members))
         } else {
             None
         }
@@ -24124,7 +24160,7 @@ fn element_slot_resumable<C: DocumentCursor>(
 ) -> Option<CursorSlot<C>> {
     let document = c.document_token();
     let parent_id = parent.node_id();
-    if let Some((last, index)) = slot_memo::resume(document, parent_id, c.node_id()) {
+    if let Some((last, index, false)) = slot_memo::resume(document, parent_id, c.node_id()) {
         let mut cursor = c.at_node_id(last).and_then(|l| l.next_element());
         let mut at = index + 1;
         while let Some(elem) = cursor {
@@ -24142,6 +24178,7 @@ fn element_slot_resumable<C: DocumentCursor>(
                     elem.node_id(),
                     at,
                     next.map(|n| n.node_id()),
+                    false,
                 );
                 return Some(CursorSlot::Element(at));
             }
@@ -24161,6 +24198,7 @@ fn element_slot_resumable<C: DocumentCursor>(
                     elem.node_id(),
                     index,
                     elem.next_element().map(|n| n.node_id()),
+                    false,
                 );
             }
             return Some(CursorSlot::Element(index));
@@ -24169,6 +24207,112 @@ fn element_slot_resumable<C: DocumentCursor>(
         e = rest;
     }
     None
+}
+
+/// The slot of the member whose key node is `key_cursor` -- of its value when
+/// `is_value`, of the key node itself otherwise -- or `None` when the key does
+/// not decode (a scan then names the malformed member).
+fn member_slot<C: DocumentCursor>(key_cursor: C, is_value: bool) -> Option<CursorSlot<C>> {
+    let key_value = key_cursor.value();
+    let key = OwnedValue::String(key_display_string(&key_value)?.into_owned().into());
+    Some(if is_value {
+        CursorSlot::Value { key, key_cursor }
+    } else {
+        CursorSlot::Key(key)
+    })
+}
+
+/// The node id of the value of the member after the one whose value is `c`.
+fn next_member_value_id<C: DocumentCursor>(c: &C) -> Option<usize> {
+    Some(c.next_element()?.next_element()?.node_id())
+}
+
+/// Remember that a scan of `parent_id`'s members last found the member whose
+/// value is `value_cursor`.
+fn remember_member<C: DocumentCursor>(document: usize, parent_id: usize, value_cursor: &C) {
+    slot_memo::remember(
+        document,
+        parent_id,
+        value_cursor.node_id(),
+        0,
+        next_member_value_id(value_cursor),
+        true,
+    );
+}
+
+/// The parent's node id, when `c` is the key node of the member whose value a
+/// scan last found (#3839): a key read right after its member's value is not
+/// before-or-after the remembered value in the sense `resume` wants, so it
+/// would otherwise rescan from the first member.
+fn remembered_member_key<C: DocumentCursor>(c: &C) -> Option<usize> {
+    if !C::RESUMABLE_ELEMENT_SCAN {
+        return None;
+    }
+    let id = c.node_id();
+    slot_memo::find(c.document_token(), |parent, last, _, _, members| {
+        // Only a key node sits before the remembered value it belongs to.
+        if members && id < last && c.next_element()?.node_id() == last {
+            Some(parent)
+        } else {
+            None
+        }
+    })
+}
+
+/// [`scan_for_slot`]'s object arm for a format whose members are the
+/// [`next_element`](DocumentCursor::next_element) chain of key, value, key,
+/// value: where `c` -- a member's value or its key node -- sits, resuming
+/// after the member the last scan of `parent` found when [`slot_memo`] holds
+/// one before `c`, and remembering where this scan ends (#3839). `all` is the
+/// parent's whole field list, which names the malformed member an undecodable
+/// key reports. A resume that finds nothing falls back to the scan from the
+/// first member, so the answer is the full scan's either way.
+fn member_slot_resumable<C: DocumentCursor>(
+    c: &C,
+    parent: &C,
+    all: &<C::Value as DocumentValue>::Fields,
+) -> Result<Option<CursorSlot<C>>, EvalError> {
+    let document = c.document_token();
+    let parent_id = parent.node_id();
+    let target = c.node_id();
+    let slot_of = |key_cursor: C, is_value: bool| -> Result<CursorSlot<C>, EvalError> {
+        member_slot(key_cursor, is_value).ok_or_else(|| all.malformed_member_error())
+    };
+    if let Some((last, _, true)) = slot_memo::resume(document, parent_id, target) {
+        let mut key_cursor = c.at_node_id(last).and_then(|v| v.next_element());
+        while let Some(kc) = key_cursor {
+            slot_memo::note_scanned();
+            // Node ids follow document order: past `c`, it is not here, and
+            // the scan from the first member decides whether it is anywhere.
+            if kc.node_id() > target {
+                break;
+            }
+            // A key with no value after it ends the list, as in the full scan.
+            let Some(vc) = kc.next_element() else { break };
+            let is_value = vc.same_node(c);
+            if is_value || kc.same_node(c) {
+                let slot = slot_of(kc, is_value)?;
+                remember_member(document, parent_id, &vc);
+                return Ok(Some(slot));
+            }
+            key_cursor = vc.next_element();
+        }
+    }
+    let mut scanned = 0i64;
+    let mut f = all.clone();
+    while let Some((field, rest)) = f.uncons() {
+        slot_memo::note_scanned();
+        let is_value = field.value_cursor.same_node(c);
+        if is_value || field.key_cursor.same_node(c) {
+            if scanned >= SLOT_MEMO_MIN_SCAN {
+                remember_member(document, parent_id, &field.value_cursor);
+            }
+            return Ok(Some(slot_of(field.key_cursor, is_value)?));
+        }
+        scanned += 1;
+        f = rest;
+    }
+    Ok(None)
 }
 
 /// The key node `key` emits for the member value `c` -- its previous sibling
@@ -45926,11 +46070,11 @@ mod tests {
     fn test_slot_memo_drops_the_least_recently_used_parent_3702() {
         let _scope = slot_memo::enter(1);
         for parent in 1..=4 {
-            slot_memo::remember(1, parent, 100 * parent, 7, None);
+            slot_memo::remember(1, parent, 100 * parent, 7, None, false);
         }
         // A read of parent 1 makes parent 2 the least recently used.
-        assert_eq!(slot_memo::resume(1, 1, 10_000), Some((100, 7)));
-        slot_memo::remember(1, 5, 500, 7, None);
+        assert_eq!(slot_memo::resume(1, 1, 10_000), Some((100, 7, false)));
+        slot_memo::remember(1, 5, 500, 7, None, false);
         assert_eq!(slot_memo::resume(1, 2, 10_000), None, "least recently used");
         // Order is now 3, 4, 1, 5 (every `resume` above moved its parent to
         // the back; look at them in that order again). A `find` is a use too.
@@ -45941,8 +46085,8 @@ mod tests {
             );
         }
         // Order: 3, 4, 1, 5. Reading 3 through `find` makes 4 the oldest.
-        assert!(slot_memo::find(1, |parent, _, _, _| (parent == 3).then_some(())).is_some());
-        slot_memo::remember(1, 6, 600, 7, None);
+        assert!(slot_memo::find(1, |parent, _, _, _, _| (parent == 3).then_some(())).is_some());
+        slot_memo::remember(1, 6, 600, 7, None, false);
         assert_eq!(slot_memo::resume(1, 4, 10_000), None, "least recently used");
         for parent in [1, 3, 5, 6] {
             assert!(
@@ -45951,8 +46095,8 @@ mod tests {
             );
         }
         // Remembering a parent again replaces its entry rather than adding one.
-        slot_memo::remember(1, 3, 333, 9, None);
-        assert_eq!(slot_memo::resume(1, 3, 10_000), Some((333, 9)));
+        slot_memo::remember(1, 3, 333, 9, None, false);
+        assert_eq!(slot_memo::resume(1, 3, 10_000), Some((333, 9, false)));
         // An element after the target is not a place to resume from.
         assert_eq!(slot_memo::resume(1, 3, 300), None);
     }
@@ -45964,23 +46108,23 @@ mod tests {
     #[test]
     fn test_slot_memo_scopes_nest_per_document_3702() {
         let _outer = slot_memo::enter(1);
-        slot_memo::remember(1, 7, 70, 3, Some(71));
+        slot_memo::remember(1, 7, 70, 3, Some(71), false);
         {
             let _inner = slot_memo::enter(2);
             assert_eq!(slot_memo::resume(1, 7, 1_000), None, "another document");
-            slot_memo::remember(2, 9, 90, 5, None);
-            assert_eq!(slot_memo::resume(2, 9, 1_000), Some((90, 5)));
+            slot_memo::remember(2, 9, 90, 5, None, false);
+            assert_eq!(slot_memo::resume(2, 9, 1_000), Some((90, 5, false)));
             // The same document again is the scope already open.
             let _same = slot_memo::enter(2);
         }
-        assert_eq!(slot_memo::resume(1, 7, 1_000), Some((70, 3)));
+        assert_eq!(slot_memo::resume(1, 7, 1_000), Some((70, 3, false)));
         assert_eq!(
             slot_memo::resume(2, 9, 1_000),
             None,
             "dropped with its scope"
         );
         assert_eq!(
-            slot_memo::find(1, |parent, last, index, next| (parent == 7)
+            slot_memo::find(1, |parent, last, index, next, _| (parent == 7)
                 .then_some((last, index, next))),
             Some((70, 3, Some(71)))
         );
@@ -46029,6 +46173,245 @@ mod tests {
             before,
             "a YAML sequence went through the resumable scan"
         );
+    }
+
+    /// #3839: a member scan that resumes after the member an earlier one found
+    /// answers what the scan from the first member does, for the value and the
+    /// key node of every member of a wide object, in order, reversed, strided
+    /// and shuffled, and the climb's path agrees.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_resumed_member_scan_answers_what_the_full_scan_does_3839() {
+        let doc = format!(
+            "{{{}}}",
+            (0..200)
+                .map(|i| format!("\"k{i}\":{{\"a\":{i}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let index = JsonIndex::build(doc.as_bytes());
+        let root = index.root(doc.as_bytes());
+        // (key node, value node) of every member, in document order.
+        let mut members = Vec::new();
+        let mut next = root.first_child();
+        while let Some(key) = next {
+            let value = key.next_sibling().expect("every key has a value");
+            next = value.next_sibling();
+            members.push((key, value));
+        }
+        assert_eq!(members.len(), 200);
+        let _scope = slot_memo::enter(root.document_token());
+        let orders: [Vec<usize>; 4] = [
+            (0..200).collect(),
+            (0..200).rev().collect(),
+            (0..200).step_by(7).collect(),
+            vec![5, 150, 40, 41, 42, 199, 0, 100, 101, 33, 34, 35],
+        ];
+        for order in orders {
+            for i in order {
+                let (key, value) = &members[i];
+                let name = OwnedValue::String(format!("k{i}").into());
+                match cursor_slot(value) {
+                    Ok(Some(CursorSlot::Value { key: k, key_cursor })) => {
+                        assert_eq!(k, name, "value of member {i}");
+                        assert!(key_cursor.same_node(key), "key node of member {i}");
+                    }
+                    other => panic!("member {i}: not a value slot: {:?}", other.map(|_| ())), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3839 pin, only reached when the pin is already failing"
+                }
+                match cursor_slot(key) {
+                    Ok(Some(CursorSlot::Key(k))) => assert_eq!(k, name, "key node of member {i}"),
+                    other => panic!("member {i}: not a key slot: {:?}", other.map(|_| ())), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3839 pin, only reached when the pin is already failing"
+                }
+                let (path, ancestors, _) = cursor_path_and_ancestors(value).unwrap();
+                assert_eq!(path, vec![name], "path of member {i}");
+                assert!(ancestors[0].same_node(&root), "parent of member {i}");
+            }
+        }
+    }
+
+    /// #3839: what a resumed or sequential member read answers, it answers as the
+    /// scan from the first member does -- including the errors and the `None`s:
+    /// an undecodable key, an unpaired trailing key, duplicate keys. Each
+    /// member's value and key node is read in order (a value, then its own key
+    /// node), reversed and shuffled with the memo open, and compared with the
+    /// answer outside any scope.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_member_slots_match_the_full_scan_on_malformed_objects_3839() {
+        fn shape(
+            r: Result<Option<CursorSlot<crate::json::light::JsonCursor<'_, Vec<u64>>>>, EvalError>,
+        ) -> String {
+            match r {
+                Ok(Some(CursorSlot::Value { key, key_cursor })) => {
+                    format!("value {} @{}", key.to_json(), key_cursor.node_id())
+                }
+                Ok(Some(CursorSlot::Key(key))) => format!("key {}", key.to_json()),
+                Ok(Some(CursorSlot::Element(i))) => format!("element {i}"),
+                Ok(None) => "none".to_owned(),
+                Err(e) => format!("error {e:?}"),
+            }
+        }
+        let members = |range: std::ops::Range<usize>, bad: Option<usize>| -> String {
+            range
+                .map(|i| {
+                    // A bare number is not a string key: it has no display name.
+                    let key = if bad == Some(i) {
+                        "7".to_owned()
+                    } else {
+                        format!("\"k{}\"", i % 40)
+                    };
+                    format!("{key}:{{\"x\":{i}}}")
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let docs = [
+            (
+                "non-string key",
+                format!("{{{}}}", members(0..100, Some(70))),
+            ),
+            (
+                "unpaired trailing key",
+                format!("{{{},\"zz\"}}", members(0..80, None)),
+            ),
+            ("duplicate keys", format!("{{{}}}", members(0..120, None))),
+        ];
+        for (name, doc) in docs {
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let mut nodes = Vec::new();
+            let mut next = root.first_child();
+            while let Some(key) = next {
+                nodes.push(key);
+                match key.next_sibling() {
+                    Some(value) => {
+                        nodes.push(value);
+                        next = value.next_sibling();
+                    }
+                    None => next = None,
+                }
+            }
+            // The full scan's answer for every node: no scope is open here.
+            let expected: Vec<String> = nodes.iter().map(|c| shape(cursor_slot(c))).collect();
+            let n = nodes.len();
+            if name == "non-string key" {
+                // The document reaches the error path: the member with the
+                // bare-number key, 70th, has no display name.
+                assert!(expected[140].starts_with("error"), "{}", expected[140]);
+                assert!(expected[141].starts_with("error"), "{}", expected[141]);
+            }
+            // In order, reversed, shuffled, and strided (which reaches a member
+            // through a resume rather than as the remembered one's neighbour).
+            let orders: [Vec<usize>; 5] = [
+                (0..n).collect(),
+                (0..n).rev().collect(),
+                (0..n).map(|i| (i * 37) % n).collect(),
+                (0..n).step_by(5).collect(),
+                (0..n).step_by(3).collect(),
+            ];
+            let _scope = slot_memo::enter(root.document_token());
+            for order in orders {
+                for i in order {
+                    assert_eq!(
+                        shape(cursor_slot(&nodes[i])),
+                        expected[i],
+                        "{name}: node {i}"
+                    );
+                }
+            }
+            // A value, then the key node of its own member, read right after it.
+            for pair in 0..n / 2 {
+                for node in [2 * pair + 1, 2 * pair] {
+                    if node < n {
+                        assert_eq!(
+                            shape(cursor_slot(&nodes[node])),
+                            expected[node],
+                            "{name}: node {node} after its neighbour"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #3839: reading a member's key node right after its value does not
+    /// rescan the members before it.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_member_key_node_after_its_value_is_not_a_rescan_3839() {
+        let n = 400usize;
+        let doc = format!(
+            "{{{}}}",
+            (0..n)
+                .map(|i| format!("\"k{i}\":{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let index = JsonIndex::build(doc.as_bytes());
+        let root = index.root(doc.as_bytes());
+        let _scope = slot_memo::enter(root.document_token());
+        let (before, _) = slot_memo::work();
+        let mut next = root.first_child();
+        while let Some(key) = next {
+            let value = key.next_sibling().expect("every key has a value");
+            next = value.next_sibling();
+            assert!(matches!(
+                cursor_slot(&value),
+                Ok(Some(CursorSlot::Value { .. }))
+            ));
+            assert!(matches!(cursor_slot(&key), Ok(Some(CursorSlot::Key(_)))));
+        }
+        let scanned = slot_memo::work().0 - before;
+        assert!(
+            scanned < 4 * n,
+            "visited {scanned} members over {n}; quadratic would be ~{}",
+            n * n / 2
+        );
+    }
+
+    /// #3839: the slots a fan-out over an object's members reads cost one scan
+    /// step each, not the whole prefix -- sequentially (the next member's
+    /// value is answered by comparing node ids) and skipping (the scan resumes
+    /// after the last member found). A quadratic scan visits n(n-1)/2.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_fan_out_member_slot_reads_are_linear_in_the_members_3839() {
+        let n = 1500usize;
+        let doc = format!(
+            "{{{}}}",
+            (0..n)
+                .map(|i| format!("\"k{i}\":{{\"a\":{{\"b\":{i}}}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for (filter, expected, sequential) in [
+            ("[.[] | tostring | [key]] | length", n, true),
+            ("[.[] | .a | tostring | path] | length", n, true),
+            (
+                "[.[] | select(.a.b % 3 == 0) | .a | tostring | [key]] | length",
+                n / 3,
+                false,
+            ),
+        ] {
+            let (scanned_before, neighbours_before) = slot_memo::work();
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), filter);
+            assert!(control.is_none(), "{filter}: {control:?}");
+            assert_eq!(out, [OwnedValue::Int(expected as i64)], "{filter}");
+            let (scanned, neighbours) = slot_memo::work();
+            let (scanned, neighbours) = (scanned - scanned_before, neighbours - neighbours_before);
+            assert!(
+                scanned < 8 * n,
+                "{filter}: visited {scanned} members over {n}; quadratic would be ~{}",
+                n * n / 2
+            );
+            if sequential {
+                assert!(
+                    neighbours >= n / 2,
+                    "{filter}: only {neighbours} of {n} positions were answered as a remembered member's neighbour"
+                );
+            }
+        }
     }
 
     /// #2785: `effective_key_values` is `effective_keys` with typed keys --
