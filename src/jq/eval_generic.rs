@@ -14816,14 +14816,12 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
         );
         use crate::jq::eval::TargetEnd;
         return match drive.finish(flow, crate::jq::eval::direct_pattern_retry(target)) {
-            TargetEnd::ConsumerStopped => false,
-            TargetEnd::Escape(control) | TargetEnd::Ended(Flow::Escaped(control)) => {
+            TargetEnd::Stopped => false,
+            TargetEnd::Escape(control) => {
                 escape.stop(control);
                 false
             }
-            TargetEnd::Ended(Flow::Exhausted) => true,
-            // omni-dev: coverage tolerate-line reason="unreachable: only this drive's own closure answers Stop, and both its Stops are handled before this arm (consumer_stop sets the flag, stop_with_escape stashes); the one other source is a stale enclosing driver's stop (#3293), which no query this suite can build reaches (#3807)"
-            TargetEnd::Ended(Flow::Stopped { .. }) => false,
+            TargetEnd::Exhausted => true,
         };
     }
     let literal_key = owned_to_expr(k);
@@ -18959,15 +18957,9 @@ fn slice_pair_streaming<S: EvalSemantics, V: DocumentValue>(
         }),
     );
     match drive.finish(flow, crate::jq::eval::direct_pattern_retry(target)) {
-        TargetEnd::ConsumerStopped => (None, true),
-        TargetEnd::Escape(control) | TargetEnd::Ended(Flow::Escaped(control)) => {
-            (Some(control), false)
-        }
-        TargetEnd::Ended(Flow::Exhausted) => (None, false),
-        // A stop the consumer did not issue is a stale enclosing driver's
-        // (#3293); the pair ends, as the index twin's does.
-        // omni-dev: coverage tolerate-line reason="unreachable: only this drive's own closure answers Stop, and both its Stops are handled before this arm (consumer_stop sets the flag, stop_with_escape stashes); the one other source is a stale enclosing driver's stop (#3293), which no query this suite can build reaches (#3807)"
-        TargetEnd::Ended(Flow::Stopped { .. }) => (None, true),
+        TargetEnd::Stopped => (None, true),
+        TargetEnd::Escape(control) => (Some(control), false),
+        TargetEnd::Exhausted => (None, false),
     }
 }
 

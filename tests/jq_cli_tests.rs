@@ -103036,7 +103036,10 @@ fn test_any_all_condition_retry_extra_verdicts_3819() -> Result<()> {
     Ok(())
 }
 
-/// #3807 rows over `null`: a `?//` in a computed index's or slice's target
+/// #3807: a `?//` in a computed index's or slice's target. Each group is a target
+/// whose first alternative's index/slice error, or consumer-stopped answer, a retry
+/// then supersedes by yielding nothing, raising, answering, or failing to
+/// destructure; every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
 const RETRY_ROWS_TARGET_RETRY_3807: &[RetryRow3293] = &[
     (
         r#"([[1]] as [$a] ?// $a | ("A"|stderr) | $a | if (.[0]|type)=="number" then . else error("E2") end)[(0|.+0)]"#,

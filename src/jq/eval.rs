@@ -8244,12 +8244,9 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             });
             return match drive.finish(target_flow, direct_pattern_retry(target)) {
-                TargetEnd::ConsumerStopped => Demand::Stop,
+                TargetEnd::Stopped => Demand::Stop,
                 TargetEnd::Escape(control) => escape.stop(control),
-                TargetEnd::Ended(Flow::Exhausted) => Demand::Continue,
-                // omni-dev: coverage tolerate-line reason="unreachable: only this drive's own closure answers Stop, and both its Stops are handled before this arm (consumer_stop sets the flag, stop_with_escape stashes); the one other source is a stale enclosing driver's stop (#3293), which no query this suite can build reaches (#3807)"
-                TargetEnd::Ended(Flow::Stopped { .. }) => Demand::Stop,
-                TargetEnd::Ended(Flow::Escaped(control)) => escape.stop(control),
+                TargetEnd::Exhausted => Demand::Continue,
             };
         }
         let literal_key = owned_to_expr(&k);
@@ -26165,14 +26162,9 @@ fn slice_pair_streaming<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     });
     match drive.finish(flow, direct_pattern_retry(target)) {
-        TargetEnd::ConsumerStopped => (None, true),
+        TargetEnd::Stopped => (None, true),
         TargetEnd::Escape(control) => (Some(control), false),
-        TargetEnd::Ended(Flow::Exhausted) => (None, false),
-        // A stop the consumer did not issue is a stale enclosing driver's
-        // (#3293); the pair ends, as the index twin's does.
-        // omni-dev: coverage tolerate-line reason="unreachable: only this drive's own closure answers Stop, and both its Stops are handled before this arm (consumer_stop sets the flag, stop_with_escape stashes); the one other source is a stale enclosing driver's stop (#3293), which no query this suite can build reaches (#3807)"
-        TargetEnd::Ended(Flow::Stopped { .. }) => (None, true),
-        TargetEnd::Ended(Flow::Escaped(control)) => (Some(control), false),
+        TargetEnd::Exhausted => (None, false),
     }
 }
 
@@ -55424,12 +55416,15 @@ pub(crate) struct TargetDrive {
 
 /// How a [`TargetDrive`] ended.
 pub(crate) enum TargetEnd {
-    /// The consumer's stop stands: no retry superseded it.
-    ConsumerStopped,
-    /// An index/slice of a target output raised, and no retry superseded it.
+    /// The target stopped: the consumer's own stop, or a stale enclosing
+    /// driver's (#3293) -- either way the pull ends and the caller's own exit
+    /// judges which.
+    Stopped,
+    /// The target raised, whether an index/slice of one of its outputs that no
+    /// retry superseded, or its own generator's trailing control.
     Escape(Control),
-    /// Neither: the drive's own verdict decides.
-    Ended(Flow),
+    /// The target ran dry.
+    Exhausted,
 }
 
 impl TargetDrive {
@@ -55465,11 +55460,15 @@ impl TargetDrive {
             .get()
             .is_some_and(|at| !retry_superseded(&flow, at, direct_retry))
         {
-            return TargetEnd::ConsumerStopped;
+            return TargetEnd::Stopped;
         }
-        match self.escape.take(&flow, direct_retry) {
-            Some(control) => TargetEnd::Escape(control),
-            None => TargetEnd::Ended(flow),
+        if let Some(control) = self.escape.take(&flow, direct_retry) {
+            return TargetEnd::Escape(control);
+        }
+        match flow {
+            Flow::Exhausted => TargetEnd::Exhausted,
+            Flow::Stopped { .. } => TargetEnd::Stopped,
+            Flow::Escaped(control) => TargetEnd::Escape(control),
         }
     }
 }
@@ -111392,6 +111391,42 @@ mod tests {
                 error.to_string().contains(message),
                 "`{filter}` over {input}: {error}"
             );
+        }
+    }
+
+    /// #3807: a direct `?//` target whose retry answers, or raises
+    /// after a consumer's stop, on the library route and without std's
+    /// thread-local retry generation (`direct_pattern_retry` stands in).
+    /// Captured from jq 1.7.1.
+    #[test]
+    fn test_direct_retry_in_index_and_slice_target_3807() {
+        let empty = r#"([{"x":1}] as [$q] ?// $q | select(type=="array"|not))"#;
+        let raise =
+            r#"([[1]] as [$a] ?// $a | if (.[0]|type)=="number" then . else error("E2") end)"#;
+        for (target, key, empty_expected) in [
+            (empty, "(0|.+0)", true),
+            (empty, "(0|.+0):(1|.+0)", true),
+            (raise, "(0|.+0)", false),
+            (raise, "(0|.+0):(1|.+0)", false),
+        ] {
+            let filter = format!("first({target}[{key}])");
+            let index = JsonIndex::build(b"null");
+            let expr = parse(&filter).unwrap();
+            let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(b"null"));
+            if empty_expected {
+                // jq 1.7.1: `null null` -- the retry's two answers, not the
+                // abandoned alternative's index error.
+                let QueryResult::ManyOwned(values) = result else {
+                    panic!("`{filter}`: expected two answers: {result:?}");
+                };
+                let got: Vec<_> = values.iter().map(OwnedValue::to_json).collect();
+                assert_eq!(got, ["null", "null"], "`{filter}`");
+            } else {
+                let QueryResult::Error(error) = result else {
+                    panic!("`{filter}`: expected E2: {result:?}");
+                };
+                assert!(error.to_string().contains("E2"), "`{filter}`: {error}");
+            }
         }
     }
 
