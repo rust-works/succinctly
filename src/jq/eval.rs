@@ -40747,10 +40747,12 @@ fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// emitting branch left it when something was ([`drained_register_after`],
 /// [`register_after`]). A static predicate cannot say which of the two a given
 /// result is, so this only admits the stage to *read* its leaf's statement:
-/// [`resolve_seq_stage`] then trusts an [`Unmoved`](BranchRegister::Unmoved)
-/// register on a result that navigated nothing, the way it already trusts the one
-/// on a result that did (`facts.navigated && step_unmoved`). Jq mode only, like
-/// every admission here (ADR-0018).
+/// [`resolve_seq_stage`] then trusts the register on a result that navigated
+/// nothing, the way it already trusts the one on a result that did
+/// (`facts.navigated && step_unmoved`). On a trackable entry that is the leaf's
+/// [`Unmoved`](BranchRegister::Unmoved); on an untracked one (#3826) it is the
+/// carried copy, unless the leaf states a loss. Jq mode only, like every
+/// admission here (ADR-0018).
 ///
 /// Not folded into [`stage_leaves_register_in_place`]: that is a per-*expression*
 /// fact, true of every result, and this one is not (`path(. as $x | any | $x)`
@@ -51497,16 +51499,30 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // untracked entry, which no leaf producer sees. A lost state
         // (`LostAt`, `LostSomewhere`) vouches for nothing.
         // #3758: `any`/`all`/`isempty(g)` state the register per result, so the
-        // stage reads the step's own statement (`Unmoved`, or nothing, which is
-        // `None` below) rather than a static answer. Taken on a trackable entry
-        // only, where the step's register is the one that entered; an untracked
-        // entry's is the carried copy, which no leaf producer sees. A result
-        // that navigated (a decided one, `.[]`'s own index) is read by
-        // `reports_register` instead; the consumers of this value ask
-        // `!navigated` themselves, and it is stated here too so the claim does
-        // not rest on them.
-        let states_register =
-            stages_per_result_register && trackable_step_eligible && !facts.navigated;
+        // stage reads the step's own statement rather than a static answer.
+        // On a trackable entry that is the step's register (`Unmoved`, or
+        // nothing, which is `None` below). On an untracked entry the register
+        // is the carried copy, which no leaf producer sees, and the leaf states
+        // `Unmoved` or nothing for a result it did not navigate (#3826): the
+        // carried copy stands unless the step *states a loss*, which vouches for
+        // nothing. A result that navigated (a decided one, `.[]`'s own index)
+        // is read by `reports_register` instead; the consumers of this value
+        // ask `!navigated` themselves, and it is stated here too so the claim
+        // does not rest on them.
+        //
+        // The contract this rests on, for these builtins only: on an untracked
+        // entry a leaf states `None` only for a result that backtracked every
+        // branch ([`drained_register`]) or whose generator provably moves
+        // nothing, and states a loss ([`register_after`]) for anything it
+        // cannot vouch for. A leaf or wrapper that returned `None` for a
+        // generator that moves the register would re-establish a stale `$x`
+        // here; the residual rows (`1 | isempty(first(2,3))`) pin the loss side.
+        let states_register = stages_per_result_register
+            && !facts.navigated
+            && !matches!(
+                step_register,
+                BranchRegister::LostAt(_) | BranchRegister::LostSomewhere
+            );
         let register_entering = if !(stage_preserves_register || seed || states_register) {
             None
         } else if trackable_step_eligible {

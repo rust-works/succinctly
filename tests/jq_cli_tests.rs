@@ -61694,10 +61694,220 @@ fn test_pipe_stage_reads_the_backtracked_register_verdict_3758() -> Result<()> {
     ])
 }
 
+/// #3826: the verdict stage of #3758 on an *untracked* entry. After a stage that
+/// computed (`1 | ...`, `{a:{b:1}} | ...`, `tostring | ...`) the register is
+/// carried by the stage and no leaf producer states it, but `any`, `all` and
+/// `isempty(g)` still leave it where it entered when nothing inside emitted, so a
+/// `$x` frozen before is the register again (`path(. as $x | 1 | isempty(empty) |
+/// $x)` on `{"a":1}` is `[]`). A step that states a loss vouches for nothing, and
+/// an `any` that iterates the computed value still raises. Every row captured from
+/// jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_verdict_stage_on_an_untracked_entry_3826() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | isempty(empty) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | any(empty; .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | all(empty; .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | isempty(1) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | tostring | isempty(empty) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | (1 | isempty(empty)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | 1 | isempty(empty) | $x)",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | {} | any | $x)",
+            "",
+            r"Invalid path expression near attempt to iterate through {}",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | [] | any | $x)",
+            "",
+            r"Invalid path expression near attempt to iterate through []",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | any(.[]?; .) | $x)",
+            "",
+            r"Invalid path expression near attempt to iterate through 1",
+            5,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(. as $x | null | any(.[]?; .) | $x)",
+            "",
+            r"Invalid path expression near attempt to iterate through null",
+            5,
+        ),
+        (
+            r"null",
+            r"path(. as $x | null | isempty(empty) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(null | isempty(empty))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | 1 | any | $x)",
+            "",
+            r"Invalid path expression near attempt to iterate through 1",
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | {a:{b:1}} | any(empty; .) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | {a:{b:1}} | isempty(empty) | $x | .a)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"(. as $x | 1 | isempty(empty) | $x) |= 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"del(. as $x | {a:{b:1}} | all(empty; .) | $x.a?)",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"del(. as $x | 1 | any(1; .a?) | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 1"#,
+            5,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | 1 | isempty(.[]?) | $x)",
+            "",
+            r"Invalid path expression near attempt to iterate through 1",
+            5,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"path(. as $x | 1 | isempty(.[]?) | $x)",
+            "",
+            r"Invalid path expression near attempt to iterate through 1",
+            5,
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"path(. as $x | .a | tostring | any? | $x)",
+            "",
+            "",
+            0,
+        ),
+        // A result identical by kind (`true`/`false`/`null`) to the carried register is it.
+        (r"true", r"path(1 | isempty(empty))", "[]\n", "", 0),
+        (
+            r"true",
+            r"path(1 | any(empty; .))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (r"true", r"path(1 | all(empty; .))", "[]\n", "", 0),
+        (r"false", r"path(1 | isempty(1))", "[]\n", "", 0),
+        (
+            r"null",
+            r"path(1 | isempty(empty))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"null",
+            r"path(1 | any(empty; .))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
+        (
+            r"true",
+            r"path(. as $x | 1 | isempty(empty) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"true", r"del(1 | isempty(empty))", "null\n", "", 0),
+        (
+            r"null",
+            r"path(1 | isempty(.[]?))",
+            "",
+            r"Invalid path expression near attempt to iterate through 1",
+            5,
+        ),
+    ])
+}
+
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
-/// verdict stage on an untracked entry (`1 | isempty(empty) | $x`) and one inside a compound stage
-/// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758, see
-/// [`test_pipe_stage_reads_the_backtracked_register_verdict_3758`]). And a
+/// verdict stage behind a `def` call or a `reduce` and one inside a compound stage
+/// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758 and the
+/// untracked entry by #3826, see
+/// [`test_pipe_stage_reads_the_backtracked_register_verdict_3758`] and
+/// [`test_verdict_stage_on_an_untracked_entry_3826`]). And a
 /// computed `true` that decides under a `cond` on an untracked entry
 /// (`.a and any(true; select(.))`, an `and` right operand) is ambiguous -- it
 /// may be the carried register, whose position is not known -- so jq's `["a"]`
@@ -61710,25 +61920,23 @@ fn test_pipe_stage_reads_the_backtracked_register_verdict_3758() -> Result<()> {
 #[test]
 fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
     for (input, filter, jq_answer, expected) in [
-        // #3758: the verdict is read on a trackable entry only. After a stage
-        // that computed (`1 | ...`, `tostring | ...`) the register is carried by
-        // the stage, no leaf producer states it, and `isempty(empty)` /
-        // `any(empty; .)` over it stay refused as they were.
+        // #3826: on an untracked entry a generator the allowlist cannot prove leaves the
+        // register in place states a loss, which the stage does not override.
         (
             r#"{"a":1}"#,
-            r"path(. as $x | 1 | isempty(empty) | $x)",
+            r"path(. as $x | 1 | isempty(first(2,3)) | $x)",
             "[]",
             r#"Invalid path expression with result {"a":1}"#,
         ),
         (
             r#"{"a":1}"#,
-            r"path(. as $x | 1 | any(empty; .) | $x)",
+            r"path(. as $x | 1 | any(first(2,3); .) | $x)",
             "[]",
             r#"Invalid path expression with result {"a":1}"#,
         ),
         (
             r#"{"a":1}"#,
-            r"path(. as $x | tostring | isempty(empty) | $x)",
+            r"path(. as $x | 1 | isempty(def f: 2; f) | $x)",
             "[]",
             r#"Invalid path expression with result {"a":1}"#,
         ),
