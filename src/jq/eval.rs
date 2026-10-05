@@ -43743,17 +43743,49 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
         trackable,
         frame,
         &mut |bound, origin| {
+            // #3423: a source the resolver neither certified (`origin`) nor knows to be
+            // `.` ([`identity_passthrough`]) nor can show fresh, whose output is
+            // value-equal to the register, may be that register's own node (a
+            // pass-through the grammars do not name: `if c then (., 1) else . end`,
+            // `(., 1) | .`, `try (., 1) catch 2`). It cannot be certified -- a fresh
+            // copy equal to the register is exactly the rebuilt copy #2642 closed --
+            // but binding it by value hands `$x` no mark, so a refusal off it reads as
+            // jq's verdict and a `try` catches it where jq navigates and writes. Bind
+            // it with the non-certifying marker instead, and resolve the body with the
+            // register's identity unknown, so that refusal is the guess it is (loud,
+            // uncatchable: #3267).
+            let ambiguous = S::TAG == EvalTag::Jq
+                && origin.is_none()
+                && !identity_passthrough(source, true)
+                && !is_provably_fresh_source(source)
+                && var_reaches_path_position(body, var)
+                && if trackable {
+                    bound == *value
+                } else {
+                    frame.register().is_some_and(|reg| bound == *reg)
+                };
             let substituted = substitute_bound_var_at(
                 source,
                 body,
                 var,
                 &bound,
                 identity_at.clone(),
-                origin,
+                if ambiguous {
+                    Some(Origin::Untracked)
+                } else {
+                    origin
+                },
                 None,
                 S::TAG == EvalTag::Jq,
                 false,
             );
+            let lost_frame;
+            let frame = if ambiguous {
+                lost_frame = frame.with_register_loss(RegisterLoss::LostSomewhere);
+                &*lost_frame
+            } else {
+                frame
+            };
             resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
         },
     )
@@ -44349,11 +44381,27 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                     }
                     // #3267: a first-step refusal is of `bound` itself, frozen
                     // when the head is a `$var` marker or a `.` over one.
+                    //
+                    // #3423: so is a source that is *value-equal to the register* and
+                    // that nothing proves fresh: jq may hold it by the register's own
+                    // pointer (a pass-through the head grammar does not recognise --
+                    // `($orig | .)`, `first($orig)`, `($orig?)`, `label $l | $orig`),
+                    // in which case it navigates where this resolver's refusal says
+                    // it cannot. The register is known here (`Kept`), which is why the
+                    // loss state is stood in for: it is the identity of `bound`, not
+                    // the register, that is unknown, and a caught guess is a write jq
+                    // makes silently dropped.
+                    let may_be_register =
+                        register.is_some_and(|reg| bound == reg) && !is_provably_fresh_source(head);
                     return ResolveFlow::Escaped(match control {
                         Control::Error(e) => EvalEscape::Error(guess_refusal_of(
                             e,
-                            &frame.register_loss,
-                            bound_is_frozen,
+                            if may_be_register {
+                                &RegisterLoss::LostSomewhere
+                            } else {
+                                &frame.register_loss
+                            },
+                            bound_is_frozen || may_be_register,
                             bound,
                             match pattern {
                                 Pattern::Object(_) => Some(NavKind::Field),
@@ -45127,6 +45175,27 @@ impl NavKind {
             ),
             Self::Iterate => matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)),
         }
+    }
+}
+
+/// Whether `source` provably yields only values jq builds fresh, so none can be
+/// the very value its path register holds (#3423): a literal, a construction, an
+/// interpolated string, or a `,`/`if`/pipe whose every output is one. A closed
+/// grammar in the safe direction: everything else -- a builtin (`ltrimstr("x")`
+/// hands a non-string back unchanged), a call, a navigation, a variable -- may
+/// pass the register through by pointer, so a refusal of an equal value is the
+/// resolver's guess, not jq's verdict.
+fn is_provably_fresh_source(source: &Expr) -> bool {
+    match unwrap_bind_source(source) {
+        Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) | Expr::StringInterpolation(_) => true,
+        Expr::Comma(exprs) => !exprs.is_empty() && exprs.iter().all(is_provably_fresh_source),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => is_provably_fresh_source(then_branch) && is_provably_fresh_source(else_branch),
+        Expr::Pipe(stages) => stages.last().is_some_and(is_provably_fresh_source),
+        _ => false,
     }
 }
 
