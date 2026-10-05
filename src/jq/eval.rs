@@ -50612,7 +50612,21 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // overwhelmingly common case where the register is never consulted
         // again.
         let reports_register = stage_reports_register || (facts.navigated && step_unmoved);
+        // #3423: an `Unproven` marker equal to the register this untracked entry
+        // carries may be that register's own node (a trackable entry's leaf states
+        // the loss itself, in the `TrackedVar` arm). Nothing here can certify it,
+        // so the register is no longer vouched for: it is lost at the carried
+        // value, which makes a navigation refusal off the marker the guess it is.
+        let unproven_equal = S::TAG == EvalTag::Jq
+            && !trackable
+            && !branch_trackable
+            && !facts.navigated
+            && matches!(facts.step_snapshot, Snapshot::Marked(Origin::Unproven))
+            && carried_register
+                .as_deref()
+                .is_some_and(|reg| *reg == *resulting);
         let carries_register = !trackable
+            && !unproven_equal
             && if reports_register {
                 step_unmoved
             } else {
@@ -50639,6 +50653,8 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             RegisterLoss::Kept
         } else if frame.register_loss.is_lost() {
             frame.register_loss.clone()
+        } else if unproven_equal {
+            RegisterLoss::LostAt(Rc::new((*resulting).clone()))
         } else if S::TAG == EvalTag::Jq
             && !facts.navigated
             && !carries_register
