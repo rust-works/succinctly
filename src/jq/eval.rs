@@ -45615,7 +45615,13 @@ fn reduce_update_at_register<S: EvalSemantics>(
     if !update_navigates || !moved {
         return persistent;
     }
-    foreach_step_register::<S>(walked, elem, reg, frame, acc, acc_snapshot, persistent).1
+    // `&&`, never a replacement: the per-step verdict may only *narrow* what the
+    // persistent flag accepted. A destructuring walk's register can read `true`
+    // where the persistent one is `false` (a `null`/`bool` accumulator is identical
+    // to any `null`/`bool` register), and taking it would admit a write jq refuses
+    // (`(reduce first(.a) as {a:$v0} (null; ($v0 | getpath([])))) = 9`).
+    persistent
+        && foreach_step_register::<S>(walked, elem, reg, frame, acc, acc_snapshot, persistent).1
 }
 
 /// A `foreach` step's verdict on a `Demand::Stop` answered downstream of its

@@ -59222,6 +59222,19 @@ fn test_reduce_destructuring_navigating_update_refuses_3780() -> Result<()> {
             "{filter}: stderr {err:?}"
         );
     }
+    // The per-step verdict may only narrow the persistent flag: a `null` accumulator
+    // is identical to any `null` register, and taking the walk's register let this
+    // write `9` over the document where jq refuses (found by the bind-origin fuzz
+    // while the review fix was in progress).
+    let doc2 = "{\"a\":{\"b\":1},\"c\":{\"b\":1},\"d\":\"s\"}\n";
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r"(reduce first(.a) as {a:$v0} (null; ($v0 | getpath([])))) = 9",
+        ],
+        Some(doc2),
+    )?;
+    assert_eq!((out.as_str(), code), ("", 5), "stderr {err:?}");
     // a passthrough UPDATE through a destructuring pattern is still the root
     let (out, _, code) = run_jq_full(&["-c", r"path(reduce .a as [$x] (.; .))"], Some(doc))?;
     assert_eq!((out.as_str(), code), ("[]\n", 0));
