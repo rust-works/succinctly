@@ -62617,6 +62617,35 @@ fn test_foreach_over_the_register_binds_it_as_a_path_3790() -> Result<()> {
             r#"Invalid path expression with result {"b":1}"#,
             5,
         ),
+        // The fold's INIT navigated first (the register is not at the root when the source runs).
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach . as $k (.a; $k; .))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(.a | foreach . as $k (.b?; $k; .))",
+            "",
+            r#"Invalid path expression with result {"b":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach . as $k (.a; $k; $k))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach (., .) as $k (.a; $k; .))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
     ])
 }
 
