@@ -14822,6 +14822,7 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
                 false
             }
             TargetEnd::Ended(Flow::Exhausted) => true,
+            // omni-dev: coverage tolerate-line reason="unreachable: only this drive's own closure answers Stop, and both its Stops are handled before this arm (consumer_stop sets the flag, stop_with_escape stashes); the one other source is a stale enclosing driver's stop (#3293), which no query this suite can build reaches (#3807)"
             TargetEnd::Ended(Flow::Stopped { .. }) => false,
         };
     }
@@ -18965,6 +18966,7 @@ fn slice_pair_streaming<S: EvalSemantics, V: DocumentValue>(
         TargetEnd::Ended(Flow::Exhausted) => (None, false),
         // A stop the consumer did not issue is a stale enclosing driver's
         // (#3293); the pair ends, as the index twin's does.
+        // omni-dev: coverage tolerate-line reason="unreachable: only this drive's own closure answers Stop, and both its Stops are handled before this arm (consumer_stop sets the flag, stop_with_escape stashes); the one other source is a stale enclosing driver's stop (#3293), which no query this suite can build reaches (#3807)"
         TargetEnd::Ended(Flow::Stopped { .. }) => (None, true),
     }
 }

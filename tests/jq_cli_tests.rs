@@ -103430,6 +103430,20 @@ const RETRY_ROWS_TARGET_RETRY_3807: &[RetryRow3293] = &[
         "Cannot index array with string \"z\"",
         5,
     ),
+    (
+        r#"1 | [(.,.)[(0|.+0)]]"#,
+        "",
+        "",
+        "Cannot index number with number",
+        5,
+    ),
+    (
+        r#"1 | [(.,.)[(0|.+0):(1|.+0)]]"#,
+        "",
+        "",
+        "Cannot index number with object",
+        5,
+    ),
 ];
 
 /// #3807: a `?//` inside a computed index's or slice's *target* (`(G)[K]`,
@@ -103446,4 +103460,27 @@ fn test_retry_in_computed_index_and_slice_target_3807() -> Result<()> {
     assert_retry_rows_3293(None, "null | ", RETRY_ROWS_TARGET_RETRY_3807)?;
     // Document route (`eval_generic.rs`): the input stays on the cursor.
     assert_retry_rows_3293(Some("null"), "", RETRY_ROWS_TARGET_RETRY_3807)
+}
+
+/// #3807: an output of a computed index's or slice's target that cannot be
+/// decoded raises its decode failure, which no `?//` retries. jq rejects the
+/// input at parse time, so there is no oracle row: this pins that both forms
+/// raise the failure (exit 5, nothing on stdout) rather than answering.
+#[test]
+fn test_undecodable_target_output_in_computed_index_and_slice_3807() -> Result<()> {
+    let input = r#"{"a":1,"b":"\ud800"}"#;
+    for filter in [
+        ".b | [(.,.)[(0|.+0)]]",
+        ".b | first((.,.)[(0|.+0)])",
+        ".b | [(.,.)[(0|.+0):(1|.+0)]]",
+        ".b | (.,.)[(0|.+0):(1|.+0)]",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!((out.as_str(), code), ("", 5), "`{filter}`: {err:?}");
+        assert!(
+            err.contains("invalid unicode escape sequence"),
+            "`{filter}`: {err:?}"
+        );
+    }
+    Ok(())
 }
