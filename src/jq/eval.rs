@@ -45296,7 +45296,11 @@ impl NavKind {
 /// value, which is jq's own doctrine for a computed one
 /// ([`could_be_lost_register`]); a call or fold that forwards its input stays a
 /// residual (#3423). A `catch` handler's `.` is the error payload, not the
-/// register, so only a `$var` it names counts there (#3334 review).
+/// register, so only a `$var` it names counts there (#3334 review). Only what the
+/// parser builds is read: `first(f)`, `last(f)` and `limit` are `FirstExpr`,
+/// `LastExpr` and `Limit`, `nth(n; f)` is `Builtin::NthStream`; their hand-built
+/// twins (`Builtin::FirstStream`, `Builtin::LastStream`, `Expr::NthExpr`) never
+/// reach a bind source.
 fn may_alias_register(source: &Expr, register_frame: Option<&Frame>) -> bool {
     fn alias(expr: &Expr, identity: bool, frame: Option<&Frame>) -> bool {
         let any = |e: &Expr, identity: bool| alias(e, identity, frame);
@@ -45325,15 +45329,10 @@ fn may_alias_register(source: &Expr, register_frame: Option<&Frame>) -> bool {
             | Expr::FirstExpr(inner)
             | Expr::LastExpr(inner)
             | Expr::Limit { expr: inner, .. }
-            | Expr::NthExpr { expr: inner, .. }
             | Expr::Label { body: inner, .. }
             | Expr::As { body: inner, .. }
             | Expr::AsPattern { body: inner, .. }
-            | Expr::Builtin(
-                Builtin::FirstStream(inner)
-                | Builtin::LastStream(inner)
-                | Builtin::NthStream(_, inner),
-            ) => any(inner, identity),
+            | Expr::Builtin(Builtin::NthStream(_, inner)) => any(inner, identity),
             Expr::Builtin(builtin)
                 if matches!(builtin, Builtin::Select(_)) || is_type_filter(builtin) =>
             {
