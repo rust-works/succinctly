@@ -87347,13 +87347,14 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
 }
 
 /// #3266/#3427: on a value the index cannot read, the CLI answers a filter
-/// that navigates past it or wraps it in `[.]`, but other collections
-/// materialize it and raise, and so does any filter once an input builtin or
-/// `-s` makes the CLI materialize the whole input. Recorded as out of policy
-/// in `docs/compliance/jq/limitations.md` ("The library `eval()` entry
-/// validates what the CLI's entry only navigates"), where the library entry
-/// `succinctly::jq::eval` raises on every answering row here. jq 1.7.1
-/// rejects every document at parse time (exit 5).
+/// that navigates past it or wraps it in a one-stream array (`[.]`, `[.b]`,
+/// `[.[] | .]`), but every other construction (a comma or nested array, an
+/// object, a bind) materializes it and raises, and so does any filter once an
+/// input builtin or `-s` makes the CLI materialize the whole input. The split
+/// is accepted (#3427), recorded in `docs/compliance/jq/limitations.md` ("An
+/// unreadable value is validated where something reads it, not where it is
+/// wrapped"); the library entry `succinctly::jq::eval` gives the same answers
+/// since #3457. jq 1.7.1 rejects every document at parse time (exit 5).
 #[test]
 fn test_unreadable_value_collection_split_3266() -> Result<()> {
     const OBJ: &str = r#"[{"a":1,"b":tru}]"#;
@@ -87383,6 +87384,37 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
         (&["-c"], "[1.2.3]", ".[0] | [., 1] | length", "", 5),
         (&["-c"], "[1.2.3]", ".[0] | {a: .} | length", "", 5),
         (&["-c"], "[1.2.3]", ".[0] | . as $x | [$x] | length", "", 5),
+        (&["-c"], "[1.2.3]", ".[0] | [., .] | length", "", 5),
+        (&["-c"], "[1.2.3]", ".[0] | [[.]] | length", "", 5),
+        (&["-c"], OBJ, ".[0] | [.b] | length", "1\n", 0),
+        (&["-c"], OBJ, ".[0] | [.[] | .] | length", "2\n", 0),
+        (&["-c"], OBJ, ".[0] | [.a, .b] | length", "", 5),
+        (&["-c"], OBJ, ".[0] | [.[], 1] | length", "", 5),
+        (&["-c"], OBJ, ".[0] | {x: .b} | length", "", 5),
+        (&["-c"], OBJ, ".[0] | .b as $x | 1", "", 5),
+        (&["-c"], "[1.2.3]", ".[0] | . as $x | 1", "", 5),
+        (&["-c"], OBJ, ".[0] | [.b, empty] | length", "", 5),
+        (&["-c"], OBJ, ".[0] | [.[] | ., .] | length", "", 5),
+        (&["-c"], OBJ, ".[0] | [.[] | [.]] | length", "", 5),
+        (&["-c"], "[1.2.3]", ".[0] | try ([., 1]) catch \"c\"", "", 5),
+        (&["-c"], OBJ, ".[0] | [.a, .b]? | length", "", 5),
+        (&["-c"], OBJ, ".[0] | [first(.b)] | length", "1\n", 0),
+        (
+            &["-c"],
+            OBJ,
+            ".[0] | [.b | select(true)] | length",
+            "1\n",
+            0,
+        ),
+        (
+            &["-c"],
+            OBJ,
+            ".[0] | [if true then .b else 1 end] | length",
+            "1\n",
+            0,
+        ),
+        (&["-c"], OBJ, ".[0] | [.b // 1] | length", "1\n", 0),
+        (&["-c"], OBJ, ".[0] | [try .b] | length", "1\n", 0),
         (&["-c"], OBJ, ".[0] | path(.a), input_line_number", "", 5),
         (&["-c", "-s"], OBJ, ".[0][0] | path(.a)", "", 5),
     ];

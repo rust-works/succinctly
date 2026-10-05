@@ -9157,7 +9157,7 @@ Pinned by `test_bridge_token_spellings_read_like_their_siblings_3034` and
 The library entry `succinctly::jq::eval` answers such a value as the CLI does since #3457. See the
 next entry.
 
-### An unreadable value is validated where something reads it, not where it is wrapped (#3266, #3427, #3457) — collections out of policy
+### An unreadable value is validated where something reads it, not where it is wrapped (#3266, #3427, #3457) — the collection split is accepted
 
 jq 1.7.1 rejects every document below at parse time (exit 5), so no row has a reference answer.
 `succinctly jq` evaluates through the generic evaluator's cursor entries
@@ -9184,20 +9184,51 @@ others.
 | `[leaf_paths]` (same)                                   | `[["a"],["b"]]`                 | `[["a"],["b"]]` |
 | `select(key == 0) \| path(.a)` (same)                   | `["a"]`                         | raises          |
 | `[., 1] \| length`, `{a: .} \| length` on `[1.2.3]`     | raises                          | raises          |
+| `[.b] \| length` on `[{"a":1,"b":tru}]`                 | `1`                             | `1`             |
+| `[.a, .b] \| length` (same)                             | raises                          | raises          |
 | `. as $x \| [$x] \| length` on `[1.2.3]`                | raises                          | raises          |
 
-**Still out of policy: the collection split inside the cursor evaluator.** `[.]`,
-`[limit(1; .)]` and `[.[]]` keep their elements as cursors, but `[., 1]`, `{a: .}` and
-`. as $x | [$x]` materialize them, so `[.] | length` answers where `[., 1] | length` raises.
-Which collections keep cursors follows which constructs have a cursor-forwarding arm, not a rule
-a user can see, and ADR-0018's #2103 amendment exists to remove exactly that kind of split.
-[#3427](https://github.com/rust-works/succinctly/issues/3427) tracks it, in the CLI and the
-library alike now. Neither direction is a quick fix: materializing every collection would decode
-every element of `[.[]]` over a large document and break `LazySeq` streaming, and keeping
-cursors in every collection needs a mixed lazy/owned array. The CLI also materializes the whole
-input for a filter that uses `input`, `inputs` or `input_line_number`, and under `-s`, so
-`.[0] | path(.a), input_line_number` and `-s '.[0][0] | path(.a)'` exit 5 where
-`.[0] | path(.a)` answers.
+**Accepted: the collection split inside the cursor evaluator (#3427).** An array stays a
+sequence of cursors, and so never decodes an element it does not read, only when its body is one
+chain of stages that each pass cursors through: navigation (`.`, `.b`, `.[]`, `.[] | .`),
+`limit`/`first`, `select`, `if`, `//` and `try`. `[.] | length` answers, and so do `[.b]`,
+`[limit(1; .)]`, `[first(.b)]`, `[.b | select(true)]`, `[if true then .b else 1 end]`,
+`[.b // 1]`, `[try .b]` and `[.[]]`. Every other construction builds an owned value and decodes
+what it holds, so each of these raises where those answer:
+
+- a comma body, whatever its branches: `[., 1]`, `[., .]`, `[.a, .b]` (the unreadable value is
+  `.b`), `[.[], 1]`, `[.[] | ., .]`, and even `[.b, empty]`;
+- a collection built per element or inside another: `[[.]]`, `[.[] | [.]]`, since the inner
+  array is materialized to be an element;
+- an object: `{a: .}`, `{x: .b}`;
+- a variable bind, whether or not `$x` is ever read: `. as $x | 1`, `.b as $x | 1`,
+  `. as $x | [$x]`.
+
+`try` and `?` around the collection do not rescue it (`try ([., 1]) catch "c"`, `[.a, .b]?`),
+because the failure is a decode failure.
+
+The rule a caller can apply is therefore "a single stream of cursors in, one array out":
+anything that has to hold the value beside another value, or under a name, decodes it. It is a
+recorded divergence from #2692's "validated when, and only when, something reads it", not a
+claim of conformance to it. It is accepted rather than fixed, by ADR-0018's decision order: jq
+1.7.1 rejects every such document at parse time, so there is no reference answer to match, and
+the two ways to remove the split both cost more than the split does. Decoding in every
+collection would validate every element of `[.[]]` over a large document, the whole-subtree
+cost semi-indexing exists to avoid, and would break the `LazySeq` streaming `map` and `sort`
+rely on. Keeping cursors in every collection needs an array that mixes cursors and owned
+values, an object and a binding that can hold a cursor, and the same change in both evaluators.
+Every affected input is one the index could not read, a document jq rejects outright, and every
+affected answer is a decode failure, never a wrong value. Revisit it if a caller needs `{a: .}`
+or a bind over an unreadable value to answer; the representation work above is what that would
+take.
+
+Every row above is pinned in both entries, so moving one is a decision made here and not a side
+effect: `eval_entry_agrees_with_the_cursor_entry_on_unreadable_values_3266` (`src/jq/eval.rs`)
+and `test_unreadable_value_collection_split_3266` (`tests/jq_cli_tests.rs`).
+
+The CLI also materializes the whole input for a filter that uses `input`, `inputs` or
+`input_line_number`, and under `-s`, so `.[0] | path(.a), input_line_number` and
+`-s '.[0][0] | path(.a)'` exit 5 where `.[0] | path(.a)` answers.
 
 **What changed for a library caller of `jq::eval` (#3457).** The library now gives the CLI's
 answers, which differ from the evaluator it used before in these ways. Each is either an
