@@ -42981,8 +42981,18 @@ impl FoldRegister {
                 frame: self.frame.clone(),
             }
         } else {
+            // #3775: keep where the register stood entering UPDATE. jq's
+            // register only moves down, so wherever UPDATE left it is at or
+            // under this path, and an EXTRACT emission that cannot say where
+            // it landed must not read as the root: `resolve_terminal`'s `null`
+            // carve-out answers `[]` only for a branch that navigated nowhere
+            // (#3579), and `foreach .a? as $k (0; (true or .[]?); $k)` on
+            // `null` answered `[]` and wrote over the whole document where
+            // jq's register sits on `["a"]`. The value stays untracked, so
+            // nothing re-establishes against it; the path only tells the
+            // terminal that the register had left the root.
             Self {
-                path: PathPrefix::root(),
+                path: Rc::clone(&self.path),
                 value: OwnedValue::Null,
                 trackable: false,
                 frame: self.frame.unknown(),

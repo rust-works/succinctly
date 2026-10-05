@@ -64451,6 +64451,54 @@ fn test_foreach_keeps_the_register_for_a_frozen_variable_after_it_3761() -> Resu
     Ok(())
 }
 
+/// #3775: a `foreach` whose UPDATE is `true or <navigating operand>` and whose
+/// EXTRACT is the bound `$k` used to answer `[]` on a `null` document, and `= 9`
+/// replaced the whole document (exit 0). jq answers `["a"]` / `{"a":9}`: the
+/// operand never runs, so jq's register is still on the source's `.a`. The step
+/// register `FoldRegister::advance` builds for a stage it cannot see inside was
+/// rebuilt at the root, so the terminal's `null` carve-out (#3579, "nothing
+/// navigated") took the emission for the root. It now keeps the path it entered
+/// UPDATE at, and every input kind refuses loudly (exit 5) -- the refusal is this
+/// resolver's guess, not jq's verdict, so no `try` turns it into a dropped
+/// write. Matching jq's answer needs `or`'s short-circuit modelled, which is not
+/// done here.
+#[test]
+fn test_foreach_true_or_update_extracting_the_variable_never_answers_the_root_3775() -> Result<()> {
+    for doc in [
+        "null",
+        r#"{"b":2}"#,
+        r#"{"a":true,"b":2}"#,
+        r#"{"a":false}"#,
+        r#"{"a":null,"b":2}"#,
+    ] {
+        for filter in [
+            r"path(foreach .a? as $k (0; (true or .[]?); $k))",
+            r"(foreach .a? as $k (0; (true or .[]?); $k)) = 9",
+            r"(foreach .a? as $k (0; (true or .[]?); $k)) |= 9",
+            r"del(foreach .a? as $k (0; (true or .[]?); $k))",
+            r"path(foreach .a as $k (0; (true or .b); null))",
+        ] {
+            let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{doc}\n")))?;
+            assert_eq!(
+                (out.as_str(), code),
+                ("", 5),
+                "{filter} on {doc}: stderr {err:?}"
+            );
+            assert!(
+                err.contains("Invalid path expression with result"),
+                "{filter} on {doc}: stderr {err:?}"
+            );
+        }
+    }
+    // jq refuses nothing here and neither do we: the shapes that always matched
+    let (out, _, code) = run_jq_full(
+        &["-c", r"path(foreach .a? as $k (0; true; $k))"],
+        Some("null\n"),
+    )?;
+    assert_eq!((out.as_str(), code), ("[\"a\"]\n", 0));
+    Ok(())
+}
+
 /// #3738: a `foreach` UPDATE that is one chain of stages under a `try`
 /// (`try ($w | .[]?)`, `try ($w | .a[])`, `try ($w | ..)`) keeps jq's path
 /// register. The fold used to withhold the register from any non-pipe body that
