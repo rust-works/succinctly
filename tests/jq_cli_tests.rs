@@ -93930,6 +93930,13 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
             doc,
             r#"del(. as $orig | has("k") | try (($orig as $p | $p) as {a:{b:$q}} | $q))"#,
         ),
+        // The other forwarder arms: `limit`, `last`, a rebind and a destructuring
+        // rebind's body, a type filter, and a pipe.
+        (doc, r"del(limit(1; ., 1) as $x | try $x.a)"),
+        (doc, r"del(last(., .) as $x | try $x.a)"),
+        (doc, r"del((. as {a:$q} | .) as $x | try $x.a)"),
+        (doc, r"del((. as $z | (., 1) | .) as $x | try $x.a)"),
+        (doc, r"del(((., 1) | objects) as $x | try $x.a)"),
         // The forwarders the alias grammar reads through: `select` inside a comma,
         // and a `catch` handler that names the frozen `$orig` (its `.` is the error
         // payload, so only the `$var` counts there).
@@ -94075,6 +94082,26 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
             "{\"a\":{\"b\":1}}\n",
         ),
         (doc, r"del(. as $x | try $x.a)", "{}\n"),
+        // `nth` forwards its generator too.
+        (doc, r"del(nth(0; ., 1) as $x | try $x.a)", "{}\n"),
+        // A `$var` marker bound at a position the register's frame can compare and
+        // does not name is a different node, whatever it equals: jq's own refusal,
+        // caught, through every forwarder that names it (equal-valued siblings).
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"del(.a as $y | .c | try (first($y) as {b:$q} | $q))",
+            "{\"a\":{\"b\":1},\"c\":{\"b\":1}}\n",
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"[path(.a as $y | .c | try ((if true then $y else 1 end) as $z | $z.b))] | length | tostring",
+            "\"0\"\n",
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"[path(.a as $y | .c | try (($y // 1) as $z | $z.b))] | length | tostring",
+            "\"0\"\n",
+        ),
         // The marker keeps its mark only while it equals the register at the use
         // site: here the register has moved onto `.a`, which `$x` (the root) cannot
         // be, so jq's own refusal is caught.

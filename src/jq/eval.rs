@@ -121034,6 +121034,93 @@ mod tests {
         }
     }
 
+    /// #3423: `may_alias_register` reads the forwarders (`,`, `if`, `//`, `try`,
+    /// `first`/`last`/`limit`/`nth`, `label`, a rebind, `select`, a pipe) over the
+    /// aliasing leaves (`.` and a `$var`), and nothing else: a value the source
+    /// builds or derives is never the register. A `catch` handler's `.` is the error
+    /// payload, so only a `$var` it names counts there.
+    #[test]
+    fn test_may_alias_register_reads_forwarders_over_aliasing_leaves_3423() {
+        for (filter, expected) in [
+            // Leaves.
+            (".", true),
+            ("$x", true),
+            // Forwarders over `.`.
+            ("(., 1)", true),
+            ("(1, .)", true),
+            ("if .a then 1 else . end", true),
+            ("(null // .)", true),
+            ("try . catch 1", true),
+            ("(.)?", true),
+            ("first(., 1)", true),
+            ("last(1, .)", true),
+            ("limit(1; ., 1)", true),
+            ("nth(0; ., 1)", true),
+            ("label $l | (., 1)", true),
+            ("(. as $z | .)", true),
+            ("(. as {a:$q} | .)", true),
+            ("select(.a)", true),
+            ("numbers", true),
+            ("((., 1) | .)", true),
+            ("(. | (., 1) | select(true))", true),
+            // A handler's `.` is the payload; a `$var` there is still a leaf.
+            ("try 1 catch .", false),
+            // Values the source builds or derives are never the register.
+            ("1", false),
+            ("{a: .}", false),
+            ("[.]", false),
+            ("(. + {})", false),
+            ("walk(.)", false),
+            ("with_entries(.)", false),
+            ("del(.zz)", false),
+            ("del(.[5])", false),
+            ("(. | tojson | fromjson)", false),
+            ("(. | tostring)", false),
+            (".a", false),
+            ("(.a, .b)", false),
+            ("(.a // .b)", false),
+            ("first(.a, .b)", false),
+            // The input of a pipe's last stage is what the stages before it left.
+            ("(1 | .)", false),
+            ("(.a | .)", false),
+        ] {
+            let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            assert_eq!(may_alias_register(&expr, None), expected, "{filter}");
+        }
+    }
+
+    /// #3423: a `$var` marker bound at a position the register's own frame names is
+    /// an aliasing leaf; bound at another position it is a different node, whatever
+    /// it equals, and only the frame of a trackable entry can say so.
+    #[test]
+    fn test_may_alias_register_compares_a_marker_with_the_registers_position_3423() {
+        let at = |components: Vec<Expr>| Origin::At {
+            invocation: 7,
+            path: BindPath(PathPrefix::extend_many(&PathPrefix::root(), components)),
+        };
+        let marker = |origin: Origin| {
+            Expr::TrackedVar(Rc::new(Tracked {
+                value: OwnedValue::Null,
+                origin,
+                node: None,
+            }))
+        };
+        let source =
+            |origin: Origin| Expr::Comma(vec![marker(origin), Expr::Literal(Literal::Null)]);
+        // The register stands at the root of invocation 7.
+        let frame = Frame::at(7, PathPrefix::root());
+        let at_root = at(Vec::new());
+        let at_a = at(vec![Expr::Field("a".to_string())]);
+        assert!(may_alias_register(&source(at_root.clone()), Some(&frame)));
+        assert!(!may_alias_register(&source(at_a.clone()), Some(&frame)));
+        // No frame (an untracked entry): the position is not the register's, so a
+        // marker is conservatively an alias, as is any other origin kind.
+        assert!(may_alias_register(&source(at_a), None));
+        assert!(may_alias_register(&source(Origin::Snapshot), Some(&frame)));
+        assert!(may_alias_register(&source(Origin::Untracked), Some(&frame)));
+        assert!(may_alias_register(&source(Origin::Unproven), Some(&frame)));
+    }
+
     /// #3334 review: an empty comma yields nothing, so it is not an identity
     /// passthrough in either grammar (the `//`/`try` soundness arguments
     /// rest on at least one output). The codebase does build them, e.g.
