@@ -44416,8 +44416,14 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                     // loss state is stood in for: it is the identity of `bound`, not
                     // the register, that is unknown, and a caught guess is a write jq
                     // makes silently dropped.
-                    let may_be_register =
-                        register.is_some_and(|reg| bound == reg) && !is_provably_fresh_source(head);
+                    //
+                    // Only a refusal at the first step can be that: with the source taken
+                    // for the register (`identical`) the first step passes, and a later
+                    // step's refusal is jq's own verdict, which a `try` catches
+                    // (`try (. as {a:$q, b:$r} | $r)`).
+                    let may_be_register = !identical
+                        && register.is_some_and(|reg| bound == reg)
+                        && !is_provably_fresh_source(head);
                     return ResolveFlow::Escaped(match control {
                         Control::Error(e) => EvalEscape::Error(guess_refusal_of(
                             e,

@@ -93891,6 +93891,13 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
             "{\"a\":{\"b\":1}}\n",
         ),
         (doc, r"del(. as $x | try $x.a)", "{}\n"),
+        // A later step's refusal is jq's own, so it stays catchable: the source IS the
+        // register here, the first step passes, and `{a:$q, b:$r}` refuses at `b`.
+        (
+            r#"{"a":[1,2,3],"b":{"c":5}}"#,
+            r"del(try (. as {a:$q, b:$r} | $r))",
+            "{\"a\":[1,2,3],\"b\":{\"c\":5}}\n",
+        ),
         (doc, r"del(first(.) as $x | try $x.a)", "{}\n"),
         (doc, r"del(select(true) as $x | try $x.a)", "{}\n"),
         (doc, r"del(. as $o | (., 1) as $x | try $x.a)", "{}\n"),
