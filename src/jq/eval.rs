@@ -43651,6 +43651,12 @@ fn resolve_bind_source_witness<S: EvalSemantics>(
 fn is_transparent_bind_source(source: &Expr) -> bool {
     match unwrap_bind_source(source) {
         Expr::Identity | Expr::Builtin(Builtin::Select(_)) => true,
+        // #3423: a literal or construction is a value jq builds fresh, never the
+        // register, and the resolver places it as computed (an untracked branch,
+        // bound by value) -- the one thing the grammar needs of a leaf. It is what
+        // keeps `select(false) // {"a":1}` an exact source rather than an
+        // ambiguous one.
+        Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) | Expr::StringInterpolation(_) => true,
         Expr::Optional(inner)
         | Expr::FirstExpr(inner)
         | Expr::Limit { expr: inner, .. }
@@ -43763,7 +43769,7 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
         value,
         trackable,
         frame,
-        &mut |bound, origin| {
+        &mut |bound, origin, witnessed| {
             // #3423: a source the resolver neither certified (`origin`) nor knows to be
             // `.` ([`identity_passthrough`]) nor can show fresh, whose output is
             // value-equal to the register, may be that register's own node (a
@@ -43776,6 +43782,7 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
             // reference to it states the register lost, so that refusal is the guess
             // it is (loud, uncatchable: #3267).
             let ambiguous = S::TAG == EvalTag::Jq
+                && !witnessed
                 && origin.is_none()
                 && !identity_passthrough(source, true)
                 && !is_provably_fresh_source(source)
@@ -43812,13 +43819,15 @@ fn resolve_bind_source_sink<S: EvalSemantics>(
     value: &OwnedValue,
     trackable: bool,
     frame: &Frame,
-    bind: &mut dyn FnMut(OwnedValue, Option<Origin>) -> ResolveFlow,
+    // The third argument says the value came through a witness route, where the
+    // resolver placed every output of the source itself (#3423).
+    bind: &mut dyn FnMut(OwnedValue, Option<Origin>, bool) -> ResolveFlow,
 ) -> ResolveFlow {
     if let Some((values, trailing)) =
         resolve_bind_source_witness::<S>(source, body, var, value, trackable, frame)
     {
         for (bound, origin) in values {
-            match bind(bound, origin) {
+            match bind(bound, origin, true) {
                 ResolveFlow::Exhausted => {}
                 other => return other,
             }
@@ -43843,7 +43852,7 @@ fn resolve_bind_source_sink<S: EvalSemantics>(
         Reentry::at_register(trackable),
         &mut |bound| {
             stashed.begin();
-            match bind(bound, None) {
+            match bind(bound, None, false) {
                 ResolveFlow::Exhausted => Demand::Continue,
                 other => {
                     if let ResolveFlow::Escaped(escape) = &other {
