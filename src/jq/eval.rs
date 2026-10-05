@@ -47457,7 +47457,7 @@ const RECURSE_MAX_ITEMS: usize = 10000;
 /// able to raise. A `cond` can reject children `..` would visit, and any other
 /// `f` can be unbounded (`recurse(.a)` on `null`), so neither qualifies.
 /// Judged on the caller's own `f`, before [`Reentry::reroot`] rewrites it.
-fn is_structural_descent(f: &Expr, cond: Option<&Expr>) -> bool {
+pub(crate) fn is_structural_descent(f: &Expr, cond: Option<&Expr>) -> bool {
     let mut f = f;
     while let Expr::Paren(inner) = f {
         f = inner;

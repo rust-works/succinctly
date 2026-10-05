@@ -51635,3 +51635,33 @@ fn yq_walk_over_a_scalar_keeps_the_by_value_route_3713() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3773: `recurse(.[]?)` reads the same position off each node over YAML as it
+/// does in jq mode: `key`, `parent` and `path` after it answer what they answer
+/// after `..`, instead of losing the node's position inside a collect.
+///
+/// Real yq's lexer rejects `recurse` (v4.53.3), so the spelled-out form is a
+/// succinctly extension behind `--jq-extensions` that follows jq's definition,
+/// `def recurse: recurse(.[]?);`. The pinned reference is yq's own `..`.
+#[test]
+fn test_yq_recurse_structural_descent_reads_position_like_recursive_descent_3773() -> Result<()> {
+    let doc = "a: [1, {b: 2}]\nc: null\nd: s\ne: {f: []}\n";
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    // Pinned to literal output so a regression that broke `..` and
+    // `recurse(.[]?)` alike could not pass by agreeing.
+    let (stdout, code) = run_yq_stdin("[recurse(.[]?) | key]", doc, &args)?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"a\",0,1,\"b\",\"c\",\"d\",\"e\",\"f\"]\n", 0)
+    );
+    for tail in ["key", "parent | length", "path", "[key, (parent | length)]"] {
+        for context in ["[X | T]", "X | T", ".a | [X | T]", "first(X | T)"] {
+            let spell = |x: &str| context.replace('X', x).replace('T', tail);
+            let (want, c1) = run_yq_stdin(&spell(".."), doc, &args)?;
+            let (got, c2) = run_yq_stdin(&spell("recurse(.[]?)"), doc, &args)?;
+            assert_eq!((c1, c2), (0, 0), "`{context}` / `{tail}`");
+            assert_eq!(got, want, "`{context}` / `{tail}` vs `..`");
+        }
+    }
+    Ok(())
+}

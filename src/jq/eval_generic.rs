@@ -10284,6 +10284,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
+        // #3773: `recurse(.[]?)` is jq's own definition of bare `recurse`, so it
+        // keeps each node's cursor here too.
+        Expr::Builtin(Builtin::RecurseF(f))
+            if cursor.is_some() && crate::jq::eval::is_structural_descent(f, None) =>
+        {
+            collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
         Expr::Pipe(exprs) => {
             eval_single_pipe::<S, V>(exprs, &PipeWhole::given(expr), value, optional, cursor)
         }
@@ -12105,6 +12112,15 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // `OwnedValue` round trip the wildcard below would take.
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
             if cursor.is_some() =>
+        {
+            each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), sink)
+        }
+        // #3719: jq defines bare `recurse` as `recurse(.[]?)`, so the spelled-out
+        // form is the same walk and takes the same cursor route. Without this it
+        // materialized the whole alias-expanded document before delivering its
+        // first node, where `..` costs nothing until a node is asked for.
+        Expr::Builtin(Builtin::RecurseF(f))
+            if cursor.is_some() && crate::jq::eval::is_structural_descent(f, None) =>
         {
             each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), sink)
         }
@@ -21069,6 +21085,10 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
         Expr::Slice { .. }
         | Expr::RecursiveDescent
         | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        // #3773: `recurse(.[]?)` is jq's definition of bare `recurse`.
+        Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
+            true
+        }
         Expr::SliceExpr { target, start, end } => {
             (nav(target) || path_context_component_walkable(target))
                 && start
@@ -21615,6 +21635,9 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             path_context_step_getpath::<S, V>(path_expr, pos, out)
         }
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
+            path_context_step_recurse::<S, V>(pos, out)
+        }
+        Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
             path_context_step_recurse::<S, V>(pos, out)
         }
         // spine 2416 (walk residue): the transparent wrappers, at the head
@@ -23857,6 +23880,10 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
         }
         Expr::Label { body, .. } => step_can_yield_absent(body, incoming),
         Expr::Shared(inner) => step_can_yield_absent(inner, incoming),
+        // #3773: a structural `recurse(.[]?)` is deliberately not listed with `..`
+        // here or in `path_context_stage_preserves_node`: both fall to the
+        // conservative arm, which only sends such a pipe down the owned route
+        // and answers identically, so an arm could not be pinned.
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => incoming,
         Expr::Break(_)
         | Expr::Error(_)
@@ -28341,6 +28368,9 @@ fn owned_identity_nav_supported(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::First | Builtin::Last) => true,
         Expr::Builtin(Builtin::Nth(n)) => owned_identity_component_supported(n),
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
+            true
+        }
         Expr::Optional(inner) | Expr::Paren(inner) => owned_identity_nav_supported(inner),
         Expr::Pipe(exprs) => exprs.iter().all(owned_identity_nav_supported),
         _ => false,
@@ -29016,6 +29046,9 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             out,
         ),
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
+            owned_identity_recurse_step::<S, V>(value, id, out).map_err(Control::Error)
+        }
+        Expr::Builtin(Builtin::RecurseF(f)) if crate::jq::eval::is_structural_descent(f, None) => {
             owned_identity_recurse_step::<S, V>(value, id, out).map_err(Control::Error)
         }
         // #2771: a literal has no position of its own. Reached only from
