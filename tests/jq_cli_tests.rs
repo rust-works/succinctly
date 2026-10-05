@@ -64872,13 +64872,51 @@ fn test_foreach_keeps_the_register_for_a_frozen_variable_after_it_3761() -> Resu
 /// UPDATE at, and every input kind refuses loudly (exit 5) -- the refusal is this
 /// resolver's guess, not jq's verdict, so no `try` turns it into a dropped
 /// write. Matching jq's answer needs `or`'s short-circuit modelled, which is not
-/// done here.
+/// done here. On `{"a":true,"b":2}` the four `.[]?` rows match jq since #3770:
+/// with the generator no longer withholding the fold register, `$k` (`true`) is
+/// identical to it by kind.
 #[test]
 fn test_foreach_true_or_update_extracting_the_variable_never_answers_the_root_3775() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":true,"b":2}"#,
+            r"path(foreach .a? as $k (0; (true or .[]?); $k))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"b":2}"#,
+            r"(foreach .a? as $k (0; (true or .[]?); $k)) = 9",
+            "{\"a\":9,\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"b":2}"#,
+            r"(foreach .a? as $k (0; (true or .[]?); $k)) |= 9",
+            "{\"a\":9,\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"b":2}"#,
+            r"del(foreach .a? as $k (0; (true or .[]?); $k))",
+            "{\"b\":2}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"b":2}"#,
+            r"path(foreach .a as $k (0; (true or .b); null))",
+            "",
+            "Invalid path expression with result null",
+            5,
+        ),
+    ])?;
     for doc in [
         "null",
         r#"{"b":2}"#,
-        r#"{"a":true,"b":2}"#,
         r#"{"a":false}"#,
         r#"{"a":null,"b":2}"#,
     ] {

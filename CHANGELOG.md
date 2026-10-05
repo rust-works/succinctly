@@ -100,7 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #3738's `is_single_path_chain` allowlist; #3769's fix (#3777) removed the root-path relocation that made this unsafe.
   A comma body still answers nothing where jq answers, and on a `null` document `//` around a generator
   (`(foreach .a? as $k (0; try (($k | .[]?) // $k); .)) = 9`, `{"a":9}` in jq) now refuses loudly where it used to skip
-  the write (#3788). Pinned by `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`.
+  the write (#3788). #3775's `(true or .[]?)` UPDATE now matches jq when `.a` is `true` (`path(...)` is `["a"]`, `= 9`
+  writes `{"a":9,"b":2}`). Pinned by `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`.
 
 - **jq: `last(f)` keeps the identity of `f`'s last output, so a result that is jq's path register stays one** (#3766, a #3643 follow-up).
   jq defines `last(f)` as `reduce f as $x (null; $x)`, so the result is the very value `f` last emitted, and `path()` accepts a result
