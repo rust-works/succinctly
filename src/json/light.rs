@@ -3634,6 +3634,12 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         JsonCursor::next_sibling(self)
     }
 
+    /// The balanced-parentheses excess at this node's open: a rank lookup.
+    #[inline]
+    fn tree_depth(&self) -> Option<usize> {
+        self.index.bp().depth(self.bp_pos)
+    }
+
     type Value = StandardJson<'a, W>;
 
     #[inline]
