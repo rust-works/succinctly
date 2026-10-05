@@ -539,8 +539,9 @@ Each turns a refusal into an answer and needs its own oracle rows:
   leave the register where it entered, `.a` still moves it. The count is a subexp. And
   `array_contents_are_checked` asks `is_select_stage` (select or a type filter), where it named
   only `select`. Still open under #3767: a `catch` handler, a compound inner stage (`,` `//`
-  `if`, a pipe, a `def` call), an `[E]` of a navigating `f` or of a wrapper around a type filter
-  (`[first(numbers)]`), and a wrapper over an inner stage that navigates nothing (`first(.)`,
+  `if`, a pipe, a `def` call), an `[E]` of a wrapper around a type filter
+  (`[first(numbers)]`; `[last(f)]` is Done by #3767 Part 2: `array_contents_are_checked` reads through
+  `last(f)` to `f`), and a wrapper over an inner stage that navigates nothing (`first(.)`,
   `limit(1; .)`, `limit(1; 5)`), which jq leaves in place and the allowlist does not read through.
 - The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
   turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`

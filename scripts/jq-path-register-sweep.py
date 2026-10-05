@@ -307,6 +307,23 @@ OPERANDS = [
     "last(empty)",
     "last(first(.a))",
     "last(.a | .b?)",
+    # (#3767) `last(f)` inside a collect: the `[E]` claim reads through it, so `f` is
+    # judged as the claim judges it. The contrasts are an `f` jq path-checks on a
+    # computed value (`1 | .a`, `.a | tostring | .b`), which must keep raising, and
+    # the generators the allowlist does not read (`first(f)`, `//`, `limit`).
+    "[last(.a)]",
+    "[last(.[]?)]",
+    "[last(.a?, .b)]",
+    "[last(empty)]",
+    "[last(.a | .b?)]",
+    "[last(1 | .a)]",
+    "[last(.a | tostring | .b)]",
+    "[last(.a | add)]",
+    "[last(first(.a, .b))]",
+    "[last(.a // .b)]",
+    "[last(limit(1; .[]?))]",
+    "[last(.[]? | select(.))]",
+    "[try last(1 | .a)]",
     "first(.a)",
     "nth(0; .a)",
     "limit(1; .a)",

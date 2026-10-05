@@ -64720,9 +64720,10 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
             5,
         ),
         // Still refused where jq answers `[]`: a compound stage mixing `last`
-        // with a navigating leaf is judged as a whole, and an `[E]` collect
-        // around it is a separate promotion. Pinned as today's (refuse-only)
-        // behaviour so lifting either is a deliberate change.
+        // with a navigating leaf is judged as a whole (the `[E]` collect around
+        // `last(f)` was lifted by #3767, see
+        // `test_collect_last_f_keeps_the_register_3767`). Pinned as today's
+        // (refuse-only) behaviour so lifting it is a deliberate change.
         (
             doc,
             r"path(. as $x | (last(.a) // .k) | $x)",
@@ -64730,7 +64731,180 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
             with_root,
             5,
         ),
-        (doc, r"path(. as $x | [last(.a)] | $x)", "", with_root, 5),
+        // #3767: inside the collect, the generators the `[E]` allowlist does not
+        // read stay refused where jq answers `[]` (jq's own `first(f)`, `//` and
+        // `limit` emit from inside the fork and move the register).
+        (
+            doc,
+            r"path(. as $x | [last(first(.a, .k))] | $x)",
+            "",
+            with_root,
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | [last(.a // .k)] | $x)",
+            "",
+            with_root,
+            5,
+        ),
+    ])
+}
+
+/// #3767: a `last(f)` inside an `[E]` collect keeps jq's path register. jq defines
+/// `last(f)` as `reduce f as $x (null; $x)` and the collect backtracks, so the
+/// register is where the array entered and a `$x` frozen there is the register
+/// again (`path(. as $x | [last(.a)] | $x)` on `{"a":{"b":1},"k":2}` is `[]`), on
+/// `path`, `del`, `=` and `|=`. The `[E]` claim reads through `last(f)` to `f`
+/// itself, so an `f` jq path-checks on a computed value still raises (`[last(1 |
+/// .a)]`, `[last(.a | tostring | .b)]`), the output is demoted so a navigation
+/// after it inside the brackets still refuses (`[last(.a)] | .k`), and the
+/// generators the allowlist does not read (`first(f)`, `//`, `limit`) keep
+/// refusing where jq answers. Every row captured from jq 1.7.1, on the stdin
+/// and `-n` routes.
+#[test]
+fn test_collect_last_f_keeps_the_register_3767() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(.a)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(.a)] | $x | .k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(.a)] | .k)",
+            "",
+            r#"Invalid path expression near attempt to access element "k" of [{"b":1}]"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(.a)] | $x.k)",
+            "[\"k\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(1 | .a)] | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 1"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(.a | tostring | .b)] | $x)",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of "{\"b\":1}""#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(.a?, .k)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(.[])] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(empty)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(.a | .b)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(.a | add)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [last(.a | first)] | $x)",
+            "",
+            r"Cannot index object with number",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(. as $x | [last(.a)] | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"(. as $x | [last(.a)] | $x.k) |= 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"del(. as $x | [last(.zz)] | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r#"try path(. as $x | [last(1 | .a)] | $x) catch "caught""#,
+            "\"caught\"\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":2}"#,
+            r"path(. as $x | [try last(1 | .a)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1,2],"k":2}"#,
+            r"path(. as $x | [last(.a[])] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1,2],"k":2}"#,
+            r"path(. as $x | [last(.a[] | select(. > 1))] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1],[2]]",
+            r"path(. as $x | [last(.[] | .[0])] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
     ])
 }
 
