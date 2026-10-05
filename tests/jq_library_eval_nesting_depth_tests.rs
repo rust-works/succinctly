@@ -91,55 +91,117 @@ fn test_public_eval_accepts_depth_under_limit_2627() {
     assert!(!result.is_error(), "unexpected error: {result:?}");
 }
 
-/// #3457: the path family reports a document nested past the generic
-/// walkers' 256 ceiling as an ordinary `QueryResult::Error`, through the
-/// public entry with no `catch_unwind` net and not as a panic. The error is
-/// decode-failure-tagged, so a `try` in the running filter cannot swallow it
-/// (a plain error would let `try ... catch` turn a stack-safety guard into an
-/// ordinary answer).
-#[test]
-fn test_public_eval_path_family_over_depth_is_a_clean_error_3457() {
-    for depth in [256, 300, 384, 1000] {
-        let json = nested_arrays(depth);
-        let bytes = json.as_bytes();
-        let index = JsonIndex::build(bytes);
-        for filter in [
-            "[paths] | length",
-            "[leaf_paths] | length",
-            "[path(..)] | length",
-            r#"try ([paths] | length) catch "swallowed""#,
-        ] {
+/// `QueryResult` of `filter` over `json`, through the public entry on a
+/// thread of an explicit stack size.
+///
+/// The native path walkers need ~1.4 MiB at 383 levels on a debug build
+/// (`MAX_PATH_WALK_DEPTH`'s doc comment has the table), so a default 2 MiB
+/// test thread leaves them only a ~1.4x margin. 8 MiB keeps these tests off
+/// that edge on any platform's frame sizes: they pin the ceiling, not the
+/// margin.
+fn run_on_big_stack(json: String, filter: &'static str) -> Result<Vec<String>, (bool, String)> {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let bytes = json.as_bytes();
+            let index = JsonIndex::build(bytes);
             let expr = parse(filter).expect("parse failed");
             let result: QueryResult<Vec<u64>> =
                 eval::<Vec<u64>, JqSemantics>(&expr, index.root(bytes));
             match result {
-                QueryResult::Error(e) => {
-                    assert!(e.is_decode_failure(), "{filter} @ {depth}: {e:?}");
-                    assert_eq!(
-                        e.to_string(),
-                        "nesting depth exceeds limit of 256",
-                        "{filter} @ {depth}"
-                    );
-                }
-                other => panic!("{filter} @ {depth}: expected an error, got {other:?}"),
+                QueryResult::Error(e) => Err((e.is_decode_failure(), e.to_string())),
+                other => Ok(other
+                    .collect_owned_checked::<JqSemantics>()
+                    .expect("collects")
+                    .iter()
+                    .map(OwnedValue::to_json)
+                    .collect()),
             }
+        })
+        .expect("spawns")
+        .join()
+        .expect("must not overflow the stack")
+}
+
+/// #3457/#3429: the path family reports a document nested past the walkers'
+/// ceiling as an ordinary `QueryResult::Error`, through the public entry
+/// with no `catch_unwind` net and not as a panic. The error is
+/// decode-failure-tagged, so a `try` in the running filter cannot swallow it
+/// (a plain error would let `try ... catch` turn a stack-safety guard into an
+/// ordinary answer).
+///
+/// The native walkers (`paths`, `leaf_paths`, `.. | path`) stop at
+/// `MAX_PATH_WALK_DEPTH` (384); `path(..)` materializes the document first and
+/// stops at `MAX_NESTING_DEPTH` (256).
+#[test]
+fn test_public_eval_path_family_over_depth_is_a_clean_error_3457() {
+    for (filter, depths, limit) in [
+        ("[paths] | length", &[384, 1000][..], 384),
+        ("[leaf_paths] | length", &[384, 1000][..], 384),
+        ("[.. | path] | length", &[384, 1000][..], 384),
+        (
+            r#"try ([paths] | length) catch "swallowed""#,
+            &[384, 1000][..],
+            384,
+        ),
+        ("[path(..)] | length", &[256, 300, 384, 1000][..], 256),
+    ] {
+        for &depth in depths {
+            let outcome = run_on_big_stack(nested_arrays(depth), filter);
+            let (decode_failure, message) =
+                outcome.expect_err(&format!("{filter} @ {depth}: expected an error"));
+            assert!(decode_failure, "{filter} @ {depth}: {message}");
+            assert_eq!(
+                message,
+                format!("nesting depth exceeds limit of {limit}"),
+                "{filter} @ {depth}"
+            );
         }
     }
 }
 
 /// Companion to the test above: just under the ceiling the same queries
-/// answer.
+/// answer -- for the native walkers that includes the 256-383 band the
+/// materializers' ceiling used to refuse (#3429).
 #[test]
 fn test_public_eval_path_family_under_depth_answers_3457() {
-    let json = nested_arrays(200);
-    let bytes = json.as_bytes();
-    let index = JsonIndex::build(bytes);
-    let expr = parse("[paths] | length").expect("parse failed");
-    let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, index.root(bytes));
-    match result {
-        QueryResult::Owned(OwnedValue::Int(n)) => assert_eq!(n, 200),
-        other => panic!("expected Owned(200), got: {other:?}"),
+    for depth in [200, 255, 256, 300, 383] {
+        for (filter, expected) in [
+            ("[paths] | length", depth),
+            ("[leaf_paths] | length", 1),
+            ("[.. | path] | length", depth + 1),
+        ] {
+            assert_eq!(
+                run_on_big_stack(nested_arrays(depth), filter),
+                Ok(vec![expected.to_string()]),
+                "{filter} @ {depth}"
+            );
+        }
     }
+    // The materializing form is still bounded by the lower ceiling.
+    assert_eq!(
+        run_on_big_stack(nested_arrays(255), "[path(..)] | length"),
+        Ok(vec!["256".to_string()])
+    );
+}
+
+/// #3429: a static chain (`path(.k.k...k)`) is bounded by the same ceiling:
+/// the guard runs before each stage's step, so 384 components are the most it
+/// takes and the 385th refuses as a decode failure -- not a native stack
+/// overflow.
+#[test]
+fn test_public_eval_static_path_chain_ceiling_3429() {
+    let doc = format!("{}{{}}{}", "{\"k\":".repeat(400), "}".repeat(400));
+    let chain = |n: usize| -> &'static str {
+        Box::leak(format!("path({}) | length", ".k".repeat(n)).into_boxed_str())
+    };
+    assert_eq!(
+        run_on_big_stack(doc.clone(), chain(384)),
+        Ok(vec!["384".to_string()])
+    );
+    let (decode_failure, message) = run_on_big_stack(doc, chain(385)).expect_err("refuses");
+    assert!(decode_failure, "{message}");
+    assert_eq!(message, "nesting depth exceeds limit of 384");
 }
 
 /// #3457: `..`/`recurse` over a document far deeper than any native stack
