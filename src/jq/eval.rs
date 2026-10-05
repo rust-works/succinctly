@@ -5361,6 +5361,32 @@ pub(crate) fn try_swallows_scalar_iteration(expr: &Expr, catch: Option<&Expr>) -
         })
 }
 
+/// The constant a `try .[] catch LITERAL` boundary answers with for a scalar
+/// input (#3704), or `None` when the boundary is not that shape.
+///
+/// The handler of such a boundary never reads its input, so the payload
+/// `.[]` would raise -- a preview string and an owned copy of the scalar --
+/// is built only to be handed to a handler that ignores it, and the handler
+/// then runs over a re-indexed one-scalar document. The literal is the
+/// handler's one output whatever the payload. Same shape rules as
+/// [`try_swallows_scalar_iteration`]: both operands are peeled by
+/// [`unwrap_bind_source`] (a closure argument arrives as `Expr::Shared`), and
+/// a `def` shadowing nothing here is a `DefCall`, never a `Literal`. A string
+/// with an interpolation is an `Expr::Format`/`Interpolation`, not a
+/// `Literal`, so it stays on the evaluating route.
+pub(crate) fn try_catches_scalar_iteration_with_literal<'e>(
+    expr: &Expr,
+    catch: Option<&'e Expr>,
+) -> Option<&'e Literal> {
+    if !matches!(unwrap_bind_source(expr), Expr::Iterate) {
+        return None;
+    }
+    match unwrap_bind_source(catch?) {
+        Expr::Literal(lit) => Some(lit),
+        _ => None,
+    }
+}
+
 /// Fold `e` into a terminal suppress-or-raise `QueryResult`, per
 /// [`suppresses`]. Collapses the `Err(e) if suppresses(...) =>
 /// QueryResult::None, Err(e) => QueryResult::Error(e)` arm-pair that
@@ -6715,6 +6741,18 @@ fn each_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     >(expr, catch, &value)
     {
         return settled.map_or_else(|e| Flow::Escaped(Control::Error(e)), |()| Flow::Exhausted);
+    }
+    // #3704: a constant handler over a scalar `.[]` answers itself.
+    if let Some(caught) = crate::jq::eval_generic::caught_scalar_iteration::<S, StandardJson<'a, W>>(
+        expr, catch, &value,
+    ) {
+        return match caught {
+            Ok(v) => match sink(Item::Owned(v)) {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            },
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        };
     }
 
     match eval_each::<W, S>(expr, value, optional, sink) {
@@ -13489,6 +13527,12 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     >(expr, catch, &value)
     {
         return settled.map_or_else(QueryResult::Error, |()| QueryResult::None);
+    }
+    // #3704: a constant handler over a scalar `.[]` answers itself.
+    if let Some(caught) = crate::jq::eval_generic::caught_scalar_iteration::<S, StandardJson<'a, W>>(
+        expr, catch, &value,
+    ) {
+        return caught.map_or_else(QueryResult::Error, QueryResult::Owned);
     }
 
     // Evaluate the expression
@@ -114133,6 +114177,181 @@ mod tests {
         assert!(settle::<JqSemantics, _>(&iterate, Some(&handler), &scalar).is_none());
         assert!(settle::<JqSemantics, _>(&field, None, &scalar).is_none());
         assert!(settle::<JqSemantics, _>(&iterate, None, &container).is_none());
+    }
+
+    /// #3704: the constant-handler shortcut's gate, which no output can show.
+    /// Taken for a bare `.[]` (under a `Paren` too) with a literal handler, over
+    /// a scalar, in jq mode; the literal is the handler's answer, and what `try`
+    /// never catches still escapes. Not taken for a handler that is not a
+    /// literal (it may read its input), a body that is not a bare `.[]`, a
+    /// container, or in yq mode.
+    #[test]
+    fn caught_scalar_iteration_gate_3704() {
+        use crate::jq::eval_generic::caught_scalar_iteration as settle;
+        let scalar_json: &[u8] = b"5";
+        let scalar_index = JsonIndex::build(scalar_json);
+        let scalar = scalar_index.root(scalar_json).value();
+        let container_json: &[u8] = b"[1]";
+        let container_index = JsonIndex::build(container_json);
+        let container = container_index.root(container_json).value();
+        let undecodable_json: &[u8] = br#""\ud800""#;
+        let undecodable_index = JsonIndex::build(undecodable_json);
+        let undecodable = undecodable_index.root(undecodable_json).value();
+
+        let iterate = Expr::Iterate;
+        let parenthesised = Expr::Paren(Box::new(Expr::Iterate));
+        let literal = parse(r#""c""#).unwrap();
+        let piped = parse(r#""c" | ."#).unwrap();
+        let reads_input = parse(".").unwrap();
+        let empty = parse("empty").unwrap();
+        let field = parse(".a").unwrap();
+
+        for body in [&iterate, &parenthesised] {
+            match settle::<JqSemantics, _>(body, Some(&literal), &scalar) {
+                Some(Ok(v)) => assert_eq!(v.to_json(), r#""c""#),
+                other => panic!("expected the literal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
+            }
+        }
+        match settle::<JqSemantics, _>(&iterate, Some(&literal), &undecodable) {
+            Some(Err(e)) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
+        }
+        assert!(settle::<YqSemantics, _>(&iterate, Some(&literal), &scalar).is_none());
+        // Not taken: no handler, a handler that is not a literal, a body that is
+        // not a bare `.[]`, a container.
+        assert!(settle::<JqSemantics, _>(&iterate, None, &scalar).is_none());
+        assert!(settle::<JqSemantics, _>(&iterate, Some(&empty), &scalar).is_none());
+        assert!(settle::<JqSemantics, _>(&iterate, Some(&piped), &scalar).is_none());
+        assert!(settle::<JqSemantics, _>(&iterate, Some(&reads_input), &scalar).is_none());
+        assert!(settle::<JqSemantics, _>(&field, Some(&literal), &scalar).is_none());
+        assert!(settle::<JqSemantics, _>(&iterate, Some(&literal), &container).is_none());
+    }
+
+    /// #3704: `try .[] catch LITERAL` over a scalar answers exactly what the
+    /// evaluated boundary did. The reference is the same handler spelled as a
+    /// pipe (`LITERAL | .`), which is not a `Literal` and so never takes the
+    /// shortcut; both evaluators' routes are driven, in both modes, over a
+    /// scalar of every kind, a container, and the scalars `try` never catches.
+    #[test]
+    fn eval_rs_constant_handler_over_scalar_iteration_matches_the_evaluated_boundary_3704() {
+        fn pulled<S: EvalSemantics>(json: &[u8], filter: &str) -> String {
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap();
+            match eval_full::<Vec<u64>, S>(&expr, index.root(json)) {
+                QueryResult::None => "none".to_owned(),
+                QueryResult::Owned(v) => v.to_json(),
+                QueryResult::ManyOwned(vs) => {
+                    format!(
+                        "{:?}",
+                        vs.iter().map(OwnedValue::to_json).collect::<Vec<_>>()
+                    )
+                }
+                // A container is not caught: its members, not a handler's answer.
+                QueryResult::Many(vs) => format!("members {}", vs.len()),
+                QueryResult::Error(e) => format!("error decode={}", e.is_decode_failure()),
+                other => panic!("`{filter}` on {json:?}: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
+            }
+        }
+        fn pushed<S: EvalSemantics>(json: &[u8], filter: &str, stop_after: usize) -> String {
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap();
+            let mut out = Vec::new();
+            let flow = eval_each::<Vec<u64>, S>(&expr, index.root(json).value(), false, &mut |i| {
+                out.push(i.into_owned::<S>().unwrap().to_json());
+                if out.len() >= stop_after {
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            });
+            match flow {
+                Flow::Exhausted => format!("exhausted {out:?}"),
+                Flow::Stopped { .. } => format!("stopped {out:?}"),
+                Flow::Escaped(Control::Error(e)) => {
+                    format!("escaped decode={} {out:?}", e.is_decode_failure())
+                }
+                _ => panic!("`{filter}` on {json:?}: unexpected flow"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3704 pin, only reached when the pin is already failing"
+            }
+        }
+        let documents: [&[u8]; 9] = [
+            b"5",
+            br#""abc""#,
+            b"null",
+            b"true",
+            b"[1,2]",
+            b"{}",
+            br#""\ud800""#,
+            b"1.2.3",
+            b"1e999",
+        ];
+        for literal in [
+            "\"c\"",
+            "1",
+            "null",
+            "false",
+            "-1",
+            "1.000",
+            "100000000000000000000",
+        ] {
+            let constant = format!("try .[] catch {literal}");
+            let evaluated = format!("try .[] catch ({literal} | .)");
+            for json in documents {
+                assert_eq!(
+                    pulled::<JqSemantics>(json, &constant),
+                    pulled::<JqSemantics>(json, &evaluated),
+                    "{constant} on {json:?}"
+                );
+                assert_eq!(
+                    pulled::<YqSemantics>(json, &constant),
+                    pulled::<YqSemantics>(json, &evaluated),
+                    "{constant} on {json:?}, yq"
+                );
+                for stop_after in [1, usize::MAX] {
+                    assert_eq!(
+                        pushed::<JqSemantics>(json, &constant, stop_after),
+                        pushed::<JqSemantics>(json, &evaluated, stop_after),
+                        "{constant} on {json:?}, stop after {stop_after}"
+                    );
+                    assert_eq!(
+                        pushed::<YqSemantics>(json, &constant, stop_after),
+                        pushed::<YqSemantics>(json, &evaluated, stop_after),
+                        "{constant} on {json:?}, yq, stop after {stop_after}"
+                    );
+                }
+            }
+        }
+        // The shortcut is not a no-op: a catchable scalar answers the literal
+        // without the re-index the evaluated handler pays, on both routes.
+        let reindexes = |run: &dyn Fn()| {
+            let before = crate::jq::value::reindex_count::get();
+            run();
+            crate::jq::value::reindex_count::get() - before
+        };
+        let constant = r#"try .[] catch "c""#;
+        let evaluated = r#"try .[] catch ("c" | .)"#;
+        assert_eq!(
+            reindexes(&|| drop(pulled::<JqSemantics>(b"5", constant))),
+            0
+        );
+        assert_eq!(
+            reindexes(&|| drop(pushed::<JqSemantics>(b"5", constant, usize::MAX))),
+            0
+        );
+        assert!(reindexes(&|| drop(pulled::<JqSemantics>(b"5", evaluated))) > 0);
+        assert!(reindexes(&|| drop(pushed::<JqSemantics>(b"5", evaluated, usize::MAX))) > 0);
+        assert_eq!(
+            pulled::<JqSemantics>(b"5", r#"try .[] catch "c""#),
+            r#""c""#
+        );
+        assert_eq!(
+            pushed::<JqSemantics>(b"5", r#"try .[] catch "c""#, usize::MAX),
+            r#"exhausted ["\"c\""]"#
+        );
+        // What `try` never catches still escapes.
+        assert_eq!(
+            pulled::<JqSemantics>(br#""\ud800""#, r#"try .[] catch "c""#),
+            "error decode=true"
+        );
     }
 
     /// #3689: a bare `.[]?` over a scalar settles in `eval_try` and `each_try`
