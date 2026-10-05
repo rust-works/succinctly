@@ -34192,6 +34192,17 @@ impl Frame {
         })
     }
 
+    /// [`Frame::origin_at`]'s position as an [`Origin::SnapshotAt`]: a marker
+    /// certified by value like a [`Origin::Snapshot`], that also names the node's
+    /// position -- which is all [`Frame::certifies_value`] accepts for an empty
+    /// array (#3494, #3789).
+    fn snapshot_origin_at(&self, path: &Rc<PathPrefix>) -> Option<Origin> {
+        self.extend(path).at.map(|path| Origin::SnapshotAt {
+            invocation: self.invocation,
+            path: BindPath(path),
+        })
+    }
+
     /// Whether a marker with `origin` names exactly this frame's position.
     /// A [`Origin::Snapshot`] marker carries no position and is always
     /// admitted here -- its own rule (value equality) is the caller's -- and
@@ -34879,7 +34890,8 @@ fn may_enter_resolver_node(node: &Expr) -> bool {
 /// `resolve_foreach` walk it that way once this gate lets them). A bare
 /// `Pattern::Var` fold performs no step and stays off this gate -- `at`
 /// remains free for the ordinary write workloads (`.[] |= f`) that use
-/// neither shape.
+/// neither shape -- except a `foreach` whose `$var` reaches a path position
+/// ([`foreach_var_reaches_path_position`], #3789).
 ///
 /// #2896: `getpath` joins the list for the same reason, one step removed.
 /// It mints no *binding*, but it is the one navigating builtin that can
@@ -34903,7 +34915,34 @@ fn may_bind_navigated(expr: &Expr) -> bool {
             e,
             Expr::Reduce { patterns, .. } | Expr::Foreach { patterns, .. }
                 if patterns.iter().any(|p| !matches!(p, Pattern::Var(_)))
-        )
+        ) || foreach_var_reaches_path_position(e)
+    })
+}
+
+/// #3789: a `foreach` whose bare `$var` can reach a path position in UPDATE or
+/// EXTRACT. The step register is the element's node, and an empty-array
+/// element certifies against it only by *position* ([`Frame::certifies_value`],
+/// #3494), so its marker has to name one ([`each_fold_bind`]) -- which needs
+/// `Frame::at`. A `foreach` that only reads `$var` by value (`select($k > 1)`,
+/// an operand) never asks the question and stays off the gate, as does every
+/// `reduce`: it re-seeds no per-step register, and jq refuses the shape too
+/// (`path(reduce .a as $k (.a; $k))` on `{"a":[]}`).
+fn foreach_var_reaches_path_position(expr: &Expr) -> bool {
+    let Expr::Foreach {
+        patterns,
+        update,
+        extract,
+        ..
+    } = expr
+    else {
+        return false;
+    };
+    patterns.iter().any(|pattern| {
+        matches!(pattern, Pattern::Var(name)
+            if var_reaches_path_position(update, name)
+                || extract
+                    .as_deref()
+                    .is_some_and(|extract| var_reaches_path_position(extract, name)))
     })
 }
 
@@ -44899,11 +44938,13 @@ enum WalkOrigins {
 enum FoldBinding<'b> {
     /// A destructuring pattern's walk, deduplicated.
     Pattern(&'b [PatternBinding]),
-    /// A bare `$var` over the whole source element.
+    /// A bare `$var` over the whole source element. `origin` is the marker's
+    /// [`Origin`] when the element is register-derived (#2031) and `None` when
+    /// it binds by value; [`Origin::Snapshot`] is the position-less marker.
     Var {
         name: &'b str,
         value: &'b OwnedValue,
-        tracked: bool,
+        origin: Option<Origin>,
     },
 }
 
@@ -44923,7 +44964,7 @@ impl FoldBind<'_> {
     /// `expr` with this branch's names substituted, then every chain name
     /// it does not bind filled with `null`.
     fn apply(&self, expr: &Expr, origins: WalkOrigins) -> Expr {
-        let mut bound = match self.binding {
+        let mut bound = match &self.binding {
             FoldBinding::Pattern(bindings) => match origins {
                 WalkOrigins::Keep => apply_pattern_bindings(expr, bindings),
                 WalkOrigins::Drop => bindings.iter().fold(expr.clone(), |bound, b| {
@@ -44933,12 +44974,20 @@ impl FoldBind<'_> {
             FoldBinding::Var {
                 name,
                 value,
-                tracked: true,
+                origin: Some(Origin::Snapshot),
             } => substitute_var_tracked(expr, name, value),
             FoldBinding::Var {
                 name,
                 value,
-                tracked: false,
+                origin: Some(origin),
+            } => {
+                let marker = LazyMarker::new(value, origin.clone(), None);
+                substitute_var_impl(expr, name, value, Some(&marker))
+            }
+            FoldBinding::Var {
+                name,
+                value,
+                origin: None,
             } => substitute_var(expr, name, value),
         };
         let null = OwnedValue::Null;
@@ -44951,9 +45000,9 @@ impl FoldBind<'_> {
     }
 
     fn binds(&self, name: &str) -> bool {
-        match self.binding {
+        match &self.binding {
             FoldBinding::Pattern(bindings) => bindings.iter().any(|b| b.name == name),
-            FoldBinding::Var { name: bound, .. } => bound == name,
+            FoldBinding::Var { name: bound, .. } => *bound == name,
         }
     }
 }
@@ -45009,11 +45058,22 @@ fn each_fold_bind<S: EvalSemantics>(
             )
         }
         Pattern::Var(name) => {
+            // #3789: the element is the register's node at `register_path`,
+            // so in jq mode its marker names that position -- the only thing
+            // `Frame::certifies_value` accepts for an empty array, which a
+            // position-less `Snapshot` never certifies. The value rule is
+            // `Snapshot`'s own; yq has no pointer identity to model and keeps it.
+            let origin = elem.register_path.as_ref().map(|path| {
+                (S::TAG == EvalTag::Jq)
+                    .then(|| frame.snapshot_origin_at(path))
+                    .flatten()
+                    .unwrap_or(Origin::Snapshot)
+            });
             let bind = FoldBind {
                 binding: FoldBinding::Var {
                     name,
                     value: &elem.value,
-                    tracked: elem.register_path.is_some(),
+                    origin,
                 },
                 alternatives,
             };
@@ -121355,7 +121415,9 @@ mod tests {
     /// #2676 step 1: `may_bind_navigated`'s syntactic gate widens to admit a
     /// fold's own destructuring pattern, but not a bare `$var` one -- the
     /// bare spelling performs no index step of its own, so `at` stays free
-    /// for it exactly as before.
+    /// for it exactly as before. (#3789 admits one bare-`$var` shape, a
+    /// `foreach` that reads the variable in path position; see
+    /// `test_frame_enter_gate_admits_a_foreach_variable_in_path_position_3789`.)
     #[test]
     fn test_frame_enter_gate_widens_only_for_destructuring_fold_patterns_2676() {
         let gated = |filter: &str| Frame::enter(&parse(filter).unwrap()).at.is_some();
@@ -121363,13 +121425,36 @@ mod tests {
         assert!(gated("path(foreach .b as {c:$x} (.; .; $x))"));
         assert!(gated("path(reduce .b as {c:$x} (.; .))"));
         assert!(gated("path(foreach .a as [$x] (.; .; $x))"));
-        assert!(!gated("path(foreach .b as $x (.; .; $x))"));
+        assert!(!gated("path(foreach .b as $x (.; .; .))"));
         assert!(!gated("path(reduce .b as $x (.; .))"));
         // A `?//` chain with a destructuring alternative also gates -- the
         // widening is keyed on *any* alternative being a destructuring
         // pattern, not on the guard `resolve_node_sink` later applies to
         // `patterns.len()`.
         assert!(gated("path(reduce .b as {c:$x} ?// $z (0; $x))"));
+    }
+
+    /// #3789: a `foreach` whose bare `$var` can reach a path position in UPDATE
+    /// or EXTRACT turns `Frame::at` on, because an empty-array element
+    /// certifies against the step register only by position (#3494). A
+    /// variable read by value only, a variable the body never names, a
+    /// variable another binding shadows, and every `reduce` (which re-seeds no
+    /// per-step register) leave `at` free for the ordinary write workloads.
+    #[test]
+    fn test_frame_enter_gate_admits_a_foreach_variable_in_path_position_3789() {
+        let gated = |filter: &str| Frame::enter(&parse(filter).unwrap()).at.is_some();
+
+        assert!(gated("path(foreach .b as $x (.; .; $x))"));
+        assert!(gated("path(foreach .b as $x (.; $x; .))"));
+        assert!(gated(
+            "path(foreach .b as $x (.; if .a then $x else . end; .))"
+        ));
+        // Either alternative of a `?//` chain may be the one that reads it.
+        assert!(gated("path(foreach .b as $y ?// $x (.; .; $x))"));
+        assert!(!gated("path(foreach .b as $x (.; .; .))"));
+        assert!(!gated("path(foreach .b as $x (.; select($x > 1); .))"));
+        assert!(!gated("path(foreach .b as $x (.; .; select(. == $x)))"));
+        assert!(!gated("path(reduce .b as $x (.; $x))"));
     }
 
     /// #2676: `resolve_node_sink`'s `Expr::Reduce`/`Expr::Foreach` dispatch
