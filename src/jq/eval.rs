@@ -35415,7 +35415,10 @@ impl Snapshot {
     /// opens the `identical()` gate (#2896): a positional mark does, the
     /// [`register_entry`](Self::register_entry) mark proves nothing and does not.
     fn proves_position(&self) -> bool {
-        matches!(self, Self::At(origin) if !matches!(origin, Origin::Untracked))
+        matches!(
+            self,
+            Self::At(Origin::At { .. } | Origin::SnapshotAt { .. } | Origin::Snapshot)
+        )
     }
 
     /// The absolute position this provenance proves, as `(invocation,
@@ -38391,30 +38394,30 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                 // independent of whatever `value` it's being compared
                 // against (#1591).
                 //
-                // #3423: an `Unproven` marker whose value equals the register may be
-                // that register's own node, which nothing here can certify and
-                // nothing refutes; the branch it resolves to states the register
-                // lost, so the next stage's refusal is the guess it is.
-                let unproven = matches!(marker.origin, Origin::Unproven)
-                    && if trackable {
-                        Some(value)
-                    } else {
-                        frame.register()
+                // #3423: an `Unproven` marker keeps that mark only while its value
+                // equals the register in hand: then it may be that register's own
+                // node, which nothing here can certify and nothing refutes, and a
+                // refusal off it is the guess it is ([`guess_refusal`]). A value
+                // that differs from the register, or a register not in hand, cannot
+                // be it by pointer, so the mark is the ordinary non-certifying one
+                // and the refusal stays exact.
+                let origin = match &marker.origin {
+                    Origin::Unproven
+                        if !(if trackable {
+                            Some(value)
+                        } else {
+                            frame.register()
+                        })
+                        .is_some_and(|reg| marker.value == *reg) =>
+                    {
+                        Origin::Untracked
                     }
-                    .is_some_and(|reg| marker.value == *reg);
+                    origin => origin.clone(),
+                };
                 resolve_leaf::<S>(expr, value, trackable, snapshot, frame, keep).map(|branches| {
                     branches
                         .into_iter()
-                        .map(|b| {
-                            let b = b.into_marked(&marker.origin);
-                            if unproven {
-                                b.with_register(BranchRegister::LostAt(Rc::new(
-                                    marker.value.clone(),
-                                )))
-                            } else {
-                                b
-                            }
-                        })
+                        .map(|b| b.into_marked(&origin))
                         .collect()
                 })
             }
@@ -43656,7 +43659,7 @@ fn is_transparent_bind_source(source: &Expr) -> bool {
         // bound by value) -- the one thing the grammar needs of a leaf. It is what
         // keeps `select(false) // {"a":1}` an exact source rather than an
         // ambiguous one.
-        Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) | Expr::StringInterpolation(_) => true,
+        leaf if is_fresh_leaf(leaf) => true,
         Expr::Optional(inner)
         | Expr::FirstExpr(inner)
         | Expr::Limit { expr: inner, .. }
@@ -43762,6 +43765,19 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     let identity_at = identity_bind_position::<S>(source, trackable, frame);
+    // #3423: a source that can hand jq's register (or a variable frozen at it) back
+    // *by pointer* through control flow no grammar names -- `if c then (., 1) else .
+    // end`, `(., 1) | .`, `try (., 1) catch 2`, `label $l | $orig`, a rebind -- but
+    // that the resolver neither placed (`witnessed`), certified (`origin`) nor knows
+    // to be `.` ([`identity_passthrough`]). It cannot be certified (a fresh copy
+    // equal to the register is the rebuilt copy #2642 closed), yet binding it by
+    // value hands `$x` no mark, so a refusal off it read as jq's own verdict and a
+    // `try` caught it where jq navigates and writes. It is bound with the `Unproven`
+    // marker instead, which certifies nothing but makes a refusal off an `$x` equal
+    // to the register at the use site the guess it is (loud, uncatchable: #3267).
+    // Jq mode only (ADR-0018); no yq row observes the marker (probed over a dozen),
+    // so this is the one place the mode is stated.
+    let may_alias = source_may_alias_register::<S>(source);
     resolve_bind_source_sink::<S>(
         source,
         body,
@@ -43770,30 +43786,7 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
         trackable,
         frame,
         &mut |bound, origin, witnessed| {
-            // #3423: a source the resolver neither certified (`origin`) nor knows to be
-            // `.` ([`identity_passthrough`]) nor can show fresh, whose output is
-            // value-equal to the register, may be that register's own node (a
-            // pass-through the grammars do not name: `if c then (., 1) else . end`,
-            // `(., 1) | .`, `try (., 1) catch 2`). It cannot be certified -- a fresh
-            // copy equal to the register is exactly the rebuilt copy #2642 closed --
-            // but binding it by value hands `$x` no mark, so a refusal off it reads as
-            // jq's verdict and a `try` catches it where jq navigates and writes. Bind
-            // it with the `Unproven` marker instead: it certifies nothing, but a
-            // reference to it states the register lost, so that refusal is the guess
-            // it is (loud, uncatchable: #3267).
-            // Jq mode only (ADR-0018). No yq row observes the marker today -- yq's
-            // `try` and resolver never act on the guess -- so the gate is the one place
-            // the mode is stated, and `Origin::Unproven` cannot exist outside jq mode.
-            let ambiguous = S::TAG == EvalTag::Jq
-                && !witnessed
-                && origin.is_none()
-                && !identity_passthrough(source, true)
-                && !is_provably_fresh_source(source)
-                && if trackable {
-                    bound == *value
-                } else {
-                    frame.register().is_some_and(|reg| bound == *reg)
-                };
+            let ambiguous = may_alias && !witnessed && origin.is_none();
             let substituted = substitute_bound_var_at(
                 source,
                 body,
@@ -44210,6 +44203,10 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     // #2978: a bare `$x` alternative of an identity source gets the same
     // positioned snapshot the `As` arm mints -- see `identity_bind_position`.
     let identity_at = identity_bind_position::<S>(source, trackable, frame);
+    // #3423: a `?//` alternative keeps the pre-#3279 identity grammar (`wide` off),
+    // so what that grammar does not call `.` may still hand the register back.
+    let unproven_source =
+        S::TAG == EvalTag::Jq && !identity_passthrough(source, false) && may_alias_register(source);
     let invert_dedup = patterns.len() > 1;
     // jq's `value_at_path` entering this stage: `value` itself while
     // trackable, otherwise whatever the enclosing pipe carried in (#3120).
@@ -44293,6 +44290,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                         identity_at.clone(),
                         bindings,
                         &all_names,
+                        unproven_source,
                     );
                     clear_nonretryable_stop();
                     let flow = if reg.path.depth() == 0 {
@@ -44408,14 +44406,15 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                     // when the head is a `$var` marker or a `.` over one.
                     //
                     // #3423: so is a source that is *value-equal to the register* and
-                    // that nothing proves fresh: jq may hold it by the register's own
-                    // pointer (a pass-through the head grammar does not recognise --
-                    // `($orig | .)`, `first($orig)`, `($orig?)`, `label $l | $orig`),
-                    // in which case it navigates where this resolver's refusal says
-                    // it cannot. The register is known here (`Kept`), which is why the
-                    // loss state is stood in for: it is the identity of `bound`, not
-                    // the register, that is unknown, and a caught guess is a write jq
-                    // makes silently dropped.
+                    // that can hand it back by pointer ([`source_may_alias_register`]):
+                    // jq may hold it as the register's own node through a pass-through
+                    // the head grammar does not recognise (`($orig | .)`,
+                    // `first($orig)`, `($orig?)`, `label $l | $orig`), in which case it
+                    // navigates where this resolver's refusal says it cannot. The
+                    // register is known here (`Kept`), which is why the loss state is
+                    // stood in for: it is the identity of `bound`, not the register,
+                    // that is unknown, and a caught guess is a write jq makes silently
+                    // dropped.
                     //
                     // Only a refusal at the first step can be that: with the source taken
                     // for the register (`identical`) the first step passes, and a later
@@ -44423,7 +44422,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                     // (`try (. as {a:$q, b:$r} | $r)`).
                     let may_be_register = !identical
                         && register.is_some_and(|reg| bound == reg)
-                        && !is_provably_fresh_source(head);
+                        && source_may_alias_register::<S>(source);
                     return ResolveFlow::Escaped(match control {
                         Control::Error(e) => EvalEscape::Error(guess_refusal_of(
                             e,
@@ -44473,12 +44472,19 @@ fn bind_pattern_body(
     identity_at: Option<Origin>,
     bindings: &[PatternBinding],
     all_names: &[String],
+    // Whether a bare `$x` alternative's source can hand the register back by
+    // pointer without the walk having proven it (#3423): it is then bound with the
+    // non-certifying `Unproven` marker, as `as $x` is.
+    unproven_source: bool,
 ) -> Expr {
     let mut bound_names: Vec<String> = Vec::new();
     let mut substituted = match pattern {
         Pattern::Var(name) => {
             bound_names.push(name.clone());
-            let origin = bindings.first().and_then(|b| b.origin.clone());
+            let origin = bindings
+                .first()
+                .and_then(|b| b.origin.clone())
+                .or_else(|| unproven_source.then_some(Origin::Unproven));
             // #3279 review: a `?//` alternative keeps the pre-#3279 grammar.
             // `?//` retries onto a bare `$v` alternative after the first one's
             // body refuses, and binding a newly admitted `(. | .)` source
@@ -45209,25 +45215,81 @@ impl NavKind {
     }
 }
 
-/// Whether `source` provably yields only values jq builds fresh, so none can be
-/// the very value its path register holds (#3423): a literal, a construction, an
-/// interpolated string, or a `,`/`if`/pipe whose every output is one. A closed
-/// grammar in the safe direction: everything else -- a builtin (`ltrimstr("x")`
-/// hands a non-string back unchanged), a call, a navigation, a variable -- may
-/// pass the register through by pointer, so a refusal of an equal value is the
-/// resolver's guess, not jq's verdict.
-fn is_provably_fresh_source(source: &Expr) -> bool {
-    match unwrap_bind_source(source) {
-        Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) | Expr::StringInterpolation(_) => true,
-        Expr::Comma(exprs) => !exprs.is_empty() && exprs.iter().all(is_provably_fresh_source),
-        Expr::If {
-            then_branch,
-            else_branch,
-            ..
-        } => is_provably_fresh_source(then_branch) && is_provably_fresh_source(else_branch),
-        Expr::Pipe(stages) => stages.last().is_some_and(is_provably_fresh_source),
-        _ => false,
+/// Whether a bind source can hand jq's path register -- or a variable frozen at it --
+/// back *by pointer* (#3423): `jv_identical` is pointer identity for a string, array
+/// or object, so only a source that forwards a leaf aliasing the register can be it,
+/// and a value the source builds or derives (`walk(.)`, `with_entries(.)`, `del(.zz)`,
+/// `tojson | fromjson`, a construction, arithmetic) is never the register whatever it
+/// equals.
+///
+/// A closed grammar of *forwarders* over *aliasing leaves*. The leaves are `.` (while
+/// the input is the register's: `identity`) and a `$var` marker. The forwarders are
+/// the constructs that pass a sub-expression's output through unchanged: a comma,
+/// `if`, `//`, `try`/`?`, `first`/`last`/`limit`/`nth`, `label`, a rebind's body,
+/// `select` and the type filters (which hand their input back), and a pipe, whose
+/// last stage sees what the stages before it left. Everything else -- a builtin, a
+/// call, a navigation, a construction, a fold -- is taken to produce a different
+/// value, which is jq's own doctrine for a computed one
+/// ([`could_be_lost_register`]); a call or fold that forwards its input stays a
+/// residual (#3423). A `catch` handler's `.` is the error payload, not the
+/// register, so only a `$var` it names counts there (#3334 review).
+fn may_alias_register(source: &Expr) -> bool {
+    fn alias(expr: &Expr, identity: bool) -> bool {
+        match unwrap_bind_source(expr) {
+            Expr::Identity => identity,
+            Expr::TrackedVar(_) | Expr::Var(_) => true,
+            Expr::Comma(exprs) => exprs.iter().any(|e| alias(e, identity)),
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => alias(then_branch, identity) || alias(else_branch, identity),
+            Expr::Alternative(left, right) => alias(left, identity) || alias(right, identity),
+            Expr::Try { expr, catch } => {
+                alias(expr, identity) || catch.as_deref().is_some_and(|c| alias(c, false))
+            }
+            Expr::Optional(inner)
+            | Expr::FirstExpr(inner)
+            | Expr::LastExpr(inner)
+            | Expr::Limit { expr: inner, .. }
+            | Expr::NthExpr { expr: inner, .. }
+            | Expr::Label { body: inner, .. }
+            | Expr::As { body: inner, .. }
+            | Expr::AsPattern { body: inner, .. }
+            | Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
+                alias(inner, identity)
+            }
+            Expr::Builtin(builtin)
+                if matches!(builtin, Builtin::Select(_)) || is_type_filter(builtin) =>
+            {
+                identity
+            }
+            // Each stage's `.` is what the stages before it left.
+            Expr::Pipe(stages) => stages
+                .iter()
+                .fold(identity, |input_aliases, stage| alias(stage, input_aliases)),
+            _ => false,
+        }
     }
+    alias(source, true)
+}
+
+/// Whether [`resolve_as_source_sink`] and the destructuring walk must treat `source`
+/// as possibly the register's own node (#3423): [`may_alias_register`], in jq mode,
+/// for a source [`identity_passthrough`] has not already proven to be `.` -- one
+/// definition for both bind sites, so they cannot disagree on what is ambiguous.
+fn source_may_alias_register<S: EvalSemantics>(source: &Expr) -> bool {
+    S::TAG == EvalTag::Jq && !identity_passthrough(source, true) && may_alias_register(source)
+}
+
+/// A literal or construction: a value jq builds fresh, never the register, which
+/// the resolver places as computed (an untracked branch, bound by value). The one
+/// thing a leaf of the transparent bind-source grammar needs (#3402, #3423).
+fn is_fresh_leaf(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) | Expr::StringInterpolation(_)
+    )
 }
 
 /// Whether a destructuring source headed by `head` may produce a frozen
@@ -45288,13 +45350,16 @@ fn guess_refusal(
     value: &OwnedValue,
     step: Option<NavKind>,
 ) -> EvalError {
-    guess_refusal_of(
-        e,
-        register_loss,
-        !matches!(snapshot, Snapshot::No),
-        value,
-        step,
-    )
+    // #3423: a value marked `Unproven` that is still equal to the register in
+    // hand may be that register's own node (the `TrackedVar` arm drops the mark
+    // otherwise), whatever the frame says about the register: a refusal of it
+    // is the resolver's guess, so the loss state is stood in for.
+    let loss = if matches!(snapshot, Snapshot::Marked(Origin::Unproven)) {
+        &RegisterLoss::LostSomewhere
+    } else {
+        register_loss
+    };
+    guess_refusal_of(e, loss, !matches!(snapshot, Snapshot::No), value, step)
 }
 
 /// [`guess_refusal`] for a refused value whose frozen-ness is known
@@ -50318,7 +50383,9 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // here rather than by the per-stage check below.
         // Kept only when a refusal could be a guess: the tail runs on every
         // branch, and nearly all of them have not lost a register.
-        let refused = (frame.register_loss.is_lost() && !branch.trackable)
+        let refused = ((frame.register_loss.is_lost()
+            || matches!(branch.snapshot, Snapshot::Marked(Origin::Unproven)))
+            && !branch.trackable)
             .then(|| (branch.snapshot.clone(), branch.value.clone()));
         let flow = match apply_static_tail_one::<S>(branch, &flat[last_dynamic + 1..]) {
             Ok(Some(b)) => match sink(b) {
@@ -50629,20 +50696,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // overwhelmingly common case where the register is never consulted
         // again.
         let reports_register = stage_reports_register || (facts.navigated && step_unmoved);
-        // #3423: an `Unproven` marker equal to the register this untracked entry
-        // carries may be that register's own node (a trackable entry's leaf states
-        // the loss itself, in the `TrackedVar` arm). Nothing here can certify it,
-        // so the register is no longer vouched for: it is lost at the carried
-        // value, which makes a navigation refusal off the marker the guess it is.
-        let unproven_equal = !trackable
-            && !branch_trackable
-            && !facts.navigated
-            && matches!(facts.step_snapshot, Snapshot::Marked(Origin::Unproven))
-            && carried_register
-                .as_deref()
-                .is_some_and(|reg| *reg == *resulting);
         let carries_register = !trackable
-            && !unproven_equal
             && if reports_register {
                 step_unmoved
             } else {
@@ -50669,8 +50723,6 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             RegisterLoss::Kept
         } else if frame.register_loss.is_lost() {
             frame.register_loss.clone()
-        } else if unproven_equal {
-            RegisterLoss::LostAt(Rc::new((*resulting).clone()))
         } else if S::TAG == EvalTag::Jq
             && !facts.navigated
             && !carries_register

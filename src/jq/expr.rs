@@ -181,7 +181,16 @@ pub struct Tracked {
 ///   `null`/`true`/`false` by value regardless of node (#3136), so the same
 ///   filter on `{"a":true,"c":true}` answers `["c"]` on both.
 ///
-/// Above all four, and reading none of them, sits jq's rule itself (#3177):
+/// - [`Origin::Unproven`] -- a binding whose source can hand the register (or a
+///   variable frozen at it) back *by pointer* through control flow no grammar
+///   places (`(., 1) | .`, `if c then (., 1) else . end`, `label $l | $orig`: #3423).
+///   It certifies exactly as [`Origin::Untracked`] does, but while its value equals
+///   the register in hand a refusal of it is the resolver's guess (loud,
+///   uncatchable) where an `Untracked` one is jq's own: the value cannot say whether
+///   it is the very node, and a `try` catching the guess silently dropped a write jq
+///   makes.
+///
+/// Above all five, and reading none of them, sits jq's rule itself (#3177):
 /// when the resolver stands on the very `Rc` a marker's value holds
 /// (`OwnedValue::shares_storage_with`), the marker certifies whatever its
 /// origin -- `jv_identical` on an allocated `jv` is pointer equality, and a
@@ -220,17 +229,15 @@ pub enum Origin {
     /// and, like every other `Origin`, by storage identity where the
     /// resolver stands on the marker's own `Rc` (#3177, `marker_identical`).
     Untracked,
-    /// Bound by value from a source the resolver neither certified nor knows to be
-    /// fresh, whose output was value-equal to the register (#3423): a pass-through
-    /// of `.` or of a frozen `$var` through a head the grammars do not name (`(., 1)
-    /// | .`, `if c then (., 1) else . end`, `try (., 1) catch 2`) is jq's own
-    /// register by pointer, and a fresh copy equal to it is not, and the value
-    /// cannot say which. It certifies exactly as [`Origin::Untracked`] does
-    /// (nothing, bar the null/bool carve-out and storage identity), but a
-    /// refusal of it is the resolver's *guess* where the register is known too:
-    /// the branch a reference resolves to states the register lost, so the
-    /// refusal is uncatchable and a `try` cannot turn it into a silently dropped
-    /// write.
+    /// Bound by value from a source that can hand the register (or a variable
+    /// frozen at it) back by pointer through control flow no grammar places (#3423):
+    /// `(., 1) | .`, `if c then (., 1) else . end`, `try (., 1) catch 2`. A
+    /// pass-through of the register is jq's own node by pointer and a fresh copy
+    /// equal to it is not, and the value cannot say which. It certifies exactly as
+    /// [`Origin::Untracked`] does (nothing, bar the null/bool carve-out and storage
+    /// identity), but while its value equals the register in hand a refusal off it
+    /// is the resolver's *guess*, uncatchable, so a `try` cannot turn it into a
+    /// silently dropped write. Made in jq mode only.
     Unproven,
 }
 
