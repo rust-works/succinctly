@@ -6983,12 +6983,18 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Return(Flow),
         }
         let mut outcome: Option<BodyOutcome> = None;
+        // #3837: the retry generation `outcome` was recorded at.
+        let mut outcome_at = 0u64;
         let walk = each_pattern_binding_set_at::<S, JsonCursor<'a, W>>(
             pattern,
             bound_val,
             source,
             invert_dedup,
             &mut |bindings| {
+                // #3837: a re-invocation after a stop is a `?//` retry inside a
+                // computed key, which supersedes what the retried-past binding
+                // set decided.
+                outcome = None;
                 // #3466: each variable that names a node holds its value for
                 // the body's whole extent, exactly as `each_as`'s does, and
                 // so is registered in the embed table; the guards drop with
@@ -7019,6 +7025,7 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // ignores it, the same reasoning `builtin_isempty` records
                     // at its own `Flow::Stopped` arm.
                     Flow::Stopped { pending } => {
+                        outcome_at = pipe_retry_generation();
                         outcome = Some(if is_retryable_stop(is_last) {
                             BodyOutcome::Retry
                         } else {
@@ -7032,6 +7039,7 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // ordinary error and a `break` (#1457) fall through to the
                     // next alternative unless this is the last one.
                     Flow::Escaped(control) => {
+                        outcome_at = pipe_retry_generation();
                         outcome = Some(if is_retryable_control(&control, is_last) {
                             BodyOutcome::Retry
                         } else {
@@ -7042,6 +7050,12 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             },
         );
+        // #3837: a `?//` inside a computed key that retried past the stop which
+        // recorded `outcome`, and produced nothing or raised, never re-entered
+        // the sink to reset it; the matcher's own verdict (`walk`) stands then.
+        if outcome.is_some() && retry_superseded(&walk, outcome_at, false) {
+            outcome = None;
+        }
         match outcome {
             Some(BodyOutcome::Retry) => continue,
             Some(BodyOutcome::Return(flow)) => return flow,
