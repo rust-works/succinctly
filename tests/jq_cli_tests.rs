@@ -61902,6 +61902,209 @@ fn test_verdict_stage_on_an_untracked_entry_3826() -> Result<()> {
     ])
 }
 
+/// #3743: a fold's destructuring `?//` over the document itself retries when its
+/// first step can never succeed on the element. `reduce . as [$a] ?// $a (0; .)`
+/// binds `.` (the register's own node) to `[$a]`, which is "Cannot index object
+/// with number" in jq whether or not `.` is the register, and `?//` retries the
+/// next alternative. The resolver called that refusal a guess (the element equals
+/// the register by value, so jq "might" have carried on) and did not retry, so a
+/// `try` around it ran its handler for an error jq never raised: `path(foreach
+/// (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))` lost
+/// the reduce's `0` and answered one path where jq answers two. The first step is
+/// judged by what it indexes (an array pattern by position, an object pattern by a
+/// literal key) against what the element is, via `NavKind::would_succeed_on`.
+/// Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_fold_pattern_first_step_that_cannot_succeed_retries_3743() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try (0, .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce 1 as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as [$a] ?// $a (0; .)), .b | .[0]) catch 1) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r#"path(foreach (try ((reduce . as [$a] ?// $a (0; .)), error("x")) catch 1) as $x (.; .; .))"#,
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"[foreach (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .)]",
+            "[{\"a\":[1],\"b\":\"abc\"},{\"a\":[1],\"b\":\"abc\"}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(reduce (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1)",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(first(try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1))",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as [[$a]] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((foreach . as [$a] ?// $a (0; .; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce .a as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as [$a] (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(reduce . as [$a] ?// $a (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach . as [$a] ?// $a (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"[path(foreach (reduce . as [$a] ?// $a (0; .)) as $x (.; .; .))]",
+            "[[]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"del(foreach (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"(foreach (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .)) = 5",
+            "5\n",
+            "",
+            0,
+        ),
+    ])
+}
+
+/// #3743: the shapes where the first step *could* succeed on the element (`{a:$a}`
+/// over a document that has `a`, a computed key) stay the walk's guess at jq's
+/// `path_intact`: not retried, and not catchable either. They answered silently
+/// wrong through a `try` (its handler's output in place of the alternative's); they
+/// are now the loud refusal every other guess site makes (ADR-0018 rule 4), where
+/// jq answers the rows' third column.
+#[test]
+fn test_fold_pattern_guessed_refusal_is_not_caught_3743() -> Result<()> {
+    for (input, filter, jq_answer) in [
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as {a:$a} ?// [$a] (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[] []",
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as [$a] ?// {a:$a} ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[] []",
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r#"path(foreach (try ((reduce . as {("a"):$a} ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))"#,
+            "[] []",
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(reduce . as {b:$a} ?// $a (.; .))",
+            "[]",
+        ),
+    ] {
+        let routes = [
+            ("stdin", run_jq_full(&["-c", filter], Some(input))?),
+            (
+                "-n",
+                run_jq_full(&["-nc", &format!("{input} | {filter}")], None)?,
+            ),
+        ];
+        for (route, (stdout, stderr, code)) in routes {
+            assert_eq!(
+                (stdout.as_str(), code),
+                ("", 5),
+                "`{filter}` on {input} via {route} (jq answers {jq_answer}): stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains("Invalid path expression near attempt to access element"),
+                "`{filter}` on {input} via {route}: {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
 /// verdict stage behind a `def` call or a `reduce` and one inside a compound stage
 /// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758 and the

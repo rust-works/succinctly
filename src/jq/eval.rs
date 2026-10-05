@@ -45790,8 +45790,24 @@ fn each_fold_bind<S: EvalSemantics>(
 /// does, and `del`/`=` would write through it. That refusal propagates
 /// instead: a refusal where jq might answer, never an answer jq would not
 /// give.
-fn fold_walk_refusal_is_guess(elem: &FoldSourceValue, reg: &FoldRegister) -> bool {
+fn fold_walk_refusal_is_guess(
+    pattern: &Pattern,
+    elem: &FoldSourceValue,
+    reg: &FoldRegister,
+) -> bool {
     if elem.register_path.is_some() {
+        return false;
+    }
+    // #3743: a pattern whose *first* step cannot succeed on the element raises in
+    // jq whether or not the element is the register's node (`{"a":1} | . as
+    // [$a]` is "Cannot index object with number" when it is, a path error when
+    // it is not), and `?//` retries either. The refusal came from that first
+    // step (nothing earlier can fail), so there is no verdict a lost or equal
+    // register could change, which is the premise of the guess below. Without
+    // this, `reduce . as [$a] ?// $a (0; .)` over the document itself refused
+    // the one alternative jq runs past, and an enclosing `try` swallowed the
+    // refusal into its handler.
+    if pattern_first_step_cannot_succeed(pattern, &elem.value) {
         return false;
     }
     // #2159: a destructuring step on a non-null scalar raises in jq whatever
@@ -45821,6 +45837,25 @@ fn fold_walk_refusal_is_guess(elem: &FoldSourceValue, reg: &FoldRegister) -> boo
     !trackable
         || (!matches!(elem.value, OwnedValue::Null | OwnedValue::Bool(_))
             && elem.value == *register)
+}
+
+/// Whether `pattern`'s first walk step could never succeed on `value` (#3743):
+/// an array pattern indexes it by position, an object pattern by a literal key
+/// (a computed key has no kind to judge, so it never qualifies), and
+/// [`NavKind::would_succeed_on`] says what each accepts. An empty pattern takes
+/// no step at all.
+fn pattern_first_step_cannot_succeed(pattern: &Pattern, value: &OwnedValue) -> bool {
+    match pattern {
+        Pattern::Array(items) if !items.is_empty() => !NavKind::Index.would_succeed_on(value),
+        Pattern::Object(entries) => match entries.first() {
+            Some(PatternEntry {
+                key: ObjectKey::Literal(_),
+                ..
+            }) => !NavKind::Field.would_succeed_on(value),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The resolver's own two refusal kinds (#2979): a pattern step or a
@@ -46263,6 +46298,7 @@ fn settle_fold_alternative(
     outcome: Option<FoldStepOutcome>,
     walk: Flow,
     is_last: bool,
+    pattern: &Pattern,
     elem: &FoldSourceValue,
     reg: &FoldRegister,
     aborted: &StashedEscape,
@@ -46276,9 +46312,22 @@ fn settle_fold_alternative(
             unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, returned just above (#2872)"
         }
         Flow::Escaped(control) => {
-            if walk_escape_retries(&control, is_last, fold_walk_refusal_is_guess(elem, reg)) {
+            let guessed = fold_walk_refusal_is_guess(pattern, elem, reg);
+            if walk_escape_retries(&control, is_last, guessed) {
                 FoldStepOutcome::Retry
             } else {
+                // #3743: a refusal that is only the walk's guess at jq's
+                // `path_intact` does not retry (jq may find the step intact and
+                // carry on with *this* alternative), and it must not be catchable
+                // either: an enclosing `try` turned it into its handler's output
+                // where jq produced the alternative's own (ADR-0018 rule 4, as
+                // [`guess_refusal`] does at every other site).
+                let control = match control {
+                    Control::Error(e) if guessed && is_resolver_refusal(&e) => {
+                        Control::Error(e.into_guessed_path_refusal())
+                    }
+                    other => other,
+                };
                 FoldStepOutcome::Return(aborted.stop(control))
             }
         }
@@ -47049,7 +47098,9 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                         }
                     },
                 );
-                match settle_fold_alternative(outcome, walk, is_last, &elem, &reg, &aborted) {
+                match settle_fold_alternative(
+                    outcome, walk, is_last, pattern, &elem, &reg, &aborted,
+                ) {
                     FoldStepOutcome::Retry => continue,
                     FoldStepOutcome::Return(demand) => return demand,
                 }
@@ -47565,7 +47616,9 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         Demand::Continue
                     },
                 );
-                match settle_fold_alternative(outcome, walk, is_last, &elem, &reg, &aborted) {
+                match settle_fold_alternative(
+                    outcome, walk, is_last, pattern, &elem, &reg, &aborted,
+                ) {
                     FoldStepOutcome::Retry => continue,
                     FoldStepOutcome::Return(demand) => return demand,
                 }
