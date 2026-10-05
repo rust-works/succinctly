@@ -391,6 +391,8 @@ OPERANDS = [
     "last(., .a)",
     "last(first(.))",
     "last(select(true))",
+    "last(last(.))",
+    "last(limit(1; .))",
     "select($x)",
     "try select($x)",
     "numbers",
