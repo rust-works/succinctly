@@ -16,6 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certifies only where that position is the register's, while a position-less marker keeps the by-value rule (the node jq holds: `input | . as $x | ($x) =
   9` still answers). `=`/`|=`/`del()` through the shape already raised, with a different message, so the observable change is `path()`/`paths()`.
   Pinned by `test_string_slice_is_not_the_register_3793`.
+- **jq: a `reduce` UPDATE that navigates inside a collect, the left of a `//`, `first(f)` or `last(f)` is checked against the register its source left, and `last(f)` keeps its output's identity for every `f`** (#3797, #3786).
+  A navigating `reduce` source moves jq's register onto its element before UPDATE runs, so any navigation UPDATE executes is checked against
+  that element and a frozen `$x` read after it is no longer the register. #3787 read the per-step register only for an UPDATE the resolver was
+  sure navigates (a bare navigation, a `,`, a pipe's first stage), so `del(. as $x | reduce .[]? as $k (.; [.k] | $x))` on `{"a":true,"k":2}`
+  kept the persistent register, `$x` re-established it, and `del` deleted the whole document (`null`, exit 0) and `=` overwrote it where jq
+  exits 5; `(.k // .) | $x`, `first(.k) | $x` and `last([.k]) | $x` did the same. A collect, the left of a `//`, `first(f)` and `last(f)` run their
+  body whatever it yields, so `update_definitely_navigates` now reads them; the right of a `//` and `limit(n; f)` may not run it and are not
+  read, so `reduce .[]? as $k (.; (. // .k))`, a source that does not navigate, `try .k catch 1 | $x` and `{a: .k} | $x` keep jq's answers.
+  With that closed, #3766's restriction of `last(f)`'s output identity to an `f` that navigates nothing is lifted (#3786): `path(last(.a, .))`,
+  `path(last(first(.)))` and `path(last(select(true)))` answer `[]` as in jq, and `del(try (last(first(.)) | .k))` deletes `k` where it dropped
+  the write. `last(f)` counts an `f` that merely *may* move the register (`last(limit(2; .k, .))`, `last(nth(1; .k, .))`, `last(label $l | .k, .)`,
+  `last(def f: .k, .; f)`), because the walk cannot read those and the root they end on is not the register the source moved off; a bare UPDATE of
+  those shapes is the still-open #3811. `first(f)` reads only the first output of `f` (`first(., .k)` never runs `.k` and keeps jq's answer).
+  Pinned by `test_reduce_update_navigating_inside_a_collect_or_alternative_refuses_3797` and
+  `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both evaluators).
+
 - **jq: a bind or destructuring source that may be the register's own node refuses loudly instead of silently dropping a write under `try`** (#3423).
   A source jq may pass the register through by pointer, through control flow no grammar names (`(., 1) | .`, `if c then (., 1) else . end`,
   `try (., 1) catch 2`, `first($orig)`, `($orig?)`, `label $l | $orig`), was bound by value with no mark (`as $x`) or classified by a head
@@ -110,13 +126,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `?` around the next navigation caught the refusal and `=`, `|=` and `del()` silently dropped the write at exit 0
   (`(. as $x | try (5 | last($x) | .k)) = 9` on `{"a":{"b":1},"k":2}` left the document unchanged where jq sets `k`). An output that is
   the entry node (trackable at the root) is now forwarded as that node, and an untracked output keeps the snapshot mark that names
-  its node, as a bare `5 | $x` does; any other output is still a copy, so `last(.a)` stays refused as jq refuses it. Only for an `f` that
-  provably navigates nothing (`last(.)`, `last($x)`): a navigating `f` inside a reduce UPDATE runs against a register the navigating source
-  already moved, where jq raises and the fold resolves it as though the accumulator sat on the register, so forwarding the root there made
-  `del(reduce .[]? as $k (.; last(.k, .)))` delete the document. That hole is older than this change and also accepts the bare
-  `del(reduce .[]? as $k (.; (.k, .)))` (#3780); `last(.a, .)`, `last(first(.))` and `last(select(true))` keep the copy, so a bare
-  read still refuses where jq answers `[]` and a `try` or `?` around the next navigation still drops the write silently, as before
-  (the same f shapes, tracked with #3780). Jq mode only (ADR-0018: yq has no oracle for `last`). Pinned by `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both
+  its node, as a bare `5 | $x` does; any other output is still a copy, so `last(.a)` stays refused as jq refuses it. This first applied
+  only to an `f` that provably navigates nothing (`last(.)`, `last($x)`), because a navigating `f` inside a reduce UPDATE ran against a register
+  the navigating source had already moved and the fold resolved it as though the accumulator sat on it (#3780, #3797); #3786 lifted
+  that once both were fixed, so it holds for every `f` (`last(.a, .)`, `last(first(.))`, `last(select(true))`). Jq mode only (ADR-0018: yq has no oracle for `last`). Pinned by `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both
   evaluators) and `yq_last_f_output_does_not_keep_its_identity_3766`; it replaces the characterization test #3653 left.
 
 - **jq: a `reduce` whose source navigates and whose UPDATE navigates the accumulator no longer lets `del` delete, or `=` overwrite, the whole document** (#3780).

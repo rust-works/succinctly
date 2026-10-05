@@ -38013,22 +38013,17 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             // it and jq refuses it. Jq mode only, like the register (ADR-0018:
             // yq has no oracle for either).
             //
-            // Only for an `f` that provably navigates nothing
-            // ([`cannot_move_register`]): a navigating `f` inside a reduce/foreach
-            // UPDATE runs against a register jq's source already moved, where jq
-            // raises on the navigation and the fold resolves it as though the
-            // accumulator sat on the register (`del(reduce .[]? as $k (.; (.k,
-            // .)))` deletes the document on `main`, where jq exits 5, #3780).
-            // Forwarding the root there would hand that hole `last(.k, .)` as
-            // well, so a navigating `f` keeps the copy it always had, and so does
-            // an `f` the allowlist cannot prove navigates nothing (`first(.)`,
-            // `select(true)`): those still refuse a bare read, and under a `try`
-            // or `?` they drop the write exactly as before (tracked with #3780).
+            // For every `f` (#3786): an `f` that navigates leaves a trackable output
+            // below the root (`last(.a)` is `.a`'s node, which is not the register jq
+            // keeps at the entry), so only a trackable output *at the root* is the
+            // entry node, and everything else is the copy it always was. This used to
+            // be gated on `cannot_move_register(f)` because a navigating `f` inside a
+            // reduce UPDATE ran against a register the source had already moved, which
+            // the fold resolved as though the accumulator sat on it (#3780, #3797);
+            // those are fixed, so `last(.k, .)` refuses there like `(.k, .)` does.
             let result = match last {
-                Some(branch) if last_register_unmoved::<S>() && cannot_move_register(inner) => {
-                    if branch.trackable {
-                        // `f` navigates nothing, so a trackable output is the entry node.
-                        debug_assert_eq!(branch.path.depth(), 0);
+                Some(branch) if last_register_unmoved::<S>() => {
+                    if branch.trackable && branch.path.depth() == 0 {
                         branch
                     } else {
                         PathBranch::demoted(branch.snapshot, branch.value).with_register(register)
@@ -40361,7 +40356,8 @@ fn resolve_leaf<'a, S: EvalSemantics>(
 /// by-value branch is built: [`untracked_branches`], the bounded leaf, and the
 /// `[E]`/drain arms ([`forward_drained_result`]) all go through here, each
 /// stating its own register ([`leaf_register`], [`drained_register`]). (`last(f)`
-/// over an `f` that navigates nothing keeps its output's own branch instead, #3766.)
+/// keeps its output's own branch instead when that output is the entry node,
+/// #3766, #3786.)
 fn untracked_at_register<'a>(
     computed: Cow<'a, OwnedValue>,
     register: BranchRegister<'a>,
@@ -41145,7 +41141,7 @@ fn resolve_from_restored_input<'a, S: EvalSemantics>(
 
 /// Shared tail for every "drain an argument fully via a discarding sink,
 /// then forward one computed value" arm in [`resolve_node_sink`] (`Array`,
-/// `LastExpr`/`LastStream` in yq mode and for an `f` that may navigate,
+/// `LastExpr`/`LastStream` in yq mode,
 /// `IsEmpty`, `UpperIndexStream` -- #2746 -- and `AnyCond`/`AllCond` when nothing
 /// decided or `cond` may move the register, #3749): once the drain itself is done (`flow`), build the one branch it
 /// produced and forward it to `sink`, propagating an escape from the drain
@@ -41168,8 +41164,8 @@ fn forward_drained_result<'a>(
 /// [`forward_drained_result`] for an arm that built the branch itself: the
 /// `any(gen; cond)`/`all(gen; cond)` arm emits its boolean at the register
 /// the decisive element left (#3749), which is not an untracked branch at the
-/// root, and `last(f)` in jq mode over an `f` that navigates nothing emits `f`'s
-/// last output with its own identity (#3766).
+/// root, and `last(f)` in jq mode emits `f`'s last output with its own identity
+/// when that output is the entry node (#3766, #3786).
 fn forward_drained_branch<'a>(
     flow: ResolveFlow,
     result: PathBranch<'a>,
@@ -46146,34 +46142,85 @@ fn foreach_step_register<S: EvalSemantics>(
 /// runs (#3780): a bare navigation (`.k`, `.[]?`, `.[0]`), a `,` with such an output,
 /// a `|` whose first stage is one, parentheses, or an `if` whose literal condition
 /// picks a branch that is (a computed condition counts when either branch does).
-/// Everything else answers `false` -- including every wrapper that merely *contains*
-/// a navigation (`first(.k)`, `. // .k`, a `try`) -- so those keep the persistent register and their
-/// existing verdict, which matches jq for the passthrough forms (`first(.)`,
+/// A collect, `first(f)`, the left of a `//` and `last(f)` read their body too (#3797,
+/// #3786). Everything else answers `false` -- the right of a `//`, `limit(n; f)`,
+/// `nth`, a `label`, a `def` call, a `try` -- so those keep the persistent register
+/// and their existing verdict, which matches jq for the passthrough forms (`first(.)`,
 /// `limit(1; .)`, `. // .k`, `((.k)?, .)` are all `[]` in jq). A shallow, conservative
-/// rule on purpose: the cost of a miss is the old behaviour, never a new refusal.
+/// rule on purpose: a miss keeps the old behaviour -- which is the open hole for a
+/// bare navigating `limit`/`nth`/`label`/`def` UPDATE (`limit(2; .k, .)`, #3811) -- and
+/// the one deliberate over-approximation is `last(f)`, which reads an `f` that merely
+/// *may* navigate so that it does not extend that hole (it then refuses a passthrough
+/// `f` outside [`cannot_move_register`]'s allowlist, `last(first(.))`, as `main` did).
 fn update_definitely_navigates(expr: &Expr) -> bool {
+    update_navigates_within(expr, false)
+}
+
+/// [`update_definitely_navigates`] for the outputs a consumer reads: every output
+/// (`first_only` false, a `reduce` takes the last) or only the first (`first(f)`
+/// stops at it, so `first(., .k)` never runs `.k` and is `[]` in jq).
+fn update_navigates_within(expr: &Expr, first_only: bool) -> bool {
     match expr {
-        Expr::Paren(inner) => update_definitely_navigates(inner),
-        Expr::Pipe(stages) => stages.first().is_some_and(update_definitely_navigates),
-        Expr::Comma(items) => items.iter().any(update_definitely_navigates),
+        Expr::Paren(inner) => update_navigates_within(inner, first_only),
+        Expr::Pipe(stages) => stages
+            .first()
+            .is_some_and(|stage| update_navigates_within(stage, first_only)),
+        // `first(f)` stops at the first output. A first item that is certain to yield
+        // one (`.`, a literal, a `$var`) ends the read there, so `first(., .k)` never
+        // runs `.k`; any other first item may yield nothing (`empty`, `select(false)`),
+        // and then a later item is the first output, so those are read too.
+        Expr::Comma(items) if first_only => match items.split_first() {
+            Some((head, rest)) => {
+                update_navigates_within(head, true)
+                    || (!matches!(
+                        unwrap_paren(head),
+                        Expr::Identity | Expr::Literal(_) | Expr::Var(_) | Expr::TrackedVar(_)
+                    ) && rest.iter().any(|item| update_navigates_within(item, true)))
+            }
+            None => false,
+        },
+        Expr::Comma(items) => items
+            .iter()
+            .any(|item| update_navigates_within(item, false)),
+        // #3797: a collect, the left of a `//`, `first(f)` and `last(f)` run their
+        // body whatever it yields, and jq path-checks what it navigates, so
+        // `[.k] | $x`, `(.k // .) | $x` and `first(.k) | $x` raise as `.k | $x` does.
+        // The right of a `//` runs only when the left yields nothing truthy, and
+        // `limit(n; f)` may not run `f` at all (`n` of 0), so neither is read. A
+        // collect and `last(f)` drain their body, so they read every output of it;
+        // `first(f)` reads only the first.
+        Expr::Array(inner) => update_navigates_within(inner, false),
+        Expr::FirstExpr(inner) => update_navigates_within(inner, true),
+        Expr::Alternative(inner, _) => update_navigates_within(inner, first_only),
+        // `last(f)` hands its *last* output back, which for `last(limit(2; .k, .))`
+        // is the root: an `f` this function cannot read (`limit`, `nth`, a `label`, a
+        // user `def`) may still navigate before it gets there, and the root it then
+        // yields is not the register the source moved off. So an `f` that may move
+        // the register at all counts, which is what `last(f)` did before #3786 lifted
+        // its restriction; a refusal where jq answers is the safe direction, a root
+        // accepted against a moved register deletes the document.
+        Expr::LastExpr(inner) => {
+            update_navigates_within(inner, false) || !cannot_move_register(inner)
+        }
         Expr::Optional(inner) if is_postfix_optional_primitive(inner) => {
-            update_definitely_navigates(inner)
+            update_navigates_within(inner, first_only)
         }
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => match unwrap_paren(cond) {
-            Expr::Literal(Literal::Bool(true)) => update_definitely_navigates(then_branch),
+            Expr::Literal(Literal::Bool(true)) => update_navigates_within(then_branch, first_only),
             Expr::Literal(Literal::Bool(false) | Literal::Null) => {
-                update_definitely_navigates(else_branch)
+                update_navigates_within(else_branch, first_only)
             }
             // A computed condition: either branch may run, and refusing a passthrough
             // whose navigating branch is not taken is the safe direction, where
             // accepting the root for one that is taken deletes the document
             // (`if .a then (.k, .) else . end`).
             _ => {
-                update_definitely_navigates(then_branch) || update_definitely_navigates(else_branch)
+                update_navigates_within(then_branch, first_only)
+                    || update_navigates_within(else_branch, first_only)
             }
         },
         other => is_fold_source_navigation(other),
