@@ -1304,18 +1304,16 @@ is the revert that established what the other one costs.
    output *is* the register (`last($x)`, `last(.)`) hands it back, so `path(last(.))` is `[]`
    and `(. as $x \| try (5 \| last($x) \| .k)) = 9` writes, as in jq, pinned by
    `test_path_register_last_f_keeps_the_identity_of_its_output_3766`. An output that is not the
-   register (`last(.a)` moved off it) is still a copy that jq refuses. Only an `f` that provably
-   navigates nothing gets this (`cannot_move_register`): `last(.a, .)`, `last(first(.))` and
-   `last(select(true))` keep the copy, so a bare read still refuses where jq answers `[]`, and a
-   `try` or `?` around the next navigation still catches the refusal and **silently drops the
-   write** at exit 0 (`del(try (last(first(.)) | .k))` leaves the document where jq deletes `k`),
-   as `last(f)` always did for those shapes. The reason is a hole in the fold, not in `last`: a
-   navigating `f` inside a reduce UPDATE runs against a register jq's navigating source already
-   moved (jq raises), and the fold resolves it as though the accumulator sat on the register, so
-   forwarding the root there made `del(reduce .[]? as $k (.; last(.k, .)))` delete the document.
-   The bare `del(reduce .[]? as $k (.; (.k, .)))` does so on `main`
-   ([#3780](https://github.com/rust-works/succinctly/issues/3780)); the restriction can be
-   lifted when that is fixed.
+   register (`last(.a)` moved off it) is still a copy that jq refuses. This holds for every
+   `f` since [#3786](https://github.com/rust-works/succinctly/issues/3786): the output decides,
+   so `last(.a, .)`, `last(first(.))`, `last(select(true))` and `last(last(.))` answer `[]` and a
+   `try` or `?` around the next navigation no longer drops the write (`del(try (last(first(.))
+   \| .k))` deletes `k` as in jq). The first version was restricted to an `f` that navigates
+   nothing because a navigating `f` inside a reduce UPDATE ran against a register jq's
+   navigating source had already moved and the fold resolved it as though the accumulator sat
+   on it; that hole is closed ([#3780](https://github.com/rust-works/succinctly/issues/3780),
+   [#3797](https://github.com/rust-works/succinctly/issues/3797)), so `last(.k, .)` refuses
+   there like `(.k, .)` does.
    Nor is `isempty(g)` a drain producer that loses it any more:
    [#3763](https://github.com/rust-works/succinctly/issues/3763) states the register the first
    branch `g` emitted left (and the entry register when it emitted nothing), so
@@ -3031,14 +3029,18 @@ answers `["b"]` — and classified the two residuals appended below):
   `resolve_reduce` therefore resolves such an UPDATE with the accumulator's at-register flag
   recomputed from the element (`foreach_step_register`'s verdict, jq mode, bare `$var` only).
   Only an UPDATE that provably navigates the accumulator on a path that always runs
-  (`update_definitely_navigates`: a bare navigation, a `,`/`|` with one, an `if` whose
-  literal condition picks one, or whose computed condition has one in either branch) is
-  affected. Everything else -- `.`, a literal, `$var`, and every wrapper that merely contains a
-  navigation (`first(.)`, `. // .k`, a `try`) -- keeps the persistent register, so those forms
+  (`update_definitely_navigates`: a bare navigation, a `,`/`|` with one, a collect `[E]`,
+  the left of a `//`, `first(E)` and `last(E)` over one ([#3797](https://github.com/rust-works/succinctly/issues/3797):
+  `[.k] | $x`, `(.k // .) | $x` and `first(.k) | $x` used to come back as the root and
+  `del` deleted the document), an `if` whose literal condition picks one, or whose computed
+  condition has one in either branch) is affected. Everything else -- `.`, a literal,
+  `$var`, the right of a `//`, `limit(n; E)`, and every wrapper that merely contains a
+  navigation it may not run (`first(.)`, `. // .k`, a `try`) -- keeps the persistent register, so those forms
   keep their answers (and, for a `try` around the navigation, #2732's wording: `path(reduce .[]
   as $k (.; try .a catch "x"))` on `{"a":1}` is jq's `with result "x"` and this `with result 1`,
   both exit 5). Two consequences, both recorded rather than fixed: a navigating wrapper
-  whose navigation does run (`first((.k, .))`) keeps the old verdict, and an `if` over a computed condition refuses when only its *untaken* branch
+  whose navigation does run through a shape the walk does not read (`limit(1; .k, .)`, a
+  `reduce`/`foreach` or a user `def` around it) keeps the old verdict, and an `if` over a computed condition refuses when only its *untaken* branch
   navigates, where jq answers `[]`. The persistent register is what the *final* re-entry check
   needs
   (`path(reduce (.[]) as $k (.; .))` on `{"a":[1,2]}` is `[]` in both, jq's own
