@@ -389,6 +389,7 @@ OPERANDS = [
     "(reduce . as $k (0; $k))",
     "(reduce . as $k (.; $k))",
     "(reduce . as $k (0; $k.a?))",
+    "(foreach . as [$a] (0; $a; .))",
     "try (foreach . as $k (0; $k; .)) catch 7",
     "(reduce (foreach . as {a:$a} (.; .; .)) as $k (.; .))",
     "(reduce . as [[$a]] (0; .))",
