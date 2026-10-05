@@ -43781,6 +43781,9 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
             // it with the `Unproven` marker instead: it certifies nothing, but a
             // reference to it states the register lost, so that refusal is the guess
             // it is (loud, uncatchable: #3267).
+            // Jq mode only (ADR-0018). No yq row observes the marker today -- yq's
+            // `try` and resolver never act on the guess -- so the gate is the one place
+            // the mode is stated, and `Origin::Unproven` cannot exist outside jq mode.
             let ambiguous = S::TAG == EvalTag::Jq
                 && !witnessed
                 && origin.is_none()
@@ -50625,8 +50628,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // the loss itself, in the `TrackedVar` arm). Nothing here can certify it,
         // so the register is no longer vouched for: it is lost at the carried
         // value, which makes a navigation refusal off the marker the guess it is.
-        let unproven_equal = S::TAG == EvalTag::Jq
-            && !trackable
+        let unproven_equal = !trackable
             && !branch_trackable
             && !facts.navigated
             && matches!(facts.step_snapshot, Snapshot::Marked(Origin::Unproven))

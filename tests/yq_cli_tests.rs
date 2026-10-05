@@ -51503,7 +51503,9 @@ fn yq_last_f_output_does_not_keep_its_identity_3766() -> Result<()> {
 /// #3423 makes a bind source that may be the register's own node refuse as a
 /// guess in jq mode only (ADR-0018: real yq has no destructuring, and no oracle
 /// for the rest). With the jq-only surface enabled, yq mode keeps the refusal a
-/// `try` catches, so the document is left as it was, exactly as before.
+/// `try` catches, so the document is left as it was, exactly as before. A
+/// regression pin: no yq row tells the mode gate on the marker apart from its
+/// absence (probed over a dozen rows), so this holds the behaviour, not the gate.
 #[test]
 fn yq_ambiguous_bind_source_keeps_the_caught_refusal_3423() -> Result<()> {
     let yaml = "a:\n  b: 1\n";
