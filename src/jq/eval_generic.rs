@@ -30688,8 +30688,9 @@ fn eval_owned_identity_spliced<S: EvalSemantics, V: DocumentValue>(
 ///
 /// #2180 WP3 review: answering `Flow::Stopped` must carry the same
 /// non-retryable classification as `Demand::Stop`. Delegate the store and
-/// classification to `stop_with_escape`; each caller retains its own rule
-/// for recovering the saved escape after the body stops (#2830).
+/// classification to [`StashedVerdict::stop`] (which is `stop_with_escape`
+/// into the slot); each caller retains its own rule for recovering the saved
+/// escape after the body stops (#2830).
 ///
 /// The slot is a [`StashedEscape`] (#3805): a `?//` inside the body re-invokes
 /// the closure that stashes here, or retries past it without producing
@@ -30861,7 +30862,7 @@ fn eval_owned_identity_any_all<S: EvalSemantics, V: DocumentValue>(
             if hit {
                 // The decisive answer continues into `rest` now, before
                 // `gen` is stopped -- `rest`'s own verdict outranks ours.
-                rest_flow.stash(eval_owned_identity_stages::<S, V>(
+                rest_flow.stop_with_downstream(eval_owned_identity_stages::<S, V>(
                     rest,
                     Cow::Owned(OwnedValue::Bool(target_truthy)),
                     id.clone(),
@@ -31631,6 +31632,9 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                         other => ended.stop_with_downstream(other),
                     }
                 });
+                // `false`: the matcher drives the pattern's computed keys, not one
+                // generator expression, so there is no `direct_pattern_retry` to hand
+                // the no-std stand-in; std compares the retry generation instead.
                 if let Some(flow) = ended.take(&walk, false) {
                     return flow;
                 }
