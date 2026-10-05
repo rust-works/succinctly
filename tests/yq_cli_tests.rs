@@ -51064,6 +51064,12 @@ fn test_yq_any_all_stage_keeps_no_path_register_3758() -> Result<()> {
             Some("[false,false]\n"),
         ),
         ("del(. as $x | isempty(empty) | $x)", None),
+        // #3826: the same on an untracked entry.
+        (
+            "(. as $x | 1 | any(empty; .) | $x) = 5",
+            Some("[false,false]\n"),
+        ),
+        ("del(. as $x | 1 | isempty(empty) | $x)", None),
     ] {
         let (stdout, code) = run_yq_stdin(filter, doc, &["--jq-extensions", "-o", "json", "-I0"])?;
         match expected {

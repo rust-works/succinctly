@@ -337,6 +337,8 @@ Consequences:
   that backtracked every branch, so `. as $x | any | $x` is the register again. A decided result
   navigated (`.[]`'s own index) and was already read through `reports_register`. The stage rule
   only *admits reading* the leaf's statement; the claim itself stays the arm's.
+  #3826: on an untracked entry the leaf states nothing (the register is carried by the stage), and the
+  carried copy stands unless the step states a loss.
 
 ## 6. Delivery
 

@@ -51409,16 +51409,22 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // untracked entry, which no leaf producer sees. A lost state
         // (`LostAt`, `LostSomewhere`) vouches for nothing.
         // #3758: `any`/`all`/`isempty(g)` state the register per result, so the
-        // stage reads the step's own statement (`Unmoved`, or nothing, which is
-        // `None` below) rather than a static answer. Taken on a trackable entry
-        // only, where the step's register is the one that entered; an untracked
-        // entry's is the carried copy, which no leaf producer sees. A result
-        // that navigated (a decided one, `.[]`'s own index) is read by
-        // `reports_register` instead; the consumers of this value ask
-        // `!navigated` themselves, and it is stated here too so the claim does
-        // not rest on them.
-        let states_register =
-            stages_per_result_register && trackable_step_eligible && !facts.navigated;
+        // stage reads the step's own statement rather than a static answer.
+        // On a trackable entry that is the step's register (`Unmoved`, or
+        // nothing, which is `None` below). On an untracked entry the register
+        // is the carried copy, which no leaf producer sees, and the leaf states
+        // `Unmoved` or nothing for a result it did not navigate (#3826): the
+        // carried copy stands unless the step *states a loss*, which vouches for
+        // nothing. A result that navigated (a decided one, `.[]`'s own index)
+        // is read by `reports_register` instead; the consumers of this value
+        // ask `!navigated` themselves, and it is stated here too so the claim
+        // does not rest on them.
+        let states_register = stages_per_result_register
+            && !facts.navigated
+            && !matches!(
+                step_register,
+                BranchRegister::LostAt(_) | BranchRegister::LostSomewhere
+            );
         let register_entering = if !(stage_preserves_register || seed || states_register) {
             None
         } else if trackable_step_eligible {
