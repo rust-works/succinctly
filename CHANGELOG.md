@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a `foreach` whose bound element is an empty array answers that element's path through `$k`** (#3789).
+  `path(foreach .a as $k (0; $k; .))` on `{"a":[]}` is `["a"]` in jq and refused here (`Invalid path expression with result []`, exit 5),
+  and `(foreach .a as $k (0; $k; .)) = 9`, `|=` and `del(foreach .a as $k (0; try $k; .))` wrote nothing. `$k` is the very node `.a`
+  navigated to, so it is `jv_identical` to jq's path register. Every other value (`{}`, `""`, `[1]`, `null`) was admitted by value; an
+  empty array is the one value a position-less marker cannot vouch for (#3494: `.[0:]` of `[]` is a fresh `[]`), and a fold's bare `$k`
+  was bound with exactly such a marker. In jq mode it now carries the position its element was navigated to (`Origin::SnapshotAt`), which
+  certifies as a `Snapshot` does by value and, for an empty array, by position. That needs `Frame::at`, which `may_bind_navigated`
+  keeps off for a bare-`$var` fold, so a `foreach` whose `$var` can reach a path position in UPDATE or EXTRACT now turns it on; a variable read by value
+  only, a variable the body never names, and every `reduce` (which restores the register, and which jq refuses for this shape too) stay off.
+  A register that has moved off `$k`'s node, a `$k` rebuilt into a container and a computed element still refuse, as in jq. Not covered:
+  a `foreach` over `.` itself (`foreach . as $k (0; $k; .)`) refuses for every value but `null`, empty or not (#3790), and
+  `first($k)` in UPDATE refuses for every value too. Pinned against jq 1.7.1 on both evaluators by `test_foreach_bound_empty_array_element_answers_its_path_3789`
+  and `test_frame_enter_gate_admits_a_foreach_variable_in_path_position_3789`.
+
 - **jq: `last(f)` keeps the identity of `f`'s last output, so a result that is jq's path register stays one** (#3766, a #3643 follow-up).
   jq defines `last(f)` as `reduce f as $x (null; $x)`, so the result is the very value `f` last emitted, and `path()` accepts a result
   that is `jv_identical` to the register (pointer identity for an object or array). The resolver forwarded a computed copy, so
