@@ -45252,18 +45252,45 @@ fn test_recurse_structural_descent_matches_recursive_descent_3719() -> Result<()
     for tail in [
         "",
         "| [., key, path, parent] | tojson",
+        "| key",
+        "| path",
         "| tag",
         "| select(type == \"!!map\") | keys",
     ] {
-        let spelled = format!("[recurse(.[]?){tail}]");
         let dots = format!("[..{tail}]");
         let (want, e1, c1) =
             run_yq_stdin_with_stderr(&dots, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
-        let (got, e2, c2) =
-            run_yq_stdin_with_stderr(&spelled, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
-        assert_eq!((c1, c2), (0, 0), "`{tail}` -- stderr: {e1:?} {e2:?}");
+        assert_eq!(c1, 0, "`{tail}` -- stderr: {e1:?}");
         assert!(!want.trim().is_empty(), "`{tail}` produced nothing");
-        assert_eq!(got, want, "`{tail}`");
+        for walk in [
+            "recurse",
+            "recurse(.[]?)",
+            "recurse((.[]?))",
+            "limit(100; recurse(.[]?))",
+        ] {
+            let spelled = format!("[{walk}{tail}]");
+            let (got, stderr, code) =
+                run_yq_stdin_with_stderr(&spelled, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
+            assert_eq!(code, 0, "`{spelled}` -- stderr: {stderr:?}");
+            assert_eq!(got, want, "`{spelled}`");
+        }
+    }
+    Ok(())
+}
+
+/// #3719: a computed or absent node has no live cursor, but structural
+/// recurse must still carry the same value positions as recursive descent.
+#[test]
+fn test_recurse_structural_descent_keeps_owned_and_absent_positions_3719() -> Result<()> {
+    for prefix in ["{a: [1, {b: 2}]} | ", ".missing | ", ".a | tostring | "] {
+        let tail = " | [key, path, parent] | tojson";
+        let dots = format!("{prefix}[..{tail}]");
+        let spelled = format!("{prefix}[recurse(.[]?){tail}]");
+        let args = ["--jq-extensions", "-o=json", "-I=0"];
+        let (want, e1, c1) = run_yq_stdin_with_stderr(&dots, "a: 5\n", &args)?;
+        let (got, e2, c2) = run_yq_stdin_with_stderr(&spelled, "a: 5\n", &args)?;
+        assert_eq!((c1, c2), (0, 0), "`{prefix}` -- stderr: {e1:?} {e2:?}");
+        assert_eq!(got, want, "`{prefix}`");
     }
     Ok(())
 }
