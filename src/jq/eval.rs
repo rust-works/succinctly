@@ -125458,6 +125458,22 @@ mod tests {
             (OBJ, "[.[], 1] | length", None, None),
             (OBJ, "{x: .b} | length", None, None),
             (OBJ, ".b as $x | 1", None, None),
+            ("[1.2.3]", ". as $x | 1", None, None),
+            (OBJ, "[.b, empty] | length", None, None),
+            (OBJ, "[.[] | ., .] | length", None, None),
+            (OBJ, "[.[] | [.]] | length", None, None),
+            ("[1.2.3]", r#"try ([., 1]) catch "c""#, None, None),
+            (OBJ, "[.a, .b]? | length", None, None),
+            (OBJ, "[first(.b)] | length", Some("1"), Some("1")),
+            (OBJ, "[.b | select(true)] | length", Some("1"), Some("1")),
+            (
+                OBJ,
+                "[if true then .b else 1 end] | length",
+                Some("1"),
+                Some("1"),
+            ),
+            (OBJ, "[.b // 1] | length", Some("1"), Some("1")),
+            (OBJ, "[try .b] | length", Some("1"), Some("1")),
         ];
         fn generic<V: crate::jq::document::DocumentValue>(r: GenericResult<V>) -> Outcome {
             match r {
