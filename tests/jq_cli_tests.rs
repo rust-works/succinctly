@@ -99456,9 +99456,9 @@ fn test_foreach_bound_empty_array_element_answers_its_path_3789() -> Result<()> 
 /// root `extend` just clones the element's path, so the answer rows in
 /// [`test_foreach_bound_empty_array_element_answers_its_path_3789`] cannot see a
 /// position that ignores the frame. A `reduce` re-seeds no per-step register, so even
-/// with the frame tracking positions for another reason (`. as $_`) it keeps its
-/// position-less marker and refuses, as jq does. Every row captured from jq 1.7.1
-/// with `-c`, on both evaluators.
+/// with the frame tracking positions for another reason (`. as $_`) it still refuses,
+/// as jq does; those rows pin the behaviour, not the marker a `reduce` binds, which no
+/// query tells apart. Every row captured from jq 1.7.1 with `-c`, on both evaluators.
 #[test]
 fn test_foreach_bound_empty_array_element_composes_with_the_frame_3789() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
