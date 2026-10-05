@@ -40558,6 +40558,41 @@ fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
     }
 }
 
+/// Whether a pipe stage `expr` is one whose by-value leaf states jq's path
+/// register *per result* (#3758): `any`/`all` in their four spellings and
+/// `isempty(g)`, read through the wrappers [`peel_register_transparent`] passes
+/// the register through. jq defines each over a generator it backtracks
+/// (`isempty(g)` is `first((g | false), true)`, `any(g; c)` is
+/// `isempty(first(g | (c or empty))) | not`), so the register is back where the
+/// stage entered exactly when nothing inside it was emitted, and wherever the
+/// emitting branch left it when something was ([`drained_register_after`],
+/// [`register_after`]). A static predicate cannot say which of the two a given
+/// result is, so this only admits the stage to *read* its leaf's statement:
+/// [`resolve_seq_stage`] then trusts an [`Unmoved`](BranchRegister::Unmoved)
+/// register on a result that navigated nothing, the way it already trusts the one
+/// on a result that did (`facts.navigated && step_unmoved`). Jq mode only, like
+/// every admission here (ADR-0018).
+///
+/// Not folded into [`stage_leaves_register_in_place`]: that is a per-*expression*
+/// fact, true of every result, and this one is not (`path(. as $x | any | $x)`
+/// on `{"a":true,"b":null}` is a path error in jq, because `.a` decided it and
+/// moved the register).
+fn stage_states_register_per_result<S: EvalSemantics>(expr: &Expr) -> bool {
+    last_register_unmoved::<S>()
+        && matches!(
+            peel_register_transparent(expr),
+            Expr::Builtin(
+                Builtin::Any
+                    | Builtin::All
+                    | Builtin::AnyF(_)
+                    | Builtin::AllF(_)
+                    | Builtin::AnyCond(..)
+                    | Builtin::AllCond(..)
+                    | Builtin::IsEmpty(_)
+            )
+        )
+}
+
 /// `stage` is a `last(f)`, which leaves jq's register where the stage entered
 /// whatever `f` navigates (#3643). jq defines it as `reduce f as $x (null; $x)`:
 /// `f` is the reduce's source, backtracked to exhaustion before the result is
@@ -51232,6 +51267,8 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // that already preserves it has nothing for the seed to add.
     let mut seed_pending =
         !stage_preserves_register && recurse_seed_keeps_register::<S>(element, branch_trackable);
+    // #3758: read once per stage, applied per result inside `place_step`.
+    let stages_per_result_register = stage_states_register_per_result::<S>(element);
     let mut place_step = |step: PathBranch<'a>| -> Demand {
         // #3293: only a `?//` retry re-invokes this after a stop.
         downstream.begin();
@@ -51280,7 +51317,16 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // part) and is the only rule that reaches a register carried on an
         // untracked entry, which no leaf producer sees. A lost state
         // (`LostAt`, `LostSomewhere`) vouches for nothing.
-        let register_entering = if !(stage_preserves_register || seed) {
+        // #3758: `any`/`all`/`isempty(g)` state the register per result, so the
+        // stage reads the step's own statement (`Unmoved`, or nothing, which is
+        // `None` below) rather than a static answer. Taken on a trackable entry
+        // only, where the step's register is the one that entered; an untracked
+        // entry's is the carried copy, which no leaf producer sees. A result
+        // that navigated (a decided one, `.[]`'s own index) is read by
+        // `reports_register` instead, and both consumers of this value already
+        // ask `!navigated`.
+        let states_register = stages_per_result_register && trackable_step_eligible;
+        let register_entering = if !(stage_preserves_register || seed || states_register) {
             None
         } else if trackable_step_eligible {
             step_register.unmoved_value()

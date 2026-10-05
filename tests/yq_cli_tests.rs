@@ -50952,6 +50952,35 @@ fn test_yq_by_value_stages_keep_no_path_register_3456() -> Result<()> {
     Ok(())
 }
 
+/// #3758: a pipe stage reading the backtracked-register verdict of `any`/`all`
+/// is a jq-mode admission too (ADR-0018). yq's `any`/`all` are its own builtins
+/// with no oracle for how they leave the register, so `succinctly yq` keeps the
+/// answers it had: a `$x` frozen before the stage is not re-established after
+/// it, the scalar write is the no-op yq's convention makes it, and `del` of it
+/// raises rather than writing.
+#[test]
+fn test_yq_any_all_stage_keeps_no_path_register_3758() -> Result<()> {
+    let doc = "[false,false]";
+    for (filter, expected) in [
+        ("(. as $x | any | $x) = 5", Some("[false,false]\n")),
+        ("(. as $x | all | $x) = 5", Some("[false,false]\n")),
+        ("del(. as $x | any | $x)", None),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I0"])?;
+        match expected {
+            Some(expected) => {
+                assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
+                assert_eq!(stdout, expected, "`{filter}`");
+            }
+            None => {
+                assert_ne!(code, 0, "`{filter}`: stdout {stdout:?}");
+                assert!(stdout.is_empty(), "`{filter}`: stdout {stdout:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// #3360: `from_entries` always raising in path position, and an empty `walk`
 /// over an object raising, are jq-mode rules (ADR-0018): jq derives them from
 /// how *jq* defines the builtins, and yq's implementation shares none of it, so
