@@ -43190,10 +43190,11 @@ fn routes_destructuring(patterns: &[Pattern]) -> bool {
 }
 
 /// Whether every output of `e` is a freshly built value -- a number or string
-/// literal, an array or object construction, or a comma/paren/pipe of them --
-/// and so can never be jq's path register (#3489). Deliberately a short
-/// allow-list: anything it does not name (`.`, a call, an arithmetic that may
-/// return its input) may preserve the register and is not claimed fresh.
+/// literal, an array or object construction, a builtin that always builds its
+/// result, or a comma/paren/pipe of them -- and so can never be jq's path register
+/// (#3489, #3745). Deliberately an allow-list: anything it does not name (`.`, a
+/// call, an arithmetic that may return its input) may preserve the register and is
+/// not claimed fresh.
 ///
 /// `null` and the booleans are **not** fresh: jq's `jv_identical` treats any
 /// `null` (or `true`/`false`) as the register's own value when the register
@@ -43201,13 +43202,50 @@ fn routes_destructuring(patterns: &[Pattern]) -> bool {
 /// applies that rule only while the register is still at the fold's input, so
 /// once INIT has navigated (`reduce (null as [$a] | $a) as $k (.[0]; .)` on
 /// `[null]`) a routed `null` source is refused where jq answers.
+///
+/// A `|` is fresh when its last stage is, and a trailing `.` does not undo what
+/// came before it (`keys | .`). The builtin list is pinned by
+/// `scripts/jq-fold-fresh-source-sweep.py`, which compares every entry (and the
+/// register-preserving sources that must stay off the list) against jq.
 fn yields_only_fresh_values(e: &Expr) -> bool {
     match e {
         Expr::Literal(Literal::Null | Literal::Bool(_)) => false,
         Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) => true,
+        // #3745: a builtin whose every output is a container it builds itself --
+        // jq defines each over a fresh `[]`/`{}` (`reduce`/`[... | f]`), so its
+        // result is never `jv_identical` to the register (an empty one is a fresh
+        // `jv_array()`, #3494). Each captured against jq 1.7.1: `keys as [$a]` and
+        // the rest raise "near attempt to access element 0". Nothing that can hand
+        // back its input or one of its elements belongs here (`add`, `first`,
+        // `select`, `.[0]`, `getpath`): `[.] | add` can be the register.
+        Expr::Builtin(
+            Builtin::Keys
+            | Builtin::KeysUnsorted
+            | Builtin::ToEntries
+            | Builtin::Map(_)
+            | Builtin::Paths
+            | Builtin::PathsFilter(_)
+            | Builtin::Flatten
+            | Builtin::FlattenDepth(_)
+            | Builtin::ToStream
+            | Builtin::Sort
+            | Builtin::SortBy(_)
+            | Builtin::Reverse
+            | Builtin::GroupBy(_)
+            | Builtin::Unique
+            | Builtin::UniqueBy(_)
+            | Builtin::Transpose,
+        ) => true,
         Expr::Paren(inner) => yields_only_fresh_values(inner),
         Expr::Comma(items) => !items.is_empty() && items.iter().all(yields_only_fresh_values),
-        Expr::Pipe(stages) => stages.last().is_some_and(yields_only_fresh_values),
+        Expr::Pipe(stages) => {
+            // a trailing `.` forwards what came before it
+            let end = stages
+                .iter()
+                .rposition(|stage| !matches!(unwrap_paren(stage), Expr::Identity))
+                .map_or(0, |i| i + 1);
+            stages[..end].last().is_some_and(yields_only_fresh_values)
+        }
         _ => false,
     }
 }

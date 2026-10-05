@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `first($k)` in UPDATE refuses for every value too. Pinned against jq 1.7.1 on both evaluators by `test_foreach_bound_empty_array_element_answers_its_path_3789`
   and `test_frame_enter_gate_admits_a_foreach_variable_in_path_position_3789`.
 
+- **jq: a destructuring bind over a builtin that always builds its result (`keys`, `to_entries`, `map(f)`, `paths`, `flatten`, `sort`, ...) in a `reduce`/`foreach` source is path-tracked like a literal one** (#3745).
+  `path(reduce (keys as [$a] | $a) as $k (.; .))` on `{"a":1}` answered `[]`, `del(...)` answered `null` and `(...) |= 5` answered `5`, where jq exits 5
+  (`near attempt to access element 0 of ["a"]`). #3489 routed a destructuring source through the resolver only when its value is provably not
+  jq's register, and listed only literals and constructions. It now also names `keys`, `keys_unsorted`, `to_entries`, `map(f)`, `paths`, `paths(f)`,
+  `flatten`, `flatten(n)`, `tostream`, `sort`, `sort_by(f)`, `reverse`, `group_by(f)`, `unique`, `unique_by(f)` and `transpose` -- each builds its result, so jq
+  never finds it identical to the register -- and treats a trailing `| .` as transparent (`keys | .`). Nothing that can return its input or an element joins it
+  (`add`, `first`, `select`, `.[0]`, `getpath`, `min`, `max`), so the register-preserving sources keep their answers. Verified against jq 1.7.1 by the new
+  `scripts/jq-fold-fresh-source-sweep.py` over source x pattern x form x document rows: all 4,104 rows over the listed sources match jq, and no register-preserving
+  source regresses against `main`.
+  Pinned by `test_fold_source_destructuring_over_a_builtin_that_builds_a_fresh_value_3745`.
 - **jq: `last(f)` keeps the identity of `f`'s last output, so a result that is jq's path register stays one** (#3766, a #3643 follow-up).
   jq defines `last(f)` as `reduce f as $x (null; $x)`, so the result is the very value `f` last emitted, and `path()` accepts a result
   that is `jv_identical` to the register (pointer identity for an object or array). The resolver forwarded a computed copy, so
