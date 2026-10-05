@@ -89,6 +89,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/jq-fold-fresh-source-sweep.py` over source x pattern x form x document rows: all 4,104 rows over the listed sources match jq, and no register-preserving
   source regresses against `main`.
   Pinned by `test_fold_source_destructuring_over_a_builtin_that_builds_a_fresh_value_3745`.
+
+- **jq: a `foreach` UPDATE or EXTRACT whose body wraps a generator in `//`, `select`, `first`, `limit`, `if`, `getpath`, a
+  computed key or a `catch` no longer silently skips a write** (#3770, a #3738 follow-up).
+  `(foreach .x as $w (0; try ($w | .a[]) // $w; .)) = 9` on `{"a":[{"b":1}],"x":{"a":[{"b":1}]}}` is
+  `{"a":[{"b":1}],"x":{"a":[9]}}` in jq and refused here, and `path(foreach .x as $w (0; try first($w | .a[]); .))`
+  printed nothing where jq prints `["x","a",0]`. `fans_out` counted `.[]` and `..` as a split into sibling branches, so
+  such a body resolved without jq's path register and its `try` caught the resulting refusal; #3738 had exempted only a
+  single chain of stages. A generator no longer counts (nor did `recurse`, `range` or `limit` before), which subsumes
+  #3738's `is_single_path_chain` allowlist; #3769's fix (#3777) removed the root-path relocation that made this unsafe.
+  A comma body still answers nothing where jq answers, and on a `null` document `//` around a generator
+  (`(foreach .a? as $k (0; try (($k | .[]?) // $k); .)) = 9`, `{"a":9}` in jq) now refuses loudly where it used to skip
+  the write (#3788). #3775's `(true or .[]?)` UPDATE now matches jq when `.a` is `true` (`path(...)` is `["a"]`, `= 9`
+  writes `{"a":9,"b":2}`). Pinned by `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`.
+
 - **jq: `last(f)` keeps the identity of `f`'s last output, so a result that is jq's path register stays one** (#3766, a #3643 follow-up).
   jq defines `last(f)` as `reduce f as $x (null; $x)`, so the result is the very value `f` last emitted, and `path()` accepts a result
   that is `jv_identical` to the register (pointer identity for an object or array). The resolver forwarded a computed copy, so
@@ -180,10 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable, `.`, parentheses, `?` and `try` with no handler, joined by `|`); every other shape keeps the old verdict
   (`getpath(...)`, a computed key even when literal, `select`, `first(...)`). The
   rows that were silently skipped now match jq, including the ones where jq raises (`path(foreach .x as $w (0; try ($w |
-  .[]?); $w))`, a slice write). Bodies that branch (a comma, `//`, `and`/`or` around a generator, a `catch` handler) and
-  the non-branching shapes the allowlist does not name still answer nothing or refuse where jq answers (#3770); widening
-  the exemption needs the fold's null-identity relocation fixed first, since dropping the generator from `fans_out`
-  outright made `(foreach .a? as $k (0; try (($k | .[]?) // $k); .)) = 9` on `null` write `9` over the whole document.
+  .[]?); $w))`, a slice write). Bodies that branch, and the non-branching shapes the allowlist did not name, were
+  left to #3770, which replaced the allowlist once #3769's fix had made widening safe.
   Verified against jq 1.7.1: 33 pinned rows plus a characterization test for what stays; an oracle sweep of the new
   `$k` operands (103,707 rows: 0 regressions, 90 rows now match), of every existing generator and fold operand over every
   context (159,867 rows, identical to the parent) and of a 100,027-row seeded sample over every operand (0 regressions);

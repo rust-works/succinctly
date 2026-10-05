@@ -42305,51 +42305,31 @@ fn recurse_seed_keeps_register<S: EvalSemantics>(element: &Expr, branch_trackabl
     )
 }
 
-/// Whether `expr` can produce more than one output -- a syntactic
-/// over-approximation, used by [`FoldRegister::resolve`] to decline
-/// carrying the register into a body whose branches would then see it
-/// unevenly (#3145 review). `Comma` and the iterating/recursing shapes
-/// count; so does anything this predicate cannot see inside, since the
-/// answer must be "maybe" for those.
+/// Whether `expr` can split into sibling branches that would see the fold's
+/// register unevenly -- a syntactic over-approximation, used by
+/// [`FoldRegister::resolve`] to decline carrying the register into such a body
+/// (#3145 review). A comma, a destructuring bind and the shapes this
+/// predicate cannot see inside (a fold, a call) count, since the answer must be
+/// "maybe" for those.
+///
+/// A generator does not count by itself (#3770): `.[]` and `..` used to, which
+/// withheld the register from `try ($w | .a[])` and from `//`, `and`/`or`,
+/// `select`, `first(...)`, `limit` or a `catch` around one, so the body
+/// resolved register-less, the `try` caught its own refusal and the UPDATE
+/// yielded nothing -- a write silently skipped where jq writes. Every output of
+/// such a body leaves through the same register view; the other generators
+/// (`recurse`, `range`, ...) were never listed here either.
 fn fans_out(expr: &Expr) -> bool {
     any_subexpr(expr, &mut |e| {
         matches!(
             e,
             Expr::Comma(_)
-                | Expr::Iterate
-                | Expr::RecursiveDescent
                 | Expr::AsPattern { .. }
                 | Expr::Reduce { .. }
                 | Expr::Foreach { .. }
                 | Expr::FuncCall { .. }
                 | Expr::NamespacedCall { .. }
         )
-    })
-}
-
-/// Whether `expr` is one chain of stages with no point at which it can split
-/// into sibling branches (#3738): navigation ([`is_navigation_node`]), the
-/// fold's bound variable (a `TrackedVar` once substituted), `.`, and the
-/// wrappers that add no branch of their own (parentheses, `?`, `try` with no
-/// `catch`) joined by `|`. Every node is vetted, the way
-/// [`is_pure_navigation`] vets a bind source, so a navigation node that
-/// carries an expression of its own is admitted only if that expression is in
-/// the list too: a field, an index, a slice, `..` and `.[]` are chains; a
-/// computed key (even a literal one, `.a[0.5]`) and `getpath(...)` are not,
-/// since their arguments are not. An allowlist, the safe direction: a shape it
-/// does not name keeps [`fans_out`]'s answer.
-fn is_single_path_chain(expr: &Expr) -> bool {
-    !any_subexpr(expr, &mut |e| {
-        !(is_navigation_node(e)
-            || matches!(
-                e,
-                Expr::Identity
-                    | Expr::TrackedVar(_)
-                    | Expr::Pipe(_)
-                    | Expr::Paren(_)
-                    | Expr::Optional(_)
-                    | Expr::Try { catch: None, .. }
-            ))
     })
 }
 
@@ -42909,8 +42889,9 @@ impl FoldRegister {
         // `(foreach .a as {a:$v} ?// {c:$v} (0; ($v[0]?, $v))) = 9` wrote
         // `.a.c`, a key jq never names, because only the second output
         // refused and drove a `?//` retry jq does not perform. A body with
-        // one output path cannot split that way. (#3738 exempts a chain of stages,
-        // generator or not: see the call site below.) Widening the other
+        // one output path cannot split that way, and neither can a generator's
+        // outputs, which all leave through the same stages (#3738, #3770).
+        // Widening the other
         // direction (re-establishing in `resolve_node`'s own arms) is
         // #2046's documented scope limit, not this fix's.
         let update_frame = if self.trackable {
@@ -42950,19 +42931,8 @@ impl FoldRegister {
                 &mut deliver,
             )
         } else {
-            // #3738: a body that is one chain of stages gets the register
-            // whether or not it holds a generator. `fans_out` guards sibling
-            // branches that would see the register unevenly; a generator inside
-            // one chain (`try ($v | .[]?)`) has no sibling to withhold it from,
-            // since every output comes through the same stages. Withholding it
-            // made such a body resolve register-less, so its own refusal was
-            // caught by the `try` as though jq had raised it and the UPDATE
-            // yielded nothing -- a write silently skipped where jq writes or
-            // raises. Anything `is_single_path_chain` does not name keeps the
-            // old verdict.
-            let carries_register = !fans_out(expr) || is_single_path_chain(expr);
             let update_frame = update_frame.with_register(
-                if S::TAG == EvalTag::Jq && self.trackable && !tr && carries_register {
+                if S::TAG == EvalTag::Jq && self.trackable && !tr && !fans_out(expr) {
                     Some(&self.value)
                 } else {
                     None
