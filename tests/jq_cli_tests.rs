@@ -62370,6 +62370,14 @@ fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> 
             "",
             0,
         ),
+        // A pipe whose head is the bind.
+        (
+            r#"{"a":1}"#,
+            r"path(foreach ((. as {a:$a} | .) | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
     ])
 }
 

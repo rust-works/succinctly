@@ -43637,8 +43637,8 @@ fn fold_source_moves_register(source: &Expr) -> bool {
 /// fold, and its by-value drive is right (`foreach (reduce . as {a:$a} (0; .)) as
 /// $x (.; .; .)`).
 ///
-/// Only the source's own spine is read (the bind itself, a bind's body, a comma's
-/// branches, a pipe's head), never a builtin's argument or a `def` body, where `.`
+/// Only the source's own spine is read (the bind itself, a comma's branches, a
+/// pipe's head), never a builtin's argument or a `def` body, where `.`
 /// is another value, and so never a nested fold either: a nested `foreach . as [$q]
 /// (...)` over `.` moves the register for the outer fold in jq too, but routing it
 /// answered a root where jq refuses inside an `or` under a `try` (54 sampled rows,
@@ -43646,13 +43646,8 @@ fn fold_source_moves_register(source: &Expr) -> bool {
 /// to the by-value drive as for a fresh source ([`routes_destructuring`]).
 fn foreach_source_destructures_register(source: &Expr) -> bool {
     match unwrap_paren(source) {
-        Expr::AsPattern {
-            expr,
-            patterns,
-            body,
-        } => {
-            (routes_destructuring(patterns) && matches!(unwrap_paren(expr), Expr::Identity))
-                || foreach_source_destructures_register(body)
+        Expr::AsPattern { expr, patterns, .. } => {
+            routes_destructuring(patterns) && matches!(unwrap_paren(expr), Expr::Identity)
         }
         Expr::Comma(branches) => branches.iter().any(foreach_source_destructures_register),
         Expr::Pipe(stages) => stages
