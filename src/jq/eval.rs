@@ -46165,9 +46165,20 @@ fn update_navigates_within(expr: &Expr, first_only: bool) -> bool {
         Expr::Pipe(stages) => stages
             .first()
             .is_some_and(|stage| update_navigates_within(stage, first_only)),
-        Expr::Comma(items) if first_only => items
-            .first()
-            .is_some_and(|item| update_navigates_within(item, true)),
+        // `first(f)` stops at the first output. A first item that is certain to yield
+        // one (`.`, a literal, a `$var`) ends the read there, so `first(., .k)` never
+        // runs `.k`; any other first item may yield nothing (`empty`, `select(false)`),
+        // and then a later item is the first output, so those are read too.
+        Expr::Comma(items) if first_only => match items.split_first() {
+            Some((head, rest)) => {
+                update_navigates_within(head, true)
+                    || (!matches!(
+                        unwrap_paren(head),
+                        Expr::Identity | Expr::Literal(_) | Expr::Var(_) | Expr::TrackedVar(_)
+                    ) && rest.iter().any(|item| update_navigates_within(item, true)))
+            }
+            None => false,
+        },
         Expr::Comma(items) => items
             .iter()
             .any(|item| update_navigates_within(item, false)),

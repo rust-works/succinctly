@@ -64350,6 +64350,15 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
             "",
             0,
         ),
+        // A trackable output at the root is the entry node only when the entry *is* the
+        // root: a `$r` frozen at the root and read from below it is not the register.
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(. as $r | .a | last($r))",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
         // Recorded refusals where jq answers `null` (exit 0), as before #3786: a
         // passthrough `f` outside `cannot_move_register`'s allowlist is read as one
         // that may navigate, because the walk cannot tell it from `limit(2; .k, .)`.
@@ -64516,6 +64525,22 @@ fn test_reduce_update_navigating_inside_a_collect_or_alternative_refuses_3797() 
             doc,
             r"path(reduce .[]? as $k (.; first(first(., .k))))",
             "[]\n",
+            "",
+            0,
+        ),
+        // ...while a first item that may yield nothing leaves a later navigation as the
+        // first output, which jq path-checks.
+        (
+            doc,
+            r"del(. as $x | reduce .[]? as $k (.; first(empty, .k) | $x))",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            doc,
+            r"del(. as $x | reduce .[]? as $k (.; first(., .k) | $x))",
+            "null\n",
             "",
             0,
         ),
