@@ -47643,20 +47643,16 @@ mod key_node_metadata_2763 {
         ])
     }
 
-    /// The key node is a node, but it is still printed as the plain key it
-    /// always was -- no anchor, tag or style leaks into the output, and the
-    /// write paths are untouched. Every row is byte-identical to what this
-    /// binary printed before #2763; two of them (`[.[] | key]` and `keys`,
-    /// where real yq re-emits the key's own `"qk"` quoting and its `&ka`
-    /// anchor) diverge from yq exactly as they did before, which is a
-    /// rendering question this issue does not touch.
+    /// Bare key results and key writes retain #2763's behavior. The `keys`
+    /// renderer now preserves source quoting (#3615), verified against yq
+    /// v4.53.3; `[.[] | key]` still has its separate presentation gap.
     #[test]
-    fn the_rendering_and_write_paths_are_unchanged_2763() -> Result<()> {
+    fn the_key_rendering_and_write_paths_2763() -> Result<()> {
         check(&[
             (".a | key", MIXED, "a\n"),
             (".[] | key", MIXED, "a\nx\nqk\nk2\n"),
             ("[.[] | key]", MIXED, "- a\n- x\n- qk\n- k2\n"),
-            ("keys", MIXED, "- a\n- x\n- qk\n- k2\n"),
+            ("keys", MIXED, "- a\n- x\n- \"qk\"\n- k2\n"),
             (".a | key | tostring | key", KEYC, "a\n"),
             // A write *through* a key is still positional, unchanged.
             ("(.a | key) = \"z\"", KEYC, "a: # keyc\n  b: 1\n"),

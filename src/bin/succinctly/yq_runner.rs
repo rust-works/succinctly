@@ -45,6 +45,8 @@ use crate::output::{
     JsonFormatOpts, LoudFlushWriter, Terminator,
 };
 
+mod reshape_presentation;
+
 /// yq's diagnostics carry no `(at <file>:<line>)` marker, so the yq paths have
 /// no location to report — unlike jq, whose marker names the input value (#355).
 fn no_location() -> InputLocation {
@@ -3856,9 +3858,9 @@ fn apply_meta_assign_writes(
 /// own) it's [`reconcile_presentation`]'s output against the pristine
 /// document when `expr` is a shape-preserving write
 /// ([`is_alias_sensitive_assign`]) and the caller wants comments at all
-/// (`need_comments`), or [`CommentTree::empty`] otherwise — see
-/// [`CommentTree`]'s own doc comment for why a cursor-less value can't
-/// generally carry metadata.
+/// (`need_comments`). Supported pure reshapes instead get a traced side-tree
+/// (#3615); other computed values get [`CommentTree::empty`]. See
+/// [`CommentTree`]'s own doc comment for the provenance boundary.
 fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     expr: &Expr,
@@ -4134,6 +4136,30 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             Ok(vs.into_iter().map(no_comments).collect())
         }
     };
+
+    // #3615: only containers need source style: bare scalar results strip
+    // it below. Trace after evaluation so errors and scalar computations
+    // pay no presentation snapshot cost. The source cursor is immutable.
+    // The allowlist excludes effects and context-sensitive expressions.
+    // The generic evaluator owns semantics, including typed/duplicate keys;
+    // a mismatching trace must not supply a guessed tree.
+    if need_comments && reshape_presentation::needed(expr) {
+        if let Ok(results) = &mut docs {
+            if results.len() == 1
+                && matches!(results[0].0, OwnedValue::Array(_) | OwnedValue::Object(_))
+            {
+                let reshaped =
+                    to_owned_with_comments::<_, YqSemantics>(&cursor.value(), Some(&cursor))
+                        .ok()
+                        .and_then(|input| reshape_presentation::trace(expr, &input));
+                if let Some((traced, tree)) = reshaped {
+                    if results[0].0 == traced {
+                        results[0].1 = tree;
+                    }
+                }
+            }
+        }
+    }
 
     if let Some((pristine, groups)) = &alias_sync_ctx {
         if let Ok(docs) = &mut docs {
@@ -8930,6 +8956,27 @@ mod tests {
         )
         .unwrap();
         groups.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn reshape_presentation_reports_a_failed_replay_only_once() {
+        let expr = jq::parse_with_mode("with_entries(.) | . + \"x\"", jq::ParserMode::Yq).unwrap();
+        let mut sink = ErrorSink::default();
+        let (groups, _) = evaluate_yaml_direct_filtered(
+            b"\"a\": 'x'\n",
+            &expr,
+            None,
+            &mut sink,
+            DirectEvalOptions {
+                need_comments: true,
+                strip_style: false,
+                sort_keys: false,
+                mark_json_sourced: false,
+            },
+        )
+        .unwrap();
+        assert!(groups.into_iter().flatten().next().is_none());
+        assert_eq!(sink.report_count(), 1);
     }
 
     #[test]

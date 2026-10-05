@@ -23,7 +23,9 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::document::{DistinctKeyCursors, DocumentFields, IndentSpec, JsonConvention};
+use super::document::{
+    DistinctKeyCursors, DocumentCursor, DocumentFields, IndentSpec, JsonConvention,
+};
 use super::error::EvalError;
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::eval_generic::key_owned_value;
@@ -36,7 +38,9 @@ use super::value::{
     assert_value_tree_depth, format_number_for_preview, format_number_jq_compat,
     infinite_float_preview_text, jq_bare_float_display, NumberRepr, OwnedValue,
 };
-use crate::yaml::encode_style::write_go_yaml_string;
+use crate::yaml::encode_style::{
+    write_go_yaml_double_quoted, write_go_yaml_single_quoted, write_go_yaml_string,
+};
 use crate::yaml::{format_float_with_fraction, format_float_yq_yaml, format_float_yq_yaml_nested};
 
 /// A value that can be streamed directly to output without intermediate allocation.
@@ -1082,10 +1086,17 @@ pub fn stream_yaml_string_in<W: core::fmt::Write>(
 
 /// One materialized key as a YAML scalar: a string through
 /// [`stream_yaml_string`]'s quoting rule, a typed key (#2785) through the
-/// owned scalar writer -- always a scalar, so the container arms and their
+/// owned scalar writer. Source quote style is retained for string nodes
+/// (#3615); always a scalar, so the container arms and their
 /// indentation never apply.
-fn stream_yaml_key_value<W: core::fmt::Write>(out: &mut W, key: &OwnedValue) -> core::fmt::Result {
+fn stream_yaml_key_value<W: core::fmt::Write>(
+    out: &mut W,
+    key: &OwnedValue,
+    style: &str,
+) -> core::fmt::Result {
     match key {
+        OwnedValue::String(key) if style == "double" => write_go_yaml_double_quoted(out, key),
+        OwnedValue::String(key) if style == "single" => write_go_yaml_single_quoted(out, key),
         OwnedValue::String(key) => stream_yaml_string(out, key),
         typed => stream_owned_value_yaml(typed, out, "", 0, ' ', false),
     }
@@ -1095,7 +1106,7 @@ fn stream_yaml_key_value<W: core::fmt::Write>(out: &mut W, key: &OwnedValue) -> 
 /// intermediate `Vec<String>`/`OwnedValue::Array` (#685).
 ///
 /// The YAML counterpart of `stream_lazy_keys_json` above, mirroring
-/// `stream_owned_value_yaml`'s `Array` arm. Keys are always plain strings,
+/// `stream_owned_value_yaml`'s `Array` arm. Keys are scalar nodes,
 /// never nested containers, so this omits that arm's "nested container gets
 /// its own indented line" branch, and — like `stream_lazy_keys_json` — has no
 /// `current_indent` parameter, since `LazyKeys { sorted: false, .. }` is
@@ -1138,7 +1149,7 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
             if i > 0 {
                 out.write_str(", ")?;
             }
-            stream_yaml_key_value(out, &key)?;
+            stream_yaml_key_value(out, &key, cursor.style())?;
         }
         // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
         // -- `is_malformed()` checks both #1194 faults this walk can find.
@@ -1164,7 +1175,7 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
                 out.write_char('\n')?;
             }
             out.write_str("- ")?;
-            stream_yaml_key_value(out, &key)?;
+            stream_yaml_key_value(out, &key, cursor.style())?;
         }
         // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
         // -- `is_malformed()` checks both #1194 faults this walk can find.

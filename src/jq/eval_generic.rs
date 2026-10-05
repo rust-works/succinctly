@@ -1941,11 +1941,12 @@ impl NodeMeta {
 /// and never go through `CommentTree` at all — `stream_owned_value_yaml` in
 /// `stream.rs` streams plain `OwnedValue` (no cursor, no metadata) and
 /// isn't part of either mechanism.
-/// A query that reshapes the tree (`map`, object/array construction, ...)
-/// simply has no `to_owned_with_comments` call in its chain, so metadata is
-/// dropped there exactly as they are today — out of scope for this issue,
-/// tracked separately (see the issue's own scope note). A query that
-/// rewrites specific paths (`=`, `|=`, `del()`, ...) instead gets a
+/// A bounded YAML-runner provenance pass (#3615) carries this tree through
+/// entries/key conversion, pure entry transformations, and plain mapping
+/// `+`/`*`. It checks its traced value against the generic evaluator's result
+/// before using metadata. Other reshaping expressions (including arbitrary
+/// object/array construction and context-sensitive filters) still lose the
+/// tree. A query that rewrites specific paths (`=`, `|=`, `del()`, ...) gets a
 /// reconciled tree from `evaluate_yaml_cursor`'s `reconcile_presentation`,
 /// which pairs the pristine (pre-write) tree with the post-write value and
 /// keeps metadata for every node whose value the write didn't touch.

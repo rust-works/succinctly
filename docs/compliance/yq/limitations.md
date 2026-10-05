@@ -599,9 +599,17 @@ replaces the mapping. `-P` strips the quoting but keeps that the key is a string
 `"a": 1` becomes `a: 1`). Pinned by the `yaml_key_style_*_3601` goldens. What is still open, each
 separate from this:
 
-- **A filter that rebuilds the tree** (`with_entries`, `to_entries | from_entries`, `keys`, `*`, `+`)
-  carries no `CommentTree` at all, so every key *and value* on that route loses its quoting. yq keeps both,
-  because it keeps the node.
+- **Reshaping provenance** ([#3615](https://github.com/rust-works/succinctly/issues/3615)) now
+  preserves key/value quoting for `with_entries(.)`, `to_entries | from_entries`, `keys`, and plain
+  mapping `+`/`*`, including static navigation, pure entry renames/updates, and `map` over entries.
+  The YAML runner carries a bounded side-tree and accepts it only when its traced value matches
+  the authoritative evaluator result. Mapping `+` keeps an existing left key's quoting and takes
+  the right value's style; `*` keeps the left scalar style at existing keys. New fields take the
+  right key/value style. The streaming `keys` writer also retains each source key's quoting.
+  Pinned by `yaml_reshape_style_*_3615` goldens. General construction, context-sensitive or
+  multi-output entry filters, merge flag variants, and typed/duplicate-key reshapes that cannot
+  be represented faithfully by the text-keyed side-tree still fall back to metadata-free output.
+  This is a scoped provenance fix, not evaluator-wide node identity.
 - **`|=` with a constructed mapping** (`.m |= {"a": 7}`) matches pristine metadata by key, so the key
   keeps its quoting where yq's fresh node has none. A value's quoting and comment are carried the same way
   (`a: "x" # cm`), so this is the existing key-matching approximation (#870), not a new one.
