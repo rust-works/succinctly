@@ -15463,6 +15463,13 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// which got the answer right but ran the side effects past the decision;
 /// now the same rule as `eval_generic.rs`'s `any_all_probe_item_generic`,
 /// so the two routes agree on that row too.
+///
+/// **Discards the control a `?//` retry raises after the decisive output**
+/// (#3810): it answers only "decided or not". Use
+/// [`any_all_probe_element_verdict`] wherever that control must follow the
+/// answer. The one remaining caller is the path-position resolver
+/// (`resolve_any_all_gen_cond_sink`), where `path(any(...))` itself still
+/// diverges before the retry is reached (#3819).
 fn any_all_probe_element<S: EvalSemantics>(
     cond: &Expr,
     elem: &OwnedValue,

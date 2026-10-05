@@ -10343,6 +10343,34 @@ register, which is out of scope here — tracked as a follow-up alongside #3048 
 opened as its own issue, since no design for surfacing fold-register state to a
 `resolve_node_sink` arm exists yet.
 
+## `any`/`all` condition retries after a decisive answer (#3810)
+
+Pinned jq 1.7.1 emits the decisive boolean before a `?//` retry inside the
+condition raises or halts. For example, on `{"a":[1],"b":[2]}`:
+
+```jq
+any(.; (. as {a:$q} ?// {b:$z} |
+  if $q != null then .a else error("E2") end))
+```
+
+prints `true` and then raises `E2` (exit 5). Replacing the retry's error with
+`("H" | halt_error(3))` prints `true`, writes `H` to stderr, and exits 3.
+An array around the call emits nothing because the raise prevents completion.
+`all` with a decisive false condition follows the same ordering. Both document
+and owned routes now preserve this control, including unary array/object
+condition probes; ordinary trailing comma outputs remain short-circuited.
+`test_any_all_condition_retry_preserves_answer_then_control_3810` pins these
+outputs, attempt traces and exit codes.
+`test_any_all_direct_condition_retry_control_3810` also pins direct `?//`
+conditions in `no_std`; wrapped conditions still require the existing std
+retry-generation mechanism to recognize that the stop was consumed.
+
+A separate, pre-existing gap remains for clean condition retries: replacing
+`error("E2")` above with `empty` or `false` makes jq emit `true` then `false`,
+and replacing it with `.b` makes jq emit two `true` values. Succinctly emits
+only the first `true` on both routes. These extra clean verdicts and the
+owned-identity `key`/`path` walker are outside this error/halt fix.
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |
@@ -10405,31 +10433,3 @@ stripped before any byte reaches the user) to apply the same double wrap.
 - [`src/jq/eval_generic.rs`](../../../src/jq/eval_generic.rs) - generic evaluator (CLI path)
 - [jq manual](https://jqlang.github.io/jq/manual/) - upstream reference
 
-
-### `any`/`all` condition retries after a decisive answer (#3810)
-
-Pinned jq 1.7.1 emits the decisive boolean before a `?//` retry inside the
-condition raises or halts. For example, on `{"a":[1],"b":[2]}`:
-
-```jq
-any(.; (. as {a:$q} ?// {b:$z} |
-  if $q != null then .a else error("E2") end))
-```
-
-prints `true` and then raises `E2` (exit 5). Replacing the retry's error with
-`("H" | halt_error(3))` prints `true`, writes `H` to stderr, and exits 3.
-An array around the call emits nothing because the raise prevents completion.
-`all` with a decisive false condition follows the same ordering. Both document
-and owned routes now preserve this control, including unary array/object
-condition probes; ordinary trailing comma outputs remain short-circuited.
-`test_any_all_condition_retry_preserves_answer_then_control_3810` pins these
-outputs, attempt traces and exit codes.
-`test_any_all_direct_condition_retry_control_3810` also pins direct `?//`
-conditions in `no_std`; wrapped conditions still require the existing std
-retry-generation mechanism to recognize that the stop was consumed.
-
-A separate, pre-existing gap remains for clean condition retries: replacing
-`error("E2")` above with `empty` or `false` makes jq emit `true` then `false`,
-and replacing it with `.b` makes jq emit two `true` values. Succinctly emits
-only the first `true` on both routes. These extra clean verdicts and the
-owned-identity `key`/`path` walker are outside this error/halt fix.
