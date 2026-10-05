@@ -6710,7 +6710,7 @@ fn each_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Flow::Escaped(Control::Error(e)) => match catch {
             Some(catch_expr) => {
                 // #3036: see `try_payload_root`.
-                let root = try_payload_root(expr);
+                let root = try_handler_root(expr, catch_expr);
                 eval_each_owned::<S>(
                     catch_expr,
                     &e.payload(),
@@ -13491,7 +13491,7 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 catch_expr,
                 &e.payload(),
                 optional,
-                Reentry::Against(try_payload_root(expr)),
+                Reentry::Against(try_handler_root(expr, catch_expr)),
             ),
             None => QueryResult::None,
         },
@@ -13523,7 +13523,7 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     catch_expr,
                     &e.payload(),
                     optional,
-                    Reentry::Against(try_payload_root(expr)),
+                    Reentry::Against(try_handler_root(expr, catch_expr)),
                 ),
                 None => QueryResult::None,
             };
@@ -34649,7 +34649,9 @@ impl Reentry {
 /// value with no node identity of its own, so it is `Owned` -- which demotes
 /// every marker -- unless every raise `BODY` spells raises one marker's own
 /// value verbatim (`error($x)`, `$x | error`, wherever they sit in the
-/// body: `.a | error($x)`, `if .a then error($x) else . end`). jq's `catch`
+/// body: `.a | error($x)`, `if .a then error($x) else . end`) -- except
+/// inside a nested `try`/`?`, which swallows its body's raises, so only that
+/// nested handler's own raises count (#3123). jq's `catch`
 /// then runs against that same `jv`, so `. as $x | try error($x) catch
 /// path($x)` is `[]` there (confirmed live, jq 1.7.1), and the node the
 /// marker names is the payload's own. A body with no raise site of its own,
@@ -34660,8 +34662,71 @@ impl Reentry {
 /// error's message) is a string a container marker never equals, so it
 /// needs no witness of its own.
 pub(crate) fn try_payload_root(body: &Expr) -> RootWitness {
+    let mut sites = RaiseSites {
+        witness: None,
+        unproven: false,
+    };
+    sites.search(body);
+    match sites.witness {
+        Some(node) if !sites.unproven => node,
+        _ => RootWitness::Owned,
+    }
+}
+
+/// [`try_payload_root`] for the `catch` handler that will read it (#3123):
+/// the body walk runs once per dispatch, which on a `try` that fails per
+/// element is once per element, so it is skipped for a handler that
+/// cannot tell one root from another.
+///
+/// Only a literal or `.` qualifies. Every reader of the witness -- the
+/// marker rewrite in [`reroot_for_reentry`] and the [`Reentry::REBUILT`]
+/// doors (`owned_path_door`, the select-peel, the bind door, ...) -- starts
+/// from a marker or from a `path`/`select`/bind head, and neither a literal
+/// nor an identity stage is one, so the handler's output is the same under
+/// any witness. A wider test ("holds no marker") is *not* sound: a
+/// marker-free `catch path(.a)` takes a door only a `REBUILT` root opens.
+pub(crate) fn try_handler_root(body: &Expr, handler: &Expr) -> RootWitness {
     use super::eval_generic::strip_parens;
-    let marker_node = |raised: &Expr| -> Option<RootWitness> {
+    match strip_parens(handler) {
+        Expr::Literal(_) | Expr::Identity => RootWitness::Owned,
+        _ => try_payload_root(body),
+    }
+}
+
+/// The raise sites of a `try` body, folded into the one witness they all
+/// agree on ([`try_payload_root`]).
+struct RaiseSites {
+    witness: Option<RootWitness>,
+    /// A raise the walk cannot name, or two naming different nodes.
+    unproven: bool,
+}
+
+impl RaiseSites {
+    /// Folds one raise site in; `true` once the answer is settled (no
+    /// witness can survive an unproven site).
+    fn note(&mut self, site: Option<RootWitness>) -> bool {
+        match site {
+            None => {
+                self.unproven = true;
+                true
+            }
+            Some(node) => match self.witness {
+                Some(seen) if seen != node => {
+                    self.unproven = true;
+                    true
+                }
+                _ => {
+                    self.witness = Some(node);
+                    false
+                }
+            },
+        }
+    }
+
+    /// The node a raised value names: only a marker recorded against a
+    /// document node.
+    fn marker_node(raised: &Expr) -> Option<RootWitness> {
+        use super::eval_generic::strip_parens;
         match strip_parens(raised) {
             Expr::TrackedVar(marker) => match &marker.node {
                 Some(BindOrigin::Node { node, document }) => Some(RootWitness::Node {
@@ -34672,55 +34737,67 @@ pub(crate) fn try_payload_root(body: &Expr) -> RootWitness {
             },
             _ => None,
         }
-    };
-    let mut witness: Option<RootWitness> = None;
-    let mut unproven = false;
-    // A bare `error` raises its input: provable only as the last stage of
-    // a pipe whose previous stage is the marker itself. The walk reaches
-    // the pipe before its stages, so the `error` it accounts for is noted
-    // by address and skipped when the walk gets to it.
-    let mut accounted: Vec<*const Expr> = Vec::new();
-    any_subexpr(body, &mut |e| {
-        let site = match e {
-            Expr::Error(Some(msg)) => Some(marker_node(msg)),
+    }
+
+    fn search(&mut self, expr: &Expr) -> bool {
+        crate::jq::walk::search_subexpr(expr, &mut |e| self.visit(e))
+    }
+
+    fn visit(&mut self, e: &Expr) -> crate::jq::walk::Visit {
+        use crate::jq::walk::Visit;
+        let stop = match e {
+            Expr::Error(Some(msg)) => self.note(Self::marker_node(msg)),
+            // A bare `error` raises its input: provable only as the last
+            // stage of a pipe whose previous stage is the marker itself.
+            // The pipe is classified here, with its trailing `error`, and
+            // only the stages *before* it are walked on -- so the `error`
+            // is never reached as a site of its own.
             Expr::Pipe(stages) => match stages.as_slice() {
-                [.., head, tail @ Expr::Error(None)] => {
-                    accounted.push(tail as *const Expr);
+                [init @ .., head, Expr::Error(None)] => {
                     // `error($x) | error`: the head raises first, and the
                     // walk reaches that site on its own.
-                    if matches!(strip_parens(head), Expr::Error(Some(_))) {
-                        None
+                    let own_site = if matches!(
+                        super::eval_generic::strip_parens(head),
+                        Expr::Error(Some(_))
+                    ) {
+                        false
                     } else {
-                        Some(marker_node(head))
-                    }
+                        self.note(Self::marker_node(head))
+                    };
+                    return if own_site || init.iter().chain([head]).any(|s| self.search(s)) {
+                        Visit::Found
+                    } else {
+                        Visit::Skip
+                    };
                 }
-                _ => None,
+                _ => false,
             },
-            Expr::Error(None) if accounted.contains(&(e as *const Expr)) => None,
-            Expr::Error(None) => Some(None),
-            _ => None,
-        };
-        match site {
-            None => false,
-            Some(None) => {
-                unproven = true;
-                true
+            Expr::Error(None) => self.note(None),
+            // `try BODY catch H` and `BODY?` swallow BODY's raises: they
+            // never reach an enclosing `catch`, so an inner site cannot
+            // name the outer payload. Only a handler's own raises escape
+            // (#3123).
+            // Relies on nothing a nested `try` fails to swallow carrying a
+            // marker payload: the errors it lets through (a decode failure,
+            // yq's negative-index error) and `break` are all payloads no
+            // `error($x)` raise site produces. A marker-bearing raise that
+            // became uncatchable would have to be counted here again. The
+            // recursion this adds is bounded by the parser's nesting limit
+            // (256).
+            Expr::Try { catch, .. } => {
+                return match catch {
+                    Some(handler) if self.search(handler) => Visit::Found,
+                    _ => Visit::Skip,
+                };
             }
-            Some(Some(node)) => match witness {
-                Some(seen) if seen != node => {
-                    unproven = true;
-                    true
-                }
-                _ => {
-                    witness = Some(node);
-                    false
-                }
-            },
+            Expr::Optional(_) => return Visit::Skip,
+            _ => false,
+        };
+        if stop {
+            Visit::Found
+        } else {
+            Visit::Descend
         }
-    });
-    match witness {
-        Some(node) if !unproven => node,
-        _ => RootWitness::Owned,
     }
 }
 
@@ -120147,6 +120224,136 @@ mod tests {
             try_payload_root(&parse("error({\"a\":1})").unwrap()),
             RootWitness::Owned
         );
+    }
+
+    /// #3123: a `try`/`?` nested in the body swallows its own body's raises,
+    /// so only the sites that can reach the *outer* `catch` count -- an
+    /// inner site neither stands in as the outer witness nor spoils an outer
+    /// one -- while a nested handler's own raises still escape. Also pins
+    /// the trailing-`error` bookkeeping the matcher replaced: `error($x) |
+    /// error` is one site, and a bare `error` after a non-marker stage is
+    /// still unproven.
+    #[test]
+    fn try_payload_root_ignores_raises_a_nested_try_swallows_3123() {
+        let marker = |node: usize| {
+            Expr::TrackedVar(Rc::new(Tracked {
+                value: OwnedValue::Int(1),
+                origin: Origin::Snapshot,
+                node: Some(BindOrigin::Node { node, document: 7 }),
+            }))
+        };
+        let raise = |node: usize| Expr::Error(Some(Box::new(marker(node))));
+        let at = |node: usize| RootWitness::Node { node, document: 7 };
+        let guarded = |body: Expr, catch: Option<Expr>| Expr::Try {
+            expr: Box::new(body),
+            catch: catch.map(Box::new),
+        };
+        let literal = || Expr::Literal(Literal::Null);
+
+        // The only raise is caught by the inner `try`: nothing reaches the
+        // outer handler, so no witness (before #3123: node 3).
+        assert_eq!(
+            try_payload_root(&guarded(raise(3), Some(literal()))),
+            RootWitness::Owned
+        );
+        assert_eq!(
+            try_payload_root(&guarded(raise(3), None)),
+            RootWitness::Owned
+        );
+        assert_eq!(
+            try_payload_root(&Expr::Optional(Box::new(raise(3)))),
+            RootWitness::Owned
+        );
+        // An outer site is neither spoiled by an inner site naming another
+        // node nor by an inner bare `error` (each was `Owned` before).
+        for swallowed in [
+            guarded(raise(4), Some(literal())),
+            guarded(Expr::Error(None), Some(literal())),
+            Expr::Optional(Box::new(raise(4))),
+        ] {
+            assert_eq!(
+                try_payload_root(&Expr::Comma(vec![swallowed, raise(3)])),
+                at(3)
+            );
+        }
+        // The handler of a nested `try` is *not* swallowed.
+        assert_eq!(try_payload_root(&guarded(literal(), Some(raise(3)))), at(3));
+        assert_eq!(
+            try_payload_root(&Expr::Comma(vec![
+                guarded(literal(), Some(raise(3))),
+                raise(4)
+            ])),
+            RootWitness::Owned
+        );
+        // `error($x) | error` is the head's one site; the trailing `error`
+        // is not a second, unproven one.
+        assert_eq!(
+            try_payload_root(&Expr::Pipe(vec![raise(3), Expr::Error(None)])),
+            at(3)
+        );
+        // A raise buried in an earlier stage of a pipe ending in `error` is
+        // still seen: here node 4's, which disagrees with the tail's node 3.
+        assert_eq!(
+            try_payload_root(&Expr::Pipe(vec![
+                Expr::Comma(vec![raise(4)]),
+                marker(3),
+                Expr::Error(None)
+            ])),
+            RootWitness::Owned
+        );
+        assert_eq!(
+            try_payload_root(&Expr::Pipe(vec![
+                Expr::Comma(vec![raise(3)]),
+                marker(3),
+                Expr::Error(None)
+            ])),
+            at(3)
+        );
+        // A bare `error` with no marker before it stays unproven.
+        assert_eq!(
+            try_payload_root(&Expr::Comma(vec![
+                raise(3),
+                Expr::Pipe(vec![Expr::Identity, Expr::Error(None)])
+            ])),
+            RootWitness::Owned
+        );
+    }
+
+    /// #3123: `try_handler_root` skips the body walk only for a handler no
+    /// witness can change the answer of (a literal or `.`); any other
+    /// handler -- including a marker-free `path(...)`, which takes a door
+    /// only a `REBUILT` root opens -- gets the body's own witness.
+    #[test]
+    fn try_handler_root_only_skips_the_walk_for_a_witness_blind_handler_3123() {
+        let proving = Expr::Error(Some(Box::new(Expr::TrackedVar(Rc::new(Tracked {
+            value: OwnedValue::Int(1),
+            origin: Origin::Snapshot,
+            node: Some(BindOrigin::Node {
+                node: 3,
+                document: 7,
+            }),
+        })))));
+        let named = RootWitness::Node {
+            node: 3,
+            document: 7,
+        };
+        assert_eq!(try_payload_root(&proving), named);
+        for blind in ["null", "\"x\"", "0", ".", "(.)", "((\"x\"))"] {
+            assert_eq!(
+                try_handler_root(&proving, &parse(blind).unwrap()),
+                RootWitness::Owned,
+                "{blind}"
+            );
+        }
+        for seeing in [
+            "path(.a)", "$__loc__", ".a", "tostring", "{a: 1}", "[.]", "(1, 2)",
+        ] {
+            assert_eq!(
+                try_handler_root(&proving, &parse(seeing).unwrap()),
+                named,
+                "{seeing}"
+            );
+        }
     }
 
     /// #2044: `reestablishes_register`'s `!branch_trackable` conjunct
