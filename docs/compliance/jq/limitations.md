@@ -10386,11 +10386,38 @@ outputs, attempt traces and exit codes.
 conditions in `no_std`; wrapped conditions still require the existing std
 retry-generation mechanism to recognize that the stop was consumed.
 
-A separate, pre-existing gap remains for clean condition retries: replacing
-`error("E2")` above with `empty` or `false` makes jq emit `true` then `false`,
-and replacing it with `.b` makes jq emit two `true` values. Succinctly emits
-only the first `true` on both routes. These extra clean verdicts and the
-owned-identity `key`/`path` walker are outside this error/halt fix.
+## `any`/`all` condition retries that answer again (#3819)
+
+The same swallowed `break` that lets a `?//` retry raise after a decisive answer
+lets it answer again. jq 1.7.1 defines `any(g; c)` as `isempty(g | (c or empty))
+| not`, so the decisive output's `break` is caught by a `?//` inside the condition,
+which retries its next alternative; the retry's own outputs flow on. On
+`{"a":[1],"b":[2]}`:
+
+```jq
+any(.; (. as {a:$q} ?// {b:$z} | if $q != null then true else empty end))
+```
+
+prints `true` then `false`: the retry ran dry, so the generator carries on and
+`isempty`'s trailing `, true` fires (`any` answers `false`). With `else .b` the
+retry decides again and jq prints `true`, `true`; `all` mirrors both with `false`.
+Three consequences, each captured from jq 1.7.1:
+
+- every decisive output is one answer, so a three-alternative chain whose first
+  two alternatives decide prints `true`, `true`, then `false` (or a third `true`
+  if the last decides too);
+- a retry that runs dry leaves the generator running, so `any(.[]; ...)` over two
+  decisive elements prints `true`, `true`, `false`;
+- a consumer's own `break` (`first`, `limit`, `isempty`) is the same swallowed
+  `break`, so `first(any(...))` still prints both answers.
+
+Both routes and the unary forms follow this. `test_any_all_condition_retry_extra_verdicts_3819`
+pins the matrix and `test_any_all_direct_condition_retry_extra_verdicts_3819` the
+direct-retry case that needs no std retry generation.
+
+One path still diverges: the path-position resolver, where `path(.x | any(.; ...))`
+raises `Invalid path expression with result true` on the first answer where jq
+raises with `result false` on the last. Both raise, so only the message differs. Tracked in #3827.
 
 ## Provenance
 
