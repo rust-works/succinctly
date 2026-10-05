@@ -126,6 +126,15 @@ OPERANDS = [
     # document. Neither operand was covered before.
     "(.a, .)",
     "(.b, .)",
+    # (#3797) the same navigation one level down: inside a collect, the left of a
+    # `//`, `first(f)` and `last(f)`, all of which run their body whatever it yields,
+    # so jq raises on `.a` there too. Followed by the contexts' own `$x`/`$k` reads,
+    # the accumulator used to come back as the root and `del` deleted the document.
+    "[.a]",
+    "(.a // .)",
+    "first(.a)",
+    "last([.a])",
+    "last((.a // .))",
     # ... and the wrappers around `.` that must NOT be refused for it: jq answers
     # `[]` for each (review of #3780: a "contains a navigation" test refused them)
     "first(.)",
