@@ -1420,14 +1420,17 @@ is the revert that established what the other one costs.
    Heads the frozen test does not recognize (`($orig \| .)`, `first($orig)`, `($orig?)`,
    `(label $l \| $orig)`, `($orig as $p \| $p)`) lost the write under `try` the same way, until
    [#3423](https://github.com/rust-works/succinctly/issues/3423): a destructuring source that
-   is *value-equal to the register* and that nothing proves fresh (a literal, a construction, or
-   a comma/`if`/pipe of them: `is_provably_fresh_source`) may be the register's own node
-   whatever its head, so its first-step refusal is the resolver's guess and refuses loudly (the
-   loss state stands in for the known register). The price is one more row of the kind above: a
-   fresh copy equal to the register that no grammar proves fresh
-   (`(. \| tojson \| fromjson) as {a:{b:$q}}`) refuses where jq's own refusal is caught. A
-   source that is not value-equal to the register cannot be it, so its refusal stays exact.
-   Pinned by `test_bind_source_that_may_be_the_register_refuses_loudly_3423`.
+   can hand the register back by pointer (`may_alias_register`: a closed grammar of forwarders
+   -- `,`, `if`, `//`, `try`/`?`, `first`/`last`/`limit`/`nth`, `label`, a rebind, `select`, a
+   pipe -- over the aliasing leaves `.` and a `$var` marker) and whose value *equals the
+   register* may be its own node whatever its head, so its **first-step** refusal is the
+   resolver's guess and refuses loudly (the loss state stands in for the known register). A
+   later step's refusal stays jq's own (`try (. as {a:$q, b:$r} \| $r)` is caught in both), and
+   a source that differs from the register by value cannot be it. A value the source derives or
+   builds (`walk(.)`, `with_entries(.)`, `del(.zz)`, `tojson \| fromjson`, a construction) is
+   never the register, so those keep their exact, catchable refusal. Pinned by
+   `test_bind_source_that_may_be_the_register_refuses_loudly_3423`. Residual shapes are
+   [#3795](https://github.com/rust-works/succinctly/issues/3795).
 
    One residual keeps the silent drop. A *terminal* refusal (the pipe's last value is a `$var`,
    with no navigation after it) is still decided where the per-branch knowledge is gone, so a
@@ -2511,8 +2514,9 @@ is the revert that established what the other one costs.
    succeeds on it and refuses on the second. Under `try` that refusal used to be caught, so
    `del((if true then (., 1) else . end) as $x \| try $x.a)` discarded the write jq makes;
    since [#3423](https://github.com/rust-works/succinctly/issues/3423) a plain bind whose
-   source is value-equal to the register and not provably fresh is bound with an `Unproven`
-   marker, a reference to which states the register lost, so that refusal is loud (exit 5).
+   source can hand the register back by pointer and whose output equals the register is bound
+   with an `Unproven` marker, which keeps its mark while its value still equals the register at
+   the use site, so that refusal is the resolver's guess and loud (exit 5).
    Pinned by `test_comma_bind_source_is_classified_per_branch_3334` and
    `test_bind_source_that_may_be_the_register_refuses_loudly_3423`.
 3. **jq's pointer-identity artifacts on `*`/`+` with an empty operand** —
@@ -3243,9 +3247,10 @@ answers `["b"]` — and classified the two residuals appended below):
       a comma or `label` head; a marker head after the register is lost) used to share that
       silent skip under `try`: the general class
       [#3423](https://github.com/rust-works/succinctly/issues/3423). Such a source whose output
-      is value-equal to the register and that is not provably fresh now binds with an `Unproven`
-      marker and refuses loudly (`del(((., 1) \| .) as $x \| try $x.a)`, jq's `{}`); a literal or
-      construction is a transparent leaf (`select(false) // {"a":1}` stays an exact source);
+      can hand the register back by pointer and whose output equals the register now binds with
+      an `Unproven` marker and refuses loudly (`del(((., 1) \| .) as $x \| try $x.a)`, jq's `{}`);
+      a literal or construction is a transparent leaf (`select(false) // {"a":1}` stays an exact
+      source);
     - a transparent source binds as `. as $x`, so it inherits that spelling's own divergences
       after it. Two rows that agreed with jq only because the plain value's refusal was caught
       now take the `.` spelling's answer: a loud refusal (`path((select(.d) // .) as $v | getpath([])
