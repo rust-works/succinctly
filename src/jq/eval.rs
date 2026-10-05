@@ -51607,6 +51607,11 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
             // generated `path`/`del`/`=`/`|=` shapes without a `?//` never
             // re-invoke here, and the one `?//` retry that does is the
             // shape this admits.
+            //
+            // This reset covers only a retry that *re-enters* the sink. One
+            // that resolves no branch, or raises, never does, and the exit
+            // `match` below has no `retry_superseded` check, so the
+            // refusal outranks it (#3517 audit, tracked in #3808).
             if let Some(generation) = refused_at.take() {
                 debug_assert!(
                     terminal_retry::began_since(generation),
