@@ -675,11 +675,17 @@ AMBIGUOUS_SOURCES = [
     ("(label $l | .)", False), ("(. as $q | $q)", False), ("((., .) | .)", False),
     ("first((., 1))", False), ("((.a, .) | select(true))", False),
     ("(if .d then 1 else (., 2) end)", False), ("((1, .) | select(. != 1))", False),
+    ("last(., 1, .)", False), ("(limit(2; ., 1))", False), ("(select(true) | (., 1))", False),
     ("(label $l | $p)", True), ("($p?)", True), ("($p | .)", True), ("($p as $q | $q)", True),
     ("(($p, 1) | .)", True), ("(if .a then $p else (., 1) end)", True),
     # Fresh or navigating: jq refuses these itself, so the refusal stays exact.
     ("({a:.a})", False), ("([.])", False), ("([.] | .[0])", False), ("(.a, 1)", False),
     ("(.x | .)", False), ("({\"a\":{\"b\":1}})", False), ("(. | tojson | fromjson)", False),
+    # Derived copies (#3791 review): equal to the register by value, never it by pointer.
+    # A bind through one must keep its exact, catchable refusal, and the no-op deletes
+    # hand back the input's own storage in succinctly where jq builds a fresh array.
+    ("with_entries(.)", False), ("walk(.)", False), ("del(.zz)", False), ("del(.[5])", False),
+    ("to_entries", False), ("(. + {})", False), ("(.d |= .)", False), ("([.] | .[0])", False),
 ]
 
 def ambiguous_source_program(rng):
