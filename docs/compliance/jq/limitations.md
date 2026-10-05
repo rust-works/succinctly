@@ -1285,10 +1285,19 @@ is the revert that established what the other one costs.
    register and `limit(1; .a)` still moves it; the count is a subexp), and lets an `[E]` collect
    hold a type filter (`[numbers]`, as `[select(.)]` already did), pinned by
    `test_register_limit_nth_wrappers_and_type_filter_collect_3767`. Still refused where jq
-   answers `[]`: a `catch` handler (it runs on a caught error's payload), either stage inside a
-   compound stage (a comma, a `//`, a `def` call), which need the leaf-level verdict for a
-   compound stage described above, and the identity stage under a wrapper (`first(.)`,
-   `limit(1; .)`), which jq leaves in place and the allowlist does not read through.
+   answers `[]`: a `catch` handler (it runs on a caught error's payload); either stage inside a
+   compound stage (a comma, a `//`, a pipe such as `select(.) \| select(.)`, a `def` call), which
+   need the leaf-level verdict for a compound stage described above; a wrapper over an inner
+   stage that merely navigates nothing (`first(.)`, `limit(1; .)`, `limit(1; 5)`), which jq leaves
+   in place and the allowlist does not read through; and an `[E]` collect of a *wrapper* around a
+   type filter or `last` (`[first(numbers)]`, `[limit(1; numbers)]`, `[last(numbers)]`), since the
+   array allowlist reads the stage, not its wrappers. Under a `try` the refusal of such a
+   shape inside a lost-register `and`/`or` operand is caught, so the write jq makes is
+   **silently skipped** (`del(.a? as $y \| try ((.a)? and limit(1; 5)) \| try ($y \| .b))` on
+   `{"a":{"b":1},"k":2}` leaves the document unchanged where jq gives `{"a":{},"k":2}`); the
+   same shapes with `first(...)` in place of `limit(...)` behave identically, so this predates
+   #3767, and the later parts of that issue (the inner-stage verdict for a compound or
+   navigates-nothing stage) are what close it.
    `select` hands its input through as the very value it received, so a `$x` that reaches it
    keeps its identity, and so does `last(f)`'s result, which is the very value `f` last
    emitted ([#3766](https://github.com/rust-works/succinctly/issues/3766)): a `last` whose
@@ -1317,7 +1326,7 @@ is the revert that established what the other one costs.
    backtracks the register to where the collect began. Since
    [#3263](https://github.com/rust-works/succinctly/issues/3263) an array carries the register
    too when the resolver both resolves it live and checks everything jq checks inside it:
-   navigation, `..`, `select`, an `if`'s branches, both of jq's `?`s and `try`/`catch`,
+   navigation, `..`, `select` and (since #3767) the type filters, an `if`'s branches, both of jq's `?`s and `try`/`catch`,
    `recurse(f)`/`recurse(f; cond)` (#2764), `and`/`or`/unary minus over checked operands
    ([#3289](https://github.com/rust-works/succinctly/issues/3289)), and pipes, commas and
    subexp shapes of those.

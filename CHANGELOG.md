@@ -55,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stage under a wrapper (`first(.)`, `limit(1; .)`), which stay refused. It also lifts #3769's `foreach` EXTRACT rows
   (`.a? | limit(1; last(.a?))`) to jq's own answers (`["a"]` twice, `{"a":9}`). jq mode only (ADR-0018). Still refused where jq answers:
   a `catch` handler and a compound inner stage, tracked by #3767. Pinned by `test_register_limit_nth_wrappers_and_type_filter_collect_3767`
-  and the stage-rule unit test `type_filters_are_defined_once_and_the_stage_rule_reads_them_3653`; three of #3653's refuse-only rows and
+  and the stage-rule unit test `type_filters_are_defined_once_and_the_stage_rule_reads_them_3653`; four of #3653's refuse-only rows and
   #3769's pin moved to jq's answers.
 
 - **jq: a `foreach` whose bound element is an empty array answers that element's path through `$k`** (#3789).

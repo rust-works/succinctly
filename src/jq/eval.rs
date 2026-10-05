@@ -40460,13 +40460,22 @@ fn is_select_stage(stage: &Expr) -> bool {
 ///   what keeps `first(.a)` refused.
 /// - `limit(n; E)` and `nth(n; E)` (#3767) are `first(E)`'s wider siblings: they
 ///   emit `E`'s outputs from inside `E` as well, so the register is wherever `E`
-///   left it and the inner stage decides. Captured the same way, for every `n`
+///   left it and the inner stage decides. Only the spellings the parser builds
+///   are read (`Expr::Limit`, `Builtin::NthStream`); `Builtin::Limit` and
+///   `Expr::NthExpr` are constructible but parser-unreachable, as in
+///   [`may_alias_register`]. Captured the same way, for every `n'
 ///   (`limit(1; E)`, `limit(2; E)` and `limit(-1; E)`, which is `E`, and
 ///   `nth(0; E)`) and nested in each other and in `try`/`first`, `[]` for `E` over
 ///   `last(.a)`, `select(.)`, `numbers` and `values`, and still refused for `.a`
 ///   (`limit(1; .a)` moves it). The count `n` is bound as a subexp, so it moves and
 ///   path-checks nothing whatever it navigates. `limit(0; E)` and `nth(1; E)` over
 ///   a one-output `E` emit nothing at all, which both sides agree on.
+///
+/// This list answers "does this wrapper add no movement of its own?". It is not
+/// [`is_transparent_bind_source`]'s ("does nothing in this source navigate?") nor
+/// [`may_alias_register`]'s ("may this forward the register by pointer?"): the
+/// three differ on purpose (`limit` is read here and by the first, `nth` here and
+/// by the second), so a wrapper added to one is not owed to the others.
 fn peel_register_transparent(expr: &Expr) -> &Expr {
     match unwrap_paren(expr) {
         Expr::Optional(inner)
@@ -40476,9 +40485,9 @@ fn peel_register_transparent(expr: &Expr) -> &Expr {
         }
         | Expr::FirstExpr(inner)
         | Expr::Limit { expr: inner, .. }
-        | Expr::Builtin(
-            Builtin::FirstStream(inner) | Builtin::Limit(_, inner) | Builtin::NthStream(_, inner),
-        ) => peel_register_transparent(inner),
+        | Expr::Builtin(Builtin::FirstStream(inner) | Builtin::NthStream(_, inner)) => {
+            peel_register_transparent(inner)
+        }
         other => other,
     }
 }

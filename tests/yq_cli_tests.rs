@@ -51522,7 +51522,9 @@ fn yq_ambiguous_bind_source_keeps_the_caught_refusal_3423() -> Result<()> {
 }
 
 /// #3653 keeps jq's path register through `last(f)`'s wrappers (`?`, `try`,
-/// `first(...)`) and across a type-filter stage in jq mode only (ADR-0018). Real
+/// `first(...)`) and across a type-filter stage in jq mode only (ADR-0018); #3767
+/// adds `limit`/`nth` around them and an `[E]` collect of a type filter, gated the
+/// same way. Real
 /// yq's lexer rejects `last(f)` and the type filters outright (v4.53.3), so there
 /// is no oracle for them, and the mode does not borrow jq's answer: with the
 /// jq-only surface enabled, yq mode still refuses every one of them exactly as
@@ -51539,6 +51541,12 @@ fn yq_last_f_wrappers_and_type_filters_do_not_keep_the_path_register_3653() -> R
         "del(. as $x | first(last(.a)) | $x.k)",
         "del(. as $x | 1 | numbers | $x.k)",
         "del(. as $x | 1 | (numbers)? | $x.k)",
+        // #3767
+        "del(. as $x | limit(1; last(.a)) | $x.k)",
+        "del(. as $x | nth(0; last(.a)) | $x.k)",
+        "del(. as $x | 1 | limit(1; numbers) | $x.k)",
+        "del(. as $x | 1 | nth(0; numbers) | $x.k)",
+        "del(. as $x | 1 | [numbers] | $x.k)",
     ] {
         let (stdout, stderr, code) =
             run_yq_stdin_with_stderr(filter, yaml, &["-o=json", "-I=0", "--jq-extensions"])?;

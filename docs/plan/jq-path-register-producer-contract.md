@@ -527,13 +527,14 @@ Each turns a refusal into an answer and needs its own oracle rows:
   identity of the value `f` last emitted.
 - ~~`limit(n; E)` and `nth(n; E)` around a register-keeping stage, and an `[E]` collect of a type
   filter.~~ Done by #3767 Part 1. Both emit from inside `E` like `first(E)`, so
-  `peel_register_transparent` reads them through (`Expr::Limit`, `Builtin::Limit`,
-  `Builtin::NthStream`) and the inner stage decides: `last(f)`, `select(f)` and the type filters
+  `peel_register_transparent` reads them through (`Expr::Limit`, `Builtin::NthStream`: the
+  spellings the parser builds) and the inner stage decides: `last(f)`, `select(f)` and the type filters
   leave the register where it entered, `.a` still moves it. The count is a subexp. And
   `array_contents_are_checked` asks `is_select_stage` (select or a type filter), where it named
   only `select`. Still open under #3767: a `catch` handler, a compound inner stage (`,` `//`
-  `if`, a `def` call), an `[E]` of a navigating `f`, and the identity stage under a wrapper
-  (`first(.)`, `limit(1; .)`), which jq leaves in place and the allowlist does not read through.
+  `if`, a pipe, a `def` call), an `[E]` of a navigating `f` or of a wrapper around a type filter
+  (`[first(numbers)]`), and a wrapper over an inner stage that navigates nothing (`first(.)`,
+  `limit(1; .)`, `limit(1; 5)`), which jq leaves in place and the allowlist does not read through.
 - The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
   turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`
   into jq's `[]`. Cheap now, because the producers already say it.

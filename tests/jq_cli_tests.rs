@@ -100395,5 +100395,34 @@ fn test_register_limit_nth_wrappers_and_type_filter_collect_3767() -> Result<()>
             "Invalid path expression with result {\"a\":{\"b\":1},\"k\":2}",
             5,
         ),
+        // the register moved before the wrapper, so jq refuses too
+        (
+            doc,
+            r"path(. as $x | .a | limit(1; select(.)) | $x)",
+            "",
+            "Invalid path expression with result {\"a\":{\"b\":1},\"k\":2}",
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | .a | nth(0; select(.)) | $x)",
+            "",
+            "Invalid path expression with result {\"a\":{\"b\":1},\"k\":2}",
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | .a | limit(1; last(.b)) | $x)",
+            "",
+            "Invalid path expression with result {\"a\":{\"b\":1},\"k\":2}",
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | .a | limit(2; objects) | $x)",
+            "",
+            "Invalid path expression with result {\"a\":{\"b\":1},\"k\":2}",
+            5,
+        ),
     ])
 }
