@@ -43786,7 +43786,17 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
         trackable,
         frame,
         &mut |bound, origin, witnessed| {
-            let ambiguous = may_alias && !witnessed && origin.is_none();
+            // Equal to the register *now*: an output that differs from it cannot be
+            // its node whatever the source forwarded (`(select(false) // .a) as $v`
+            // binds `.a`, which an equal-valued sibling register is not).
+            let ambiguous = may_alias
+                && !witnessed
+                && origin.is_none()
+                && if trackable {
+                    bound == *value
+                } else {
+                    frame.register().is_some_and(|reg| bound == *reg)
+                };
             let substituted = substitute_bound_var_at(
                 source,
                 body,
@@ -44203,10 +44213,6 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     // #2978: a bare `$x` alternative of an identity source gets the same
     // positioned snapshot the `As` arm mints -- see `identity_bind_position`.
     let identity_at = identity_bind_position::<S>(source, trackable, frame);
-    // #3423: a `?//` alternative keeps the pre-#3279 identity grammar (`wide` off),
-    // so what that grammar does not call `.` may still hand the register back.
-    let unproven_source =
-        S::TAG == EvalTag::Jq && !identity_passthrough(source, false) && may_alias_register(source);
     let invert_dedup = patterns.len() > 1;
     // jq's `value_at_path` entering this stage: `value` itself while
     // trackable, otherwise whatever the enclosing pipe carried in (#3120).
@@ -44290,7 +44296,6 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                         identity_at.clone(),
                         bindings,
                         &all_names,
-                        unproven_source,
                     );
                     clear_nonretryable_stop();
                     let flow = if reg.path.depth() == 0 {
@@ -44472,19 +44477,12 @@ fn bind_pattern_body(
     identity_at: Option<Origin>,
     bindings: &[PatternBinding],
     all_names: &[String],
-    // Whether a bare `$x` alternative's source can hand the register back by
-    // pointer without the walk having proven it (#3423): it is then bound with the
-    // non-certifying `Unproven` marker, as `as $x` is.
-    unproven_source: bool,
 ) -> Expr {
     let mut bound_names: Vec<String> = Vec::new();
     let mut substituted = match pattern {
         Pattern::Var(name) => {
             bound_names.push(name.clone());
-            let origin = bindings
-                .first()
-                .and_then(|b| b.origin.clone())
-                .or_else(|| unproven_source.then_some(Origin::Unproven));
+            let origin = bindings.first().and_then(|b| b.origin.clone());
             // #3279 review: a `?//` alternative keeps the pre-#3279 grammar.
             // `?//` retries onto a bare `$v` alternative after the first one's
             // body refuses, and binding a newly admitted `(. | .)` source
