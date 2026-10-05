@@ -64369,6 +64369,88 @@ fn test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769()
     Ok(())
 }
 
+/// #3761: a `foreach` that provably cannot move jq's path register states it on
+/// every computed emission, as `reduce` does since #3710. The stage used to drop
+/// it, so a variable frozen before the `foreach` and navigated after it
+/// (`($v0 | .b?)?`) turned jq's catchable "Invalid path expression" into this
+/// resolver's uncatchable guess: `path(...)` exited 5 and `del`/`=` refused
+/// where jq answers empty and writes nothing. Every row captured from jq 1.7.1
+/// with `-c`; the rows jq refuses (`$v0 | .b` with no `?`) still refuse.
+#[test]
+fn test_foreach_keeps_the_register_for_a_frozen_variable_after_it_3761() -> Result<()> {
+    let doc = "{\"a\":{\"b\":1}}\n";
+    let refusal = "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"b\" of {\"b\":1}\n";
+    for (filter, stdout, stderr, code) in [
+        // the issue's row, its `try` spelling and the computed-emission shapes
+        (
+            r"path((.a | ..) as $v0 | foreach (1) as $i (.; $v0; .) | ($v0 | .b?)?)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r"path(.a as $v0 | foreach (1) as $i (.; 5; .) | ($v0 | .b?)?)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r"path(.a as $v0 | foreach (1) as $i (.; .; $i) | ($v0 | .b?)?)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r"[path(.a as $v0 | foreach (1) as $i (.; 5; .) | ($v0 | .b?)?)]",
+            "[]\n",
+            "",
+            0,
+        ),
+        // the writes the refusal used to block: jq writes nothing
+        (
+            r"del((.a | ..) as $v0 | foreach (1) as $i (.; $v0; .) | ($v0 | .b?)?)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r"((.a | ..) as $v0 | foreach (1) as $i (.; $v0; .) | ($v0 | .b?)?) = 9",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        // jq still refuses the unguarded navigation, and a handler's output
+        (
+            r"path(.a as $v0 | foreach (1) as $i (.; 5; .) | ($v0 | .b))",
+            "",
+            refusal,
+            5,
+        ),
+    ] {
+        let (out, err, got) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), got),
+            (stdout, stderr, code),
+            "{filter}"
+        );
+    }
+    // A `foreach` nothing in which can navigate keeps the register (#3761, the
+    // `reduce` rule of #3710), so `$x` still re-establishes and jq's deletion is
+    // made: this row used to be a loud refusal in the list above.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r"del(. as $x | foreach (1) as $i (.; 5) | try ($x | .k))",
+        ],
+        Some(r#"{"a":{"b":1},"k":1,"l":[1,2]}"#),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("{\"a\":{\"b\":1},\"l\":[1,2]}\n", "", 0)
+    );
+    Ok(())
+}
+
 /// #3738: a `foreach` UPDATE that is one chain of stages under a `try`
 /// (`try ($w | .[]?)`, `try ($w | .a[])`, `try ($w | ..)`) keeps jq's path
 /// register. The fold used to withhold the register from any non-pipe body that
@@ -83762,7 +83844,6 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         r#"del((. as $x | contains({"a":{}}) | $x | .a)?)"#,
         // And a value-position `?` around the whole write catches nothing.
         r#"[del(. as $x | contains({"a":{}}) | try ($x | .a))?]"#,
-        r"del(. as $x | foreach (1) as $i (.; 5) | try ($x | .k))",
         r"del(. as $x | (.zz // 5) | try ($x | .k))",
         r"del(. as $x | if .k then 5 else .a end | try ($x | .k))",
         r"del(. as $x | (def f: 5; f) | try ($x | .k))",

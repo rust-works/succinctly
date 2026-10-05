@@ -41476,6 +41476,19 @@ fn reduce_cannot_move_register(
         && cannot_move_register(update)
 }
 
+/// [`reduce_cannot_move_register`]'s `foreach` twin: EXTRACT runs in the same
+/// extent, so it has to be unable to navigate too.
+fn foreach_cannot_move_register(
+    patterns: &[Pattern],
+    input: &Expr,
+    init: &Expr,
+    update: &Expr,
+    extract: Option<&Expr>,
+) -> bool {
+    reduce_cannot_move_register(patterns, input, init, update)
+        && extract.map_or(true, cannot_move_register)
+}
+
 /// Whether evaluating `expr` as one pipe stage provably leaves jq's path
 /// register (`value_at_path`) exactly where it was (#1573).
 ///
@@ -41782,13 +41795,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
             init,
             update,
             extract,
-        } => {
-            patterns_all_bare(patterns)
-                && cannot_move_register(input)
-                && cannot_move_register(init)
-                && cannot_move_register(update)
-                && extract.as_deref().map_or(true, cannot_move_register)
-        }
+        } => foreach_cannot_move_register(patterns, input, init, update, extract.as_deref()),
 
         // #3456: `range(a; b; c)` and `range(n)` are jq-defined over `$param`
         // bindings, and a parameter binding is an `as` source -- a subexp --
@@ -45924,6 +45931,26 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    // #3761: `resolve_reduce`'s #3710 rule for `foreach`. A computed emission is
+    // not the register, but when nothing in the fold can have moved it jq's
+    // register is where the `foreach` entered, and the next pipe stage may still
+    // navigate from a variable frozen there (`path(.a as $v | foreach (1) as $i
+    // (.; 5; .) | ($v | .b?)?)` is empty in jq, which catches the refusal; the
+    // stage dropped the register and the refusal became an uncatchable guess).
+    // The leaf states it on every untracked emission; the stage then takes the
+    // stricter of that and its own verdict. A trackable entry only: an untracked
+    // one carries its register on the stage.
+    let register_unmoved = S::TAG == EvalTag::Jq
+        && trackable
+        && foreach_cannot_move_register(patterns, input, init, update, extract);
+    let mut stating_sink = |branch: PathBranch<'a>| -> Demand {
+        if register_unmoved && !branch.trackable {
+            sink(branch.with_register(BranchRegister::Unmoved(Cow::Borrowed(value))))
+        } else {
+            sink(branch)
+        }
+    };
+    let sink: &mut dyn FnMut(PathBranch<'a>) -> Demand = &mut stating_sink;
     // Ambient `snapshot` threaded the same way `resolve_reduce` threads it
     // into its own INIT resolution — see that function's doc comment
     // (#1591). #2031: INIT resolved before SOURCE, same reordering as

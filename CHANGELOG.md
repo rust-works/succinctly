@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a `foreach` that cannot move the path register no longer turns jq's catchable error into an uncatchable refusal** (#3761).
+  `path((.a | ..) as $v0 | foreach (1) as $i (.; $v0; .) | ($v0 | .b?)?)` on `{"a":{"b":1}}` is empty in jq (exit 0: the
+  `?` catches the invalid-path error) and exited 5 here, and `del(...)` / `(...) = 9` refused where jq writes nothing. The
+  `reduce` twin was fixed in #3710; `foreach` emitted its computed outputs without stating the register, so the pipe stage
+  dropped it and the later refusal became this resolver's guess, which no `?` or `try` can catch. It now states the register on
+  every untracked emission when nothing in SOURCE, INIT, UPDATE or EXTRACT can navigate (`foreach_cannot_move_register`). Pinned by
+  `test_foreach_keeps_the_register_for_a_frozen_variable_after_it_3761`.
 - **jq: a `foreach` whose EXTRACT navigates and then ends on an untracked `null` no longer answers the root path** (#3769).
   `(foreach (1,2) as $i (.; .; .a? | limit(1; last(.a?)))) = 9` on `null` is `{"a":9}` in jq and replaced the whole
   document with `9` here (exit 0), and `path(...)` answered `[]` twice where jq answers `["a"]`. The same held for any
