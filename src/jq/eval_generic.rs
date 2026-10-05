@@ -1000,6 +1000,23 @@ pub(super) fn to_owned_cursor_with<C: DocumentCursor, S: EvalSemantics>(
     to_owned_cursor_at_depth::<S, _, BuildOwned>(cursor, 0, &check_depth, &scalar_override, &[])
 }
 
+/// [`to_owned_cursor`] for a cursor over a document no `as` binding can name.
+///
+/// The same walk, without the #2889 embed-table consultation, which is keyed
+/// by node and so could mistake a node of this document for a bound node of
+/// another. `load()`'s file and the `yq` CLI's own input documents are the
+/// cases (#2664); `lazy.rs`'s own two entries are the same shape through
+/// `to_owned_cursor_with`.
+///
+/// `#[doc(hidden)]`: `pub` only because `src/bin/succinctly/*` is a separate
+/// crate, not library API.
+#[doc(hidden)]
+pub fn to_owned_cursor_unbound<S: EvalSemantics, C: DocumentCursor>(
+    cursor: &C,
+) -> Result<OwnedValue, EvalError> {
+    to_owned_cursor_at_depth::<S, _, BuildOwned>(cursor, 0, &nesting_depth_check, &|_| None, &[])
+}
+
 /// [`to_owned_cursor`]'s and [`validate_cursor`]'s depth contract: a
 /// catchable decode failure past [`MAX_NESTING_DEPTH`] levels.
 fn nesting_depth_check(depth: usize) -> Result<(), EvalError> {

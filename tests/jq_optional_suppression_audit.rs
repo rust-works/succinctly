@@ -7,8 +7,7 @@
 //! `eval::suppresses` is `optional && !e.is_decode_failure()`. Every error the
 //! materialization family can raise today is `decode_failure`-tagged --
 //! `to_owned`/`to_owned_at_depth`, `to_owned_cursor_at_depth`,
-//! `to_owned_with_cursor`, `collect_cursors_checked` and
-//! `yaml_value_to_owned_checked`, whose only error
+//! `to_owned_with_cursor` and `collect_cursors_checked`, whose only error
 //! constructors are `EvalError::decode_failure`,
 //! `EvalError::colliding_display_key` (which delegates to it) and the
 //! `malformed_delimiter/member/element_error` trio (#2286 retagged the last of
@@ -134,20 +133,17 @@ fn is_materializer_fn(name: &str) -> bool {
 /// Materializers whose names do not carry the `to_owned` prefix, and so would
 /// otherwise slip past [`is_materializer_fn`] entirely.
 ///
-/// `yaml_value_to_owned_checked` (`eval.rs`, `#[cfg(feature = "std")]`) is the
-/// `load` builtin's own YAML walk: `YamlCursor -> Result<OwnedValue,
-/// EvalError>`, recursive, raising exactly the two constructors the rest of
-/// the family does (`EvalError::decode_failure` and
-/// `EvalError::colliding_display_key`, which delegates to it). It sits inside
-/// `builtin_load`, which has a live `optional` -- and the prefix rule could not
-/// see it, because the prefix is in the *middle* of the name (#2334 review).
+/// Empty since #2664: its one entry, `yaml_value_to_owned_checked` (`load()`'s
+/// hand-written YAML walk, whose name hid the prefix in the *middle* -- #2334
+/// review), was folded onto `eval_generic::to_owned_cursor_unbound`, which the
+/// prefix rule finds by itself.
 ///
 /// Keep this roster empty if you can: a name that starts with `to_owned` is
 /// found by default, which is the polarity this audit is about. Anything here
 /// had to be noticed by a human first, which is exactly the failure mode
 /// STYLE-0012 exists to stop -- so a new materializer should be *named* into
 /// the family rather than added here.
-const MATERIALIZER_FN_EXTRA: &[&str] = &["yaml_value_to_owned_checked"];
+const MATERIALIZER_FN_EXTRA: &[&str] = &[];
 
 /// Methods with the same materialization contract. `collect_cursors_checked`
 /// is only ever a method call (`elements.collect_cursors_checked()`).

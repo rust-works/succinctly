@@ -715,8 +715,9 @@ what this section originally argued for; only the tag-storage mechanism and the 
 (`explicit_tag()`, not `has_tag()`/`tag()`) differ from the original proposal.
 
 **One consumer this section didn't anticipate**: the jq-integrated evaluator has two paths —
-materializing to `OwnedValue` (`yaml_to_owned_value` in `src/bin/succinctly/yq_runner.rs`,
-`yaml_value_to_owned` in `src/jq/eval.rs`) and a lazy cursor-based evaluator
+materializing to `OwnedValue` (`yaml_to_owned_value` in `src/bin/succinctly/yq_runner.rs` and
+the `load` builtin in `src/jq/eval.rs`, both thin callers of `eval_generic`'s one cursor walk
+since #2664) and a lazy cursor-based evaluator
 (`src/jq/eval_generic.rs`'s `to_owned`, generic over `DocumentValue` for both JSON and YAML).
 The materializing path is tag-aware; the lazy path is not, since `DocumentValue` operates on
 an already-extracted `YamlValue` with no `bp_pos` to look a tag up with. So `succinctly yq

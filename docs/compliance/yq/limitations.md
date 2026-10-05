@@ -2509,9 +2509,12 @@ a duplicate-capable object exists ([#1344](https://github.com/rust-works/succinc
 **Residuals.** `with_entries(.)` and `to_entries | from_entries` still merge on stdout
 (`'': v2`, exit 0): `to_entries` has already turned both keys into the plain string `""`, so
 `from_entries` sees an ordinary repeated key and no fallback flag survives to catch it. `-i`
-refuses these (its `validate_yaml_display_keys` pre-walk stays for exactly this case). And the
-`load()` builtin's own YAML-mapping conversion is tracked separately in
-[#1753](https://github.com/rust-works/succinctly/issues/1753).
+refuses these (its `validate_yaml_display_keys` pre-walk stays for exactly this case). The
+`load()` builtin's YAML-mapping conversion is the same walk since
+[#2664](https://github.com/rust-works/succinctly/issues/2664): it spells a complex key `""`
+(yq: `load("bk.yaml")` => `{"":"value"}`) and raises on a colliding pair like every route above.
+What remains of [#1753](https://github.com/rust-works/succinctly/issues/1753) is `key_hash_of`'s
+jq-mode collapse.
 
 **Merge keys (`<<`) keep a merged-in complex key beside a local one
 ([#3467](https://github.com/rust-works/succinctly/issues/3467)).** Merge resolution overrides

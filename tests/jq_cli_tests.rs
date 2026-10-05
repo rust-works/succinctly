@@ -37784,7 +37784,8 @@ fn test_argument_type_mismatch_optional_arms_produce_no_output_1164() -> Result<
     Ok(())
 }
 
-/// #1801: `load()`'s YAML path (`yaml_value_to_owned_checked`) raises on an
+/// #1801: `load()`'s YAML path (a hand-written walk until #2664, now the
+/// generic `to_owned_cursor`) raises on an
 /// undecodable string scalar instead of silently substituting `null`,
 /// mirroring the `StandardJson` family's own `to_owned` (#1746/
 /// #1755/#1620). Not suppressed by `?` -- a decode failure is never
@@ -37814,8 +37815,8 @@ fn test_load_yaml_raises_on_undecodable_string_1801() -> Result<()> {
 /// #1801 (review): a `Mapping` field whose *key* fails to decode keeps
 /// both the key (under #1642's own display fallback, `""`) and its value,
 /// rather than silently dropping the whole field -- matches
-/// `yaml_to_owned_value`'s identical handling (`yq_runner.rs`) for this
-/// same YamlCursor-native shape. An earlier draft of this fix left the
+/// `yaml_to_owned_value`'s identical handling (`yq_runner.rs`; the same walk
+/// since #2664) for this same YamlCursor-native shape. An earlier draft of this fix left the
 /// field dropped, incorrectly citing the `StandardJson` family's own
 /// #1194 structural carve-out as precedent for what is actually #1642's
 /// decode-failure-preservation territory.
@@ -37855,8 +37856,8 @@ fn test_load_yaml_two_undecodable_keys_collide_1801() -> Result<()> {
 }
 
 /// #1813 review: the sibling test above only checks the raw, uncaught
-/// route -- `yaml_value_to_owned_checked` (`load()`'s YAML path,
-/// `eval.rs`) is a third call site for `EvalError::colliding_display_key`
+/// route -- `load()`'s YAML path (`eval.rs`; `yaml_value_to_owned_checked`
+/// then, the generic walk since #2664) is a third call site for `EvalError::colliding_display_key`
 /// besides the two already covered directly by #1813's own tests, and
 /// nothing pinned that `try`/`catch` around `load()` itself still can't
 /// suppress it.
