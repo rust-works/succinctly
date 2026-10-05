@@ -454,6 +454,28 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// for YAML.
     const HAS_DELIMITER_CHECKS: bool = true;
 
+    /// Whether a sequence's elements are exactly the chain
+    /// [`next_element`](Self::next_element) walks from the first, so that a
+    /// scan for one element can resume from one an earlier scan already
+    /// reached (#3702). `eval_generic::cursor_slot` finds an element's index
+    /// by scanning its parent's elements from the first, `O(index)`; a pipe
+    /// that reads `key`/`path` at every element of one array was `O(n^2)` in
+    /// the length of that array before it could resume.
+    ///
+    /// The default is `false`: a format whose element cursor is not the plain
+    /// sibling of the previous one (YAML's block-sequence items are wrapper
+    /// nodes that `uncons_cursor` unwraps) keeps the scan from the start.
+    const RESUMABLE_ELEMENT_SCAN: bool = false;
+
+    /// The element after this one, when [`RESUMABLE_ELEMENT_SCAN`] holds and
+    /// this cursor is an element of a sequence; `None` at the last element
+    /// (and for every format that does not resume).
+    ///
+    /// [`RESUMABLE_ELEMENT_SCAN`]: Self::RESUMABLE_ELEMENT_SCAN
+    fn next_element(&self) -> Option<Self> {
+        None
+    }
+
     /// Whether this node, already known to sit at `text_pos`, is preceded
     /// by the delimiter its position in the document requires: nothing if
     /// `expected` is `None` (a container's first child), otherwise exactly

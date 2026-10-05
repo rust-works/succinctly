@@ -3625,6 +3625,15 @@ fn scan_canonical_array(bytes: &[u8], pos: usize, depth: usize) -> Option<usize>
 }
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
+    /// `JsonElements::uncons_cursor` yields the first child, then each
+    /// `next_sibling`: the chain is exactly the siblings.
+    const RESUMABLE_ELEMENT_SCAN: bool = true;
+
+    #[inline]
+    fn next_element(&self) -> Option<Self> {
+        JsonCursor::next_sibling(self)
+    }
+
     type Value = StandardJson<'a, W>;
 
     #[inline]

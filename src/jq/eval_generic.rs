@@ -7170,6 +7170,220 @@ pub(crate) enum AnchorScope {
     On,
 }
 
+/// The element scans [`cursor_slot`] may resume, for the duration of one
+/// evaluation (#3702).
+///
+/// `cursor_slot` finds where a node sits in its parent by scanning the
+/// parent's members, so the slot of the `i`th element of an array costs
+/// `O(i)`. A pipe that reads a position at every element of one fan-out
+/// (`.[] | ... | [key]`) asks for the elements in document order, and the
+/// scans summed over `n` of them are `O(n^2)`. Remembering where the last
+/// scan of a wide parent stopped lets the next one start there, and answers
+/// the element after it, or the same one read again, with no scan at all.
+///
+/// Scoped, not global: an entry names one document's parent by node id, so
+/// it is installed by an evaluation entry point for the document it
+/// evaluates over and consulted only for that document's own cursors (a
+/// bridge or `--eval-all` builds throwaway documents whose node ids mean
+/// something else, which the document token tells apart). An evaluation of
+/// another document inside the scope opens its own and restores this one
+/// when it returns, so no entry outlives the document it describes. The
+/// answer is the full scan's: a resume starts at an element a previous scan
+/// found, before the target.
+#[cfg(feature = "std")]
+mod slot_memo {
+    use std::cell::RefCell;
+
+    /// How many wide parents are remembered at once: a document has a handful
+    /// of wide levels, and each position's climb touches each of them. The
+    /// least recently used is dropped, so an outer array read at every
+    /// position outlives the inner arrays that come and go beneath it.
+    const CAPACITY: usize = 4;
+
+    struct Scan {
+        parent: usize,
+        /// The node id of the element the last scan found, and its index.
+        last: usize,
+        index: i64,
+        /// The node id of the element after it, if there is one.
+        next: Option<usize>,
+    }
+
+    struct State {
+        document: usize,
+        /// Least recently used first.
+        scans: Vec<Scan>,
+    }
+
+    thread_local! {
+        static MEMO: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    // What the scans did, for the tests that pin their cost: elements
+    // visited by a scan, and elements answered as a remembered one or its
+    // successor.
+    #[cfg(test)]
+    thread_local! {
+        static WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn work() -> (usize, usize) {
+        WORK.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_scanned() {
+        WORK.with(|w| w.set((w.get().0 + 1, w.get().1)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_neighbour() {
+        WORK.with(|w| w.set((w.get().0, w.get().1 + 1)));
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn note_scanned() {}
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn note_neighbour() {}
+
+    /// What a [`Guard`] puts back when it drops.
+    enum Restore {
+        /// It opened nothing: the scope it found was already for its document.
+        Nothing,
+        /// It opened a scope, over this one (or over none).
+        Previous(Option<State>),
+    }
+
+    /// Restores what the scope it opened replaced, if it opened one.
+    pub(crate) struct Guard(Restore);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Restore::Previous(previous) = std::mem::replace(&mut self.0, Restore::Nothing) {
+                MEMO.with(|m| *m.borrow_mut() = previous);
+            }
+        }
+    }
+
+    /// Open the scope for evaluations over `document`: a no-op while one is
+    /// already open for it, a nested scope (restored on drop) otherwise.
+    pub(crate) fn enter(document: usize) -> Guard {
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.as_ref().is_some_and(|s| s.document == document) {
+                return Guard(Restore::Nothing);
+            }
+            Guard(Restore::Previous(m.replace(State {
+                document,
+                scans: Vec::new(),
+            })))
+        })
+    }
+
+    /// The element of `parent` the last scan found -- its node id and index --
+    /// when `target` comes after it.
+    pub(crate) fn resume(document: usize, parent: usize, target: usize) -> Option<(usize, i64)> {
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let state = m.as_mut().filter(|s| s.document == document)?;
+            let at = state
+                .scans
+                .iter()
+                .position(|s| s.parent == parent && s.last < target)?;
+            let scan = state.scans.remove(at);
+            let found = (scan.last, scan.index);
+            state.scans.push(scan);
+            Some(found)
+        })
+    }
+
+    /// The first remembered scan of `document` that `f` accepts, given its
+    /// parent, last element, that element's index and the element after it.
+    /// `f` must not call back into this module.
+    pub(crate) fn find<R>(
+        document: usize,
+        mut f: impl FnMut(usize, usize, i64, Option<usize>) -> Option<R>,
+    ) -> Option<R> {
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let state = m.as_mut().filter(|s| s.document == document)?;
+            let (at, found) = state
+                .scans
+                .iter()
+                .enumerate()
+                .find_map(|(at, s)| f(s.parent, s.last, s.index, s.next).map(|r| (at, r)))?;
+            let scan = state.scans.remove(at);
+            state.scans.push(scan);
+            Some(found)
+        })
+    }
+
+    pub(crate) fn remember(
+        document: usize,
+        parent: usize,
+        last: usize,
+        index: i64,
+        next: Option<usize>,
+    ) {
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let Some(state) = m.as_mut().filter(|s| s.document == document) else {
+                return;
+            };
+            if let Some(at) = state.scans.iter().position(|s| s.parent == parent) {
+                state.scans.remove(at);
+            } else if state.scans.len() == CAPACITY {
+                state.scans.remove(0);
+            }
+            state.scans.push(Scan {
+                parent,
+                last,
+                index,
+                next,
+            });
+        });
+    }
+}
+
+/// `no_std` has no `thread_local!`: the scan always starts at the first
+/// element, as it did before #3702.
+#[cfg(not(feature = "std"))]
+mod slot_memo {
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter(_document: usize) -> Guard {
+        Guard
+    }
+
+    pub(crate) fn resume(_document: usize, _parent: usize, _target: usize) -> Option<(usize, i64)> {
+        None
+    }
+
+    pub(crate) fn find<R>(
+        _document: usize,
+        _f: impl FnMut(usize, usize, i64, Option<usize>) -> Option<R>,
+    ) -> Option<R> {
+        None
+    }
+
+    pub(crate) fn remember(
+        _document: usize,
+        _parent: usize,
+        _last: usize,
+        _index: i64,
+        _next: Option<usize>,
+    ) {
+    }
+
+    pub(crate) fn note_scanned() {}
+
+    pub(crate) fn note_neighbour() {}
+}
+
 #[cfg(feature = "std")]
 mod anchor_scope {
     use super::AnchorScope;
@@ -7727,6 +7941,9 @@ fn eval_with_cursor_unscoped<S: EvalSemantics, C: DocumentCursor>(
     expr: &Expr,
     cursor: C,
 ) -> GenericResult<C::Value> {
+    // #3702: the scans for the slots this evaluation reads resume across its
+    // fan-outs, over this document.
+    let _slots = slot_memo::enter(cursor.document_token());
     if takes_input_queue_bridge(expr) {
         // `to_owned_cursor` directly rather than `to_owned_with_cursor`: the
         // latter ignores its value argument whenever the cursor is `Some`, so
@@ -7836,6 +8053,9 @@ fn eval_each_with_cursor_unscoped<S: EvalSemantics, C: DocumentCursor>(
     cursor: C,
     on_value: &mut dyn FnMut(GenericResult<C::Value>) -> bool,
 ) -> Option<Control> {
+    // #3702: the scans for the slots this evaluation reads resume across its
+    // fan-outs, over this document.
+    let _slots = slot_memo::enter(cursor.document_token());
     if takes_input_queue_bridge(expr) {
         let owned = match to_owned_cursor::<S, _>(&cursor) {
             Ok(o) => o,
@@ -23753,9 +23973,40 @@ enum CursorSlot<C> {
 }
 
 fn cursor_slot<C: DocumentCursor>(c: &C) -> Result<Option<CursorSlot<C>>, EvalError> {
+    Ok(cursor_parent_and_slot(c)?.map(|(_, slot)| slot))
+}
+
+/// `c`'s parent within the document and where `c` sits in it, or `None` at the
+/// root and for a node its parent does not list.
+///
+/// One lookup of what [`slot_memo`] remembers answers both for a remembered
+/// element or the one after it (#3702); otherwise the parent is
+/// [`DocumentCursor::document_parent`] and the slot a scan of its members.
+fn cursor_parent_and_slot<C: DocumentCursor>(
+    c: &C,
+) -> Result<Option<(C, CursorSlot<C>)>, EvalError> {
+    if let Some((parent_id, index, advanced)) = remembered_neighbour(c) {
+        if let Some(parent) = c.at_node_id(parent_id) {
+            if advanced {
+                slot_memo::remember(
+                    c.document_token(),
+                    parent_id,
+                    c.node_id(),
+                    index,
+                    c.next_element().map(|n| n.node_id()),
+                );
+            }
+            return Ok(Some((parent, CursorSlot::Element(index))));
+        }
+    }
     let Some(parent) = c.document_parent() else {
         return Ok(None);
     };
+    Ok(scan_for_slot(c, &parent)?.map(|slot| (parent, slot)))
+}
+
+/// Where `c` sits among `parent`'s members, by scanning them.
+fn scan_for_slot<C: DocumentCursor>(c: &C, parent: &C) -> Result<Option<CursorSlot<C>>, EvalError> {
     let parent_value = parent.value();
     if let Some(fields) = parent_value.as_object() {
         let mut f = fields.clone();
@@ -23779,6 +24030,9 @@ fn cursor_slot<C: DocumentCursor>(c: &C) -> Result<Option<CursorSlot<C>>, EvalEr
         }
         Ok(None)
     } else if let Some(elements) = parent_value.as_array() {
+        if C::RESUMABLE_ELEMENT_SCAN {
+            return Ok(element_slot_resumable(c, parent, elements));
+        }
         let mut index = 0i64;
         let mut e = elements;
         while let Some((elem, rest)) = e.uncons_cursor() {
@@ -23792,6 +24046,97 @@ fn cursor_slot<C: DocumentCursor>(c: &C) -> Result<Option<CursorSlot<C>>, EvalEr
     } else {
         Ok(None)
     }
+}
+
+/// An array scan shorter than this is cheaper to redo than to remember.
+const SLOT_MEMO_MIN_SCAN: i64 = 32;
+
+/// The parent's node id and the index of `c`, and whether `c` is a new element
+/// rather than the remembered one itself, when `c` is a remembered element or
+/// the one right after it ([`slot_memo`], #3702): a fan-out reading each
+/// element in turn finds every one after the first this way, with no scan and
+/// no `document_parent` -- `enclose` is a backward scan of the balanced
+/// parentheses, `O(distance to the parent's open)`, so for the `i`th element
+/// of a wide array it is `O(i)` as well. Integer comparisons only: each
+/// remembered scan carries the node id of the element after its last.
+fn remembered_neighbour<C: DocumentCursor>(c: &C) -> Option<(usize, i64, bool)> {
+    if !C::RESUMABLE_ELEMENT_SCAN {
+        return None;
+    }
+    let id = c.node_id();
+    let found = slot_memo::find(c.document_token(), |parent, last, index, next| {
+        if id == last {
+            // The same element read again (`key`, then `path`, at one position).
+            Some((parent, index, false))
+        } else if next == Some(id) {
+            Some((parent, index + 1, true))
+        } else {
+            None
+        }
+    });
+    if found.is_some() {
+        slot_memo::note_neighbour();
+    }
+    found
+}
+
+/// [`scan_for_slot`]'s array arm for a format whose elements are the
+/// [`next_element`](DocumentCursor::next_element) chain: the element `c` of
+/// `parent`, resuming from the element the last scan of `parent` found when
+/// [`slot_memo`] holds one before `c`, and remembering where this scan ends
+/// for the next (#3702). A resume that finds nothing falls back to the scan
+/// from the first element, so the answer is the full scan's either way.
+///
+/// A scan back to an element before the remembered one replaces it: a pipe
+/// that alternates a read near the start with a read near the end gets no
+/// help, as it got none before.
+fn element_slot_resumable<C: DocumentCursor>(
+    c: &C,
+    parent: &C,
+    elements: <C::Value as DocumentValue>::Elements,
+) -> Option<CursorSlot<C>> {
+    let document = c.document_token();
+    let parent_id = parent.node_id();
+    if let Some((last, index)) = slot_memo::resume(document, parent_id, c.node_id()) {
+        let mut cursor = c.at_node_id(last).and_then(|l| l.next_element());
+        let mut at = index + 1;
+        while let Some(elem) = cursor {
+            slot_memo::note_scanned();
+            let next = elem.next_element();
+            if elem.same_node(c) {
+                slot_memo::remember(
+                    document,
+                    parent_id,
+                    elem.node_id(),
+                    at,
+                    next.map(|n| n.node_id()),
+                );
+                return Some(CursorSlot::Element(at));
+            }
+            cursor = next;
+            at += 1;
+        }
+    }
+    let mut index = 0i64;
+    let mut e = elements;
+    while let Some((elem, rest)) = e.uncons_cursor() {
+        slot_memo::note_scanned();
+        if elem.same_node(c) {
+            if index >= SLOT_MEMO_MIN_SCAN {
+                slot_memo::remember(
+                    document,
+                    parent_id,
+                    elem.node_id(),
+                    index,
+                    elem.next_element().map(|n| n.node_id()),
+                );
+            }
+            return Some(CursorSlot::Element(index));
+        }
+        index += 1;
+        e = rest;
+    }
+    None
 }
 
 /// The key node `key` emits for the member value `c` -- its previous sibling
@@ -23895,15 +24240,14 @@ fn cursor_path_and_ancestors<C: DocumentCursor>(
     let mut at_key = false;
     let mut cur = *c;
     let mut first = true;
-    while let Some(parent) = cur.document_parent() {
-        let key = match cursor_slot(&cur)? {
-            Some(CursorSlot::Value { key, .. }) => key,
-            Some(CursorSlot::Key(key)) => {
+    while let Some((parent, slot)) = cursor_parent_and_slot(&cur)? {
+        let key = match slot {
+            CursorSlot::Value { key, .. } => key,
+            CursorSlot::Key(key) => {
                 at_key |= first;
                 key
             }
-            Some(CursorSlot::Element(index)) => OwnedValue::Int(index),
-            None => break,
+            CursorSlot::Element(index) => OwnedValue::Int(index),
         };
         first = false;
         path.push(key);
@@ -45411,6 +45755,240 @@ mod tests {
         assert!(
             cursor_ancestor(&at(".a.b[1]"), 4).is_none(),
             "above the root"
+        );
+    }
+
+    /// #3702: a sibling scan that resumes from the element an earlier one
+    /// found answers what the scan from the first element does, for every
+    /// element of a wide array, in order, reversed and skipping, and the
+    /// parent of the element after a remembered one is the array's.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_resumed_slot_scan_answers_what_the_full_scan_does_3702() {
+        let doc = format!(
+            "[{}]",
+            (0..200)
+                .map(|i| format!("{{\"a\":{i}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let index = JsonIndex::build(doc.as_bytes());
+        let root = index.root(doc.as_bytes());
+        let mut elements = Vec::new();
+        let mut next = root.first_child();
+        while let Some(c) = next {
+            next = c.next_sibling();
+            elements.push(c);
+        }
+        assert_eq!(elements.len(), 200);
+        let slot_of = |c: &crate::json::light::JsonCursor<'_, Vec<u64>>| match cursor_slot(c) {
+            Ok(Some(CursorSlot::Element(i))) => i,
+            other => panic!("not an element slot: {:?}", other.map(|_| ())), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3702 pin, only reached when the pin is already failing"
+        };
+        let _scope = slot_memo::enter(root.document_token());
+        let orders: [Vec<usize>; 4] = [
+            (0..200).collect(),
+            (0..200).rev().collect(),
+            (0..200).step_by(7).collect(),
+            [5, 150, 40, 41, 42, 199, 0, 100, 101, 33, 34, 35]
+                .into_iter()
+                .collect(),
+        ];
+        for order in orders {
+            for i in order {
+                assert_eq!(slot_of(&elements[i]), i as i64, "element {i}");
+                let (path, ancestors, _) = cursor_path_and_ancestors(&elements[i]).unwrap();
+                assert_eq!(path, vec![OwnedValue::Int(i as i64)], "path of {i}");
+                assert!(ancestors[0].same_node(&root), "parent of {i}");
+            }
+        }
+        // A cursor of another document is never answered from this one's scans.
+        let other_doc = format!("[{}]", vec!["null"; 200].join(","));
+        let other = JsonIndex::build(other_doc.as_bytes());
+        let mut c = other.root(other_doc.as_bytes()).first_child();
+        for i in 0..200 {
+            let cursor = c.expect("200 elements");
+            assert_eq!(slot_of(&cursor), i);
+            c = cursor.next_sibling();
+        }
+    }
+
+    /// #3702: the slots a fan-out reads cost one scan step each, not the
+    /// whole prefix. Without the scans resuming, `[.[] | ... | [key]]` over
+    /// `n` elements visits `n(n-1)/2` of them; with them, about `n`. The
+    /// neighbour count pins the other half: the element after a remembered
+    /// one is answered with no scan and no parent lookup.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_fan_out_slot_reads_are_linear_in_the_elements_3702() {
+        let n = 1500usize;
+        let doc = format!(
+            "[{}]",
+            (0..n)
+                .map(|i| format!("{{\"a\":{{\"b\":{i}}}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for filter in [
+            "[.[] | .a.x | tostring | [key]] | length",
+            "[.[] | .a | tostring | [key]] | length",
+            "[.[] | .a.x | tostring | path] | length",
+        ] {
+            let (scanned_before, neighbours_before) = slot_memo::work();
+            let (out, control) = drive_each_sink::<JqSemantics>(doc.as_bytes(), filter);
+            assert!(control.is_none(), "{filter}: {control:?}");
+            assert_eq!(out, [OwnedValue::Int(n as i64)], "{filter}");
+            let (scanned, neighbours) = slot_memo::work();
+            let (scanned, neighbours) = (scanned - scanned_before, neighbours - neighbours_before);
+            assert!(
+                scanned < 4 * n,
+                "{filter}: visited {scanned} elements over {n}; quadratic would be ~{}",
+                n * n / 2
+            );
+            assert!(
+                neighbours >= n / 2,
+                "{filter}: only {neighbours} of {n} positions were answered as a remembered element's neighbour"
+            );
+        }
+    }
+
+    /// #3702: a fan-out that skips elements is not their neighbours' reads, so
+    /// only resuming the scan keeps it linear: every third element answers,
+    /// and each lookup starts at the last one found rather than the first.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_skipping_fan_out_slot_reads_resume_the_scan_3702() {
+        let n = 1500usize;
+        let doc = format!(
+            "[{}]",
+            (0..n)
+                .map(|i| format!("{{\"a\":{{\"b\":{i}}}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (scanned_before, _) = slot_memo::work();
+        let (out, control) = drive_each_sink::<JqSemantics>(
+            doc.as_bytes(),
+            "[.[] | select(.a.b % 3 == 0) | .a | tostring | [key]] | length",
+        );
+        assert!(control.is_none(), "{control:?}");
+        assert_eq!(out, [OwnedValue::Int((n / 3) as i64)]);
+        let scanned = slot_memo::work().0 - scanned_before;
+        assert!(
+            scanned < 8 * n,
+            "visited {scanned} elements over {n}; quadratic would be ~{}",
+            n * n / 6
+        );
+    }
+
+    /// #3702: the memo keeps the parents a pipe is still reading. Least
+    /// recently *used*, not oldest: an outer array read at every position must
+    /// outlive the inner arrays that come and go beneath it, or a wide matrix
+    /// is quadratic in its rows again.
+    // The memo these pin is `std`-only: `no_std` has no `thread_local!`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_slot_memo_drops_the_least_recently_used_parent_3702() {
+        let _scope = slot_memo::enter(1);
+        for parent in 1..=4 {
+            slot_memo::remember(1, parent, 100 * parent, 7, None);
+        }
+        // A read of parent 1 makes parent 2 the least recently used.
+        assert_eq!(slot_memo::resume(1, 1, 10_000), Some((100, 7)));
+        slot_memo::remember(1, 5, 500, 7, None);
+        assert_eq!(slot_memo::resume(1, 2, 10_000), None, "least recently used");
+        // Order is now 3, 4, 1, 5 (every `resume` above moved its parent to
+        // the back; look at them in that order again). A `find` is a use too.
+        for parent in [3, 4, 1, 5] {
+            assert!(
+                slot_memo::resume(1, parent, 10_000).is_some(),
+                "parent {parent} was dropped"
+            );
+        }
+        // Order: 3, 4, 1, 5. Reading 3 through `find` makes 4 the oldest.
+        assert!(slot_memo::find(1, |parent, _, _, _| (parent == 3).then_some(())).is_some());
+        slot_memo::remember(1, 6, 600, 7, None);
+        assert_eq!(slot_memo::resume(1, 4, 10_000), None, "least recently used");
+        for parent in [1, 3, 5, 6] {
+            assert!(
+                slot_memo::resume(1, parent, 10_000).is_some(),
+                "parent {parent} was dropped"
+            );
+        }
+        // Remembering a parent again replaces its entry rather than adding one.
+        slot_memo::remember(1, 3, 333, 9, None);
+        assert_eq!(slot_memo::resume(1, 3, 10_000), Some((333, 9)));
+        // An element after the target is not a place to resume from.
+        assert_eq!(slot_memo::resume(1, 3, 300), None);
+    }
+
+    /// #3702: an evaluation of another document inside an open scope gets a
+    /// scope of its own, and the first one is back when it returns; no entry
+    /// is ever answered for a document it does not describe.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_slot_memo_scopes_nest_per_document_3702() {
+        let _outer = slot_memo::enter(1);
+        slot_memo::remember(1, 7, 70, 3, Some(71));
+        {
+            let _inner = slot_memo::enter(2);
+            assert_eq!(slot_memo::resume(1, 7, 1_000), None, "another document");
+            slot_memo::remember(2, 9, 90, 5, None);
+            assert_eq!(slot_memo::resume(2, 9, 1_000), Some((90, 5)));
+            // The same document again is the scope already open.
+            let _same = slot_memo::enter(2);
+        }
+        assert_eq!(slot_memo::resume(1, 7, 1_000), Some((70, 3)));
+        assert_eq!(
+            slot_memo::resume(2, 9, 1_000),
+            None,
+            "dropped with its scope"
+        );
+        assert_eq!(
+            slot_memo::find(1, |parent, last, index, next| (parent == 7)
+                .then_some((last, index, next))),
+            Some((70, 3, Some(71)))
+        );
+    }
+
+    /// #3702: a YAML sequence is not on the resumable path (its item cursor is
+    /// a wrapper `uncons_cursor` unwraps, not the previous item's sibling), so
+    /// it answers by the scan from the first item, and answers the same.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_yaml_sequence_slots_take_the_scan_from_the_start_3702() {
+        let yaml: String = (0..120)
+            .map(|i| format!("- a:\n    b: {i}\n"))
+            .collect::<String>();
+        let index = crate::yaml::YamlIndex::build(yaml.as_bytes()).unwrap();
+        let expr = parse("[.[] | .[] | tostring | [key]]").unwrap();
+        let before = slot_memo::work();
+        let mut out = Vec::new();
+        let control = eval_each_with_cursor_using::<YqSemantics, _>(
+            &expr,
+            index.root(yaml.as_bytes()),
+            &mut |result| {
+                if let Ok(Some(v)) = result.into_owned::<YqSemantics>() {
+                    out.push(v);
+                }
+                true
+            },
+        );
+        assert!(control.is_none(), "{control:?}");
+        let OwnedValue::Array(keys) = &out[0] else {
+            panic!("expected one array, got {out:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure arm of a #3702 pin, only reached when the pin is already failing"
+        };
+        assert_eq!(keys.len(), 120);
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(key.to_json(), format!("[{i}]"), "item {i}");
+        }
+        assert_eq!(
+            slot_memo::work(),
+            before,
+            "a YAML sequence went through the resumable scan"
         );
     }
 
