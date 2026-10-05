@@ -454,10 +454,13 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// for YAML.
     const HAS_DELIMITER_CHECKS: bool = true;
 
-    /// Whether a sequence's elements are exactly the chain
-    /// [`next_element`](Self::next_element) walks from the first, so that a
-    /// scan for one element can resume from one an earlier scan already
-    /// reached (#3702). `eval_generic::cursor_slot` finds an element's index
+    /// Whether a sequence's elements, and a mapping's members, are exactly the
+    /// chain [`next_element`](Self::next_element) walks from the first, so that
+    /// a scan for one can resume from one an earlier scan already reached
+    /// (#3702, #3839). For a mapping that chain alternates key node, value
+    /// node, key node, ...: a key's `next_element` is its value, a value's is
+    /// the next key, and a value's [`prev_sibling`](Self::prev_sibling) is its
+    /// key. `eval_generic::cursor_slot` finds an element's index
     /// by scanning its parent's elements from the first, `O(index)`; a pipe
     /// that reads `key`/`path` at every element of one array was `O(n^2)` in
     /// the length of that array before it could resume.
@@ -473,8 +476,9 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     const RESUMABLE_ELEMENT_SCAN: bool = false;
 
     /// The element after this one, when [`RESUMABLE_ELEMENT_SCAN`] holds and
-    /// this cursor is an element of a sequence; `None` at the last element
-    /// (and for every format that does not resume).
+    /// this cursor is an element of a sequence or a key or value node of a
+    /// mapping; `None` at the last element (and for every format that does not
+    /// resume).
     ///
     /// [`RESUMABLE_ELEMENT_SCAN`]: Self::RESUMABLE_ELEMENT_SCAN
     fn next_element(&self) -> Option<Self> {
