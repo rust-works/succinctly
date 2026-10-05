@@ -881,7 +881,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   register onto the matched member and a `foreach` does not backtrack its source past them, so the body's `.` is no longer at the register, and a
   write through it (`|=`, `=`, `del`) landed on the root. #3489 had left a bare-`.` source on the by-value drive because routing it traded a wrong
   accept for a wrong refusal and, through `try`, a lost handler output (#3743, fixed above); it is now routed through the resolver for `foreach`
-  (`foreach_source_destructures_register`), which models a bare `.` exactly. `reduce` keeps the by-value drive (jq restores the register when it backtracks
+  (`foreach_source_destructures_register`, which reads only the source's own spine, never a builtin's argument or a `def` body), which models a bare `.` exactly. `reduce` keeps the by-value drive (jq restores the register when it backtracks
   a `reduce` source: `reduce (. as {a:$a} | .) as $x (.; .)` is `[]`, pinned as the contrast), and so does a destructuring under a nested `reduce`.
   Not changed: a nested `foreach . as [$q] (...)` over `.` in a `foreach` source (routing it answered a root where jq refuses inside an `or` under a
   `try`, 54 sampled rows, so it keeps the by-value drive), a `?//` chain, and the nested `reduce (reduce (. as [$q] | .) as [$a] (0; .)) as $x (.; .)`

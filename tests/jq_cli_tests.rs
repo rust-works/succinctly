@@ -62149,7 +62149,7 @@ fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
 /// {a:$a} | .) as $x (.; .; .))` on `{"a":1}` refuses ("Invalid path expression
 /// with result"), and a write through it (`|=`, `=`, `del`) lands nowhere, where
 /// the by-value drive accepted the root. A bare `.` source is routed through the
-/// resolver for `foreach` (`is_fold_source_destructuring`), which models it
+/// resolver for `foreach` (`foreach_source_destructures_register`), which models it
 /// exactly, now that #3743's `?//` retry no longer loses a handler's output on
 /// that route. `reduce` keeps the by-value drive: jq restores the register when it
 /// backtracks a `reduce` source, so `reduce (. as {a:$a} | .) as $x (.; .)` is `[]`
@@ -62371,6 +62371,53 @@ fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> 
             0,
         ),
     ])
+}
+
+/// #3744: what the routing costs, in the safe direction. A `foreach (. as PATTERN | ...)`
+/// source inside `and`/`or`/`-` under a `try` or `?` refuses (exit 5) where jq answers,
+/// because the resolver's terminal "Invalid path expression with result" refusal is
+/// uncatchable by design while jq's own `try` caught the equivalent error; `main`
+/// matched these only by the by-value drive's luck (it answered the root). Pinned so
+/// lifting it is a deliberate change; the jq answers are in each row.
+#[test]
+fn test_foreach_source_destructuring_register_under_try_stays_refused_3744() -> Result<()> {
+    for (input, filter, jq_answer) in [
+        (
+            r#"{"a":[true]}"#,
+            r"del(try ((foreach (. as {a:$a} | .) as [$z] (.; .; .)) and true))",
+            "{\"a\":[true]}",
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del((-(try (foreach (. as {a:$a} | .) as $k (.; .; .)) catch 7))?)",
+            "{\"a\":false,\"b\":null}",
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"del(. as $x | ((foreach (. as {$a} | .) as $k (.; .; .)) and (.a | .b)?) | $x)",
+            "{\"a\":[true]}",
+        ),
+    ] {
+        let routes = [
+            ("stdin", run_jq_full(&["-c", filter], Some(input))?),
+            (
+                "-n",
+                run_jq_full(&["-nc", &format!("{input} | {filter}")], None)?,
+            ),
+        ];
+        for (route, (stdout, stderr, code)) in routes {
+            assert_eq!(
+                (stdout.as_str(), code),
+                ("", 5),
+                "`{filter}` on {input} via {route} (jq answers {jq_answer}): stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains("Invalid path expression"),
+                "`{filter}` on {input} via {route}: {stderr:?}"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
