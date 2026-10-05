@@ -43627,8 +43627,7 @@ fn fold_source_moves_register(source: &Expr) -> bool {
 }
 
 /// Whether a `foreach` SOURCE destructures the register itself (`.`) with an array
-/// or object pattern (#3744): `foreach (. as {a:$a} | .) as $x (...)`, or a nested
-/// `foreach . as [$q] (...)` over `.`. The pattern's tracked index steps move jq's
+/// or object pattern (#3744): `foreach (. as {a:$a} | .) as $x (...)`. The pattern's tracked index steps move jq's
 /// register onto the matched member and the source is not backtracked past it,
 /// so EXTRACT is checked against a register it is no longer at, which only the
 /// resolver models (the by-value drive answered the root).
@@ -43638,6 +43637,11 @@ fn fold_source_moves_register(source: &Expr) -> bool {
 /// fold, and its by-value drive is right (`foreach (reduce . as {a:$a} (0; .)) as
 /// $x (.; .; .)`). That subtree is skipped whole. A `?//` chain is left to the
 /// by-value drive as for a fresh source ([`routes_destructuring`]).
+///
+/// Only the `. as PATTERN | ...` bind: a nested `foreach . as [$q] (...)` fold
+/// over `.` moves the register for the outer fold in jq too, but routing it
+/// answered a root where jq refuses inside an `or` under a `try` (54 sampled
+/// rows, the dangerous direction), so it keeps the by-value drive.
 fn foreach_source_destructures_register(source: &Expr) -> bool {
     use crate::jq::walk::{search_subexpr, Visit};
     let is_dot = |e: &Expr| matches!(unwrap_paren(e), Expr::Identity);
@@ -43648,9 +43652,6 @@ fn foreach_source_destructures_register(source: &Expr) -> bool {
         {
             Visit::Found
         }
-        Expr::Foreach {
-            input, patterns, ..
-        } if routes_destructuring(patterns) && is_dot(input) => Visit::Found,
         _ => Visit::Descend,
     })
 }

@@ -876,6 +876,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a `foreach` source that destructures the register itself (`. as PATTERN | ...`) moves it, so EXTRACT is checked where jq's register is** (#3744, a #3489 residual).
+  `path(foreach (. as {a:$a} | .) as $x (.; .; .))` on `{"a":1}` answered `[]` where jq refuses: the pattern's tracked index steps move jq's path
+  register onto the matched member and a `foreach` does not backtrack its source past them, so the body's `.` is no longer at the register, and a
+  write through it (`|=`, `=`, `del`) landed on the root. #3489 had left a bare-`.` source on the by-value drive because routing it traded a wrong
+  accept for a wrong refusal and, through `try`, a lost handler output (#3743, fixed above); it is now routed through the resolver for `foreach`
+  (`foreach_source_destructures_register`), which models a bare `.` exactly. `reduce` keeps the by-value drive (jq restores the register when it backtracks
+  a `reduce` source: `reduce (. as {a:$a} | .) as $x (.; .)` is `[]`, pinned as the contrast), and so does a destructuring under a nested `reduce`.
+  Not changed: a nested `foreach . as [$q] (...)` over `.` in a `foreach` source (routing it answered a root where jq refuses inside an `or` under a
+  `try`, 54 sampled rows, so it keeps the by-value drive), a `?//` chain, and the nested `reduce (reduce (. as [$q] | .) as [$a] (0; .)) as $x (.; .)`
+  shape the issue also names. 14 of the issue's 15 probe rows now match jq (the nested reduce is the other). Against a build of the branch below it (#3743's
+  fix), the path-register sweep (22 new fold-source operands, 90,000 sampled rows) went from 912 `ACCEPT_WRONG` rows to 313, 599 of them now matching jq
+  and none new, and a 30,027-row full-grid sample from 47 to 28. It is not regression-free: 383 and 5 sampled rows that matched now refuse, all of them the
+  new `foreach (. as PATTERN | ...)` operands inside `and`/`or`/`try`, where the resolver's terminal "with result" refusal is uncatchable by design while
+  jq's `try` caught the equivalent error, so `main` matched by luck. `scripts/jq-bind-origin-fuzz.py` (8,000 programs at `--fold-p 1.0
+  --destructure-bind-p 1.0`, and 8,000 mixed) and the `jq-bind-origin-oracle-sweep.sh` matrix (identical row classes) and
+  `jq-alt-retry-oracle-sweep.sh` (2,689 of 2,689) showed no fabricated or mismatching rows.
 - **jq: a fold's `?//` pattern retries when it fails by value** (#3743).
   `reduce . as [$a] ?// $a (0; .)` over the document itself raised "near attempt to access element 0" and did not retry: the walk called the
   refusal a guess (the element equals the register by value, so jq "might" have carried on), but an array pattern's first step can never

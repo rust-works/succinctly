@@ -62373,63 +62373,6 @@ fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> 
     ])
 }
 
-/// #3744: a nested `foreach` over `.` in a `foreach` source moves jq's register for the
-/// outer fold, so the outer EXTRACT is refused (exit 5), where the by-value drive
-/// answered the root. Stdout and exit status only: succinctly words the path error
-/// differently from jq for some of these ("with result" for jq's "near attempt to
-/// access element"). Captured from jq 1.7.1.
-#[test]
-fn test_foreach_source_nested_foreach_over_the_register_moves_it_3744() -> Result<()> {
-    for (input, filter, stdout, code) in [
-        (
-            r#"{"a":1}"#,
-            r"path(foreach (foreach . as {a:$a} (0; .; .)) as $x (.; .; .))",
-            "",
-            5,
-        ),
-        (
-            r#"{"a":1}"#,
-            r"path(foreach (foreach . as {a:$a} (.; .; .)) as $x (.; .; .))",
-            "",
-            5,
-        ),
-        (
-            r#"{"a":1}"#,
-            r"path(foreach (foreach . as {a:$a} (.; .; $a)) as $x (.; .; .))",
-            "",
-            5,
-        ),
-        (
-            r#"{"a":1}"#,
-            r"path(foreach (foreach . as {a:$a} (.; .; .)) as [$z] (.; .; .))",
-            "",
-            5,
-        ),
-        (
-            r"[1]",
-            r"path(foreach (foreach . as [$a] (.; .; .)) as $x (.; .; .))",
-            "",
-            5,
-        ),
-    ] {
-        let routes = [
-            ("stdin", run_jq_full(&["-c", filter], Some(input))?),
-            (
-                "-n",
-                run_jq_full(&["-nc", &format!("{input} | {filter}")], None)?,
-            ),
-        ];
-        for (route, (out, err, exit)) in routes {
-            assert_eq!(
-                (out.as_str(), exit),
-                (stdout, code),
-                "`{filter}` on {input} via {route}: stderr {err:?}"
-            );
-        }
-    }
-    Ok(())
-}
-
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
 /// verdict stage behind a `def` call or a `reduce` and one inside a compound stage
 /// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758 and the
