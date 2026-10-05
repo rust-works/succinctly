@@ -61880,6 +61880,26 @@ fn test_verdict_stage_on_an_untracked_entry_3826() -> Result<()> {
 #[test]
 fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
     for (input, filter, jq_answer, expected) in [
+        // #3826: on an untracked entry a generator the allowlist cannot prove leaves the
+        // register in place states a loss, which the stage does not override.
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | isempty(first(2,3)) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":1}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | any(first(2,3); .) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":1}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | isempty(def f: 2; f) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":1}"#,
+        ),
         // #3758: a verdict stage the resolver cannot see as one: behind a `def`
         // call or a `reduce`, which hand back no register statement.
         (
