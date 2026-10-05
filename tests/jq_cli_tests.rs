@@ -59224,6 +59224,81 @@ fn test_reduce_navigating_update_ending_on_the_accumulator_refuses_3780() -> Res
     Ok(())
 }
 
+/// #3811: jq 1.7.1 oracle rows, captured on stdin and -n routes.
+#[test]
+fn test_reduce_update_navigation_in_stream_wrappers_and_defs_3811() -> Result<()> {
+    let doc = r#"{"a":true,"k":2}"#;
+    let near_k = "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"k\" of {\"a\":true,\"k\":2}\n";
+    // A navigating SOURCE leaves the register off the accumulator. Every body
+    // below navigates it before returning the accumulator or a frozen root.
+    for update in [
+        "limit(2; .k, .)",
+        "nth(1; .k, .)",
+        "nth(0.5; ., .k)",
+        "label $f | .k, .",
+        "def f: .k, .; f",
+        "limit(1; .k, .) | $x",
+        "[limit(1; .k)] | $x",
+        "first(label $l | .k) | $x",
+        "last(limit(2; .k, .)) | $x",
+        "(limit(1; .k) // .) | $x",
+        "def f(g): g; f(.k, .)",
+        "def f($v): .k, .; f(1)",
+        "def f: .k, .; def g: f; g",
+        "def f($n): if $n == 0 then .k, . else f($n-1) end; f(3)",
+    ] {
+        let fold = format!(". as $x | reduce .[]? as $k (.; {update})");
+        for filter in [
+            format!("path({fold})"),
+            format!("del({fold})"),
+            format!("({fold}) = 9"),
+            format!("({fold}) |= 9"),
+        ] {
+            let got = run_jq_full(&["-c", &filter], Some(&format!("{doc}\n")))?;
+            assert_eq!(got, (String::new(), near_k.into(), 5), "stdin: {filter}");
+            let owned = format!("{doc} | {filter}");
+            let got = run_jq_full(&["-n", "-c", &owned], None)?;
+            assert_eq!(
+                got,
+                (String::new(), near_k.replace("<stdin>:1", "<unknown>"), 5),
+                "owned: {filter}"
+            );
+        }
+    }
+    // Recursive calls must terminate this static inspection too.
+    // Counts, passthrough bodies, subexpressions and caught navigation must
+    // retain jq's answers, as must a SOURCE that does not move the register.
+    for (filter, stdout, stderr, code) in [
+        ("path(reduce .[]? as $k (.; limit(1; ., .k)))", "[]\n", "", 0),
+        ("path(reduce .[]? as $k (.; limit(0.5; ., .k)))", "[]\n", "", 0),
+        ("path(reduce .[]? as $k (.; nth(0; ., .k)))", "[]\n", "", 0),
+        ("path(reduce .[]? as $k (.; first(limit(2; ., .k))))", "[]\n", "", 0),
+        ("path(reduce .[]? as $k (.; first(label $l | ., .k)))", "[]\n", "", 0),
+        ("path(reduce .[]? as $k (.; first(def f: ., .k; f)))", "[]\n", "", 0),
+        ("path(reduce .[]? as $k (.; first(def f(g): g; f(., .k))))", "[]\n", "", 0),
+        ("path(. as $x | reduce .[]? as $k (.; def f($n): if $n == 0 then . else f($n-1) end; f(3)))", "[]\n", "", 0),
+        ("path(. as $x | reduce .[]? as $k (.; limit(1; .)))", "[]\n", "", 0),
+        ("path(. as $x | reduce .[]? as $k (.; nth(0; .)))", "[]\n", "", 0),
+        ("path(. as $x | reduce .[]? as $k (.; label $l | .))", "[]\n", "", 0),
+        ("path(. as $x | reduce .[]? as $k (.; def f: .; f))", "[]\n", "", 0),
+        ("path(. as $x | reduce .[]? as $k (.; def f(g): g; f(.)))", "[]\n", "", 0),
+        ("path(. as $x | reduce .[]? as $k (.; def f($v): .; f(.k)))", "[]\n", "", 0),
+        ("path(. as $x | reduce .[]? as $k (.; limit(0; .k, .) | $x))", "", "jq: error (at <stdin>:1): Invalid path expression with result null\n", 5),
+        ("path(. as $x | reduce .[]? as $k (.; limit(-1; .k, .) | $x))", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"k\" of {\"a\":true,\"k\":2}\n", 5),
+        ("path(. as $x | reduce .[]? as $k (.; try limit(1; .k) catch 1 | $x))", "[]\n", "", 0),
+        ("path(. as $x | reduce .[]? as $k (.; {a: limit(1; .k)} | $x))", "[]\n", "", 0),
+        ("del(. as $x | reduce (1,2) as $k (.; limit(2; .k, .) | $x))", "null\n", "", 0),
+        ("path(. as $x | reduce .[]? as $k (.; def f: if true then . else f end; f))", "[]\n", "", 0),
+    ] {
+        let got = run_jq_full(&["-c", filter], Some(&format!("{doc}\n")))?;
+        assert_eq!(got, (stdout.into(), stderr.into(), code), "stdin: {filter}");
+        let owned = format!("{doc} | {filter}");
+        let got = run_jq_full(&["-n", "-c", &owned], None)?;
+        assert_eq!(got, (stdout.into(), stderr.replace("<stdin>:1", "<unknown>"), code), "owned: {filter}");
+    }
+    Ok(())
+}
+
 /// #3780 (review): a destructuring pattern walks its own register, and the same
 /// `(.k, .)` UPDATE used to delete the document through it too. Each row now
 /// refuses with exit 5, as jq does; the `?//` rows differ from jq only in the node
