@@ -70380,7 +70380,9 @@ fn test_walk_residue_constructs_jq_2416() -> anyhow::Result<()> {
         ("[.. | parent | key]", "[\"a\",\"a\",\"c\",\"c\"]", 0),
         ("[.a | .. | key]", "[\"a\",\"b\",\"e\"]", 0),
         ("[recurse | key]", "[\"a\",\"b\",\"e\",\"c\",0,1,\"n\",\"m\",\"s\",\"u\"]", 0),
-        ("[recurse(.[]?) | key]", "[]", 0),
+        // #3773: `recurse(.[]?)` is jq's definition of bare `recurse`, so it
+        // reads the same keys (this row used to pin `[]`).
+        ("[recurse(.[]?) | key]", "[\"a\",\"b\",\"e\",\"c\",0,1,\"n\",\"m\",\"s\",\"u\"]", 0),
         (".. | select(key == \"b\")", "1", 0),
         ("first(.. | key)", "\"a\"", 0),
         // builtins with a rule
