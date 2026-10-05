@@ -15200,28 +15200,70 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     // failing element. Found by #2815's review after this file's first
     // version claimed no forwarder was ever needed.
     let outer_budget = sink.budget();
+    // #3806: a `?//` in `first` retries when anything downstream fails, so a
+    // lazy item the last stage hands over (`G | map(f)`) must be forced *here*,
+    // inside the retry's scope. Left for a sink to force after the drive ended
+    // it either never retries (the printer, a collector) or, for the sinks that
+    // stash the failure themselves, leaves a stale escape the retry's own
+    // verdict never replaces. Forcing it here makes the failure this stage's
+    // own `Flow::Escaped`, which `stop_with_downstream` stashes and
+    // `pipe_terminal_after_retry` lets the retry supersede -- the route an
+    // owned item already takes.
+    let force_lazy = crate::jq::eval::contains_retrying_pattern_bind(first);
     let upstream = {
         let mut driver = forward_lazy(outer_budget, |item: GenericItem<V>| -> Demand {
-            let flow = match identity_from_first {
-                Some(_) if key_stage && matches!(item, GenericItem::OneCursor(_)) => {
-                    continue_pipe_element_generic::<S, V>(item, &mut rest, optional, &mut *sink)
-                }
-                Some(c) => match owned_identity_materialize::<V, S>(item) {
-                    Ok(o) => match owned_identity_leaving_cursor::<S, V>(first, c, &o, optional) {
-                        Ok(id) => eval_owned_identity_pipe::<S, V>(
-                            rest.stages(),
-                            Cow::Owned(o),
-                            id.unwrap_or_else(OwnedIdentity::detached),
-                            optional,
-                            &mut *sink,
-                        ),
-                        Err(e) => Flow::Escaped(Control::Error(e)),
+            let mut run = |item: GenericItem<V>, snk: &mut dyn Sink<V>| -> Flow {
+                match identity_from_first {
+                    Some(_) if key_stage && matches!(item, GenericItem::OneCursor(_)) => {
+                        continue_pipe_element_generic::<S, V>(item, &mut rest, optional, &mut *snk)
+                    }
+                    Some(c) => match owned_identity_materialize::<V, S>(item) {
+                        Ok(o) => {
+                            match owned_identity_leaving_cursor::<S, V>(first, c, &o, optional) {
+                                Ok(id) => eval_owned_identity_pipe::<S, V>(
+                                    rest.stages(),
+                                    Cow::Owned(o),
+                                    id.unwrap_or_else(OwnedIdentity::detached),
+                                    optional,
+                                    &mut *snk,
+                                ),
+                                Err(e) => Flow::Escaped(Control::Error(e)),
+                            }
+                        }
+                        Err(control) => Flow::Escaped(control),
                     },
-                    Err(control) => Flow::Escaped(control),
-                },
-                None => {
-                    continue_pipe_element_generic::<S, V>(item, &mut rest, optional, &mut *sink)
+                    None => {
+                        continue_pipe_element_generic::<S, V>(item, &mut rest, optional, &mut *snk)
+                    }
                 }
+            };
+            let flow = if force_lazy {
+                let mut forced: Option<Control> = None;
+                let flow = {
+                    let mut forcing = WithBudget {
+                        budget: outer_budget,
+                        f: |inner: GenericItem<V>| match inner {
+                            lazy @ GenericItem::LazySeq(_) => {
+                                match generic_item_into_owned::<V, S>(lazy) {
+                                    Ok(owned) => sink.push(GenericItem::Owned(owned)),
+                                    Err(control) => {
+                                        forced = Some(control);
+                                        Demand::Stop
+                                    }
+                                }
+                            }
+                            other => sink.push(other),
+                        },
+                        lazy_ok: true,
+                    };
+                    run(item, &mut forcing)
+                };
+                match forced {
+                    Some(control) => Flow::Escaped(control),
+                    None => flow,
+                }
+            } else {
+                run(item, &mut *sink)
             };
             match flow {
                 Flow::Exhausted => Demand::Continue,
