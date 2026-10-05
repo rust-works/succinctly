@@ -2977,33 +2977,36 @@ answers `["b"]` — and classified the two residuals appended below):
   would hand the *unchanged target* to the fold where the evaluator raises. `succinctly yq`
   therefore still path-checks with `Keep::First` and then drives its values by value
   through `eval_each_owned`; only the jq-mode value reuse is new.
-- **`reduce`'s mid-step register position is message-only wrong ([#2732](https://github.com/rust-works/succinctly/issues/2732)).**
-  `resolve_reduce` checks every UPDATE step against the fold's persistent register, never a
-  per-step one seeded from a navigating SOURCE element the way `resolve_foreach` already does
-  — correctly, for the *final* re-entry check (`path(reduce (.[]) as $k (.; .))` on
-  `{"a":[1,2]}` is `[]` in both, jq's own path-restoring `FORK`/`BACKTRACK` at the exit
-  boundary). But jq's `gen_reduce` bytecode is `DUPN, source, …` with no `SUBEXP` around it,
-  so *inside* a step the register genuinely sits where SOURCE left it — the same per-step
-  position `foreach` already models. Every *outcome* agrees — exit code, whether a value is
-  produced at all, whether a write goes through (never, on either side, for this shape) — and
-  only the error message's own wording differs, including a value it happens to quote from
-  wherever each side's own model of the register landed:
-  ```
-  $ echo '{"a":1}' | jq -c 'path(reduce .[] as $k (.; .a))'
-  jq: error: Invalid path expression near attempt to access element "a" of {"a":1}
-  $ echo '{"a":1}' | succinctly jq -c 'path(reduce .[] as $k (.; .a))'
-  jq: error: Invalid path expression with result 1
-  ```
-  Wrapping the navigating step in `try`/`catch` does not change this into a genuine output
-  divergence either — confirmed live that jq's own `try` here does not prevent `path()`'s
-  outer check from raising too, just with the *caught* value quoted instead:
-  `path(reduce .[] as $k (.; try .a catch "x"))` on `{"a":1}` is jq's `Invalid path expression
-  with result "x"`, exit 5; succinctly's `Invalid path expression with result 1`, exit 5 — the
-  identical message-wording-only pattern, not a new case where one side succeeds.
-  Both exit 5. Modelling the mid-step position too needs a dual provenance per step ("at the
-  per-step register" *and* "still identical to the persistent one") without regressing the
-  `[]` case above — recorded rather than built, since the exit code and value already match
-  and only wording differs.
+- **`reduce`'s UPDATE reads the per-step register only when it can navigate ([#3780](https://github.com/rust-works/succinctly/issues/3780), was the message-only residual [#2732](https://github.com/rust-works/succinctly/issues/2732)).**
+  jq's `gen_reduce` bytecode is `DUPN, source, …` with no `SUBEXP` around it, so *inside* a
+  step the register sits where a navigating SOURCE left it, and an UPDATE that navigates the
+  accumulator is checked against that element (`path(reduce .[] as $k (.; .a))` on `{"a":1}`
+  is `Invalid path expression near attempt to access element "a" of {"a":1}` in both, and
+  `del(reduce .[]? as $k (.; (.k, .)))` refuses where it used to delete the document).
+  `resolve_reduce` therefore resolves such an UPDATE with the accumulator's at-register flag
+  recomputed from the element (`foreach_step_register`'s verdict, jq mode, bare `$var` only).
+  Only an UPDATE that provably navigates the accumulator on a path that always runs
+  (`update_definitely_navigates`: a bare navigation, a `,`/`|` with one, an `if` whose
+  literal condition picks one, or whose computed condition has one in either branch) is
+  affected. Everything else -- `.`, a literal, `$var`, and every wrapper that merely contains a
+  navigation (`first(.)`, `. // .k`, a `try`) -- keeps the persistent register, so those forms
+  keep their answers (and, for a `try` around the navigation, #2732's wording: `path(reduce .[]
+  as $k (.; try .a catch "x"))` on `{"a":1}` is jq's `with result "x"` and this `with result 1`,
+  both exit 5). Two consequences, both recorded rather than fixed: a navigating wrapper
+  whose navigation does run (`first((.k, .))`) keeps the old verdict, and an `if` over a computed condition refuses when only its *untaken* branch
+  navigates, where jq answers `[]`. The persistent register is what the *final* re-entry check
+  needs
+  (`path(reduce (.[]) as $k (.; .))` on `{"a":[1,2]}` is `[]` in both, jq's own
+  path-restoring `FORK`/`BACKTRACK` at the exit boundary). A destructuring pattern walks its
+  own register, whose at-register flag is read the same way. Only the *flag* is per-step:
+  UPDATE is still resolved and relocated against the persistent register, so two adjacent
+  shapes keep wording that differs from jq's, both exit 5 and neither a write:
+  `path(reduce .a as $k (.; $k | .b))` on `{"a":{"b":1}}` (jq says `with result 1`, this says
+  `near attempt to access element "b"`), and `path(reduce .[]? as $k (.; .k |= 1))` on
+  `{"a":true,"k":2}` (jq quotes `[{"a":true,"k":1},[]]`). A `?//` chain after a failed first
+  alternative quotes the document where jq quotes `null` (`path(reduce .a as [$x] ?// $x (.;
+  (.k, .)))` on `{"a":[1],"k":2}`). What remains unmodelled is a dual provenance for an UPDATE
+  that navigates *and* hands back the accumulator it started from.
 - **A recursion's first output keeps the path register; the later ones move it
   ([#3272](https://github.com/rust-works/succinctly/issues/3272)).** jq defines every spelling
   (`..`, `recurse`, `recurse(f)`, `recurse(f; cond)`) as `def r: ., (f | r); r;`, so the `.` is

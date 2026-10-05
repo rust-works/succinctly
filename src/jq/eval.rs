@@ -43482,10 +43482,11 @@ struct FoldSourceValue {
 /// together: [`fold_pattern_seed`] (the destructuring walk's register),
 /// [`fold_walk_refusal_is_guess`] (whether that walk's refusal is jq's own
 /// verdict) and [`foreach_step_register`] (`resolve_foreach`'s per-step
-/// register). `resolve_reduce` reads it only through the first two: its
-/// UPDATE is deliberately not re-seeded, because `reduce` restores the
-/// register when it backtracks its source and only its final accumulator is
-/// checked against it.
+/// register). `resolve_reduce` reads it through all three: the first two as
+/// above, and [`foreach_step_register`] only for the at-register flag of an
+/// UPDATE that can navigate ([`reduce_update_at_register`], #3780); its UPDATE
+/// is still resolved against the persistent register, which the final
+/// accumulator is checked against.
 enum MovedRegister {
     /// The source never navigated to this element (a literal, an `as`
     /// source, an untaken navigating branch): the fold's persistent
@@ -45441,8 +45442,8 @@ fn foreach_step_register<S: EvalSemantics>(
 ) -> (FoldRegister, bool) {
     // #2031: this step's own register -- where the pattern walk
     // left it, else the register-derived element's own position,
-    // else the fold's persistent `reg`. `resolve_reduce` has no
-    // counterpart: it never seeds a per-step register.
+    // else the fold's persistent `reg`. `resolve_reduce` uses only the
+    // returned flag, never the step register itself (#3780).
     if let Some(walked_reg) = walked {
         let step_reg = FoldRegister {
             path: Rc::clone(&walked_reg.path),
@@ -45581,6 +45582,91 @@ fn foreach_step_register<S: EvalSemantics>(
     }
 }
 
+/// Whether a `reduce` UPDATE navigates the accumulator itself on a path that always
+/// runs (#3780): a bare navigation (`.k`, `.[]?`, `.[0]`), a `,` with such an output,
+/// a `|` whose first stage is one, parentheses, or an `if` whose literal condition
+/// picks a branch that is (a computed condition counts when either branch does).
+/// Everything else answers `false` -- including every wrapper that merely *contains*
+/// a navigation (`first(.k)`, `. // .k`, a `try`) -- so those keep the persistent register and their
+/// existing verdict, which matches jq for the passthrough forms (`first(.)`,
+/// `limit(1; .)`, `. // .k`, `((.k)?, .)` are all `[]` in jq). A shallow, conservative
+/// rule on purpose: the cost of a miss is the old behaviour, never a new refusal.
+fn update_definitely_navigates(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => update_definitely_navigates(inner),
+        Expr::Pipe(stages) => stages.first().is_some_and(update_definitely_navigates),
+        Expr::Comma(items) => items.iter().any(update_definitely_navigates),
+        Expr::Optional(inner) if is_postfix_optional_primitive(inner) => {
+            update_definitely_navigates(inner)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => match unwrap_paren(cond) {
+            Expr::Literal(Literal::Bool(true)) => update_definitely_navigates(then_branch),
+            Expr::Literal(Literal::Bool(false) | Literal::Null) => {
+                update_definitely_navigates(else_branch)
+            }
+            // A computed condition: either branch may run, and refusing a passthrough
+            // whose navigating branch is not taken is the safe direction, where
+            // accepting the root for one that is taken deletes the document
+            // (`if .a then (.k, .) else . end`).
+            _ => {
+                update_definitely_navigates(then_branch) || update_definitely_navigates(else_branch)
+            }
+        },
+        other => is_fold_source_navigation(other),
+    }
+}
+
+/// Whether `reduce`'s accumulator is at jq's register for this step's UPDATE (#3780).
+///
+/// A source that navigated -- or a destructuring pattern, which walks its own
+/// register -- moved jq's register onto its element *before* UPDATE runs
+/// (`gen_reduce` has no `SUBEXP` around the source), so UPDATE's own navigation of
+/// the accumulator is checked against that element, and the accumulator is on it
+/// only when it is still the element's own value ([`foreach_step_register`]'s
+/// verdict). `reduce .[]? as $k (.; (.k, .))` on `{"a":true,"k":2}` raises in jq;
+/// resolved as trackable, its last output (`.`) relocated to the root and `del`
+/// deleted the document. `update_navigates` ([`update_definitely_navigates`]) is
+/// false for every UPDATE that does not provably navigate the accumulator on a path
+/// that always runs -- `.`, a literal, `$var`, `first(.)`, `. // .k`, a `try` -- and
+/// those keep `persistent`, the flag the final re-entry check relies on
+/// (`reduce .a as $k (.; .)` is `[]`). jq mode only: `update_navigates` carries the
+/// gate.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `foreach_step_register`'s ambient
+fn reduce_update_at_register<S: EvalSemantics>(
+    update_navigates: bool,
+    walked: Option<&PatternRegister>,
+    elem: &FoldSourceValue,
+    reg: &FoldRegister,
+    frame: &Frame,
+    acc: &OwnedValue,
+    acc_snapshot: &Snapshot,
+    persistent: bool,
+) -> bool {
+    if !update_navigates {
+        return persistent;
+    }
+    let moved = walked.is_some()
+        || match (&elem.register_path, &elem.moved) {
+            (Some(path), _) => **path != *reg.path,
+            (None, MovedRegister::At { .. } | MovedRegister::Lost) => true,
+            (None, MovedRegister::Unmoved) => false,
+        };
+    if !moved {
+        return persistent;
+    }
+    // `&&`, never a replacement: the per-step verdict may only *narrow* what the
+    // persistent flag accepted. A destructuring walk's register can read `true`
+    // where the persistent one is `false` (a `null`/`bool` accumulator is identical
+    // to any `null`/`bool` register), and taking it would admit a write jq refuses
+    // (`(reduce first(.a) as {a:$v0} (null; ($v0 | getpath([])))) = 9`).
+    persistent
+        && foreach_step_register::<S>(walked, elem, reg, frame, acc, acc_snapshot, persistent).1
+}
+
 /// A `foreach` step's verdict on a `Demand::Stop` answered downstream of its
 /// stored state (EXTRACT, the emission's own sink): retry the next `?//`
 /// alternative when [`is_retryable_stop`] allows it, else answer the source
@@ -45678,6 +45764,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         && trackable
         && reduce_cannot_move_register(patterns, input, init, update);
     let slice_ok = fold_slice_ok(patterns, input);
+    // #3780: whether UPDATE navigates the accumulator on a path that always runs --
+    // syntactic, so decided once, not per source element
+    // ([`reduce_update_at_register`]).
+    let update_navigates = S::TAG == EvalTag::Jq && update_definitely_navigates(update);
     // INIT resolved first, before SOURCE (#2031, reordered from the
     // original #1467/#1872 shape): confirmed live against jq 1.7.1 (via
     // `debug`-instrumented INIT/SOURCE/UPDATE clauses) that real jq
@@ -45789,31 +45879,23 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // coincide (`identical()`'s existing snapshot-gated fallback),
         // exactly as any other navigated value would.
         //
-        // **#2732: this is the *final-emission* behaviour, not "SOURCE
-        // never navigates the register within a step."** jq's own
-        // `gen_reduce` is `DUPN, source, …` with no `SUBEXP` around it, so
-        // *inside* one step the register genuinely sits where SOURCE left
-        // it -- `foreach`'s per-step register (which this resolver already
-        // models below) is what jq's own bytecode actually produces
-        // mid-step; `reduce`'s `[]` above is jq's own path-restoring
-        // `FORK`/`BACKTRACK` at the *exit* boundary, not evidence that
-        // navigation never happened in between. The two agree at every
-        // *outcome* -- exit code, whether a value is produced, whether a
-        // write goes through -- and only the *mid-step* error message's
-        // own wording differs, including a value it happens to quote
-        // (`path(reduce .[] as $k (.; .a))` on `{"a":1}`: jq's "near
-        // attempt to access element \"a\" of {\"a\":1}" -- position
-        // restored -- versus this resolver's own "with result 1" -- the
-        // fold's persistent position -- both exit 5, neither a value-
-        // producing success `try`/`catch` can turn into one: `path(reduce
-        // .[] as $k (.; try .a catch "x"))` on the same document is jq's
-        // own "Invalid path expression with result \"x\"", still exit 5,
-        // just quoting the caught value instead). Modelling the
-        // mid-step position too would need a dual provenance per step
-        // ("at the per-step register" *and* "still identical to the
-        // persistent one") without breaking the `[]` case above; recorded
-        // as a message-only residual in `docs/compliance/jq/limitations.md`
-        // rather than built here.
+        // **#2732, narrowed by #3780: the persistent register is the
+        // *final-emission* behaviour, not "SOURCE never navigates the register
+        // within a step."** jq's own `gen_reduce` is `DUPN, source, …` with no
+        // `SUBEXP` around it, so *inside* one step the register genuinely sits
+        // where SOURCE left it -- `foreach`'s per-step register is what jq's
+        // bytecode produces mid-step; `reduce`'s `[]` above is jq's own
+        // path-restoring `FORK`/`BACKTRACK` at the *exit* boundary. So an UPDATE
+        // that can navigate is resolved with the accumulator's at-register flag
+        // read off the per-step register ([`reduce_update_at_register`]), and
+        // everything else -- a passthrough UPDATE, the carry-forward provenance
+        // and the final emission -- keeps the persistent `reg`. Only the *flag* is
+        // per-step: the resolver still compares and relocates against `reg`, which
+        // is enough because a step whose flag is false resolves untracked, and an
+        // untracked navigation refuses. The dual provenance a navigating UPDATE
+        // that hands back its own accumulator would need is not built, and the
+        // wording of two adjacent shapes still differs from jq's
+        // (`docs/compliance/jq/limitations.md`).
         //
         // The source is driven by demand (#2235): each element runs its
         // UPDATE step here, inside the drive, before the next one is
@@ -45897,7 +45979,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     &reg,
                     frame,
                     alternatives,
-                    &mut |_walked, bind| {
+                    &mut |walked, bind| {
                         let substituted = bind.apply(update, WalkOrigins::Drop);
                         // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
                         // (#2161) — `acc_at_register` alone is the previous step's
@@ -45937,6 +46019,17 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                 &acc_snapshot,
                                 S::TAG == EvalTag::Jq,
                             );
+                        // #3780: see [`reduce_update_at_register`].
+                        let update_at_register = reduce_update_at_register::<S>(
+                            update_navigates,
+                            walked.as_ref(),
+                            &elem,
+                            &reg,
+                            frame,
+                            acc_effective,
+                            &acc_snapshot,
+                            acc_at_register,
+                        );
                         let acc_input = acc.take().unwrap_or(OwnedValue::Null);
                         if let Some(control) =
                             charge_alternative_update(&mut budget, &mut ran_update, "reduce")
@@ -45947,7 +46040,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                         match reg.resolve::<S>(
                             &substituted,
                             acc_input,
-                            acc_at_register,
+                            update_at_register,
                             &acc_snapshot,
                             keep,
                         ) {
