@@ -93764,6 +93764,141 @@ fn test_comma_bind_source_is_classified_per_branch_3334() -> Result<()> {
     Ok(())
 }
 
+/// #3423: a bind source jq may pass the register through by pointer, through a
+/// head no grammar names (a comma nested under a pipe, `if`, `try` or `//`, a
+/// `label`, a rebind, `first($orig)`, `$orig?`), used to bind by value with no
+/// mark (`as $x`) or to be classified frozen-free (`as {a:{b:$q}}`), so the
+/// refusal off it read as jq's own verdict and a `try` caught it: `del`, `=` and
+/// `|=` silently dropped the write jq makes (exit 0). A source *value-equal to
+/// the register* that nothing proves fresh now refuses as the resolver's guess,
+/// uncatchable, so the write is loud (exit 5) instead of lost. jq 1.7.1 writes
+/// in every refused row (`{}` / `{"a":{}}` / `{"a":9}`); the refusal is the
+/// documented price, in the safe direction. Both evaluators: the document on
+/// stdin and as a `-n` literal.
+#[test]
+fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()> {
+    let doc = r#"{"a":{"b":1}}"#;
+    let wide = r#"{"a":1,"c":1,"d":{"b":1},"x":{"a":1,"c":{"b":1}}}"#;
+    let refused = [
+        // A plain bind, the source a comma under another head.
+        (
+            doc,
+            r"del((if true then (., 1) else . end) as $x | try $x.a)",
+        ),
+        (doc, r"del(((., 1) | .) as $x | try $x.a)"),
+        (doc, r"del((try (., 1) catch 2) as $x | try $x.a)"),
+        (doc, r"del(((., 1) // 2) as $x | try $x.a)"),
+        (doc, r"del(((., 1)?) as $x | try $x.a)"),
+        (doc, r"(((., 1) | .) as $x | try $x.a) = 9"),
+        // A destructuring bind, the source a pass-through of a frozen `$orig`.
+        (
+            doc,
+            r#"del(. as $orig | has("k") | try (($orig | .) as {a:{b:$q}} | $q))"#,
+        ),
+        (
+            doc,
+            r#"del(. as $orig | has("k") | try (first($orig) as {a:{b:$q}} | $q))"#,
+        ),
+        (
+            doc,
+            r#"del(. as $orig | has("k") | try (($orig?) as {a:{b:$q}} | $q))"#,
+        ),
+        (
+            doc,
+            r#"del(. as $orig | has("k") | try ((label $l | $orig) as {a:{b:$q}} | $q))"#,
+        ),
+        (
+            doc,
+            r#"del(. as $orig | has("k") | try (($orig as $p | $p) as {a:{b:$q}} | $q))"#,
+        ),
+        // The source's output equal to the register by value, off the register:
+        // the stage the bind is read in is untracked and carries it.
+        (doc, r"del(((., 1) | .) as $x | 5 | try $x.a)"),
+    ];
+    for (input, filter) in refused {
+        for (label, args, stdin) in [
+            (
+                "stdin",
+                vec!["-c".to_string(), filter.to_string()],
+                Some(input),
+            ),
+            (
+                "-n",
+                vec!["-nc".to_string(), format!("{input} | {filter}")],
+                None,
+            ),
+        ] {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (out, stderr, code) = run_jq_full(&args, stdin)?;
+            assert_eq!(code, 5, "{label} {filter}: out {out:?}");
+            assert_eq!(
+                out, "",
+                "{label} {filter}: no write may be dropped silently"
+            );
+            assert!(
+                stderr.contains("Invalid path expression near attempt to access element"),
+                "{label} {filter}: {stderr:?}"
+            );
+        }
+    }
+    // The same refusal where the bind is read below an untracked stage and `?`
+    // would otherwise prune it: jq answers `[["b"]]`.
+    let (out, stderr, code) = run_jq_full(
+        &["-c", r#"[path(((., 1)?) as $v0 | "z" | try ($v0 | .b?))]"#],
+        Some(wide),
+    )?;
+    assert_eq!(code, 5, "{out:?}");
+    assert!(
+        stderr.contains("Invalid path expression near attempt to access element"),
+        "{stderr:?}"
+    );
+
+    // Not ambiguous, so nothing moves. A fresh value (a construction) is never the
+    // register, so its refusal is jq's own and a `try` still catches it; the
+    // certified binds (`.`, `first(.)`, a top-level comma split per leaf) still
+    // write, as jq does.
+    for (input, filter, expected) in [
+        (
+            doc,
+            r"del(({a:{b:1}}) as $x | try $x.a)",
+            "{\"a\":{\"b\":1}}\n",
+        ),
+        (
+            doc,
+            r"del((if true then {a:{b:1}} else {a:{b:1}} end) as $x | try $x.a)",
+            "{\"a\":{\"b\":1}}\n",
+        ),
+        (
+            doc,
+            r#"del(. as $orig | has("k") | try (({a:{b:1}}) as {a:{b:$q}} | $q))"#,
+            "{\"a\":{\"b\":1}}\n",
+        ),
+        (doc, r"del(. as $x | try $x.a)", "{}\n"),
+        (doc, r"del(first(.) as $x | try $x.a)", "{}\n"),
+        (doc, r"del(select(true) as $x | try $x.a)", "{}\n"),
+        (doc, r"del(. as $o | (., 1) as $x | try $x.a)", "{}\n"),
+    ] {
+        for (label, args, stdin) in [
+            (
+                "stdin",
+                vec!["-c".to_string(), filter.to_string()],
+                Some(input),
+            ),
+            (
+                "-n",
+                vec!["-nc".to_string(), format!("{input} | {filter}")],
+                None,
+            ),
+        ] {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (out, stderr, code) = run_jq_full(&args, stdin)?;
+            assert_eq!(code, 0, "{label} {filter}: {stderr:?}");
+            assert_eq!(out, expected, "{label} {filter}");
+        }
+    }
+    Ok(())
+}
+
 /// #3334: a frozen `$orig` reached through a comma, `if` or `//` head pays
 /// the loud refusal the bare `$orig` head already pays (#3267), instead of
 /// a refusal `try` caught -- which silently discarded the write jq makes on

@@ -51500,6 +51500,25 @@ fn yq_last_f_output_does_not_keep_its_identity_3766() -> Result<()> {
     Ok(())
 }
 
+/// #3423 makes a bind source that may be the register's own node refuse as a
+/// guess in jq mode only (ADR-0018: real yq has no destructuring, and no oracle
+/// for the rest). With the jq-only surface enabled, yq mode keeps the refusal a
+/// `try` catches, so the document is left as it was, exactly as before.
+#[test]
+fn yq_ambiguous_bind_source_keeps_the_caught_refusal_3423() -> Result<()> {
+    let yaml = "a:\n  b: 1\n";
+    for filter in [
+        "del((if true then (., 1) else . end) as $x | try $x.a)",
+        "del(((., 1) | .) as $x | try $x.a)",
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, yaml, &["-o=json", "-I=0", "--jq-extensions"])?;
+        assert_eq!(code, 0, "`{filter}` stderr {stderr:?}");
+        assert_eq!(stdout.trim(), r#"{"a":{"b":1}}"#, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #3653 keeps jq's path register through `last(f)`'s wrappers (`?`, `try`,
 /// `first(...)`) and across a type-filter stage in jq mode only (ADR-0018). Real
 /// yq's lexer rejects `last(f)` and the type filters outright (v4.53.3), so there
