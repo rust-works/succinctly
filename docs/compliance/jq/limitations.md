@@ -3039,20 +3039,20 @@ answers `["b"]` — and classified the two residuals appended below):
   `resolve_reduce` therefore resolves such an UPDATE with the accumulator's at-register flag
   recomputed from the element (`foreach_step_register`'s verdict, jq mode, bare `$var` only).
   Only an UPDATE that provably navigates the accumulator on a path that always runs
-  (`update_definitely_navigates`: a bare navigation, a `,`/`|` with one, a collect `[E]`,
-  the left of a `//`, `first(E)` and `last(E)` over one ([#3797](https://github.com/rust-works/succinctly/issues/3797):
-  `[.k] | $x`, `(.k // .) | $x` and `first(.k) | $x` used to come back as the root and
-  `del` deleted the document), an `if` whose literal condition picks one, or whose computed
-  condition has one in either branch) is affected. Everything else -- `.`, a literal,
-  `$var`, the right of a `//`, `limit(n; E)`, `nth`, a `label`, a user `def` call (those last
-  four are the open hole [#3811](https://github.com/rust-works/succinctly/issues/3811) when
-  their body navigates and ends on the root), and every wrapper that merely contains a
-  navigation it may not run (`first(.)`, `. // .k`, a `try`) -- keeps the persistent register, so those forms
+  (`update_definitely_navigates`: a bare navigation, a `,`/`|` with one, an `if` whose
+  literal condition picks one, or whose computed condition has one in either branch, an
+  array collect, `first(f)`/`last(f)`, the left of `//`, a label body, a nonzero literal
+  `limit(n; f)`, a nonnegative literal `nth(n; f)`, or a bound user-definition body) is
+  affected ([#3811](https://github.com/rust-works/succinctly/issues/3811)). Passthrough bodies
+  (`first(.)`, `limit(1; .)`, `nth(0; .)`, `def f: .; f`), subexpressions, `. // .k`,
+  zero limits, dynamic counts and a `try` keep the persistent register, so those forms
   keep their answers (and, for a `try` around the navigation, #2732's wording: `path(reduce .[]
   as $k (.; try .a catch "x"))` on `{"a":1}` is jq's `with result "x"` and this `with result 1`,
-  both exit 5). Two consequences, both recorded rather than fixed: a navigating wrapper
-  whose navigation does run through a shape the walk does not read (`limit(1; .k, .)`, a
-  `reduce`/`foreach` or a user `def` around it) keeps the old verdict, and an `if` over a computed condition refuses when only its *untaken* branch
+  both exit 5). Dynamic counts remain outside this static walk even when their stream
+  navigates, as do nested `reduce`/`foreach` shapes this walk does not inspect.
+  `first` and one-output literal stream counts read only the first output, preserving
+  `first(., .k)` and `limit(1; ., .k)` where the navigation never executes.
+  An `if` over a computed condition refuses when only its *untaken* branch
   navigates, where jq answers `[]`. The persistent register is what the *final* re-entry check
   needs
   (`path(reduce (.[]) as $k (.; .))` on `{"a":[1,2]}` is `[]` in both, jq's own

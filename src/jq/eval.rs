@@ -46206,20 +46206,13 @@ fn foreach_step_register<S: EvalSemantics>(
     }
 }
 
-/// Whether a `reduce` UPDATE navigates the accumulator itself on a path that always
-/// runs (#3780): a bare navigation (`.k`, `.[]?`, `.[0]`), a `,` with such an output,
-/// a `|` whose first stage is one, parentheses, or an `if` whose literal condition
-/// picks a branch that is (a computed condition counts when either branch does).
-/// A collect, `first(f)`, the left of a `//` and `last(f)` read their body too (#3797,
-/// #3786). Everything else answers `false` -- the right of a `//`, `limit(n; f)`,
-/// `nth`, a `label`, a `def` call, a `try` -- so those keep the persistent register
-/// and their existing verdict, which matches jq for the passthrough forms (`first(.)`,
-/// `limit(1; .)`, `. // .k`, `((.k)?, .)` are all `[]` in jq). A shallow, conservative
-/// rule on purpose: a miss keeps the old behaviour -- which is the open hole for a
-/// bare navigating `limit`/`nth`/`label`/`def` UPDATE (`limit(2; .k, .)`, #3811) -- and
-/// the one deliberate over-approximation is `last(f)`, which reads an `f` that merely
-/// *may* navigate so that it does not extend that hole (it then refuses a passthrough
-/// `f` outside [`cannot_move_register`]'s allowlist, `last(first(.))`, as `main` did).
+/// Whether a `reduce` UPDATE executes path-checked accumulator navigation.
+/// Read through wrappers that execute their body, but not subexpressions (object
+/// entries, counts, `as` sources), caught navigation, or an alternative's right
+/// operand, which may never run. Passthrough bodies keep the persistent register.
+/// Literal nonzero `limit` counts and nonnegative `nth` indices execute the
+/// stream at least once. Definition probes bind arguments without marking the
+/// call as evaluated; their existing frame/stack guard bounds recursive walks.
 fn update_definitely_navigates(expr: &Expr) -> bool {
     update_navigates_within(expr, false)
 }
@@ -46230,6 +46223,54 @@ fn update_definitely_navigates(expr: &Expr) -> bool {
 fn update_navigates_within(expr: &Expr, first_only: bool) -> bool {
     match expr {
         Expr::Paren(inner) => update_navigates_within(inner, first_only),
+        Expr::Shared(inner) => {
+            !native_stack_exhausted() && update_navigates_within(inner, first_only)
+        }
+        Expr::Label { body, .. } | Expr::As { body, .. } => {
+            update_navigates_within(body, first_only)
+        }
+        Expr::Limit {
+            n: count,
+            expr: inner,
+        }
+        | Expr::NthExpr {
+            n: count,
+            expr: inner,
+        }
+        | Expr::Builtin(Builtin::Limit(count, inner) | Builtin::NthStream(count, inner)) => {
+            let n = match unwrap_paren(count) {
+                Expr::Literal(lit) => literal_to_owned(lit).as_f64(),
+                Expr::Negate(inner) => match unwrap_paren(inner) {
+                    Expr::Literal(lit) => literal_to_owned(lit).as_f64().map(|n| -n),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(n) = n else {
+                return false;
+            };
+            if matches!(expr, Expr::Limit { .. } | Expr::Builtin(Builtin::Limit(..))) {
+                // Negative limits are unlimited; positive fractions take ceil(n).
+                n != 0.0 && update_navigates_within(inner, first_only || (n > 0.0 && n <= 1.0))
+            } else {
+                // Even an outer first must consume through nth's selected index.
+                n >= 0.0 && update_navigates_within(inner, n == 0.0)
+            }
+        }
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } => update_navigates_within(&bind_def(name, params, body, then, bound), first_only),
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => probe_def_call(def, args, *frames, bound)
+            .is_ok_and(|body| update_navigates_within(&body, first_only)),
         Expr::Pipe(stages) => stages
             .first()
             .is_some_and(|stage| update_navigates_within(stage, first_only)),
@@ -46254,20 +46295,22 @@ fn update_navigates_within(expr: &Expr, first_only: bool) -> bool {
         // body whatever it yields, and jq path-checks what it navigates, so
         // `[.k] | $x`, `(.k // .) | $x` and `first(.k) | $x` raise as `.k | $x` does.
         // The right of a `//` runs only when the left yields nothing truthy, and
-        // `limit(n; f)` may not run `f` at all (`n` of 0), so neither is read. A
+        // a zero `limit` may not run `f` at all, so neither is read. A
         // collect and `last(f)` drain their body, so they read every output of it;
         // `first(f)` reads only the first.
         Expr::Array(inner) => update_navigates_within(inner, false),
-        Expr::FirstExpr(inner) => update_navigates_within(inner, true),
+        Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
+            update_navigates_within(inner, true)
+        }
         Expr::Alternative(inner, _) => update_navigates_within(inner, first_only),
         // `last(f)` hands its *last* output back, which for `last(limit(2; .k, .))`
-        // is the root: an `f` this function cannot read (`limit`, `nth`, a `label`, a
-        // user `def`) may still navigate before it gets there, and the root it then
+        // is the root: an `f` this function cannot read (such as a dynamic-count
+        // stream) may still navigate before it gets there, and the root it then
         // yields is not the register the source moved off. So an `f` that may move
         // the register at all counts, which is what `last(f)` did before #3786 lifted
         // its restriction; a refusal where jq answers is the safe direction, a root
         // accepted against a moved register deletes the document.
-        Expr::LastExpr(inner) => {
+        Expr::LastExpr(inner) | Expr::Builtin(Builtin::LastStream(inner)) => {
             update_navigates_within(inner, false) || !cannot_move_register(inner)
         }
         Expr::Optional(inner) if is_postfix_optional_primitive(inner) => {

@@ -135,6 +135,16 @@ OPERANDS = [
     "first(.a)",
     "last([.a])",
     "last((.a // .))",
+    # #3811: navigation inside executed stream/label/definition bodies, reached
+    # by the reduce-source context as well as the other path/write contexts.
+    "limit(2; .a, .)",
+    "nth(1; .a, .)",
+    "label $l | .a, .",
+    "def f: .a, .; f",
+    "def f(g): g; f(.a, .)",
+    "[limit(1; .a)]",
+    "first(label $l | .a)",
+    "(limit(1; .a) // .)",
     # ... and the wrappers around `.` that must NOT be refused for it: jq answers
     # `[]` for each (review of #3780: a "contains a navigation" test refused them)
     "first(.)",
