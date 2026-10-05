@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write as jq does, and a literal or construction is a transparent leaf of the #3402 witness grammar (`select(false) // {"a":1}`). Jq mode
   only. Residual, unchanged from before and tracked in #3795: a source whose output is a descendant node the register later
   moves onto (`((.a // .) as $x | .a | try $x.b) = 9`), a `?//` bare `$x` alternative, a call or fold that forwards its input, a `reduce`/`foreach`
-  element bind, and a register already recorded lost when the bind is made. The first version of this change refused every value-equal
+  element bind, a `catch` handler whose body raises the register (`try error(.) catch .`), and a register already recorded lost when the bind is made. The first version of this change refused every value-equal
   copy no grammar proved fresh; review found that it fabricated a write through storage identity for a no-op `del(.[5])`
   (`(del(.[5]) as $x | try $x[0]) = 9` on `["a"]`), poisoned later re-establishment, and refused read-only `walk(.)` and `with_entries(.)`
   copies, so it was reworked onto the alias grammar. The bind-origin fuzz gained an `--ambiguous-source-p` family; against a build of
