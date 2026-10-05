@@ -20,9 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   register it carries. A fresh value stays exact and catchable, `. as $x`, `first(.)`, `select(...)` and a top-level comma split per leaf
   still write as jq does, a source that differs from the register by value cannot be it, and a literal or construction is now a
   transparent leaf (`select(false) // {"a":1}`). The price, in the safe direction: a fresh copy equal to the register that no grammar proves
-  fresh (`(. | tojson | fromjson) as $x | try $x.a`) refuses where jq catches its own refusal. Jq mode only. A 3,000-program fuzz of the new
-  `--ambiguous-source-p` family went from 5 fabricated and 11 mismatching rows to none, with 13 new refusals (11 of them rows that were
-  silently wrong). Pinned by `test_bind_source_that_may_be_the_register_refuses_loudly_3423` and `yq_ambiguous_bind_source_keeps_the_caught_refusal_3423`.
+  fresh (`(. | tojson | fromjson) as $x | try $x.a`) refuses where jq catches its own refusal. Jq mode only. The bind-origin fuzz gained an
+  `--ambiguous-source-p` family: on seed 7 (3,000 programs) `main` fabricated 5 rows and mismatched 11, the change none; across 16
+  runs of 3,000 programs over every family, and a 60,000-row seeded register sweep, nothing new fabricates or mismatches and the sweep is
+  unchanged, and of the 30 refusals the three source families add 23 are rows `main` answered wrongly (a silent drop or a lost path).
+  Pinned by `test_bind_source_that_may_be_the_register_refuses_loudly_3423` and `yq_ambiguous_bind_source_keeps_the_caught_refusal_3423`.
 
 - **jq: `last(f)` keeps the identity of `f`'s last output, so a result that is jq's path register stays one** (#3766, a #3643 follow-up).
   jq defines `last(f)` as `reduce f as $x (null; $x)`, so the result is the very value `f` last emitted, and `path()` accepts a result
