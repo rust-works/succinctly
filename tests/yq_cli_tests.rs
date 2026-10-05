@@ -45211,6 +45211,90 @@ fn test_wildcard_bridge_over_alias_fanout_completes_2173() -> Result<()> {
     Ok(())
 }
 
+/// #3719: `recurse(.[]?)` is jq's own definition of bare `recurse`, so it
+/// takes the cursor walk `..` takes instead of materializing the
+/// alias-expanded document first.
+///
+/// Same method as `test_wildcard_bridge_over_alias_fanout_completes_2173`:
+/// no bound is asserted, only that a consumer needing a few nodes finishes
+/// with the right answer. The document expands to 2^26 leaves, so a
+/// regression to the materializing route exhausts memory instead of
+/// answering. Each spelling is also pinned equal to `..` on the same node.
+#[test]
+fn test_recurse_structural_descent_over_alias_fanout_completes_3719() -> Result<()> {
+    let mut doc = String::from("a0: &a0 [x, x]\n");
+    for i in 1..=26 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+    doc.push_str("root: *a26\n");
+
+    for (filter, want) in [
+        (".root | first(recurse(.[]?)) | length", "2"),
+        (".root | first(recurse) | length", "2"),
+        (".root | first(..) | length", "2"),
+        (".root | [limit(3; recurse(.[]?))] | length", "3"),
+        (".root | [limit(3; recurse(.[]?)) | length] | .[2]", "2"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &["--jq-extensions"])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
+/// #3719: the rerouted `recurse(.[]?)` answers what `..` answers, node for
+/// node, on a document with anchors, aliases, merge keys, tags and duplicate
+/// keys -- including what a later stage reads off each node's position.
+#[test]
+fn test_recurse_structural_descent_matches_recursive_descent_3719() -> Result<()> {
+    let doc = "base: &b {x: 1, y: [1, 2]}\nd: {<<: *b, z: !!str 5}\ne: [*b, \"s\", null, 3.5, {k: v}]\ndup: {a: 1, a: 2}\n";
+    for tail in [
+        "",
+        "| [., key, path, parent] | tojson",
+        "| key",
+        "| path",
+        "| tag",
+        "| select(type == \"!!map\") | keys",
+    ] {
+        let dots = format!("[..{tail}]");
+        let (want, e1, c1) =
+            run_yq_stdin_with_stderr(&dots, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
+        assert_eq!(c1, 0, "`{tail}` -- stderr: {e1:?}");
+        assert!(!want.trim().is_empty(), "`{tail}` produced nothing");
+        for walk in [
+            "recurse",
+            "recurse(.[]?)",
+            "recurse((.[]?))",
+            "limit(100; recurse(.[]?))",
+        ] {
+            let spelled = format!("[{walk}{tail}]");
+            let (got, stderr, code) =
+                run_yq_stdin_with_stderr(&spelled, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
+            assert_eq!(code, 0, "`{spelled}` -- stderr: {stderr:?}");
+            assert_eq!(got, want, "`{spelled}`");
+        }
+    }
+    Ok(())
+}
+
+/// #3719: a computed or absent node has no live cursor, but structural
+/// recurse must still carry the same value positions as recursive descent.
+#[test]
+fn test_recurse_structural_descent_keeps_owned_and_absent_positions_3719() -> Result<()> {
+    for prefix in ["{a: [1, {b: 2}]} | ", ".missing | ", ".a | tostring | "] {
+        let tail = " | [key, path, parent] | tojson";
+        let dots = format!("{prefix}[..{tail}]");
+        let spelled = format!("{prefix}[recurse(.[]?){tail}]");
+        let args = ["--jq-extensions", "-o=json", "-I=0"];
+        let (want, e1, c1) = run_yq_stdin_with_stderr(&dots, "a: 5\n", &args)?;
+        let (got, e2, c2) = run_yq_stdin_with_stderr(&spelled, "a: 5\n", &args)?;
+        assert_eq!((c1, c2), (0, 0), "`{prefix}` -- stderr: {e1:?} {e2:?}");
+        assert_eq!(got, want, "`{prefix}`");
+    }
+    Ok(())
+}
+
 /// #2476's one behaviour change: #1804's accepted trade-off, now shared by
 /// `and`/`or`.
 ///

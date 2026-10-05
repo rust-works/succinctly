@@ -777,8 +777,9 @@ luck.
 `.[]?` is the exception, and is lifted since #3703: jq defines `def recurse: recurse(.[]?);`
 (`jq --debug-dump-disasm` shows the lambda as `EACH_OPT`), so `recurse(.[]?)`, bare `recurse` and `..`
 are one walk, bounded by the document. The value walker hands exactly that `f` (parentheses allowed,
-no `cond`) to a direct walk of the owned tree, so no cap applies; the path walker takes its cap from
-the caller's own `f` and lifts it for the same shape.
+no `cond`) to a cursor walk when a document node is available (#3719), otherwise to a direct walk
+of the owned tree, so no cap applies; the path walker takes its cap from the caller's own `f` and
+lifts it for the same shape.
 
 What still differs from jq, on a 12,001-node document (6,000 one-element arrays), captured from jq 1.7.1:
 
@@ -802,11 +803,12 @@ budget applies to a walk's output. Measured with `memcap.py --report` on a 458-b
 nine-way alias ladder expands to 5.4 million nodes at six levels: `[path(recurse(.[]?))] | length`
 peaks at 1.95 GB, the same as `[path(..)]`'s 1.95 GB, where it peaked at 0.41 GB capped at 10,000;
 `del(recurse(.[]?) | select(type == "string"))` peaks at 3.70 GB with or without the cap, because
-the expanded document dominates; `[recurse(.[]?)] | length` 1.04 GB against `[..]`'s 0.46 GB. The
-explicit spelling also materializes the whole expanded document before it walks, so
-`first(recurse(.[]?))` costs 0.40 GB there and exhausts a 3 GB cap on a nine-level document where
-`first(..)` and `first(recurse)` answer from nothing
-([#3719](https://github.com/rust-works/succinctly/issues/3719)).
+the expanded document dominates. Since [#3719](https://github.com/rust-works/succinctly/issues/3719),
+the value route for `recurse(.[]?)` walks document cursors like `..` and bare `recurse`, including
+when collecting results or reading each node's `key`, `path`, or `parent`. A consumer such as
+`first(recurse(.[]?))` no longer materializes the entire alias-expanded document before receiving
+its first node. Collecting the entire walk still pays for every delivered node; the path resolver
+and its memory costs are unchanged.
 
 ## A builtin's argument and a `?//` retry (#3487)
 
