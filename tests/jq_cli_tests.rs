@@ -93890,6 +93890,63 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
             r#"del(. as $orig | has("k") | try ((.a | {a:{b:1}}) as {a:{b:$q}} | $q))"#,
             "{\"a\":{\"b\":1}}\n",
         ),
+        // A value the source derives or builds is never the register, whatever it
+        // equals: no mark, so the refusal stays jq's own and a `try` catches it (the
+        // first versions' alias test was "not provably fresh", which refused all of
+        // these, and the no-op deletes hand back the input's own storage where jq
+        // builds a fresh array, which storage identity then certified: the write
+        // below went through).
+        (
+            r#"["a"]"#,
+            r"(del(.[5]) as $x | try $x[0]) = 9",
+            "[\"a\"]\n",
+        ),
+        (
+            r#"["a"]"#,
+            r"del(del(.[-9]) as $x | try $x[0])",
+            "[\"a\"]\n",
+        ),
+        ("[]", r"(del(.[0]?) as $x | try ($x|.[0])) |= 9", "[]\n"),
+        (
+            doc,
+            r"del((. | tojson | fromjson) as $x | try $x.a)",
+            "{\"a\":{\"b\":1}}\n",
+        ),
+        (doc, r"del(walk(.) as $x | try $x.a)", "{\"a\":{\"b\":1}}\n"),
+        (
+            doc,
+            r"del(del(.zz) as $x | try $x.a)",
+            "{\"a\":{\"b\":1}}\n",
+        ),
+        (
+            doc,
+            r"del(with_entries(.) as $x | try $x.a)",
+            "{\"a\":{\"b\":1}}\n",
+        ),
+        (
+            doc,
+            r"[path(with_entries(.) as $x | try (5 | $x.a))] | length | tostring",
+            "\"0\"\n",
+        ),
+        // Referencing a marked `$x` must not poison what follows: a root snapshot
+        // still re-establishes the register by value.
+        (
+            doc,
+            r"del(. as $y | first(., 1) as $x | $x | $y | .a)",
+            "{}\n",
+        ),
+        (
+            doc,
+            r"del(. as $y | ((., 1) | .) as $x | $x | $y | .a)",
+            "{}\n",
+        ),
+        // A source that is `.` over a computed value is the identity grammar's, not
+        // this one's: its refusal is exact, in a destructuring bind as in a plain one.
+        (
+            doc,
+            r#"del({"a":{"b":1}} | try (. as {a:$q} | $q.zz))"#,
+            "{\"a\":{\"b\":1}}\n",
+        ),
         (doc, r"del(. as $x | try $x.a)", "{}\n"),
         // A later step's refusal is jq's own, so it stays catchable: the source IS the
         // register here, the first step passes, and `{a:$q, b:$r}` refuses at `b`.
