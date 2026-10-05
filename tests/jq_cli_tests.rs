@@ -100676,3 +100676,67 @@ fn test_register_limit_nth_wrappers_and_type_filter_collect_3767() -> Result<()>
         ),
     ])
 }
+
+/// #3773: `recurse(.[]?)` is jq's own definition of bare `recurse`, so a stage
+/// after it reads the same position (`key`, `parent`, `path`) off each node
+/// that it reads after `..` and `recurse`. Inside a collect, and in every
+/// pipe shape that walks positions, the spelled-out form used to lose the
+/// position and answer `[]`/`null` for every node.
+#[test]
+fn test_recurse_structural_descent_reads_position_like_recursive_descent_3773() -> Result<()> {
+    let input = r#"{"a":[1,{"b":2}],"c":null,"d":"s","e":{"f":[]}}"#;
+    // The issue's own repro, pinned to literal output so a regression that
+    // broke `..` and `recurse(.[]?)` alike could not pass by agreeing.
+    let (out, code) = run_jq_stdin("[recurse(.[]?) | key?]", input, &["-c"])?;
+    assert_eq!(
+        (out.as_str(), code),
+        ("[\"a\",0,1,\"b\",\"c\",\"d\",\"e\",\"f\"]\n", 0)
+    );
+    let (out, code) = run_jq_stdin("[recurse(.[]?) | [key?, parent?]] | length", input, &["-c"])?;
+    assert_eq!((out.as_str(), code), ("9\n", 0));
+
+    let tails = [
+        "key?",
+        "parent?",
+        "parent? | length",
+        "[key?, parent?]",
+        "path(.)?",
+        "select(key? == 0)",
+    ];
+    // One context per route that decides how a position survives: the
+    // collect, the sink pipeline, a head the path-context walk steps, a
+    // mid-pipe head, an absent or scalar input, and the owned identity pipe.
+    let contexts = [
+        "[X | T]",
+        "X | T",
+        "first(X | T)",
+        "[limit(4; X | T)]",
+        ".a | [X | T]",
+        ".a | X | T",
+        ".a[]? | X | T",
+        ".zzz | X | T",
+        ".c | X | T",
+        ".d | X | T",
+        ".a | X | select(true) | T",
+        "X | X | T",
+        ".a | X | .[]? | T",
+        "[.a | X | T]",
+        ".a | limit(2; X | T)",
+        "[X | select(true) | T]",
+        "try (X | T) catch \"E\"",
+        "def f: X | T; [f]",
+        "[.[] | [X | T]]",
+    ];
+    for context in contexts {
+        for tail in tails {
+            let spell = |x: &str| context.replace('X', x).replace('T', tail);
+            let (want, c1) = run_jq_stdin(&spell(".."), input, &["-c"])?;
+            let (bare, c2) = run_jq_stdin(&spell("recurse"), input, &["-c"])?;
+            let (got, c3) = run_jq_stdin(&spell("recurse(.[]?)"), input, &["-c"])?;
+            assert_eq!((c1, c2, c3), (0, 0, 0), "`{context}` / `{tail}`");
+            assert_eq!(got, want, "`{context}` / `{tail}` vs `..`");
+            assert_eq!(got, bare, "`{context}` / `{tail}` vs `recurse`");
+        }
+    }
+    Ok(())
+}
