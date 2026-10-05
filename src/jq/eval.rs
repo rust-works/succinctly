@@ -32150,7 +32150,7 @@ fn fresh_run_pos<'a>(pos: Option<&UpdatePos<'a>>, fresh: &[Expr]) -> Option<Upda
 /// Whether `expr` climbs to an ancestor node -- the one path-context read
 /// [`UpdatePos`] needs a materialized snapshot for (#2522). `key` and `path`
 /// are functions of the position alone and cost nothing.
-fn reads_parent(expr: &Expr) -> bool {
+pub(crate) fn reads_parent(expr: &Expr) -> bool {
     any_subexpr(expr, &mut |e| {
         matches!(e, Expr::Builtin(Builtin::Parent | Builtin::ParentN(_)))
     })
