@@ -101328,6 +101328,36 @@ fn test_any_all_condition_retry_preserves_answer_then_control_3810() -> Result<(
     assert_retry_rows_3293(None, &format!("{doc} | "), rows)
 }
 
+/// #3808 needs the complete diagnostic: a stale error beside the retry's
+/// own error, or a halt marker written twice, must fail the comparison.
+fn assert_path_retry_rows_3808(
+    input: Option<&str>,
+    prefix: &str,
+    rows: &[RetryRow3293],
+) -> Result<()> {
+    for &(filter, stdout, trace, message, exit) in rows {
+        let filter = format!("{prefix}{filter}");
+        let flag = if input.is_some() { "-c" } else { "-nc" };
+        let (out, err, code) = run_jq_full(&[flag, &filter], input)?;
+        assert_eq!((out.as_str(), code), (stdout, exit), "`{filter}`: {err:?}");
+        let rest = err
+            .strip_prefix(trace)
+            .unwrap_or_else(|| panic!("`{filter}`: stderr {err:?} lacks trace {trace:?}"));
+        let actual = if exit == 5 {
+            // The location differs for stdin and -n; everything after it
+            // must be exactly the expected error, with no second diagnostic.
+            rest.strip_prefix("jq: error (at ")
+                .and_then(|s| s.split_once("): ").map(|(_, message)| message))
+                .unwrap_or_else(|| panic!("`{filter}`: malformed diagnostic {err:?}"))
+        } else {
+            // halt_error writes its input directly, without a location.
+            rest
+        };
+        assert_eq!(actual.trim_end(), message, "`{filter}`: stderr {err:?}");
+    }
+    Ok(())
+}
+
 // #3808: expectations captured from /usr/bin/jq 1.7.1. Each table runs
 // on the document route and again on an owned value built under -n.
 #[test]
@@ -101446,8 +101476,8 @@ fn test_path_sink_retry_terminal_3808() -> Result<()> {
             3,
         ),
     ];
-    assert_retry_rows_3293(Some("[[0]]"), "", rows)?;
-    assert_retry_rows_3293(None, "[[0]] | ", rows)
+    assert_path_retry_rows_3808(Some("[[0]]"), "", rows)?;
+    assert_path_retry_rows_3808(None, "[[0]] | ", rows)
 }
 #[test]
 fn test_path_sink_retry_index_3808() -> Result<()> {
@@ -101565,8 +101595,8 @@ fn test_path_sink_retry_index_3808() -> Result<()> {
             3,
         ),
     ];
-    assert_retry_rows_3293(Some(r#"[["a"]]"#), "", rows)?;
-    assert_retry_rows_3293(None, r#"[["a"]] | "#, rows)
+    assert_path_retry_rows_3808(Some(r#"[["a"]]"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"[["a"]] | "#, rows)
 }
 #[test]
 fn test_path_sink_retry_key_3808() -> Result<()> {
@@ -101600,8 +101630,8 @@ fn test_path_sink_retry_key_3808() -> Result<()> {
             3,
         ),
     ];
-    assert_retry_rows_3293(Some(r#"{"a":1}"#), "", rows)?;
-    assert_retry_rows_3293(None, r#"{"a":1} | "#, rows)
+    assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)
 }
 #[test]
 fn test_path_sink_retry_door_3808() -> Result<()> {
@@ -101635,8 +101665,8 @@ fn test_path_sink_retry_door_3808() -> Result<()> {
             3,
         ),
     ];
-    assert_retry_rows_3293(Some(r#"{"a":[[1]],"b":2}"#), "", rows)?;
-    assert_retry_rows_3293(None, r#"{"a":[[1]],"b":2} | "#, rows)
+    assert_path_retry_rows_3808(Some(r#"{"a":[[1]],"b":2}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":[[1]],"b":2} | "#, rows)
 }
 #[test]
 fn test_path_sink_retry_write_3808() -> Result<()> {
@@ -101756,8 +101786,8 @@ fn test_path_sink_retry_write_3808() -> Result<()> {
             3,
         ),
     ];
-    assert_retry_rows_3293(Some("[1]"), "", rows)?;
-    assert_retry_rows_3293(None, "[1] | ", rows)
+    assert_path_retry_rows_3808(Some("[1]"), "", rows)?;
+    assert_path_retry_rows_3808(None, "[1] | ", rows)
 }
 
 #[test]
@@ -101770,11 +101800,11 @@ fn test_path_sink_retry_controls_3808() -> Result<()> {
         "Invalid path expression with result 1",
         5,
     )];
-    assert_retry_rows_3293(Some("[[0]]"), "", rows)?;
-    assert_retry_rows_3293(None, "[[0]] | ", rows)?;
+    assert_path_retry_rows_3808(Some("[[0]]"), "", rows)?;
+    assert_path_retry_rows_3808(None, "[[0]] | ", rows)?;
     let rows: &[RetryRow3293] = &[(r#"path(INDEX(.[]; error("E1")) | empty)"#, "", "", "E1", 5)];
-    assert_retry_rows_3293(Some(r#"[["a"]]"#), "", rows)?;
-    assert_retry_rows_3293(None, r#"[["a"]] | "#, rows)?;
+    assert_path_retry_rows_3808(Some(r#"[["a"]]"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"[["a"]] | "#, rows)?;
     let rows: &[RetryRow3293] = &[(
         r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | $q)): $v} | ("H"|halt_error(3))"#,
         "",
@@ -101782,8 +101812,8 @@ fn test_path_sink_retry_controls_3808() -> Result<()> {
         "H",
         3,
     )];
-    assert_retry_rows_3293(Some(r#"{"a":1}"#), "", rows)?;
-    assert_retry_rows_3293(None, r#"{"a":1} | "#, rows)?;
+    assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)?;
     let rows: &[RetryRow3293] = &[(
         r#"path(1 as $a ?// $b | ("A"|stderr) as $_ | .a) | ("H"|halt_error(3))"#,
         "",
@@ -101791,8 +101821,8 @@ fn test_path_sink_retry_controls_3808() -> Result<()> {
         "H",
         3,
     )];
-    assert_retry_rows_3293(Some(r#"{"a":1}"#), "", rows)?;
-    assert_retry_rows_3293(None, r#"{"a":1} | "#, rows)?;
+    assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)?;
     let rows: &[RetryRow3293] = &[(
         r#"path(INDEX((. as [$q] ?// [[$q]] | ("A"|stderr) | $q); "H"|halt_error(3)) | empty)"#,
         "",
@@ -101800,11 +101830,11 @@ fn test_path_sink_retry_controls_3808() -> Result<()> {
         "H",
         3,
     )];
-    assert_retry_rows_3293(Some(r#"[["a"]]"#), "", rows)?;
-    assert_retry_rows_3293(None, r#"[["a"]] | "#, rows)?;
+    assert_path_retry_rows_3808(Some(r#"[["a"]]"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"[["a"]] | "#, rows)?;
     let rows: &[RetryRow3293] = &[(".[-5] = 1", "", "", "Out of bounds negative array index", 5)];
-    assert_retry_rows_3293(Some("[1]"), "", rows)?;
-    assert_retry_rows_3293(None, "[1] | ", rows)?;
+    assert_path_retry_rows_3808(Some("[1]"), "", rows)?;
+    assert_path_retry_rows_3808(None, "[1] | ", rows)?;
     let rows: &[RetryRow3293] = &[(
         r#"[first(path(1 as $a ?// $b | ("A"|stderr) as $_ | if $a then .a else error("E2") end))]"#,
         "",
@@ -101812,8 +101842,8 @@ fn test_path_sink_retry_controls_3808() -> Result<()> {
         "E2",
         5,
     )];
-    assert_retry_rows_3293(Some(r#"{"a":1}"#), "", rows)?;
-    assert_retry_rows_3293(None, r#"{"a":1} | "#, rows)?;
+    assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)?;
     let rows: &[RetryRow3293] = &[(
         r#"label $done | path(1 as $a ?// $b | ("A"|stderr) as $_ | if $a then .a else empty end) | break $done"#,
         "",
@@ -101821,7 +101851,7 @@ fn test_path_sink_retry_controls_3808() -> Result<()> {
         "",
         0,
     )];
-    assert_retry_rows_3293(Some(r#"{"a":1}"#), "", rows)?;
-    assert_retry_rows_3293(None, r#"{"a":1} | "#, rows)?;
+    assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
+    assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)?;
     Ok(())
 }
