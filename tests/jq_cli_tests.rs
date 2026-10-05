@@ -64579,9 +64579,10 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
             5,
         ),
         // Still refused where jq answers `[]`: a `catch` handler runs on a
-        // caught error's payload, and `limit`/`nth` around a `last` are wrappers
-        // of their own. Pinned as today's (refuse-only) behaviour so lifting
-        // either is a deliberate change with rows of its own.
+        // caught error's payload, a register of its own. Pinned as today's
+        // (refuse-only) behaviour so lifting it is a deliberate change with rows
+        // of its own. (`limit`/`nth` of a `last`, and of a `select`, and an `[E]`
+        // collect of a type filter, were pinned here too until #3767.)
         (
             doc,
             r"path(. as $x | try last(.a) catch . | $x)",
@@ -64591,36 +64592,29 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
         ),
         (
             doc,
-            r"path(. as $x | limit(1; last(.a)) | $x)",
-            "",
-            with_root,
-            5,
-        ),
-        (
-            doc,
-            r"path(. as $x | nth(0; last(.a)) | $x)",
-            "",
-            with_root,
-            5,
-        ),
-        // The same holds for `select`: a handler, a `limit` and an `[E]` collect
-        // of a type filter (the array allowlist names `select` but not the nine
-        // type filters) are still refused where jq answers `[]`.
-        (
-            doc,
             r"path(. as $x | 5 | try select(.) catch . | $x)",
             "",
             with_root,
             5,
         ),
+        // Lifted by #3767: `limit`/`nth` emit from inside `E`, so they are read
+        // through like `first`, and the `[E]` allowlist names the type filters.
+        (
+            doc,
+            r"path(. as $x | limit(1; last(.a)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(. as $x | nth(0; last(.a)) | $x)", "[]\n", "", 0),
         (
             doc,
             r"path(. as $x | 5 | limit(1; select(.)) | $x)",
+            "[]\n",
             "",
-            with_root,
-            5,
+            0,
         ),
-        (doc, r"path(. as $x | 5 | [numbers] | $x)", "", with_root, 5),
+        (doc, r"path(. as $x | 5 | [numbers] | $x)", "[]\n", "", 0),
     ])
 }
 
@@ -64634,6 +64628,11 @@ fn test_path_register_last_f_wrappers_and_select_keep_it_3653() -> Result<()> {
 /// the same pipe does outside a fold. The refusal is this resolver's guess, not
 /// jq's verdict (jq answers), so no `try` turns it into a dropped write. A fold
 /// that never navigated still answers `[]`, as jq does.
+///
+/// Since #3767 the `limit(1; last(f))` rows answer jq's own value (`["a"]` twice,
+/// `{"a":9}`, `null`): `limit` is read through to the `last`, which leaves the
+/// register where the stage entered, so the same pipe outside a fold answers too.
+/// The `first(null)` and `(.b // null)` rows are still refused where jq answers.
 #[test]
 fn test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769() -> Result<()> {
     let refusal = "jq: error (at <stdin>:1): Invalid path expression with result null\n";
@@ -64641,27 +64640,27 @@ fn test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769()
     for (filter, stdout, stderr, code) in [
         (
             format!("path(foreach (1,2) as $i (.; .; {extract}))"),
+            "[\"a\"]\n[\"a\"]\n",
             "",
-            refusal,
-            5,
+            0,
         ),
         (
             format!("(foreach (1,2) as $i (.; .; {extract})) = 9"),
+            "{\"a\":9}\n",
             "",
-            refusal,
-            5,
+            0,
         ),
         (
             format!("(foreach (1,2) as $i (.; .; {extract})) |= 9"),
+            "{\"a\":9}\n",
             "",
-            refusal,
-            5,
+            0,
         ),
         (
             format!("del(foreach (1,2) as $i (.; .; {extract}))"),
+            "null\n",
             "",
-            refusal,
-            5,
+            0,
         ),
         (
             "path(foreach (1) as $i (.; .; .a | first(null)))".to_string(),
@@ -100131,6 +100130,269 @@ fn test_foreach_bound_empty_array_element_composes_with_the_frame_3789() -> Resu
             r"path(. as $_ | reduce .a as $k (0; $k))",
             "",
             "Invalid path expression with result []",
+            5,
+        ),
+    ])
+}
+
+// ============================================================================
+// #3767 Part 1: `limit`/`nth` around a register-keeping stage, and the type
+// filters in an `[E]` collect
+// ============================================================================
+
+/// `limit(n; E)` and `nth(n; E)` emit `E`'s outputs from inside `E`, like
+/// `first(E)`, so jq's path register is wherever `E` left it and the inner stage
+/// decides: `last(f)`, `select(f)` and the type filters leave it where the stage
+/// entered, `.a` moves it. The count is bound as a subexp, so it moves nothing
+/// whatever it navigates. `limit(0; E)` and `nth(1; E)` over a one-output `E`
+/// emit nothing, which both sides agree on. The type filters are `select`s over a
+/// type test, so an `[E]` collect of one navigates nothing for jq to path-check
+/// (the array allowlist named `select` but not the nine type filters). The answer
+/// rows were refused before #3767; the empty-output and contrast rows agreed
+/// already and pin the behaviour. (A trackable branch navigates natively, so the
+/// contrast rows cannot tell a stage rule that wrongly admits `.a`; the unit test
+/// `type_filters_are_defined_once_and_the_stage_rule_reads_them_3653` refuses it.)
+/// Every row captured from jq 1.7.1 with `-c` on `{"a":{"b":1},"k":2}`, on both
+/// evaluators. A `try ... catch` handler (a register of its own) and a compound
+/// inner stage are still refused where jq answers, tracked by #3767's later parts.
+#[test]
+fn test_register_limit_nth_wrappers_and_type_filter_collect_3767() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"k":2}"#;
+    assert_path_rows_both_routes_3749(&[
+        // `last(f)` under `limit`/`nth`, entered on the register
+        (
+            doc,
+            r"path(. as $x | limit(1; last(.a)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | limit(2; last(.a, .k)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | limit(-1; last(.a)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(. as $x | nth(0; last(.a)) | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | limit(1; first(last(.a))) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | limit(1; try last(.a)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | limit(1; (last(.a))?) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | first(limit(1; last(.a))) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | nth(0; limit(1; last(.a))) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | limit(1; limit(1; last(.a))) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // `select(f)` and the type filters under `limit`/`nth`, entered on an untracked value
+        (
+            doc,
+            r"path(. as $x | 5 | limit(1; select(.)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | limit(2; select(.)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | limit(-1; select(.)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | nth(0; select(.)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | limit(1; numbers) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | nth(0; values) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | limit(1; try select(.)) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | limit(1; select(.)?) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | first(limit(1; select(.))) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | nth(0; limit(1; select(.))) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | 5 | limit(1; select(.a)) | $x)",
+            "",
+            "Cannot index number with string \"a\"",
+            5,
+        ),
+        // the write side lands on the register's node
+        (
+            doc,
+            r"del(. as $x | limit(1; last(.a)) | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | nth(0; last(.a)) | $x.k) = 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | 5 | limit(1; select(.)) | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | 5 | nth(0; numbers) | $x.k) |= 9",
+            "{\"a\":{\"b\":1},\"k\":9}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | 5 | limit(2; select(.)) | $x.a)",
+            "{\"k\":2}\n",
+            "",
+            0,
+        ),
+        // an `[E]` collect of each type filter
+        (doc, r"path(. as $x | 5 | [nulls] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | [booleans] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | [numbers] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | [strings] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | [arrays] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | [objects] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | [iterables] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | [scalars] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | 5 | [values] | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | 5 | [numbers, strings] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(. as $x | [numbers] | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"del(. as $x | 5 | [strings] | $x.k)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        // no output at all, which both sides agree on
+        (doc, r"path(. as $x | limit(0; last(.a)) | $x)", "", "", 0),
+        (doc, r"path(. as $x | nth(1; last(.a)) | $x)", "", "", 0),
+        // a wrapper over a stage that navigates still moves the register, so jq refuses too
+        (
+            doc,
+            r"path(. as $x | limit(1; .a) | $x)",
+            "",
+            "Invalid path expression with result {\"a\":{\"b\":1},\"k\":2}",
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | nth(0; .a) | $x)",
+            "",
+            "Invalid path expression with result {\"a\":{\"b\":1},\"k\":2}",
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | limit(2; first(.a)) | $x)",
+            "",
+            "Invalid path expression with result {\"a\":{\"b\":1},\"k\":2}",
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | nth(0; try .a) | $x)",
+            "",
+            "Invalid path expression with result {\"a\":{\"b\":1},\"k\":2}",
             5,
         ),
     ])

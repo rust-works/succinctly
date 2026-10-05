@@ -295,9 +295,9 @@ OPERANDS = [
     # movement of their own: `?`, `try` with no `catch`, and `first(...)`
     # (which emits from inside `last`, where the register is back where it
     # entered). The contrasts are the wrappers that are not admitted, and so stay
-    # refused where jq answers (`try ... catch`, `limit`/`nth` of a `last`, a
-    # compound stage), and the same wrappers around a `f` that navigates, which
-    # move it and must stay refused.
+    # refused where jq answers (`try ... catch`, a compound stage; `limit`/`nth`
+    # of a `last` were contrasts until #3767 admitted them), and the same
+    # wrappers around a `f` that navigates, which move it and must stay refused.
     "last(.a)?",
     "(last(.a))?",
     "try last(.a)",
@@ -328,6 +328,38 @@ OPERANDS = [
     "(numbers)?",
     "try numbers",
     "first(numbers)",
+    # (#3767) `limit(n; E)` and `nth(n; E)` emit from inside `E`, so the inner stage
+    # decides: `last(f)`, `select(f)` and the type filters leave the register where
+    # it entered, and `.a` moves it. `limit(1; .a)`, `nth(0; .a)` (above), the
+    # handler, the compound inner and the navigation-before-`select` rows are the
+    # contrasts that must stay refused. `[numbers]` is the `[E]` collect of a type
+    # filter, which the array allowlist now names beside `select`.
+    "limit(1; select(.))",
+    "limit(2; select(.))",
+    "limit(-1; select(.))",
+    "limit(0; select(.))",
+    "nth(0; select(.))",
+    "nth(1; select(.))",
+    "limit(1; numbers)",
+    "nth(0; values)",
+    "limit(2; last(.a, .))",
+    "limit(1; select(.a))",
+    "limit(1; first(last(.a)))",
+    "limit(1; try select(.))",
+    "limit(1; select(.)?)",
+    "first(limit(1; last(.a)))",
+    "nth(0; limit(1; select(.)))",
+    "limit(1; limit(1; last(.a)))",
+    "limit(1; try last(.a) catch .)",
+    "limit(1; (last(.a), select(.)))",
+    "limit(1; (.a | select(.)))",
+    "nth(0; (.a | last(.a)))",
+    "limit(1; first(.a))",
+    "[numbers]",
+    "[strings]",
+    "[select(.)]",
+    "[numbers, strings]",
+    "[.[]? | numbers]",
     # (#3653 review) a `last`/`select` whose output *is* the register: `.` and, in
     # the contexts that bind it, `$x`. `select` hands its input through as the
     # very value it received, so the register keeps its identity; `last(f)`'s
