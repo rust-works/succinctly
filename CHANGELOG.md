@@ -885,12 +885,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jq whatever the register is, so its refusal is exact. A refusal that is still only a guess (`reduce . as {a:$a} ?// [$a] (0; .)` over a document that
   has `a`) does not retry and is now uncatchable like every other guess site (ADR-0018 rule 4), so it is loud where it was silently wrong; jq answers
   those, pinned in `test_fold_pattern_guessed_refusal_is_not_caught_3743`. A pattern with a computed key is not judged (running it would repeat its
-  effects) and keeps its old behaviour, recorded in `docs/compliance/jq/limitations.md`. Against a clean `main` build, the path-register sweep (16 new fold-pattern
-  operands, 80,027 sampled rows) went from 990 `ACCEPT_WRONG` rows to none, 987 of them now matching jq, and a 30,027-row full-grid sample from 29
-  to 4. It is not regression-free: 1,014 and 24 rows that matched now refuse, all of them the new fold-pattern operands, where `main` matched only
-  because a wrapper (`try`, `?`) swallowed the walk's guessed refusal or because the guess landed on jq's answer by luck (a `reduce` operand of
-  `and`/`or` states no register, #3646). `scripts/jq-bind-origin-fuzz.py` (6,000 programs stock and 6,000 at `--fold-p 1.0`) showed no fabricated,
-  mismatching or newly refusing rows beyond the baseline's own.
+  effects) and keeps its old behaviour, recorded in `docs/compliance/jq/limitations.md`. Against a clean `main` build, the path-register sweep (21 new fold-pattern
+  operands, 80,027 sampled rows) went from 866 `ACCEPT_WRONG` rows to 86 (all of them the computed-key operand, which keeps its old behaviour), and a
+  30,027-row full-grid sample from 30 to 2. It is not regression-free: 797 and 29 rows that matched now refuse, all of them the new fold-pattern
+  operands, where `main` matched only because a wrapper (`try`, `?`) swallowed the walk's guessed refusal or because the guess landed on jq's answer
+  by luck (a `reduce` operand of `and`/`or` states no register, #3646). `scripts/jq-bind-origin-fuzz.py` (6,000 programs stock and 6,000 at
+  `--fold-p 1.0`) showed no fabricated, mismatching or newly refusing rows beyond the baseline's own.
 - **jq: a pipe stage reads the backtracked-register verdict of `any`/`all`/`isempty(g)`, on a tracked or an untracked entry** (#3758, #3826, the plain-stage residual of #3757).
   `path(. as $x | any | $x)` on `{"a":false,"b":null}` is `[]` in jq: these builtins are defined over a generator jq backtracks, so when nothing inside
   emitted the register is back where the stage entered. The leaf already stated that per result; `resolve_seq_stage` dropped it, so a `$x` frozen
