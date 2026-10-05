@@ -3039,6 +3039,25 @@ answers `["b"]` — and classified the two residuals appended below):
   alternative quotes the document where jq quotes `null` (`path(reduce .a as [$x] ?// $x (.;
   (.k, .)))` on `{"a":[1],"k":2}`). What remains unmodelled is a dual provenance for an UPDATE
   that navigates *and* hands back the accumulator it started from.
+- **A `?//` retry that rests on a guessed first-step refusal refuses a tracked path ([#3781](https://github.com/rust-works/succinctly/issues/3781)).**
+  jq takes a destructuring pattern's first step *on* the register when the bind source passes `.`
+  through (`select(true)`, `select(.a)`, `(.|.)`, `first(.)`, `limit(1; .)`), so a body that
+  navigates under `try` is refused and caught: no paths, and `del`/`=`/`|=` leave the document
+  alone. `resolve_as_pattern` cannot always tell such a head from a copy of the register (the
+  open-ended class of #3423), took the first step's refusal for jq's, retried onto the next
+  alternative and resolved `try .a` as a tracked path, so `del(select(true) as {a:$v0} ?// $v0 |
+  try .a)` on `{"a":{"b":1}}` wrote `{}` where jq prints the document. A retry that rests on that
+  guess now refuses a *tracked* output of a later alternative (uncatchable, exit 5): a write needs
+  a path, and a retry that yields none, or only values, says what jq says. It applies in jq mode
+  only, to a head that is not a bare `.`/marker, not provably fresh (#3489) and whose spine does
+  not navigate, a body holding a `try` or a parenthesised `?` (a postfix `?` on a bare
+  navigation keeps jq's path and answers as before), and a pattern whose steps could match the
+  bound value by type and whose refusal is not provably exact (`bound != register`). The cost,
+  measured over 76,000 jq-differential rows (`scripts/jq-alt-passthrough-sweep.py`): 817 wrong
+  answers become refusals and 77 rows that matched jq become refusals, every one a `del`/`=` over a
+  document where the wrong write changed nothing (`{}`, `{"a":null}`) -- `del(select(true) as
+  {a:$v0} ?// $v0 | try .a)` on `{}` is `{}` in jq and exits 5 here. Closing it exactly means
+  recognising these heads as the register (#3423's class), which this does not do.
 - **A recursion's first output keeps the path register; the later ones move it
   ([#3272](https://github.com/rust-works/succinctly/issues/3272)).** jq defines every spelling
   (`..`, `recurse`, `recurse(f)`, `recurse(f; cond)`) as `def r: ., (f | r); r;`, so the `.` is

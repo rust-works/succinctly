@@ -77811,6 +77811,10 @@ fn test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781() 
         r"[path(select(true) as {a:$v0} ?// $v0 | try .a)]",
         r"[path(first(.) as {a:$v0} ?// $v0 | try .b)]",
         r"[path(select(true) as {a:{b:$v0}} ?// $v0 | try .a)]",
+        r"del(select(.a) as {a:$v0} ?// $v0 | try .a)",
+        r"del(limit(1; .) as {a:$v0} ?// $v0 | try .a)",
+        r"del(last(.) as {a:$v0} ?// $v0 | try .a)",
+        r"del(select(true) as {a:$v0} ?// {b:$v0} ?// $v0 | try .a)",
     ] {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{doc}\n")))?;
         assert_eq!((out.as_str(), code), ("", 5), "{filter}: stderr {err:?}");
@@ -77839,6 +77843,41 @@ fn test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781() 
             r#"[["a"]]"#,
         ),
         ("[1]", r"del(first(.) as {a:$v0} ?// $v0 | try .a)", "[1]"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
+        assert_eq!(
+            (out.trim_end(), code),
+            (expected, 0),
+            "{filter} on {input}: {err:?}"
+        );
+    }
+    // the array register: the same shape through an array pattern
+    for filter in [
+        r"[path(first(.) as [$v0] ?// $v0 | try .[0])]",
+        r"del(first(.) as [$v0] ?// $v0 | try .[0])",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some("[[1]]\n"))?;
+        assert_eq!((out.as_str(), code), ("", 5), "{filter}: stderr {err:?}");
+    }
+    // a refusal that is provably exact (the head is a copy, not the register), a
+    // nested pattern that is a certain type error, and a postfix `?` on a bare
+    // navigation keep jq's answer
+    for (input, filter, expected) in [
+        (
+            doc,
+            r#"del((. + {"z":1}) as {a:$v0} ?// $v0 | try .a)"#,
+            "{}",
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(select(true) as {a:[$x]} ?// $v0 | try .a)",
+            "{}",
+        ),
+        (
+            "[1]",
+            r"[path(select(true) as [$v0] ?// $v0 | .[0]?)]",
+            "[[0]]",
+        ),
     ] {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
         assert_eq!(

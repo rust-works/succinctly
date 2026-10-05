@@ -36,12 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `path()` followed (`[["a"]]` where jq gives `[]`); `(.|.)` and `first(.)` heads did the same. jq takes the object pattern's first step on the
   register when the source passes `.` through, so the body's navigation is refused and caught by the `try`; `resolve_as_pattern` took the head for an
   off-register value, read the step's refusal as jq's, retried onto the bare `$v0` alternative and resolved `try .a` as a tracked path. A retry that rests
-  on that guess (a head it cannot place, not provably fresh, a body that can swallow an error, an object pattern whose steps could match by type) now
-  refuses a *tracked* output of a later alternative -- uncatchable, exit 5 -- since a write needs a path. The bare `.` source, a navigated source, an
-  array pattern, a navigating head, a body without a swallowed error, and a pattern that cannot match by type keep their answers. Over 24,057
-  jq-differential rows (9 sources x 3 patterns x 3 alternatives x 11 bodies x 3 forms x 9 documents) no new accept-where-jq-refuses row appears,
-  216 wrong answers become refusals, and 24 rows that matched jq become refusals, all of them a `del`/`=` over a document where the wrong write changes
-  nothing (`{}`). Pinned by `test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781`.
+  on that guess (a head it cannot place, not provably fresh, a body holding a `try` or a parenthesised `?`, a pattern whose steps could match by type, and a refusal that is not provably exact) now
+  refuses a *tracked* output of a later alternative -- uncatchable, exit 5 -- since a write needs a path. The bare `.` source, a navigated source, a
+  body without a swallowed error (a postfix `?` on a bare navigation keeps jq's path), and a pattern that cannot match by type keep their answers.
+  Over 76,000 jq-differential rows (`scripts/jq-alt-passthrough-sweep.py`) no new accept-where-jq-refuses row appears, 817 wrong answers become
+  refusals, and 77 rows that matched jq become refusals, all of them a `del`/`=` over a document where the wrong write changes nothing (`{}`,
+  `{"a":null}`); recorded in `limitations.md`. Pinned by `test_alt_destructuring_of_a_passthrough_source_under_try_never_writes_3781`.
 - **jq: a `foreach` whose bound element is an empty array answers that element's path through `$k`** (#3789).
   `path(foreach .a as $k (0; $k; .))` on `{"a":[]}` is `["a"]` in jq and refused here (`Invalid path expression with result []`, exit 5),
   and `(foreach .a as $k (0; $k; .)) = 9`, `|=` and `del(foreach .a as $k (0; try $k; .))` wrote nothing. `$k` is the very node `.a`

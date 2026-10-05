@@ -44317,16 +44317,20 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     // but once one rests on that guess a *tracked* output of a later alternative is
     // refused instead of delivered: a write needs a path, and a retry that yields
     // none, or only values, says what jq says either way.
-    let head_may_be_register = S::TAG == EvalTag::Jq
-        && !head_resolves_to_register
-        && !matches!(head, Expr::Identity | Expr::TrackedVar(_))
-        && !yields_only_fresh_values(head)
-        // a head that navigates is a navigated source, which `identical`/the walk
-        // already model (`.a as {b:$v0} ?// $v0 | try .a` matches jq)
-        && !fold_source_moves_register(head)
-        && any_subexpr(body, &mut |e| {
-            matches!(e, Expr::Try { .. } | Expr::Optional(_))
-        });
+    // Evaluated only where a `?//` retry is about to happen: the walks below cost
+    // nothing for the common single-pattern bind.
+    let head_may_be_register = || {
+        S::TAG == EvalTag::Jq
+            && !head_resolves_to_register
+            && !matches!(head, Expr::Identity | Expr::TrackedVar(_))
+            && !yields_only_fresh_values(head)
+            // a head whose spine navigates is a navigated source, which
+            // `identical`/the walk already model (`.a as {b:$v0} ?// $v0 | try .a`
+            // matches jq); navigation inside a filter argument (`select(.a)`) is not
+            // on the spine -- the head still passes `.` through
+            && !head_spine_navigates(head)
+            && body_can_swallow_an_error(body)
+    };
     let suspect_retry = core::cell::Cell::new(false);
     let tripped = core::cell::Cell::new(false);
     let mut guarded = |branch: PathBranch<'a>| -> Demand {
@@ -44520,7 +44524,10 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                         // #3781: this retry rests on a guess when the head may be
                         // jq's register and the pattern's first step could have
                         // succeeded on it -- see `suspect_retry`.
-                        if head_may_be_register && first_step_can_succeed(pattern, bound) {
+                        if !refusal_is_exact
+                            && first_step_can_succeed(pattern, bound)
+                            && head_may_be_register()
+                        {
                             suspect_retry.set(true);
                         }
                         continue;
@@ -44574,37 +44581,76 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     }
 }
 
-/// Whether an object `pattern` could match `bound` by type, at every level: an object
-/// or `null` allows indexing by string, and a literal key's value (`null` when absent)
-/// is matched against its sub-pattern in turn. When a level cannot, jq's own step is a
-/// real type error (`Cannot index number with string`), so a `?//` retry onto the next
-/// alternative is certain whatever the source was (#3781). A computed key counts as
-/// able to match. An array pattern is left out: the wrong writes found are all object
-/// patterns, and jq's behaviour for an array pattern whose step succeeds is not
-/// captured (the `[$v0]` rows with a swallowed body answer on `main` and in jq alike).
+/// Whether `pattern` could match `bound` by type, at every level: an object or `null`
+/// allows indexing by string, an array or `null` by number, and a literal key's (or
+/// index's) value -- `null` when absent -- is matched against its sub-pattern in turn.
+/// When a level cannot, jq's own step is a real type error (`Cannot index number with
+/// string`), so a `?//` retry onto the next alternative is certain whatever the source
+/// was (#3781). A computed key counts as able to match.
 fn first_step_can_succeed(pattern: &Pattern, bound: &OwnedValue) -> bool {
-    fn matches_by_type(pattern: &Pattern, bound: &OwnedValue) -> bool {
-        match pattern {
-            Pattern::Var(_) => true,
-            Pattern::Object(entries) => {
-                let fields = match bound {
-                    OwnedValue::Object(fields) => Some(fields),
-                    OwnedValue::Null => None,
-                    _ => return false,
-                };
-                entries.iter().all(|entry| match &entry.key {
-                    ObjectKey::Literal(key) => {
-                        let value = fields.and_then(|f| f.get(key.as_str()));
-                        matches_by_type(&entry.pattern, value.unwrap_or(&OwnedValue::Null))
-                    }
-                    _ => true,
-                })
-            }
-            // not modelled: treated as matching, so the caller stays conservative
-            Pattern::Array(_) => true,
+    match pattern {
+        Pattern::Var(_) => true,
+        Pattern::Object(entries) => {
+            let fields = match bound {
+                OwnedValue::Object(fields) => Some(fields),
+                OwnedValue::Null => None,
+                _ => return false,
+            };
+            entries.iter().all(|entry| match &entry.key {
+                ObjectKey::Literal(key) => {
+                    let value = fields.and_then(|f| f.get(key.as_str()));
+                    first_step_can_succeed(&entry.pattern, value.unwrap_or(&OwnedValue::Null))
+                }
+                _ => true,
+            })
+        }
+        Pattern::Array(subs) => {
+            let items = match bound {
+                OwnedValue::Array(items) => Some(items),
+                OwnedValue::Null => None,
+                _ => return false,
+            };
+            subs.iter().enumerate().all(|(i, sub)| {
+                let value = items.and_then(|items| items.get(i));
+                first_step_can_succeed(sub, value.unwrap_or(&OwnedValue::Null))
+            })
         }
     }
-    matches!(pattern, Pattern::Object(_)) && matches_by_type(pattern, bound)
+}
+
+/// Whether the spine of a `?//` bind head -- what it passes through, not the filter
+/// arguments it merely consults -- navigates (#3781). `select(.a)` navigates in its
+/// argument only and still hands `.` through at its path, so it is not a navigated
+/// source; `.a`, `.[0]`, `first`, `.a | select(true)` are.
+fn head_spine_navigates(e: &Expr) -> bool {
+    match e {
+        Expr::Identity => false,
+        Expr::Paren(inner) | Expr::FirstExpr(inner) | Expr::LastExpr(inner) => {
+            head_spine_navigates(inner)
+        }
+        Expr::Limit { expr, .. } | Expr::NthExpr { expr, .. } => head_spine_navigates(expr),
+        Expr::Pipe(stages) => stages.iter().any(head_spine_navigates),
+        Expr::Comma(items) => items.iter().any(head_spine_navigates),
+        Expr::Builtin(Builtin::Select(_)) => false,
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => head_spine_navigates(then_branch) || head_spine_navigates(else_branch),
+        other => fold_source_moves_register(other),
+    }
+}
+
+/// Whether `body` holds a construct that can swallow a path error the way jq's `try`
+/// does: a `try`, or a parenthesised/compound `?`. A postfix `?` on a bare navigation
+/// (`.[0]?`, `.a?`) is not one -- jq's `INDEX_OPT` keeps the path it resolved, and
+/// those bodies answer on `main` and in jq alike (#3781).
+fn body_can_swallow_an_error(body: &Expr) -> bool {
+    any_subexpr(body, &mut |e| match e {
+        Expr::Try { .. } => true,
+        Expr::Optional(inner) => !is_postfix_optional_primitive(inner),
+        _ => false,
+    })
 }
 
 /// Splice one branch's bindings into `body` for [`resolve_as_pattern`].
