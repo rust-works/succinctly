@@ -97800,6 +97800,37 @@ fn test_update_collapse_mid_fan_out_matches_jq_3747() -> Result<()> {
     Ok(())
 }
 
+/// #3756: the `?//` collapse of #3747 under a slice path. A slice anchored at
+/// the front with no back-counted bound is spelled out as plain indexes; one
+/// jq resolves against the state the write has reached keeps its old route.
+/// jq 1.7.1, captured live.
+#[test]
+fn test_update_collapse_through_front_slice_matches_jq_3756() -> Result<()> {
+    let q = "(1 as $x ?// $y | select($y == null) | $x)";
+    let cond = format!("(if . == 5 then {q} else 7 end)");
+    for (input, filter, expected) in [
+        ("[5,6,7]", format!(".[0:2][] |= {cond}"), "[7]\n"),
+        ("[5,6,7]", format!(".[0:2][]? |= {cond}"), "[7]\n"),
+        ("[5,5,5]", format!(".[0:2][] |= {cond}"), "[7]\n"),
+        ("[6,5,7]", format!(".[0:2][] |= {cond}"), "null\n"),
+        ("[5,6,7]", format!(".[0:9][] |= {cond}"), "[7,7]\n"),
+        ("[5,6,7]", format!(".[0:][] |= {cond}"), "[7,7]\n"),
+        (
+            "[[5,6],[7,5]]",
+            format!(".[0:2][][0] |= {cond}"),
+            "[null,[7]]\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", &filter], Some(input))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (expected, 0),
+            "`{filter}` on {input}: {err:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3471, owned route: the tables above again with the target built under `-n`
 /// (`eval.rs`'s evaluator, which has its own `each_slice_expr`), and once more
 /// with an `input` builtin inside the bound, which forces that evaluator for an
