@@ -62341,6 +62341,35 @@ fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> 
             "",
             0,
         ),
+        // A destructuring under a nested `reduce` never reaches the outer fold (the reduce backtracks its source).
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce (. as {a:$a} | .) as $y (0; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce (. as {a:$a} | .) as $y (.; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce (foreach . as {a:$a} (.; .; .)) as $y (.; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce (. as {a:$a} | $a) as $y (.; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
     ])
 }
 
