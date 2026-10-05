@@ -63409,6 +63409,32 @@ fn test_string_slice_is_not_the_register_3793() -> Result<()> {
         (r#"{"a":"s"}"#, r"path(.a | . as $k | .[0:] | $k)"),
         (r#"{"a":"s"}"#, r"path(foreach .a as $k (0; $k|.[0:]; $k))"),
         (r#"{"a":"s"}"#, r"del(.a | . as $k | .[0:] | $k)"),
+        // review: nested/derived binds that mint a position-less marker, over a document
+        // that also holds a non-string
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r"path(.a | . as $k | . as $z | .[0:] | $z)",
+        ),
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r"path(.a | .[0:] | . as $q | .[0:] | $q)",
+        ),
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r"path(.a | first(.) as $k | .[0:] | $k)",
+        ),
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r"path(.a | . as $k | .[0:] | ..| $k)",
+        ),
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r"path(.[] | strings | . as $k | .[0:] | $k)",
+        ),
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r#"path(.. | select(type=="string") as $k | .[0:] | $k)"#,
+        ),
     ] {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
         assert_eq!(

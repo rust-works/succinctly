@@ -34244,7 +34244,8 @@ impl Frame {
     /// [`Frame::origin_at`]'s position as an [`Origin::SnapshotAt`]: a marker
     /// certified by value like a [`Origin::Snapshot`], that also names the node's
     /// position -- which is all [`Frame::certifies_value`] accepts for an empty
-    /// array (#3494, #3789).
+    /// array (#3494, #3789), and all it accepts from a *positioned* marker for a
+    /// string (#3793).
     fn snapshot_origin_at(&self, path: &Rc<PathPrefix>) -> Option<Origin> {
         self.extend(path).at.map(|path| Origin::SnapshotAt {
             invocation: self.invocation,
@@ -34275,8 +34276,14 @@ impl Frame {
 
     /// [`Frame::certifies`] for a marker whose value is `value`, which in jq
     /// mode must also name this frame's *position* when `value` is an empty
-    /// array (#3494). Every by-value reader goes through here; `certifies`
-    /// alone is the value-blind half.
+    /// array (#3494) or a string (#3793). Every by-value reader goes through
+    /// here; `certifies` alone is the value-blind half.
+    ///
+    /// A string differs from an empty array in one way: a marker that carries
+    /// **no** position still certifies it by value (it is the very node jq holds:
+    /// `input | . as $x | ($x) = 9`), where an empty array refuses. A marker that
+    /// names a position certifies either only at the frame's own position, so the
+    /// copy a slice returns -- a string's pointer changes too -- is not the register.
     ///
     /// `certifies` admits a [`Origin::Snapshot`]/[`Origin::SnapshotAt`]
     /// marker by value, sound because a strict subtree of a finite document
@@ -34312,8 +34319,10 @@ impl Frame {
             Origin::At { invocation, path } | Origin::SnapshotAt { invocation, path } => {
                 self.names(*invocation, path)
             }
+            // position-less: an empty array cannot prove it is not a fresh copy, so it
+            // refuses; a string keeps the by-value rule (the node jq holds)
             Origin::Snapshot | Origin::Untracked | Origin::Unproven => {
-                !empty_array && self.certifies(origin)
+                is_string && self.certifies(origin)
             }
         }
     }
@@ -118940,6 +118949,35 @@ mod tests {
         };
         assert!(marker_identical::<JqSemantics>(&snapshot, &rebuilt, &frame));
         assert!(marker_identical::<YqSemantics>(&snapshot, &rebuilt, &frame));
+    }
+
+    /// #3793: a string is position-gated like an empty array when its marker names a
+    /// position -- jq's string slice is a copy -- but a position-less marker keeps the
+    /// by-value rule (the node jq holds), and yq mode is unchanged.
+    #[test]
+    fn certifies_value_gates_a_positioned_string_on_its_position_3793() {
+        let invocation = 7;
+        let root = PathPrefix::root();
+        let slice = PathPrefix::extend(&root, Expr::Field("slice".to_string()));
+        let at_root = Frame::at(invocation, Rc::clone(&root));
+        let at_slice = Frame::at(invocation, slice);
+        let position_less = Frame::enter(&Expr::Identity);
+        let text = OwnedValue::string("s");
+        let bound_at_root = Origin::SnapshotAt {
+            invocation,
+            path: BindPath(Rc::clone(&root)),
+        };
+
+        // Positioned: only at the position the marker was bound.
+        assert!(at_root.certifies_value::<JqSemantics>(&bound_at_root, &text));
+        assert!(!at_slice.certifies_value::<JqSemantics>(&bound_at_root, &text));
+        // Position-less: by value, wherever the register stands.
+        assert!(position_less.certifies_value::<JqSemantics>(&Origin::Snapshot, &text));
+        assert!(at_slice.certifies_value::<JqSemantics>(&Origin::Snapshot, &text));
+        // Never for a marker that proves nothing.
+        assert!(!at_root.certifies_value::<JqSemantics>(&Origin::Untracked, &text));
+        // yq has no pointer identity to model: the by-value rule it always had.
+        assert!(at_slice.certifies_value::<YqSemantics>(&bound_at_root, &text));
     }
 
     /// #3494: in jq mode a marker certifies a non-empty array by value alone
