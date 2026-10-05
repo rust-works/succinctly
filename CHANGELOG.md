@@ -25,6 +25,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the same f shapes, tracked with #3780). Jq mode only (ADR-0018: yq has no oracle for `last`). Pinned by `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both
   evaluators) and `yq_last_f_output_does_not_keep_its_identity_3766`; it replaces the characterization test #3653 left.
 
+- **jq: a `foreach` whose UPDATE is `true or <navigating operand>` and whose EXTRACT is the bound variable no longer answers the root path** (#3775).
+  `path(foreach .a? as $k (0; (true or .[]?); $k))` on `null` is `["a"]` in jq and answered `[]` here, and `(...) = 9` replaced the
+  whole document with `9` (exit 0) where jq writes `{"a":9}`. `FoldRegister::advance` rebuilt the register of a stage it cannot see
+  inside at the root, discarding where the source had left it, so the terminal's `null` carve-out (#3579) read the emission as the
+  root. It now keeps the path it entered UPDATE at, and every input (`null`, an object with or without `a`, a falsy `a`) refuses with
+  exit 5, which no `try` can catch. jq answers these rows; matching it needs `or`'s short-circuit modelled, which is not done here.
+  Pinned by `test_foreach_true_or_update_extracting_the_variable_never_answers_the_root_3775`.
+- **jq: a `foreach` that cannot move the path register no longer turns jq's catchable error into an uncatchable refusal** (#3761).
+  `path((.a | ..) as $v0 | foreach (1) as $i (.; $v0; .) | ($v0 | .b?)?)` on `{"a":{"b":1}}` is empty in jq (exit 0: the
+  `?` catches the invalid-path error) and exited 5 here, and `del(...)` / `(...) = 9` refused where jq writes nothing. The
+  `reduce` twin was fixed in #3710; `foreach` emitted its computed outputs without stating the register, so the pipe stage
+  dropped it and the later refusal became this resolver's guess, which no `?` or `try` can catch. It now states the register on
+  every untracked emission when nothing in SOURCE, INIT, UPDATE or EXTRACT can navigate (`foreach_cannot_move_register`). Pinned by
+  `test_foreach_keeps_the_register_for_a_frozen_variable_after_it_3761`.
+
+- **jq: a bind source that passes `.` through (`select`, `first`, `limit`, a `try`-wrapped `if`) no longer silently skips a write under `try`** (#3402).
+  `del(select(true) as $v | try $v.b)` on `{"a":1,"b":2}` is `{"a":1}` in jq and echoed the document unchanged here
+  (exit 0), and so did `first(.)`, `limit(1; .)` and `(try (if .a then . else . end) catch 1)` as the source; without the
+  `try` they refused (`path(select(true) as $v | $v.b)`, jq `["b"]`). The static passthrough grammar cannot prove such a
+  source is `.` -- an `if` condition like `.a` raises into the handler on some inputs and not others -- so `$v` bound a
+  plain value, and the `try` caught its refusal. A source on a closed *transparent* grammar (`select(c)`, `first(S)`,
+  `limit(n; S)`, and `if`/`try`/`//`/`?`/pipes over them, nothing that navigates or computes in a source position) is now
+  resolved in path mode on the input: an output that is the register binds exactly as `. as $v` does, and a `catch`
+  handler's value still binds by value and refuses. A source with an effect keeps the old route, since the witness can
+  decline and re-run it (a doubled `input` turned a program jq answers into exit 5). Not covered: `last(.)` (#3766) and
+  the other shapes of #3423. Because the source now binds as `. as $v`, it shares that spelling's divergences after it:
+  one fuzz row that agreed only through the caught refusal now refuses loudly, and one behind a `?//` destructuring
+  head writes where jq does not, as the `.` spelling already did (#3781). Verified against jq 1.7.1: 30 pinned rows,
+  plus a test that an effect runs once and one that the `select(true)` spelling matches the `.` one; a mutation of each of the grammar's arms and guards fails a pin; `scripts/jq-bind-origin-fuzz.py` gained a
+  `--transparent-source-p` family (7 seeds x 3,000 programs: fabricate/mismatch rows 94 -> 17, the one new-only row is
+  #3781's), and 25 stock-family runs of 3,000 programs and `scripts/jq-bind-origin-oracle-sweep.sh` move no row that
+  agreed. Pinned by `test_transparent_bind_source_keeps_register_3402`.
+
 - **jq: a `foreach` whose EXTRACT navigates and then ends on an untracked `null` no longer answers the root path** (#3769).
   `(foreach (1,2) as $i (.; .; .a? | limit(1; last(.a?)))) = 9` on `null` is `{"a":9}` in jq and replaced the whole
   document with `9` here (exit 0), and `path(...)` answered `[]` twice where jq answers `["a"]`. The same held for any
@@ -865,6 +898,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shapes of #3723 (an `f` that navigates the rebuilt array at any nesting level, bare in `path`, `del`,
   `=` and `|=`, and a nested `walk(walk(empty))`); one shape stays open there, pinned as today's
   behaviour: a `[walk(f)]` collect whose refusal a later `try` swallows.
+
+- **jq: a destructuring bind over a literal in a `reduce`/`foreach` source is path-tracked like jq's** (#3489).
+  jq path-tracks the pattern steps of a destructuring bind, so over a freshly built value they raise: `[1] as
+  [$a] | $a` is `near attempt to access element 0 of [1]`, as the bare construct already was here. As a fold
+  source it was not, because a destructuring spells no `Field`/`Index`/`Iterate`, so `drive_fold_source` drove
+  the source by value and nothing checked the step: `path(reduce ([1] as [$a] | $a) as $k (.; .))` answered
+  `[]`, `del(...)` answered `null`, `= 5` and `|= 5` answered `5`, and a `try` never caught it, where jq exits
+  5 or catches. A nested `reduce`/`foreach` whose own loop pattern destructures a literal source is the same
+  shape. Only a **single** array or object pattern over a **number or string literal, or an array or object
+  construction**, (or a comma, paren or pipe of them) now goes through the resolver, jq mode only. That is
+  deliberately narrow, because routing a source exposes everything in it to the resolver's imprecision, and each
+  wider scope regressed something jq answers: a source that merely *preserves* jq's register (`select(true)`,
+  `first(.)`, `limit(1; .)`, `(.|.)`), since the resolver recognises only a bare `.` as the register (#3423);
+  `null` and the booleans, which jq treats as the register's own value when it holds the same one, and which the
+  resolver refuses once INIT has navigated (`reduce (null as [$a] | $a) as $k (.[0]; .)` on `[null]`, a write
+  too); and a `?//` alternation, which jq retries onto the next alternative where the resolver, with INIT having
+  moved the register, cannot tell the first refusal from a guess. Against jq 1.7.1, a differential fuzz that
+  varies the bind's source, pattern, body and INIT (eight seeds, 10,620 cases) found 0 regressions and 66
+  fixed; a 164-row hand matrix has one regression, below. **Not fixed**, still answering where jq refuses as
+  before: a destructuring over a *computed* source that is not a literal (`keys as [$a]`, `to_entries as [$a]`,
+  and so `del(reduce (keys as [$a] | $a) as $k (.; .))`, which answers `null` where jq exits 5, #3745); over a
+  bare `.` under `foreach` (#3744); under a `?//` alternation; over `null` or a boolean literal (`null as [$a]` over `[1]`, excluded
+  on purpose, see above); over a comma that mixes a literal with a non-literal; and over a literal that
+  follows another stage in a pipe (`{"a":1} | . as {a:$a} | $a`).
+  **One regression:** `try ((reduce X as [$a] ?// $a (0; .)), <a branch that raises>) catch H` as a fold source
+  drops the handler's output once the source goes through the resolver, which a navigating step already did
+  before this change; a literal destructuring that raises as that branch now triggers it too (#3743).
 
 - **jq: a `reduce`/`foreach` source that jq always refuses in path position now raises** (#3726).
   `from_entries`, `unique`, `unique_by`, `with_entries`, `map_values`, `sub`/`gsub`, `ascii_downcase`/

@@ -50966,6 +50966,39 @@ fn test_yq_reduce_source_that_jq_refuses_in_path_position_still_answers_3726() -
     Ok(())
 }
 
+/// #3489: a destructuring bind as a `reduce` source raises in `succinctly jq`
+/// over a value the register is not on (`[1] as [$a] | $a`), because jq
+/// path-tracks the pattern's steps. That is jq-mode only (ADR-0018), so
+/// `succinctly yq` keeps answering. There is no yq oracle: yq v4.53.3 rejects
+/// `reduce` in its lexer and `path(f)` as a bad expression, so both are
+/// succinctly extensions (`path(f)` gated behind `--jq-extensions`) and this
+/// pins today's behaviour, not a verified yq answer.
+#[test]
+fn test_yq_destructuring_fold_source_still_answers_3489() -> Result<()> {
+    for (filter, extra, expected) in [
+        (
+            "(reduce ([1] as [$a] | $a) as $k (.; .)) = 5",
+            &["-o", "json", "-I0"][..],
+            "5\n",
+        ),
+        (
+            "(reduce (. as {a:$a} | .) as $k (.; .)) = 5",
+            &["-o", "json", "-I0"][..],
+            "5\n",
+        ),
+        (
+            "[path(reduce ([1] as [$a] | $a) as $k (.; .))]",
+            &["--jq-extensions", "-o", "json", "-I0"][..],
+            "[[]]\n",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, r#"{"a":[1]}"#, extra)?;
+        assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// On a mapping real yq's `first` names the first *key*, and assigning through
 /// it renames that key (`first = 9` on `{a: 1}` is `{"9":1}`). There is no path
 /// component for a key rename here, so the write is refused loudly rather than

@@ -41518,6 +41518,19 @@ fn reduce_cannot_move_register(
         && cannot_move_register(update)
 }
 
+/// [`reduce_cannot_move_register`]'s `foreach` twin: EXTRACT runs in the same
+/// extent, so it has to be unable to navigate too.
+fn foreach_cannot_move_register(
+    patterns: &[Pattern],
+    input: &Expr,
+    init: &Expr,
+    update: &Expr,
+    extract: Option<&Expr>,
+) -> bool {
+    reduce_cannot_move_register(patterns, input, init, update)
+        && extract.map_or(true, cannot_move_register)
+}
+
 /// Whether evaluating `expr` as one pipe stage provably leaves jq's path
 /// register (`value_at_path`) exactly where it was (#1573).
 ///
@@ -41824,13 +41837,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
             init,
             update,
             extract,
-        } => {
-            patterns_all_bare(patterns)
-                && cannot_move_register(input)
-                && cannot_move_register(init)
-                && cannot_move_register(update)
-                && extract.as_deref().map_or(true, cannot_move_register)
-        }
+        } => foreach_cannot_move_register(patterns, input, init, update, extract.as_deref()),
 
         // #3456: `range(a; b; c)` and `range(n)` are jq-defined over `$param`
         // bindings, and a parameter binding is an `as` source -- a subexp --
@@ -43016,8 +43023,18 @@ impl FoldRegister {
                 frame: self.frame.clone(),
             }
         } else {
+            // #3775: keep where the register stood entering UPDATE. jq's
+            // register only moves down, so wherever UPDATE left it is at or
+            // under this path, and an EXTRACT emission that cannot say where
+            // it landed must not read as the root: `resolve_terminal`'s `null`
+            // carve-out answers `[]` only for a branch that navigated nowhere
+            // (#3579), and `foreach .a? as $k (0; (true or .[]?); $k)` on
+            // `null` answered `[]` and wrote over the whole document where
+            // jq's register sits on `["a"]`. The value stays untracked, so
+            // nothing re-establishes against it; the path only tells the
+            // terminal that the register had left the root.
             Self {
-                path: PathPrefix::root(),
+                path: Rc::clone(&self.path),
                 value: OwnedValue::Null,
                 trackable: false,
                 frame: self.frame.unknown(),
@@ -43086,6 +43103,76 @@ fn fold_source_moves_register(source: &Expr) -> bool {
     })
 }
 
+/// Whether `e` destructures a *freshly built* value (#3489): an `[1] as [$a] |
+/// ...` bind, or a `reduce`/`foreach` loop pattern over `([1], [2])`, with an
+/// array or object pattern ([`patterns_all_bare`] is `false`). Matching one
+/// performs its own tracked index steps, and a fresh value is never the node
+/// the register is on, so jq raises `near attempt to access element 0` exactly
+/// as it does for the bare construct. Such a step spells no
+/// `Field`/`Index`/`Iterate`, so [`is_fold_source_navigation`] misses it, and a
+/// source holding only one was driven by value, where nothing checks the step.
+///
+/// Only a fresh source qualifies, because routing a source through the
+/// resolver exposes *everything* in it to the resolver's own imprecision, so it
+/// is done only where the by-value drive is certainly wrong. A source that may
+/// preserve the register (`.`, `select(true)`, `first(.)`, `limit(1; .)`,
+/// `(.|.)`) destructures it without raising in jq, and the by-value drive
+/// already answers the same; the resolver recognises only a bare `.` as the
+/// register (the open-ended class of #3423), so routing those traded a wrong
+/// accept for a wrong refusal (`path(reduce (select(true) as [$x] | $x) as $k
+/// (.; .))` is `[]` in jq and was refused). A bare `$var` bind performs no step
+/// and stays by value too.
+fn is_fold_source_destructuring(e: &Expr) -> bool {
+    match e {
+        Expr::AsPattern { expr, patterns, .. } => {
+            routes_destructuring(patterns) && yields_only_fresh_values(expr)
+        }
+        Expr::Reduce {
+            input, patterns, ..
+        }
+        | Expr::Foreach {
+            input, patterns, ..
+        } => routes_destructuring(patterns) && yields_only_fresh_values(input),
+        _ => false,
+    }
+}
+
+/// A single array or object pattern: the case the resolver answers like jq
+/// whatever INIT did to the register. A `?//` alternative is left to the
+/// by-value drive. jq retries onto the next alternative when the first one's
+/// pattern step raises, but once INIT has navigated (`(.[]; ...)`, `(.a; ...)`)
+/// the resolver cannot tell that refusal from a guess, so it does not retry and
+/// raises where jq answers: `reduce (([1],[2]) as [$a] ?// $a | empty) as $x
+/// (.[]; .)` is answered by jq and the by-value drive, and was refused. The
+/// price is that a fresh source under `?//` is still accepted where jq raises
+/// in every alternative.
+fn routes_destructuring(patterns: &[Pattern]) -> bool {
+    matches!(patterns, [pattern] if !matches!(pattern, Pattern::Var(_)))
+}
+
+/// Whether every output of `e` is a freshly built value -- a number or string
+/// literal, an array or object construction, or a comma/paren/pipe of them --
+/// and so can never be jq's path register (#3489). Deliberately a short
+/// allow-list: anything it does not name (`.`, a call, an arithmetic that may
+/// return its input) may preserve the register and is not claimed fresh.
+///
+/// `null` and the booleans are **not** fresh: jq's `jv_identical` treats any
+/// `null` (or `true`/`false`) as the register's own value when the register
+/// holds the same one, so `null as [$a]` does not raise there. The resolver
+/// applies that rule only while the register is still at the fold's input, so
+/// once INIT has navigated (`reduce (null as [$a] | $a) as $k (.[0]; .)` on
+/// `[null]`) a routed `null` source is refused where jq answers.
+fn yields_only_fresh_values(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(Literal::Null | Literal::Bool(_)) => false,
+        Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) => true,
+        Expr::Paren(inner) => yields_only_fresh_values(inner),
+        Expr::Comma(items) => !items.is_empty() && items.iter().all(yields_only_fresh_values),
+        Expr::Pipe(stages) => stages.last().is_some_and(yields_only_fresh_values),
+        _ => false,
+    }
+}
+
 /// Drive a `reduce`/`foreach` SOURCE **by demand** in path context,
 /// handing each element to `step` as the source produces it -- the fold
 /// loop runs *inside* `step`, so the next element is pulled only once the
@@ -43130,7 +43217,7 @@ fn fold_source_moves_register(source: &Expr) -> bool {
 /// fixed alongside).
 ///
 /// **Gated on `any_subexpr` finding, anywhere in `source`, a step that can
-/// reach one of the resolver's own raising arms.** Two kinds count. A
+/// reach one of the resolver's own raising arms.** Three kinds count. A
 /// navigation step: a `Field`/`Index`/`Slice`/`Iterate`, a computed
 /// `IndexExpr`/`SliceExpr`/`ArrayKey`, or (#2159) the `..`/`recurse`/`walk`/
 /// `getpath` spellings that move jq's register without writing an `INDEX`.
@@ -43138,9 +43225,12 @@ fn fold_source_moves_register(source: &Expr) -> bool {
 /// `unique`, `from_entries`, `with_entries`, `map_values`, `sub`/`gsub`,
 /// `ascii_downcase`, the `match` family, an update assignment, `fromstream` --
 /// which spells no `INDEX` but whose jq-defined body iterates a container it
-/// built, so it raises once it runs, wherever it appears. A source with
-/// neither (`range(n)`, `keys`, a literal, and critically `input`/`inputs`)
-/// is driven by value through [`eval_each_owned`] and never resolved here at
+/// built, so it raises once it runs, wherever it appears. And (#3489, jq mode
+/// only) a destructuring bind over a freshly built value
+/// ([`is_fold_source_destructuring`]), whose pattern steps are tracked index
+/// steps jq refuses. A source with none of the three (`range(n)`, `keys`, a
+/// literal, and critically `input`/`inputs`) is driven by value through
+/// [`eval_each_owned`] and never resolved here at
 /// all. `input`/`inputs` is why the gate is not just an optimisation: the
 /// resolver's leaf collects a generator before delivering it, which would
 /// drain the shared input reader (`reduce input as $x (0; $x)` over
@@ -43192,10 +43282,14 @@ fn drive_fold_source<S: EvalSemantics>(
     // construct jq refuses outright in path position ([`live_path_refusal`]) --
     // it spells no `INDEX` of its own, but its jq-defined body iterates a value
     // it built, so `unique` as a source raises where a by-value drive answers.
-    // Jq mode only: yq has no `reduce`/`foreach`/`path` to check against, and
-    // the refusal itself is jq mode only ([`always_refuses_as_live_path`]).
+    // #3489: and so does a destructuring bind ([`is_fold_source_destructuring`]),
+    // whose pattern steps are tracked index steps of their own. Jq mode only:
+    // yq has no `reduce`/`foreach`/`path` to check against, and the refusal
+    // itself is jq mode only ([`always_refuses_as_live_path`]).
     let has_navigation = any_subexpr(source, &mut |e| {
-        is_fold_source_navigation(e) || (S::TAG == EvalTag::Jq && live_path_refusal(e).is_some())
+        is_fold_source_navigation(e)
+            || (S::TAG == EvalTag::Jq
+                && (live_path_refusal(e).is_some() || is_fold_source_destructuring(e)))
     });
     if !has_navigation {
         return drive_fold_source_by_value::<S>(source, ambient.value, ambient.trackable, step);
@@ -43448,6 +43542,18 @@ type BindSourceWitness = (Vec<(OwnedValue, Option<Origin>)>, Option<Control>);
 ///   the resolver's own prefix and escape, whose partial-prefix contract
 ///   already mirrors `eval_owned_expr_fork`'s (`path((.a, error("x")) as
 ///   $y | .a | $y)` prints `["a"]` before raising `x`, as jq does);
+/// - #3402: a source on the closed *transparent* grammar
+///   ([`is_transparent_bind_source`]: `select`, `first`, `limit`, and `if`/
+///   `try`/`//`/`?`/pipes over them, none of which navigates) that
+///   [`is_identity_passthrough`] cannot prove is `.` -- typically because an
+///   `if` condition may raise into a `catch` handler. Each output is either
+///   the register itself, passed through, or a value computed beside it (a
+///   handler's, an `if` arm's that is not `.`), and the resolver tells the two
+///   apart on this input: the first is bound as a `.` bind would be
+///   ([`Origin::SnapshotAt`]), the second by value. A source with effects
+///   ([`walk_body_may_have_effects`]) keeps the by-value route, because the
+///   witness may still decline -- a handler navigating its error value is a
+///   resolver refusal -- and the by-value re-run would repeat the effect;
 /// - a source headed by a navigated marker (`$y as $z`, `$y.b as $z`,
 ///   `(($y | .b) | .c) as $w`, [`marker_headed`]) binds the marker's own
 ///   node, or a pure-navigation continuation from it: the rest is resolved
@@ -43482,32 +43588,93 @@ fn resolve_bind_source_witness<S: EvalSemantics>(
                 return None;
             }
             let rerooted = Frame::at(*invocation, Rc::clone(&path.0));
-            return resolve_bind_source_in::<S>(&rest, &marker.value, true, &rerooted);
+            return resolve_bind_source_in::<S>(&rest, &marker.value, true, &rerooted, false);
         }
     }
     if !trackable || frame.at.is_none() {
         return None;
     }
+    if is_transparent_bind_source(source)
+        && !is_identity_passthrough::<S>(source)
+        && !walk_body_may_have_effects(source)
+    {
+        return resolve_bind_source_in::<S>(source, value, trackable, frame, true);
+    }
     let (pure_navigation, navigates) = classify_navigation(source);
     if !pure_navigation || !navigates {
         return None;
     }
-    resolve_bind_source_in::<S>(source, value, trackable, frame)
+    resolve_bind_source_in::<S>(source, value, trackable, frame, false)
+}
+
+/// The sources [`resolve_bind_source_witness`] resolves in path mode to learn
+/// whether each output *is* the register (#3402): `.`, and `select(c)`,
+/// `first(S)`, `limit(n; S)`, `if c then S else S end`, `try S catch h`,
+/// `S // S`, `S?` and `S | S` over them. Nothing here navigates, so every
+/// output the resolver keeps trackable is the frame's own node, passed
+/// through by pointer as jq passes it; an output it does not keep trackable
+/// (a `catch` handler's value) binds by value as before.
+///
+/// The slots that are *not* sources -- a condition, a count, a handler --
+/// are arbitrary: the resolver evaluates conditions and counts by value, as
+/// jq's subexps do, and a handler's output is untracked. What keeps the
+/// grammar closed is that no other node may produce an output: a literal, a
+/// construction, a navigation, a call or a variable each falls to the
+/// by-value route, so a value the resolver cannot place is never certified.
+///
+/// Measured against `/usr/bin/jq` 1.7.1 with `scripts/jq-bind-origin-fuzz.py`
+/// (25 runs of 3,000 programs over every family) and
+/// `scripts/jq-bind-origin-oracle-sweep.sh`: no row that agreed before moves.
+/// Widening it to any source wrote where jq refuses
+/// (`(.a | tostring | .[0:1])? as $v`), which is why it is a grammar.
+fn is_transparent_bind_source(source: &Expr) -> bool {
+    match unwrap_bind_source(source) {
+        Expr::Identity | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Optional(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::Limit { expr: inner, .. }
+        | Expr::Try { expr: inner, .. } => is_transparent_bind_source(inner),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => is_transparent_bind_source(then_branch) && is_transparent_bind_source(else_branch),
+        Expr::Alternative(left, right) => {
+            is_transparent_bind_source(left) && is_transparent_bind_source(right)
+        }
+        Expr::Pipe(stages) => !stages.is_empty() && stages.iter().all(is_transparent_bind_source),
+        _ => false,
+    }
 }
 
 /// [`resolve_bind_source_witness`]'s path-mode resolution proper, against
 /// `value` sitting at `frame`. `None` is "the witness declines" -- an
 /// untracked navigation the resolver refuses but jq's suspended tracking
 /// evaluates -- which sends the caller to the by-value route.
+///
+/// `passthrough` is the #3402 transparent route: a trackable output is the
+/// frame's own `.`, so it gets the [`Origin::SnapshotAt`] a `. as $x` bind
+/// gets ([`identity_bind_position`]) rather than an [`Origin::At`]. The two
+/// certify the same node, but [`is_identity_passthrough`] admits only the
+/// `Snapshot` family as `.`, so an `At` would make `select(true) as $v` behave
+/// unlike `. as $v` after it: a later `(if true then $v else . end) as $w`
+/// bound `$w` by value, and `try ($w | ...)` then went silent where the `.`
+/// spelling refuses.
 fn resolve_bind_source_in<S: EvalSemantics>(
     source: &Expr,
     value: &OwnedValue,
     trackable: bool,
     frame: &Frame,
+    passthrough: bool,
 ) -> Option<BindSourceWitness> {
     let bind = |b: PathBranch<'_>| {
         let origin = if b.trackable && slice_witnesses_node(&b.path, &b.value) {
-            frame.origin_at(&b.path)
+            frame.origin_at(&b.path).map(|origin| match origin {
+                Origin::At { invocation, path } if passthrough => {
+                    Origin::SnapshotAt { invocation, path }
+                }
+                origin => origin,
+            })
         } else {
             None
         };
@@ -45966,6 +46133,26 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    // #3761: `resolve_reduce`'s #3710 rule for `foreach`. A computed emission is
+    // not the register, but when nothing in the fold can have moved it jq's
+    // register is where the `foreach` entered, and the next pipe stage may still
+    // navigate from a variable frozen there (`path(.a as $v | foreach (1) as $i
+    // (.; 5; .) | ($v | .b?)?)` is empty in jq, which catches the refusal; the
+    // stage dropped the register and the refusal became an uncatchable guess).
+    // The leaf states it on every untracked emission; the stage then takes the
+    // stricter of that and its own verdict. A trackable entry only: an untracked
+    // one carries its register on the stage.
+    let register_unmoved = S::TAG == EvalTag::Jq
+        && trackable
+        && foreach_cannot_move_register(patterns, input, init, update, extract);
+    let mut stating_sink = |branch: PathBranch<'a>| -> Demand {
+        if register_unmoved && !branch.trackable {
+            sink(branch.with_register(BranchRegister::Unmoved(Cow::Borrowed(value))))
+        } else {
+            sink(branch)
+        }
+    };
+    let sink: &mut dyn FnMut(PathBranch<'a>) -> Demand = &mut stating_sink;
     // Ambient `snapshot` threaded the same way `resolve_reduce` threads it
     // into its own INIT resolution — see that function's doc comment
     // (#1591). #2031: INIT resolved before SOURCE, same reordering as

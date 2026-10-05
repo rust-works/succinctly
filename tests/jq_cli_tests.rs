@@ -64582,6 +64582,136 @@ fn test_foreach_extract_ending_on_untracked_null_after_navigation_refuses_3769()
     Ok(())
 }
 
+/// #3761: a `foreach` that provably cannot move jq's path register states it on
+/// every computed emission, as `reduce` does since #3710. The stage used to drop
+/// it, so a variable frozen before the `foreach` and navigated after it
+/// (`($v0 | .b?)?`) turned jq's catchable "Invalid path expression" into this
+/// resolver's uncatchable guess: `path(...)` exited 5 and `del`/`=` refused
+/// where jq answers empty and writes nothing. Every row captured from jq 1.7.1
+/// with `-c`; the rows jq refuses (`$v0 | .b` with no `?`) still refuse.
+#[test]
+fn test_foreach_keeps_the_register_for_a_frozen_variable_after_it_3761() -> Result<()> {
+    let doc = "{\"a\":{\"b\":1}}\n";
+    let refusal = "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"b\" of {\"b\":1}\n";
+    for (filter, stdout, stderr, code) in [
+        // the issue's row, its `try` spelling and the computed-emission shapes
+        (
+            r"path((.a | ..) as $v0 | foreach (1) as $i (.; $v0; .) | ($v0 | .b?)?)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r"path(.a as $v0 | foreach (1) as $i (.; 5; .) | ($v0 | .b?)?)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r"path(.a as $v0 | foreach (1) as $i (.; .; $i) | ($v0 | .b?)?)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r"[path(.a as $v0 | foreach (1) as $i (.; 5; .) | ($v0 | .b?)?)]",
+            "[]\n",
+            "",
+            0,
+        ),
+        // the writes the refusal used to block: jq writes nothing
+        (
+            r"del((.a | ..) as $v0 | foreach (1) as $i (.; $v0; .) | ($v0 | .b?)?)",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        (
+            r"((.a | ..) as $v0 | foreach (1) as $i (.; $v0; .) | ($v0 | .b?)?) = 9",
+            "{\"a\":{\"b\":1}}\n",
+            "",
+            0,
+        ),
+        // jq still refuses the unguarded navigation, and a handler's output
+        (
+            r"path(.a as $v0 | foreach (1) as $i (.; 5; .) | ($v0 | .b))",
+            "",
+            refusal,
+            5,
+        ),
+    ] {
+        let (out, err, got) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), got),
+            (stdout, stderr, code),
+            "{filter}"
+        );
+    }
+    // A `foreach` nothing in which can navigate keeps the register (#3761, the
+    // `reduce` rule of #3710), so `$x` still re-establishes and jq's deletion is
+    // made: this row used to be a loud refusal in the list above.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r"del(. as $x | foreach (1) as $i (.; 5) | try ($x | .k))",
+        ],
+        Some(r#"{"a":{"b":1},"k":1,"l":[1,2]}"#),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("{\"a\":{\"b\":1},\"l\":[1,2]}\n", "", 0)
+    );
+    Ok(())
+}
+
+/// #3775: a `foreach` whose UPDATE is `true or <navigating operand>` and whose
+/// EXTRACT is the bound `$k` used to answer `[]` on a `null` document, and `= 9`
+/// replaced the whole document (exit 0). jq answers `["a"]` / `{"a":9}`: the
+/// operand never runs, so jq's register is still on the source's `.a`. The step
+/// register `FoldRegister::advance` builds for a stage it cannot see inside was
+/// rebuilt at the root, so the terminal's `null` carve-out (#3579, "nothing
+/// navigated") took the emission for the root. It now keeps the path it entered
+/// UPDATE at, and every input kind refuses loudly (exit 5) -- the refusal is this
+/// resolver's guess, not jq's verdict, so no `try` turns it into a dropped
+/// write. Matching jq's answer needs `or`'s short-circuit modelled, which is not
+/// done here.
+#[test]
+fn test_foreach_true_or_update_extracting_the_variable_never_answers_the_root_3775() -> Result<()> {
+    for doc in [
+        "null",
+        r#"{"b":2}"#,
+        r#"{"a":true,"b":2}"#,
+        r#"{"a":false}"#,
+        r#"{"a":null,"b":2}"#,
+    ] {
+        for filter in [
+            r"path(foreach .a? as $k (0; (true or .[]?); $k))",
+            r"(foreach .a? as $k (0; (true or .[]?); $k)) = 9",
+            r"(foreach .a? as $k (0; (true or .[]?); $k)) |= 9",
+            r"del(foreach .a? as $k (0; (true or .[]?); $k))",
+            r"path(foreach .a as $k (0; (true or .b); null))",
+        ] {
+            let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{doc}\n")))?;
+            assert_eq!(
+                (out.as_str(), code),
+                ("", 5),
+                "{filter} on {doc}: stderr {err:?}"
+            );
+            assert!(
+                err.contains("Invalid path expression with result"),
+                "{filter} on {doc}: stderr {err:?}"
+            );
+        }
+    }
+    // jq refuses nothing here and neither do we: the shapes that always matched
+    let (out, _, code) = run_jq_full(
+        &["-c", r"path(foreach .a? as $k (0; true; $k))"],
+        Some("null\n"),
+    )?;
+    assert_eq!((out.as_str(), code), ("[\"a\"]\n", 0));
+    Ok(())
+}
+
 /// #3738: a `foreach` UPDATE that is one chain of stages under a `try`
 /// (`try ($w | .[]?)`, `try ($w | .a[])`, `try ($w | ..)`) keeps jq's path
 /// register. The fold used to withhold the register from any non-pipe body that
@@ -66241,6 +66371,634 @@ fn test_walk_over_an_array_does_not_rerun_an_f_with_effects_3713() -> Result<()>
         2,
         "#3713: stderr={stderr:?}"
     );
+    Ok(())
+}
+
+/// #3489: a destructuring bind over a freshly built value in a `reduce`/`foreach`
+/// SOURCE is path-tracked by jq, so its pattern step raises: `[1] as [$a] | $a` as
+/// a source is `near attempt to access element 0 of [1]`, exactly as the bare
+/// construct is. A source holding one spells no `Field`/`Index`/`Iterate`, so
+/// `drive_fold_source` drove it by value and nothing checked the step:
+/// `path(reduce ([1] as [$a] | $a) as $k (.; .))` answered `[]`, `del(...)`
+/// answered `null`, `= 5`/`|= 5` answered `5` and a `try` never caught it, where
+/// jq exits 5 or catches. A nested `reduce`/`foreach` whose own loop pattern
+/// destructures a literal source is the same shape.
+///
+/// Only a single pattern over a fresh source (a number or string literal, or an
+/// array or object construction) is routed through the resolver. Everything
+/// else keeps the by-value drive, and most of these rows pin that it stays
+/// right, each one a regression an earlier version had:
+/// - a source that merely *preserves* jq's register (`select(true)`, `first(.)`,
+///   `(.|.)`, `limit(1; .)`, ...), which jq destructures without a refusal;
+/// - `null` and the booleans, which jq treats as the register's own value when
+///   it holds the same one, so they must not be routed once INIT has navigated
+///   (`reduce (null as [$a] | $a) as $k (.[0]; .)` on `[null]`, a write too);
+/// - a `?//` alternation, which jq retries onto the next alternative where the
+///   resolver, with INIT having moved the register, cannot tell the first
+///   refusal from a guess and raises.
+///
+/// The gate looks at every node of the source, so a destructuring inside an
+/// object value, a `limit` count, an `if` condition, a `try` or a `?` (where
+/// jq suspends path tracking) is routed too; those rows pin that it still
+/// matches jq. Every row was captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_fold_source_destructuring_bind_is_path_tracked_3489() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce ([1] as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach ([1] as [$a] | $a) as $k (.; .; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"path(reduce ({"a":1} as {a:$a} | $a) as $k (.; .))"#,
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] | 1) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] | empty) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] | .) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] | $a, 1) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([[2]] as [[$a]] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([[2]] as [[$a]] | 1) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"del(reduce ([1] as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"(reduce ([1] as [$a] | $a) as $k (.; .)) |= 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"(reduce ([1] as [$a] | $a) as $k (.; .)) = 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"(foreach ([1] as [$a] | $a) as $k (.; .; .)) |= 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r#"try path(reduce ([1] as [$a] | $a) as $k (.; .)) catch "caught""#,
+            "\"caught\"\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"[path(reduce ([1] as [$a] | $a) as $k (.; .))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (. as {a:$a} | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (. as {a:$a} | 1) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (. as {a:$a} | length) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (. as {a:$a} | ., 1) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"path(reduce (. as [$a] | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"path(reduce (. as [[$a]] | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as {a:$a} | .) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(reduce (. as {a:$a} | .) as $k (.; .)) |= 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(reduce (. as {a:$a} | .) as $k (.; .)) = 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(reduce (. as {a:$a} | .) as $k (.; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(reduce (. as [$a] | .) as $k (.; .)) |= 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(reduce (. as [$a] | .) as $k (.; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(reduce (.a as [$x] | $x) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (.a as {b:$b} | $b) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] ?// $a | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (. as [$a] ?// $a | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (reduce ([1],[2]) as [$a] (0; .)) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (foreach ([1],[2]) as [$a] (0; .)) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (reduce ([1]) as [$a] (0; .)) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (reduce (.[]) as [$a] (0; .)) as $k (.; .))",
+            "",
+            "Cannot index number with number",
+            5,
+        ),
+        (
+            r"[[1]]",
+            r"path(reduce (reduce (.[]) as [$a] (0; .)) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (1 as $a | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (. as $a | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[reduce ([1] as [$a] | $a) as $k (.; .)]",
+            "[[1]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"[foreach ([1] as [$a] | $a) as $k (.; .; .)]",
+            "[{\"a\":{\"b\":1}}]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (select(true) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ((.|.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (limit(1;.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (first(.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (last(.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (nth(0;.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (until(true;.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (first(.,1) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"5",
+            r"path(reduce (first(.) as [$x] | $x) as $k (.; .))",
+            "",
+            "Cannot index number with number",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] ?// $a | .) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(foreach ([2] as [$a] ?// $a | .) as $k (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(reduce ([2] as [$a] ?// $a | .) as $k (.; .)) |= 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(reduce ([2] as [$a] ?// $a | .) as $k (.; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(reduce (null as [$a] | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"true",
+            r"path(reduce (true as [$a] | $a) as $k (.; .))",
+            "",
+            "Cannot index boolean with number",
+            5,
+        ),
+        (
+            r"[null]",
+            r"[path(reduce (null as [$a] | $a) as $k (.[]; .))]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"[path(reduce (null as [$a] | $a) as $k (.a; .))]",
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":null}}"#,
+            r"[path(reduce (null as [$a] | $a) as $k (.a.b; .))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[null]",
+            r"(reduce (null as [$a] | $a) as $k (.[0]; .)) |= 5",
+            "[5]\n",
+            "",
+            0,
+        ),
+        (
+            r"[null]",
+            r"del(reduce (null as {a:$a} | $a) as $k (.[0]; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"[path(reduce ([1] as [$a] | $a) as $k (.[]; .))]",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"(reduce ([1] as [$a] | $a) as $k (.a; .)) |= 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"[path(reduce (([1],[2]) as [$a] ?// $a | empty) as $x (.[]; .))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(foreach (([1],[2]) as [$a] ?// $a | empty) as $x (.a; .; .)) |= 5",
+            "{\"a\":1}\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(foreach (([1],[2]) as [$a] ?// $a | empty) as $x (.[0]; .; .)) |= 5",
+            "[1]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(foreach ([type], (1 as [$a] ?// $a | length)) as $x ((.[]?); .; .))",
+            "[0]\n[0]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(foreach ([type], (1 as [$a] ?// $a | length)) as $x (first(.[]?); .; .)) |= 5",
+            "{\"a\":5}\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"path(reduce first(([.] as [$a] ?// $a | ($a, 1))) as $x (.[0]; .))",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"del(reduce first(([.] as [$a] ?// $a | ($a, 1))) as $x (first(.[]?); .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce ({a:([1] as [$b]|$b)}) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (limit(([1] as [$a]|$a); .)) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (if ([1] as [$a]|$a) then . else . end) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (try ([1] as [$a]|$a) catch 1) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (([1] as [$a]|$a)?) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce range([1] as [$a]|$a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"path(reduce ("\([1] as [$a]|$a)") as $k (.; .))"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(reduce ({a:([1] as [$b]|$b)}) as $k (.; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"(reduce (limit(([1] as [$a]|$a); .)) as $k (.; .)) |= 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce ([[1] as [$a]|$a]) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (-1 as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+    ])
+}
+
+/// #3489: a destructuring source that also reads `inputs` goes through the
+/// resolver, whose collecting leaf would drain the shared input reader if the
+/// pattern did not raise first. It does, so jq's own position holds: the error
+/// is reported at line 1 of the three documents, and a later `input` still
+/// sees the second one. Both are jq 1.7.1's output; the base drained the
+/// reader (`break`) or answered `[]`.
+#[test]
+fn test_fold_source_destructuring_does_not_drain_inputs_3489() -> Result<()> {
+    let docs = "[1]\n[2]\n[3]\n";
+    let (out, err, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            "path(reduce (inputs | [.] as [$a] | $a) as $x (.; .))",
+        ],
+        Some(docs),
+    )?;
+    assert_eq!((out.as_str(), code), ("", 5), "stderr {err:?}");
+    assert!(
+        err.contains("(at <stdin>:1): Invalid path expression near attempt to access element 0"),
+        "stderr {err:?}"
+    );
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            "path(reduce (inputs | [.] as [$a] | $a) as $x (.; .))?, input",
+        ],
+        Some(docs),
+    )?;
+    assert_eq!((out.as_str(), code), ("[2]\n", 0), "stderr {err:?}");
     Ok(())
 }
 
@@ -76777,6 +77535,243 @@ fn test_try_wrapped_if_bind_source_yq_unchanged_3279() -> Result<()> {
 }
 
 // ============================================================================
+// #3402: a transparent bind source (`select`, `first`, `limit`, a `try`-
+// wrapped `if` with a raising condition) binds `.` when it passes `.` through
+// ============================================================================
+
+/// A bind source on the transparent grammar (`select(c)`, `first(S)`,
+/// `limit(n; S)`, and `if`/`try`/`//`/`?`/pipes over them) is resolved in
+/// path mode, so an output that *is* the register binds as `. as $v` would,
+/// and `$v.b` under `try` writes instead of being silently discarded. An
+/// output the source computed beside it -- a `catch` handler's value, a
+/// fresh literal -- still binds by value and refuses as jq does, and so does
+/// a `$v` used after the register moved. Every row captured live against jq
+/// 1.7.1.
+#[test]
+fn test_transparent_bind_source_keeps_register_3402() -> Result<()> {
+    for (input, filter, expected) in [
+        // The fuzz row (#3279's seed 11): `.a` may raise, but not here.
+        (
+            r#"{"a":1,"c":1,"d":2,"x":{"a":1,"c":"s"}}"#,
+            "((try (if .a then . else . end) catch 1) as $v0 | (null + .) | try ($v0 | .b?)) = 9",
+            r#"{"a":1,"c":1,"d":2,"x":{"a":1,"c":"s"},"b":9}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del((try (if .a then . else . end) catch 1) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del(select(true) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del(first(.) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del(limit(1; .) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del((. | select(true)) as $v | ($v | .b)?)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del((.?) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del((select(false) // .) as $v | try $v.b)",
+            r#"{"a":1}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"del((select(false) // {"a":1,"b":2}) as $v | try $v.b)"#,
+            r#"{"a":1,"b":2}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "path(select(true) as $v | $v.b)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "(select(.a == 1) as $v | $v.b) = 9",
+            r#"{"a":1,"b":9}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "(select(.a == 2) as $v | $v.b) = 9",
+            r#"{"a":1,"b":2}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(limit(3; .) as $v | $v.b)]",
+            r#"[["b"]]"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(select(false) as $v | $v.b)]",
+            "[]",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "del(.a | select(true) as $v | try $v.b)",
+            r#"{"a":{}}"#,
+        ),
+        (
+            r#"{"a":5}"#,
+            "path(.a | select(true) as $v | $v)",
+            r#"["a"]"#,
+        ),
+        ("null", "path(select(true) as $v | $v)", "[]"),
+        // The register is lost (`1 |`), and `$v0` is still the root's node.
+        (
+            r#"{"a":{"b":1},"c":{"b":1},"d":false}"#,
+            "del(select(true) as $v0 | 1 | try ($v0 | .[]? | .b?))",
+            r#"{"a":{},"c":{},"d":false}"#,
+        ),
+        // `$v` is `.a`'s node, which the register still holds after `$c`.
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            "del(.c as $c | .a | select(true) as $v | $c | try $v.b)",
+            r#"{"a":{},"c":{"b":1}}"#,
+        ),
+        // Unchanged: jq refuses each `$v.b` and the `try` catches it -- a
+        // fresh literal, a handler's value, a register that moved on, a
+        // rebuilt root.
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"del(({"a":1,"b":2}) as $v | try $v.b)"#,
+            r#"{"a":1,"b":2}"#,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"del((try (if .a.q then . else . end) catch {"b":5}) as $v | try $v.b)"#,
+            r#"{"a":1,"b":2}"#,
+        ),
+        (
+            r#"{"a":{"b":1},"b":3}"#,
+            "del(select(true) as $v | .a | try $v.b)",
+            r#"{"a":{"b":1},"b":3}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"del({"b":1} | select(true) as $v | try $v.b)"#,
+            r#"{"a":{"b":1}}"#,
+        ),
+        // The grammar is closed against navigation: a navigated output is
+        // `.a`'s node, not `.`, and marking it as `.`'s snapshot certified it
+        // by value against the equal `.c` (an open grammar, or a `//` whose
+        // right side went unchecked, deleted `.c.b`).
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            "del((select(false) // .a) as $v | .c | try ($v | .b))",
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            "del((.a | select(true)) as $v | .c | try ($v | .b))",
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+        ),
+        // A source with an effect keeps the by-value route: the witness may
+        // decline (`catch .b` navigates the error value) and re-run it, and
+        // a second `input` would read the document the outer `input` needs.
+        (
+            r#"{"a":1,"b":2} {"x":1} {"x":2}"#,
+            r#"[del((try (if (input | error({"b":1})) then . else . end) catch .b) as $v | try $v.b), input]"#,
+            r#"[{"a":1,"b":2},{"x":2}]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (expected, 0),
+            "#3402: `{filter}` on {input}: stderr={stderr:?}"
+        );
+    }
+    for (input, filter, message) in [
+        (
+            "5",
+            r#"path((try (if error("x") then . else . end) catch 5) as $v | $v)"#,
+            "Invalid path expression with result 5",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"path((try (if .a.q then . else . end) catch {"b":5}) as $v | $v.b)"#,
+            r#"Invalid path expression near attempt to access element "b" of {"b":5}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"path({"b":1} | select(true) as $v | $v.b)"#,
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            "[path((select(false) // .a) as $v | .c | $v | .b)]",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3402: `{filter}` on {input} must still refuse: stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(message),
+            "#3402: `{filter}` on {input}: expected {message:?}, stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3402: an effect in a transparent bind source runs once, as in jq. The
+/// witness declines when a `catch` handler navigates its error value, and
+/// re-running the source by value printed `debug`'s line twice.
+#[test]
+fn test_transparent_bind_source_effect_runs_once_3402() -> Result<()> {
+    let filter =
+        r#"del((try (if (debug | error({"b":1})) then . else . end) catch .b) as $v | try $v.b)"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        (r#"{"a":1,"b":2}"#, 0),
+        "stderr={stderr:?}"
+    );
+    assert_eq!(stderr.matches("DEBUG").count(), 1, "stderr={stderr:?}");
+    Ok(())
+}
+
+/// #3402: `select(true) as $v` behaves exactly as `. as $v` downstream --
+/// including where the `.` spelling itself still differs from jq (a later
+/// `(if true then $v else . end) as $w` binds by value; jq deletes
+/// `.a.b`/`.c.b` in both). Marking the witness's output with a position
+/// rather than `.`'s own snapshot made the `select` spelling go silent here
+/// while the `.` spelling refuses.
+#[test]
+fn test_transparent_bind_source_matches_identity_bind_3402() -> Result<()> {
+    let input = r#"{"a":{"b":1},"c":{"b":1},"d":false}"#;
+    let tail = "([$v0] | path(.[0] | $v0)) | (if true then $v0 else . end) as $v1 | try (($v1 | .[]?) | .b?)";
+    let identity = run_jq_full(&["-c", &format!("del(. as $v0 | {tail})")], Some(input))?;
+    let select = run_jq_full(
+        &["-c", &format!("del(select(true) as $v0 | {tail})")],
+        Some(input),
+    )?;
+    assert_eq!(select, identity);
+    // Never the silent discard: the document unchanged at exit 0.
+    assert_ne!((select.0.trim_end(), select.2), (input, 0), "{select:?}");
+    Ok(())
+}
+
+// ============================================================================
 // #3036: #2642's fabrication through the routes that never cross a funnel
 // ============================================================================
 
@@ -83975,7 +84970,6 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         r#"del((. as $x | contains({"a":{}}) | $x | .a)?)"#,
         // And a value-position `?` around the whole write catches nothing.
         r#"[del(. as $x | contains({"a":{}}) | try ($x | .a))?]"#,
-        r"del(. as $x | foreach (1) as $i (.; 5) | try ($x | .k))",
         r"del(. as $x | (.zz // 5) | try ($x | .k))",
         r"del(. as $x | if .k then 5 else .a end | try ($x | .k))",
         r"del(. as $x | (def f: 5; f) | try ($x | .k))",
