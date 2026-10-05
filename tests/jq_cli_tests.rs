@@ -101226,108 +101226,6 @@ fn test_recurse_structural_descent_reads_position_like_recursive_descent_3773() 
     Ok(())
 }
 
-/// #3809: decoding a slice bound must terminate before a ?// retries it.
-/// Invalid JSON has no jq evaluation oracle; assert our decode-failure contract.
-#[test]
-fn test_slice_bound_decode_failure_stops_stderr_retry_3809() -> Result<()> {
-    let input = r#"{"bad":"\x","arr":[1,2,3]}"#;
-    let bound = r#"(1 as $x ?// $y | ("A"|stderr) as $_ | if $x != null then .bad else 1 end)"#;
-    for slice in [format!(".arr[{bound}:]"), format!(".arr[:{bound}]")] {
-        for filter in [
-            slice.clone(),
-            format!("{slice}?"),
-            format!("first({slice})"),
-        ] {
-            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
-            assert_eq!(code, 5, "{filter}: {stderr:?}");
-            assert!(stdout.is_empty(), "{filter}: {stdout:?}");
-            assert_eq!(stderr.matches('A').count(), 1, "{filter}: {stderr:?}");
-            assert!(
-                stderr.contains("invalid escape sequence in string"),
-                "{filter}: {stderr:?}"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// #3810: captured from /usr/bin/jq 1.7.1. A decisive condition emits the
-/// boolean before its `?//` retry raises; an array consumer cannot complete.
-/// Test both cursor input and an owned literal, plus unary array/object arms.
-#[test]
-fn test_any_all_condition_retry_preserves_answer_then_control_3810() -> Result<()> {
-    let doc = r#"{"a":[1],"b":[2]}"#;
-    for (ending, code, message) in [
-        (r#"error("E2")"#, 5, "E2"),
-        (r#"("H"|halt_error(3))"#, 3, "H"),
-    ] {
-        let cond = format!(
-            r#"(. as {{a:$q}} ?// {{b:$z}} | ("A"|stderr) as $m | if $q != null then .a else {ending} end)"#
-        );
-        for (container, call, answer) in [
-            (doc.to_string(), format!("any(.; {cond})"), "true\n"),
-            (doc.to_string(), format!("all(.; {cond}|not)"), "false\n"),
-            (format!("[{doc}]"), format!("any({cond})"), "true\n"),
-            (format!("[{doc}]"), format!("all({cond}|not)"), "false\n"),
-            (
-                format!(r#"{{"k":{doc}}}"#),
-                format!("any({cond})"),
-                "true\n",
-            ),
-            (
-                format!(r#"{{"k":{doc}}}"#),
-                format!("all({cond}|not)"),
-                "false\n",
-            ),
-        ] {
-            for (filter, expected) in [
-                (call.clone(), answer),
-                (format!("[{call}, 9]"), ""),
-                (format!("first({call})"), answer),
-            ] {
-                for owned in [false, true] {
-                    let query = if owned {
-                        format!("{container} | {filter}")
-                    } else {
-                        filter.clone()
-                    };
-                    let args = [if owned { "-nc" } else { "-c" }, query.as_str()];
-                    let (out, err, exit) =
-                        run_jq_full(&args, if owned { None } else { Some(&container) })?;
-                    assert_eq!((out.as_str(), exit), (expected, code), "`{query}`: {err:?}");
-                    let rest = err
-                        .strip_prefix("AA")
-                        .unwrap_or_else(|| panic!("`{query}`: {err:?}"));
-                    if code == 3 {
-                        assert_eq!(rest, message, "`{query}`");
-                    } else {
-                        assert!(
-                            !rest.starts_with('A') && rest.contains(message),
-                            "`{query}`: {err:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-    // A plain comma's trailing control must stay unreachable. A halt in
-    // the generator must retain its own status (no decisive condition).
-    let rows: &[RetryRow3293] = &[
-        (r#"any(.; true, error("E2"))"#, "true\n", "", "", 0),
-        (
-            r#"all(.; false, ("H"|halt_error(3)))"#,
-            "false\n",
-            "",
-            "",
-            0,
-        ),
-        (r#"any(("H"|halt_error(3)); .)"#, "", "H", "", 3),
-        (r#"any(.; error("E2"))"#, "", "", "E2", 5),
-    ];
-    assert_retry_rows_3293(Some(doc), "", rows)?;
-    assert_retry_rows_3293(None, &format!("{doc} | "), rows)
-}
-
 /// #3808 needs the complete diagnostic: a stale error beside the retry's
 /// own error, or a halt marker written twice, must fail the comparison.
 fn assert_path_retry_rows_3808(
@@ -101854,4 +101752,106 @@ fn test_path_sink_retry_controls_3808() -> Result<()> {
     assert_path_retry_rows_3808(Some(r#"{"a":1}"#), "", rows)?;
     assert_path_retry_rows_3808(None, r#"{"a":1} | "#, rows)?;
     Ok(())
+}
+
+/// #3809: decoding a slice bound must terminate before a ?// retries it.
+/// Invalid JSON has no jq evaluation oracle; assert our decode-failure contract.
+#[test]
+fn test_slice_bound_decode_failure_stops_stderr_retry_3809() -> Result<()> {
+    let input = r#"{"bad":"\x","arr":[1,2,3]}"#;
+    let bound = r#"(1 as $x ?// $y | ("A"|stderr) as $_ | if $x != null then .bad else 1 end)"#;
+    for slice in [format!(".arr[{bound}:]"), format!(".arr[:{bound}]")] {
+        for filter in [
+            slice.clone(),
+            format!("{slice}?"),
+            format!("first({slice})"),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
+            assert_eq!(code, 5, "{filter}: {stderr:?}");
+            assert!(stdout.is_empty(), "{filter}: {stdout:?}");
+            assert_eq!(stderr.matches('A').count(), 1, "{filter}: {stderr:?}");
+            assert!(
+                stderr.contains("invalid escape sequence in string"),
+                "{filter}: {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3810: captured from /usr/bin/jq 1.7.1. A decisive condition emits the
+/// boolean before its `?//` retry raises; an array consumer cannot complete.
+/// Test both cursor input and an owned literal, plus unary array/object arms.
+#[test]
+fn test_any_all_condition_retry_preserves_answer_then_control_3810() -> Result<()> {
+    let doc = r#"{"a":[1],"b":[2]}"#;
+    for (ending, code, message) in [
+        (r#"error("E2")"#, 5, "E2"),
+        (r#"("H"|halt_error(3))"#, 3, "H"),
+    ] {
+        let cond = format!(
+            r#"(. as {{a:$q}} ?// {{b:$z}} | ("A"|stderr) as $m | if $q != null then .a else {ending} end)"#
+        );
+        for (container, call, answer) in [
+            (doc.to_string(), format!("any(.; {cond})"), "true\n"),
+            (doc.to_string(), format!("all(.; {cond}|not)"), "false\n"),
+            (format!("[{doc}]"), format!("any({cond})"), "true\n"),
+            (format!("[{doc}]"), format!("all({cond}|not)"), "false\n"),
+            (
+                format!(r#"{{"k":{doc}}}"#),
+                format!("any({cond})"),
+                "true\n",
+            ),
+            (
+                format!(r#"{{"k":{doc}}}"#),
+                format!("all({cond}|not)"),
+                "false\n",
+            ),
+        ] {
+            for (filter, expected) in [
+                (call.clone(), answer),
+                (format!("[{call}, 9]"), ""),
+                (format!("first({call})"), answer),
+            ] {
+                for owned in [false, true] {
+                    let query = if owned {
+                        format!("{container} | {filter}")
+                    } else {
+                        filter.clone()
+                    };
+                    let args = [if owned { "-nc" } else { "-c" }, query.as_str()];
+                    let (out, err, exit) =
+                        run_jq_full(&args, if owned { None } else { Some(&container) })?;
+                    assert_eq!((out.as_str(), exit), (expected, code), "`{query}`: {err:?}");
+                    let rest = err
+                        .strip_prefix("AA")
+                        .unwrap_or_else(|| panic!("`{query}`: {err:?}"));
+                    if code == 3 {
+                        assert_eq!(rest, message, "`{query}`");
+                    } else {
+                        assert!(
+                            !rest.starts_with('A') && rest.contains(message),
+                            "`{query}`: {err:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // A plain comma's trailing control must stay unreachable. A halt in
+    // the generator must retain its own status (no decisive condition).
+    let rows: &[RetryRow3293] = &[
+        (r#"any(.; true, error("E2"))"#, "true\n", "", "", 0),
+        (
+            r#"all(.; false, ("H"|halt_error(3)))"#,
+            "false\n",
+            "",
+            "",
+            0,
+        ),
+        (r#"any(("H"|halt_error(3)); .)"#, "", "H", "", 3),
+        (r#"any(.; error("E2"))"#, "", "", "E2", 5),
+    ];
+    assert_retry_rows_3293(Some(doc), "", rows)?;
+    assert_retry_rows_3293(None, &format!("{doc} | "), rows)
 }
