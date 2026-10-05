@@ -464,7 +464,12 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     ///
     /// The default is `false`: a format whose element cursor is not the plain
     /// sibling of the previous one (YAML's block-sequence items are wrapper
-    /// nodes that `uncons_cursor` unwraps) keeps the scan from the start.
+    /// nodes that `uncons_cursor` unwraps) keeps the scan from the start. A
+    /// format that sets it must also have [`at_node_id`](Self::at_node_id) of
+    /// a parent's [`node_id`](Self::node_id) answer that parent's
+    /// [`document_parent`](Self::document_parent) -- the scan answers an
+    /// element's parent from a remembered id rather than climbing -- and node
+    /// ids that follow document order.
     const RESUMABLE_ELEMENT_SCAN: bool = false;
 
     /// The element after this one, when [`RESUMABLE_ELEMENT_SCAN`] holds and

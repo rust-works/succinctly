@@ -24102,6 +24102,11 @@ fn element_slot_resumable<C: DocumentCursor>(
         let mut at = index + 1;
         while let Some(elem) = cursor {
             slot_memo::note_scanned();
+            // Node ids follow document order: past `c`, it is not here, and
+            // the scan from the first element decides whether it is anywhere.
+            if elem.node_id() > c.node_id() {
+                break;
+            }
             let next = elem.next_element();
             if elem.same_node(c) {
                 slot_memo::remember(
