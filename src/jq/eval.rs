@@ -15498,10 +15498,11 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// **Discards the control a `?//` retry raises after the decisive output**
 /// (#3810): it answers only "decided or not". Use
-/// [`any_all_probe_element_verdict`] wherever that control must follow the
-/// answer. The one remaining caller is the path-position resolver
+/// [`any_all_probe_element_verdict`] wherever the answers and control a
+/// `?//` retry produces after the decisive output must follow it. The one
+/// remaining caller is the path-position resolver
 /// (`resolve_any_all_gen_cond_sink`), where `path(any(...))` itself still
-/// diverges before the retry is reached (#3819).
+/// diverges before the retry is reached.
 fn any_all_probe_element<S: EvalSemantics>(
     cond: &Expr,
     elem: &OwnedValue,
@@ -111281,6 +111282,33 @@ mod tests {
                         "`{filter}`"
                     );
                 }
+            }
+        }
+    }
+
+    /// #3819: a direct condition retry that decides again, or runs dry,
+    /// answers again -- on the library's owned route and without std's
+    /// thread-local retry generation. Captured from jq 1.7.1.
+    #[test]
+    fn test_any_all_direct_condition_retry_extra_verdicts_3819() {
+        for (name, decision, ending, expected) in [
+            ("any", "true", "empty", "[true,false]"),
+            ("any", "true", "false", "[true,false]"),
+            ("any", "true", "true", "[true,true]"),
+            ("all", "false", "empty", "[false,true]"),
+            ("all", "false", "true", "[false,true]"),
+            ("all", "false", "false", "[false,false]"),
+        ] {
+            let cond = format!(r"([1] as [$q] ?// $z | if $q then {decision} else {ending} end)");
+            for filter in [format!("{name}(.; {cond})"), format!("{name}({cond})")] {
+                let index = JsonIndex::build(b"[1]");
+                let expr = parse(&filter).unwrap();
+                let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(b"[1]"));
+                let QueryResult::ManyOwned(values) = result else {
+                    panic!("`{filter}`: expected two answers: {result:?}");
+                };
+                let got: Vec<_> = values.iter().map(OwnedValue::to_json).collect();
+                assert_eq!(format!("[{}]", got.join(",")), expected, "`{filter}`");
             }
         }
     }

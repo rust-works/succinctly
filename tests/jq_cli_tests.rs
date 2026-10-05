@@ -88816,9 +88816,9 @@ fn test_and_or_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
 /// ending, on both the owned route and the document route. Captured from
 /// `/usr/bin/jq` 1.7.1 with `-nc`.
 ///
-/// Not pinned, and still divergent: a retry that yields nothing or answers
-/// cleanly makes jq deliver a second answer (`true` then `false`); neither
-/// route reproduces that.
+/// A retry that yields nothing or answers cleanly makes jq deliver a second
+/// answer (`true` then `false`); that is #3819's
+/// `test_any_all_condition_retry_extra_verdicts_3819`.
 const RETRY_ROWS_ANY_ALL_DECIDED_OBJ_3810: &[RetryRow3293] = &[
     (
         r#"any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else error("E2") end))"#,
