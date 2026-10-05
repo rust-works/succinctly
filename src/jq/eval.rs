@@ -53618,12 +53618,27 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
             Return(Control),
         }
         let mut outcome: Option<StepOutcome> = None;
+        // #3842: the retry generation `outcome` was recorded at.
+        let mut outcome_at = 0u64;
         let walk =
             each_pattern_binding_set::<S>(pattern, input_val, invert_dedup, &mut |bindings| {
+                // #3842: a re-invocation after a stop is a `?//` retry inside a
+                // computed key, which supersedes what the retried-past binding
+                // set decided -- except a `halt` or decode failure, which no retry
+                // passes (`StashedVerdict::begin`'s rule): that stop is final, so no
+                // further step runs past it.
+                if matches!(
+                    &outcome,
+                    Some(StepOutcome::Return(control)) if !is_retryable_control(control, false)
+                ) {
+                    return Demand::Stop;
+                }
+                outcome = None;
                 let (update, reentry) = update.against::<S>(&state);
                 let substituted = substitute_fold_step(update, bindings, all_var_names);
 
                 if let Some(control) = charge_budget(budget, "reduce") {
+                    outcome_at = pipe_retry_generation();
                     outcome = Some(StepOutcome::Return(control));
                     return Demand::Stop;
                 }
@@ -53667,6 +53682,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
                     // the #1620/#1660 decode-failure exclusion this absorbs
                     // unchanged.
                     Flow::Escaped(control) => {
+                        outcome_at = pipe_retry_generation();
                         outcome = Some(if is_retryable_control(&control, is_last) {
                             StepOutcome::Retry
                         } else {
@@ -53676,6 +53692,20 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
                     }
                 }
             });
+        // #3842: a `?//` inside a computed key that retried past the stop which
+        // recorded `outcome`, and produced nothing or raised, never re-entered
+        // the sink to reset it; the matcher's own verdict (`walk`) stands then.
+        // A `halt` or decode failure is never retried past, so it is kept. Without
+        // std there is no retry generation, so `retry_superseded` answers `false`
+        // (the matcher gives it no direct-retry hint) and only the reset above is in
+        // force there.
+        let nonretryable = matches!(
+            &outcome,
+            Some(StepOutcome::Return(control)) if !is_retryable_control(control, false)
+        );
+        if outcome.is_some() && !nonretryable && retry_superseded(&walk, outcome_at, false) {
+            outcome = None;
+        }
         match outcome {
             Some(StepOutcome::Retry) => continue,
             Some(StepOutcome::Return(control)) => return (state, Some(control)),
@@ -55789,8 +55819,25 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
             Return(Flow),
         }
         let mut outcome: Option<AlternativeOutcome> = None;
-        let walk =
-            each_pattern_binding_set::<S>(pattern, input_val, invert_dedup, &mut |bindings| {
+        // #3842: the retry generation `outcome` was recorded at.
+        let mut outcome_at = 0u64;
+        let walk = each_pattern_binding_set::<S>(
+            pattern,
+            input_val,
+            invert_dedup,
+            &mut |bindings| {
+                // #3842: a re-invocation after a stop is a `?//` retry inside a
+                // computed key, which supersedes what the retried-past binding
+                // set decided -- except a `halt` or decode failure, which no retry
+                // passes (`StashedVerdict::begin`'s rule): that stop is final, so no
+                // further step runs past it.
+                if matches!(
+                    &outcome,
+                    Some(AlternativeOutcome::Return(Flow::Escaped(control))) if !is_retryable_control(control, false)
+                ) {
+                    return Demand::Stop;
+                }
+                outcome = None;
                 let (update, update_reentry) = update.against::<S>(&state);
                 let substituted_update = substitute_fold_step(update, bindings, all_var_names);
                 // EXTRACT runs against each UPDATE output, not against `state`,
@@ -55807,6 +55854,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 clear_nonretryable_stop();
 
                 if let Some(control) = charge_budget(budget, "foreach") {
+                    outcome_at = pipe_retry_generation();
                     outcome = Some(AlternativeOutcome::Return(Flow::Escaped(control)));
                     return Demand::Stop;
                 }
@@ -55991,11 +56039,13 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 match step_verdict {
                     Some(FoldUpdateVerdict::Retry(update_val)) => {
                         state = update_val;
+                        outcome_at = pipe_retry_generation();
                         outcome = Some(AlternativeOutcome::Retry);
                         Demand::Stop
                     }
                     Some(FoldUpdateVerdict::Return(update_val, flow)) => {
                         state = update_val;
+                        outcome_at = pipe_retry_generation();
                         outcome = Some(AlternativeOutcome::Return(flow));
                         Demand::Stop
                     }
@@ -56014,17 +56064,34 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                                 unreachable!("outcome recorded first") // omni-dev: coverage tolerate-line reason="unreachable: on_update records a `step_outcome` before every Demand::Stop it answers, and the fallback match runs only when it recorded none (#2872)"
                             }
                             Flow::Escaped(control) if is_retryable_control(&control, is_last) => {
+                                outcome_at = pipe_retry_generation();
                                 outcome = Some(AlternativeOutcome::Retry);
                                 Demand::Stop
                             }
                             Flow::Escaped(control) => {
+                                outcome_at = pipe_retry_generation();
                                 outcome = Some(AlternativeOutcome::Return(Flow::Escaped(control)));
                                 Demand::Stop
                             }
                         }
                     }
                 }
-            });
+            },
+        );
+        // #3842: a `?//` inside a computed key that retried past the stop which
+        // recorded `outcome`, and produced nothing or raised, never re-entered
+        // the sink to reset it; the matcher's own verdict (`walk`) stands then.
+        // A `halt` or decode failure is never retried past, so it is kept. Without
+        // std there is no retry generation, so `retry_superseded` answers `false`
+        // (the matcher gives it no direct-retry hint) and only the reset above is in
+        // force there.
+        let nonretryable = matches!(
+            &outcome,
+            Some(AlternativeOutcome::Return(Flow::Escaped(control))) if !is_retryable_control(control, false)
+        );
+        if outcome.is_some() && !nonretryable && retry_superseded(&walk, outcome_at, false) {
+            outcome = None;
+        }
         match outcome {
             Some(AlternativeOutcome::Retry) => continue,
             Some(AlternativeOutcome::Return(flow)) => return (state, flow),
