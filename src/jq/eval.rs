@@ -111394,38 +111394,36 @@ mod tests {
         }
     }
 
-    /// #3807: a direct `?//` target whose retry answers, or raises
+    /// #3807: a direct `?//` target whose retry produces nothing, or raises
     /// after a consumer's stop, on the library route and without std's
     /// thread-local retry generation (`direct_pattern_retry` stands in).
-    /// Captured from jq 1.7.1.
+    /// Captured from jq 1.7.1 with `-nc` over `null`: the first alternative's
+    /// index/slice error is retried past, so the empty retry answers nothing;
+    /// and `first` stopping on the first alternative's answer is followed by the
+    /// retry's `E2`.
     #[test]
     fn test_direct_retry_in_index_and_slice_target_3807() {
-        let empty = r#"([{"x":1}] as [$q] ?// $q | select(type=="array"|not))"#;
+        let empty = r#"([{"x":1}] as [$q] ?// $q | $q | select(type=="array"|not))"#;
         let raise =
-            r#"([[1]] as [$a] ?// $a | if (.[0]|type)=="number" then . else error("E2") end)"#;
-        for (target, key, empty_expected) in [
-            (empty, "(0|.+0)", true),
-            (empty, "(0|.+0):(1|.+0)", true),
-            (raise, "(0|.+0)", false),
-            (raise, "(0|.+0):(1|.+0)", false),
+            r#"([[1]] as [$a] ?// $a | $a | if (.[0]|type)=="number" then . else error("E2") end)"#;
+        for (target, key, answers) in [
+            (empty, "(0|.+0)", None),
+            (empty, "(0|.+0):(1|.+0)", None),
+            (raise, "(0|.+0)", Some("1")),
+            (raise, "(0|.+0):(1|.+0)", Some("[1]")),
         ] {
             let filter = format!("first({target}[{key}])");
             let index = JsonIndex::build(b"null");
             let expr = parse(&filter).unwrap();
             let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(b"null"));
-            if empty_expected {
-                // jq 1.7.1: `null null` -- the retry's two answers, not the
-                // abandoned alternative's index error.
-                let QueryResult::ManyOwned(values) = result else {
-                    panic!("`{filter}`: expected two answers: {result:?}");
-                };
-                let got: Vec<_> = values.iter().map(OwnedValue::to_json).collect();
-                assert_eq!(got, ["null", "null"], "`{filter}`");
-            } else {
-                let QueryResult::Error(error) = result else {
-                    panic!("`{filter}`: expected E2: {result:?}");
-                };
-                assert!(error.to_string().contains("E2"), "`{filter}`: {error}");
+            match (answers, result) {
+                (None, QueryResult::None) => {}
+                (Some(want), QueryResult::Partial(values, Control::Error(error))) => {
+                    let got: Vec<_> = values.iter().map(OwnedValue::to_json).collect();
+                    assert_eq!(got, [want], "`{filter}`");
+                    assert!(error.to_string().contains("E2"), "`{filter}`: {error}");
+                }
+                (_, result) => panic!("`{filter}`: unexpected {result:?}"),
             }
         }
     }
