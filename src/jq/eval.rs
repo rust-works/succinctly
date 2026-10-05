@@ -43626,6 +43626,37 @@ fn fold_source_moves_register(source: &Expr) -> bool {
     })
 }
 
+/// Whether a `foreach` SOURCE destructures the register itself (`.`) with an array
+/// or object pattern (#3744): `foreach (. as {a:$a} | .) as $x (...)`. The pattern's tracked index steps move jq's
+/// register onto the matched member and the source is not backtracked past it,
+/// so EXTRACT is checked against a register it is no longer at, which only the
+/// resolver models (the by-value drive answered the root).
+///
+/// Not under a nested `reduce`: jq restores the register when it backtracks a
+/// `reduce`'s source, so what a `reduce` destructures never reaches the outer
+/// fold, and its by-value drive is right (`foreach (reduce . as {a:$a} (0; .)) as
+/// $x (.; .; .)`).
+///
+/// Only the source's own spine is read (the bind itself, a comma's branches, a
+/// pipe's head), never a builtin's argument or a `def` body, where `.`
+/// is another value, and so never a nested fold either: a nested `foreach . as [$q]
+/// (...)` over `.` moves the register for the outer fold in jq too, but routing it
+/// answered a root where jq refuses inside an `or` under a `try` (54 sampled rows,
+/// the dangerous direction), so it keeps the by-value drive. A `?//` chain is left
+/// to the by-value drive as for a fresh source ([`routes_destructuring`]).
+fn foreach_source_destructures_register(source: &Expr) -> bool {
+    match unwrap_paren(source) {
+        Expr::AsPattern { expr, patterns, .. } => {
+            routes_destructuring(patterns) && matches!(unwrap_paren(expr), Expr::Identity)
+        }
+        Expr::Comma(branches) => branches.iter().any(foreach_source_destructures_register),
+        Expr::Pipe(stages) => stages
+            .first()
+            .is_some_and(foreach_source_destructures_register),
+        _ => false,
+    }
+}
+
 /// Whether `e` destructures a *freshly built* value (#3489): an `[1] as [$a] |
 /// ...` bind, or a `reduce`/`foreach` loop pattern over `([1], [2])`, with an
 /// array or object pattern ([`patterns_all_bare`] is `false`). Matching one
@@ -43839,6 +43870,28 @@ fn drive_fold_source<S: EvalSemantics>(
     relocate_base: Option<&Rc<PathPrefix>>,
     step: &mut dyn FnMut(FoldSourceValue) -> Demand,
 ) -> Flow {
+    drive_fold_source_with::<S>(source, false, ambient, relocate_base, step)
+}
+
+/// [`drive_fold_source`] for a `foreach` source, which also routes a source that
+/// destructures the register itself through the resolver ([`foreach_source_destructures_register`],
+/// #3744); a `reduce` backtracks its source, so it does not.
+fn drive_foreach_source<S: EvalSemantics>(
+    source: &Expr,
+    ambient: &FoldSourceAmbient<'_>,
+    relocate_base: Option<&Rc<PathPrefix>>,
+    step: &mut dyn FnMut(FoldSourceValue) -> Demand,
+) -> Flow {
+    drive_fold_source_with::<S>(source, true, ambient, relocate_base, step)
+}
+
+fn drive_fold_source_with<S: EvalSemantics>(
+    source: &Expr,
+    foreach_source: bool,
+    ambient: &FoldSourceAmbient<'_>,
+    relocate_base: Option<&Rc<PathPrefix>>,
+    step: &mut dyn FnMut(FoldSourceValue) -> Demand,
+) -> Flow {
     // #2159: see [`is_fold_source_navigation`] for what counts. #3726: so does a
     // construct jq refuses outright in path position ([`live_path_refusal`]) --
     // it spells no `INDEX` of its own, but its jq-defined body iterates a value
@@ -43851,7 +43904,9 @@ fn drive_fold_source<S: EvalSemantics>(
         is_fold_source_navigation(e)
             || (S::TAG == EvalTag::Jq
                 && (live_path_refusal(e).is_some() || is_fold_source_destructuring(e)))
-    });
+    }) || (S::TAG == EvalTag::Jq
+        && foreach_source
+        && foreach_source_destructures_register(source));
     if !has_navigation {
         return drive_fold_source_by_value::<S>(source, ambient.value, ambient.trackable, step);
     }
@@ -47408,7 +47463,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // (#3293): a `?//` in the source that retries past that stop and then
         // produces nothing or raises supersedes it, as it does `aborted`.
         let mut downstream_stopped: Option<u64> = None;
-        let source_flow = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
+        let source_flow = drive_foreach_source::<S>(input, &ambient, relocate_base, &mut |elem| {
             downstream_stopped = None;
             aborted.begin();
             if let Some(control) = charge_budget(&mut budget, "foreach") {

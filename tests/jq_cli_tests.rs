@@ -62143,6 +62143,291 @@ fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
     Ok(())
 }
 
+/// #3744: a destructuring of the register itself (`.`) as a `foreach` SOURCE moves
+/// jq's path register through the pattern's tracked index steps, so the body's
+/// EXTRACT is checked against a register it is no longer at: `path(foreach (. as
+/// {a:$a} | .) as $x (.; .; .))` on `{"a":1}` refuses ("Invalid path expression
+/// with result"), and a write through it (`|=`, `=`, `del`) lands nowhere, where
+/// the by-value drive accepted the root. A bare `.` source is routed through the
+/// resolver for `foreach` (`foreach_source_destructures_register`), which models it
+/// exactly, now that #3743's `?//` retry no longer loses a handler's output on
+/// that route. `reduce` keeps the by-value drive: jq restores the register when it
+/// backtracks a `reduce` source, so `reduce (. as {a:$a} | .) as $x (.; .)` is `[]`
+/// (the contrast rows). Every row captured from jq 1.7.1, on the stdin and `-n`
+/// routes.
+#[test]
+fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. as {a:$a} | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(foreach (. as {a:$a} | .) as $x (.; .; .)) |= 5",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(foreach (0, (. as {a:$a} | $a)) as $x (.; .; .))",
+            "[]\n",
+            r#"Invalid path expression with result {"a":[1]}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as {a:$a} | .) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. as {a:$a} | $a) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. as {a:$a} | .a) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":1}"#,
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(foreach (. as [$a] | .) as $x (.; .; .))",
+            "",
+            r"Invalid path expression with result [1]",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach (. as {a:{b:$b}} | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach (. as {a:$a} ?// $a | .) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (. as {a:$a} | .) as $x (.; .; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as [$x] ?// {a:$x} | .) as $y (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. as {a:$a} | $a, .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(first(. as {a:$a} | .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as {a:$a} | .)",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(foreach (. as {a:$a} | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(foreach (. as {a:$a} | $a) as $x (.; .; .)) = 5",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(foreach (. as {a:$a} | .) as $x (.; .; $x))]",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. as {a:$a} | .) as $x (.; $x; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as [$a] | .) as $x (.; .))",
+            "",
+            r"Cannot index object with number",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as {a:$a} | $a) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(try (foreach (. as {a:$a} | .) as $x (.; .; .)) catch 7)",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(foreach (. as {a:[$z]} | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":[1]}"#,
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(foreach (. as {a:$a, b:$b} | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of {"a":1,"b":2}"#,
+            5,
+        ),
+        // Nested folds: a nested `foreach` over `.` moves the register for the outer one, a nested `reduce` does not.
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce . as {a:$a} (0; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce . as {a:$a} (.; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (foreach . as {a:$a} (.; .; .)) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A destructuring under a nested `reduce` never reaches the outer fold (the reduce backtracks its source).
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce (. as {a:$a} | .) as $y (0; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce (. as {a:$a} | .) as $y (.; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce (foreach . as {a:$a} (.; .; .)) as $y (.; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (reduce (. as {a:$a} | $a) as $y (.; .)) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A pipe whose head is the bind.
+        (
+            r#"{"a":1}"#,
+            r"path(foreach ((. as {a:$a} | .) | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+    ])
+}
+
+/// #3744: what the routing costs, in the safe direction. A `foreach (. as PATTERN | ...)`
+/// source inside `and`/`or`/`-` under a `try` or `?` refuses (exit 5) where jq answers,
+/// because the resolver's terminal "Invalid path expression with result" refusal is
+/// uncatchable by design while jq's own `try` caught the equivalent error; `main`
+/// matched these only by the by-value drive's luck (it answered the root). Pinned so
+/// lifting it is a deliberate change; the jq answers are in each row.
+#[test]
+fn test_foreach_source_destructuring_register_under_try_stays_refused_3744() -> Result<()> {
+    for (input, filter, jq_answer) in [
+        (
+            r#"{"a":[true]}"#,
+            r"del(try ((foreach (. as {a:$a} | .) as [$z] (.; .; .)) and true))",
+            "{\"a\":[true]}",
+        ),
+        (
+            r#"{"a":false,"b":null}"#,
+            r"del((-(try (foreach (. as {a:$a} | .) as $k (.; .; .)) catch 7))?)",
+            "{\"a\":false,\"b\":null}",
+        ),
+        (
+            r#"{"a":[true]}"#,
+            r"del(. as $x | ((foreach (. as {$a} | .) as $k (.; .; .)) and (.a | .b)?) | $x)",
+            "{\"a\":[true]}",
+        ),
+    ] {
+        let routes = [
+            ("stdin", run_jq_full(&["-c", filter], Some(input))?),
+            (
+                "-n",
+                run_jq_full(&["-nc", &format!("{input} | {filter}")], None)?,
+            ),
+        ];
+        for (route, (stdout, stderr, code)) in routes {
+            assert_eq!(
+                (stdout.as_str(), code),
+                ("", 5),
+                "`{filter}` on {input} via {route} (jq answers {jq_answer}): stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains("Invalid path expression"),
+                "`{filter}` on {input} via {route}: {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
 /// verdict stage behind a `def` call or a `reduce` and one inside a compound stage
 /// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758 and the

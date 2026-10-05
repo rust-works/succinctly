@@ -341,6 +341,36 @@ OPERANDS = [
     "(reduce .[]? as [$a] ?// $a (0; .))",
     "(reduce . as {(\"a\"):$a} ?// $a (0; .))",
     "(reduce . as [$a] (0; .))",
+    # (#3744) a destructuring of the register itself as a `foreach` SOURCE: the pattern's
+    # tracked index steps move jq's register onto the matched member, so an EXTRACT that
+    # is not there refuses, and a bare `$k` the walk bound is a path. Under `reduce` jq
+    # restores the register when it backtracks the source, so the by-value drive is right
+    # there and the `reduce` rows are the must-not-change contrast.
+    "(foreach (. as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as [$a] | .) as $k (.; .; .))",
+    "(foreach (. as {a:{b:$a}} | .) as $k (.; .; .))",
+    "(foreach (. as {a:$a} | $a) as $k (.; .; .))",
+    "(foreach (. as {a:$a} | .a) as $k (.; .; $k))",
+    "(foreach (. as {a:$a} | .) as $k (.; $k; .))",
+    "(foreach (. as {a:$a} | .) as $k (.; .; $k))",
+    "(foreach (. as {a:$a} | $a, .) as $k (.; .; .))",
+    "(foreach (0, (. as {a:$a} | $a)) as $k (.; .; .))",
+    "(foreach (. as {a:$a} ?// $a | .) as $k (.; .; .))",
+    "(foreach (. as {a:$a, b:$b} | .) as $k (.; .; .))",
+    "(foreach (. as {$a} | .) as $k (.; .; .))",
+    "(foreach (select(true) as {a:$a} | .) as $k (.; .; .))",
+    "(foreach (. as {a:$a} | .) as [$z] (.; .; .))",
+    "(reduce (. as {a:$a} | .) as $k (.; .))",
+    "(reduce (. as [$a] | .) as $k (.; .))",
+    "(reduce (. as {a:$a} | $a) as $k (.; .))",
+    "try (foreach (. as {a:$a} | .) as $k (.; .; .)) catch 7",
+    # ...and the same inside a nested fold: a nested `foreach` over `.` moves the register
+    # for the outer one, a nested `reduce` does not (it is backtracked), so the latter is
+    # the contrast that must keep the by-value drive.
+    "(foreach (foreach . as {a:$a} (0; .; .)) as $k (.; .; .))",
+    "(foreach (reduce . as {a:$a} (0; .)) as $k (.; .; .))",
+    "(foreach (foreach . as [$a] (.; .; .)) as $k (.; .; .))",
+    "(reduce (foreach . as {a:$a} (.; .; .)) as $k (.; .))",
     "(reduce . as [[$a]] (0; .))",
     "try (reduce . as [[$a]] (0; .)) catch 7",
     "(reduce . as [[$a]] ?// [$a] (0; .))",
