@@ -94557,6 +94557,316 @@ fn test_owned_identity_retry_supersedes_stashed_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(Some(r#"{"a":[1,2]}"#), "", RETRY_ROWS_OWNED_IDENTITY_3293)
 }
 
+/// #3805: a `?//` retry inside the body of a stage the owned identity walk drives (`key` over an owned
+/// value). The walk stashed `rest`'s verdict in bare locals a retry never reset, so the abandoned
+/// alternative's error outranked the retry's. Each form is a stash site -- a ruled stage's `?//`
+/// operand, `//`, `label`, `try`, `first`, `limit`, `nth`, `any`, `all` -- under all four retry
+/// endings. `key` is not a jq builtin: every value is captured from `/usr/bin/jq` 1.7.1 with `1` in
+/// its place (`key` answers `1` at `.x[1]`).
+/// Three combinations are left out because `1` cannot stand in for `key` there: `(W // 9)` over an
+/// empty `W`, and `(try W catch 0)` over a raising or destructure-failing `W`, answer from a literal
+/// or a handler, which `key` reads as `null` where the stand-in prints `1`.
+const RETRY_ROWS_OWNED_IDENTITY_STASH_3805: &[RetryRow3293] = &[
+    (
+        r#"(. + ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|if type=="array" then 1 else 2 end))) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"((if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end) // 9) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(label $f | (if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(try (if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end) catch 0) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first((if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"limit(5; (if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"nth(0; (if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any((if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end); key as $k | if . == 21 then error("E") else false end)"#,
+        "false\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all((if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end); key as $k | if . == 21 then error("E") else true end)"#,
+        "true\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any((if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end); true) | . as $v | key | if $v == true then error("E") else . end"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
+        r#"all((if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end); false) | . as $v | key | if $v == false then error("E") else . end"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
+        r#"(. + ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | (if ($q|type=="array") then 1 else empty end))) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(label $f | ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(try ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end) catch 0) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"first(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"limit(5; ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"nth(0; ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end); key as $k | if . == 21 then error("E") else false end)"#,
+        "false\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end); key as $k | if . == 21 then error("E") else true end)"#,
+        "true\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end); true) | . as $v | key | if $v == true then error("E") else . end"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end); false) | . as $v | key | if $v == false then error("E") else . end"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(. + ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | (if ($q|type=="array") then 1 else error("E2") end))) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end) // 9) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"(label $f | ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"first(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"limit(5; ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"nth(0; ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"any(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end); key as $k | if . == 21 then error("E") else false end)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"all(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end); key as $k | if . == 21 then error("E") else true end)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"any(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end); true) | . as $v | key | if $v == true then error("E") else . end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"all(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end); false) | . as $v | key | if $v == false then error("E") else . end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"(. + ([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | 1)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"(([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1) // 9) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"(label $f | ([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"first(([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"limit(5; ([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"nth(0; ([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1)) | . as $v | key | if $v == 21 then error("E") else . end"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"any(([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1); key as $k | if . == 21 then error("E") else false end)"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"all(([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1); key as $k | if . == 21 then error("E") else true end)"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"any(([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1); true) | . as $v | key | if $v == true then error("E") else . end"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"all(([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1); false) | . as $v | key | if $v == false then error("E") else . end"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+];
+
+#[test]
+fn test_owned_identity_walk_retry_supersedes_stashed_verdicts_3805() -> Result<()> {
+    // The owned route: the walk only runs over a value with no document
+    // behind it, and `key` there is the succinctly extension the rows say.
+    assert_retry_rows_3293(
+        None,
+        r#"{"x":[10,20,30]} | .x | .[1] | "#,
+        RETRY_ROWS_OWNED_IDENTITY_STASH_3805,
+    )
+}
+
 /// #3513: `skip(n; f) | key` (and `| path`) names the position of the output
 /// it delivers, as `limit`'s twin does. Over an owned input the owned-identity
 /// walk treated `skip` as an opaque stage and placed every output at the

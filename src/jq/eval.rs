@@ -55221,11 +55221,15 @@ pub(crate) fn stop_with_eval_escape(slot: &mut Option<EvalEscape>, escape: EvalE
 /// [`stop_with_eval_escape`] cover the drivers whose slot holds a `Control`,
 /// an `EvalError`, or an `EvalEscape`; [`stop_with_downstream`] covers the
 /// one whose slot holds a whole `Flow`. [`StashedVerdict`] round-trips
-/// through `stop_with_escape_cell`/`stop_with_downstream` (#3293). The four owned-identity stages in
-/// `eval_generic.rs` share `stop_owned_identity_rest_escape`, an adapter over
-/// [`stop_with_escape`] that answers `Flow::Stopped` instead of
-/// `Demand::Stop` (#2830). The `Flow` slots [`foreach_forks`] and
-/// [`reduce_forks`] keep are [`StashedVerdict<Flow>`]s, which call it through
+/// through `stop_with_escape_cell`/`stop_with_downstream` (#3293). The
+/// owned-identity stages in `eval_generic.rs` keep [`StashedEscape`]s and
+/// [`StashedVerdict<Flow>`]s too (#3805): the alternative, scoped and
+/// `try`-handler drivers share `stop_owned_identity_rest_escape`, an adapter
+/// over [`StashedVerdict::stop`] that answers `Flow::Stopped` instead of
+/// `Demand::Stop` (#2830), and the bounded, `any`/`all`, ruled-stage and
+/// computed-key sites stash a whole `Flow` through [`stop_with_downstream`].
+/// The `Flow` slots [`foreach_forks`] and [`reduce_forks`] keep are
+/// [`StashedVerdict<Flow>`]s, which call it through
 /// [`stop_with_downstream`]. The classification rule stays in one place,
 /// which is what drifted twice before (#1313, #1457).
 pub(crate) fn mark_nonretryable_escape(control: &Control) {
