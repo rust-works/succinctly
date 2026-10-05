@@ -46156,6 +46156,15 @@ fn update_definitely_navigates(expr: &Expr) -> bool {
         Expr::Paren(inner) => update_definitely_navigates(inner),
         Expr::Pipe(stages) => stages.first().is_some_and(update_definitely_navigates),
         Expr::Comma(items) => items.iter().any(update_definitely_navigates),
+        // #3797: a collect, the left of a `//`, `first(f)` and `last(f)` run their
+        // body whatever it yields, and jq path-checks what it navigates, so
+        // `[.k] | $x`, `(.k // .) | $x` and `first(.k) | $x` raise as `.k | $x` does.
+        // The right of a `//` runs only when the left yields nothing truthy, and
+        // `limit(n; f)` may not run `f` at all (`n` of 0), so neither is read.
+        Expr::Array(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::LastExpr(inner)
+        | Expr::Alternative(inner, _) => update_definitely_navigates(inner),
         Expr::Optional(inner) if is_postfix_optional_primitive(inner) => {
             update_definitely_navigates(inner)
         }
