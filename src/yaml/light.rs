@@ -7333,6 +7333,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     /// two staying in step.
     const HAS_DELIMITER_CHECKS: bool = false;
 
+    const REUSE_FIELD_VALUE: bool = true;
+
     #[inline]
     fn value(&self) -> Self::Value {
         YamlCursor::value(self)

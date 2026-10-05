@@ -454,6 +454,18 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// for YAML.
     const HAS_DELIMITER_CHECKS: bool = true;
 
+    /// Whether a cursor walk that already holds a member's value (a
+    /// [`DocumentField`] is built with one) hands it to the member's own walk
+    /// instead of resolving it again from the member's cursor (#2664).
+    ///
+    /// `false` by default, so JSON's walks are untouched: resolving a JSON
+    /// value is a token classification, and carrying the value into the
+    /// callee costs it an argument. `true` for YAML, where the resolve decodes
+    /// the node and the walk was doing it twice per member -- the difference
+    /// between the shared walk costing 26-40% and 2-5% more than the
+    /// hand-written one it replaced on a 10 MB `--slurp`.
+    const REUSE_FIELD_VALUE: bool = false;
+
     /// Whether a sequence's elements, and a mapping's members, are exactly the
     /// chain [`next_element`](Self::next_element) walks from the first, so that
     /// a scan for one can resume from one an earlier scan already reached

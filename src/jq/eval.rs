@@ -67128,7 +67128,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // If single document, return it directly; otherwise return array
                                 let mut doc_values = Vec::new();
                                 while let Some((doc_cursor, rest)) = docs.uncons_cursor() {
-                                    let loaded = super::eval_generic::to_owned_cursor_unbound::<S, _>(
+                                    let loaded = super::eval_generic::to_owned_yaml_cursor::<S, _>(
                                         &doc_cursor,
                                     );
                                     debug_assert_materialization_error(&loaded);
@@ -67157,7 +67157,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // document's cursor either way.
                             _ => {
                                 let loaded =
-                                    super::eval_generic::to_owned_cursor_unbound::<S, _>(&root);
+                                    super::eval_generic::to_owned_yaml_cursor::<S, _>(&root);
                                 debug_assert_materialization_error(&loaded);
                                 match loaded {
                                     Ok(v) => QueryResult::Owned(v),

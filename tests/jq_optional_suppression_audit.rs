@@ -135,7 +135,7 @@ fn is_materializer_fn(name: &str) -> bool {
 ///
 /// Empty since #2664: its one entry, `yaml_value_to_owned_checked` (`load()`'s
 /// hand-written YAML walk, whose name hid the prefix in the *middle* -- #2334
-/// review), was folded onto `eval_generic::to_owned_cursor_unbound`, which the
+/// review), was folded onto `eval_generic::to_owned_yaml_cursor`, which the
 /// prefix rule finds by itself.
 ///
 /// Keep this roster empty if you can: a name that starts with `to_owned` is

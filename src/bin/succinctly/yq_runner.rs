@@ -19,7 +19,7 @@ use succinctly::jq::document::{
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
     check_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
-    to_owned_cursor as generic_to_owned_cursor, to_owned_cursor_unbound, to_owned_with_comments,
+    to_owned_cursor as generic_to_owned_cursor, to_owned_with_comments, to_owned_yaml_cursor,
     AnchorMark, CommentTree, GenericResult, NodeMeta, KEY_STYLE_STRING, VALUE_STYLE_STRING,
 };
 use succinctly::jq::stream::StreamFailure;
@@ -866,7 +866,7 @@ fn walk_yaml_display_keys(bytes: &[u8], refuse_complex: bool) -> Result<()> {
 /// where the default route and every other materializer already did, #1090).
 /// Folding onto the library's one walk (#2664) retired it.
 fn yaml_to_owned_value<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> Result<OwnedValue> {
-    to_owned_cursor_unbound::<YqSemantics, _>(&cursor).map_err(|e| anyhow::anyhow!("{e}"))
+    to_owned_yaml_cursor::<YqSemantics, _>(&cursor).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Read input from stdin as bytes.

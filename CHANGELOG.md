@@ -80,7 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the reindex round trip (#1176), which #2902 made unnecessary: it then leaked into string builtins, so `yq --eval-all '.a | tostring'` on `a: !!float 2`
   answered `"2.0"` where yq answers `"2"`, and `.a == 2` answered `false` where yq answers `true`. Both now match yq, as every other route already did.
   Pinned by `test_load_complex_mapping_key_spells_empty_like_the_runner_2664`, `test_load_colliding_complex_mapping_keys_raise_2664` and
-  `test_runner_walk_keeps_tag_forced_float_type_without_respelling_2664`.
+  `test_runner_walk_keeps_tag_forced_float_type_without_respelling_2664`. The shared walk resolved every YAML member's value twice (once when the
+  member was built, again on entering it), which cost the folded `--slurp` route 26-40% on a 10 MB document; it now reuses the first resolve
+  (`DocumentCursor::REUSE_FIELD_VALUE`, YAML only) and takes a one-resolve scalar path, leaving that route 0-5% over the hand-written walk and making
+  every other YAML materialization (`map_values`, `tojson`, ...) 7-19% faster on object-heavy documents.
 - **jq: a string slice in path position is no longer certified as the register by value** (#3793).
   `"s" | path(. as $k | .[0:] | $k)` answered `[{"start":0,"end":null}]` where jq refuses with `Invalid path expression with result "s"`, and
   `path(.a | . as $k | .[0:] | $k)` and `path(foreach .a as $k (0; $k|.[0:]; $k))` on `{"a":"s"}` did the same. jq's string slice is a copy and
