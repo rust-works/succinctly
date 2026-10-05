@@ -1200,9 +1200,10 @@ is the revert that established what the other one costs.
      entry) and refuses on `{"a":true,"b":null}` (`.a` decided and moved it), as in jq, on `path`, `del`, `=` and
      `|=`, through `?`, `try`, `first`, `limit` and `nth`, and for `isempty(g)` as a `cond` (`any(.[]; isempty(empty))`
      is `[0]`). Pinned by `test_pipe_stage_reads_the_backtracked_register_verdict_3758`, and in yq mode, where it is not
-     admitted (ADR-0018), by `test_yq_any_all_stage_keeps_no_path_register_3758`. One shape still refuses where jq
-     answers, pinned (`test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`): the verdict stage inside a
-     compound stage (`(any, any)`, `any // 1`) is refused as a whole (#3644). In yq mode `any`/`all` are real yq
+     admitted (ADR-0018), by `test_yq_any_all_stage_keeps_no_path_register_3758`. Two shapes still refuse where jq
+     answers, pinned (`test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`): the verdict stage on an
+     untracked entry (`1 | isempty(empty) | $x`, where the register is carried by the stage and no leaf states it),
+     and inside a compound stage (`(any, any)`, `any // 1`), which is refused as a whole (#3644). In yq mode `any`/`all` are real yq
      builtins and keep yq's own scalar error (`all only supports arrays, was !!int`); real yq rejects the two-argument
      form outright, so `--jq-extensions` keeps its refusal.
 

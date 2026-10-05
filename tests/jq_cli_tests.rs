@@ -61659,8 +61659,8 @@ fn test_pipe_stage_reads_the_backtracked_register_verdict_3758() -> Result<()> {
 }
 
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
-/// verdict stage inside a compound stage (`(any, any)`, `any // 1`) is refused as
-/// a whole (#3644; the plain stage was lifted by #3758, see
+/// verdict stage on an untracked entry (`1 | isempty(empty) | $x`) and one inside a compound stage
+/// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758, see
 /// [`test_pipe_stage_reads_the_backtracked_register_verdict_3758`]). And a
 /// computed `true` that decides under a `cond` on an untracked entry
 /// (`.a and any(true; select(.))`, an `and` right operand) is ambiguous -- it
@@ -61674,6 +61674,28 @@ fn test_pipe_stage_reads_the_backtracked_register_verdict_3758() -> Result<()> {
 #[test]
 fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
     for (input, filter, jq_answer, expected) in [
+        // #3758: the verdict is read on a trackable entry only. After a stage
+        // that computed (`1 | ...`, `tostring | ...`) the register is carried by
+        // the stage, no leaf producer states it, and `isempty(empty)` /
+        // `any(empty; .)` over it stay refused as they were.
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | isempty(empty) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":1}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 1 | any(empty; .) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":1}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | tostring | isempty(empty) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":1}"#,
+        ),
         // #3758: the same stage gap for a compound stage that mixes the verdict
         // stage with another branch (#3644's whole-stage refusal).
         (
