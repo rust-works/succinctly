@@ -50965,8 +50965,23 @@ fn test_yq_any_all_stage_keeps_no_path_register_3758() -> Result<()> {
         ("(. as $x | any | $x) = 5", Some("[false,false]\n")),
         ("(. as $x | all | $x) = 5", Some("[false,false]\n")),
         ("del(. as $x | any | $x)", None),
+        // The other spellings the jq-mode stage rule names, behind
+        // `--jq-extensions` where yq's own lexer rejects them.
+        (
+            "(. as $x | any(. == false) | $x) = 5",
+            Some("[false,false]\n"),
+        ),
+        (
+            "(. as $x | any(.[]; . == false) | $x) = 5",
+            Some("[false,false]\n"),
+        ),
+        (
+            "(. as $x | isempty(empty) | $x) = 5",
+            Some("[false,false]\n"),
+        ),
+        ("del(. as $x | isempty(empty) | $x)", None),
     ] {
-        let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I0"])?;
+        let (stdout, code) = run_yq_stdin(filter, doc, &["--jq-extensions", "-o", "json", "-I0"])?;
         match expected {
             Some(expected) => {
                 assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");

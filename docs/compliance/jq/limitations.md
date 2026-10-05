@@ -1199,11 +1199,14 @@ is the revert that established what the other one costs.
      entry. `path(. as $x | any | $x)` on `{"a":false,"b":null}` is `[]` (nothing decided, the register is back at the
      entry) and refuses on `{"a":true,"b":null}` (`.a` decided and moved it), as in jq, on `path`, `del`, `=` and
      `|=`, through `?`, `try`, `first`, `limit` and `nth`, and for `isempty(g)` as a `cond` (`any(.[]; isempty(empty))`
-     is `[0]`). Pinned by `test_pipe_stage_reads_the_backtracked_register_verdict_3758`, and in yq mode, where it is not
-     admitted (ADR-0018), by `test_yq_any_all_stage_keeps_no_path_register_3758`. Two shapes still refuse where jq
-     answers, pinned (`test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`): the verdict stage on an
-     untracked entry (`1 | isempty(empty) | $x`, where the register is carried by the stage and no leaf states it),
-     and inside a compound stage (`(any, any)`, `any // 1`), which is refused as a whole (#3644). In yq mode `any`/`all` are real yq
+     is `[0]`). Pinned by `test_pipe_stage_reads_the_backtracked_register_verdict_3758` (including
+     `any(.[]; isempty(empty))`), and in yq mode, where it is not admitted (ADR-0018), by
+     `test_yq_any_all_stage_keeps_no_path_register_3758`. Shapes that still refuse where jq answers, in the safe
+     direction (a sample, not an exhaustive list), pinned by
+     `test_any_all_pipe_stage_verdict_residuals_stay_refused_3757`: the verdict stage on an untracked entry
+     (`1 | isempty(empty) | $x`, where the register is carried by the stage and no leaf states it), inside a
+     compound stage (`(any, any)`, `any // 1`, `any? // 1`), which is refused as a whole (#3644), and behind a
+     `def` call or a `reduce` (`def f: any; f | $x`), which state no register. In yq mode `any`/`all` are real yq
      builtins and keep yq's own scalar error (`all only supports arrays, was !!int`); real yq rejects the two-argument
      form outright, so `--jq-extensions` keeps its refusal.
 

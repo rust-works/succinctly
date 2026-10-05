@@ -51323,9 +51323,11 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         // only, where the step's register is the one that entered; an untracked
         // entry's is the carried copy, which no leaf producer sees. A result
         // that navigated (a decided one, `.[]`'s own index) is read by
-        // `reports_register` instead, and both consumers of this value already
-        // ask `!navigated`.
-        let states_register = stages_per_result_register && trackable_step_eligible;
+        // `reports_register` instead; the consumers of this value ask
+        // `!navigated` themselves, and it is stated here too so the claim does
+        // not rest on them.
+        let states_register =
+            stages_per_result_register && trackable_step_eligible && !facts.navigated;
         let register_entering = if !(stage_preserves_register || seed || states_register) {
             None
         } else if trackable_step_eligible {

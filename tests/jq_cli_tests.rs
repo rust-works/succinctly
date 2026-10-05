@@ -61339,6 +61339,42 @@ fn test_any_all_gen_retrying_pattern_supersedes_the_stashed_escape_3757() -> Res
 #[test]
 fn test_pipe_stage_reads_the_backtracked_register_verdict_3758() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
+        // `isempty(g)` as the `cond` of an `any`: a stage of `gen | cond`.
+        (
+            r"[true,false]",
+            r"path(any(.[]; isempty(empty)))",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true,false]",
+            r"del(any(.[]; isempty(empty)))",
+            "[false]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true,false]",
+            r"(any(.[]; isempty(empty))) = 5",
+            "[5,false]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true,false]",
+            r"path(all(.[]; isempty(empty)))",
+            "",
+            r"Invalid path expression with result true",
+            5,
+        ),
+        (
+            r"[true,false]",
+            r"path(any(.[]; isempty(.)))",
+            "",
+            r"Invalid path expression with result false",
+            5,
+        ),
         (
             r#"{"a":false,"b":null}"#,
             r"path(. as $x | any | $x)",
@@ -61695,6 +61731,20 @@ fn test_any_all_pipe_stage_verdict_residuals_stay_refused_3757() -> Result<()> {
             r"path(. as $x | tostring | isempty(empty) | $x)",
             "[]",
             r#"Invalid path expression with result {"a":1}"#,
+        ),
+        // #3758: a verdict stage the resolver cannot see as one: behind a `def`
+        // call or a `reduce`, which hand back no register statement.
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | def f: any; f | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":false}"#,
+        ),
+        (
+            r#"{"a":false}"#,
+            r"path(. as $x | reduce 1 as $i (.; any) | $x)",
+            "[]",
+            r#"Invalid path expression with result {"a":false}"#,
         ),
         // #3758: the same stage gap for a compound stage that mixes the verdict
         // stage with another branch (#3644's whole-stage refusal).
