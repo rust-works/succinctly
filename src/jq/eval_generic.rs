@@ -14788,8 +14788,7 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
     // later ones (jq's `E as $t`). An error on one output comes after the
     // outputs before it, as in jq.
     if S::TAG == EvalTag::Jq && !crate::jq::eval::yields_at_most_one_value(target) {
-        let mut own_escape: Option<Control> = None;
-        let mut stopped = false;
+        let drive = crate::jq::eval::TargetDrive::new();
         let flow = eval_each_generic::<S, V>(
             target,
             value,
@@ -14798,45 +14797,32 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
             &mut MaterializesLazyItems(|item: GenericItem<V>| {
                 // A re-invocation after a stop is a `?//` retry inside the
                 // target (#3293): it supersedes the retried-past call.
-                own_escape = None;
-                stopped = false;
+                drive.begin();
                 let t = match generic_item_into_owned::<V, S>(item) {
                     Ok(t) => t,
-                    Err(control) => {
-                        own_escape = Some(control);
-                        return Demand::Stop;
-                    }
+                    Err(control) => return drive.stop_with_escape(control),
                 };
                 match index_owned_checked::<S>(&t, k, optional) {
                     Ok(Some(v)) => {
                         if sink.push(GenericItem::Owned(v)) == Demand::Stop {
-                            stopped = true;
-                            return Demand::Stop;
+                            return drive.consumer_stop();
                         }
                         Demand::Continue
                     }
                     Ok(None) => Demand::Continue,
-                    Err(e) => {
-                        own_escape = Some(Control::Error(e));
-                        Demand::Stop
-                    }
+                    Err(e) => drive.stop_with_escape(Control::Error(e)),
                 }
             }),
         );
-        if stopped {
-            return false;
-        }
-        if let Some(control) = own_escape {
-            escape.stop(control);
-            return false;
-        }
-        return match flow {
-            Flow::Exhausted => true,
-            Flow::Stopped { .. } => false,
-            Flow::Escaped(control) => {
+        use crate::jq::eval::TargetEnd;
+        return match drive.finish(flow, crate::jq::eval::direct_pattern_retry(target)) {
+            TargetEnd::ConsumerStopped => false,
+            TargetEnd::Escape(control) | TargetEnd::Ended(Flow::Escaped(control)) => {
                 escape.stop(control);
                 false
             }
+            TargetEnd::Ended(Flow::Exhausted) => true,
+            TargetEnd::Ended(Flow::Stopped { .. }) => false,
         };
     }
     let literal_key = owned_to_expr(k);
@@ -18944,8 +18930,8 @@ fn slice_pair_streaming<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> (Option<Control>, bool) {
-    let mut escape: Option<Control> = None;
-    let mut stopped = false;
+    use crate::jq::eval::{TargetDrive, TargetEnd};
+    let drive = TargetDrive::new();
     let flow = eval_each_generic::<S, V>(
         target,
         value,
@@ -18954,39 +18940,33 @@ fn slice_pair_streaming<S: EvalSemantics, V: DocumentValue>(
         &mut MaterializesLazyItems(|item: GenericItem<V>| {
             // A re-invocation after a stop is a `?//` retry inside the target
             // (#3293): it supersedes the retried-past call.
-            escape = None;
-            stopped = false;
+            drive.begin();
             let t = match generic_item_into_owned::<V, S>(item) {
                 Ok(t) => t,
-                Err(control) => {
-                    escape = Some(control);
-                    return Demand::Stop;
-                }
+                Err(control) => return drive.stop_with_escape(control),
             };
             match slice_owned_value_read_computed::<S>(&t, s, e, optional) {
                 Ok(Some(v)) => {
                     if sink(v) == Demand::Stop {
-                        stopped = true;
-                        return Demand::Stop;
+                        return drive.consumer_stop();
                     }
                     Demand::Continue
                 }
                 Ok(None) => Demand::Continue,
-                Err(err) => {
-                    escape = Some(Control::Error(err));
-                    Demand::Stop
-                }
+                Err(err) => drive.stop_with_escape(Control::Error(err)),
             }
         }),
     );
-    match flow {
-        Flow::Escaped(control) if escape.is_none() && !stopped => escape = Some(control),
+    match drive.finish(flow, crate::jq::eval::direct_pattern_retry(target)) {
+        TargetEnd::ConsumerStopped => (None, true),
+        TargetEnd::Escape(control) | TargetEnd::Ended(Flow::Escaped(control)) => {
+            (Some(control), false)
+        }
+        TargetEnd::Ended(Flow::Exhausted) => (None, false),
         // A stop the consumer did not issue is a stale enclosing driver's
         // (#3293); the pair ends, as the index twin's does.
-        Flow::Stopped { .. } if escape.is_none() => stopped = true,
-        _ => {}
+        TargetEnd::Ended(Flow::Stopped { .. }) => (None, true),
     }
-    (escape, stopped)
 }
 
 /// One `(s, e)` pair's worth of [`each_slice_expr_generic`]'s work: evaluate

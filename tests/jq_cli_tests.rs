@@ -103035,3 +103035,247 @@ fn test_any_all_condition_retry_extra_verdicts_3819() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3807 rows over `null`: a `?//` in a computed index's or slice's target
+const RETRY_ROWS_TARGET_RETRY_3807: &[RetryRow3293] = &[
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0)]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0)], 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0):(1|.+0)]"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0):(1|.+0)], 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0):(1|.+0)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | select(type=="array"|not))[(0|.+0):(1|.+0)]), 9]"#,
+        "[9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0)], 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0):(1|.+0)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0):(1|.+0)], 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0):(1|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then error("E2") else . end)[(0|.+0):(1|.+0)]), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0)]"#,
+        "5\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0)], 9]"#,
+        "[5,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0)]), 9]"#,
+        "[5,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0)]), 9]"#,
+        "[5,9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0):(1|.+0)]"#,
+        "[5]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0):(1|.+0)], 9]"#,
+        "[[5],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0):(1|.+0)]), 9]"#,
+        "[[5],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// $q | ("A"|stderr) | $q | if type=="array" then [5,6] else . end)[(0|.+0):(1|.+0)]), 9]"#,
+        "[[5],9]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0)], 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0):(1|.+0)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0):(1|.+0)], 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[first(([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0):(1|.+0)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[limit(1; ([{"x":1}] as [$q] ?// {$z} | ("A"|stderr) | $q)[(0|.+0):(1|.+0)]), 9]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+];
+
+/// #3807: a `?//` inside a computed index's or slice's *target* (`(G)[K]`,
+/// `(G)[a:b]`). The drive of `G` stashes the first alternative's index/slice
+/// error and answers `Stop`; the retry then produces nothing, raises, answers,
+/// or fails to destructure. A retry that never re-invokes the closure left the
+/// abandoned alternative's error to outrank it (and a consumer's stop to outrank
+/// a retry's raise). Rows cover all four endings for the index and slice forms,
+/// bare and under `first`/`limit`/an array collector, on the owned route and the
+/// document route. Every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+#[test]
+fn test_retry_in_computed_index_and_slice_target_3807() -> Result<()> {
+    // Owned route (`eval.rs`): the input is built under `-n`.
+    assert_retry_rows_3293(None, "null | ", RETRY_ROWS_TARGET_RETRY_3807)?;
+    // Document route (`eval_generic.rs`): the input stays on the cursor.
+    assert_retry_rows_3293(Some("null"), "", RETRY_ROWS_TARGET_RETRY_3807)
+}
