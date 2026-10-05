@@ -43639,9 +43639,13 @@ fn resolve_bind_source_witness<S: EvalSemantics>(
 /// The slots that are *not* sources -- a condition, a count, a handler --
 /// are arbitrary: the resolver evaluates conditions and counts by value, as
 /// jq's subexps do, and a handler's output is untracked. What keeps the
-/// grammar closed is that no other node may produce an output: a literal, a
-/// construction, a navigation, a call or a variable each falls to the
-/// by-value route, so a value the resolver cannot place is never certified.
+/// grammar closed is that no other node may produce an output: a navigation,
+/// a call or a variable falls to the by-value route, so a value the resolver
+/// cannot place is never certified. The one exception is a literal or a
+/// construction ([`is_fresh_leaf`], #3423): jq builds it fresh, so it is never
+/// the register, and the resolver places it as computed (an untracked branch,
+/// bound by value), which is what keeps `select(false) // {"a":1}` an exact
+/// source instead of an ambiguous one.
 ///
 /// Measured against `/usr/bin/jq` 1.7.1 with `scripts/jq-bind-origin-fuzz.py`
 /// (25 runs of 3,000 programs over every family) and

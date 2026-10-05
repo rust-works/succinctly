@@ -3243,9 +3243,11 @@ answers `["b"]` — and classified the two residuals appended below):
     - a transparent source with an effect (`debug`, `stderr`, `input`, `halt`, a call;
       `walk_body_may_have_effects`) keeps the by-value route, because the witness can decline
       after running it (a `catch .b` navigating the error value is a resolver refusal) and the
-      by-value re-run would repeat the effect. Under a `try`, such a `$x`'s refusal is still
-      caught and the write jq performs is **silently skipped**
-      (`del(select(debug) as $v | try $v.b)`);
+      by-value re-run would repeat the effect. Such a `$x` used to be caught under a `try`
+      and the write jq performs silently skipped; since
+      [#3423](https://github.com/rust-works/succinctly/issues/3423) a `select`/`first`/`limit`
+      source whose output equals the register binds with an `Unproven` marker and refuses
+      loudly (`del(select(debug) as $v | try $v.b)`, jq's `{"a":1}` on `{"a":1,"b":{"c":1}}`);
     - every other non-`.` source (`last(.)`, [#3766](https://github.com/rust-works/succinctly/issues/3766);
       a comma or `label` head; a marker head after the register is lost) used to share that
       silent skip under `try`: the general class
