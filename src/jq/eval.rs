@@ -38401,23 +38401,19 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                 // that differs from the register, or a register not in hand, cannot
                 // be it by pointer, so the mark is the ordinary non-certifying one
                 // and the refusal stays exact.
-                let origin = match &marker.origin {
-                    Origin::Unproven
-                        if !(if trackable {
-                            Some(value)
-                        } else {
-                            frame.register()
-                        })
-                        .is_some_and(|reg| marker.value == *reg) =>
-                    {
-                        Origin::Untracked
-                    }
-                    origin => origin.clone(),
+                let demoted = Origin::Untracked;
+                let origin = if matches!(marker.origin, Origin::Unproven)
+                    && !register_in_hand(value, trackable, frame)
+                        .is_some_and(|reg| equals_register(&marker.value, reg))
+                {
+                    &demoted
+                } else {
+                    &marker.origin
                 };
                 resolve_leaf::<S>(expr, value, trackable, snapshot, frame, keep).map(|branches| {
                     branches
                         .into_iter()
-                        .map(|b| b.into_marked(&origin))
+                        .map(|b| b.into_marked(origin))
                         .collect()
                 })
             }
@@ -43778,7 +43774,7 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
     // to the register at the use site the guess it is (loud, uncatchable: #3267).
     // Jq mode only (ADR-0018); no yq row observes the marker (probed over a dozen),
     // so this is the one place the mode is stated.
-    let may_alias = source_may_alias_register::<S>(source);
+    let may_alias = core::cell::OnceCell::new();
     resolve_bind_source_sink::<S>(
         source,
         body,
@@ -43790,14 +43786,11 @@ fn resolve_as_source_sink<'a, S: EvalSemantics>(
             // Equal to the register *now*: an output that differs from it cannot be
             // its node whatever the source forwarded (`(select(false) // .a) as $v`
             // binds `.a`, which an equal-valued sibling register is not).
-            let ambiguous = may_alias
-                && !witnessed
-                && origin.is_none()
-                && if trackable {
-                    bound == *value
-                } else {
-                    frame.register().is_some_and(|reg| bound == *reg)
-                };
+            let ambiguous = !witnessed
+                && *may_alias
+                    .get_or_init(|| source_may_alias_register::<S>(source, trackable, frame))
+                && register_in_hand(value, trackable, frame)
+                    .is_some_and(|reg| equals_register(&bound, reg));
             let substituted = substitute_bound_var_at(
                 source,
                 body,
@@ -44427,8 +44420,8 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                     // step's refusal is jq's own verdict, which a `try` catches
                     // (`try (. as {a:$q, b:$r} | $r)`).
                     let may_be_register = !identical
-                        && register.is_some_and(|reg| bound == reg)
-                        && source_may_alias_register::<S>(source);
+                        && register.is_some_and(|reg| equals_register(bound, reg))
+                        && source_may_alias_register::<S>(source, trackable, frame);
                     return ResolveFlow::Escaped(match control {
                         Control::Error(e) => EvalEscape::Error(guess_refusal_of(
                             e,
@@ -45232,20 +45225,29 @@ impl NavKind {
 /// ([`could_be_lost_register`]); a call or fold that forwards its input stays a
 /// residual (#3423). A `catch` handler's `.` is the error payload, not the
 /// register, so only a `$var` it names counts there (#3334 review).
-fn may_alias_register(source: &Expr) -> bool {
-    fn alias(expr: &Expr, identity: bool) -> bool {
+fn may_alias_register(source: &Expr, register_frame: Option<&Frame>) -> bool {
+    fn alias(expr: &Expr, identity: bool, frame: Option<&Frame>) -> bool {
+        let any = |e: &Expr, identity: bool| alias(e, identity, frame);
         match unwrap_bind_source(expr) {
             Expr::Identity => identity,
-            Expr::TrackedVar(_) | Expr::Var(_) => true,
-            Expr::Comma(exprs) => exprs.iter().any(|e| alias(e, identity)),
+            // A marker bound at a position the register's own frame can compare and
+            // does not name is a different node, whatever it equals (`.a as $y | .c
+            // | try (first($y) as {b:$q} | $q)` on equal siblings: jq catches it).
+            Expr::TrackedVar(marker) => !matches!(
+                &marker.origin,
+                Origin::At { invocation, path }
+                    if frame.is_some_and(|f| f.at.is_some() && !f.names(*invocation, path))
+            ),
+            Expr::Var(_) => true,
+            Expr::Comma(exprs) => exprs.iter().any(|e| any(e, identity)),
             Expr::If {
                 then_branch,
                 else_branch,
                 ..
-            } => alias(then_branch, identity) || alias(else_branch, identity),
-            Expr::Alternative(left, right) => alias(left, identity) || alias(right, identity),
+            } => any(then_branch, identity) || any(else_branch, identity),
+            Expr::Alternative(left, right) => any(left, identity) || any(right, identity),
             Expr::Try { expr, catch } => {
-                alias(expr, identity) || catch.as_deref().is_some_and(|c| alias(c, false))
+                any(expr, identity) || catch.as_deref().is_some_and(|c| any(c, false))
             }
             Expr::Optional(inner)
             | Expr::FirstExpr(inner)
@@ -45255,9 +45257,11 @@ fn may_alias_register(source: &Expr) -> bool {
             | Expr::Label { body: inner, .. }
             | Expr::As { body: inner, .. }
             | Expr::AsPattern { body: inner, .. }
-            | Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
-                alias(inner, identity)
-            }
+            | Expr::Builtin(
+                Builtin::FirstStream(inner)
+                | Builtin::LastStream(inner)
+                | Builtin::NthStream(_, inner),
+            ) => any(inner, identity),
             Expr::Builtin(builtin)
                 if matches!(builtin, Builtin::Select(_)) || is_type_filter(builtin) =>
             {
@@ -45266,19 +45270,46 @@ fn may_alias_register(source: &Expr) -> bool {
             // Each stage's `.` is what the stages before it left.
             Expr::Pipe(stages) => stages
                 .iter()
-                .fold(identity, |input_aliases, stage| alias(stage, input_aliases)),
+                .fold(identity, |input_aliases, stage| any(stage, input_aliases)),
             _ => false,
         }
     }
-    alias(source, true)
+    alias(source, true, register_frame)
 }
 
 /// Whether [`resolve_as_source_sink`] and the destructuring walk must treat `source`
 /// as possibly the register's own node (#3423): [`may_alias_register`], in jq mode,
 /// for a source [`identity_passthrough`] has not already proven to be `.` -- one
 /// definition for both bind sites, so they cannot disagree on what is ambiguous.
-fn source_may_alias_register<S: EvalSemantics>(source: &Expr) -> bool {
-    S::TAG == EvalTag::Jq && !identity_passthrough(source, true) && may_alias_register(source)
+fn source_may_alias_register<S: EvalSemantics>(
+    source: &Expr,
+    trackable: bool,
+    frame: &Frame,
+) -> bool {
+    // The frame's position is the register's only while the entry is trackable.
+    S::TAG == EvalTag::Jq
+        && !identity_passthrough(source, true)
+        && may_alias_register(source, trackable.then_some(frame))
+}
+
+/// The register in hand at a stage: the ambient value itself while trackable, else
+/// the one the frame carries (#3423).
+fn register_in_hand<'a>(
+    value: &'a OwnedValue,
+    trackable: bool,
+    frame: &'a Frame,
+) -> Option<&'a OwnedValue> {
+    if trackable {
+        Some(value)
+    } else {
+        frame.register()
+    }
+}
+
+/// Whether `candidate` equals the register `register`: O(1) when the two share
+/// storage -- the case a pass-through produces -- else a structural compare (#3423).
+fn equals_register(candidate: &OwnedValue, register: &OwnedValue) -> bool {
+    candidate.shares_storage_with(register) || candidate == register
 }
 
 /// A literal or construction: a value jq builds fresh, never the register, which
