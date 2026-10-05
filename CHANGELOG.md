@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a `foreach` whose UPDATE is `true or <navigating operand>` and whose EXTRACT is the bound variable no longer answers the root path** (#3775).
+  `path(foreach .a? as $k (0; (true or .[]?); $k))` on `null` is `["a"]` in jq and answered `[]` here, and `(...) = 9` replaced the
+  whole document with `9` (exit 0) where jq writes `{"a":9}`. `FoldRegister::advance` rebuilt the register of a stage it cannot see
+  inside at the root, discarding where the source had left it, so the terminal's `null` carve-out (#3579) read the emission as the
+  root. It now keeps the path it entered UPDATE at, and every input (`null`, an object with or without `a`, a falsy `a`) refuses with
+  exit 5, which no `try` can catch. jq answers these rows; matching it needs `or`'s short-circuit modelled, which is not done here.
+  Pinned by `test_foreach_true_or_update_extracting_the_variable_never_answers_the_root_3775`.
 - **jq: a `foreach` that cannot move the path register no longer turns jq's catchable error into an uncatchable refusal** (#3761).
   `path((.a | ..) as $v0 | foreach (1) as $i (.; $v0; .) | ($v0 | .b?)?)` on `{"a":{"b":1}}` is empty in jq (exit 0: the
   `?` catches the invalid-path error) and exited 5 here, and `del(...)` / `(...) = 9` refused where jq writes nothing. The
