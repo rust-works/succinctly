@@ -94563,6 +94563,9 @@ fn test_owned_identity_retry_supersedes_stashed_verdict_3293() -> Result<()> {
 /// operand, `//`, `label`, `try`, `first`, `limit`, `nth`, `any`, `all` -- under all four retry
 /// endings. `key` is not a jq builtin: every value is captured from `/usr/bin/jq` 1.7.1 with `1` in
 /// its place (`key` answers `1` at `.x[1]`).
+/// Three combinations are left out because `1` cannot stand in for `key` there: `(W // 9)` over an
+/// empty `W`, and `(try W catch 0)` over a raising or destructure-failing `W`, answer from a literal
+/// or a handler, which `key` reads as `null` where the stand-in prints `1`.
 const RETRY_ROWS_OWNED_IDENTITY_STASH_3805: &[RetryRow3293] = &[
     (
         r#"(. + ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|if type=="array" then 1 else 2 end))) | . as $v | key | if $v == 21 then error("E") else . end"#,
@@ -94628,6 +94631,20 @@ const RETRY_ROWS_OWNED_IDENTITY_STASH_3805: &[RetryRow3293] = &[
         0,
     ),
     (
+        r#"any((if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end); true) | . as $v | key | if $v == true then error("E") else . end"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
+        r#"all((if ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | ($q|type=="array")) then . + 1 else . + 2 end); false) | . as $v | key | if $v == false then error("E") else . end"#,
+        "",
+        "AA",
+        "E",
+        5,
+    ),
+    (
         r#"(. + ([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | (if ($q|type=="array") then 1 else empty end))) | . as $v | key | if $v == 21 then error("E") else . end"#,
         "",
         "AA",
@@ -94679,6 +94696,20 @@ const RETRY_ROWS_OWNED_IDENTITY_STASH_3805: &[RetryRow3293] = &[
     (
         r#"all(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end); key as $k | if . == 21 then error("E") else true end)"#,
         "true\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"any(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end); true) | . as $v | key | if $v == true then error("E") else . end"#,
+        "1\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"all(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else empty end); false) | . as $v | key | if $v == false then error("E") else . end"#,
+        "1\n",
         "AA",
         "",
         0,
@@ -94740,6 +94771,20 @@ const RETRY_ROWS_OWNED_IDENTITY_STASH_3805: &[RetryRow3293] = &[
         5,
     ),
     (
+        r#"any(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end); true) | . as $v | key | if $v == true then error("E") else . end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"all(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then . + 1 else error("E2") end); false) | . as $v | key | if $v == false then error("E") else . end"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
         r#"(. + ([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | 1)) | . as $v | key | if $v == 21 then error("E") else . end"#,
         "",
         "A",
@@ -94790,6 +94835,20 @@ const RETRY_ROWS_OWNED_IDENTITY_STASH_3805: &[RetryRow3293] = &[
     ),
     (
         r#"all(([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1); key as $k | if . == 21 then error("E") else true end)"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"any(([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1); true) | . as $v | key | if $v == true then error("E") else . end"#,
+        "",
+        "A",
+        "Cannot index array with string \"x\"",
+        5,
+    ),
+    (
+        r#"all(([["a"]] as [$q] ?// {x:$q} | ("A"|stderr) | . + 1); false) | . as $v | key | if $v == false then error("E") else . end"#,
         "",
         "A",
         "Cannot index array with string \"x\"",
