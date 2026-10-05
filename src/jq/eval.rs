@@ -45814,8 +45814,30 @@ fn each_fold_bind<S: EvalSemantics>(
 /// does, and `del`/`=` would write through it. That refusal propagates
 /// instead: a refusal where jq might answer, never an answer jq would not
 /// give.
-fn fold_walk_refusal_is_guess(elem: &FoldSourceValue, reg: &FoldRegister) -> bool {
+///
+/// **The one exemption** (#3743): a literal-keyed `pattern` that raises when
+/// destructured by value ([`pattern_walk_fails_by_value`]) raises in jq too, at
+/// the step it fails at or earlier, whatever the register is, so there is no
+/// verdict a lost or equal register could change and its refusal is jq's own.
+/// This is a fold-only rule: [`resolve_as_pattern`] keeps its own
+/// `refusal_is_exact`, so `. as [$a] ?// $a` over the same object still reads the
+/// equal-by-value element as a guess there.
+fn fold_walk_refusal_is_guess<S: EvalSemantics>(
+    pattern: &Pattern,
+    elem: &FoldSourceValue,
+    reg: &FoldRegister,
+) -> bool {
     if elem.register_path.is_some() {
+        return false;
+    }
+    // #3743: a pattern that fails by value raises in jq whether or not the element
+    // is the register's node (`{"a":1} | . as [$a]` is "Cannot index object with
+    // number" when it is, a path error when it is not), and `?//` retries either.
+    // There is no verdict a lost or equal register could change, which is the
+    // premise of the guess below. Without this, `reduce . as [$a] ?// $a (0; .)`
+    // over the document itself refused the one alternative jq runs past, and an
+    // enclosing `try` swallowed the refusal into its handler.
+    if pattern_walk_fails_by_value::<S>(pattern, &elem.value) {
         return false;
     }
     // #2159: a destructuring step on a non-null scalar raises in jq whatever
@@ -45845,6 +45867,26 @@ fn fold_walk_refusal_is_guess(elem: &FoldSourceValue, reg: &FoldRegister) -> boo
     !trackable
         || (!matches!(elem.value, OwnedValue::Null | OwnedValue::Bool(_))
             && elem.value == *register)
+}
+
+/// Whether destructuring `value` with the literal-keyed `pattern` raises a value
+/// error at *some* step (#3743), whatever jq's path register is.
+///
+/// jq raises at a step whose input is not the register's node (a path error) and
+/// at one whose input is, but which cannot index it (`Cannot index object with
+/// number`): either way the alternative fails, `?//` retries, and a `try` around
+/// it catches. So a walk that fails by value fails in jq at the step it fails
+/// at, or earlier, and a refusal of it is jq's own verdict, never the walk's
+/// guess at `path_intact`. The converse does not hold (a walk that succeeds by
+/// value may still raise in jq, `{a:$x, b:$y}`'s second entry), so a pattern that
+/// does not fail here keeps the guess. A computed key is not judged: running it
+/// would repeat its effects.
+fn pattern_walk_fails_by_value<S: EvalSemantics>(pattern: &Pattern, value: &OwnedValue) -> bool {
+    !pattern_has_computed_key(pattern)
+        && matches!(
+            each_pattern_binding_set::<S>(pattern, value, false, &mut |_| Demand::Continue),
+            Flow::Escaped(Control::Error(_))
+        )
 }
 
 /// The resolver's own two refusal kinds (#2979): a pattern step or a
@@ -46283,10 +46325,11 @@ enum FoldStepOutcome {
 /// retries only when it is jq's own verdict ([`walk_escape_retries`],
 /// guided by [`fold_walk_refusal_is_guess`]); a key generator's `break`
 /// retries like any other, `halt` never.
-fn settle_fold_alternative(
+fn settle_fold_alternative<S: EvalSemantics>(
     outcome: Option<FoldStepOutcome>,
     walk: Flow,
     is_last: bool,
+    pattern: &Pattern,
     elem: &FoldSourceValue,
     reg: &FoldRegister,
     aborted: &StashedEscape,
@@ -46300,7 +46343,13 @@ fn settle_fold_alternative(
             unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, returned just above (#2872)"
         }
         Flow::Escaped(control) => {
-            if walk_escape_retries(&control, is_last, fold_walk_refusal_is_guess(elem, reg)) {
+            // Asked only of a refusal that could retry: the by-value walk inside
+            // [`fold_walk_refusal_is_guess`] is not free (#3743), and
+            // [`walk_escape_retries`] reads `guessed` for nothing else.
+            let guessed = !is_last
+                && matches!(&control, Control::Error(e) if is_resolver_refusal(e))
+                && fold_walk_refusal_is_guess::<S>(pattern, elem, reg);
+            if walk_escape_retries(&control, is_last, guessed) {
                 FoldStepOutcome::Retry
             } else {
                 FoldStepOutcome::Return(aborted.stop(control))
@@ -47073,7 +47122,9 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                         }
                     },
                 );
-                match settle_fold_alternative(outcome, walk, is_last, &elem, &reg, &aborted) {
+                match settle_fold_alternative::<S>(
+                    outcome, walk, is_last, pattern, &elem, &reg, &aborted,
+                ) {
                     FoldStepOutcome::Retry => continue,
                     FoldStepOutcome::Return(demand) => return demand,
                 }
@@ -47589,7 +47640,9 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         Demand::Continue
                     },
                 );
-                match settle_fold_alternative(outcome, walk, is_last, &elem, &reg, &aborted) {
+                match settle_fold_alternative::<S>(
+                    outcome, walk, is_last, pattern, &elem, &reg, &aborted,
+                ) {
                     FoldStepOutcome::Retry => continue,
                     FoldStepOutcome::Return(demand) => return demand,
                 }

@@ -324,6 +324,34 @@ OPERANDS = [
     "[last(limit(1; .[]?))]",
     "[last(.[]? | select(.))]",
     "[try last(1 | .a)]",
+    # (#3743) a fold's `?//` pattern over a source that is the register itself (`.`):
+    # the first alternative's step can never succeed on the element, so jq raises and
+    # retries whether or not the element is the register's node. The contrasts are a
+    # source that is not the register (`.a`, a literal), a first step that can succeed
+    # (`[$a]` over an array), no alternatives, and a computed key (no kind to judge).
+    # The operands whose pattern succeeds by value (`{a:$a}` over a document with `a`,
+    # `[[$a]]` over `[[1]]`) and the computed-key one are the known-refused class: the
+    # walk's guess still refuses them where jq answers, so a delta there is expected.
+    "(reduce . as [$a] ?// $a (0; .))",
+    "(reduce . as {a:$a} ?// $a (0; .))",
+    "(reduce . as {a:$a} ?// [$a] (0; .))",
+    "(reduce . as [[$a]] ?// $a (0; .))",
+    "(reduce . as [$a] ?// {a:$a} ?// $a (0; .))",
+    "(reduce .a as [$a] ?// $a (0; .))",
+    "(reduce .[]? as [$a] ?// $a (0; .))",
+    "(reduce . as {(\"a\"):$a} ?// $a (0; .))",
+    "(reduce . as [$a] (0; .))",
+    "(reduce . as [[$a]] (0; .))",
+    "try (reduce . as [[$a]] (0; .)) catch 7",
+    "(reduce . as [[$a]] ?// [$a] (0; .))",
+    "(reduce . as {a:{b:$a}} ?// $a (0; .))",
+    "try (reduce . as {a:[[$a]]} (0; .)) catch 7",
+    "(foreach . as [$a] ?// $a (0; .; .))",
+    "(foreach . as {a:$a} ?// [$a] (0; .; $a))",
+    "(foreach . as [$a] ?// $a (0; $a; .))",
+    "(foreach .a as [$a] ?// $a (0; .; .))",
+    "try (reduce . as [$a] ?// $a (0; .)) catch 7",
+    "try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1",
     "first(.a)",
     "nth(0; .a)",
     "limit(1; .a)",

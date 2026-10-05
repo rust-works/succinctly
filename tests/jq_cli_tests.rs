@@ -61902,6 +61902,247 @@ fn test_verdict_stage_on_an_untracked_entry_3826() -> Result<()> {
     ])
 }
 
+/// #3743: a fold's destructuring `?//` over the document itself retries when the
+/// pattern fails by value. `reduce . as [$a] ?// $a (0; .)` binds `.` (the
+/// register's own node) to `[$a]`, which is "Cannot index object with number" in
+/// jq whether or not `.` is the register, and `?//` retries the next alternative.
+/// The resolver called that refusal a guess (the element equals the register by
+/// value, so jq "might" have carried on) and did not retry, so a `try` around it
+/// ran its handler for an error jq never raised: `path(foreach (try ((reduce . as
+/// [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))` lost the reduce's `0`
+/// and answered one path where jq answers two. A literal-keyed pattern that
+/// raises when destructured by value (`pattern_walk_fails_by_value`), at any step
+/// (`[[$a]]` over `[1]`), is exact. Every row captured from jq 1.7.1, on the stdin
+/// and `-n` routes.
+#[test]
+fn test_fold_pattern_that_fails_by_value_retries_3743() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try (0, .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce 1 as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as [$a] ?// $a (0; .)), .b | .[0]) catch 1) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r#"path(foreach (try ((reduce . as [$a] ?// $a (0; .)), error("x")) catch 1) as $x (.; .; .))"#,
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"[foreach (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .)]",
+            "[{\"a\":[1],\"b\":\"abc\"},{\"a\":[1],\"b\":\"abc\"}]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(reduce (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1)",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(first(try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1))",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as [[$a]] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((foreach . as [$a] ?// $a (0; .; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce .a as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach (try ((reduce . as [$a] (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(reduce . as [$a] ?// $a (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"path(foreach . as [$a] ?// $a (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"[path(foreach (reduce . as [$a] ?// $a (0; .)) as $x (.; .; .))]",
+            "[[]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"del(foreach (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1],"b":"abc"}"#,
+            r"(foreach (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .)) = 5",
+            "5\n",
+            "",
+            0,
+        ),
+        // An object pattern's first step over a document that is no object.
+        (
+            r"[1,2]",
+            r"path(foreach (try ((reduce . as {a:$a} ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r#"path(foreach (try ((reduce . as {"a":$a} ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))"#,
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"path(foreach (try ((reduce . as {$a} ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"path(foreach (try ((reduce . as {a:[$b]} ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        // A later step that cannot succeed: the walk fails by value, so jq raises whatever the register is.
+        (
+            r"[1]",
+            r"path(try (reduce . as [[$a]] (0; .)) catch 7)",
+            "",
+            r"Invalid path expression with result 7",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(try (reduce . as [[$a]] ?// $a (0; .)) catch 7)",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(try (reduce . as {a:[[$a]]} (0; .)) catch 7)",
+            "",
+            r"Invalid path expression with result 7",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(reduce . as {a:{b:$a}} ?// $a (0; .))",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(foreach . as [[$a]] ?// $a (0; .; .))",
+            "",
+            r"Invalid path expression with result 0",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(try (foreach . as [[$a]] (0; .; .)) catch 7)",
+            "",
+            r"Invalid path expression with result 7",
+            5,
+        ),
+    ])
+}
+
+/// #3743: a computed key is not judged by value, because running its generator a
+/// second time would repeat its effects: `stderr` in the key writes once, as in
+/// jq (`a`, then the error), and the pattern keeps the refusal it had.
+#[test]
+fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
+    let input = r#"{"a":1}"#;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(reduce . as {("a"|stderr):$x} ?// $x (0; .))"#],
+        Some(input),
+    )?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "stderr {stderr:?}");
+    assert!(
+        stderr.starts_with("ajq: error"),
+        "the key's `stderr` ran once: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
 /// verdict stage behind a `def` call or a `reduce` and one inside a compound stage
 /// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758 and the

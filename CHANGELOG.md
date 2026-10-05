@@ -876,6 +876,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a fold's `?//` pattern retries when it fails by value** (#3743).
+  `reduce . as [$a] ?// $a (0; .)` over the document itself raised "near attempt to access element 0" and did not retry: the walk called the
+  refusal a guess (the element equals the register by value, so jq "might" have carried on), but an array pattern's first step can never
+  succeed on an object, so jq raises there whether or not the element is the register and `?//` retries. Inside a `try` the refusal ran the
+  handler instead, so `path(foreach (try ((reduce . as [$a] ?// $a (0; .)), .b[0]) catch 1) as $x (.; .; .))` lost the reduce's `0` at exit 0. A
+  literal-keyed pattern that raises when destructured by value (`pattern_walk_fails_by_value`: `[$a]` over an object, `[[$a]]` over `[1]`) raises in
+  jq whatever the register is, so its refusal is now exact and retries. Refusals that remain a guess (`reduce . as {a:$a} ?// [$a] (0; .)` over a
+  document that has `a`) and patterns with a computed key (running the key again would repeat its effects) are unchanged, recorded in
+  `docs/compliance/jq/limitations.md`. Against a clean `main` build the path-register sweep (21 new
+  fold-pattern operands, 80,027 sampled rows) went from 866 `ACCEPT_WRONG` rows to 532, 334 of them now matching jq and none new, and a 30,027-row
+  full-grid sample from 30 to 21. It is not regression-free: 223 and 7 rows that matched now refuse, all of them the new fold-pattern operands under
+  `try`/`and`/`or`, where the reduce now succeeds as jq's does and an `and`/`or` operand that states no register (#3646) refuses, while `main` matched
+  only because the handler ran for an error jq never raised. `scripts/jq-bind-origin-fuzz.py` (6,000 programs stock and 6,000 at `--fold-p 1.0`)
+  showed no fabricated, mismatching or newly refusing rows beyond the baseline's.
 - **jq: a pipe stage reads the backtracked-register verdict of `any`/`all`/`isempty(g)`, on a tracked or an untracked entry** (#3758, #3826, the plain-stage residual of #3757).
   `path(. as $x | any | $x)` on `{"a":false,"b":null}` is `[]` in jq: these builtins are defined over a generator jq backtracks, so when nothing inside
   emitted the register is back where the stage entered. The leaf already stated that per result; `resolve_seq_stage` dropped it, so a `$x` frozen
