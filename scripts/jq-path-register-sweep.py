@@ -56,8 +56,8 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 2,792,000 rows (`--list-axes` prints the exact count:
-225 operands, each also swept as a bare pipe stage since #3361, across 37 contexts),
+**Size.** The full grid is about 2,938,000 rows (`--list-axes` prints the exact count:
+236 operands, each also swept as a bare pipe stage since #3361, across 37 contexts),
 which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
@@ -393,6 +393,13 @@ OPERANDS = [
     "last(select(true))",
     "last(last(.))",
     "last(limit(1; .))",
+    # An `f` the reduce walk cannot read may still navigate before its last output,
+    # the root: `del(reduce .[]? as $k (.; last(limit(2; .a, .))))` deleted the document
+    # once `last(f)` stopped refusing an `f` that may navigate (#3786 review).
+    "last(limit(2; .a, .))",
+    "last(nth(1; .a, .))",
+    "last(label $l | .a, .)",
+    "last(def f: .a, .; f)",
     "select($x)",
     "try select($x)",
     "numbers",

@@ -26,7 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read, so `reduce .[]? as $k (.; (. // .k))`, a source that does not navigate, `try .k catch 1 | $x` and `{a: .k} | $x` keep jq's answers.
   With that closed, #3766's restriction of `last(f)`'s output identity to an `f` that navigates nothing is lifted (#3786): `path(last(.a, .))`,
   `path(last(first(.)))` and `path(last(select(true)))` answer `[]` as in jq, and `del(try (last(first(.)) | .k))` deletes `k` where it dropped
-  the write. Pinned by `test_reduce_update_navigating_inside_a_collect_or_alternative_refuses_3797` and
+  the write. `last(f)` counts an `f` that merely *may* move the register (`last(limit(2; .k, .))`, `last(nth(1; .k, .))`, `last(label $l | .k, .)`,
+  `last(def f: .k, .; f)`), because the walk cannot read those and the root they end on is not the register the source moved off; a bare UPDATE of
+  those shapes is the still-open #3811.
+  Pinned by `test_reduce_update_navigating_inside_a_collect_or_alternative_refuses_3797` and
   `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both evaluators).
 
 - **jq: a bind or destructuring source that may be the register's own node refuses loudly instead of silently dropping a write under `try`** (#3423).

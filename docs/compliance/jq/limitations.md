@@ -1313,7 +1313,11 @@ is the revert that established what the other one costs.
    navigating source had already moved and the fold resolved it as though the accumulator sat
    on it; that hole is closed ([#3780](https://github.com/rust-works/succinctly/issues/3780),
    [#3797](https://github.com/rust-works/succinctly/issues/3797)), so `last(.k, .)` refuses
-   there like `(.k, .)` does.
+   there like `(.k, .)` does. The reduce walk cannot read a navigation inside `limit`, `nth`, a
+   `label` or a user `def` call, so `last(f)` over an `f` that may move the register
+   (`last(limit(2; .k, .))`) counts as navigating there and refuses; a *bare* UPDATE of those
+   shapes (`limit(2; .k, .)`) still keeps the persistent register and `del` deletes the document
+   where jq exits 5, tracked as [#3811](https://github.com/rust-works/succinctly/issues/3811).
    Nor is `isempty(g)` a drain producer that loses it any more:
    [#3763](https://github.com/rust-works/succinctly/issues/3763) states the register the first
    branch `g` emitted left (and the entry register when it emitted nothing), so
@@ -3034,7 +3038,9 @@ answers `["b"]` — and classified the two residuals appended below):
   `[.k] | $x`, `(.k // .) | $x` and `first(.k) | $x` used to come back as the root and
   `del` deleted the document), an `if` whose literal condition picks one, or whose computed
   condition has one in either branch) is affected. Everything else -- `.`, a literal,
-  `$var`, the right of a `//`, `limit(n; E)`, and every wrapper that merely contains a
+  `$var`, the right of a `//`, `limit(n; E)`, `nth`, a `label`, a user `def` call (those last
+  four are the open hole [#3811](https://github.com/rust-works/succinctly/issues/3811) when
+  their body navigates and ends on the root), and every wrapper that merely contains a
   navigation it may not run (`first(.)`, `. // .k`, a `try`) -- keeps the persistent register, so those forms
   keep their answers (and, for a `try` around the navigation, #2732's wording: `path(reduce .[]
   as $k (.; try .a catch "x"))` on `{"a":1}` is jq's `with result "x"` and this `with result 1`,

@@ -40356,7 +40356,8 @@ fn resolve_leaf<'a, S: EvalSemantics>(
 /// by-value branch is built: [`untracked_branches`], the bounded leaf, and the
 /// `[E]`/drain arms ([`forward_drained_result`]) all go through here, each
 /// stating its own register ([`leaf_register`], [`drained_register`]). (`last(f)`
-/// over an `f` that navigates nothing keeps its output's own branch instead, #3766.)
+/// keeps its output's own branch instead when that output is the entry node,
+/// #3766, #3786.)
 fn untracked_at_register<'a>(
     computed: Cow<'a, OwnedValue>,
     register: BranchRegister<'a>,
@@ -41140,7 +41141,7 @@ fn resolve_from_restored_input<'a, S: EvalSemantics>(
 
 /// Shared tail for every "drain an argument fully via a discarding sink,
 /// then forward one computed value" arm in [`resolve_node_sink`] (`Array`,
-/// `LastExpr`/`LastStream` in yq mode and for an `f` that may navigate,
+/// `LastExpr`/`LastStream` in yq mode,
 /// `IsEmpty`, `UpperIndexStream` -- #2746 -- and `AnyCond`/`AllCond` when nothing
 /// decided or `cond` may move the register, #3749): once the drain itself is done (`flow`), build the one branch it
 /// produced and forward it to `sink`, propagating an escape from the drain
@@ -41163,8 +41164,8 @@ fn forward_drained_result<'a>(
 /// [`forward_drained_result`] for an arm that built the branch itself: the
 /// `any(gen; cond)`/`all(gen; cond)` arm emits its boolean at the register
 /// the decisive element left (#3749), which is not an untracked branch at the
-/// root, and `last(f)` in jq mode over an `f` that navigates nothing emits `f`'s
-/// last output with its own identity (#3766).
+/// root, and `last(f)` in jq mode emits `f`'s last output with its own identity
+/// when that output is the entry node (#3766, #3786).
 fn forward_drained_branch<'a>(
     flow: ResolveFlow,
     result: PathBranch<'a>,
@@ -46141,11 +46142,15 @@ fn foreach_step_register<S: EvalSemantics>(
 /// runs (#3780): a bare navigation (`.k`, `.[]?`, `.[0]`), a `,` with such an output,
 /// a `|` whose first stage is one, parentheses, or an `if` whose literal condition
 /// picks a branch that is (a computed condition counts when either branch does).
-/// Everything else answers `false` -- including every wrapper that merely *contains*
-/// a navigation (`first(.k)`, `. // .k`, a `try`) -- so those keep the persistent register and their
-/// existing verdict, which matches jq for the passthrough forms (`first(.)`,
+/// A collect, `first(f)`, the left of a `//` and `last(f)` read their body too (#3797,
+/// #3786). Everything else answers `false` -- the right of a `//`, `limit(n; f)`,
+/// `nth`, a `label`, a `def` call, a `try` -- so those keep the persistent register
+/// and their existing verdict, which matches jq for the passthrough forms (`first(.)`,
 /// `limit(1; .)`, `. // .k`, `((.k)?, .)` are all `[]` in jq). A shallow, conservative
-/// rule on purpose: the cost of a miss is the old behaviour, never a new refusal.
+/// rule on purpose: the cost of a miss is the old behaviour, never a new refusal --
+/// and that old behaviour is the open hole for a bare navigating `limit`/`nth`/`label`/
+/// `def` UPDATE (`limit(2; .k, .)`), which `last(f)` must not extend, so it reads an
+/// `f` that merely *may* navigate.
 fn update_definitely_navigates(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(inner) => update_definitely_navigates(inner),
@@ -46156,10 +46161,17 @@ fn update_definitely_navigates(expr: &Expr) -> bool {
         // `[.k] | $x`, `(.k // .) | $x` and `first(.k) | $x` raise as `.k | $x` does.
         // The right of a `//` runs only when the left yields nothing truthy, and
         // `limit(n; f)` may not run `f` at all (`n` of 0), so neither is read.
-        Expr::Array(inner)
-        | Expr::FirstExpr(inner)
-        | Expr::LastExpr(inner)
-        | Expr::Alternative(inner, _) => update_definitely_navigates(inner),
+        Expr::Array(inner) | Expr::FirstExpr(inner) | Expr::Alternative(inner, _) => {
+            update_definitely_navigates(inner)
+        }
+        // `last(f)` hands its *last* output back, which for `last(limit(2; .k, .))`
+        // is the root: an `f` this function cannot read (`limit`, `nth`, a `label`, a
+        // user `def`) may still navigate before it gets there, and the root it then
+        // yields is not the register the source moved off. So an `f` that may move
+        // the register at all counts, which is what `last(f)` did before #3786 lifted
+        // its restriction; a refusal where jq answers is the safe direction, a root
+        // accepted against a moved register deletes the document.
+        Expr::LastExpr(inner) => update_definitely_navigates(inner) || !cannot_move_register(inner),
         Expr::Optional(inner) if is_postfix_optional_primitive(inner) => {
             update_definitely_navigates(inner)
         }

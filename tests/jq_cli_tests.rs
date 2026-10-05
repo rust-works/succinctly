@@ -64310,6 +64310,46 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
             r#"near attempt to access element "k""#,
             5,
         ),
+        // An `f` the reduce walk cannot read (`limit`, `nth`, a `label`, a user `def`) may
+        // still navigate before its last output, the root, so `last(f)` counts it as
+        // navigating when it merely *may*; read as a non-navigating UPDATE it kept the
+        // persistent register and `del` deleted the document (`null`, exit 0).
+        (
+            r#"{"a":true,"k":2}"#,
+            r"del(reduce .[]? as $k (.; last(limit(2; .k, .))))",
+            "",
+            r#"near attempt to access element "k""#,
+            5,
+        ),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"del(reduce .[]? as $k (.; last(nth(1; .k, .))))",
+            "",
+            r#"near attempt to access element "k""#,
+            5,
+        ),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"del(reduce .[]? as $k (.; last(label $f | .k, .)))",
+            "",
+            r#"near attempt to access element "k""#,
+            5,
+        ),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"del(reduce .[]? as $k (.; last(def f: .k, .; f)))",
+            "",
+            r#"near attempt to access element "k""#,
+            5,
+        ),
+        // A passthrough `f` that cannot move the register keeps jq's answer.
+        (
+            r#"{"a":true,"k":2}"#,
+            r"del(reduce .[]? as $k (.; last(.)))",
+            "null\n",
+            "",
+            0,
+        ),
     ])
 }
 
