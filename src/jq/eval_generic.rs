@@ -7921,8 +7921,9 @@ pub fn eval_with_cursor<C: DocumentCursor>(expr: &Expr, cursor: C) -> GenericRes
 /// cannot read (a malformed number such as `1.2.3`, or a keyword such as
 /// `tru`) does not raise under a filter that navigates past it (`path(.a)`) or
 /// wraps it in `[.]`, where [`eval_using`], which is handed a decoded value,
-/// can (#3266). Other collections (`[., 1]`, `{a: .}`, `. as $x | [$x]`)
-/// materialize the value here too, and raise (#3427). A document nested deeper
+/// can (#3266). Other constructions (`[., 1]`, `[[.]]`, `{a: .}`,
+/// `. as $x | [$x]`) materialize the value here too, and raise; that split is
+/// accepted, not pending (#3427). A document nested deeper
 /// than 256 levels makes the `path`/`paths`/`leaf_paths`/`getpath` walkers
 /// return a decode-failure-tagged error (#3429 tracks the ceiling).
 ///
