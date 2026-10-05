@@ -26338,20 +26338,22 @@ fn each_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// exactly as the eager version's `One`/`Many` arms did; a decode failure
 /// doing so is the bound generator's own escape, reported as
 /// `Flow::Escaped`.
+/// Its stop is classified through the shared escape helper (#3809), so a
+/// destructuring alternative cannot retry past a failed decode. This slot
+/// needs no retry reset because decode failures are always nonretryable.
 fn pull_slice_bound<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     round: fn(f64) -> f64,
     sink: &mut dyn FnMut(ComputedSliceBound) -> Demand,
 ) -> Flow {
-    let mut decode_failure: Option<EvalError> = None;
+    let mut decode_failure: Option<Control> = None;
     let mut item_sink = |item: Item<'a, W>| -> Demand {
         let raw = match item {
             Item::Borrowed(v) => match to_owned_key_shape::<_, S>(&v) {
                 Ok(k) => k,
                 Err(e) => {
-                    decode_failure = Some(e);
-                    return Demand::Stop;
+                    return stop_with_escape(&mut decode_failure, Control::Error(e));
                 }
             },
             Item::Owned(v) => v,
@@ -26363,10 +26365,7 @@ fn pull_slice_bound<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // while computing a bound -- `[1,2] | [.[(0,error("e"),1):]?]` still
     // raises `e` in jq 1.7.1.
     let flow = eval_each::<W, S>(expr, value, false, &mut item_sink);
-    match decode_failure {
-        Some(e) => Flow::Escaped(Control::Error(e)),
-        None => flow,
-    }
+    resume_from_escape(decode_failure, flow)
 }
 
 /// Classify a resolved bound value the way jq's slice descriptor does
@@ -110649,6 +110648,38 @@ mod tests {
             let filter = r#"[limit(1; if ([1] as $a ?// $b | $a) then 1 else error("E") end)]"#;
             let (got, got_end) = outputs_and_end(b"null", filter);
             assert_eq!((got.len(), got_end.as_str()), (0, "error: E"), "`{filter}`");
+        }
+    }
+
+    /// #3809: corrupt document strings are uncatchable decode failures,
+    /// so a slice bound's destructuring alternative must never retry them.
+    /// jq rejects this document before evaluation; it is not an oracle here.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_slice_bound_decode_failure_never_retries_3809() {
+        let json = br#"{"bad":"\x","arr":[1,2,3]}"#;
+        for filter in [
+            ".arr[(1 as $x ?// $y | if $x != null then .bad else 1 end):]",
+            ".arr[:(1 as $x ?// $y | if $x != null then .bad else 1 end)]",
+        ] {
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            let mut pushed = 0;
+            let flow = eval_each::<Vec<u64>, JqSemantics>(
+                &expr,
+                index.root(json).value(),
+                false,
+                &mut |_| {
+                    pushed += 1;
+                    Demand::Continue
+                },
+            );
+            assert_eq!(pushed, 0, "{filter}: emitted a retry's slice");
+            assert!(
+                matches!(flow, Flow::Escaped(Control::Error(e))
+                if e.is_decode_failure() && e.message.contains("invalid escape sequence")),
+                "{filter}: expected a decode failure"
+            );
         }
     }
 

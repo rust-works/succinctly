@@ -101040,3 +101040,28 @@ fn test_recurse_structural_descent_reads_position_like_recursive_descent_3773() 
     }
     Ok(())
 }
+
+/// #3809: decoding a slice bound must terminate before a ?// retries it.
+/// Invalid JSON has no jq evaluation oracle; assert our decode-failure contract.
+#[test]
+fn test_slice_bound_decode_failure_stops_stderr_retry_3809() -> Result<()> {
+    let input = r#"{"bad":"\x","arr":[1,2,3]}"#;
+    let bound = r#"(1 as $x ?// $y | ("A"|stderr) as $_ | if $x != null then .bad else 1 end)"#;
+    for slice in [format!(".arr[{bound}:]"), format!(".arr[:{bound}]")] {
+        for filter in [
+            slice.clone(),
+            format!("{slice}?"),
+            format!("first({slice})"),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
+            assert_eq!(code, 5, "{filter}: {stderr:?}");
+            assert!(stdout.is_empty(), "{filter}: {stdout:?}");
+            assert_eq!(stderr.matches('A').count(), 1, "{filter}: {stderr:?}");
+            assert!(
+                stderr.contains("invalid escape sequence in string"),
+                "{filter}: {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
