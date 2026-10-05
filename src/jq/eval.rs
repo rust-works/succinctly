@@ -35946,7 +35946,8 @@ impl<'a> PathBranch<'a> {
 
     /// Rebuild as `untracked`/`snapshot` according to `snapshot`, for the
     /// sites that demote a branch but must not lose its provenance — see
-    /// `FoldRegister::relocate_one` and `resolve_foreach`'s own emission (#1466).
+    /// `FoldRegister::relocate_one`, `resolve_foreach`'s own emission (#1466) and
+    /// the `last(f)` arm, which keeps the mark of an output it re-registers (#3766).
     fn demoted(snapshot: Snapshot, value: Cow<'a, OwnedValue>) -> Self {
         match snapshot {
             Snapshot::Marked(origin) => Self::marked(origin, value),
@@ -37835,24 +37836,23 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             // UPDATE runs against a register jq's source already moved, where jq
             // raises on the navigation and the fold resolves it as though the
             // accumulator sat on the register (`del(reduce .[]? as $k (.; (.k,
-            // .)))` deletes the document on `main`, where jq exits 5). Forwarding
-            // the root there would hand that hole `last(.k, .)` as well, so a
-            // navigating `f` keeps the copy it always had.
-            let keeps_identity = last_register_unmoved::<S>() && cannot_move_register(inner);
+            // .)))` deletes the document on `main`, where jq exits 5, #3780).
+            // Forwarding the root there would hand that hole `last(.k, .)` as
+            // well, so a navigating `f` keeps the copy it always had, and so does
+            // an `f` the allowlist cannot prove navigates nothing (`first(.)`,
+            // `select(true)`): those still refuse a bare read, and under a `try`
+            // or `?` they drop the write exactly as before (tracked with #3780).
             let result = match last {
-                Some(branch) if keeps_identity => {
+                Some(branch) if last_register_unmoved::<S>() && cannot_move_register(inner) => {
                     if branch.trackable {
                         // `f` navigates nothing, so a trackable output is the entry node.
                         debug_assert_eq!(branch.path.depth(), 0);
                         branch
                     } else {
-                        PathBranch::demoted(branch.snapshot, Cow::Owned(branch.value.into_owned()))
-                            .with_register(register)
+                        PathBranch::demoted(branch.snapshot, branch.value).with_register(register)
                     }
                 }
-                Some(branch) => {
-                    untracked_at_register(Cow::Owned(branch.value.into_owned()), register)
-                }
+                Some(branch) => untracked_at_register(branch.value, register),
                 None => untracked_at_register(Cow::Owned(OwnedValue::Null), register),
             };
             forward_drained_branch(flow, result, sink)
@@ -40161,7 +40161,8 @@ fn resolve_leaf<'a, S: EvalSemantics>(
 /// says about jq's register afterwards (#1573, #3456). The one place a
 /// by-value branch is built: [`untracked_branches`], the bounded leaf, and the
 /// `[E]`/drain arms ([`forward_drained_result`]) all go through here, each
-/// stating its own register ([`leaf_register`], [`drained_register`]).
+/// stating its own register ([`leaf_register`], [`drained_register`]). (`last(f)`
+/// over an `f` that navigates nothing keeps its output's own branch instead, #3766.)
 fn untracked_at_register<'a>(
     computed: Cow<'a, OwnedValue>,
     register: BranchRegister<'a>,
@@ -40924,9 +40925,9 @@ fn resolve_from_restored_input<'a, S: EvalSemantics>(
 
 /// Shared tail for every "drain an argument fully via a discarding sink,
 /// then forward one computed value" arm in [`resolve_node_sink`] (`Array`,
-/// `LastExpr`/`LastStream`, `IsEmpty`, `UpperIndexStream` -- #2746 -- and
-/// `AnyCond`/`AllCond` when nothing decided or `cond` may move the register,
-/// #3749): once the drain itself is done (`flow`), build the one branch it
+/// `LastExpr`/`LastStream` in yq mode and for an `f` that may navigate,
+/// `IsEmpty`, `UpperIndexStream` -- #2746 -- and `AnyCond`/`AllCond` when nothing
+/// decided or `cond` may move the register, #3749): once the drain itself is done (`flow`), build the one branch it
 /// produced and forward it to `sink`, propagating an escape from the drain
 /// immediately and mapping the caller's own `Demand` back to a `ResolveFlow`.
 /// Lets each call site's own match arm differ only in *what* `computed` is,
@@ -40947,7 +40948,8 @@ fn forward_drained_result<'a>(
 /// [`forward_drained_result`] for an arm that built the branch itself: the
 /// `any(gen; cond)`/`all(gen; cond)` arm emits its boolean at the register
 /// the decisive element left (#3749), which is not an untracked branch at the
-/// root.
+/// root, and `last(f)` in jq mode over an `f` that navigates nothing emits `f`'s
+/// last output with its own identity (#3766).
 fn forward_drained_branch<'a>(
     flow: ResolveFlow,
     result: PathBranch<'a>,

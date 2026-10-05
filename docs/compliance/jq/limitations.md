@@ -1292,9 +1292,16 @@ is the revert that established what the other one costs.
    `test_path_register_last_f_keeps_the_identity_of_its_output_3766`. An output that is not the
    register (`last(.a)` moved off it) is still a copy that jq refuses. Only an `f` that provably
    navigates nothing gets this (`cannot_move_register`): `last(.a, .)`, `last(first(.))` and
-   `last(select(true))` still refuse where jq answers `[]`, because a navigating `f` inside a
-   reduce/foreach UPDATE runs against a register jq's source already moved and the fold does not
-   see that.
+   `last(select(true))` keep the copy, so a bare read still refuses where jq answers `[]`, and a
+   `try` or `?` around the next navigation still catches the refusal and **silently drops the
+   write** at exit 0 (`del(try (last(first(.)) | .k))` leaves the document where jq deletes `k`),
+   as `last(f)` always did for those shapes. The reason is a hole in the fold, not in `last`: a
+   navigating `f` inside a reduce UPDATE runs against a register jq's navigating source already
+   moved (jq raises), and the fold resolves it as though the accumulator sat on the register, so
+   forwarding the root there made `del(reduce .[]? as $k (.; last(.k, .)))` delete the document.
+   The bare `del(reduce .[]? as $k (.; (.k, .)))` does so on `main`
+   ([#3780](https://github.com/rust-works/succinctly/issues/3780)); the restriction can be
+   lifted when that is fixed.
    Nor is `isempty(g)` a drain producer that loses it any more:
    [#3763](https://github.com/rust-works/succinctly/issues/3763) states the register the first
    branch `g` emitted left (and the entry register when it emitted nothing), so

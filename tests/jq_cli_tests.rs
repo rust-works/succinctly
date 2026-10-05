@@ -63871,9 +63871,10 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
 /// the bare reads refused where jq answers `[]`, and because the copy was classed
 /// as computed, a `try` or `?` around the next navigation caught the refusal and
 /// `=`, `|=` and `del()` dropped the write at exit 0. Every row captured from
-/// jq 1.7.1 with `-c` on `{"a":{"b":1},"k":2}`, on both evaluators (the document
-/// on stdin, and as a `-n` literal). The last group is the contrast: an output
-/// that is not the register (`last(.a)` moved off it) is still refused.
+/// jq 1.7.1 with `-c` on the document in each row (mostly `{"a":{"b":1},"k":2}`),
+/// on both evaluators (the document on stdin, and as a `-n` literal). The
+/// contrast rows are an output that is not the register (`last(.a)` moved off
+/// it), still refused.
 #[test]
 fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<()> {
     let doc = r#"{"a":{"b":1},"k":2}"#;
@@ -64003,6 +64004,60 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
             r#"near attempt to access element "a" of {"b":1}"#,
             5,
         ),
+        // An `f` that navigates nothing, in a fold UPDATE: the root is the
+        // accumulator and jq accepts it (these flipped from a refusal), and the
+        // other shapes the allowlist proves navigate nothing keep their identity too.
+        (
+            r#"{"a":true,"k":2}"#,
+            r"del(reduce .[]? as $k (.; last(.)))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"(reduce .[]? as $k (.; last(.))) = 9",
+            "9\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"path(foreach .[]? as $k (.; last(.); .))",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        (r#"{"a":true,"k":2}"#, r"path(last(. // .))", "[]\n", "", 0),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"path(last(if . then . else . end))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"path(last(reduce 1 as $i (.; .)))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"path(last(label $o | .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r#"{"a":true,"k":2}"#, r"path(last(1, .))", "[]\n", "", 0),
+        (
+            r#"{"a":true,"k":2}"#,
+            r"path(last(. as $y | $y))",
+            "[]\n",
+            "",
+            0,
+        ),
         // Still refused where jq answers `[]` (refuse-only), pinned so lifting it is a
         // deliberate change: an `f` that navigates (`last(.a, .)`) or that the
         // `cannot_move_register` allowlist cannot prove navigates nothing
@@ -64033,7 +64088,7 @@ fn test_path_register_last_f_keeps_the_identity_of_its_output_3766() -> Result<(
         // the navigation; the fold resolves it as though the accumulator sat on the
         // register, and forwarding the root from `last(.k, .)` made the update an
         // accepted `[]` that `del` turned into deleting the document (exit 0). Its
-        // bare twin `(.k, .)` is the same hole, older than this change.
+        // bare twin `(.k, .)` is the same hole, older than this change (#3780).
         (
             r#"{"a":true,"k":2}"#,
             r"del(reduce .[]? as $k (.; last(.k, .)))",

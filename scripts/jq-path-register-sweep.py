@@ -56,8 +56,8 @@ where the base is already ACCEPT_WRONG on thousands of rows reads differently
 from "0 FAIL" over a clean base. A benchmark cannot measure a shape it does
 not generate: add the generator pattern here before claiming a shape is safe.
 
-**Size.** The full grid is about 2,299,000 rows (`--list-axes` prints the exact count:
-188 operands, each also swept as a bare pipe stage since #3361, across 37 contexts),
+**Size.** The full grid is about 2,352,000 rows (`--list-axes` prints the exact count:
+192 operands, each also swept as a bare pipe stage since #3361, across 37 contexts),
 which takes hours on a loaded machine. Judge a change with
 `--operand` over the operands it touches (83,187 rows for 14 of them took about
 22 minutes at `--jobs 6` on a box at load 100) plus a seeded `--sample`, and run
@@ -327,10 +327,12 @@ OPERANDS = [
     "last($x)?",
     "first(last($x))",
     # (#3766) which of a generator's outputs is the register: only the last one
-    # decides, and only when it is the entry node itself. The first and third are
-    # the shapes a navigating `f` in a reduce UPDATE would turn into an accepted
-    # root (`del(reduce .[]? as $k (.; last(.a, .)))` deleted the document before
-    # the arm was restricted to an `f` that navigates nothing).
+    # decides, and only when it is the entry node itself. `last(.a, .)` is the
+    # shape a navigating `f` in a reduce UPDATE turned into an accepted root
+    # (`del(reduce .[]? as $k (.; last(.a, .)))` deleted the document before the
+    # arm was restricted to an `f` that navigates nothing); `last(first(.))` and
+    # `last(select(true))` navigate nothing but are outside the
+    # `cannot_move_register` allowlist, so they keep the copy.
     "last(.a, .)",
     "last(., .a)",
     "last(first(.))",

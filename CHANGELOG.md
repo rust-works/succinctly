@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provably navigates nothing (`last(.)`, `last($x)`): a navigating `f` inside a reduce UPDATE runs against a register the navigating source
   already moved, where jq raises and the fold resolves it as though the accumulator sat on the register, so forwarding the root there made
   `del(reduce .[]? as $k (.; last(.k, .)))` delete the document. That hole is older than this change and also accepts the bare
-  `del(reduce .[]? as $k (.; (.k, .)))` (filed separately); `last(.a, .)`, `last(first(.))` and `last(select(true))` stay refused where
-  jq answers `[]`. Jq mode only (ADR-0018: yq has no oracle for `last`). Pinned by `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both
+  `del(reduce .[]? as $k (.; (.k, .)))` (#3780); `last(.a, .)`, `last(first(.))` and `last(select(true))` keep the copy, so a bare
+  read still refuses where jq answers `[]` and a `try` or `?` around the next navigation still drops the write silently, as before
+  (the same f shapes, tracked with #3780). Jq mode only (ADR-0018: yq has no oracle for `last`). Pinned by `test_path_register_last_f_keeps_the_identity_of_its_output_3766` (both
   evaluators) and `yq_last_f_output_does_not_keep_its_identity_3766`; it replaces the characterization test #3653 left.
 
 - **jq: a `foreach` whose EXTRACT navigates and then ends on an untracked `null` no longer answers the root path** (#3769).
