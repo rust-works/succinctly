@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MAX_PATH_WALK_DEPTH` (384, `MAX_VALUE_TREE_DEPTH`), reporting `limit of 384` as the same decode-failure-tagged error. Measured on a debug
   build with every guard lifted, the smallest stack a 383-deep `paths` needs is ~1.4 MiB (a ~1.4x margin on a 2 MiB thread, the margin the
   materializer has at 256), `.. | path` ~0.45 MiB and a 383-component chain ~0.5 MiB. **Not raised:** `path(..)`, `path(recurse(f; c))`,
-  `paths(f)` and `path(getpath(p))` materialize the whole document first, and that recursion overflows a 2 MiB debug thread at ~360 levels, so
+  `paths(f)` and `path(getpath(p))` materialize the whole document first, and that recursion overflows a 2 MiB debug thread at ~360 levels on aarch64 and ~385 on x86_64, so
   they keep 256 (pinned by `test_materializing_path_forms_still_stop_at_the_materializer_ceiling_3429`; the heap-stack or stack-aware options
   are on the issue). Pinned by `test_paths_and_leaf_paths_answer_between_256_and_384_3429`, `test_public_eval_path_family_under_depth_answers_3457`
   and `test_public_eval_static_path_chain_ceiling_3429`.

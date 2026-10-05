@@ -294,15 +294,17 @@ pub(crate) fn guard_nesting_depth(depth: usize) -> Result<(), EvalError> {
 /// route needs to answer a 383-deep document, against the 2 MiB a library
 /// caller's thread or a `cargo test` thread gets:
 ///
-/// - `collect_paths_generic` (`paths`, `leaf_paths`): ~1.4 MiB, a ~1.4x margin;
-/// - `path_context_step_recurse` (`.. | path`): ~0.45 MiB, ~4.6x;
-/// - a 383-component static chain (`path(.k.k...k)`): ~0.5 MiB, ~4x.
+/// - `collect_paths_generic` (`paths`, `leaf_paths`): ~1.4 MiB on aarch64 and
+///   ~1.3 MiB on x86_64, a ~1.4-1.5x margin;
+/// - `path_context_step_recurse` (`.. | path`): ~0.45 / ~0.43 MiB, ~4.6x;
+/// - a 383-component static chain (`path(.k.k...k)`): ~0.5 / ~0.47 MiB, ~4x.
 ///
 /// The first is the same margin 256 gives the materializer today (it overflows
-/// a 2 MiB debug thread at ~360 levels with its guard lifted, against its
-/// 256 ceiling), so it is accepted; the CLI's own thread is 256 MB-2 GB.
-/// The materializer itself does *not* clear 384 -- it would abort a 2 MiB
-/// debug thread before reaching its own guard -- so it keeps
+/// a 2 MiB debug thread at ~360 levels on aarch64 and ~385 on x86_64 with its
+/// guard lifted, against its 256 ceiling), so it is accepted; the CLI's own
+/// thread is 256 MB-2 GB. The materializer itself does *not* clear 384 -- it
+/// would abort a 2 MiB debug thread before reaching its own guard on aarch64,
+/// and leave no margin at all on x86_64 -- so it keeps
 /// [`MAX_NESTING_DEPTH`], and a route that materializes the document first
 /// (`path(..)`, `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among
 /// others) still refuses past 256; see `docs/compliance/jq/limitations.md`.

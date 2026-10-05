@@ -25726,7 +25726,7 @@ fn test_paths_and_leaf_paths_past_384_refuse_cleanly_3429() -> Result<()> {
 
 /// #3429 residual: `path(..)` and `paths(f)` materialize the whole document
 /// first (`to_owned_with_cursor`, a native recursion that overflows a 2 MiB
-/// debug thread at ~360 levels), so they keep the materializers' 256 ceiling
+/// debug thread at ~360 levels on aarch64, ~385 on x86_64), so they keep the materializers' 256 ceiling
 /// even though `paths` and `.. | path` over the same document answer. Pinned
 /// so that lifting it is a deliberate change that also re-measures the
 /// materializer's stack (see `MAX_PATH_WALK_DEPTH`).

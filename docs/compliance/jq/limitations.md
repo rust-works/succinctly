@@ -9249,7 +9249,7 @@ narrowing:
   to catch). Pinned by `test_public_eval_path_family_over_depth_is_a_clean_error_3457`
   (`tests/jq_library_eval_nesting_depth_tests.rs`). **The materializing forms are the residual
   of #3429, not an oversight:** the materializer (`to_owned_cursor`) overflows a 2 MiB debug
-  thread at about 360 levels with its guard lifted, so it cannot take 384 without a
+  thread at about 360 levels (aarch64) to 385 (x86_64) with its guard lifted, so it cannot take 384 without a
   heap-stack rewrite or a stack-aware ceiling (the options are on the issue), and a path
   builtin that reaches it keeps 256. Pinned by
   `test_materializing_path_forms_still_stop_at_the_materializer_ceiling_3429`
