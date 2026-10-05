@@ -93769,12 +93769,14 @@ fn test_comma_bind_source_is_classified_per_branch_3334() -> Result<()> {
 /// `label`, a rebind, `first($orig)`, `$orig?`), used to bind by value with no
 /// mark (`as $x`) or to be classified frozen-free (`as {a:{b:$q}}`), so the
 /// refusal off it read as jq's own verdict and a `try` caught it: `del`, `=` and
-/// `|=` silently dropped the write jq makes (exit 0). A source *value-equal to
-/// the register* that nothing proves fresh now refuses as the resolver's guess,
-/// uncatchable, so the write is loud (exit 5) instead of lost. jq 1.7.1 writes
-/// in every refused row (`{}` / `{"a":{}}` / `{"a":9}`); the refusal is the
-/// documented price, in the safe direction. Both evaluators: the document on
-/// stdin and as a `-n` literal.
+/// `|=` silently dropped the write jq makes (exit 0). A source that can hand the
+/// register back by pointer (`may_alias_register`) and whose output equals the
+/// register now refuses as the resolver's guess, uncatchable, so the write is
+/// loud (exit 5) instead of lost. jq 1.7.1 writes in every refused row (`{}` /
+/// `{"a":{}}` / `{"a":9}`); the refusal is the documented price, in the safe
+/// direction. A value the source derives or builds is never the register, and the
+/// controls pin that those keep their catchable refusal. Both evaluators: the
+/// document on stdin and as a `-n` literal.
 #[test]
 fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()> {
     let doc = r#"{"a":{"b":1}}"#;
@@ -93892,10 +93894,10 @@ fn test_bind_source_that_may_be_the_register_refuses_loudly_3423() -> Result<()>
         ),
         // A value the source derives or builds is never the register, whatever it
         // equals: no mark, so the refusal stays jq's own and a `try` catches it (the
-        // first versions' alias test was "not provably fresh", which refused all of
-        // these, and the no-op deletes hand back the input's own storage where jq
-        // builds a fresh array, which storage identity then certified: the write
-        // below went through).
+        // first version's alias test was "not provably fresh", which refused all of
+        // these, and certified the no-op deletes -- they hand back the input's own
+        // storage where jq builds a fresh array -- by storage identity, so the
+        // write below went through).
         (
             r#"["a"]"#,
             r"(del(.[5]) as $x | try $x[0]) = 9",

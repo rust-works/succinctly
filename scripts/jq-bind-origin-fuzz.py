@@ -102,8 +102,9 @@ grammar and the transparent one -- a comma nested under a pipe, `if`, `try` or
 `//`, a `label`, a rebind, a `first`/`?` over a marker. Whether such a source
 *is* the register is unknowable from the value, so a refusal off its `$x` or
 pattern must be loud, never caught: the trap is the silent drop of a write jq
-makes. Mixed with sources that are provably fresh or that navigate, which must
-keep their exact, catchable refusal. Off by default (`--ambiguous-source-p`).
+makes. Mixed with sources that build or derive a value (a construction, `walk`,
+`with_entries`, `del(.zz)`, a no-op `del(.[5])`) or that navigate, which must keep
+their exact, catchable refusal. Off by default (`--ambiguous-source-p`).
 
 Usage:
     cargo build --release --features cli
