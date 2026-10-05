@@ -63391,6 +63391,88 @@ fn test_path_register_equal_array_copy_is_not_the_register_3456() -> Result<()> 
     ])
 }
 
+/// #3793: a string slice in path position is a copy in jq (`jv_identical` compares
+/// string pointers), so a `$k` bound to the string before `.[0:]` does not
+/// re-establish the register after it: `"s" | path(. as $k | .[0:] | $k)` refuses
+/// `with result "s"`. `Frame::certifies_value` had applied jq's slice-identity rule to
+/// arrays only (#3494), so the string was certified by value and `path()` answered
+/// `[{"start":0,"end":null}]`. A string whose marker names a position now certifies only
+/// where that position is the register's; a position-less marker keeps the by-value rule
+/// (the same node jq holds). `=`/`|=`/`del()` over the same shape already raised, with a
+/// different message. Every row captured from jq 1.7.1.
+#[test]
+fn test_string_slice_is_not_the_register_3793() -> Result<()> {
+    for (input, filter) in [
+        (r#""s""#, r"path(. as $k | .[0:] | $k)"),
+        (r#""""#, r"path(. as $k | .[0:] | $k)"),
+        (r#""abc""#, r"path(. as $k | .[0:] | $k)"),
+        (r#"{"a":"s"}"#, r"path(.a | . as $k | .[0:] | $k)"),
+        (r#"{"a":"s"}"#, r"path(foreach .a as $k (0; $k|.[0:]; $k))"),
+        (r#"{"a":"s"}"#, r"del(.a | . as $k | .[0:] | $k)"),
+        // review: nested/derived binds that mint a position-less marker, over a document
+        // that also holds a non-string
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r"path(.a | . as $k | . as $z | .[0:] | $z)",
+        ),
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r"path(.a | .[0:] | . as $q | .[0:] | $q)",
+        ),
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r"path(.a | first(.) as $k | .[0:] | $k)",
+        ),
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r"path(.a | . as $k | .[0:] | ..| $k)",
+        ),
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r"path(.[] | strings | . as $k | .[0:] | $k)",
+        ),
+        (
+            r#"{"a":"s","l":["x"]}"#,
+            r#"path(.. | select(type=="string") as $k | .[0:] | $k)"#,
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
+        assert_eq!(
+            (out.as_str(), code),
+            ("", 5),
+            "{filter} on {input}: stderr {err:?}"
+        );
+        assert!(
+            err.contains("Invalid path expression with result"),
+            "{filter} on {input}: stderr {err:?}"
+        );
+    }
+    // controls that agree with jq: a non-empty array's full slice is the node, and a
+    // string that never went through a slice is the register itself
+    for (input, filter, expected) in [
+        (
+            r"[1]",
+            r"path(. as $k | .[0:] | $k)",
+            r#"[{"start":0,"end":null}]"#,
+        ),
+        (r#""s""#, r"path(. as $k | $k)", r"[]"),
+        (r#""s""#, r". as $x | ($x) = 9", r"9"),
+        (
+            r#""s""#,
+            r#". as $x | {"k":.} | .k as $y | .k | path($y)"#,
+            r"[]",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(&format!("{input}\n")))?;
+        assert_eq!(
+            (out.trim_end(), code),
+            (expected, 0),
+            "{filter} on {input}: stderr {err:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3494 (#3425 regression): an empty array is never identical to the
 /// register. jq's `.[0:]` of a non-empty array is the same array, but the
 /// slice of `[]` -- and any empty slice -- is a fresh `[]`, so `$x` is not
