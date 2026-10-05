@@ -43918,15 +43918,11 @@ fn drive_fold_source_with<S: EvalSemantics>(
     }) || (S::TAG == EvalTag::Jq
         && foreach_source
         && foreach_source_destructures_register(source));
-    // #3790: a `foreach` whose source is the register itself (`.`) emits it as
-    // jq's register-derived element at the root: `.` does not move the register
-    // and `$k` is bound to that very node, so the element carries the root path
-    // (rebased like a resolved branch's) instead of the by-value drive's none.
-    if S::TAG == EvalTag::Jq
-        && foreach_source
-        && ambient.trackable
-        && yields_only_the_register(source)
-    {
+    // #3790: a fold whose source is the register itself (`.`) emits it as jq's
+    // register-derived element at the root: `.` does not move the register and `$k`
+    // is bound to that very node, so the element carries the root path (rebased
+    // like a resolved branch's) instead of the by-value drive's none.
+    if S::TAG == EvalTag::Jq && ambient.trackable && yields_only_the_register(source) {
         let path = match relocate_base {
             Some(base) => Rc::clone(base),
             None => PathPrefix::root(),

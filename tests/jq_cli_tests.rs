@@ -62434,8 +62434,8 @@ fn test_foreach_source_destructuring_register_under_try_stays_refused_3744() -> 
 /// write through it lands on the root. The by-value drive gave the element no
 /// position, so `$k` re-established only for `null`/`true`/`false` and everything
 /// else refused ("Invalid path expression with result"). The element now carries the
-/// root path like a navigated source's does (`.a`, `.[]` already answered). `reduce`
-/// is unchanged. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+/// root path like a navigated source's does (`.a`, `.[]` already answered); `reduce`
+/// over `.` binds the same element and answers alike. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
 #[test]
 fn test_foreach_over_the_register_binds_it_as_a_path_3790() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
@@ -62575,6 +62575,47 @@ fn test_foreach_over_the_register_binds_it_as_a_path_3790() -> Result<()> {
             "[]\n",
             "",
             0,
+        ),
+        // `reduce` over the register: the same element, so the same answer.
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce . as $k (.a; $k))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce . as $k (.; $k))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce . as $k (0; .a))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 0"#,
+            5,
+        ),
+        (r#"{"a":1}"#, r"path(reduce . as $k (.; $k))", "[]\n", "", 0),
+        (r#"{"a":1}"#, r"(reduce . as $k (.; $k)) = 9", "9\n", "", 0),
+        (r#"{"a":1}"#, r"path(reduce . as $k (0; $k))", "[]\n", "", 0),
+        (r"[1]", r"path(reduce . as $k (.; $k))", "[]\n", "", 0),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce . as $k (0; .a))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of 0"#,
+            5,
+        ),
+        (r#"{"a":1}"#, r"(reduce . as $k (0; $k)) = 9", "9\n", "", 0),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce . as $k (.; $k.a))",
+            "",
+            r#"Invalid path expression with result {"b":1}"#,
+            5,
         ),
     ])
 }
