@@ -13335,7 +13335,20 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
         // #3837: a `?//` inside a computed key that retried past the stop which
         // recorded `outcome`, and produced nothing or raised, never re-entered
         // the sink to reset it; the matcher's own verdict (`walk`) stands then.
-        if outcome.is_some() && crate::jq::eval::retry_superseded(&walk, outcome_at, false) {
+        // A `halt` or decode failure is never retried past, so it is kept
+        // whatever the generation did (`StashedVerdict::take`'s rule). Without
+        // std there is no generation (`retry_superseded` answers from the
+        // `direct_retry` hint, `false` here: the matcher drives the pattern's
+        // computed keys, not one generator expression), so only the reset above
+        // is in force there.
+        let nonretryable = matches!(
+            &outcome,
+            Some(BodyOutcome::Return(Flow::Escaped(control))) if !is_retryable_control(control, false)
+        );
+        if outcome.is_some()
+            && !nonretryable
+            && crate::jq::eval::retry_superseded(&walk, outcome_at, false)
+        {
             outcome = None;
         }
         match outcome {

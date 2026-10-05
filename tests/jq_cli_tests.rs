@@ -94936,6 +94936,13 @@ const RETRY_ROWS_PATTERN_KEY_3837: &[RetryRow3293] = &[
         0,
     ),
     (
+        r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} | $v | if . == 1 then ("H"|halt_error(3)) else . end"#,
+        "",
+        "A",
+        "H",
+        3,
+    ),
+    (
         r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} | $v | (if . == 1 then error("E") else . end) | . + 10"#,
         "12\n",
         "AA",
@@ -95004,6 +95011,13 @@ const RETRY_ROWS_PATTERN_KEY_3837: &[RetryRow3293] = &[
         "AA",
         "",
         0,
+    ),
+    (
+        r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} | $v | if . == 1 then ("H"|halt_error(3)) else . end"#,
+        "",
+        "A",
+        "H",
+        3,
     ),
     (
         r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} | $v | (if . == 1 then error("E") else . end) | . + 10"#,
@@ -95076,6 +95090,13 @@ const RETRY_ROWS_PATTERN_KEY_3837: &[RetryRow3293] = &[
         5,
     ),
     (
+        r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} | $v | if . == 1 then ("H"|halt_error(3)) else . end"#,
+        "",
+        "A",
+        "H",
+        3,
+    ),
+    (
         r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} | $v | (if . == 1 then error("E") else . end) | . + 10"#,
         "",
         "AA",
@@ -95146,6 +95167,13 @@ const RETRY_ROWS_PATTERN_KEY_3837: &[RetryRow3293] = &[
         0,
     ),
     (
+        r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} | $v | if . == 1 then ("H"|halt_error(3)) else . end"#,
+        "",
+        "A",
+        "H",
+        3,
+    ),
+    (
         r#". as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} | $v | (if . == 1 then error("E") else . end) | . + 10"#,
         "12\n",
         "AA",
@@ -95214,6 +95242,13 @@ const RETRY_ROWS_PATTERN_KEY_3837: &[RetryRow3293] = &[
         "A",
         "Cannot index array with string \"z\"",
         5,
+    ),
+    (
+        r#". as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} | $v | if . == 1 then ("H"|halt_error(3)) else . end"#,
+        "",
+        "A",
+        "H",
+        3,
     ),
     (
         r#". as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} | $v | (if . == 1 then error("E") else . end) | . + 10"#,
