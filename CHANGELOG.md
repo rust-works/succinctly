@@ -883,6 +883,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `=` and `|=`, and a nested `walk(walk(empty))`); one shape stays open there, pinned as today's
   behaviour: a `[walk(f)]` collect whose refusal a later `try` swallows.
 
+- **jq: a destructuring bind over a literal in a `reduce`/`foreach` source is path-tracked like jq's** (#3489).
+  jq path-tracks the pattern steps of a destructuring bind, so over a freshly built value they raise: `[1] as
+  [$a] | $a` is `near attempt to access element 0 of [1]`, as the bare construct already was here. As a fold
+  source it was not, because a destructuring spells no `Field`/`Index`/`Iterate`, so `drive_fold_source` drove
+  the source by value and nothing checked the step: `path(reduce ([1] as [$a] | $a) as $k (.; .))` answered
+  `[]`, `del(...)` answered `null`, `= 5` and `|= 5` answered `5`, and a `try` never caught it, where jq exits
+  5 or catches. A nested `reduce`/`foreach` whose own loop pattern destructures a literal source is the same
+  shape. Only a **single** array or object pattern over a **number or string literal, or an array or object
+  construction**, (or a comma, paren or pipe of them) now goes through the resolver, jq mode only. That is
+  deliberately narrow, because routing a source exposes everything in it to the resolver's imprecision, and each
+  wider scope regressed something jq answers: a source that merely *preserves* jq's register (`select(true)`,
+  `first(.)`, `limit(1; .)`, `(.|.)`), since the resolver recognises only a bare `.` as the register (#3423);
+  `null` and the booleans, which jq treats as the register's own value when it holds the same one, and which the
+  resolver refuses once INIT has navigated (`reduce (null as [$a] | $a) as $k (.[0]; .)` on `[null]`, a write
+  too); and a `?//` alternation, which jq retries onto the next alternative where the resolver, with INIT having
+  moved the register, cannot tell the first refusal from a guess. Against jq 1.7.1, a differential fuzz that
+  varies the bind's source, pattern, body and INIT (eight seeds, 10,620 cases) found 0 regressions and 66
+  fixed; a 164-row hand matrix has one regression, below. **Not fixed**, still answering where jq refuses as
+  before: a destructuring over a *computed* source that is not a literal (`keys as [$a]`, `to_entries as [$a]`,
+  and so `del(reduce (keys as [$a] | $a) as $k (.; .))`, which answers `null` where jq exits 5, #3745); over a
+  bare `.` under `foreach` (#3744); under a `?//` alternation; over `null` or a boolean literal (`null as [$a]` over `[1]`, excluded
+  on purpose, see above); over a comma that mixes a literal with a non-literal; and over a literal that
+  follows another stage in a pipe (`{"a":1} | . as {a:$a} | $a`).
+  **One regression:** `try ((reduce X as [$a] ?// $a (0; .)), <a branch that raises>) catch H` as a fold source
+  drops the handler's output once the source goes through the resolver, which a navigating step already did
+  before this change; a literal destructuring that raises as that branch now triggers it too (#3743).
+
 - **jq: a `reduce`/`foreach` source that jq always refuses in path position now raises** (#3726).
   `from_entries`, `unique`, `unique_by`, `with_entries`, `map_values`, `sub`/`gsub`, `ascii_downcase`/
   `ascii_upcase`, the `match` family, an update assignment (`|=`, `+=`, `//=`) and `fromstream` iterate a

@@ -66161,6 +66161,634 @@ fn test_walk_over_an_array_does_not_rerun_an_f_with_effects_3713() -> Result<()>
     Ok(())
 }
 
+/// #3489: a destructuring bind over a freshly built value in a `reduce`/`foreach`
+/// SOURCE is path-tracked by jq, so its pattern step raises: `[1] as [$a] | $a` as
+/// a source is `near attempt to access element 0 of [1]`, exactly as the bare
+/// construct is. A source holding one spells no `Field`/`Index`/`Iterate`, so
+/// `drive_fold_source` drove it by value and nothing checked the step:
+/// `path(reduce ([1] as [$a] | $a) as $k (.; .))` answered `[]`, `del(...)`
+/// answered `null`, `= 5`/`|= 5` answered `5` and a `try` never caught it, where
+/// jq exits 5 or catches. A nested `reduce`/`foreach` whose own loop pattern
+/// destructures a literal source is the same shape.
+///
+/// Only a single pattern over a fresh source (a number or string literal, or an
+/// array or object construction) is routed through the resolver. Everything
+/// else keeps the by-value drive, and most of these rows pin that it stays
+/// right, each one a regression an earlier version had:
+/// - a source that merely *preserves* jq's register (`select(true)`, `first(.)`,
+///   `(.|.)`, `limit(1; .)`, ...), which jq destructures without a refusal;
+/// - `null` and the booleans, which jq treats as the register's own value when
+///   it holds the same one, so they must not be routed once INIT has navigated
+///   (`reduce (null as [$a] | $a) as $k (.[0]; .)` on `[null]`, a write too);
+/// - a `?//` alternation, which jq retries onto the next alternative where the
+///   resolver, with INIT having moved the register, cannot tell the first
+///   refusal from a guess and raises.
+///
+/// The gate looks at every node of the source, so a destructuring inside an
+/// object value, a `limit` count, an `if` condition, a `try` or a `?` (where
+/// jq suspends path tracking) is routed too; those rows pin that it still
+/// matches jq. Every row was captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_fold_source_destructuring_bind_is_path_tracked_3489() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce ([1] as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach ([1] as [$a] | $a) as $k (.; .; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"path(reduce ({"a":1} as {a:$a} | $a) as $k (.; .))"#,
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] | 1) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] | empty) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] | .) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] | $a, 1) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([[2]] as [[$a]] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([[2]] as [[$a]] | 1) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"del(reduce ([1] as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"(reduce ([1] as [$a] | $a) as $k (.; .)) |= 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"(reduce ([1] as [$a] | $a) as $k (.; .)) = 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"(foreach ([1] as [$a] | $a) as $k (.; .; .)) |= 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r#"try path(reduce ([1] as [$a] | $a) as $k (.; .)) catch "caught""#,
+            "\"caught\"\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"[path(reduce ([1] as [$a] | $a) as $k (.; .))?]",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (. as {a:$a} | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (. as {a:$a} | 1) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (. as {a:$a} | length) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (. as {a:$a} | ., 1) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"path(reduce (. as [$a] | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"path(reduce (. as [[$a]] | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as {a:$a} | .) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(reduce (. as {a:$a} | .) as $k (.; .)) |= 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(reduce (. as {a:$a} | .) as $k (.; .)) = 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(reduce (. as {a:$a} | .) as $k (.; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(reduce (. as [$a] | .) as $k (.; .)) |= 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(reduce (. as [$a] | .) as $k (.; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(reduce (.a as [$x] | $x) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (.a as {b:$b} | $b) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] ?// $a | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (. as [$a] ?// $a | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (reduce ([1],[2]) as [$a] (0; .)) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (foreach ([1],[2]) as [$a] (0; .)) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (reduce ([1]) as [$a] (0; .)) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (reduce (.[]) as [$a] (0; .)) as $k (.; .))",
+            "",
+            "Cannot index number with number",
+            5,
+        ),
+        (
+            r"[[1]]",
+            r"path(reduce (reduce (.[]) as [$a] (0; .)) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (1 as $a | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (. as $a | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"[reduce ([1] as [$a] | $a) as $k (.; .)]",
+            "[[1]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"[foreach ([1] as [$a] | $a) as $k (.; .; .)]",
+            "[{\"a\":{\"b\":1}}]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (select(true) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ((.|.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (limit(1;.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (first(.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (last(.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (nth(0;.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (until(true;.) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(reduce (first(.,1) as [$x] | $x) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"5",
+            r"path(reduce (first(.) as [$x] | $x) as $k (.; .))",
+            "",
+            "Cannot index number with number",
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(reduce ([2] as [$a] ?// $a | .) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"path(foreach ([2] as [$a] ?// $a | .) as $k (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(reduce ([2] as [$a] ?// $a | .) as $k (.; .)) |= 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"del(reduce ([2] as [$a] ?// $a | .) as $k (.; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(reduce (null as [$a] | $a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"true",
+            r"path(reduce (true as [$a] | $a) as $k (.; .))",
+            "",
+            "Cannot index boolean with number",
+            5,
+        ),
+        (
+            r"[null]",
+            r"[path(reduce (null as [$a] | $a) as $k (.[]; .))]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":null}"#,
+            r"[path(reduce (null as [$a] | $a) as $k (.a; .))]",
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":null}}"#,
+            r"[path(reduce (null as [$a] | $a) as $k (.a.b; .))]",
+            "[[\"a\",\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r"[null]",
+            r"(reduce (null as [$a] | $a) as $k (.[0]; .)) |= 5",
+            "[5]\n",
+            "",
+            0,
+        ),
+        (
+            r"[null]",
+            r"del(reduce (null as {a:$a} | $a) as $k (.[0]; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"[path(reduce ([1] as [$a] | $a) as $k (.[]; .))]",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"(reduce ([1] as [$a] | $a) as $k (.a; .)) |= 5",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"[{"key":"a","value":1}]"#,
+            r"[path(reduce (([1],[2]) as [$a] ?// $a | empty) as $x (.[]; .))?]",
+            "[[0]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(foreach (([1],[2]) as [$a] ?// $a | empty) as $x (.a; .; .)) |= 5",
+            "{\"a\":1}\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(foreach (([1],[2]) as [$a] ?// $a | empty) as $x (.[0]; .; .)) |= 5",
+            "[1]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(foreach ([type], (1 as [$a] ?// $a | length)) as $x ((.[]?); .; .))",
+            "[0]\n[0]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(foreach ([type], (1 as [$a] ?// $a | length)) as $x (first(.[]?); .; .)) |= 5",
+            "{\"a\":5}\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"path(reduce first(([.] as [$a] ?// $a | ($a, 1))) as $x (.[0]; .))",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (
+            r"[[1]]",
+            r"del(reduce first(([.] as [$a] ?// $a | ($a, 1))) as $x (first(.[]?); .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce ({a:([1] as [$b]|$b)}) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (limit(([1] as [$a]|$a); .)) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (if ([1] as [$a]|$a) then . else . end) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (try ([1] as [$a]|$a) catch 1) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (([1] as [$a]|$a)?) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce range([1] as [$a]|$a) as $k (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r#"path(reduce ("\([1] as [$a]|$a)") as $k (.; .))"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"del(reduce ({a:([1] as [$b]|$b)}) as $k (.; .))",
+            "null\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"(reduce (limit(([1] as [$a]|$a); .)) as $k (.; .)) |= 5",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce ([[1] as [$a]|$a]) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(reduce (-1 as [$a] | $a) as $k (.; .))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+    ])
+}
+
+/// #3489: a destructuring source that also reads `inputs` goes through the
+/// resolver, whose collecting leaf would drain the shared input reader if the
+/// pattern did not raise first. It does, so jq's own position holds: the error
+/// is reported at line 1 of the three documents, and a later `input` still
+/// sees the second one. Both are jq 1.7.1's output; the base drained the
+/// reader (`break`) or answered `[]`.
+#[test]
+fn test_fold_source_destructuring_does_not_drain_inputs_3489() -> Result<()> {
+    let docs = "[1]\n[2]\n[3]\n";
+    let (out, err, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            "path(reduce (inputs | [.] as [$a] | $a) as $x (.; .))",
+        ],
+        Some(docs),
+    )?;
+    assert_eq!((out.as_str(), code), ("", 5), "stderr {err:?}");
+    assert!(
+        err.contains("(at <stdin>:1): Invalid path expression near attempt to access element 0"),
+        "stderr {err:?}"
+    );
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            "path(reduce (inputs | [.] as [$a] | $a) as $x (.; .))?, input",
+        ],
+        Some(docs),
+    )?;
+    assert_eq!((out.as_str(), code), ("[2]\n", 0), "stderr {err:?}");
+    Ok(())
+}
+
 /// #3456 (B2): the survival rule is decided per *stage*, not per leaf. A
 /// compound stage that mixes a leaf that navigates with one that does not
 /// loses the register as a whole, so these refuse where jq 1.7.1 answers `[]`
