@@ -62050,6 +62050,35 @@ fn test_fold_pattern_first_step_that_cannot_succeed_retries_3743() -> Result<()>
             "",
             0,
         ),
+        // An object pattern's first step over a document that is no object.
+        (
+            r"[1,2]",
+            r"path(foreach (try ((reduce . as {a:$a} ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r#"path(foreach (try ((reduce . as {"a":$a} ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))"#,
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"path(foreach (try ((reduce . as {$a} ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[1,2]",
+            r"path(foreach (try ((reduce . as {a:[$b]} ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))",
+            "[]\n[]\n",
+            "",
+            0,
+        ),
     ])
 }
 
@@ -62081,6 +62110,11 @@ fn test_fold_pattern_guessed_refusal_is_not_caught_3743() -> Result<()> {
             r#"{"a":[1],"b":"abc"}"#,
             r"path(reduce . as {b:$a} ?// $a (.; .))",
             "[]",
+        ),
+        (
+            r"[1,2]",
+            r"path(foreach (try ((reduce . as [$a] ?// $a (0; .)), .[0][0]) catch 1) as $x (.; .; .))",
+            "[] []",
         ),
     ] {
         let routes = [
