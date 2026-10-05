@@ -62143,6 +62143,185 @@ fn test_fold_pattern_computed_key_is_not_run_twice_3743() -> Result<()> {
     Ok(())
 }
 
+/// #3744: a destructuring of the register itself (`.`) as a `foreach` SOURCE moves
+/// jq's path register through the pattern's tracked index steps, so the body's
+/// EXTRACT is checked against a register it is no longer at: `path(foreach (. as
+/// {a:$a} | .) as $x (.; .; .))` on `{"a":1}` refuses ("Invalid path expression
+/// with result"), and a write through it (`|=`, `=`, `del`) lands nowhere, where
+/// the by-value drive accepted the root. A bare `.` source is routed through the
+/// resolver for `foreach` (`is_fold_source_destructuring`), which models it
+/// exactly, now that #3743's `?//` retry no longer loses a handler's output on
+/// that route. `reduce` keeps the by-value drive: jq restores the register when it
+/// backtracks a `reduce` source, so `reduce (. as {a:$a} | .) as $x (.; .)` is `[]`
+/// (the contrast rows). Every row captured from jq 1.7.1, on the stdin and `-n`
+/// routes.
+#[test]
+fn test_foreach_source_destructuring_the_register_moves_it_3744() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. as {a:$a} | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(foreach (. as {a:$a} | .) as $x (.; .; .)) |= 5",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(foreach (0, (. as {a:$a} | $a)) as $x (.; .; .))",
+            "[]\n",
+            r#"Invalid path expression with result {"a":[1]}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as {a:$a} | .) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. as {a:$a} | $a) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. as {a:$a} | .a) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression near attempt to access element "a" of {"a":1}"#,
+            5,
+        ),
+        (
+            r"[1]",
+            r"path(foreach (. as [$a] | .) as $x (.; .; .))",
+            "",
+            r"Invalid path expression with result [1]",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach (. as {a:{b:$b}} | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"path(foreach (. as {a:$a} ?// $a | .) as $x (.; .; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"null",
+            r"path(foreach (. as {a:$a} | .) as $x (.; .; .))",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as [$x] ?// {a:$x} | .) as $y (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. as {a:$a} | $a, .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(first(. as {a:$a} | .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(. as {a:$a} | .)",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(foreach (. as {a:$a} | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(foreach (. as {a:$a} | $a) as $x (.; .; .)) = 5",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(foreach (. as {a:$a} | .) as $x (.; .; $x))]",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(foreach (. as {a:$a} | .) as $x (.; $x; .))",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as [$a] | .) as $x (.; .))",
+            "",
+            r"Cannot index object with number",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(reduce (. as {a:$a} | $a) as $x (.; .))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(try (foreach (. as {a:$a} | .) as $x (.; .; .)) catch 7)",
+            "",
+            r#"Invalid path expression with result {"a":1}"#,
+            5,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(foreach (. as {a:[$z]} | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression with result {"a":[1]}"#,
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            r"path(foreach (. as {a:$a, b:$b} | .) as $x (.; .; .))",
+            "",
+            r#"Invalid path expression near attempt to access element "b" of {"a":1,"b":2}"#,
+            5,
+        ),
+    ])
+}
+
 /// #3749/#3757, what is still refused where jq answers, in the safe direction. A
 /// verdict stage behind a `def` call or a `reduce` and one inside a compound stage
 /// (`(any, any)`, `any // 1`) are refused (#3644; the plain stage was lifted by #3758 and the
