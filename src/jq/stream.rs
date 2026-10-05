@@ -1217,6 +1217,28 @@ mod tests {
     use super::*;
     use indexmap::IndexMap;
 
+    #[test]
+    fn stream_lazy_keys_yaml_preserves_quotes_in_flow_and_block_3615() {
+        use crate::jq::document::DocumentValue;
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"\"a\": 1\n'b''c': 2\n\"1\": 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let value = index.root(yaml).first_child().unwrap().value();
+        let fields = value.as_object().unwrap();
+        // Captured from yq v4.53.3: `keys | . style="flow"` and `keys`.
+        for (indent, expected) in [
+            (IndentSpec::COMPACT, "[\"a\", 'b''c', \"1\"]"),
+            (IndentSpec::spaces(2), "- \"a\"\n- 'b''c'\n- \"1\""),
+        ] {
+            let mut out = String::new();
+            let mut error = None;
+            stream_lazy_keys_yaml(&fields, false, &mut out, indent, &mut error).unwrap();
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(out, expected);
+        }
+    }
+
     /// #3588: a computed string is written the way go-yaml's encoder writes one, in
     /// block context and, inside `[...]`/`{...}`, in flow context; a string with a
     /// line break, which go-yaml writes as a block scalar, keeps the escaped
