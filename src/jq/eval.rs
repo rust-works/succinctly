@@ -7859,10 +7859,7 @@ fn each_any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     AfterVerdict::Raise(control) => stop_with_escape(&mut probe_escape, control),
                     AfterVerdict::Stop => Demand::Stop,
                     // #3819: the swallowed break leaves `gen` running.
-                    AfterVerdict::Resume => {
-                        outer_stopped = false;
-                        Demand::Continue
-                    }
+                    AfterVerdict::Resume => Demand::Continue,
                 }
             }
             Ok(ElementProbe::Undecided) => Demand::Continue,
@@ -15661,16 +15658,14 @@ fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
     // swallows the decisive output's break makes the next alternative answer
     // too, and the elements after it stay in play.
     let mut matches = 0usize;
+    let counted = |matches: usize, flow: Flow| {
+        counted_bool_flow_to_result(matches, target_truthy, !target_truthy, flow)
+    };
     for cursor_elem in elements {
         let elem = match to_owned::<S, _>(&cursor_elem) {
             Ok(v) => v,
             Err(e) => {
-                return counted_bool_flow_to_result(
-                    matches,
-                    target_truthy,
-                    !target_truthy,
-                    Flow::Escaped(Control::Error(e)),
-                );
+                return counted(matches, Flow::Escaped(Control::Error(e)));
             }
         };
         match any_all_probe_element_verdict::<S>(cond, &elem, target_truthy) {
@@ -15678,37 +15673,22 @@ fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
                 matches += verdicts;
                 match after {
                     AfterVerdict::Stop => {
-                        return counted_bool_flow_to_result(
-                            matches,
-                            target_truthy,
-                            !target_truthy,
-                            Flow::Stopped { pending: None },
-                        );
+                        return counted(matches, Flow::Stopped { pending: None });
                     }
                     // #3810: the answer, then the `?//` retry's raise.
                     AfterVerdict::Raise(control) => {
-                        return counted_bool_flow_to_result(
-                            matches,
-                            target_truthy,
-                            !target_truthy,
-                            Flow::Escaped(control),
-                        );
+                        return counted(matches, Flow::Escaped(control));
                     }
                     AfterVerdict::Resume => {}
                 }
             }
             Ok(ElementProbe::Undecided) => {}
             Err(control) => {
-                return counted_bool_flow_to_result(
-                    matches,
-                    target_truthy,
-                    !target_truthy,
-                    Flow::Escaped(control),
-                );
+                return counted(matches, Flow::Escaped(control));
             }
         }
     }
-    counted_bool_flow_to_result(matches, target_truthy, !target_truthy, Flow::Exhausted)
+    counted(matches, Flow::Exhausted)
 }
 
 /// Builtin: `any(cond)` - true if cond is truthy for any element of `.[]`.

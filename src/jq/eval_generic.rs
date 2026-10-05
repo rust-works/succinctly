@@ -13817,10 +13817,7 @@ fn each_any_all_gen_cond_generic<S: EvalSemantics, V: DocumentValue>(
                     // #3810: the answer is out; a `?//` retry's raise follows it.
                     AfterVerdict::Raise(control) => stop_with_escape(&mut probe_escape, control),
                     AfterVerdict::Stop => Demand::Stop,
-                    AfterVerdict::Resume => {
-                        outer_stopped = false;
-                        Demand::Continue
-                    }
+                    AfterVerdict::Resume => Demand::Continue,
                 }
             }
             Ok(crate::jq::eval::ElementProbe::Undecided) => Demand::Continue,

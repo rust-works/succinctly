@@ -10417,7 +10417,7 @@ direct-retry case that needs no std retry generation.
 
 One path still diverges: the path-position resolver, where `path(.x | any(.; ...))`
 raises `Invalid path expression with result true` on the first answer where jq
-raises with `result false` on the last. Both raise, so only the message differs.
+raises with `result false` on the last. Both raise, so only the message differs. Tracked in #3827.
 
 ## Provenance
 
