@@ -11918,11 +11918,11 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
             // omni-dev: coverage tolerate-line reason="the CLI evaluates every program that uses input/inputs on the eager route (jq_runner's can_use_lazy_path excludes them), so this guard never fires today -- #2968's identical guards on the arms above are equally unfired; kept for the day the lazy path admits such a program (#1309)"
         }
-        Expr::Builtin(Builtin::AnyF(cond)) if cursor.is_some() => drain_result_generic::<V>(
+        Expr::Builtin(Builtin::AnyF(cond)) if cursor.is_some() => drain_any_all_probe_generic::<V>(
             any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), true),
             sink,
         ),
-        Expr::Builtin(Builtin::AllF(cond)) if cursor.is_some() => drain_result_generic::<V>(
+        Expr::Builtin(Builtin::AllF(cond)) if cursor.is_some() => drain_any_all_probe_generic::<V>(
             any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), false),
             sink,
         ),
@@ -13724,25 +13724,29 @@ fn each_isempty_generic<S: EvalSemantics, V: DocumentValue>(
 /// An item with no cursor to offer (`Owned`, a lazy chain) takes the owned
 /// evaluator exactly as before, materialized first.
 ///
-/// `Ok(true)`: decisive. `Ok(false)`: `cond` ran dry undecided. `Err`: an
-/// escape before any decision -- an error after a decisive output is never
-/// reached, which is the "prefix wins over trailing control" rule
-/// `eval::any_all_probe_element` states, arrived at by stopping early
-/// instead of by collecting and then discarding.
+/// Probe one condition, retaining a decisive answer and any control raised
+/// by a subsequent `?//` retry (#3810). Ordinary trailing outputs are
+/// short-circuited, as in `eval::any_all_probe_element_verdict`.
 fn any_all_probe_item_generic<S: EvalSemantics, V: DocumentValue>(
     cond: &Expr,
     item: GenericItem<V>,
     target_truthy: bool,
-) -> Result<bool, Control> {
-    let mut decided = false;
+) -> Result<crate::jq::eval::ElementProbe, Control> {
+    use crate::jq::eval::ElementProbe;
+    let mut decided_at: Option<u64> = None;
     let mut escape: Option<Control> = None;
-    let mut probe = |out: GenericItem<V>| match generic_item_truthiness::<_, S>(out) {
-        Ok(truthy) if truthy == target_truthy => {
-            decided = true;
-            Demand::Stop
+    let mut probe = |out: GenericItem<V>| {
+        // Each invocation belongs to the current attempt, not an abandoned
+        // `?//` alternative. The emitted decision remains a real prefix.
+        escape = None;
+        match generic_item_truthiness::<_, S>(out) {
+            Ok(truthy) if truthy == target_truthy => {
+                decided_at = Some(crate::jq::eval::pipe_retry_generation());
+                Demand::Stop
+            }
+            Ok(_) => Demand::Continue,
+            Err(control) => stop_with_escape(&mut escape, control),
         }
-        Ok(_) => Demand::Continue,
-        Err(control) => stop_with_escape(&mut escape, control),
     };
     let flow = match item {
         GenericItem::One(v) => eval_each_generic::<S, V>(cond, v, false, None, &mut probe),
@@ -13765,12 +13769,24 @@ fn any_all_probe_item_generic<S: EvalSemantics, V: DocumentValue>(
     if let Some(control) = escape {
         return Err(control);
     }
-    if decided {
-        return Ok(true);
+    if let Some(at) = decided_at {
+        // #3810: a `?//` retry that began after the decisive output and
+        // raised supersedes the stop, and its control follows the answer
+        // (see [`ElementProbe::Decided`]). The same rule as
+        // `eval::any_all_probe_element_verdict`, which this mirrors.
+        let superseded = crate::jq::eval::retry_superseded(
+            &flow,
+            at,
+            crate::jq::eval::direct_pattern_retry(cond),
+        );
+        return Ok(ElementProbe::Decided(match flow {
+            Flow::Escaped(control) if superseded => Some(control),
+            _ => None,
+        }));
     }
     match flow {
         Flow::Escaped(control) => Err(control),
-        Flow::Exhausted | Flow::Stopped { .. } => Ok(false),
+        Flow::Exhausted | Flow::Stopped { .. } => Ok(ElementProbe::Undecided),
     }
 }
 
@@ -13802,14 +13818,18 @@ fn each_any_all_gen_cond_generic<S: EvalSemantics, V: DocumentValue>(
         // #3293: reset per invocation -- see `eval::each_limit`.
         outer_stopped = false;
         match any_all_probe_item_generic::<S, V>(cond, item, target_truthy) {
-            Ok(true) => {
+            Ok(crate::jq::eval::ElementProbe::Decided(then_raise)) => {
                 probe_escape = None;
                 if sink.push(GenericItem::Owned(OwnedValue::Bool(target_truthy))) == Demand::Stop {
                     outer_stopped = true;
                 }
-                Demand::Stop
+                // #3810: the answer is out; a `?//` retry's raise follows it.
+                match then_raise {
+                    Some(control) => stop_with_escape(&mut probe_escape, control),
+                    None => Demand::Stop,
+                }
             }
-            Ok(false) => Demand::Continue,
+            Ok(crate::jq::eval::ElementProbe::Undecided) => Demand::Continue,
             Err(control) => stop_with_escape(&mut probe_escape, control),
         }
     });
@@ -13927,6 +13947,26 @@ fn each_skip_generic<S: EvalSemantics, V: DocumentValue>(
     })
 }
 
+/// Unary probes only produce a partial answer when a condition's `?//`
+/// retry raised after the decision (#3810). Preserve that control even if
+/// the consumer stops on the boolean, matching the binary streaming arm.
+fn drain_any_all_probe_generic<V: DocumentValue>(
+    result: GenericResult<V>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    match result {
+        GenericResult::Partial(values, control) => {
+            for value in values {
+                if sink.push(GenericItem::Owned(value)) == Demand::Stop {
+                    break;
+                }
+            }
+            Flow::Escaped(control)
+        }
+        result => drain_result_generic(result, sink),
+    }
+}
+
 /// `any(cond)`/`all(cond)` over the cursor, instead of through the wildcard
 /// bridge's ambient materialization (#2658).
 ///
@@ -13969,6 +14009,7 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: V::Cursor,
     target_truthy: bool,
 ) -> GenericResult<V> {
+    use crate::jq::eval::ElementProbe;
     let answer = |b: bool| GenericResult::Owned(OwnedValue::Bool(b));
     // One probe for both container arms: decisive -> the answer, undecided
     // -> keep walking, an escape before any decision -> propagate it.
@@ -13984,8 +14025,12 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
         let mut elems = elements;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             match probe(elem_cursor) {
-                Ok(true) => return answer(target_truthy),
-                Ok(false) => {}
+                Ok(ElementProbe::Decided(None)) => return answer(target_truthy),
+                // #3810: the answer, then the `?//` retry's raise.
+                Ok(ElementProbe::Decided(Some(control))) => {
+                    return partial_generic(vec![OwnedValue::Bool(target_truthy)], control);
+                }
+                Ok(ElementProbe::Undecided) => {}
                 Err(control) => return partial_generic(Vec::new(), control),
             }
             elems = rest;
@@ -14005,8 +14050,12 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(fields) => {
                 for field in fields {
                     match probe(field.value_cursor) {
-                        Ok(true) => return answer(target_truthy),
-                        Ok(false) => {}
+                        Ok(ElementProbe::Decided(None)) => return answer(target_truthy),
+                        // #3810: the answer, then the `?//` retry's raise.
+                        Ok(ElementProbe::Decided(Some(control))) => {
+                            return partial_generic(vec![OwnedValue::Bool(target_truthy)], control);
+                        }
+                        Ok(ElementProbe::Undecided) => {}
                         Err(control) => return partial_generic(Vec::new(), control),
                     }
                 }

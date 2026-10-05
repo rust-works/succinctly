@@ -88341,6 +88341,116 @@ fn test_and_or_retry_supersedes_stashed_sink_verdict_3293() -> Result<()> {
     assert_retry_rows_3293(None, "", RETRY_ROWS_AND_OR_3293)
 }
 
+/// #3810: a decisive `any`/`all` probe is delivered first, and the control a
+/// `?//` retry raises *after* it follows. The decisive output's `Stop` is what
+/// makes the `?//` inside `cond` try its next alternative (#1519); that
+/// alternative's raise or `halt_error` is real in jq 1.7.1, so it prints `true`
+/// and then fails (`E2`, exit 5), or halts (exit 3). The probe kept a sticky
+/// `decided` that outranked the retry's `Escaped` flow, so it answered `true`
+/// with exit 0. Rows cover `any`/`all` in the `(gen; cond)` and `(cond)` forms,
+/// an enclosing array collector (which gets no output at all), and a halt
+/// ending, on both the owned route and the document route. Captured from
+/// `/usr/bin/jq` 1.7.1 with `-nc`.
+///
+/// Not pinned, and still divergent: a retry that yields nothing or answers
+/// cleanly makes jq deliver a second answer (`true` then `false`); neither
+/// route reproduces that.
+const RETRY_ROWS_ANY_ALL_DECIDED_OBJ_3810: &[RetryRow3293] = &[
+    (
+        r#"any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else error("E2") end))"#,
+        "true\n",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"all(.; ((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else error("E2") end) | not))"#,
+        "false\n",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else error("E2") end)), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[all(.; ((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else error("E2") end) | not)), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else ("H"|halt_error(3)) end))"#,
+        "true\n",
+        "AAH",
+        "",
+        3,
+    ),
+    (
+        r#"[any(.; (. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else ("H"|halt_error(3)) end)), 9]"#,
+        "",
+        "AAH",
+        "",
+        3,
+    ),
+];
+
+const RETRY_ROWS_ANY_ALL_DECIDED_ARR_3810: &[RetryRow3293] = &[
+    (
+        r#"any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else error("E2") end))"#,
+        "true\n",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"all(((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else error("E2") end) | not))"#,
+        "false\n",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else error("E2") end)), 9]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"any((. as {a:$q} ?// {b:$z} | ("A"|stderr) as $m | if $q != null then .a else ("H"|halt_error(3)) end))"#,
+        "true\n",
+        "AAH",
+        "",
+        3,
+    ),
+];
+
+#[test]
+fn test_any_all_decisive_probe_then_retry_control_3810() -> Result<()> {
+    let obj = r#"{"a":[1],"b":[2]}"#;
+    let arr = r#"[{"a":[1],"b":[2]}]"#;
+    // Owned route (`eval.rs`): the input is built under `-n`.
+    assert_retry_rows_3293(
+        None,
+        &format!("{obj} | "),
+        RETRY_ROWS_ANY_ALL_DECIDED_OBJ_3810,
+    )?;
+    assert_retry_rows_3293(
+        None,
+        &format!("{arr} | "),
+        RETRY_ROWS_ANY_ALL_DECIDED_ARR_3810,
+    )?;
+    // Document route (`eval_generic.rs`): the input stays on the cursor.
+    assert_retry_rows_3293(Some(obj), "", RETRY_ROWS_ANY_ALL_DECIDED_OBJ_3810)?;
+    assert_retry_rows_3293(Some(arr), "", RETRY_ROWS_ANY_ALL_DECIDED_ARR_3810)
+}
+
 /// #3293: a `?//` retry inside the first stage of a pipe supersedes the verdict the
 /// retried-past alternative left in the pipe driver's stash.
 ///
@@ -101064,4 +101174,81 @@ fn test_slice_bound_decode_failure_stops_stderr_retry_3809() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// #3810: captured from /usr/bin/jq 1.7.1. A decisive condition emits the
+/// boolean before its `?//` retry raises; an array consumer cannot complete.
+/// Test both cursor input and an owned literal, plus unary array/object arms.
+#[test]
+fn test_any_all_condition_retry_preserves_answer_then_control_3810() -> Result<()> {
+    let doc = r#"{"a":[1],"b":[2]}"#;
+    for (ending, code, message) in [
+        (r#"error("E2")"#, 5, "E2"),
+        (r#"("H"|halt_error(3))"#, 3, "H"),
+    ] {
+        let cond = format!(
+            r#"(. as {{a:$q}} ?// {{b:$z}} | ("A"|stderr) as $m | if $q != null then .a else {ending} end)"#
+        );
+        for (container, call, answer) in [
+            (doc.to_string(), format!("any(.; {cond})"), "true\n"),
+            (doc.to_string(), format!("all(.; {cond}|not)"), "false\n"),
+            (format!("[{doc}]"), format!("any({cond})"), "true\n"),
+            (format!("[{doc}]"), format!("all({cond}|not)"), "false\n"),
+            (
+                format!(r#"{{"k":{doc}}}"#),
+                format!("any({cond})"),
+                "true\n",
+            ),
+            (
+                format!(r#"{{"k":{doc}}}"#),
+                format!("all({cond}|not)"),
+                "false\n",
+            ),
+        ] {
+            for (filter, expected) in [
+                (call.clone(), answer),
+                (format!("[{call}, 9]"), ""),
+                (format!("first({call})"), answer),
+            ] {
+                for owned in [false, true] {
+                    let query = if owned {
+                        format!("{container} | {filter}")
+                    } else {
+                        filter.clone()
+                    };
+                    let args = [if owned { "-nc" } else { "-c" }, query.as_str()];
+                    let (out, err, exit) =
+                        run_jq_full(&args, if owned { None } else { Some(&container) })?;
+                    assert_eq!((out.as_str(), exit), (expected, code), "`{query}`: {err:?}");
+                    let rest = err
+                        .strip_prefix("AA")
+                        .unwrap_or_else(|| panic!("`{query}`: {err:?}"));
+                    if code == 3 {
+                        assert_eq!(rest, message, "`{query}`");
+                    } else {
+                        assert!(
+                            !rest.starts_with('A') && rest.contains(message),
+                            "`{query}`: {err:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // A plain comma's trailing control must stay unreachable. A halt in
+    // the generator must retain its own status (no decisive condition).
+    let rows: &[RetryRow3293] = &[
+        (r#"any(.; true, error("E2"))"#, "true\n", "", "", 0),
+        (
+            r#"all(.; false, ("H"|halt_error(3)))"#,
+            "false\n",
+            "",
+            "",
+            0,
+        ),
+        (r#"any(("H"|halt_error(3)); .)"#, "", "H", "", 3),
+        (r#"any(.; error("E2"))"#, "", "", "E2", 5),
+    ];
+    assert_retry_rows_3293(Some(doc), "", rows)?;
+    assert_retry_rows_3293(None, &format!("{doc} | "), rows)
 }

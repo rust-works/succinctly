@@ -6444,6 +6444,23 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Builtin(Builtin::IsEmpty(inner)) => {
             each_isempty::<W, S>(inner, value, optional, sink)
         }
+        Expr::Builtin(builtin @ (Builtin::AnyF(_) | Builtin::AllF(_))) => {
+            let result = eval_builtin::<W, S>(builtin, value, optional);
+            // #3810: unary probes' only partial result is a decision followed
+            // by a condition retry's control. That retry consumed the probe's
+            // stop, so even a stopping consumer must see the control.
+            match result {
+                QueryResult::Partial(values, control) => {
+                    for value in values {
+                        if sink(Item::Owned(value)) == Demand::Stop {
+                            break;
+                        }
+                    }
+                    Flow::Escaped(control)
+                }
+                result => drain_result(result, sink),
+            }
+        }
         Expr::Builtin(Builtin::AnyCond(gen, cond)) => {
             each_any_all_gen_cond::<W, S>(gen, cond, value, optional, true, sink)
         }
@@ -7804,15 +7821,19 @@ fn each_any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let flow = eval_each_owned::<S>(gen, &owned, optional, Reentry::Proven, &mut |elem| {
         // #3293: reset per invocation -- see `each_limit`.
         outer_stopped = false;
-        match any_all_probe_element::<S>(cond, &elem, target_truthy) {
-            Ok(true) => {
+        match any_all_probe_element_verdict::<S>(cond, &elem, target_truthy) {
+            Ok(ElementProbe::Decided(then_raise)) => {
                 probe_escape = None;
                 if sink(Item::Owned(OwnedValue::Bool(target_truthy))) == Demand::Stop {
                     outer_stopped = true;
                 }
-                Demand::Stop
+                // #3810: the answer is out; a `?//` retry's raise follows it.
+                match then_raise {
+                    Some(control) => stop_with_escape(&mut probe_escape, control),
+                    None => Demand::Stop,
+                }
             }
-            Ok(false) => Demand::Continue,
+            Ok(ElementProbe::Undecided) => Demand::Continue,
             Err(control) => stop_with_escape(&mut probe_escape, control),
         }
     });
@@ -15442,26 +15463,64 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// which got the answer right but ran the side effects past the decision;
 /// now the same rule as `eval_generic.rs`'s `any_all_probe_item_generic`,
 /// so the two routes agree on that row too.
+///
+/// **Discards the control a `?//` retry raises after the decisive output**
+/// (#3810): it answers only "decided or not". Use
+/// [`any_all_probe_element_verdict`] wherever that control must follow the
+/// answer. The one remaining caller is the path-position resolver
+/// (`resolve_any_all_gen_cond_sink`), where `path(any(...))` itself still
+/// diverges before the retry is reached (#3819).
 fn any_all_probe_element<S: EvalSemantics>(
     cond: &Expr,
     elem: &OwnedValue,
     target_truthy: bool,
 ) -> Result<bool, Control> {
-    let mut decided = false;
+    any_all_probe_element_verdict::<S>(cond, elem, target_truthy)
+        .map(|verdict| matches!(verdict, ElementProbe::Decided(_)))
+}
+
+/// What probing one element's `cond` found (#3810).
+pub(crate) enum ElementProbe {
+    /// `cond` ran dry without a decisive output.
+    Undecided,
+    /// A decisive output. The `Option` is the control a `?//` retry raised
+    /// *after* it: the decisive output's `Stop` is what makes the `?//` try
+    /// its next alternative (#1519), and that alternative's raise or `halt`
+    /// is real in jq 1.7.1 -- the answer is delivered first and the control
+    /// follows it (`any(.; (1 as $x ?// $y | if $x then true else
+    /// error("E2") end))` prints `true`, then fails with `E2`). Dropping it
+    /// answered `true` and exit 0.
+    Decided(Option<Control>),
+}
+
+/// [`any_all_probe_element`] with the trailing control kept (#3810). Only a
+/// retry that began after the decisive output can supersede it
+/// ([`retry_superseded`]); an escape with no retry since cannot follow a
+/// stop at all.
+pub(crate) fn any_all_probe_element_verdict<S: EvalSemantics>(
+    cond: &Expr,
+    elem: &OwnedValue,
+    target_truthy: bool,
+) -> Result<ElementProbe, Control> {
+    let mut decided_at: Option<u64> = None;
     let flow = eval_each_owned::<S>(cond, elem, false, Reentry::REBUILT, &mut |out| {
         if out.is_truthy() == target_truthy {
-            decided = true;
+            decided_at = Some(pipe_retry_generation());
             Demand::Stop
         } else {
             Demand::Continue
         }
     });
-    if decided {
-        return Ok(true);
+    if let Some(at) = decided_at {
+        let superseded = retry_superseded(&flow, at, direct_pattern_retry(cond));
+        return Ok(ElementProbe::Decided(match flow {
+            Flow::Escaped(control) if superseded => Some(control),
+            _ => None,
+        }));
     }
     match flow {
         Flow::Escaped(control) => Err(control),
-        Flow::Exhausted | Flow::Stopped { .. } => Ok(false),
+        Flow::Exhausted | Flow::Stopped { .. } => Ok(ElementProbe::Undecided),
     }
 }
 
@@ -15532,9 +15591,15 @@ fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         };
-        match any_all_probe_element::<S>(cond, &elem, target_truthy) {
-            Ok(true) => return QueryResult::Owned(OwnedValue::Bool(target_truthy)),
-            Ok(false) => {}
+        match any_all_probe_element_verdict::<S>(cond, &elem, target_truthy) {
+            Ok(ElementProbe::Decided(None)) => {
+                return QueryResult::Owned(OwnedValue::Bool(target_truthy));
+            }
+            // #3810: the answer, then the `?//` retry's raise.
+            Ok(ElementProbe::Decided(Some(control))) => {
+                return partial(vec![OwnedValue::Bool(target_truthy)], control);
+            }
+            Ok(ElementProbe::Undecided) => {}
             Err(control) => return control_to_result(control),
         }
     }
@@ -15628,13 +15693,17 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // element `gen` yields is a computed value, so `cond` runs on it through
     // the demoting entry.
     let flow = eval_each_owned::<S>(gen, &owned, optional, Reentry::Proven, &mut |elem| {
-        match any_all_probe_element::<S>(cond, &elem, target_truthy) {
-            Ok(true) => {
+        match any_all_probe_element_verdict::<S>(cond, &elem, target_truthy) {
+            Ok(ElementProbe::Decided(then_raise)) => {
                 matches += 1;
                 probe_escape = None;
-                Demand::Stop
+                // #3810: the answer counts; a `?//` retry's raise follows it.
+                match then_raise {
+                    Some(control) => stop_with_escape(&mut probe_escape, control),
+                    None => Demand::Stop,
+                }
             }
-            Ok(false) => Demand::Continue,
+            Ok(ElementProbe::Undecided) => Demand::Continue,
             Err(control) => stop_with_escape(&mut probe_escape, control),
         }
     });
@@ -110935,6 +111004,40 @@ mod tests {
                 (0, "error: E2"),
                 "`{filter}`"
             );
+        }
+    }
+
+    /// #3810: direct condition retries also retain their trailing control
+    /// without std's thread-local retry generation. Captured from jq 1.7.1.
+    #[test]
+    fn test_any_all_direct_condition_retry_control_3810() {
+        for (ending, end) in [
+            (r#"error("E2")"#, "error: E2"),
+            (r#"("H"|halt_error(3))"#, "halt: 3"),
+        ] {
+            for (name, decision) in [("any", "true"), ("all", "false")] {
+                let cond =
+                    format!(r"([1] as [$q] ?// $z | if $q then {decision} else {ending} end)");
+                for filter in [format!("{name}(.; {cond})"), format!("{name}({cond})")] {
+                    let index = JsonIndex::build(b"[1]");
+                    let expr = parse(&filter).unwrap();
+                    let result = eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(b"[1]"));
+                    let QueryResult::Partial(values, control) = result else {
+                        panic!("`{filter}`: expected a boolean followed by control: {result:?}");
+                    };
+                    let got: Vec<_> = values.iter().map(OwnedValue::to_json).collect();
+                    let got_end = match control {
+                        Control::Error(error) => format!("error: {error}"),
+                        Control::Halt(code) => format!("halt: {code}"),
+                        other => panic!("`{filter}`: unexpected {other:?}"),
+                    };
+                    assert_eq!(
+                        (got, got_end.as_str()),
+                        (vec![decision.to_string()], end),
+                        "`{filter}`"
+                    );
+                }
+            }
         }
     }
 
