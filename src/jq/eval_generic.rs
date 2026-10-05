@@ -1026,14 +1026,17 @@ pub(super) fn to_owned_cursor_with<C: DocumentCursor, S: EvalSemantics>(
 pub fn to_owned_yaml_cursor<S: EvalSemantics, W: AsRef<[u64]> + Clone>(
     cursor: &crate::yaml::YamlCursor<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
-    to_owned_cursor_at_depth::<S, _, BuildOwned>(
+    let result = to_owned_cursor_at_depth::<S, _, BuildOwned>(
         cursor,
         None,
         0,
         &nesting_depth_check,
         &yaml_scalar_in_one_resolve,
         &[],
-    )
+    );
+    // #2334: the depth-0 entry point asserts, as `to_owned_cursor` does.
+    debug_assert_materialization_error(&result);
+    result
 }
 
 /// A YAML scalar materialized from one resolve of its text, or `None` to take
@@ -42927,14 +42930,9 @@ mod tests {
             "\"\\q\": bad\ngood: kept\n",
             "a: \"\\q\"\n",
         ];
-        for doc in docs {
-            let index = YamlIndex::build(doc.as_bytes()).unwrap();
-            let root = index.root(doc.as_bytes());
-            let cursor = root
-                .first_child()
-                .expect("YAML document should have content");
-            let fast = to_owned_yaml_cursor::<YqSemantics, _>(&cursor);
-            let chain = to_owned_cursor::<YqSemantics, _>(&cursor);
+        fn agree<S: EvalSemantics>(doc: &str, cursor: &crate::yaml::YamlCursor<'_, Vec<u64>>) {
+            let fast = to_owned_yaml_cursor::<S, _>(cursor);
+            let chain = to_owned_cursor::<S, _>(cursor);
             match (fast, chain) {
                 (Ok(fast), Ok(chain)) => {
                     assert_eq!(fast.to_json(), chain.to_json(), "value of {doc:?}");
@@ -42946,6 +42944,68 @@ mod tests {
                 }
                 (Err(fast), Err(chain)) => assert_eq!(fast.message, chain.message, "{doc:?}"),
                 (fast, chain) => panic!("{doc:?}: fast {fast:?} vs chain {chain:?}"),
+            }
+        }
+        for doc in docs {
+            let index = YamlIndex::build(doc.as_bytes()).unwrap();
+            let root = index.root(doc.as_bytes());
+            let cursor = root
+                .first_child()
+                .expect("YAML document should have content");
+            agree::<YqSemantics>(doc, &cursor);
+            // `load()` runs this entry under whichever mode it was called in.
+            agree::<JqSemantics>(doc, &cursor);
+        }
+    }
+
+    /// #2664: `DocumentCursor::REUSE_FIELD_VALUE` lets the walk hand a child
+    /// the value its member was built with instead of resolving it again; that
+    /// is only sound while a YAML member's `value` *is* its cursor's value, on
+    /// every shape of member (a merge key's, an alias's, a tagged scalar's).
+    #[test]
+    fn yaml_field_value_is_its_cursors_value_2664() {
+        use crate::yaml::YamlIndex;
+        // The choice is per format and deliberate: YAML resolves a value by
+        // decoding the node, JSON's walks stay as they were.
+        const _: () = {
+            assert!(
+                <crate::yaml::YamlCursor<'static, Vec<u64>> as DocumentCursor>::REUSE_FIELD_VALUE
+            );
+            assert!(
+                !<crate::json::light::JsonCursor<'static, Vec<u64>> as DocumentCursor>::REUSE_FIELD_VALUE
+            );
+        };
+        let docs = [
+            "a: 1\nb: [2, {c: x}]\nd: !!float 3\ne: \"s\"\n",
+            "x: &a hello\ny: *a\nz: &m {k: v}\nw: *m\n",
+            "base: &b {x: 1, y: 2}\nm:\n  <<: *b\n  z: 3\n",
+        ];
+        for doc in docs {
+            let index = YamlIndex::build(doc.as_bytes()).unwrap();
+            let root = index.root(doc.as_bytes());
+            let cursor = root
+                .first_child()
+                .expect("YAML document should have content");
+            let mut stack = vec![cursor];
+            while let Some(node) = stack.pop() {
+                let value = node.value();
+                if let Some(fields) = value.as_object() {
+                    let mut f = fields;
+                    while let Some((field, rest)) = DocumentFields::uncons(&f) {
+                        let held = to_owned_cursor::<YqSemantics, _>(&field.value_cursor)
+                            .map(|v| v.to_json());
+                        let own = to_owned::<YqSemantics, _>(&field.value).map(|v| v.to_json());
+                        assert_eq!(own, held, "member value of {doc:?}");
+                        stack.push(field.value_cursor);
+                        f = rest;
+                    }
+                } else if let Some(elements) = value.as_array() {
+                    let mut e = elements;
+                    while let Some((elem, rest)) = e.uncons_cursor() {
+                        stack.push(elem);
+                        e = rest;
+                    }
+                }
             }
         }
     }

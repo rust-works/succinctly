@@ -67131,7 +67131,6 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                     let loaded = super::eval_generic::to_owned_yaml_cursor::<S, _>(
                                         &doc_cursor,
                                     );
-                                    debug_assert_materialization_error(&loaded);
                                     match loaded {
                                         Ok(v) => doc_values.push(v),
                                         // #1620: a decode failure is never
@@ -67158,7 +67157,6 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             _ => {
                                 let loaded =
                                     super::eval_generic::to_owned_yaml_cursor::<S, _>(&root);
-                                debug_assert_materialization_error(&loaded);
                                 match loaded {
                                     Ok(v) => QueryResult::Owned(v),
                                     // Same #1620 routing as the sequence arm
@@ -110911,7 +110909,7 @@ mod tests {
             });
         }
 
-        // ========== #224: explicit tag resolution in load()'s YAML walk (`yaml_value_to_owned`, until #2664 made it the generic `to_owned_cursor`) ==========
+        // ========== #224: explicit tag resolution in load()'s YAML walk ==========
 
         #[test]
         fn test_load_yaml_explicit_tag_resolution() {
@@ -110961,8 +110959,7 @@ mod tests {
 
         #[test]
         fn test_load_yaml_explicit_tag_on_bare_dash_deferred_sequence_item_835() {
-            // #835: `yaml_value_to_owned`'s `Sequence` arm (a hand walk until
-            // #2664; this now pins the generic one) used to walk
+            // #835: a sequence walk used to walk
             // elements via the raw `uncons_cursor` (rather than
             // `uncons_resolved_cursor`), and its own `explicit_tag()` check
             // doesn't resolve a bare `-` sequence-item wrapper itself (a

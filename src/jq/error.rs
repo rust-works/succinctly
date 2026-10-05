@@ -1783,8 +1783,8 @@ impl EvalError {
 /// used to be a hand-written walk (`yaml_value_to_owned_checked`) with those
 /// same two constructors, which #2334's review found outside both halves of
 /// the guard because its name hid the `to_owned` in the middle; since #2664 it
-/// is `eval_generic::to_owned_yaml_cursor`, whose depth-0 entry is asserted
-/// at its two `builtin_load` call sites.
+/// is `eval_generic::to_owned_yaml_cursor`, which asserts at its own depth-0
+/// entry, as does the CLI's input route that calls it.
 ///
 /// Called from the depth-0 entry points only, never the recursive
 /// `*_at_depth` inner calls -- one assert per materialization, not one per

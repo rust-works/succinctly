@@ -79,6 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a flow-sequence key no longer shows the parser's `[[1,2]]` double wrap. The runner's walk re-spelled `!!float 2` as the literal `2.0` to survive
   the reindex round trip (#1176), which #2902 made unnecessary: it then leaked into string builtins, so `yq --eval-all '.a | tostring'` on `a: !!float 2`
   answered `"2.0"` where yq answers `"2"`, and `.a == 2` answered `false` where yq answers `true`. Both now match yq, as every other route already did.
+  The runner route's error text for an undecodable string is the shared walk's, as `load()`'s already was: `Error: invalid escape sequence`, without the
+  old `invalid YAML string: ` prefix (and without `YAML error: ` for an `Error` node); yq's own wording differs from both.
   Pinned by `test_load_complex_mapping_key_spells_empty_like_the_runner_2664`, `test_load_colliding_complex_mapping_keys_raise_2664` and
   `test_runner_walk_keeps_tag_forced_float_type_without_respelling_2664`. The shared walk resolved every YAML member's value twice (once when the
   member was built, again on entering it), which cost the folded `--slurp` route 26-40% on a 10 MB document; it now reuses the first resolve
