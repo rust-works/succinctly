@@ -1,0 +1,10 @@
+- key: "a"
+  value: "x"
+- key: 'b c'
+  value: 'y'
+- key: "1"
+  value: "e"
+- key: "true"
+  value: 'z'
+- key: nested
+  value: {"q": "v"}

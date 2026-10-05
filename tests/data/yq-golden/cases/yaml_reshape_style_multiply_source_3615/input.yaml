@@ -1,0 +1,10 @@
+m:
+  "a": "x"
+  'b c': 'y'
+  "1": "e"
+  "true": 'z'
+  nested: {"q": "v"}
+r:
+  "a": 'new'
+  "b": "fresh"
+  nested: {"q": 'right', 'new': "n"}
