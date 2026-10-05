@@ -72,6 +72,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they keep 256 (pinned by `test_materializing_path_forms_still_stop_at_the_materializer_ceiling_3429`; the heap-stack or stack-aware options
   are on the issue). Pinned by `test_paths_and_leaf_paths_answer_between_256_and_384_3429`, `test_public_eval_path_family_under_depth_answers_3457`
   and `test_public_eval_static_path_chain_ceiling_3429`.
+- **yq: `load()` and the `--slurp`/`--eval-all`/`--arg`/`-P` input route materialize YAML through one walk, and `load` now agrees with yq on a complex mapping key; a tag-forced float no longer leaks `2.0` into string builtins on `--eval-all`/`--slurp`** (#2664).
+  The two hand-written YAML cursor-to-`OwnedValue` walks (`load()`'s `yaml_value_to_owned_checked` and the runner's `yaml_to_owned_value`) are now the
+  library's `to_owned_cursor` walk. `load("f.yaml")` on `? [1, 2]` / `: value` answers `{"":"value"}` as yq does (it was `{"[1,2]":"value"}`), two
+  complex keys raise `object key "" is ambiguous` like every other materializing route (#2519) instead of being kept under two renderings of the key, and
+  a flow-sequence key no longer shows the parser's `[[1,2]]` double wrap. The runner's walk re-spelled `!!float 2` as the literal `2.0` to survive
+  the reindex round trip (#1176), which #2902 made unnecessary: it then leaked into string builtins, so `yq --eval-all '.a | tostring'` on `a: !!float 2`
+  answered `"2.0"` where yq answers `"2"`, and `.a == 2` answered `false` where yq answers `true`. Both now match yq, as every other route already did.
+  Pinned by `test_load_complex_mapping_key_spells_empty_like_the_runner_2664`, `test_load_colliding_complex_mapping_keys_raise_2664` and
+  `test_runner_walk_keeps_tag_forced_float_type_without_respelling_2664`.
 - **jq: a string slice in path position is no longer certified as the register by value** (#3793).
   `"s" | path(. as $k | .[0:] | $k)` answered `[{"start":0,"end":null}]` where jq refuses with `Invalid path expression with result "s"`, and
   `path(.a | . as $k | .[0:] | $k)` and `path(foreach .a as $k (0; $k|.[0:]; $k))` on `{"a":"s"}` did the same. jq's string slice is a copy and

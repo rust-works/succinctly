@@ -568,8 +568,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// #1314) -- the cursor-returning sibling of `resolve_alias_chain`
     /// above (a private method, not linkable from this public one), for
     /// callers that need to re-invoke a cursor method on the
-    /// resolved target (`stream_json_value`, `write_json_to`, `tag`, and
-    /// the CLI/evaluator's `yaml_to_owned_value`/`yaml_value_to_owned`)
+    /// resolved target (`stream_json_value`, `write_json_to`, `tag`)
     /// rather than just the resolved value. `self` need not itself be an
     /// alias -- returns `self` unchanged (zero hops) if it isn't.
     ///
@@ -595,9 +594,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// signatures -- accepted as a real but small (non-chain-scaling) cost,
     /// not benchmarked separately from the fix as a whole.
     ///
-    /// A `pub`, not `pub(crate)`, visibility (unlike its sibling):
-    /// `yaml_to_owned_value` (`src/bin/succinctly/yq_runner.rs`) is a
-    /// separate binary crate and needs to call this directly.
+    /// A `pub`, not `pub(crate)`, visibility (unlike its sibling): the CLI's
+    /// own materializing walk (`yaml_to_owned_value` in
+    /// `src/bin/succinctly/yq_runner.rs`, a separate binary crate) called
+    /// this directly until #2664 folded it onto the library's walk. Nothing
+    /// outside the library calls it now.
     ///
     /// Returns `None` only for a dangling (unresolvable) target. Panics
     /// past `MAX_ALIAS_CHAIN_DEPTH` (both private, not linkable from this
@@ -2931,9 +2932,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///
     /// `#[doc(hidden)]`: `pub`, not `pub(crate)`, only because
     /// `src/bin/succinctly/*` compiles as a separate crate from this
-    /// library and needs to reach this from `yaml_to_owned_value`
-    /// (`pub(crate)` cannot cross that boundary) -- not intended as public
-    /// library API (#2621), the same reason
+    /// library and used to reach this from its own `yaml_to_owned_value`
+    /// (`pub(crate)` cannot cross that boundary; that walk was folded onto the
+    /// library's in #2664, so nothing outside the library calls it now) -- not
+    /// intended as public library API (#2621), the same reason
     /// [`crate::jq::eval_generic::path_context_pipe_streams_cursors`] is
     /// `#[doc(hidden)]` too.
     ///

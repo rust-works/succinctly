@@ -19,8 +19,8 @@ use succinctly::jq::document::{
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
     check_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
-    to_owned_cursor as generic_to_owned_cursor, to_owned_with_comments, AnchorMark, CommentTree,
-    GenericResult, NodeMeta, KEY_STYLE_STRING, VALUE_STYLE_STRING,
+    to_owned_cursor as generic_to_owned_cursor, to_owned_cursor_unbound, to_owned_with_comments,
+    AnchorMark, CommentTree, GenericResult, NodeMeta, KEY_STYLE_STRING, VALUE_STYLE_STRING,
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
@@ -33,8 +33,8 @@ use succinctly::json::light::JsonCursor;
 use succinctly::json::validate;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
-    format_float_yq_yaml, format_float_yq_yaml_nested, go_yaml_dom_scalar, resolve_tagged,
-    stream_json_sequence, stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
+    format_float_yq_yaml, format_float_yq_yaml_nested, go_yaml_dom_scalar, stream_json_sequence,
+    stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
 };
 
 use super::m2_gate::can_use_m2_streaming;
@@ -847,106 +847,26 @@ fn walk_yaml_display_keys(bytes: &[u8], refuse_complex: bool) -> Result<()> {
     Ok(())
 }
 
-/// Convert a YAML value to an OwnedValue for jq evaluation.
+/// Convert a YAML cursor to an OwnedValue for jq evaluation.
 ///
-/// Takes a cursor rather than a bare `YamlValue`: an explicit tag
-/// (`!!str`, `!!int`, …) lives on the cursor's `bp_pos`
-/// ([`YamlCursor::explicit_tag`]), not on the extracted value, and forces
-/// resolution regardless of quoting style — `!!int "5"` converts to the
-/// number 5, matching real `yq` (#224). Every recursive call passes a
-/// cursor too (`field.value_cursor()`, `YamlElements::uncons_cursor`), so a
-/// tag on a nested element is never lost.
+/// One walk with the library's other materializers (#2664):
+/// `eval_generic::to_owned_cursor_at_depth` does the explicit-tag lookup
+/// (#224, through an alias #903, on a bare-`-` item #835), the quoted-string
+/// short-circuit, the sequence/mapping recursion and the shared
+/// `resolve_display_key` guard (#1749/#2519) that this function used to
+/// restate by hand.
 ///
-/// Materializes through `to_owned_value_for_json_bridge`, not the plain
-/// `to_owned_value`: everything this function builds is headed for
-/// [`evaluate_input`]'s `to_json_for_reindex::<JqSemantics>` round trip,
-/// the one bridge that would otherwise flatten a tag-forced `!!float 2`
-/// to an `Int` (#1176). That variant's doc comment explains why no other
-/// `ResolvedScalar -> OwnedValue` caller wants the same treatment.
+/// This used to materialize a tag-forced float through its own
+/// `to_owned_value_for_json_bridge`, which re-spelled `!!float 2` as the
+/// literal `2.0` so it would survive [`evaluate_input`]'s reindex round trip
+/// as a float (#1176). Since #2902 that round trip writes a bare `Float` as a
+/// token that reparses to the same `Float`, so the re-spelling carried nothing
+/// and leaked its literal into string builtins instead: `--eval-all '.a |
+/// tostring'` on `a: !!float 2` answered `"2.0"` where yq answers `"2"` (and
+/// where the default route and every other materializer already did, #1090).
+/// Folding onto the library's one walk (#2664) retired it.
 fn yaml_to_owned_value<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> Result<OwnedValue> {
-    match cursor.value() {
-        YamlValue::String(s) => {
-            let str_value = s
-                .as_str()
-                .map_err(|e| anyhow::anyhow!("invalid YAML string: {e}"))?;
-
-            // #2621: `cursor.value()` above already proved `cursor` isn't
-            // `Alias` by matching `String`, so `None` skips a second
-            // resolve.
-            if let Some(explicit) = cursor.explicit_tag_at(None) {
-                if let Some(resolved) = resolve_tagged(&str_value, explicit) {
-                    return Ok(resolved.to_owned_value_for_json_bridge(str_value));
-                }
-            }
-
-            // Quoted strings should always be treated as strings (yq-compatible behavior)
-            // Only unquoted scalars should undergo type detection
-            if !s.is_unquoted() {
-                return Ok(OwnedValue::String(str_value.into_owned().into()));
-            }
-
-            // Resolve plain scalars per the YAML 1.2 core schema
-            Ok(s.resolve_plain_scalar(&str_value)
-                .to_owned_value_for_json_bridge(str_value))
-        }
-        YamlValue::Mapping(fields) => {
-            let mut map = IndexMap::new();
-            // #1749: two complex/undecodable keys (e.g. two different
-            // sequence keys) both stringify to "" per #222 -- real yq's own
-            // streaming/DOM paths keep both entries (its underlying
-            // representation isn't a plain map), but `OwnedValue::Object`'s
-            // `IndexMap<String, _>` cannot hold two values under one key.
-            // Guarding against that silent overwrite the same way
-            // #1642/#1738 guard a JSON decode-failure collision: an
-            // *ordinary* repeated genuine key still overwrites without
-            // complaint (matching jq's own last-key-wins), only a
-            // fallback-spelling collision raises. Through the shared
-            // `resolve_display_key` since #2519 put YAML's complex-key
-            // classification on `DocumentValue::display_key_kind`, so this
-            // route and every generic materializer answer from one rule.
-            let mut guard = DisplayKeyGuard::default();
-            // STYLE-0013: same reason as `validate_yaml_display_keys`'s own
-            // exemption -- a `YamlCursor`-native walk with no delimiters.
-            for field in fields {
-                let key = resolve_display_key(&field.key(), &map, &mut guard)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                    // `YamlValue::display_key_kind` never answers `None`: a
-                    // YAML key is never dropped (#222).
-                    .unwrap_or_default();
-                let value = yaml_to_owned_value(field.value_cursor())?;
-                map.insert(key, value);
-            }
-            Ok(OwnedValue::Object(map.into()))
-        }
-        YamlValue::Sequence(elements) => {
-            let mut arr = Vec::new();
-            let mut rest = elements;
-            // `uncons_resolved_cursor`, not `uncons_cursor`: the recursive
-            // call's own `cursor.explicit_tag_at(None)` above doesn't
-            // resolve a bare `-` sequence-item wrapper itself (see
-            // `YamlCursor::anchor`'s doc comment for why), so an
-            // unresolved cursor here would silently drop an explicit tag
-            // on a bare-dash-deferred scalar (#835).
-            while let Some((elem_cursor, next)) = rest.uncons_resolved_cursor() {
-                arr.push(yaml_to_owned_value(elem_cursor)?);
-                rest = next;
-            }
-            Ok(OwnedValue::array_from(arr))
-        }
-        YamlValue::Alias { target, .. } => {
-            // Resolve the *entire* alias chain first (#1193), not just this
-            // one hop: the resolved cursor's own `.value()` is guaranteed
-            // non-`Alias`, so this recursive call terminates in exactly one
-            // more step regardless of chain length.
-            match target.and_then(|t| t.resolve_alias_target_cursor()) {
-                Some(resolved) => yaml_to_owned_value(resolved),
-                // Unresolved (dangling) target - treat as null
-                None => Ok(OwnedValue::Null),
-            }
-        }
-        YamlValue::Error(msg) => Err(anyhow::anyhow!("YAML error: {msg}")),
-        YamlValue::Null => Ok(OwnedValue::Null),
-    }
+    to_owned_cursor_unbound::<YqSemantics, _>(&cursor).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Read input from stdin as bytes.
