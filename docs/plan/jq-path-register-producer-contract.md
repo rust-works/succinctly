@@ -520,8 +520,10 @@ Each turns a refusal into an answer and needs its own oracle rows:
   gained contexts that enter the stage on a literal (`untracked-*`). Still refused where jq
   answers, tracked by #3767: `try ... catch H`, `limit(n; E)`, `nth(n; E)`, an `[E]` collect of a
   type filter, and either stage inside a compound stage. Not a promotion but found on the way,
-  #3766: `last(f)` returns a copy, so a `last` whose output is the register itself
-  (`last($x)`, `last(.)`) loses its identity.
+  #3766 (fixed): `last(f)` returned a copy, so a `last` whose output is the register itself
+  (`last($x)`, `last(.)`) lost its identity; the arm now forwards the last branch itself when
+  it is the entry node, and keeps an untracked output's snapshot mark, so it states the
+  identity of the value `f` last emitted.
 - The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
   turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`
   into jq's `[]`. Cheap now, because the producers already say it.
