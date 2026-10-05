@@ -105319,6 +105319,341 @@ fn test_fold_pattern_key_retry_supersedes_the_abandoned_step_3842() -> Result<()
     )
 }
 
+/// #3843: a `?//` inside a computed object-pattern key in *path position* (`path(. as {(K): $v} | ...)`).
+/// The path-mode resolver recorded the body's verdict in a local the key's retry never reset, so after the
+/// first key output's body raised, a retry that answered cleanly still reported the abandoned error.
+/// Every value is captured from `/usr/bin/jq` 1.7.1 with `-c` over the document.
+const RETRY_ROWS_PATH_PATTERN_KEY_3843: &[RetryRow3293] = &[
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} | $v | if . == 1 then error("E") else . end)]"#,
+        "[[\"y\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} | $v | if . == 1 then error("E") else . end)"#,
+        "[\"y\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[paths(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} | $v | if . == 1 then error("E") else true end)]"#,
+        "",
+        "AAAA",
+        "Cannot index number with string \"y\"",
+        5,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} ?// $z | if $v == 1 then error("E") else $v end)]"#,
+        "[[\"y\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} ?// {y: $z} | if $v == 1 then error("E") else [$v,$z] end)]"#,
+        "",
+        "AA",
+        "Invalid path expression with result [null,2]",
+        5,
+    ),
+    (
+        r#"[first(path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} | $v | if . == 1 then error("E") else . end))]"#,
+        "[[\"y\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"try [path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} | $v | if . == 1 then error("E") else . end)] catch "c""#,
+        "[[\"y\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} | $v | if . == 1 then ("H"|halt_error(3)) else . end)]"#,
+        "",
+        "A",
+        "H",
+        3,
+    ),
+    (
+        r#"del(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else "y" end)): $v} | $v | if . == 1 then error("E") else . end)"#,
+        "{\"x\":1}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} | $v | if . == 1 then error("E") else . end)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} | $v | if . == 1 then error("E") else . end)"#,
+        "",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[paths(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} | $v | if . == 1 then error("E") else true end)]"#,
+        "[]\n",
+        "AAAAAA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} ?// $z | if $v == 1 then error("E") else $v end)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} ?// {y: $z} | if $v == 1 then error("E") else [$v,$z] end)]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[first(path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} | $v | if . == 1 then error("E") else . end))]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"try [path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} | $v | if . == 1 then error("E") else . end)] catch "c""#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} | $v | if . == 1 then ("H"|halt_error(3)) else . end)]"#,
+        "",
+        "A",
+        "H",
+        3,
+    ),
+    (
+        r#"del(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else empty end)): $v} | $v | if . == 1 then error("E") else . end)"#,
+        "{\"x\":1,\"y\":2}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} | $v | if . == 1 then error("E") else . end)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} | $v | if . == 1 then error("E") else . end)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[paths(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} | $v | if . == 1 then error("E") else true end)]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} ?// $z | if $v == 1 then error("E") else $v end)]"#,
+        "",
+        "AA",
+        "Invalid path expression with result null",
+        5,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} ?// {y: $z} | if $v == 1 then error("E") else [$v,$z] end)]"#,
+        "",
+        "AA",
+        "Invalid path expression with result [null,2]",
+        5,
+    ),
+    (
+        r#"[first(path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} | $v | if . == 1 then error("E") else . end))]"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"try [path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} | $v | if . == 1 then error("E") else . end)] catch "c""#,
+        "\"c\"\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} | $v | if . == 1 then ("H"|halt_error(3)) else . end)]"#,
+        "",
+        "A",
+        "H",
+        3,
+    ),
+    (
+        r#"del(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then "x" else error("E2") end)): $v} | $v | if . == 1 then error("E") else . end)"#,
+        "",
+        "AA",
+        "E2",
+        5,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} | $v | if . == 1 then error("E") else . end)]"#,
+        "[[\"y\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} | $v | if . == 1 then error("E") else . end)"#,
+        "[\"y\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[paths(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} | $v | if . == 1 then error("E") else true end)]"#,
+        "",
+        "AAAA",
+        "Cannot index number with string \"y\"",
+        5,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} ?// $z | if $v == 1 then error("E") else $v end)]"#,
+        "[[\"y\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} ?// {y: $z} | if $v == 1 then error("E") else [$v,$z] end)]"#,
+        "",
+        "AA",
+        "Invalid path expression with result [null,2]",
+        5,
+    ),
+    (
+        r#"[first(path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} | $v | if . == 1 then error("E") else . end))]"#,
+        "[[\"y\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"try [path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} | $v | if . == 1 then error("E") else . end)] catch "c""#,
+        "[[\"y\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} | $v | if . == 1 then ("H"|halt_error(3)) else . end)]"#,
+        "",
+        "A",
+        "H",
+        3,
+    ),
+    (
+        r#"del(. as {(([["a"]] as [$q] ?// [[$q]] | ("A"|stderr) | if ($q|type=="array") then ("x","y") else "y" end)): $v} | $v | if . == 1 then error("E") else . end)"#,
+        "{\"x\":1}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} | $v | if . == 1 then error("E") else . end)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"path(. as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} | $v | if . == 1 then error("E") else . end)"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[paths(. as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} | $v | if . == 1 then error("E") else true end)]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} ?// $z | if $v == 1 then error("E") else $v end)]"#,
+        "",
+        "A",
+        "Invalid path expression with result null",
+        5,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} ?// {y: $z} | if $v == 1 then error("E") else [$v,$z] end)]"#,
+        "",
+        "A",
+        "Invalid path expression with result [null,2]",
+        5,
+    ),
+    (
+        r#"[first(path(. as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} | $v | if . == 1 then error("E") else . end))]"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+    (
+        r#"try [path(. as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} | $v | if . == 1 then error("E") else . end)] catch "c""#,
+        "\"c\"\n",
+        "A",
+        "",
+        0,
+    ),
+    (
+        r#"[path(. as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} | $v | if . == 1 then ("H"|halt_error(3)) else . end)]"#,
+        "",
+        "A",
+        "H",
+        3,
+    ),
+    (
+        r#"del(. as {(([["a"]] as [$q] ?// {z:$q} | ("A"|stderr) | "x")): $v} | $v | if . == 1 then error("E") else . end)"#,
+        "",
+        "A",
+        "Cannot index array with string \"z\"",
+        5,
+    ),
+];
+
+#[test]
+fn test_path_mode_pattern_key_retry_supersedes_the_abandoned_branch_3843() -> Result<()> {
+    let input = r#"{"x":1,"y":2}"#;
+    // Document route.
+    assert_retry_rows_3293(Some(input), "", RETRY_ROWS_PATH_PATTERN_KEY_3843)?;
+    // Owned route: the input is built under `-n`.
+    assert_retry_rows_3293(
+        None,
+        &format!("{input} | "),
+        RETRY_ROWS_PATH_PATTERN_KEY_3843,
+    )
+}
+
 /// #3806: a `?//` in a pipe's source followed by a lazy `map(f)` whose element raises.
 /// On the document route the lazy sequence reached its sink unforced, so the sink forced
 /// it after the drive ended: the retry never ran (`A` once, not twice) or a sink's stashed
