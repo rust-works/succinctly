@@ -30278,26 +30278,27 @@ fn eval_owned_identity_alternative<S: EvalSemantics, V: DocumentValue>(
     mut tail: OwnedIdentityTail<'_, V>,
 ) -> Flow {
     let mut any_truthy = false;
-    let mut rest_escape: Option<Control> = None;
+    let rest_escape = StashedEscape::new();
     let left_flow = eval_owned_identity_stages::<S, V>(
         owned_identity_body_stages(left),
         Cow::Borrowed(&value),
         id.clone(),
         optional,
         OwnedIdentityTail::Pairs(&mut |v, vid| {
+            // #3805: a re-invocation after a stop is a `?//` retry inside `left`.
+            rest_escape.begin();
             if !v.is_truthy() {
                 return Flow::Exhausted;
             }
             any_truthy = true;
             match eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail.reborrow()) {
-                Flow::Escaped(control) => {
-                    stop_owned_identity_rest_escape(&mut rest_escape, control)
-                }
+                Flow::Escaped(control) => stop_owned_identity_rest_escape(&rest_escape, control),
                 other => other,
             }
         }),
     );
-    if let Some(control) = rest_escape {
+    if let Some(control) = rest_escape.take(&left_flow, crate::jq::eval::direct_pattern_retry(left))
+    {
         return Flow::Escaped(control);
     }
     match left_flow {
@@ -30689,8 +30690,13 @@ fn eval_owned_identity_spliced<S: EvalSemantics, V: DocumentValue>(
 /// non-retryable classification as `Demand::Stop`. Delegate the store and
 /// classification to `stop_with_escape`; each caller retains its own rule
 /// for recovering the saved escape after the body stops (#2830).
-fn stop_owned_identity_rest_escape(slot: &mut Option<Control>, control: Control) -> Flow {
-    stop_with_escape(slot, control);
+///
+/// The slot is a [`StashedEscape`] (#3805): a `?//` inside the body re-invokes
+/// the closure that stashes here, or retries past it without producing
+/// anything, and a bare `Option` left the abandoned alternative's escape to
+/// outrank the retry's own verdict.
+fn stop_owned_identity_rest_escape(slot: &StashedEscape, control: Control) -> Flow {
+    slot.stop(control);
     Flow::Stopped { pending: None }
 }
 
@@ -30707,24 +30713,22 @@ fn eval_owned_identity_scoped<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     tail: &mut OwnedIdentityTail<'_, V>,
 ) -> Result<Flow, Control> {
-    let mut rest_escape: Option<Control> = None;
+    let rest_escape = StashedEscape::new();
     let flow = eval_owned_identity_stages::<S, V>(
         owned_identity_body_stages(body),
         value,
         id,
         optional,
-        OwnedIdentityTail::Pairs(&mut |v, vid| match eval_owned_identity_stages::<S, V>(
-            rest,
-            v,
-            vid,
-            optional,
-            tail.reborrow(),
-        ) {
-            Flow::Escaped(control) => stop_owned_identity_rest_escape(&mut rest_escape, control),
-            other => other,
+        OwnedIdentityTail::Pairs(&mut |v, vid| {
+            // #3805: a re-invocation after a stop is a `?//` retry inside `body`.
+            rest_escape.begin();
+            match eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail.reborrow()) {
+                Flow::Escaped(control) => stop_owned_identity_rest_escape(&rest_escape, control),
+                other => other,
+            }
         }),
     );
-    match rest_escape {
+    match rest_escape.take(&flow, crate::jq::eval::direct_pattern_retry(body)) {
         Some(control) => Err(control),
         None => Ok(flow),
     }
@@ -30773,24 +30777,23 @@ fn eval_owned_identity_try<S: EvalSemantics, V: DocumentValue>(
     // of the document, so a path descended into it would name nothing
     // (`.a | (try error({"b":9}) catch .b) | path` is `["a"]`). Its reads
     // still resolve at that position, which is where the handler runs from.
-    let mut rest_escape: Option<Control> = None;
+    let rest_escape = StashedEscape::new();
     let flow = eval_owned_identity_stages::<S, V>(
         owned_identity_body_stages(handler),
         Cow::Owned(payload),
         id.clone(),
         optional,
-        OwnedIdentityTail::Pairs(&mut |v, _| match eval_owned_identity_stages::<S, V>(
-            rest,
-            v,
-            id.clone(),
-            optional,
-            tail.reborrow(),
-        ) {
-            Flow::Escaped(control) => stop_owned_identity_rest_escape(&mut rest_escape, control),
-            other => other,
+        OwnedIdentityTail::Pairs(&mut |v, _| {
+            // #3805: a re-invocation after a stop is a `?//` retry inside the handler.
+            rest_escape.begin();
+            match eval_owned_identity_stages::<S, V>(rest, v, id.clone(), optional, tail.reborrow())
+            {
+                Flow::Escaped(control) => stop_owned_identity_rest_escape(&rest_escape, control),
+                other => other,
+            }
         }),
     );
-    resume_from_escape(rest_escape, flow)
+    rest_escape.resume(flow, crate::jq::eval::direct_pattern_retry(handler))
 }
 
 /// `any(gen; cond)` / `all(gen; cond)` over an owned value with identity,
@@ -30826,15 +30829,20 @@ fn eval_owned_identity_any_all<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     mut tail: OwnedIdentityTail<'_, V>,
 ) -> Flow {
-    let mut decided = false;
-    let mut probe_escape: Option<Control> = None;
-    let mut rest_flow: Option<Flow> = None;
+    // #3805: all three out-of-band results are per-attempt, so a `?//` retry
+    // inside `gen` can supersede them: the decisive answer's continuation
+    // (`rest_flow`, which also says an answer was decided) and the probe's
+    // escape are stashes, not bare locals.
+    let probe_escape = StashedEscape::new();
+    let rest_flow = StashedVerdict::<Flow>::new();
     let flow = eval_owned_identity_stages::<S, V>(
         owned_identity_body_stages(gen),
         Cow::Borrowed(&value),
         id.clone(),
         optional,
         OwnedIdentityTail::Pairs(&mut |v, vid| {
+            probe_escape.begin();
+            rest_flow.begin();
             let mut hit = false;
             let probe = eval_owned_identity_stages::<S, V>(
                 owned_identity_body_stages(cond),
@@ -30851,10 +30859,9 @@ fn eval_owned_identity_any_all<S: EvalSemantics, V: DocumentValue>(
                 }),
             );
             if hit {
-                decided = true;
                 // The decisive answer continues into `rest` now, before
                 // `gen` is stopped -- `rest`'s own verdict outranks ours.
-                rest_flow = Some(eval_owned_identity_stages::<S, V>(
+                rest_flow.stash(eval_owned_identity_stages::<S, V>(
                     rest,
                     Cow::Owned(OwnedValue::Bool(target_truthy)),
                     id.clone(),
@@ -30865,18 +30872,21 @@ fn eval_owned_identity_any_all<S: EvalSemantics, V: DocumentValue>(
             }
             match probe {
                 Flow::Escaped(control) => {
-                    stop_with_escape(&mut probe_escape, control);
+                    probe_escape.stop(control);
                     Flow::Stopped { pending: None }
                 }
                 _ => Flow::Exhausted,
             }
         }),
     );
-    if let Some(control) = probe_escape {
+    let direct_retry = crate::jq::eval::direct_pattern_retry(gen);
+    if let Some(control) = probe_escape.take(&flow, direct_retry) {
         return resume_from_escape(Some(control), flow);
     }
-    if decided {
-        return rest_flow.unwrap_or(Flow::Exhausted);
+    // A decided answer's continuation stands unless a retry inside `gen`
+    // superseded the stop that decided it; then `gen`'s own verdict does.
+    if let Some(decided) = rest_flow.take(&flow, direct_retry) {
+        return decided;
     }
     match flow {
         Flow::Exhausted => eval_owned_identity_stages::<S, V>(
@@ -30960,14 +30970,16 @@ fn eval_owned_identity_bounded<S: EvalSemantics, V: DocumentValue>(
     }
     let mut to_skip = skip;
     let mut count = 0usize;
-    let mut rest_escape: Option<Control> = None;
-    let mut rest_stopped: Option<Flow> = None;
+    // #3805: `rest`'s verdict -- an escape, or a stop it raised -- is one
+    // stash a `?//` retry inside `body` can supersede.
+    let rest_verdict = StashedVerdict::<Flow>::new();
     let flow = eval_owned_identity_stages::<S, V>(
         owned_identity_body_stages(body),
         value,
         id,
         optional,
         OwnedIdentityTail::Pairs(&mut |v, vid| {
+            rest_verdict.begin();
             if to_skip > 0 {
                 to_skip -= 1;
                 return Flow::Exhausted;
@@ -30981,21 +30993,15 @@ fn eval_owned_identity_bounded<S: EvalSemantics, V: DocumentValue>(
                         Flow::Exhausted
                     }
                 }
-                Flow::Escaped(control) => {
-                    stop_owned_identity_rest_escape(&mut rest_escape, control)
-                }
-                stopped => {
-                    rest_stopped = Some(stopped);
+                other => {
+                    rest_verdict.stop_with_downstream(other);
                     Flow::Stopped { pending: None }
                 }
             }
         }),
     );
-    if let Some(control) = rest_escape {
-        return Flow::Escaped(control);
-    }
-    if let Some(stopped) = rest_stopped {
-        return stopped;
+    if let Some(verdict) = rest_verdict.take(&flow, crate::jq::eval::direct_pattern_retry(body)) {
+        return verdict;
     }
     match flow {
         Flow::Stopped { .. } | Flow::Exhausted => Flow::Exhausted,
@@ -31599,8 +31605,11 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 // stashed out-of-band; the matcher's own trailing control
                 // (a step error, a key's error/break/halt) escapes after
                 // every earlier binding set has run.
-                let mut ended: Option<Flow> = None;
+                // #3805: a `?//` in a computed key re-invokes this closure after
+                // a stop, so the verdict is a stash a retry can supersede.
+                let ended = StashedVerdict::<Flow>::new();
                 let walk = each_pattern_binding_set::<S>(pattern, &bound, false, &mut |bindings| {
+                    ended.begin();
                     let substituted = substitute_vars(
                         body,
                         as_var_refs(bindings).chain(
@@ -31619,10 +31628,10 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                         tail.reborrow(),
                     ) {
                         Flow::Exhausted => Demand::Continue,
-                        other => stop_with_downstream(&mut ended, other),
+                        other => ended.stop_with_downstream(other),
                     }
                 });
-                if let Some(flow) = ended {
+                if let Some(flow) = ended.take(&walk, false) {
                     return flow;
                 }
                 if let Flow::Escaped(control) = walk {
@@ -31760,8 +31769,12 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             // for the node's own unrebuilt value, and demotes everything
             // otherwise -- rather than the blanket `Owned` witness the
             // #2642 review tried and reverted here.
-            let mut downstream: Option<Flow> = None;
+            // #3805: a `?//` in the stage's own expression re-invokes `emit`
+            // after a stop, or retries past it silently, so the verdict is a
+            // stash a retry can supersede.
+            let downstream = StashedVerdict::<Flow>::new();
             let mut emit = |output: OwnedValue| -> Demand {
+                downstream.begin();
                 let flow = match owned_identity_after_stage::<S, V>(
                     stage, rule, &value, &id, &output, optional,
                 ) {
@@ -31787,7 +31800,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 };
                 match flow {
                     Flow::Exhausted => Demand::Continue,
-                    other => stop_with_downstream(&mut downstream, other),
+                    other => downstream.stop_with_downstream(other),
                 }
             };
             // #2471 (gate reason 1 of spine 2416): a map-family stage whose
@@ -31839,7 +31852,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                     &mut emit,
                 ),
             };
-            match downstream {
+            match downstream.take(&upstream, crate::jq::eval::direct_pattern_retry(stage_expr)) {
                 Some(flow) => flow,
                 None => owned_identity_after_prefetch(upstream, escaped),
             }
