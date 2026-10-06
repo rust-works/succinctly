@@ -42119,17 +42119,23 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         ) => true,
         // #3283: `map(f)`/`any(f)`/`all(f)`/`walk(f)` all run `f` on
         // jq-tracked elements, but this resolver evaluates `f` by value, so
-        // admit only an `f` that navigates nothing at all -- a
-        // navigating-but-tracked `f` (`map(.a)`, `all(.a)`, `map(first)`)
-        // needs its own predicate with its own oracle rows, a follow-up,
-        // not this PR (`[map({k:1}|.k)]` and `[any({k:1}|.k)]` still raise
-        // in jq, and admitting them here would fabricate `[]`). `walk(f)`'s
-        // own nested-object refusal is a separate, value-dependent
-        // question `always_refuses_as_live_path`'s own `Walk` arm answers
-        // (step 3, `array_reaches_object`), not this predicate's.
-        Expr::Builtin(Builtin::Map(f) | Builtin::AnyF(f) | Builtin::AllF(f) | Builtin::Walk(f)) => {
-            cannot_move_register(f)
+        // an `f` is admitted only where by-value evaluation cannot differ
+        // from jq's path-check: one that navigates nothing at all
+        // ([`cannot_move_register`]) or, since #3724, one that navigates
+        // only the register's own node ([`navigates_only_the_register`]) --
+        // `map(.a)`, `all(.a)`, `map(first)` are `[]` in jq, while
+        // `[map({k:1}|.k)]` and `[any({k:1}|.k)]` still raise there (the
+        // navigation is on a computed value) and stay refused here.
+        Expr::Builtin(Builtin::Map(f) | Builtin::AnyF(f) | Builtin::AllF(f)) => {
+            navigates_only_the_register(f)
         }
+        // `walk(f)` is not among them: its trailing `f` runs on the *computed*
+        // result of `map(w)` at every array node, so an `f` that navigates
+        // raises in jq however tracked its own input is (#3723). Its own
+        // nested-object refusal is a separate, value-dependent question
+        // `always_refuses_as_live_path`'s own `Walk` arm answers (step 3,
+        // `array_reaches_object`), not this predicate's.
+        Expr::Builtin(Builtin::Walk(f)) => cannot_move_register(f),
         // #3284: every construct `always_refuses_as_live_path` raises on
         // unconditionally (#3271's set) is, by that same fact, one the
         // resolver checks exactly as jq's own internal path-check does: it
@@ -42146,6 +42152,80 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // further change, as this comment used to predict.
         e if live_path_refusal(e).is_some() => true,
         other => cannot_move_register(other),
+    }
+}
+
+/// Whether `f`, the argument of a `map`/`any`/`all` inside an `[E]` collect,
+/// navigates nothing jq would path-check *off* the register (#3724).
+///
+/// jq defines `map(f)` as `[.[] | f]` and `any(f)`/`all(f)` over `.[] | f`, so
+/// `f` runs on each element of the input, and while the collect's own input is
+/// jq's register the elements are tracked: `.a`, `.[0]`, `first`, `select(g)`
+/// and the like are path-intact there, and the collect backtracks the register
+/// to where it began. `[map(.a)]`, `[all(.a)]` and `[map(first)]` are `[]` in
+/// jq 1.7.1. An `f` that first builds a value and then navigates it
+/// (`{k:1} | .k`, `tostring | .a`, `sort | .[0]`) path-checks the computed
+/// value and raises, which a by-value evaluation cannot do -- admitting it would
+/// fabricate `[]`. So the predicate is an allowlist, the safe direction:
+///
+/// - an `f` that navigates nothing at all ([`cannot_move_register`]), the
+///   original #3283 admission; or
+/// - a navigation chain in which every stage keeps jq's register on the node it
+///   navigated to ([`stays_on_the_register`]), optionally ending in one stage
+///   that navigates nothing (`.a | length`), whose computed output nothing then
+///   navigates. An `f` that forks (`,`, `if`) is judged branch by branch: jq
+///   backtracks the register between them.
+fn navigates_only_the_register(f: &Expr) -> bool {
+    cannot_move_register(f) || stays_on_the_register(f, true)
+}
+
+/// Whether every step of `e` navigates from the register's node to another
+/// node jq's register follows (or passes the register's node through), so the
+/// output of `e` is itself on the register -- the property a stage needs for a
+/// *following* stage to navigate it (#3724). With `terminal` set nothing
+/// navigates `e`'s output, so a stage that navigates nothing
+/// ([`cannot_move_register`]) is allowed as well; it is checked at the leaves
+/// only, so the walk stays linear.
+///
+/// The navigation primitives, `first`/`last` (jq defines them as `.[0]`/`.[-1]`),
+/// and a `select`/type filter, which passes its input through and whose
+/// condition is a subexp. A computed key or bound is a subexp too, so only the
+/// target decides. `?` on a primitive only suppresses a value error
+/// (`INDEX_OPT`), not a path error; every other `?` is jq's `try`, which the
+/// resolver reaches by another route, so it stays refused here.
+fn stays_on_the_register(e: &Expr, terminal: bool) -> bool {
+    match e {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::Builtin(Builtin::First | Builtin::Last) => true,
+        // Only the target is navigated; the key or bound is a subexp.
+        Expr::IndexExpr { target, .. } | Expr::SliceExpr { target, .. } => {
+            stays_on_the_register(target, false)
+        }
+        Expr::Paren(inner) => stays_on_the_register(inner, terminal),
+        Expr::Optional(inner) if is_postfix_optional_primitive(inner) => {
+            stays_on_the_register(inner, false)
+        }
+        e if is_select_stage(e) => true,
+        Expr::Comma(branches) => branches.iter().all(|b| stays_on_the_register(b, terminal)),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stays_on_the_register(then_branch, terminal)
+                && stays_on_the_register(else_branch, terminal)
+        }
+        // Every stage but the last must hand the next one a tracked value.
+        Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, init)| {
+            init.iter().all(|stage| stays_on_the_register(stage, false))
+                && stays_on_the_register(last, terminal)
+        }),
+        other => terminal && cannot_move_register(other),
     }
 }
 
@@ -117908,6 +117988,115 @@ mod tests {
         );
     }
 
+    /// #3724: a `map`/`any`/`all` argument that navigates only the register's own
+    /// node keeps the register inside `[E]`, where #3283 admitted only an argument
+    /// that navigated nothing. Each row is `del(. as $x | [E] | $x[0])`, so a
+    /// preserved register writes through to the array's first element, as jq does;
+    /// every row confirmed live against jq 1.7.1.
+    #[test]
+    // `"{k:1}"` is a jq filter literal, not a formatting string; clippy
+    // cannot tell the two apart from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_array_register_admits_navigating_tracked_f_3724() {
+        let doc = r#"[{"a":1,"b":[2]},{"a":3}]"#;
+        for filter in [
+            r"del(. as $x | [map(.a)] | $x[0])",
+            r"del(. as $x | [map(.b | .[0])] | $x[0])",
+            r"del(. as $x | [map(.[]?)] | $x[0])",
+            r"del(. as $x | [map(select(.a))] | $x[0])",
+            r"del(. as $x | [map(.a, .b)] | $x[0])",
+            r"del(. as $x | [map(if .a then .b else .a end)] | $x[0])",
+            r"del(. as $x | [map(.b | length)] | $x[0])",
+            r"del(. as $x | [map((.a | length))] | $x[0])",
+            // Nothing in `f` navigates, so the chain rule is not what admits it.
+            r"del(. as $x | [map(tostring | length)] | $x[0])",
+            // A fork is judged branch by branch, so a branch that navigates
+            // nothing may sit beside one that stays on the register.
+            r"del(. as $x | [map(.a, length)] | $x[0])",
+            r"del(. as $x | [map(if .a then .b else length end)] | $x[0])",
+            r"del(. as $x | [map(if .a then length else .b end)] | $x[0])",
+            r"del(. as $x | [any(.a)] | $x[0])",
+            r"del(. as $x | [all(.a)] | $x[0])",
+            r"del(. as $x | [map(..)] | $x[0])",
+            r"del(. as $x | [map(.a?)] | $x[0])",
+        ] {
+            assert_eq!(
+                outputs(doc.as_bytes(), filter),
+                [r#"[{"a":3}]"#],
+                "{filter}"
+            );
+        }
+        // `last` and a slice navigate an element that is an array; a computed bound
+        // is a subexp, so only the target of `.a[S:T]` decides.
+        assert_eq!(
+            outputs(br"[[1,2],[3]]", r"del(. as $x | [map(last)] | $x[0])"),
+            ["[[3]]"]
+        );
+        assert_eq!(
+            outputs(br"[[1,2],[3]]", r"del(. as $x | [map(.[0:1])] | $x[0])"),
+            ["[[3]]"]
+        );
+        for filter in [
+            r"del(. as $x | [map(.a[.k:])] | $x[0])",
+            r"del(. as $x | [map(.a[.k:1])] | $x[0])",
+        ] {
+            assert_eq!(
+                outputs(br#"[{"k":0,"a":[1,2]}]"#, filter),
+                ["[]"],
+                "{filter}"
+            );
+        }
+        // A computed key is a subexp, so only the target of `.[K]` decides.
+        assert_eq!(
+            outputs(
+                br#"[{"k":"a","a":1}]"#,
+                r"del(. as $x | [map(.[.k])] | $x[0])"
+            ),
+            ["[]"]
+        );
+        // `first` navigates an element that is an array.
+        assert_eq!(
+            outputs(br"[[1],[2]]", r"del(. as $x | [map(first)] | $x[0])"),
+            ["[[2]]"]
+        );
+        // Contrasts jq raises on: `f` navigates a computed value or sits behind a
+        // stage that is not a plain navigation. All stay refused (`walk(f)` is
+        // not promoted either; its sweep rows pin that, #3723).
+        for (doc, filter) in [
+            (r#"[{"a":1}]"#, r"path(. as $x | [map({k:1} | .k)] | $x)"),
+            (
+                r#"[{"a":1}]"#,
+                r"path(. as $x | [map(.a | {k:1} | .k)] | $x)",
+            ),
+            (r#"[{"a":1}]"#, r"path(. as $x | [any({k:1} | .k)] | $x)"),
+            (
+                r#"[{"a":1}]"#,
+                r"path(. as $x | [all(.a | {k:1} | .k)] | $x)",
+            ),
+            (r"[[1]]", r"path(. as $x | [map(sort | .[0])] | $x)"),
+            (
+                r#"[{"a":{"b":1}}]"#,
+                r"path(. as $x | [map((.a, length) | .b?)] | $x)",
+            ),
+            // `walk(f)` is not promoted: its trailing `f` runs on a computed array
+            // (#3723), so jq raises on `.[0]?` here, a path error `?` does not catch.
+            (r"[1]", r"path(. as $x | [walk(.[0]?)] | $x)"),
+            (r#"[{"a":1}]"#, r"path(. as $x | [map(try .a)] | $x)"),
+            (r#"[{"a":1}]"#, r"path(. as $x | [map(.a // .b)] | $x)"),
+        ] {
+            query!(doc.as_bytes(), filter,
+                QueryResult::Error(e) => {
+                    assert!(is_resolver_refusal(&e), "{filter}: {}", e.message);
+                }
+            );
+        }
+        query!(br#"[{"a":1}]"#, r"path(. as $x | [map(.a)] | .[0])",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("Invalid path expression"), "{}", e.message);
+            }
+        );
+    }
+
     /// #3284: the same allowlist gap, for #3271's own construct set --
     /// `array_contents_are_checked` had no arm for any of them, so an array
     /// holding one always refused, whether or not it was wrapped in a
@@ -120526,14 +120715,11 @@ mod tests {
         for src in [
             "map(.)",
             "map(. + 1)",
-            "map(.a)",
-            "map(first)",
             "map(empty)",
             "map(has(\"a\"))",
             "map(has(.a | tostring))",
             "map(range(2))",
             "map(paths)",
-            "map(.[] | .a)",
         ] {
             let expr = parse(src).unwrap();
             assert_eq!(
@@ -120541,6 +120727,23 @@ mod tests {
                 array_contents_are_checked(&expr),
                 "`[{src}]`: the register verdict and the `[E]` claim disagree"
             );
+        }
+        // ...and the one place they differ on purpose (#3724): an `f` that navigates
+        // only the register's own node is admitted inside `[E]`, where the collect
+        // backtracks the register, and still refused as a bare stage.
+        for src in [
+            "map(.a)",
+            "map(first)",
+            "map(.[] | .a)",
+            "any(.a)",
+            "all(.a | .b)",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(
+                !leaves_register_in_place::<JqSemantics>(&expr),
+                "`{src}` as a bare stage"
+            );
+            assert!(array_contents_are_checked(&expr), "`[{src}]`");
         }
     }
 

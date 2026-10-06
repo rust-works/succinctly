@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: an `[E]` collect holds a `map`/`any`/`all` whose `f` navigates only the register's own node, so `path(. as $x | [map(.a)] | $x)` is `[]`** (#3724, item 1).
+  jq runs `f` over the input's elements, which are tracked while the collect's input is the register, and the collect backtracks the register to where it
+  began; the `[E]` allowlist admitted only an `f` that navigates nothing (#3283). It now also admits a chain of register navigations (`.a`, `.[i]`, `.[]`,
+  `..`, `first`, `last`, `select`, computed keys and bounds, a primitive `?`), optionally ending in a stage that navigates nothing, with `,`/`if` judged
+  branch by branch. An `f` that builds a value and then navigates it (`{k:1} | .k`, `.a | tostring | .b`) still raises, as in jq; `walk(f)`, `try`, `//` and
+  `first(f)` stay refused. jq mode only; yq is pinned unchanged. Against a clean `main`, the sweep (new `[map]`/`[any]`/`[all]` operands, and a full-grid sample)
+  showed 0 regressions and 0 new `ACCEPT_WRONG`. Still open on #3724: item 2, the `and`/`or` arm. Pinned by
+  `test_collect_map_any_all_navigating_f_keeps_the_register_3724` and `test_array_register_admits_navigating_tracked_f_3724`.
 - **jq: `paths`, `leaf_paths` and the cursor-native `path(f)` walkers answer on documents nested 256-383 levels deep** (#3429).
   They shared the whole-document materializers' 256 ceiling, so a well-formed document in that band answered `[..]` but raised
   `nesting depth exceeds limit of 256` for `[paths]`, `[leaf_paths]`, `[.. | path]` and a static `path(.a.a...)` chain. They now stop at

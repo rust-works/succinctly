@@ -65684,6 +65684,145 @@ fn test_path_register_last_f_does_not_move_it_3643() -> Result<()> {
     ])
 }
 
+/// #3724: a `map`/`any`/`all` inside an `[E]` collect whose `f` only navigates the
+/// register's own node keeps jq's path register. jq defines `map(f)` as `[.[] | f]`
+/// and `any(f)`/`all(f)` over `.[] | f`, so while the collect's input is the register
+/// the elements are tracked and `f`'s navigation is path-intact; the collect then
+/// backtracks the register to where it began (`path(. as $x | [map(.a)] | $x)` on
+/// `[{"a":1}]` is `[]`). An `f` that builds a value and then navigates it (`{k:1} |
+/// .k`, `.a | tostring | .b`) path-checks a computed value and raises, so it stays
+/// refused, as does the output of the collect (`[map(.a)] | .[0]`) and an untracked
+/// entry (`1 | [map(.a)]`). `walk(f)` is deliberately not promoted (its trailing `f`
+/// runs on a computed array, #3723; pinned in the library tests). Every row captured
+/// from jq 1.7.1, on the stdin and `-n` routes; where both refuse with different
+/// wording the row asserts the common prefix.
+#[test]
+// The `{k:1}` rows are jq filter literals, not formatting strings.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_collect_map_any_all_navigating_f_keeps_the_register_3724() -> Result<()> {
+    let doc = r#"[{"a":1,"b":[2]},{"a":3}]"#;
+    assert_path_rows_both_routes_3749(&[
+        // Answered: the register is where the collect began, so `$x` is the root.
+        (doc, r"path(. as $x | [map(.a)] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | [map(.b | .[0])] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | [map(.[]?)] | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | [map(select(.a))] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(. as $x | [map(.a, .b)] | $x)", "[]\n", "", 0),
+        (
+            doc,
+            r"path(. as $x | [map(if .a then .b else .a end)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A chain may end in a stage that navigates nothing.
+        (
+            doc,
+            r"path(. as $x | [map(.a, length)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | [map(if .a then .b else length end)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | [map(.b | length)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(. as $x | [any(.a)] | $x)", "[]\n", "", 0),
+        (doc, r"path(. as $x | [all(.a)] | $x)", "[]\n", "", 0),
+        // The register is usable afterwards, and a write lands on it.
+        (
+            doc,
+            r"path(. as $x | [map(.a)] | $x | .[0])",
+            "[0]\n",
+            "",
+            0,
+        ),
+        (doc, r"path(. as $x | [map(.a)] | $x.k?)", "", "", 0),
+        (
+            doc,
+            r"del(. as $x | [map(.a)] | $x[0])",
+            "[{\"a\":3}]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(. as $x | [map(.b | .[0])] | $x[1])",
+            "[{\"a\":1,\"b\":[2]}]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(. as $x | [map(.a)] | $x[0]) |= 9",
+            "[9,{\"a\":3}]\n",
+            "",
+            0,
+        ),
+        // Refused where jq raises: `f` navigates a computed value.
+        (
+            doc,
+            r"path(. as $x | [map({k:1} | .k)] | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | [any({k:1} | .k)] | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | [all(.a | {k:1} | .k)] | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        // The collect's own output is computed, so navigating it raises.
+        (
+            doc,
+            r"path(. as $x | [map(.a)] | .[0])",
+            "",
+            "Invalid path expression near attempt to access element 0 of [[1,3]]",
+            5,
+        ),
+        // An untracked entry raises on the iteration, whatever `f` is.
+        (
+            doc,
+            r"path(1 | . as $x | [map(.a)] | $x)",
+            "",
+            "Invalid path expression near attempt to iterate through 1",
+            5,
+        ),
+        (
+            doc,
+            r"path(. as $x | {a:{b:1}} | [map(.a)] | $x)",
+            "",
+            "Invalid path expression near attempt to iterate through",
+            5,
+        ),
+    ])
+}
+
 /// #3767: a `last(f)` inside an `[E]` collect keeps jq's path register. jq defines
 /// `last(f)` as `reduce f as $x (null; $x)` and the collect backtracks, so the
 /// register is where the array entered and a `$x` frozen there is the register

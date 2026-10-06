@@ -51036,6 +51036,25 @@ fn test_yq_by_value_stages_keep_no_path_register_3456() -> Result<()> {
     Ok(())
 }
 
+/// #3724: a `map`/`any`/`all` whose `f` navigates only the register's own node keeps
+/// jq's path register inside an `[E]` collect in jq mode only (ADR-0018). yq has no
+/// oracle for how its `map` leaves the register, so `succinctly yq` keeps refusing the
+/// write through a `$x` frozen before the collect, as it did before the promotion.
+#[test]
+fn test_yq_collect_map_navigating_f_keeps_no_path_register_3724() -> Result<()> {
+    let doc = r#"[{"a":1},{"a":2}]"#;
+    for filter in [
+        "del(. as $x | [map(.a)] | $x[0])",
+        "del(. as $x | [map(select(.a))] | $x[0])",
+        "del(. as $x | [any(.a)] | $x[0])",
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json"])?;
+        assert_ne!(code, 0, "`{filter}`: stdout {stdout:?}");
+        assert!(stdout.is_empty(), "`{filter}`: stdout {stdout:?}");
+    }
+    Ok(())
+}
+
 /// #3758: a pipe stage reading the backtracked-register verdict of `any`/`all`
 /// is a jq-mode admission too (ADR-0018). yq's `any`/`all` are its own builtins
 /// with no oracle for how they leave the register, so `succinctly yq` keeps the
