@@ -1216,9 +1216,9 @@ is the revert that established what the other one costs.
      [#3865](https://github.com/rust-works/succinctly/issues/3865) a `map(f)` whose `f` can move the
      register is *resolved* as the collect jq defines (`[.[] | f]`), so jq's path error inside `f`
      surfaces even where the result is discarded (`path(map({k:1} | .k) | empty)` raises near
-     `"k"`, as in jq); the register verdict above is unchanged. A `map(f)` holding `getpath`
-     still evaluates by value (the collect arm leaves `getpath` to the eager fallback, #2759),
-     so `[map(getpath(["a"]))]` on an untracked entry accepts where jq raises; jq mode only.
+     `"k"`, as in jq), also with a `getpath` in `f` and inside an `[E]` collect on an untracked entry
+     (`getpath` is never the first stage of `.[] | f`, so the collect arm's #2759 gate does not
+     apply to it); the register verdict above is unchanged. jq mode only.
    - **The promoted builtins inside a compound stage** (`[sort]`, `limit(1; sort)`,
      `(sort, add)`, `(flatten(1), reverse)`, `[join(",")]`, `if`/`try` around them) are read as
      a loss: the stage is judged as a whole, and jq answers for each (the stage-level

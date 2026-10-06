@@ -64934,6 +64934,37 @@ fn test_map_f_in_path_position_raises_where_jq_does_3865() -> Result<()> {
             r#"Invalid path expression near attempt to iterate through {"a":{"b":1}}"#,
             5,
         ),
+        // `getpath` inside `f` does not hide jq's path error, and an untracked entry
+        // still raises through the enclosing collect (`getpath` is never the first stage
+        // of `.[] | f`).
+        (
+            r#"[{"a":1}]"#,
+            r#"path(map(getpath(["a"]) | {k:1} | .k) | empty)"#,
+            "",
+            near_k,
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r#"path(map({k:1} | .k, getpath(["a"])) | empty)"#,
+            "",
+            near_k,
+            5,
+        ),
+        (
+            r"null",
+            r#"path(. as $x | {a:{b:1}} | [map(getpath(["a"]))] | $x)"#,
+            "",
+            r#"Invalid path expression near attempt to iterate through {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r#"path(map(getpath(["a"])) | empty)"#,
+            "",
+            "",
+            0,
+        ),
         // Answers: `f` only navigates the elements it is given, or runs on none.
         (r#"[{"a":1}]"#, r"path(map(.a) | empty)", "", "", 0),
         (r#"[{"a":1}]"#, r"path(map(.a // .b) | empty)", "", "", 0),
