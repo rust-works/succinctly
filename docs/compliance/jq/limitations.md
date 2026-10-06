@@ -10513,17 +10513,21 @@ The resolver drains the generator before it delivers the answers, so a retried
 alternative's side effects (`stderr`, `debug`) run before the first answer reaches the
 consumer: `path(.x | any(.; ...)) | ("H"|halt_error(3))` halts at the first answer in
 jq without running the retry, and here after it. The halt itself, its exit code and
-the output are the same (`test_any_all_path_answer_halt_is_not_retried_3827`).
+the output are the same (`test_any_all_path_answer_halt_is_not_retried_3827`); tracked in #3859).
 
-One shape in this family still diverges, and it is a *valid* answer rather than a
-refused one: an answer identical to jq's register (a `true` over a `true` node) that
-follows an alternative's error is a valid path in jq, and the resolver refuses it
-(`path(.x | any(.; (. as [$q] ?// $q | true)))` on `{"x":true}` is `["x"]` in jq). The same holds for the
-identity element after a swallowed answer: `path(.x | all(.; (1 as $x ?// $y | if $x then false else empty end)))`
-on `{"x":true}` is `["x"]` in jq, because the retry restores the register the answer is compared with,
-where the resolver states it lost and refuses.
-An answer that is a valid path is printed before the raise of the retry that follows
-it, as jq does (`test_any_all_path_answer_precedes_retry_raise_3827`).
+The identity element `any`/`all` answer once `gen` is exhausted after a swallowed answer
+is compared with the register where the call entered, since backtracking through every fork
+of `gen` restores it (#3858): `path(.x | all(.; (1 as $x ?// $y | if $x then false else empty
+end)))` on `{"x":true}` is `["x"]` in jq and here
+(`test_any_all_path_identity_answer_is_at_the_entry_register_3858`).
+
+One shape in this family still diverges, and it is a *valid* answer rather than a refused
+one: a by-value `true`/`false` that follows a `?//` bind whose first alternative failed to
+destructure is a valid path in jq when it is identical to the register, and the resolver
+refuses it, with no `any`/`all` involved (`path(.x | (. as [$q] ?// $z | true))` on
+`{"x":true}` is `["x"]` in jq). The pipe stage's register rule does not admit a destructuring
+bind; tracked in #3859. An answer that is a valid path is printed before the raise of the
+retry that follows it, as jq does (`test_any_all_path_answer_precedes_retry_raise_3827`).
 
 ## Provenance
 

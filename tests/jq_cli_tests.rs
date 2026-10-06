@@ -105336,6 +105336,95 @@ fn test_any_all_path_answer_halt_is_not_retried_3827() -> Result<()> {
     Ok(())
 }
 
+/// #3858 rows over `{"x":true}`
+const RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_0: &[RetryRow3293] = &[
+    (
+        r#"path(.x | all(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then false else empty end)))"#,
+        "[\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"[path(.x | all(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then false else empty end)))]"#,
+        "[[\"x\"]]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+/// #3858 rows over `{"x":false}`
+const RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_1: &[RetryRow3293] = &[
+    (
+        r#"path(.x | any(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then true else empty end)))"#,
+        "[\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"del(.x | any(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then true else empty end)))"#,
+        "{}\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"(.x | any(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then true else empty end))) |= 7"#,
+        "{\"x\":7}\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+/// #3858 rows over `{"x":1}`
+const RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_2: &[RetryRow3293] = &[
+    (
+        r#"path(.x | any(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then true else empty end)))"#,
+        "",
+        "AA",
+        "Invalid path expression with result false",
+        5,
+    ),
+    (
+        r#"[path(.x | all(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then false else empty end)))?]"#,
+        "[]\n",
+        "AA",
+        "",
+        0,
+    ),
+];
+
+/// #3858 rows over `{"x":null}`
+const RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_3: &[RetryRow3293] = &[(
+    r#"path(.x | all(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then false else empty end)))"#,
+    "",
+    "AA",
+    "Invalid path expression with result true",
+    5,
+)];
+
+/// #3858: the identity element `any`/`all` answer once `gen` is exhausted after a
+/// swallowed answer is compared with jq's register where the call entered, since
+/// backtracking through every fork of `gen` restores it. A `false` over a `false`
+/// node (or a `true` over a `true` one) is therefore a valid path, and anything else
+/// is refused as before. Every value is captured from `/usr/bin/jq` 1.7.1 with `-nc`.
+#[test]
+fn test_any_all_path_identity_answer_is_at_the_entry_register_3858() -> Result<()> {
+    for (input, rows) in [
+        (r#"{"x":true}"#, RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_0),
+        (r#"{"x":false}"#, RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_1),
+        (r#"{"x":1}"#, RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_2),
+        (r#"{"x":null}"#, RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_3),
+    ] {
+        assert_retry_rows_3293(None, &format!("{input} | "), rows)?;
+        assert_retry_rows_3293(Some(input), "", rows)?;
+    }
+    Ok(())
+}
+
 /// #3807: a `?//` in a computed index's or slice's target. Each group is a target
 /// whose first alternative's index/slice error, or consumer-stopped answer, a retry
 /// then supersedes by yielding nothing, raising, answering, or failing to

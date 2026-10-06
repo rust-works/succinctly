@@ -41218,11 +41218,11 @@ fn deliver_any_all_answers<'a, S: EvalSemantics>(
         })
         .collect();
     if identity_follows {
-        // The generator emitted, so the register is not known to be where this
-        // entered ([`drained_register_after`]).
         branches.push(untracked_at_register(
             Cow::Owned(OwnedValue::Bool(!target_truthy)),
-            drained_register::<S>(trackable, value),
+            // Every fork of `gen` is backtracked by now, so jq's register is back where
+            // this entered (the same rule an empty generator follows).
+            drained_register_after::<S>(trackable, value, false),
         ));
     }
     // Whether delivery runs on past `demand`. A stop is the break the `?//`
