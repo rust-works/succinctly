@@ -60747,6 +60747,184 @@ fn test_reverse_raises_unconditionally_2744() -> Result<()> {
     Ok(())
 }
 
+/// #3347: `indices`, `index` and `rindex` on a value the resolver is not
+/// tracking raise jq's `Invalid path expression`, naming the access jq's own
+/// definition makes -- which depends on the *evaluated pattern*, the one thing
+/// #2744's static table could not know. Every row captured live from jq 1.7.1
+/// as `[path((INPUT | BUILTIN(PATTERN)) | empty)]` over `{}`.
+#[test]
+fn test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347() -> Result<()> {
+    for (filter, access) in [
+        // An array input searches for the pattern itself when it is an array
+        // (`.[$i]`) and for the one-element array holding it otherwise
+        // (`.[[$i]]`).
+        ("[1,2,3] | indices(1)", "element [1] of [1,2,3]"),
+        ("[1,2,3] | indices([1,2])", "element [1,2] of [1,2,3]"),
+        ("[1,2,3] | index(1)", "element [1] of [1,2,3]"),
+        (r#"[1,2,3] | rindex("b")"#, r#"element ["b"] of [1,2,3]"#),
+        ("[] | indices(null)", "element [null] of []"),
+        // Any other input names the pattern as it came, string input included
+        // (a number or an array is not a substring to search for).
+        (r#""abc" | indices(1)"#, r#"element 1 of "abc""#),
+        (r#""abc" | indices([1])"#, r#"element [1] of "abc""#),
+        (r#""abc" | index(null)"#, r#"element null of "abc""#),
+        (r#"{"a":1} | indices("b")"#, r#"element "b" of {"a":1}"#),
+        (r#"null | rindex(1)"#, "element 1 of null"),
+        (r#"5 | index("b")"#, r#"element "b" of 5"#),
+        // A string searched for a string only reads, so `indices` answers; `index`
+        // and `rindex` then apply `.[0]` / `.[-1:]` to the array of positions
+        // `indices` built, which is never the register.
+        (r#""abc" | index("b")"#, "element 0 of [1]"),
+        (r#""abc" | index("zzz")"#, "element 0 of []"),
+        (r#""abc" | rindex("b")"#, r#"element {"start":-1... of [1]"#),
+        // jq forks on a multi-output pattern and raises on the first value,
+        // never on a collection of them.
+        ("[1,2,3] | indices(1,2)", "element [1] of [1,2,3]"),
+        (r#""abc" | indices("b", 1)"#, r#"element 1 of "abc""#),
+    ] {
+        let program = format!("[path(({filter}) | empty)]");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &program], Some("{}"))?;
+        assert_eq!(code, 5, "#3347: `{program}`: stdout {stdout:?}");
+        assert!(stdout.is_empty(), "#3347: `{program}`: {stdout:?}");
+        assert!(
+            stderr.contains(&format!(
+                "Invalid path expression near attempt to access {access}"
+            )),
+            "#3347: `{program}`: wanted {access:?}, got {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3347: where `indices` does not navigate -- a string searched for a string --
+/// it answers, and a pattern that is empty or raises never reaches the access at
+/// all (jq's `$i` binding runs first). Captured live from jq 1.7.1.
+#[test]
+fn test_indices_family_stays_silent_without_a_navigating_pattern_3347() -> Result<()> {
+    for filter in [
+        r#"[path(("abc" | indices("b")) | empty)]"#,
+        r#"[path(("abc" | indices("b", "c")) | empty)]"#,
+        r#"[path(([1] | indices(empty)) | empty)]"#,
+        r#"[path(([1] | index(empty)) | empty)]"#,
+        r#"[path(([1] | rindex(empty)) | empty)]"#,
+        // `?` catches the raise.
+        r#"[path(([1] | indices(1))?)]"#,
+        r#"[path(("abc" | index("b"))?)]"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_eq!(code, 0, "#3347: `{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), "[]", "#3347: `{filter}`");
+    }
+    // The pattern's own failure comes first, exactly as `$i`'s binding does.
+    for filter in [
+        r#"[path(([1] | indices(error("boom"))) | empty)]"#,
+        r#"[path((5 | rindex(error("boom"))) | empty)]"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_eq!(code, 5, "#3347: `{filter}`: stdout {stdout:?}");
+        assert!(stderr.contains("boom"), "#3347: `{filter}`: {stderr:?}");
+        assert!(
+            !stderr.contains("Invalid path expression"),
+            "#3347: `{filter}`: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3347: the pattern is evaluated once. #2744's probe evaluated it a second
+/// time whenever it decided not to raise, so an `input` in it consumed two
+/// documents (`debug` printed twice). Captured live from jq 1.7.1; each program
+/// leaves `2` for the trailing `input`.
+#[test]
+fn test_indices_family_evaluates_its_pattern_once_3347() -> Result<()> {
+    for filter in [
+        // The pattern yields nothing: the search never runs.
+        r#"[path((["x","y"] | indices(input | empty)) | empty)], input"#,
+        // The pattern is a string and so is the input: the search answers.
+        r#"[path(("abc" | indices(input | "b")) | empty)], input"#,
+        r#"[path(("abc" | indices(input | "b", "c")) | empty)], input"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some("1\n2\n3\n"))?;
+        assert_eq!(code, 0, "#3347: `{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout, "[]\n2\n", "#3347: `{filter}`");
+    }
+    // The pattern raises on its first value: that is the only one consumed.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            r#"[path((["x","y"] | indices(input)) | empty)], input"#,
+        ],
+        Some("1\n2\n3\n"),
+    )?;
+    assert_eq!(code, 5, "stdout {stdout:?}");
+    assert!(
+        stderr
+            .contains(r#"Invalid path expression near attempt to access element [1] of ["x","y"]"#),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #3347: the raise reaches the write consumers of `path()` too, where the old
+/// by-value answer was an empty path set (`del` echoed the document, `=` wrote
+/// nothing, both exit 0). Captured live from jq 1.7.1.
+#[test]
+fn test_indices_family_raises_under_del_and_assignment_3347() -> Result<()> {
+    for (filter, access) in [
+        ("del(([1] | rindex(1)) | empty)", "element [1] of [1]"),
+        ("(([1,2] | indices(2)) | empty) = 9", "element [2] of [1,2]"),
+        (r#"(("abc" | index("b")) | empty) |= 9"#, "element 0 of [1]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(code, 5, "#3347: `{filter}`: stdout {stdout:?}");
+        assert!(stdout.is_empty(), "#3347: `{filter}`: {stdout:?}");
+        assert!(stderr.contains(access), "#3347: `{filter}`: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #3347: real yq has no `indices`, `index` or `rindex` (its lexer rejects
+/// them), so under `--jq-extensions` they mean what jq defines and raise the
+/// same way, rather than answering an empty path set (ADR-0018).
+#[test]
+fn test_indices_family_raises_in_yq_extensions_3347() -> Result<()> {
+    for (filter, access) in [
+        (
+            "[path(([1,2,3] | indices(1)) | empty)]",
+            "element [1] of [1,2,3]",
+        ),
+        (
+            r#"[path(("abc" | index("b")) | empty)]"#,
+            "element 0 of [1]",
+        ),
+        ("del(([1] | rindex(1)) | empty)", "element [1] of [1]"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .args(["yq", "--jq-extensions", "-o", "json", "-I", "0", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().expect("piped").write_all(b"a: 1\n")?;
+                child.wait_with_output()
+            })?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "#3347 (yq): `{filter}`: {output:?}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "Invalid path expression near attempt to access {access}"
+            )),
+            "#3347 (yq): `{filter}`: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2746: `last(f)`, `isempty(f)` and `INDEX(stream; idx_expr)` navigate
 /// their own argument, and that argument's navigation was previously
 /// evaluated by value, never through the resolver -- an untracked value

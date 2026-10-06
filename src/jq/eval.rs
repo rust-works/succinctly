@@ -39730,6 +39730,148 @@ fn builtin_navigation<S: EvalSemantics>(
     }
 }
 
+/// The three builtins jq defines on top of one `$i`-parameter navigation, whose
+/// element is the *evaluated pattern* and so cannot come from
+/// [`builtin_navigation`]'s static table (#3347).
+#[derive(Clone, Copy)]
+enum PatternSearch {
+    /// `def indices($i): if type == "array" and ($i|type) == "array" then .[$i]
+    /// elif type == "array" then .[[$i]] elif type == "string" and ($i|type) ==
+    /// "string" then _strindices($i) else .[$i] end;`
+    Indices,
+    /// `def index($i): indices($i) | .[0];`
+    Index,
+    /// `def rindex($i): indices($i) | .[-1:][0];`
+    Rindex,
+}
+
+impl PatternSearch {
+    /// `expr` as one of the three, with its pattern argument.
+    fn of(expr: &Expr) -> Option<(Self, &Expr)> {
+        match expr {
+            Expr::Builtin(Builtin::Indices(pattern)) => Some((Self::Indices, pattern)),
+            Expr::Builtin(Builtin::Index(pattern)) => Some((Self::Index, pattern)),
+            Expr::Builtin(Builtin::Rindex(pattern)) => Some((Self::Rindex, pattern)),
+            _ => None,
+        }
+    }
+}
+
+/// What one evaluated pattern makes a [`PatternSearch`] do to an input the
+/// resolver is not tracking (#3347).
+enum PatternNavigation {
+    /// No path-checked access of its own: `indices` of a string by a string is
+    /// `_strindices`, which only reads (`"abc" | indices("b")` is `[1]`).
+    ByValue,
+    /// An access of the untracked input itself, naming this element.
+    OfInput(OwnedValue),
+    /// An access of the fresh array `indices` answered (`index` is `.[0]` of
+    /// it, `rindex` is `.[-1:]`), which is never jq's register, so it raises
+    /// whatever the register is.
+    OfResult(OwnedValue),
+}
+
+/// The navigation `search` performs, given the pattern it was handed, on an
+/// `input` the resolver is not tracking (#3347). Every branch was captured
+/// from jq 1.7.1 with `[path((INPUT | indices(PATTERN)) | empty)]` over each
+/// input and pattern type, and `index`/`rindex` alike.
+///
+/// An array input names the pattern itself when the pattern is an array and
+/// the one-element array holding it otherwise; any other input names the
+/// pattern as it came (`"abc" | indices(1)` reports `element 1 of "abc"`, an
+/// object or `null` input too). A string input searched for a string is the one
+/// pair that does not navigate -- except that `index` and `rindex` then apply
+/// their own access to the array of positions `_strindices` answered.
+fn pattern_search_navigation(
+    search: PatternSearch,
+    input: &OwnedValue,
+    pattern: &OwnedValue,
+) -> PatternNavigation {
+    match (input, pattern) {
+        (OwnedValue::Array(_), OwnedValue::Array(_)) => PatternNavigation::OfInput(pattern.clone()),
+        (OwnedValue::Array(_), _) => {
+            PatternNavigation::OfInput(OwnedValue::array_from(vec![pattern.clone()]))
+        }
+        (OwnedValue::String(_), OwnedValue::String(_)) => match search {
+            PatternSearch::Indices => PatternNavigation::ByValue,
+            PatternSearch::Index => PatternNavigation::OfResult(OwnedValue::Int(0)),
+            PatternSearch::Rindex => {
+                PatternNavigation::OfResult(slice_component_value(Some(-1), None, None, None))
+            }
+        },
+        _ => PatternNavigation::OfInput(pattern.clone()),
+    }
+}
+
+/// [`eval_each_owned`] for a [`PatternSearch`] leaf on an untracked `input`,
+/// observing each pattern once instead of probing it (#3347).
+///
+/// jq runs `def indices($i): ...` as `PATTERN as $i | BODY`, so the body's
+/// path-checked access runs on the *first* pattern value, and a pattern that is
+/// empty or raises never reaches it. This is that desugaring: the pattern is
+/// evaluated here, exactly once, and the real search runs on each value of it
+/// -- never on the pattern expression, which is why this is not the speculative
+/// probe #2744 rejected (that probe evaluated the pattern a second time when it
+/// did not raise, so an `input` or `debug` in it fired twice, and mis-named a
+/// multi-output pattern by collecting it).
+///
+/// Returns the flow and the refusal this raised, if any: the sink did not stop
+/// (it would have been handed a value first), so the caller reads it as it reads
+/// its own `construct_refusal`. `refuse` classifies a refusal of `input`
+/// itself ([`guess_refusal`]); a refusal of `indices`'s own fresh array is exact
+/// and never goes through it.
+fn eval_each_pattern_search<S: EvalSemantics>(
+    search: PatternSearch,
+    pattern_expr: &Expr,
+    input: &OwnedValue,
+    reentry: Reentry,
+    refuse: &dyn Fn(EvalError, Option<NavKind>) -> EvalError,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> (Flow, Option<EvalError>) {
+    let mut refusal: Option<EvalError> = None;
+    // The search's own non-exhausted verdict for the pattern value it ran on:
+    // the pattern sink can only answer `Demand`, so a control that ended the
+    // search (an error, a `break`, a `halt`) is carried out of band.
+    let mut ended: Option<Flow> = None;
+    let flow =
+        eval_each_owned::<S>(pattern_expr, input, false, reentry, &mut |pattern| {
+            let navigation = pattern_search_navigation(search, input, &pattern);
+            if let PatternNavigation::OfInput(element) = navigation {
+                let step = NavKind::of(&element);
+                refusal = Some(refuse(
+                    EvalError::invalid_path_expression_near_access(&element, input),
+                    step,
+                ));
+                return Demand::Stop;
+            }
+            let positions = Expr::Builtin(Builtin::Indices(Box::new(owned_to_expr(&pattern))));
+            let search_flow =
+                eval_each_owned::<S>(&positions, input, false, reentry, &mut |result| {
+                    match &navigation {
+                        PatternNavigation::OfResult(element) => {
+                            refusal = Some(EvalError::invalid_path_expression_near_access(
+                                element, &result,
+                            ));
+                            Demand::Stop
+                        }
+                        _ => sink(result),
+                    }
+                });
+            match search_flow {
+                Flow::Exhausted => Demand::Continue,
+                other => {
+                    ended = Some(other);
+                    Demand::Stop
+                }
+            }
+        });
+    let flow = match ended {
+        Some(escaped @ Flow::Escaped(_)) => escaped,
+        _ => flow,
+    };
+    (flow, refusal)
+}
+
 /// #3271: six kinds of construct (eleven `Expr`/`Builtin` variants between
 /// them) whose jq-defined bodies always fail jq's own internal path-check
 /// once they have actually *produced a value* -- `with_entries`,
@@ -40273,50 +40415,60 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     // `value` (this leaf's own input) is fixed for the whole drive below --
     // computed once rather than once per produced value.
     let walk_input_reaches_object = array_reaches_object(value);
-    let flow = eval_each_owned::<S>(
-        expr,
-        value,
-        false,
-        Reentry::at_register(trackable),
-        &mut |v| {
-            delivered += 1;
-            if let Some(e) = always_refuses_as_live_path::<S>(expr, walk_input_reaches_object, &v) {
-                construct_refusal = Some(e);
-                return Demand::Stop;
-            }
-            // #3711: the iteration `flatten(n)`/`join(s)` make, on a value
-            // they have produced, so an argument's own error has already won.
-            if let Some(e) =
-                iterates_untracked_input::<S>(expr, trackable, value, register_loss, snapshot)
-            {
-                construct_refusal = Some(e);
-                return Demand::Stop;
-            }
-            let state = register
-                .get_or_insert_with(|| leaf_register::<S>(expr, trackable, value))
-                .clone();
-            let branch = untracked_at_register(Cow::Owned(v), state);
-            // `untracked_branches`' own rule, applied one value at a time --
-            // see its doc comment for why the register is recorded here.
-            let demand = sink(branch);
-            if demand == Demand::Stop {
-                stopped_by_sink = true;
-            }
-            // Two independent reasons to stop, folded into one answer: the
-            // sink asked, or this leaf has delivered its own `keep` bound.
-            // Only the first is reachable with today's bounded consumers --
-            // `resolve_bounded_sink` (limit/first) and the nth arm both answer
-            // `Demand::Stop` from `sink(branch)` on the very branch that
-            // reaches the count they narrowed `keep` to. The second is kept
-            // because honouring `keep` is this function's own contract with
-            // #1872, not something to inherit from whoever is downstream.
-            if demand == Demand::Stop || delivered >= limit {
-                Demand::Stop
-            } else {
-                Demand::Continue
-            }
-        },
-    );
+    let mut on_value = |v: OwnedValue| {
+        delivered += 1;
+        if let Some(e) = always_refuses_as_live_path::<S>(expr, walk_input_reaches_object, &v) {
+            construct_refusal = Some(e);
+            return Demand::Stop;
+        }
+        // #3711: the iteration `flatten(n)`/`join(s)` make, on a value
+        // they have produced, so an argument's own error has already won.
+        if let Some(e) =
+            iterates_untracked_input::<S>(expr, trackable, value, register_loss, snapshot)
+        {
+            construct_refusal = Some(e);
+            return Demand::Stop;
+        }
+        let state = register
+            .get_or_insert_with(|| leaf_register::<S>(expr, trackable, value))
+            .clone();
+        let branch = untracked_at_register(Cow::Owned(v), state);
+        // `untracked_branches`' own rule, applied one value at a time --
+        // see its doc comment for why the register is recorded here.
+        let demand = sink(branch);
+        if demand == Demand::Stop {
+            stopped_by_sink = true;
+        }
+        // Two independent reasons to stop, folded into one answer: the
+        // sink asked, or this leaf has delivered its own `keep` bound.
+        // Only the first is reachable with today's bounded consumers --
+        // `resolve_bounded_sink` (limit/first) and the nth arm both answer
+        // `Demand::Stop` from `sink(branch)` on the very branch that
+        // reaches the count they narrowed `keep` to. The second is kept
+        // because honouring `keep` is this function's own contract with
+        // #1872, not something to inherit from whoever is downstream.
+        if demand == Demand::Stop || delivered >= limit {
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    };
+    let reentry = Reentry::at_register(trackable);
+    let pattern_search = PatternSearch::of(expr).filter(|_| !trackable);
+    let flow = if let Some((search, pattern)) = pattern_search {
+        // #3347: `indices`/`index`/`rindex` name their pattern in the access
+        // they raise on an untracked input, which only the evaluation that
+        // produces the pattern can tell.
+        let refuse = |e: EvalError, step: Option<NavKind>| {
+            guess_refusal(e, register_loss, snapshot, value, step)
+        };
+        let (flow, refusal) =
+            eval_each_pattern_search::<S>(search, pattern, value, reentry, &refuse, &mut on_value);
+        construct_refusal = construct_refusal.or(refusal);
+        flow
+    } else {
+        eval_each_owned::<S>(expr, value, false, reentry, &mut on_value)
+    };
 
     // Halt first, exactly as the collecting form checks `trailing` first: an
     // already-triggered halt must never be downgraded into a catchable path
@@ -40627,31 +40779,39 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     // `value` (this leaf's own input) is fixed for the whole drive below --
     // computed once rather than once per produced value.
     let walk_input_reaches_object = array_reaches_object(value);
-    let flow = eval_each_owned::<S>(
-        expr,
-        value,
-        false,
-        Reentry::at_register(trackable),
-        &mut |v| {
-            if let Some(e) = always_refuses_as_live_path::<S>(expr, walk_input_reaches_object, &v) {
-                construct_refusal = Some(e);
-                return Demand::Stop;
-            }
-            // #3711: as in `resolve_leaf_sink`.
-            if let Some(e) =
-                iterates_untracked_input::<S>(expr, trackable, value, register_loss, snapshot)
-            {
-                construct_refusal = Some(e);
-                return Demand::Stop;
-            }
-            values.push(v);
-            if values.len() >= limit {
-                Demand::Stop
-            } else {
-                Demand::Continue
-            }
-        },
-    );
+    let mut on_value = |v: OwnedValue| {
+        if let Some(e) = always_refuses_as_live_path::<S>(expr, walk_input_reaches_object, &v) {
+            construct_refusal = Some(e);
+            return Demand::Stop;
+        }
+        // #3711: as in `resolve_leaf_sink`.
+        if let Some(e) =
+            iterates_untracked_input::<S>(expr, trackable, value, register_loss, snapshot)
+        {
+            construct_refusal = Some(e);
+            return Demand::Stop;
+        }
+        values.push(v);
+        if values.len() >= limit {
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    };
+    let reentry = Reentry::at_register(trackable);
+    let pattern_search = PatternSearch::of(expr).filter(|_| !trackable);
+    let flow = if let Some((search, pattern)) = pattern_search {
+        // #3347: as in `resolve_leaf_sink`.
+        let refuse = |e: EvalError, step: Option<NavKind>| {
+            guess_refusal(e, register_loss, snapshot, value, step)
+        };
+        let (flow, refusal) =
+            eval_each_pattern_search::<S>(search, pattern, value, reentry, &refuse, &mut on_value);
+        construct_refusal = construct_refusal.or(refusal);
+        flow
+    } else {
+        eval_each_owned::<S>(expr, value, false, reentry, &mut on_value)
+    };
 
     // Halt-first, exactly as the eager version checked `trailing` first —
     // an already-triggered halt (whether it escaped bare, or is `pending`
