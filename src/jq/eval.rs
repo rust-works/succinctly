@@ -43935,8 +43935,10 @@ impl FoldRegister {
 /// a computed key *containing* a `Field` or `Iterate` of its own reached the
 /// gate before, so the same navigation with a constant-folded key was driven by
 /// value and fabricated the path jq refuses. `first`/`last`/`nth`
-/// (`.[0]`/`.[-1]`/`.[n]`) do not count: nothing here can tell them from a
-/// computed value (#3459).
+/// (`.[0]`/`.[-1]`/`.[n]`) do not count *here*, because this predicate is also read
+/// on the UPDATE side and has no mode gate; [`drive_fold_source_with`] adds them
+/// for a fold's source in jq mode (#3459), where the resolver models them as the
+/// index steps they are.
 fn is_fold_source_navigation(e: &Expr) -> bool {
     matches!(
         e,
@@ -43970,10 +43972,10 @@ fn fold_slice_ok(patterns: &[Pattern], source: &Expr) -> bool {
 
 /// Whether a fold SOURCE moves jq's path register: [`is_fold_source_navigation`],
 /// plus the bare `first`/`last`/`nth(n)` builtins, which are `.[0]`/`.[-1]`/`.[n]`.
-/// [`drive_fold_source`] cannot count those (nothing there tells them from a
-/// computed value, #3459), but the whole-array-slice rule (#3504) can: it only
-/// ever *refuses more* when this says yes, and `reduce first as $a (.; .[0:])`
-/// is refused by jq (#3734).
+/// [`drive_fold_source`] counts those through its own jq-only clause (#3459); this
+/// one serves the whole-array-slice rule (#3504), which only ever *refuses more*
+/// when this says yes, and `reduce first as $a (.; .[0:])` is refused by jq
+/// (#3734).
 fn fold_source_moves_register(source: &Expr) -> bool {
     any_subexpr(source, &mut |e| {
         is_fold_source_navigation(e)
@@ -44283,10 +44285,32 @@ fn drive_fold_source_with<S: EvalSemantics>(
     // whose pattern steps are tracked index steps of their own. Jq mode only:
     // yq has no `reduce`/`foreach`/`path` to check against, and the refusal
     // itself is jq mode only ([`always_refuses_as_live_path`]).
+    // #3459: and so do the builtins jq defines over an index of their own input,
+    // which the resolver models as that navigation. Bare `first`/`last`/`nth(n)` are
+    // `.[0]`/`.[-1]`/`.[n]` (#3545/#3550); `map(f)`, `flatten` and `add` iterate their
+    // input with a path-checked `.[]` ([`builtin_navigation`]'s `Iterate` entries,
+    // #3361), so they raise on an input the register is not on. Left to the by-value
+    // drive, `first|tostring` read as a literal that never touched the register and
+    // fabricated the root path jq refuses, and `map(1)|length` over an INIT that had
+    // navigated away (`foreach (map(1)|length) as $k (.b; .)`) answered where jq raises
+    // "iterate through". Jq mode only: yq's `first` is a root-only operator, not an
+    // index, and yq has no `foreach`/`path` to check against.
     let has_navigation = any_subexpr(source, &mut |e| {
         is_fold_source_navigation(e)
             || (S::TAG == EvalTag::Jq
-                && (live_path_refusal(e).is_some() || is_fold_source_destructuring(e)))
+                && (live_path_refusal(e).is_some()
+                    || is_fold_source_destructuring(e)
+                    || matches!(
+                        e,
+                        Expr::Builtin(
+                            Builtin::First
+                                | Builtin::Last
+                                | Builtin::Nth(_)
+                                | Builtin::Map(_)
+                                | Builtin::Flatten
+                                | Builtin::Add
+                        )
+                    )))
     }) || (S::TAG == EvalTag::Jq
         && foreach_source
         && foreach_source_destructures_register(source))
@@ -44389,9 +44413,10 @@ fn drive_fold_source_with<S: EvalSemantics>(
             // branch still at the root never navigated (a literal, an `as`
             // source, a conditional whose taken arm computes, the first
             // output of `..`), so the register stayed put. Depth is a proxy
-            // for "did an INDEX run" that an opaque stage defeats: a bare
-            // `first|tostring` never grows the path, so it reads as
-            // unmoved and stays the by-value behaviour (#3459). A nested
+            // for "did an INDEX run" that an opaque stage defeats: a stage
+            // the resolver cannot see inside that never grows the path reads as
+            // unmoved. The bare `first`/`last`/`nth` that used to be such a
+            // stage are navigation now (the gate above, #3459). A nested
             // navigating `foreach` is the one such stage that can be named
             // from the source's text, so a root branch that states no
             // register while one is in the source is as lost as a navigated

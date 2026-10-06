@@ -108972,3 +108972,448 @@ fn test_consumer_of_a_prefetched_path_context_body_follows_jq_3639() -> Result<(
     }
     Ok(())
 }
+
+/// #3459: a `foreach`/`reduce` source that is a bare `first`/`last`/`nth(n)`
+/// (optionally followed by a computing stage) moves jq's path register, because
+/// jq defines them as `.[0]`/`.[-1]`/`.[n]`. `drive_fold_source`'s navigation
+/// gate did not count them, so the source was driven by value and read as a
+/// literal that never touched the register: `path(foreach (first|tostring) as $k
+/// (.; .))` on `[1,2,3]` answered `[]` and `(foreach (last) as $k (.; .)) = 9`
+/// overwrote the whole document, where jq refuses (`Invalid path expression with
+/// result [1,2,3]`), and on `null` the path came out `[]` instead of `[0]`. The
+/// rows cover each builtin alone and before a computing stage, `path` and `=`,
+/// `foreach` and `reduce`, array/`null`/object inputs, UPDATEs that navigate
+/// after the moved register, and the neighbouring shapes that must not move
+/// (`.a|first`, `map(1)|length`, `first(f)`, `nth(n; f)`, a user `def first`).
+/// Every value is captured from jq 1.7.1 -- `(input, filter, stdout, exit)`.
+const FOLD_SOURCE_BARE_INDEX_BUILTIN_ROWS_3459: &[(&str, &str, &str, i32)] = &[
+    (
+        r"[1,2,3]",
+        r"path(foreach (first|tostring) as $k (.; .))",
+        "",
+        5,
+    ),
+    (
+        r"null",
+        r"path(foreach (first|tostring) as $k (.; .))",
+        "[0]\n",
+        0,
+    ),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"path(foreach (first|tostring) as $k (.; .))",
+        "",
+        5,
+    ),
+    (
+        r"[1,2,3]",
+        r"(foreach (first|tostring) as $k (.; .)) = 9",
+        "",
+        5,
+    ),
+    (
+        r"null",
+        r"(foreach (first|tostring) as $k (.; .)) = 9",
+        "[9]\n",
+        0,
+    ),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"(foreach (first|tostring) as $k (.; .)) = 9",
+        "",
+        5,
+    ),
+    (r"[1,2,3]", r"path(foreach (last) as $k (.; .))", "", 5),
+    (r"null", r"path(foreach (last) as $k (.; .))", "[-1]\n", 0),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"path(foreach (last) as $k (.; .))",
+        "",
+        5,
+    ),
+    (r"[1,2,3]", r"(foreach (last) as $k (.; .)) = 9", "", 5),
+    (r"null", r"(foreach (last) as $k (.; .)) = 9", "", 5),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"(foreach (last) as $k (.; .)) = 9",
+        "",
+        5,
+    ),
+    (
+        r"[1,2,3]",
+        r"path(foreach (last|tostring) as $k (.; .))",
+        "",
+        5,
+    ),
+    (
+        r"null",
+        r"path(foreach (last|tostring) as $k (.; .))",
+        "[-1]\n",
+        0,
+    ),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"path(foreach (last|tostring) as $k (.; .))",
+        "",
+        5,
+    ),
+    (
+        r"[1,2,3]",
+        r"(foreach (last|tostring) as $k (.; .)) = 9",
+        "",
+        5,
+    ),
+    (
+        r"null",
+        r"(foreach (last|tostring) as $k (.; .)) = 9",
+        "",
+        5,
+    ),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"(foreach (last|tostring) as $k (.; .)) = 9",
+        "",
+        5,
+    ),
+    (
+        r"[1,2,3]",
+        r"path(foreach (nth(0)|tostring) as $k (.; .))",
+        "",
+        5,
+    ),
+    (
+        r"null",
+        r"path(foreach (nth(0)|tostring) as $k (.; .))",
+        "[0]\n",
+        0,
+    ),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"path(foreach (nth(0)|tostring) as $k (.; .))",
+        "",
+        5,
+    ),
+    (
+        r"[1,2,3]",
+        r"(foreach (nth(0)|tostring) as $k (.; .)) = 9",
+        "",
+        5,
+    ),
+    (
+        r"null",
+        r"(foreach (nth(0)|tostring) as $k (.; .)) = 9",
+        "[9]\n",
+        0,
+    ),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"(foreach (nth(0)|tostring) as $k (.; .)) = 9",
+        "",
+        5,
+    ),
+    (r"[1,2,3]", r"path(foreach (nth(1)) as $k (.; .))", "", 5),
+    (r"null", r"path(foreach (nth(1)) as $k (.; .))", "[1]\n", 0),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"path(foreach (nth(1)) as $k (.; .))",
+        "",
+        5,
+    ),
+    (r"[1,2,3]", r"(foreach (nth(1)) as $k (.; .)) = 9", "", 5),
+    (
+        r"null",
+        r"(foreach (nth(1)) as $k (.; .)) = 9",
+        "[null,9]\n",
+        0,
+    ),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"(foreach (nth(1)) as $k (.; .)) = 9",
+        "",
+        5,
+    ),
+    (r"[1,2,3]", r"path(foreach (first) as $k (.; .))", "", 5),
+    (r"null", r"path(foreach (first) as $k (.; .))", "[0]\n", 0),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"path(foreach (first) as $k (.; .))",
+        "",
+        5,
+    ),
+    (r"[1,2,3]", r"(foreach (first) as $k (.; .)) = 9", "", 5),
+    (r"null", r"(foreach (first) as $k (.; .)) = 9", "[9]\n", 0),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"(foreach (first) as $k (.; .)) = 9",
+        "",
+        5,
+    ),
+    (
+        r"null",
+        r"path(foreach (first|tostring) as $k (.; .a))",
+        "[0,\"a\"]\n",
+        0,
+    ),
+    (
+        r"[1,2,3]",
+        r"path(foreach (first|tostring) as $k (.; .[0]))",
+        "",
+        5,
+    ),
+    (
+        r"[1,2,3]",
+        r"path(reduce (first|tostring) as $k (.; .))",
+        "[]\n",
+        0,
+    ),
+    (
+        r"[1,2,3]",
+        r"(reduce (last|tostring) as $k (.; .)) = 9",
+        "9\n",
+        0,
+    ),
+    (
+        r"[[1]]",
+        r"(foreach (first|tostring) as $k (.; $k)) = 9",
+        "",
+        5,
+    ),
+    (
+        r#"{"a":[1,2]}"#,
+        r"path(foreach (.a|first) as $k (.; .))",
+        "",
+        5,
+    ),
+    (
+        r"null",
+        r"path(foreach (.a|first) as $k (.; .))",
+        "[\"a\",0]\n",
+        0,
+    ),
+    (
+        r"null",
+        r"(foreach (.a|first) as $k (.; .)) = 9",
+        "{\"a\":[9]}\n",
+        0,
+    ),
+    (
+        r"[1,2,3]",
+        r"path(foreach (map(1)|length) as $k (.; .))",
+        "[]\n",
+        0,
+    ),
+    (
+        r"[1,2,3]",
+        r"path(foreach (first(.[])|tostring) as $k (.; .))",
+        "",
+        5,
+    ),
+    (
+        r"[1,2,3]",
+        r"path(foreach (nth(1; .[])) as $k (.; .))",
+        "",
+        5,
+    ),
+    (
+        r"[1,2,3]",
+        r"def first: 5; path(foreach (first|tostring) as $k (.; .))",
+        "[]\n",
+        0,
+    ),
+    (
+        r"null",
+        r"def first: 5; path(foreach (first|tostring) as $k (.; .))",
+        "[]\n",
+        0,
+    ),
+    (
+        r"[1,2,3]",
+        r"path(foreach (nth(0,2)|tostring) as $k (.; .))",
+        "",
+        5,
+    ),
+];
+
+/// #3459: the by-value builtins jq defines over a path-checked `.[]` of their own
+/// input (`map(f)`, `flatten`, `add`) as a fold source. After an INIT that has
+/// navigated off the input (`.b`), jq's register is no longer on the value the
+/// source iterates, so the `.[]` inside the builtin raises `Invalid path
+/// expression near attempt to iterate through <input>`; the by-value drive of the
+/// source answered `["b"]` and `(...) = 9` wrote `{"a":[1],"b":9}`. The rows with
+/// the register still on the input must keep answering as before, and `add?`
+/// (jq's `?` swallows the raise, so the fold runs zero steps and writes nothing).
+/// Every value
+/// is captured from jq 1.7.1 -- `(input, filter, stdout, exit)`.
+const FOLD_SOURCE_ITERATING_BUILTIN_ROWS_3459: &[(&str, &str, &str, i32)] = &[
+    (
+        r#"{"a":[1],"b":{"c":2}}"#,
+        r"path(foreach (map(1)|length) as $k (.b; .))",
+        "",
+        5,
+    ),
+    (
+        r#"{"a":[1],"b":{"c":2}}"#,
+        r"path(foreach (map(1)) as $k (.b; .))",
+        "",
+        5,
+    ),
+    (
+        r#"{"a":[1],"b":{"c":2}}"#,
+        r"path(foreach (map(.)|length) as $k (.b; .))",
+        "",
+        5,
+    ),
+    (
+        r#"{"a":[1],"b":{"c":2}}"#,
+        r"path(foreach (flatten|length) as $k (.b; .))",
+        "",
+        5,
+    ),
+    (
+        r#"{"a":[1],"b":{"c":2}}"#,
+        r"path(foreach (add|length) as $k (.b; .))",
+        "",
+        5,
+    ),
+    (
+        r#"{"a":[1],"b":{"c":2}}"#,
+        r"(foreach (map(1)|length) as $k (.b; .)) = 9",
+        "",
+        5,
+    ),
+    (
+        r#"{"a":[1],"b":{"c":2}}"#,
+        r"path(reduce (map(1)|length) as $k (.b; .))",
+        "",
+        5,
+    ),
+    (
+        r#"{"a":[1],"b":{"c":2}}"#,
+        r"(reduce (flatten|length) as $k (.b; .)) = 9",
+        "",
+        5,
+    ),
+    (
+        r#"{"a":[1],"b":{"c":2}}"#,
+        r"path(foreach (map(1)|length) as $k (.b; .c))",
+        "",
+        5,
+    ),
+    (
+        r"[[1],[2]]",
+        r"path(foreach (map(1)|length) as $k (.; .))",
+        "[]\n",
+        0,
+    ),
+    (
+        r"[[1],[2]]",
+        r"path(foreach (map(1)|length) as $k (.; .[0]))",
+        "[0]\n",
+        0,
+    ),
+    (
+        r"[[1],[2]]",
+        r"path(foreach (flatten|length) as $k (.; .))",
+        "[]\n",
+        0,
+    ),
+    (
+        r"[[1],[2]]",
+        r"path(foreach (flatten|length) as $k (.; .[0]))",
+        "[0]\n",
+        0,
+    ),
+    (
+        r"[[1],[2]]",
+        r"path(foreach (add|length) as $k (.; .))",
+        "[]\n",
+        0,
+    ),
+    (
+        r"[[1],[2]]",
+        r"path(foreach (add|length) as $k (.; .[0]))",
+        "[0]\n",
+        0,
+    ),
+    (
+        r"[[1],[2]]",
+        r"path(foreach (map(.)|length) as $k (.; .))",
+        "[]\n",
+        0,
+    ),
+    (
+        r"[[1],[2]]",
+        r"path(foreach (map(.)|length) as $k (.; .[0]))",
+        "[0]\n",
+        0,
+    ),
+    (
+        r"[[1],[2]]",
+        r"(foreach (map(1)|length) as $k (.; .)) = 9",
+        "9\n",
+        0,
+    ),
+    (
+        r"[[1],[2]]",
+        r"path(foreach (map(1)|length) as $k (.[0]; .))",
+        "",
+        5,
+    ),
+    (r"null", r"path(foreach (map(1)) as $k (.; .))", "", 5),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"path(foreach (add?) as $k (.b; .))",
+        "",
+        0,
+    ),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"(foreach (add?) as $k (.b; .)) = 9",
+        "{\"a\":null,\"b\":null}\n",
+        0,
+    ),
+    (
+        r#"{"a":{"a":1},"b":{"c":2}}"#,
+        r"(foreach (add?) as $k (.b; .)) = 9",
+        "{\"a\":{\"a\":1},\"b\":{\"c\":2}}\n",
+        0,
+    ),
+    (
+        r#"{"a":null,"b":null}"#,
+        r"path(foreach (add?) as $k (.b; .a))",
+        "",
+        0,
+    ),
+    (
+        r"[[1],[2]]",
+        r"path(foreach (add?) as $k (.; .[0]))",
+        "[0]\n",
+        0,
+    ),
+    (r"[[1],[2]]", r"(foreach (add?) as $k (.; .)) = 9", "9\n", 0),
+];
+
+#[test]
+fn test_fold_source_bare_first_last_nth_moves_the_register_3459() -> Result<()> {
+    assert_as_binding_rows_3397(FOLD_SOURCE_BARE_INDEX_BUILTIN_ROWS_3459)?;
+    assert_as_binding_rows_3397(FOLD_SOURCE_ITERATING_BUILTIN_ROWS_3459)
+}
+
+/// #3459: the same rows with the document written into the program, which takes
+/// the owned-value route instead of the document cursor one.
+#[test]
+fn test_fold_source_bare_first_last_nth_moves_the_register_on_a_literal_input_3459() -> Result<()> {
+    for &(input, filter, stdout, exit) in FOLD_SOURCE_BARE_INDEX_BUILTIN_ROWS_3459
+        .iter()
+        .chain(FOLD_SOURCE_ITERATING_BUILTIN_ROWS_3459)
+    {
+        let program = format!("{input} | ({filter})");
+        let (out, err, code) = run_jq_full(&["-c", "--", &program], Some("null"))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (stdout, exit),
+            "`{program}`: stderr {err:?}"
+        );
+    }
+    Ok(())
+}
