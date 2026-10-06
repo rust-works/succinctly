@@ -11264,11 +11264,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // itself, not `RootWitness::of(cursor)` (which would wrongly
             // compare against `.`'s own node instead of the accumulator's).
             let mut outputs: Vec<OwnedValue> = Vec::new();
+            let shared = fold_init_shares_identity::<S>(patterns, update, None);
             let flow = reduce_forks::<S>(
                 patterns,
                 update,
                 &mut |per_init| {
-                    drive_foreach_expr_generic::<S, V>(init, &value, optional, cursor, per_init)
+                    drive_foreach_init_generic::<S, V>(
+                        init, &value, optional, cursor, shared, per_init,
+                    )
                 },
                 optional,
                 &mut |per_element| {
@@ -11321,12 +11324,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // `foreach_forks` demotes them against `Owned` itself, same
             // reasoning as the `Expr::Reduce` arm just above.
             let mut outputs: Vec<OwnedValue> = Vec::new();
+            let shared = fold_init_shares_identity::<S>(patterns, update, extract.as_deref());
             let flow = foreach_forks::<S>(
                 patterns,
                 update,
                 extract.as_deref(),
                 &mut |per_init| {
-                    drive_foreach_expr_generic::<S, V>(init, &value, optional, cursor, per_init)
+                    drive_foreach_init_generic::<S, V>(
+                        init, &value, optional, cursor, shared, per_init,
+                    )
                 },
                 optional,
                 &mut |per_element| {
@@ -12834,6 +12840,65 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     resume_from_escape(escape, flow)
 }
 
+/// Whether a fold's INIT outputs register themselves in the embed table for
+/// the fork they start (#3329).
+///
+/// jq's `reduce (.) as $x (.; ($x.a) = 9)` binds `$x` and the accumulator to
+/// the *same* `jv`, because INIT and the source both read the input. The
+/// generic evaluator materializes the two separately, so the loop variable is
+/// a value-equal twin of the accumulator that the resolver's storage clause
+/// (#3177) cannot match. An entry for INIT's node makes the source's
+/// materialization of that node return INIT's own `Rc` ([`embed_table`]).
+///
+/// Only a fold that marks its loop variables asks for it
+/// ([`fold_loop_variable_is_marked`]): the entry makes the accumulator's first
+/// in-place write copy, and the table being live reshapes owned navigation,
+/// neither of which a fold that cannot certify a marker should pay.
+fn fold_init_shares_identity<S: EvalSemantics>(
+    patterns: &[Pattern],
+    update: &Expr,
+    extract: Option<&Expr>,
+) -> bool {
+    crate::jq::eval::fold_loop_variable_is_marked::<S>(patterns, update, extract)
+}
+
+/// [`drive_foreach_expr_generic`] for a fold's INIT: with `shared`, the first
+/// output, if it names a document node, is registered in the embed table for as
+/// long as the fork it starts runs (#3329, see [`fold_init_shares_identity`]).
+fn drive_foreach_init_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    shared: bool,
+    per_item: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    if !shared {
+        return drive_foreach_expr_generic::<S, V>(expr, value, optional, cursor, per_item);
+    }
+    let mut escape: Option<Control> = None;
+    let mut first = true;
+    let flow = eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
+        match generic_item_into_owned_with_origin::<_, S>(item) {
+            Ok((mut v, origin)) => {
+                // Only the first INIT output: jq 1.7.1 evaluates SOURCE against
+                // `null` on every later fork, so a loop variable there is never
+                // the accumulator's own node (`[reduce (.) as $x ((.,.); $x)]` is
+                // `[{"a":1},null]`), and an entry would make us answer a write
+                // through it that jq refuses.
+                let _entry = if core::mem::take(&mut first) {
+                    embed_table_push::<S>(origin.as_ref(), &mut v)
+                } else {
+                    None
+                };
+                per_item(v)
+            }
+            Err(control) => stop_with_escape(&mut escape, control),
+        }
+    });
+    resume_from_escape(escape, flow)
+}
+
 /// [`eval_each_generic`]'s `reduce` arm (#2899) -- `each_foreach_generic`'s
 /// twin over [`reduce_forks`].
 #[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `each_foreach_generic`'s parameter list
@@ -12850,11 +12915,12 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
     // #2642/#3122: same reasoning as the eager `Expr::Reduce` arm -- `update`
     // reruns against the fold's own accumulator, never the ambient cursor,
     // and `reduce_forks` demotes it against `Owned` itself.
+    let shared = fold_init_shares_identity::<S>(patterns, update, None);
     reduce_forks::<S>(
         patterns,
         update,
         &mut |per_init| {
-            drive_foreach_expr_generic::<S, V>(init, &value, optional, cursor, per_init)
+            drive_foreach_init_generic::<S, V>(init, &value, optional, cursor, shared, per_init)
         },
         optional,
         &mut |per_element| {
@@ -12897,12 +12963,13 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     // #2642/#3122: same reasoning as the eager `Expr::Foreach` arm above --
     // `update`/`extract` rerun against the fold's own accumulator, never the
     // ambient cursor, and `foreach_forks` demotes them against `Owned` itself.
+    let shared = fold_init_shares_identity::<S>(patterns, update, extract);
     foreach_forks::<S>(
         patterns,
         update,
         extract,
         &mut |per_init| {
-            drive_foreach_expr_generic::<S, V>(init, &value, optional, cursor, per_init)
+            drive_foreach_init_generic::<S, V>(init, &value, optional, cursor, shared, per_init)
         },
         optional,
         &mut |per_element| {

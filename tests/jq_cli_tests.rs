@@ -82110,56 +82110,166 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
     Ok(())
 }
 
-/// What is left of #3036's agree-to-refuse flips on the `eval.rs` route
-/// after #2889 Stage B and #3181: the fold's own loop variable used inside
-/// its UPDATE (`reduce (.) as $x`). The fold substitutes a loop variable's
-/// value as a literal, so there is no marker for anything to reroot.
+/// #3329: a fold's own loop variable used in path position inside its
+/// UPDATE or EXTRACT. jq's `$x` is the very `jv` the source yielded, so a
+/// write or `path()` through it succeeds exactly while the accumulator still
+/// *is* that `jv`; the fold used to splice `$x` in as a rebuilt literal, which
+/// has no identity at all, and refused every one of these.
 ///
-/// A marker bound outside the fold (`. as $x | reduce (1) as $i`) was the
-/// other row here; #3181 answers it wherever the accumulator is still `$x`'s
-/// node, in `test_fold_update_marker_naming_the_accumulator_3181`.
-///
-/// The rest of this list -- the embedding constructions (`[.] | .[0]`,
-/// `{k:.} | .k`, `reduce empty as $i (.; .)`, each `| path($x)`) and the
-/// owned-copy passthroughs (`getpath([])`, `nth(0; .)`, `until(true; .)`,
-/// `ltrimstr("x")`, `try error($x) catch path($x)`) -- is recovered and
-/// asserted to *answer* in
-/// `test_owned_embed_keeps_node_identity_on_the_input_bridge_2889`.
-///
-/// They are recorded in `docs/compliance/jq/limitations.md`; a row here
-/// answering again would be a genuine recovery, not a bug, so it is pinned
-/// as refuse-only rather than asserted to error forever.
+/// Every row runs on both routes -- stdin through the generic evaluator (INIT
+/// and source materialize separately, so INIT's own `Rc` is registered for the
+/// source to reuse) and `-n 'input | ...'` through `eval.rs`'s owned fold --
+/// and every expected value is captured from `/usr/bin/jq` 1.7.1.
 #[test]
 // jq filter literals like `{k:.}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
 #[allow(clippy::literal_string_with_formatting_args)]
-fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> Result<()> {
-    for (args, input, filter) in [
+fn test_fold_loop_variable_in_path_position_3329() -> Result<()> {
+    let answering = [
+        (r"reduce (.) as $x (.; ($x.a) = 9)", r#"{"a":9}"#),
+        (r"foreach (.) as $x (.; ($x.a) = 9)", r#"{"a":9}"#),
+        (r"reduce (.) as $x (.; path($x))", "[]"),
+        (r"[.] | reduce .[0] as $x (.; del(.[0] | $x))", "[]"),
+        (r"reduce (.) as $x (.; ($x.a) |= . + 1)", r#"{"a":2}"#),
+        (r"reduce (.) as $x (.; del($x.a))", "{}"),
+        (r"reduce (.) as $x (.; ($x | .a) |= 5)", r#"{"a":5}"#),
         (
-            &["-n", "-c"][..],
-            r#"{"a":1}"#,
-            "input | reduce (.) as $x (.; ($x.a = 9))",
+            r"reduce (.) as $x (.; ($x.a, $x.b) = 9)",
+            r#"{"a":9,"b":9}"#,
         ),
+        // EXTRACT reads the loop variable too.
+        (r"foreach (.) as $x (.; .; path($x))", "[]"),
+        (r"foreach (.) as $x (.; .; ($x.a) = 9)", r#"{"a":9}"#),
+        (r"[foreach (.) as $x (.; .; path($x))]", "[[]]"),
+        // A consumer's stop, and a `first` around the fold.
         (
-            &["-n", "-c"][..],
-            r#"{"a":1}"#,
-            "input | foreach (.) as $x (.; ($x.a = 9))",
+            r"[limit(1; foreach (.,.) as $x (.; ($x.a) = 9; .))]",
+            r#"[{"a":9}]"#,
         ),
+        (r"first(reduce (.) as $x (.; ($x.a) = 9))", r#"{"a":9}"#),
+        // An INIT that fails to materialize escapes before any step runs.
         (
-            &["-n", "-c"][..],
-            r#"{"a":1}"#,
-            "input | reduce (.) as $x (.; path($x))",
+            r#"try (reduce (.) as $x (map(1/0); ($x.a) = 9)) catch "c""#,
+            r#""c""#,
         ),
-    ] {
-        let mut argv: Vec<&str> = args.to_vec();
-        argv.push(filter);
-        let (stdout, stderr, code) = run_jq_full(&argv, Some(input))?;
-        assert_eq!(
-            code, 5,
-            "#3036: `{filter}` is a documented refuse-only residual (real jq \
-             accepts it), got stdout={stdout:?} stderr={stderr:?}"
-        );
+        // A nested fold sees the outer loop variable.
+        (
+            r"reduce (.) as $x (.; reduce (.) as $y (.; ($x.a) = 9))",
+            r#"{"a":9}"#,
+        ),
+        // Destructured loop variables hold the same node.
+        (r"reduce ([.]) as [$x] (.; ($x.a) = 9)", r#"{"a":9}"#),
+        (r"reduce ({k:.}) as {k:$x} (.; ($x.a) = 9)", r#"{"a":9}"#),
+    ];
+    for (filter, want) in answering {
+        for (args, program) in [
+            (&["-c"][..], filter.to_string()),
+            (&["-n", "-c"][..], format!("input | {filter}")),
+        ] {
+            let mut argv: Vec<&str> = args.to_vec();
+            argv.push(&program);
+            let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+            assert_eq!(
+                (stdout.trim(), code),
+                (want, 0),
+                "#3329: `{program}` ({args:?}) must answer as jq 1.7.1 does; stderr={stderr:?}"
+            );
+        }
     }
+    // jq refuses these too, because the loop variable is not the accumulator's
+    // node: a literal INIT, an UPDATE that rebuilt the accumulator, a second
+    // step after a write, a value that round-tripped through a string.
+    for filter in [
+        r"reduce (.) as $x ({a:1}; ($x.a) = 9)",
+        r"reduce (.) as $x (.; {a:1} | ($x.a) = 9)",
+        r"reduce (.,.) as $x (.; ($x.a) = 9)",
+        r"reduce (.) as $x (.; .a = 5 | path($x))",
+        r"reduce (.) as $x (.; tojson | fromjson | path($x))",
+        r"reduce (. | tojson | fromjson) as $x (.; path($x))",
+        // A scalar has no storage identity here (#3191's promotion is the
+        // bind's); the row is refuse-only, as it was.
+        r#"reduce ("s") as $x (.; path($x))"#,
+    ] {
+        for (args, program) in [
+            (&["-c"][..], filter.to_string()),
+            (&["-n", "-c"][..], format!("input | {filter}")),
+        ] {
+            let mut argv: Vec<&str> = args.to_vec();
+            argv.push(&program);
+            let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+            assert_eq!(
+                (stdout.trim(), code),
+                ("", 5),
+                "#3329: `{program}` ({args:?}) must refuse as jq 1.7.1 does; stderr={stderr:?}"
+            );
+            assert!(
+                stderr.contains("Invalid path expression"),
+                "#3329: `{program}` ({args:?}) refused for the wrong reason: {stderr:?}"
+            );
+        }
+    }
+    // Only the first INIT fork's loop variable can be the accumulator: jq 1.7.1
+    // evaluates SOURCE against `null` on every later fork, so a write through
+    // `$x` answers once and then refuses. Marking the later forks would answer
+    // them too.
+    for filter in [
+        r"reduce (.) as $x ((.,.); ($x.a) = 9)",
+        r"foreach (.) as $x ((.,.); ($x.a) = 9; .)",
+    ] {
+        for (args, program) in [
+            (&["-c"][..], filter.to_string()),
+            (&["-n", "-c"][..], format!("input | {filter}")),
+        ] {
+            let mut argv: Vec<&str> = args.to_vec();
+            argv.push(&program);
+            let (stdout, stderr, code) = run_jq_full(&argv, Some(r#"{"a":1}"#))?;
+            assert_eq!(
+                (stdout.trim(), code),
+                (r#"{"a":9}"#, 5),
+                "#3329: `{program}` ({args:?}); stderr={stderr:?}"
+            );
+            assert!(stderr.contains("Invalid path expression"), "{stderr:?}");
+        }
+    }
+    // Equal values at different nodes are different `jv`s; the same node is one.
+    for (filter, want) in [
+        (
+            r".a as $y | reduce .a as $x (.a; ($x.b) = 9)",
+            Some(r#"{"b":9}"#),
+        ),
+        (r"reduce .a as $x (.a; ($x.b) = 9)", Some(r#"{"b":9}"#)),
+        (r"reduce .a as $x (.c; ($x.b) = 9)", None),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(
+            &["-n", "-c", &format!("input | {filter}")],
+            Some(r#"{"a":{"b":1},"c":{"b":1}}"#),
+        )?;
+        match want {
+            Some(want) => assert_eq!((stdout.trim(), code), (want, 0), "{filter}: {stderr:?}"),
+            None => {
+                assert_eq!((stdout.trim(), code), ("", 5), "{filter}: {stderr:?}");
+                assert!(stderr.contains("Invalid path expression"), "{stderr:?}");
+            }
+        }
+    }
+    // The stdin route reuses INIT's `Rc` only for the node INIT itself is; a
+    // source that navigates *below* it still refuses where jq answers (the
+    // ancestor lookup #3179's nested reuse has no mirror for), never the
+    // other way round.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r"reduce .a as $x (.a; ($x.b) = 9)"],
+        Some(r#"{"a":{"b":1},"c":{"b":1}}"#),
+    )?;
+    assert_eq!(
+        (stdout.trim(), code),
+        (r#"{"b":9}"#, 0),
+        "stderr={stderr:?}"
+    );
+    let (stdout, _, code) = run_jq_full(
+        &["-c", r"reduce .a as $x (.; del(.a | $x))"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!((stdout.trim(), code), ("", 5));
     Ok(())
 }
 

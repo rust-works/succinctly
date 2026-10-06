@@ -132,8 +132,8 @@ pub struct Tracked {
 ///   `eval_as`/`each_as` bind sites (strings and number literals too since
 ///   #3191, promoted to shared storage at the bind). A value re-indexed
 ///   before the read (`sort`/`unique`/`reverse`/
-///   `to_entries`/`getpath`/a slice), a fold over an owned input (#3328)
-///   or a fold's own loop variable (#3329), and a few Stage-B-only shapes on the
+///   `to_entries`/`getpath`/a slice), a fold's own loop variable over a
+///   source that navigates below INIT's node (#3329), and a few Stage-B-only shapes on the
 ///   `-n 'input | ...'` route stay documented refuse-only residuals, not
 ///   new correctness gaps -- see `docs/compliance/jq/limitations.md`'s
 ///   #2642 and #3036 sections. #3036 closed the same
