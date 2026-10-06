@@ -4265,8 +4265,14 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     // at all (`print_json`'s `Out` is bound to `std::io::Write`, not the
     // `core::fmt::Write` `AsciiEscapeWriter` implements, so reusing it here
     // would need its own adapter -- not attempted by this change).
-    let can_use_lazy_path = !args.slurp
-        && !args.raw_input
+    //
+    // #2847: `--slurp` joined them. It used to build the whole `Vec<OwnedValue>`
+    // here too (`get_inputs`), so `-s '1+1'` on a malformed member exited 5
+    // and paid the full DOM where the default route answered `2`. The lazy
+    // route now indexes one synthesized `[v1,v2,...]` buffer instead
+    // (`slurp_documents`). `-n -s` is still excluded by the `!args.null_input`
+    // test below, and `-R`/`--seq`/DSV `-s` stay on the materializing path.
+    let can_use_lazy_path = !args.raw_input
         && args.input_dsv.is_none()
         && !args.seq // seq input mode parses differently
         && !uses_input_builtins;
@@ -4304,6 +4310,33 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             raw_inputs.into_iter().map(utf8_lossy_document).collect()
         };
 
+        // #2847: `--slurp` replaces the per-file documents with the single
+        // synthesized array, evaluated once below. Everything the per-file
+        // loop derives from a file (its name, its source tag, the line a
+        // diagnostic names) is carried here instead, since the one document
+        // no longer belongs to any single file.
+        let (raw_inputs, slurped) = if args.slurp {
+            match slurp_documents(raw_inputs, &files, args.validate) {
+                Ok(mut slurped) => (vec![std::mem::take(&mut slurped.combined)], Some(slurped)),
+                // `--validate` already printed its own report.
+                Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
+                // Line 0 of the first file, where `get_inputs` has always
+                // named a `--slurp` stream it could not finish splitting: the
+                // one combined value has no document position of its own.
+                Err(SlurpFailure::Unsplittable) => {
+                    let file = files.first().map(|p| p.to_string_lossy().to_string());
+                    sink.report(
+                        DiagStyle::Jq,
+                        &EvalError::new("Invalid JSON text"),
+                        &InputLocation::at(file.as_deref(), 0),
+                    );
+                    return Ok(DiagStyle::Jq.error_exit_code());
+                }
+            }
+        } else {
+            (raw_inputs, None)
+        };
+
         // Check if we can use the identity fast path (raw bytes output, no materialization)
         let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
         // #1653 introduced streaming, gated so only a cursor-transparent
@@ -4316,10 +4349,17 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         // the sweep that measures them.
 
         for (idx, raw) in raw_inputs.iter().enumerate() {
-            jq::cli_context::set_current_source(u32::try_from(idx).ok());
-            let filename: Option<String> = files.get(idx).map(|p| p.to_string_lossy().to_string());
-            // Validate JSON if --validate flag is set
-            if args.validate {
+            // The slurped document answers for the last file (`input_filename`,
+            // and the file a diagnostic names), as the materializing route's
+            // `InputLocations::single` always did.
+            let source = slurped.as_ref().map_or(idx, |s| s.last_source);
+            jq::cli_context::set_current_source(u32::try_from(source).ok());
+            let filename: Option<String> =
+                files.get(source).map(|p| p.to_string_lossy().to_string());
+            // Validate JSON if --validate flag is set. Under `--slurp` this
+            // already ran per file, on each file's own bytes, inside
+            // `slurp_documents`; the synthesized buffer is not input.
+            if args.validate && slurped.is_none() {
                 if let Err(exit_code) = validate_json_input(raw, filename.as_deref()) {
                     // Every other return from this loop that can run after
                     // `out` has already buffered real output flushes
@@ -4341,7 +4381,15 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
             // Every value before a malformed one is still processed, and the
             // parse error is reported after them, as jq's incremental parser
             // does (#2961) -- see the report below the per-value loop.
-            let (values, split_error) = split_json_values(raw);
+            //
+            // A slurped input is already split: the one span is the whole
+            // synthesized array, and scanning it again would be a second pass
+            // over the entire input for nothing.
+            let (values, split_error) = if slurped.is_some() {
+                (vec![(0, raw.len())], None)
+            } else {
+                split_json_values(raw)
+            };
             // `values`' end offsets are non-decreasing (find_json_values is
             // a single left-to-right scan), so one LineCounter shared across
             // every value in this file keeps the whole loop O(n) (#1213).
@@ -4369,7 +4417,13 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 let index = JsonIndex::build(json_bytes);
                 // jq names the line the input value ends on, counted in the
                 // whole file rather than in this value's slice.
-                let at = InputLocation::at(filename.as_deref(), line_counter.advance_to(end));
+                // A slurped array names its last source's EOF line, not a line
+                // in the synthesized buffer (#1520, `InputLocations::slurp_eof`).
+                let line = match &slurped {
+                    Some(slurped) => slurped.eof_line,
+                    None => line_counter.advance_to(end),
+                };
+                let at = InputLocation::at(filename.as_deref(), line);
 
                 // #1576: the M2 fast path, mirroring `yq_runner.rs`'s own
                 // (`can_use_m2_streaming`/`GenericResult::stream_json`) but
@@ -4608,8 +4662,11 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
     } else {
         // The materializing path: reads every document up front into a
         // `Vec<OwnedValue>`, which is what the input-builtin queue below needs
-        // to seed from and what `--slurp`/`-R`/`--seq` need in order to
-        // combine or reshape the whole stream.
+        // to seed from and what `-R`/`--seq`/DSV input need in order to
+        // combine or reshape the whole stream. Plain `--slurp` is no longer
+        // among them (#2847): `slurp_documents` joins its values into one
+        // array the lazy route indexes. It lands here only combined with one
+        // of those modes, or with `input`/`inputs`.
         //
         // This comment used to say "parse through serde_json (loses number
         // formatting)". Both halves went stale: `parse_json_stream` routes
@@ -6267,6 +6324,80 @@ fn scan_one_json_token(bytes: &[u8], pos: usize) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+/// Why [`slurp_documents`] could not produce a document.
+enum SlurpFailure {
+    /// `--validate` rejected a file; its report is already printed. The exit
+    /// code to leave with.
+    Validation(i32),
+    /// A file's splitter gave up (a truncated container, a byte that starts
+    /// no token): the stream cannot be slurped.
+    Unsplittable,
+}
+
+/// What [`slurp_documents`] hands the lazy per-document loop (#2847).
+struct SlurpedInput {
+    /// `[`, every top-level value's own bytes joined by `,`, `]`.
+    combined: Vec<u8>,
+    /// Index of the last source on the command line (0 for stdin).
+    last_source: usize,
+    /// The last source's own newline count at EOF, the line jq's `(at ...)`
+    /// marker names for a value slurped out of the whole stream (#1520).
+    eof_line: usize,
+}
+
+/// Join every top-level value of every input, in order, into one JSON array
+/// for `--slurp` to index, without materializing any of them (#2847).
+///
+/// Each value is copied as the bytes it already has -- number spellings,
+/// string escapes and whitespace inside it are untouched -- so the lazy route
+/// reads exactly what the document route would have decoded. Nothing is
+/// validated beyond what [`split_json_values`] checks to find a value's end,
+/// which is the same rule the default route applies (#2103): a malformed
+/// *member* is reported only if the filter reads it, where the splitter's own
+/// failures (and `--validate`) still stop the whole stream, as they always did
+/// under `--slurp`.
+///
+/// `raw_inputs` is consumed so each file's buffer is freed as soon as it has
+/// been copied. Failures surface in file order, each file validated and split
+/// before the next is looked at, as `get_inputs` has always done.
+fn slurp_documents(
+    raw_inputs: Vec<Vec<u8>>,
+    files: &[PathBuf],
+    validate: bool,
+) -> core::result::Result<SlurpedInput, SlurpFailure> {
+    let last = raw_inputs.len().saturating_sub(1);
+    let mut combined = Vec::with_capacity(raw_inputs.iter().map(Vec::len).sum::<usize>() + 2);
+    let mut eof_line = 0;
+    combined.push(b'[');
+    let mut wrote_value = false;
+    for (idx, raw) in raw_inputs.into_iter().enumerate() {
+        if validate {
+            let filename = files.get(idx).map(|p| p.to_string_lossy().to_string());
+            validate_json_input(&raw, filename.as_deref()).map_err(SlurpFailure::Validation)?;
+        }
+        let (spans, split_error) = split_json_values(&raw);
+        if split_error.is_some() {
+            return Err(SlurpFailure::Unsplittable);
+        }
+        for (start, end) in spans {
+            if wrote_value {
+                combined.push(b',');
+            }
+            combined.extend_from_slice(&raw[start..end]);
+            wrote_value = true;
+        }
+        if idx == last {
+            eof_line = line_at(&raw, raw.len());
+        }
+    }
+    combined.push(b']');
+    Ok(SlurpedInput {
+        combined,
+        last_source: last,
+        eof_line,
+    })
 }
 
 /// Find the end of an object or array starting at `pos`.
@@ -10612,6 +10743,37 @@ mod tests {
         let (spans, error) = split_json_values(b" 1 2 ");
         assert_eq!(spans, vec![(1, 2), (3, 4)]);
         assert_eq!(error, None);
+    }
+
+    /// #2847: the joined buffer `--slurp` indexes. Top-level values need no
+    /// separator in the source (`{}{}`), so the commas are the join's own, and
+    /// a file with no value in it contributes none.
+    #[test]
+    fn slurp_documents_joins_every_value_in_file_order_2847() {
+        let join = |files: &[&str]| {
+            let raw = files.iter().map(|f| f.as_bytes().to_vec()).collect();
+            match slurp_documents(raw, &[], false) {
+                Ok(s) => Ok((
+                    String::from_utf8(s.combined).unwrap(),
+                    s.last_source,
+                    s.eof_line,
+                )),
+                Err(SlurpFailure::Unsplittable) => Err("unsplittable"),
+                Err(SlurpFailure::Validation(_)) => Err("validation"),
+            }
+        };
+        assert_eq!(join(&[""]), Ok(("[]".into(), 0, 0)));
+        assert_eq!(join(&["1\n", "2\n"]), Ok(("[1,2]".into(), 1, 1)));
+        assert_eq!(
+            join(&["{}{} 1\n", "", "[2]\n\n", ""]),
+            Ok(("[{},{},1,[2]]".into(), 3, 0))
+        );
+        // The location is the last file's own newline count, not the total.
+        assert_eq!(join(&["1\n\n\n", "2\n3"]), Ok(("[1,2,3]".into(), 1, 1)));
+        // One file the splitter cannot delimit fails the whole stream, even
+        // after clean ones.
+        assert_eq!(join(&["1", "[1,"]), Err("unsplittable"));
+        assert_eq!(join(&["1 }"]), Err("unsplittable"));
     }
 
     #[test]

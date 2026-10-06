@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci: the shared coverage action now uses `action-works/patchcov-action@v1`** (#3880). It replaces `action-works/omni-dev-coverage-check@v2` in `.github/actions/coverage/action.yml`
   (the one definition behind both `ci.yml` and `coverage-baseline.yml`). `v1` resolves to the same commit and an identical `action.yml` as the old `v2`, so every input, the `version: 0.1.1`
   patchcov pin and the baseline lookup are unchanged; only the repository an `omni-dev`-named workflow depended on is gone.
+- **jq: `-s`/`--slurp` indexes the input instead of materializing it, so a filter validates only what it reads and peak memory drops to the default route's** (#2847).
+  `-s` built a full `Vec<OwnedValue>` before the filter ran: `-sc '1+1'` on `{123:1} 2` exited 5 where the default route answers `2`, and `-sc '1+1'` on a 5.7 MB document peaked at 140 MB.
+  It now joins each file's top-level values (found by the scanner the default route uses) into one `[v1,v2,...]` buffer and runs the lazy route over it: **21 MB** for the same query
+  (341 → 40 MB and 459 → 28 ms on a 14 MB document; 5-16x less wall time across 1-14 MB). Only plain `-s` on JSON input moved; `-R -s`, `--seq -s`, DSV `-s`, `-n -s` and `input`/`inputs`
+  filters are unchanged. Unchanged too: output bytes, number spellings, the `(at <file>:<line>)` marker, `input_filename`, `-e`, `--validate`, files in command-line order, and the
+  splitter's own failures (`1 2 }`, `[1,2`), which still exit 5 with no output. What differs: a malformed *member* is reported only if the filter reads it (the #2103 rule, as `-S`/`-a`/`-C`
+  got in #2662); a value jq rejects as undecodable (`"\ud800"`) is echoed raw as on the default route; a document nested past jq's parse limit of 256 is accepted by any filter that does not
+  print it whole, and printing one is bounded by the printer's 384 levels (the slurp array counts as one) with the default route's own `nesting depth exceeds limit of 384` at exit 1,
+  where `-s` used to answer exit 5 (a document at jq's own limit of 256 now prints, where the old route's extra array level rejected it); and `--preserve-input -s` echoes source spelling,
+  and keeps duplicate keys, as that flag does elsewhere (#2986's `-s` half).
+  Differential sweep against the previous build (3,602 documents x 24 filters, 86,448 rows): no panic, no timeout, no row that succeeded before and fails now. Pinned by
+  `test_slurp_output_matches_jq_on_the_lazy_route_2847` and seven sibling `_2847` tests.
 - **jq: `indices` of a string no longer panics on a needle that starts with a multi-byte character** (#3903).
   `"éé" | indices("é")` (and `"日本日本" | indices("日")`, `"😀a😀" | indices("😀")`) panicked with `byte index 1 is not a char boundary`: the scan resumed one *byte* after each match and sliced the haystack
   there. It now resumes after the match's first character, which finds the same overlapping matches as jq 1.7.1's byte-wise scan (`"ééé" | indices("éé")` is `[0,2]`) and reports the same byte offsets.
