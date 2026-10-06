@@ -105,6 +105,9 @@ pattern must be loud, never caught: the trap is the silent drop of a write jq
 makes. Mixed with sources that build or derive a value (a construction, `walk`,
 `with_entries`, `del(.zz)`, a no-op `del(.[5])`) or that navigate, which must keep
 their exact, catchable refusal. Off by default (`--ambiguous-source-p`).
+#3795 widens it with a navigation mixed with `.` under `//`/`first`/`limit`/`if`
+(whose output can be a node the register later moves onto), a `catch` handler
+whose body raises the register (`try error(.) catch .`), and a forwarding `def`.
 
 Usage:
     cargo build --release --features cli
@@ -687,6 +690,14 @@ AMBIGUOUS_SOURCES = [
     # hand back the input's own storage in succinctly where jq builds a fresh array.
     ("with_entries(.)", False), ("walk(.)", False), ("del(.zz)", False), ("del(.[5])", False),
     ("to_entries", False), ("(. + {})", False), ("(.d |= .)", False), ("([.] | .[0])", False),
+    # #3795: a navigation mixed with `.` (the output may be a node the register later
+    # moves onto), a `catch` handler whose body raises the register, a forwarding def.
+    ("(.a // .)", False), ("first(.a, .)", False), ("limit(1; .a, .)", False),
+    ("(.c // .)", False), ("(select(.d) // .a // .)", False), ("(if .d then .a else . end)", False),
+    ("(try error(.) catch .)", False), ("(try select(error(.)) catch .)", False),
+    ("(try (if error(.) then . else . end) catch .)", False), ("(try error($p) catch .)", True),
+    ("(try error({\"b\":1}) catch .)", False), ("(def f: .; f)", False),
+    ("(def f: (., 1); f)", False), ("(def f: .a; def g: f; g)", False),
 ]
 
 def ambiguous_source_program(rng):
