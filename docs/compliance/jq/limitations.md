@@ -10513,7 +10513,7 @@ The resolver drains the generator before it delivers the answers, so a retried
 alternative's side effects (`stderr`, `debug`) run before the first answer reaches the
 consumer: `path(.x | any(.; ...)) | ("H"|halt_error(3))` halts at the first answer in
 jq without running the retry, and here after it. The halt itself, its exit code and
-the output are the same (`test_any_all_path_answer_halt_is_not_retried_3827`); tracked in #3859).
+the output are the same (`test_any_all_path_answer_halt_is_not_retried_3827`); the ordering is tracked in #3859.
 
 The identity element `any`/`all` answer once `gen` is exhausted after a swallowed answer
 is compared with the register where the call entered, since backtracking through every fork
@@ -10525,7 +10525,7 @@ One shape in this family still diverges, and it is a *valid* answer rather than 
 one: a by-value `true`/`false` that follows a `?//` bind whose first alternative failed to
 destructure is a valid path in jq when it is identical to the register, and the resolver
 refuses it, with no `any`/`all` involved (`path(.x | (. as [$q] ?// $z | true))` on
-`{"x":true}` is `["x"]` in jq). The pipe stage's register rule does not admit a destructuring
+`{"x":true}` is `["x"]` in jq, and so is `any(.; (. as [$q] ?// $q | true))` there). The pipe stage's register rule does not admit a destructuring
 bind; tracked in #3859. An answer that is a valid path is printed before the raise of the
 retry that follows it, as jq does (`test_any_all_path_answer_precedes_retry_raise_3827`).
 

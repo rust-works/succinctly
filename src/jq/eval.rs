@@ -41220,8 +41220,10 @@ fn deliver_any_all_answers<'a, S: EvalSemantics>(
     if identity_follows {
         branches.push(untracked_at_register(
             Cow::Owned(OwnedValue::Bool(!target_truthy)),
-            // Every fork of `gen` is backtracked by now, so jq's register is back where
-            // this entered (the same rule an empty generator follows).
+            // `gen` ran to its end, so every one of its forks was backtracked and jq's
+            // register is back where this entered, exactly as for a generator that
+            // emitted nothing. `emitted` is that restoration, not whether `gen` produced
+            // outputs: passing `true` would re-break #3858.
             drained_register_after::<S>(trackable, value, false),
         ));
     }
@@ -41283,7 +41285,9 @@ fn drained_register<'a, S: EvalSemantics>(
 /// generator that emitted nothing backtracked every branch it explored, so
 /// jq's register is where the arm entered, and it is stated as unmoved
 /// (#3456, #3749). An emitting generator may have moved it, so that stays a
-/// loss.
+/// loss -- unless it ran to its end after a swallowed answer, which backtracks
+/// every fork it explored just as an empty one does, so that caller states
+/// `emitted = false` for the same reason (#3858).
 ///
 /// Both conditions are load-bearing. Jq mode only, like every admission here
 /// (ADR-0018). And only on a trackable entry, where `value` *is* the register:

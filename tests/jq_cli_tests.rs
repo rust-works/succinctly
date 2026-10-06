@@ -105352,6 +105352,27 @@ const RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_0: &[RetryRow3293] = &[
         "",
         0,
     ),
+    (
+        r#"path(.x | any((.,.); (1 as $x ?// $y | ("A"|stderr) as $m | if $x then true else empty end)))"#,
+        "[\"x\"]\n[\"x\"]\n",
+        "AAAA",
+        "Invalid path expression with result false",
+        5,
+    ),
+    (
+        r#"path(.x | true | any(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then true else empty end)))"#,
+        "[\"x\"]\n",
+        "AA",
+        "Invalid path expression with result false",
+        5,
+    ),
+    (
+        r#"path(.x | (true | all(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then false else empty end))))"#,
+        "[\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
 ];
 
 /// #3858 rows over `{"x":false}`
@@ -105376,6 +105397,27 @@ const RETRY_ROWS_ANY_ALL_PATH_IDENTITY_3858_1: &[RetryRow3293] = &[
         "AA",
         "",
         0,
+    ),
+    (
+        r#"path(.x | false | any(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then true else empty end)))"#,
+        "[\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(.x | 5 | (any(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then true else empty end))))"#,
+        "[\"x\"]\n",
+        "AA",
+        "",
+        0,
+    ),
+    (
+        r#"path(false | (any(.; (1 as $x ?// $y | ("A"|stderr) as $m | if $x then true else empty end)) and 1))"#,
+        "",
+        "AA",
+        "Invalid path expression with result false",
+        5,
     ),
 ];
 
