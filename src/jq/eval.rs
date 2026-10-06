@@ -39408,7 +39408,15 @@ fn resolve_alternative_sink<'a, S: EvalSemantics>(
 ) -> ResolveFlow {
     if let Expr::Literal(lit) = unwrap_paren(left) {
         if !literal_to_owned(lit).is_truthy() {
-            return resolve_node_sink::<S>(right, value, trackable, snapshot, frame, keep, sink);
+            return resolve_node_sink::<S>(
+                right,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                &mut |branch| sink(carry_frame_register(right, branch, frame)),
+            );
         }
     }
     let mut emitted = false;
@@ -39428,11 +39436,48 @@ fn resolve_alternative_sink<'a, S: EvalSemantics>(
         },
     );
     match flow {
-        ResolveFlow::Exhausted if !emitted => {
-            resolve_node_sink::<S>(right, value, trackable, snapshot, frame, keep, sink)
-        }
+        // #3788: the alternate runs after jq backtracked out of everything `left`
+        // navigated, so what the register is depends on `right` alone.
+        ResolveFlow::Exhausted if !emitted => resolve_node_sink::<S>(
+            right,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            &mut |branch| sink(carry_frame_register(right, branch, frame)),
+        ),
         other => other,
     }
+}
+
+/// State the register `frame` carries on a by-value branch that `operand`
+/// produced, when `operand` provably cannot have moved it (#3788).
+///
+/// A leaf computing by value says nothing about jq's register on an untracked
+/// entry, which the enclosing stage carries ([`leaf_register`]); a pipe stage
+/// fills it in from [`cannot_move_register`] of *its* expression
+/// ([`register_after`]). A compound node (`//`, `,`, `if`) forwards what the
+/// branch says, so its stage asks the question of the whole node, and one
+/// operand that navigates makes every operand's branch unknown. For an
+/// operand jq runs only after backtracking out of the others, the operand's
+/// own answer is the right one -- this is that answer, stated on the branch.
+/// A tracked branch already states its own, and a branch that already says
+/// anything keeps it.
+///
+/// The checks run cheapest first: `frame` has a register only in a jq-mode
+/// fold, so `operand` is walked only for a branch that could use the answer.
+fn carry_frame_register<'a>(
+    operand: &Expr,
+    mut branch: PathBranch<'a>,
+    frame: &Frame,
+) -> PathBranch<'a> {
+    if !branch.trackable && matches!(branch.register, BranchRegister::None) {
+        if let Some(register) = frame.register().filter(|_| cannot_move_register(operand)) {
+            branch.register = BranchRegister::Unmoved(Cow::Owned(register.clone()));
+        }
+    }
+    branch
 }
 
 /// Flatten path components into one `Expr`, using `Expr::Pipe` only when
@@ -44232,7 +44277,21 @@ impl FoldRegister {
             // $v0; (.zzz | $v0)))` answered `["a"]` instead of
             // raising, and `del()` through it corrupted a document jq
             // refuses to touch).
-            identical_eligible || b.snapshot.proves_position(),
+            //
+            // #3788: nor is a producer's own statement that jq's register
+            // is still on this very node. A `//` alternate runs after jq
+            // backtracked out of whatever its left operand navigated, so
+            // [`carry_frame_register`] states the register the alternate
+            // started from -- the question [`cannot_move_register`] answers
+            // for the *whole* body (a navigating left operand makes it
+            // `false`) is, for that branch, answered by its own operand.
+            // The empty path says the branch navigated nothing from the
+            // register's own node, and the value comparison says the
+            // register in hand is this fold's.
+            identical_eligible
+                || b.snapshot.proves_position()
+                || (b.path.depth() == 0
+                    && b.register.unmoved_value().is_some_and(|r| *r == self.value)),
         ) {
             PathBranch::new(Rc::clone(&self.path), b.value, true)
         } else {
@@ -125212,9 +125271,10 @@ mod tests {
     /// here regardless of the walk's own verdict.
     ///
     /// Reached via `FoldRegister::advance`'s third arm: the *outer*
-    /// `foreach`'s UPDATE (`def f: null; f`, a call -- `cannot_move_register`
-    /// is unconditionally `false` for a call, unlike a literal) produces an
-    /// untrackable branch, so the fold's own register frame becomes
+    /// `foreach`'s UPDATE (`def f: null; f | f`, a pipe of calls --
+    /// `cannot_move_register` is unconditionally `false` for a call, unlike a
+    /// literal) produces an untrackable branch, so the fold's own register
+    /// frame becomes
     /// `self.frame.unknown()` for the rest of that step. The *inner*
     /// `foreach`'s own destructuring pattern (`{a:$x}`, admitted by
     /// #2676's widened `may_bind_navigated` gate) then walks under that
@@ -125233,7 +125293,7 @@ mod tests {
         assert_eq!(
             outputs(
                 b"null",
-                "path(foreach (1) as $y (.; (def f: null; f); \
+                "path(foreach (1) as $y (.; (def f: null; f | f); \
                  foreach (null) as {a:$x} (.; .; $x)))"
             ),
             [r#"["a"]"#]
