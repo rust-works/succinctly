@@ -64721,6 +64721,8 @@ fn test_array_claim_over_composite_and_or_operands_carries_the_register_3456() -
 /// whose operands never navigate off the register (`[first and true]`) backtracks
 /// to the root. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
 #[test]
+// The `{k:1}` rows are jq filter literals, not formatting strings.
+#[allow(clippy::literal_string_with_formatting_args)]
 fn test_collect_and_or_over_register_moving_builtins_3724() -> Result<()> {
     assert_path_rows_both_routes_3749(&[
         (
@@ -64805,6 +64807,23 @@ fn test_collect_and_or_over_register_moving_builtins_3724() -> Result<()> {
             "[9,2]\n",
             "",
             0,
+        ),
+        // An operand outside both allowlists keeps the collect refusing, on either
+        // side: a nested `[map(f)]` whose `f` navigates a computed value raises in
+        // jq, and the resolver evaluates it by value.
+        (
+            r"[true]",
+            r"path(. as $x | [[map({k:1} | .k)] and true] | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | [true and [map({k:1} | .k)]] | $x)",
+            "",
+            "Invalid path expression",
+            5,
         ),
         // The collect's own output is computed, so navigating it still raises.
         (

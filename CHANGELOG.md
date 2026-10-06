@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: an `and`/`or`/unary minus inside an `[E]` collect is judged as jq judges it when an operand is a bare `first`/`last`/`add` or a `map(f)`** (#3724, item 2).
+  `path(. as $x | [first and .[0]] | $x)` raises near element 0 on `[true]` (`first` moved jq's register, so the right operand navigates off it) and is `[]`
+  on `[false,1]` (the left operand short-circuits); `[first and true]`, `[add and 1]`, `[map(.) and true]` and `[-first]` are `[]`. The claim was
+  `register_movement_tracked` alone, which a builtin the resolver does not follow fails; it is now that or `array_contents_are_checked`. jq mode only.
+  Against a clean `main`, a stage-only sweep of 300 `[L and R]`/`[L or R]`/`[-L]` operands (266,427 rows) showed 0 regressions and no `ACCEPT_WRONG`
+  (1,424 refuse-to-match flips). Pinned by `test_collect_and_or_over_register_moving_builtins_3724`. Closes the second item of #3724.
 - **jq: an `[E]` collect holds a `map`/`any`/`all` whose `f` navigates only the register's own node, so `path(. as $x | [map(.a)] | $x)` is `[]`** (#3724, item 1).
   jq runs `f` over the input's elements, which are tracked while the collect's input is the register, and the collect backtracks the register to where it
   began; the `[E]` allowlist admitted only an `f` that navigates nothing (#3283). It now also admits a chain of register navigations (`.a`, `.[i]`, `.[]`,
