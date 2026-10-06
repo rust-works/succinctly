@@ -51101,6 +51101,8 @@ fn test_yq_collect_map_navigating_f_keeps_no_path_register_3724() -> Result<()> 
 /// path-checks `f`, so `succinctly yq` keeps evaluating it by value: the discarded
 /// `map({k:1} | .k)` stays a silent no-op, as it was before.
 #[test]
+// The `{k:1}` rows are jq filter literals, not formatting strings.
+#[allow(clippy::literal_string_with_formatting_args)]
 fn test_yq_map_f_in_path_position_stays_by_value_3865() -> Result<()> {
     let doc = r#"[{"a":1},{"a":2}]"#;
     let unchanged = "[\n  {\n    \"a\": 1\n  },\n  {\n    \"a\": 2\n  }\n]\n";
