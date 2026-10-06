@@ -2710,10 +2710,15 @@ is the revert that established what the other one costs.
    write ([#3862](https://github.com/rust-works/succinctly/issues/3862)). Marking the withheld register lost (#3267) would make it refuse loudly, but also
    turns rows that match jq today into refusals, where jq's own `try` catches a real error
    (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).
-   On a `null` document, `//` around a generator (`(foreach .a? as $k (0; try (($k \| .[]?) //
-   $k); .)) = 9`, `{"a":9}` in jq) now refuses loudly where it used to skip the write: the bare
-   `$k` alternate cannot relocate to the register once the body navigates anywhere
-   ([#3788](https://github.com/rust-works/succinctly/issues/3788)). Pinned by
+   A bare `$k` reached through a `//` alternate relocates to the register even when the left
+   operand navigates (`(foreach .a as $k (0; ($k \| .b) // $k; .)) = 9` is `{"a":9}` in jq and
+   here): the alternate runs after jq backtracked out of the left operand, so the question
+   `cannot_move_register` answers is asked of the alternate alone
+   ([#3788](https://github.com/rust-works/succinctly/issues/3788), pinned by
+   `test_foreach_update_bare_var_alternate_keeps_the_register_3788`). Still refused loudly where
+   jq answers: a bare `$k` in a comma body (`path(foreach .a as $k (0; $k, ($k \| .c); .))`,
+   the register is withheld from a body that fans out) and a by-value alternate followed by an
+   EXTRACT `$k` (`path(foreach .a as $k (0; ($k \| .b) // 5; $k))`). Pinned by
    `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`,
    `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`,
    `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770` and, for what stays,
