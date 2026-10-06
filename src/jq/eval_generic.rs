@@ -42979,31 +42979,89 @@ mod tests {
             "a: \"\\q\"\n",
         ];
         fn agree<S: EvalSemantics>(doc: &str, cursor: &crate::yaml::YamlCursor<'_, Vec<u64>>) {
-            let fast = to_owned_yaml_cursor::<S, _>(cursor);
-            let chain = to_owned_cursor::<S, _>(cursor);
-            match (fast, chain) {
-                (Ok(fast), Ok(chain)) => {
-                    assert_eq!(fast.to_json(), chain.to_json(), "value of {doc:?}");
-                    assert_eq!(
-                        format!("{fast:?}"),
-                        format!("{chain:?}"),
-                        "representation of {doc:?}"
-                    );
-                }
-                (Err(fast), Err(chain)) => assert_eq!(fast.message, chain.message, "{doc:?}"),
-                (fast, chain) => panic!("{doc:?}: fast {fast:?} vs chain {chain:?}"),
-            }
+            // The value (through `to_json` and through `Debug`, which keeps the
+            // number spelling `PartialEq` can blur) or the error message.
+            let observe = |r: Result<OwnedValue, EvalError>| {
+                r.map(|v| (v.to_json(), format!("{v:?}")))
+                    .map_err(|e| e.message)
+            };
+            assert_eq!(
+                observe(to_owned_yaml_cursor::<S, _>(cursor)),
+                observe(to_owned_cursor::<S, _>(cursor)),
+                "{doc:?}"
+            );
         }
         for doc in docs {
-            let index = YamlIndex::build(doc.as_bytes()).unwrap();
-            let root = index.root(doc.as_bytes());
-            let cursor = root
-                .first_child()
-                .expect("YAML document should have content");
-            agree::<YqSemantics>(doc, &cursor);
-            // `load()` runs this entry under whichever mode it was called in.
-            agree::<JqSemantics>(doc, &cursor);
+            // A JSON-sourced index canonicalizes numbers, which the override
+            // declines and leaves to the chain: it must agree there too.
+            for json_sourced in [false, true] {
+                let mut index = YamlIndex::build(doc.as_bytes()).unwrap();
+                if json_sourced {
+                    index.mark_json_sourced();
+                }
+                let root = index.root(doc.as_bytes());
+                let cursor = root
+                    .first_child()
+                    .expect("YAML document should have content");
+                agree::<YqSemantics>(doc, &cursor);
+                // `load()` runs this entry under whichever mode it was called in.
+                agree::<JqSemantics>(doc, &cursor);
+            }
         }
+    }
+
+    /// #2664: the trait-default `try_for_each_member` (which only a format
+    /// that overrides nothing runs -- JSON checks member delimiters, so the walk
+    /// never reaches for it there) visits the members `uncons` yields, in
+    /// order, stops at the first error the callback returns, and reports a
+    /// list that ended unpaired.
+    #[test]
+    fn default_try_for_each_member_visits_in_order_and_stops_on_error_2664() {
+        use crate::json::JsonIndex;
+
+        let json = br#"{"a": 1, "b": [2], "c": "x"}"#;
+        let index = JsonIndex::build(json);
+        let fields = index.root(json).value().as_object().expect("an object");
+        let mut seen = Vec::new();
+        fields
+            .try_for_each_member(|key, _value, cursor| {
+                seen.push((
+                    key.as_str().map(|k| k.to_string()),
+                    to_owned_cursor::<JqSemantics, _>(&cursor)
+                        .unwrap()
+                        .to_json(),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            seen,
+            [
+                (Some("a".to_string()), "1".to_string()),
+                (Some("b".to_string()), "[2]".to_string()),
+                (Some("c".to_string()), "\"x\"".to_string()),
+            ]
+        );
+
+        let mut visited = 0;
+        let stopped = fields.try_for_each_member(|_, _, _| {
+            visited += 1;
+            Err(EvalError::new("stop"))
+        });
+        assert_eq!(stopped.unwrap_err().message, "stop");
+        assert_eq!(visited, 1, "the walk must stop at the first error");
+
+        // A trailing member with no value is the list ending unpaired.
+        let unpaired = br#"{"a": 1, invalid}"#;
+        let index = JsonIndex::build(unpaired);
+        let fields = index.root(unpaired).value().as_object().expect("an object");
+        let mut visited = 0;
+        let result = fields.try_for_each_member(|_, _, _| {
+            visited += 1;
+            Ok(())
+        });
+        assert_eq!(visited, 1);
+        assert!(result.is_err(), "an unpaired tail must raise");
     }
 
     /// #2664: `DocumentCursor::REUSE_FIELD_VALUE` lets the walk hand a child

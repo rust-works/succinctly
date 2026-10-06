@@ -67155,8 +67155,8 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // so this is defensive; `root` itself is this single
                             // document's cursor either way.
                             _ => {
-                                let loaded =
-                                    super::eval_generic::to_owned_yaml_cursor::<S, _>(&root);
+                                let loaded = // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::root always wraps the documents in a virtual root sequence, so the arm above takes every input (#2664)"
+                                    super::eval_generic::to_owned_yaml_cursor::<S, _>(&root); // omni-dev: coverage tolerate-line reason="unreachable: the same defensive arm as the line above (#2664)"
                                 match loaded {
                                     Ok(v) => QueryResult::Owned(v),
                                     // Same #1620 routing as the sequence arm
@@ -111035,17 +111035,16 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
-                        QueryResult::Owned(OwnedValue::Object(obj)) => {
-                            assert_eq!(obj.len(), 1, "{doc:?}");
-                            assert_eq!(
-                                obj.get(""),
-                                Some(&OwnedValue::String("value".to_string().into())),
-                                "{doc:?}"
-                            );
-                        }
-                        other => panic!("{doc:?}: unexpected result: {other:?}"),
-                    }
+                    let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
+                    let expected = OwnedValue::String("value".to_string().into());
+                    assert!(
+                        matches!(
+                            &result,
+                            QueryResult::Owned(OwnedValue::Object(obj))
+                                if obj.len() == 1 && obj.get("") == Some(&expected)
+                        ),
+                        "{doc:?}: unexpected result: {result:?}"
+                    );
                 });
             }
         }
@@ -111067,13 +111066,15 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
-                    match eval_full::<Vec<u64>, JqSemantics>(&expr, cursor) {
-                        QueryResult::Error(e) => {
-                            assert!(e.is_decode_failure(), "{doc:?}: {e}");
-                            assert!(e.to_string().contains("is ambiguous"), "{doc:?}: {e}");
-                        }
-                        other => panic!("{doc:?}: expected the collision error, got {other:?}"),
-                    }
+                    let result = eval_full::<Vec<u64>, JqSemantics>(&expr, cursor);
+                    assert!(
+                        matches!(
+                            &result,
+                            QueryResult::Error(e)
+                                if e.is_decode_failure() && e.to_string().contains("is ambiguous")
+                        ),
+                        "{doc:?}: expected the collision error, got {result:?}"
+                    );
                 });
             }
         }
