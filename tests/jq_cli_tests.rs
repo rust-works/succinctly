@@ -68152,6 +68152,16 @@ fn test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3
             "",
             0,
         ),
+        // A comma above the pipe, where the register is still withheld: jq's `try`
+        // stops at `.z` of a number, so neither writes. Must stay a match (a
+        // withheld register marked lost made this refuse, #3770's review).
+        (
+            r#"{"a":{"a":[1],"b":2,"c":3}}"#,
+            r"(foreach .a as $w (0; try (($w | .c | .z), $w.b); .)) = 9",
+            "{\"a\":{\"a\":[1],\"b\":2,\"c\":3}}\n",
+            "",
+            0,
+        ),
         // The EXTRACT is the register itself, which a frozen `$w` is not identical to.
         (
             doc,
@@ -68164,13 +68174,13 @@ fn test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3
 }
 
 /// #3770, characterization of what remains of a pre-existing bug. A `foreach`
-/// UPDATE whose body has a comma *above* any pipe still answers differently
-/// from jq: that is the split `fans_out` really guards (#3145: `(foreach .a as
-/// {a:$v} ?// {c:$v} (0; ($v[0]?, $v))) = 9` wrote `.a.c`), so the fold
-/// withholds the register. It now marks the register lost, so the refusal is
-/// loud (exit 5) instead of being caught by the body's `try` into a silently
-/// skipped write. A refusal of a value that cannot be the register stays
-/// catchable (`try (.zz, $w)`, which matches jq). On `null`, `//` around a
+/// UPDATE whose body has a comma *above* every pipe still answers nothing where
+/// jq answers a path, so a write through it is silently skipped: that is the
+/// split `fans_out` really guards (#3145: `(foreach .a as {a:$v} ?// {c:$v}
+/// (0; ($v[0]?, $v))) = 9` wrote `.a.c`), so the fold withholds the register.
+/// Marking it lost instead would make these loud, but it also makes loud a
+/// refusal that precedes an error jq's own `try` catches (the last row of
+/// `..._comma_inside_a_pipe_keeps_the_register_3770`). On `null`, `//` around a
 /// generator refuses loudly where jq answers: a bare `$k` alternate cannot
 /// relocate to the register once the body navigates anywhere (#3788), and an
 /// `and` body leaves the EXTRACT's `$k` with no register. jq 1.7.1's answers
@@ -68179,38 +68189,29 @@ fn test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3
 fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770(
 ) -> Result<()> {
     let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#;
-    let refused =
-        r#"Invalid path expression near attempt to access element "a" of {"a":[{"b":1}]}"#;
+    let unchanged = "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}]}}\n";
     assert_path_rows_3289(&[
         // jq: ["x","a",0] and ["x"]
         (
             doc,
             r"path(foreach .x as $w (0; try (($w | .a[]), $w); .))",
             "",
-            refused,
-            5,
+            "",
+            0,
         ),
         // jq: {"a":[{"b":1}],"x":9}
         (
             doc,
             r"(foreach .x as $w (0; try (($w | .a[]), $w); .)) = 9",
+            unchanged,
             "",
-            refused,
-            5,
+            0,
         ),
         // jq: {"a":[{"b":1}],"x":{}}
         (
             doc,
             r"del(foreach .x as $w (0; try (($w | .a), ($w | .b)); .))",
-            "",
-            refused,
-            5,
-        ),
-        // Matches jq: `.zz` of the accumulator `0` is not a guess about the register.
-        (
-            doc,
-            r"path(foreach .x as $w (0; try (.zz, $w); .))",
-            "",
+            unchanged,
             "",
             0,
         ),

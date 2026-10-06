@@ -43673,25 +43673,23 @@ impl FoldRegister {
                 &mut deliver,
             )
         } else {
-            // #3770: a body the register is withheld from has lost it. jq may
-            // still hold it there, so a refusal of a value that could be it is
-            // this resolver's guess, and the body's own `try` must not swallow
-            // it into a skipped write (#3267's `guess_refusal`): `(foreach .x as
-            // $w (0; try (($w | .a[]), $w); .)) = 9` echoed the document where
-            // jq writes `.x`, and now refuses loudly.
-            let carries = S::TAG == EvalTag::Jq && self.trackable && !tr;
-            let withheld = carries && fans_out(expr);
-            let update_frame =
-                update_frame.with_register((carries && !withheld).then_some(&self.value));
-            let lost_frame;
-            let update_frame = if withheld {
-                lost_frame = update_frame
-                    .with_register_loss(RegisterLoss::LostAt(Rc::new(self.value.clone())));
-                &*lost_frame
-            } else {
-                &update_frame
-            };
-            resolve_node_sink::<S>(expr, &input, tr, snapshot, update_frame, keep, &mut deliver)
+            // #3770 tried marking a withheld register lost (#3267) so the
+            // body's `try` could not swallow the refusal into a skipped write.
+            // That also made loud a refusal that precedes an error jq's own
+            // `try` catches -- `(foreach .a as $w (0; try (($w | .c | .z),
+            // $w.b); .)) = 9` matched jq by writing nothing -- so a withheld
+            // register still resolves register-less here.
+            let carries = S::TAG == EvalTag::Jq && self.trackable && !tr && !fans_out(expr);
+            let update_frame = update_frame.with_register(carries.then_some(&self.value));
+            resolve_node_sink::<S>(
+                expr,
+                &input,
+                tr,
+                snapshot,
+                &update_frame,
+                keep,
+                &mut deliver,
+            )
         }
     }
 

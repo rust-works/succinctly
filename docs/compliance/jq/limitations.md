@@ -2634,8 +2634,10 @@ is the revert that established what the other one costs.
    .a, .b?); .))` is `["x","a"]`, `["x","b"]`, as in jq). It still counts a comma, a
    destructuring bind, a fold and a call *above* every pipe, the split #3145 guards, and such a
    body still differs from jq: `(foreach .x as $w (0; try (($w \| .a[]), $w); .)) = 9` is
-   `{"a":[{"b":1}],"x":9}` in jq. The fold marks the withheld register lost (#3267), so that
-   refuses loudly (exit 5) rather than silently skipping the write.
+   `{"a":[{"b":1}],"x":9}` in jq and leaves the document unchanged here, a silently skipped
+   write. Marking the withheld register lost (#3267) would make it refuse loudly, but also
+   turns rows that match jq today into refusals, where jq's own `try` catches a real error
+   (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).
    On a `null` document, `//` around a generator (`(foreach .a? as $k (0; try (($k \| .[]?) //
    $k); .)) = 9`, `{"a":9}` in jq) now refuses loudly where it used to skip the write: the bare
    `$k` alternate cannot relocate to the register once the body navigates anywhere
