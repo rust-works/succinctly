@@ -597,6 +597,27 @@ in SIMD when the context check is simple and cheap at scalar level.
 
 ---
 
+### JSON String Specials as a 64-Byte Block Mask (-3% to -31% on string-heavy rows, #3340)
+
+A SIMD skip *inside* each string lost on short keys and escape-dense text because its entry (load,
+compare, movemask, GPR transfer) is paid once per string and again after every escape (#3168). Moving
+the SIMD work from "per query" to "per block" removes the entry: `SpecialMask`
+(`util/simd/specials.rs`) classifies 64 bytes into a `u64` once, and each query inside the block is a
+shift and a `trailing_zeros`.
+
+- **NEON:** four 16-byte compares, each ANDed with `[1,2,4,...,128]` weights, then three `vpaddq_u8`
+  rounds fold them to one `u64`: one vector-to-GPR transfer per 64 bytes instead of one per 16 (the
+  `shrn` nibble mask is the right tool for a *single* chunk; a 64-bit bitmap wants the reduction).
+- **x86_64:** four SSE2 `movemask`s shifted into one word. SSE2 is the baseline, so there is no runtime
+  dispatch to pay for and the kernel inlines; AVX2 was not measured because the table below already
+  clears the bar.
+- **Lazy beats eager.** The caller's text runs to the end of the document and a numbers-only document
+  has no strings, so a whole-span pass is charged to inputs it cannot help. Classify when a query
+  first needs a block, starting at the query, not at an aligned address.
+- Measured on the M4 Pro and the 7950X against a never-calling holdout; see
+  [parsing/json.md](../parsing/json.md) for the table, and its one residual (a flat object of 2-8-byte
+  keys read +1% to +2% on the M4 Pro at 5% fewer instructions).
+
 ## Failed SIMD Optimizations
 
 ### AVX-512 JSON Parser (-10% penalty)

@@ -3211,7 +3211,7 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   Since #3167 that is asked in one pass: the rule's own prefix parser,
 ///   [`jq_canonical_number_prefix`], plus a check that the run ends where
 ///   the prefix does (see `scan_canonical_number`).
-/// - Strings: scanned byte-by-byte between the quotes against exactly
+/// - Strings: scanned between the quotes (one specials mask, #3340) against exactly
 ///   [`write_json_body_jq`]'s escape table (see `scan_json_string_span`'s
 ///   own doc comment) -- **not** [`write_json_body_jq_ascii`]'s. That
 ///   distinction is what keeps `-a`/`--ascii-output` out of this fast path
@@ -3441,7 +3441,7 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 ///   is literal content.
 ///
 /// **UTF-8 validity is deliberately not decided here.** Every byte `>= 0x80`
-/// is advanced over one at a time, as literal content, and the single
+/// is skipped over as literal content (it is not a special, see below), and the single
 /// `core::str::from_utf8` `stream_json`'s echo branch already runs over the
 /// whole accepted span is what actually rules on it -- a `from_utf8`
 /// failure there falls through to the re-render, which produces the real
@@ -3460,10 +3460,24 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 /// work from a scalar per-byte decode to one vectorised pass is a ~25x
 /// reduction on that term, not a duplicated cost.
 ///
+/// **The walk itself is over a specials mask, not bytes (#3340).** A byte is
+/// *plain* unless it is one of the four the arms above decide on (`"`, `\`,
+/// control `< 0x20`, DEL), so the scan asks [`SpecialMask`] for the next one
+/// and never visits the bytes between. The mask classifies a 64-byte block
+/// once, when a string first reaches it, and every string inside the block is
+/// answered from the same word with a shift and a `trailing_zeros`: no vector
+/// call is paid per string or per escape, which is what made a SIMD skip
+/// inside each string lose on short keys and escape-dense text (#3168). It is
+/// lazy on purpose: `bytes` runs to the end of the document even when the
+/// value is a small sub-value, and a document of numbers has no strings, so a
+/// block is classified only when a string asks for it. The previous
+/// byte-at-a-time loop survives in this module's tests as the independent
+/// oracle the block walk is swept against.
+///
 /// Soundness is unchanged: none of `"`, `\`, or a control/DEL byte can ever
 /// appear as a byte of a UTF-8 sequence, valid or not (each is `< 0x80` or
 /// exactly `0x7F`, and every byte of a multi-byte sequence is `>= 0x80`), so
-/// skipping a sequence byte by byte can never walk past a closing quote, an
+/// skipping a sequence can never walk past a closing quote, an
 /// escape, or a byte the writer would have escaped. What the scan certifies
 /// is therefore exactly "canonical **given** the span is valid UTF-8", and
 /// the caller supplies the given.
