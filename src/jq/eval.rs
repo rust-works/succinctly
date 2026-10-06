@@ -39640,18 +39640,16 @@ enum BuiltinNavigation {
 ///   their element depends on an argument or on `length` (and `reverse`
 ///   does not raise at all on an empty input), so they need a value this
 ///   function is not given — #2744. `reverse` is the one of the three
-///   this function answers for, below; `nth`/`indices`/`index`/`rindex`
-///   remain absent even though their *element* is simple enough to
-///   compute (unlike the derived-container group above): a speculative
-///   evaluation of their argument, purely to name it, either duplicates
-///   real evaluation's own side effects when it turns out not to raise
-///   (an `input`/`debug` in the argument fires twice; code review on
+///   this function answers for, below. `nth` is the `.[n]` path step
+///   instead (#3550), and `indices`/`index`/`rindex` are answered where
+///   the pattern is observed, not here ([`PatternSearch`], #3347): a
+///   speculative evaluation of the pattern, purely to name it, either
+///   duplicates real evaluation's own side effects when it turns out not
+///   to raise (an `input`/`debug` in it fires twice; code review on
 ///   #2744's own PR caught this live) or mis-names a multi-output
-///   argument (jq forks and raises on the first value, not on a
-///   collected array of all of them) — a correct fix needs the
-///   resolver to observe the argument's value inline, as part of the
-///   builtin's own *real* evaluation, not a separate probe. Filed as a
-///   #2744 follow-up rather than attempted here.
+///   pattern (jq forks and raises on the first value, not on a collected
+///   array of all of them). [`eval_each_pattern_search`] evaluates the
+///   pattern once and runs the real search on each value of it.
 ///
 /// The return type widened for `Reverse` (#2744), from a plain `Option`
 /// into:

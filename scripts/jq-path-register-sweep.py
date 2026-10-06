@@ -577,6 +577,21 @@ OPERANDS = [
     "flatten(0)",
     "join(\",\")",
     "unique_by(.)",
+    # (#3347) `indices`/`index`/`rindex` are `.[$i]` / `.[[$i]]` on their input
+    # (and `index`/`rindex` then index the array `_strindices` built), so on an
+    # untracked value jq raises naming the *evaluated pattern*, which the leaf
+    # resolvers now observe once. The patterns cover each type the access names
+    # differently (a bool and a null against the array and string inputs, an
+    # array, a string), a fork (jq raises on the first value), and an empty one
+    # (nothing runs, so nothing raises).
+    "indices(true)",
+    "index(true)",
+    "rindex(null)",
+    "indices([true])",
+    "index(\"a\")",
+    "rindex(\"a\")",
+    "indices(true, null)",
+    "indices(empty)",
     # (#3360) `from_entries` is `map({...}) | add`: it always iterates the array
     # `map` built, so jq raises on every value it produces. The `walk` rows are
     # the zero-output case (`f` yields nothing, but an input that reaches an

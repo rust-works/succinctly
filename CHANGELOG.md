@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as refusals now answer as jq does (`(.a as $x | .a | 5 | first(..) | $x) = 9` on `null` writes `{"a":9}`). jq mode only; yq is unchanged. Still refused, each pinned loud by
   `test_recurse_seed_residuals_stay_loud_3580`: a literal ahead of the recursion (`(1, ..)`), `nth(0; ..)`, a recursion behind a bind or a `def` call, a `reduce` UPDATE of
   `recurse(f)`, a forking `foreach` UPDATE. Swept with `scripts/jq-path-register-sweep.py` against the merge-base build (a debug build, jq 1.7.1): the 67 new operands as bare stages (59,463 rows) went from 56,124 to 57,186 matches with `ACCEPT_WRONG` 34 to 34 and 0 regressions; a seeded 30,027-row sample of their full shapes (before the final rebase) had 0 regressions and `ACCEPT_WRONG` 8 to 8; seeded samples of the whole grid against the rebased `main` (40,027 rows without a `null` input, 25,027 with only one) had 0 regressions and `ACCEPT_WRONG` 8 to 8 and 12 to 12; `scripts/jq-bind-origin-fuzz.py` over six seeds (3,000 to 4,000 programs each, `--fold-p` 0, 0.3 and 0.7) found no fabricate, mismatch or new refuse-only row. Pinned by `test_recurse_seed_behind_call_or_fork_keeps_register_3580`.
+- **jq: `indices`, `index` and `rindex` on an untracked value in `path()`/`del()`/`=` raise jq's `Invalid path expression`, naming the access jq's own definition makes** (#3347).
+  `[path(([1,2,3] | indices(1)) | empty)]` answered `[]` and `del(([1] | rindex(1)) | empty)` echoed the document at exit 0, where jq exits 5 with
+  `near attempt to access element [1] of [1,2,3]`. The element depends on the *evaluated pattern* (`.[$i]` for an array pattern on an array, `.[[$i]]` for any other
+  pattern on an array, the pattern as it came on any other input, and for a string searched for a string no access at all, except that `index`/`rindex` then index the
+  array of positions `indices` built), which #2744's static table could not hold and its speculative probe got wrong twice: it ran a pattern's `input`/`debug` a second time
+  whenever it decided not to raise, and named a multi-output pattern as one collected array where jq raises on the first value. The leaf resolvers now evaluate the pattern
+  once and run the real search on each value of it, which is jq's own `PATTERN as $i | BODY` desugaring, so a pattern that is empty or raises never reaches the access.
+  Applies in `--jq-extensions` too (real yq has none of the three, ADR-0018). Against jq 1.7.1, 164 of 168 rows of the builtin x input x pattern matrix now match
+  (from 4): the other four are #3889, a by-value empty-string needle. Still diverging, filed: `INDEX(f)`/`transpose` (#3888), and a *tracked* input, where jq answers a path
+  through an array key (#3890). Pinned by `test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347` and four siblings.
+  `scripts/jq-path-register-sweep.py` over the eight new operands (106,587 rows) against a clean `main`: `ACCEPT_WRONG` 454 to 210 (the rest are a tracked `null`/object input, #3890),
+  244 `ACCEPT_WRONG` and 176 `REFUSE_WRONG` rows now match jq, 0 new `ACCEPT_WRONG` or `DIFF`. 168 rows lose a match, all `del(. as [$q] ?// $q | (X and (.a)?))` and its `or`
+  and `| .c` twins: the raise is the resolver's own refusal, which a `?//` does not retry, so `indices(true)` now refuses where jq's retry answers, exactly as its
+  `first`, `reverse` and `.[0:1]` twins already do on `main` (the `?//` retry gap #3865 recorded).
 - **jq: a `?//` chain over a freshly built source in a `reduce`/`foreach` source runs the alternative jq runs in `path()`/`del()`/`=`** (#3651).
   A pattern step in path position is a tracked index, and a fresh value is never the register's node, so jq's `[[1]] as [$x] ?// $y | $x` raises in
   alternative one and runs `$y`. The fold source was driven by value, where alternative one succeeded: `first(path(foreach ([[1]] as [$x] ?// $y | $x) as $w
