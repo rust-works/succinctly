@@ -1524,7 +1524,8 @@ is the revert that established what the other one costs.
    - after a `foreach` stage or a `reduce` that navigates, whose route hands back no register
      value, where the register was lost isn't known at all, so every `$var` or `null` refusal
      after one is loud (a `reduce` that cannot move the register states it since
-     [#3710](https://github.com/rust-works/succinctly/issues/3710), and no longer refuses).
+     [#3710](https://github.com/rust-works/succinctly/issues/3710), and one whose INIT cannot move it states it whatever the
+     source and `UPDATE` navigate since [#3732](https://github.com/rust-works/succinctly/issues/3732); neither refuses).
 
    A `def` call used to be a third, opaque-by-construction case here too (`del(. as $x \|
    (def f: .a; f) \| try ($x \| .k))` refused loudly where jq's own refusal is exact and
@@ -1767,13 +1768,18 @@ is the revert that established what the other one costs.
    `src/jq/eval.rs`). `try`-style groups stay out (`(.a)? as $y` is a syntax error in jq 1.7.1 anyway), and a
    `?` after a construction (`([$q] \| .[0]?) as $y`) still binds by value.
 
-   One consequence is recorded as [#3732](https://github.com/rust-works/succinctly/issues/3732): a `?` source now
+   One consequence was recorded as [#3732](https://github.com/rust-works/succinctly/issues/3732): a `?` source
    behaves like the plain spelling when a `try` or a `?` group catches a near-access refusal after the register was
-   lost (a construction, a `reduce`). `path(.a as $v \| {k: .a} \| ($v \| select(true)) \| try ($v \| .b?))` and
-   `... \| (($v \| .b)?)` both refuse where jq's own `try` answers, which the `?` spelling used to match only because it
-   bound by value. The exposure depends on the program's shape: four programs in about 93,000 fuzzed against the
-   pre-change binary, between one in 12,000 and one in 18,000 of those drawn from `?` sources alone, and none in a
-   21,600-case grid. Each has a plain twin that already refused on `main`.
+   lost, which `path(.a as $v \| {k: .a} \| ($v \| select(true)) \| try ($v \| .b?))` and `... \| (($v \| .b)?)` showed
+   against the base the issue was filed on. Both now answer like jq (a construction does not lose the register), and the
+   remaining shapes the fuzzer found were a `reduce` that loses it: jq runs a `reduce`'s source and `UPDATE` in a looped
+   branch that backtracks the register to where INIT left it, so `path(.a as $x \| reduce (1) as $i (.; .a) \| try ($x \|
+   .b))` is empty in jq and refused here. A `reduce` with bare-variable patterns and an INIT that cannot move the register
+   now states it unmoved whatever its source and `UPDATE` navigate, when they are ones the resolver checks as jq does
+   (`reduce_leaves_register_in_place`). Still refused where jq answers: a `reduce` whose INIT navigates
+   (`path(.a as $x \| reduce (1) as $i (.a; .b) \| $x)` is `["a"]` in jq, where the register stays on INIT's node), a
+   destructuring pattern, and a source or `UPDATE` outside that allowlist (a source that destructures a computed value is a
+   path error in jq the fold does not model, so accepting the stage there would answer where jq refuses).
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

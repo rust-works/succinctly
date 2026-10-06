@@ -543,6 +543,11 @@ Each turns a refusal into an answer and needs its own oracle rows:
   (`[first(numbers)]`; `[last(f)]` is Done by #3767 Part 2: `array_contents_are_checked` reads through
   `last(f)` to `f`), and a wrapper over an inner stage that navigates nothing (`first(.)`,
   `limit(1; .)`, `limit(1; 5)`), which jq leaves in place and the allowlist does not read through.
+- ~~A `reduce` whose source or `UPDATE` navigates.~~ Done by #3732 (`reduce_leaves_register_in_place`, read by
+  `resolve_reduce`'s emission and by `leaves_register_in_place`): jq's `reduce` is `INIT; FORK loop; SOURCE; UPDATE;
+  BACKTRACK`, so the register is where INIT left it, and an INIT that cannot move it leaves it at the entry whatever
+  the loop navigates. A navigating INIT, a destructuring pattern and `foreach` (which emits from inside the loop) stay
+  refused.
 - The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
   turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`
   into jq's `[]`. Cheap now, because the producers already say it.

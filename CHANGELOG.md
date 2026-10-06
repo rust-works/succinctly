@@ -18,6 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operands (60,027) and the whole grid (60,027) showed 0 regressions on the first and last (`ACCEPT_WRONG` 81 to 0 and 14 to 10) and one lost match on the #3724 operands:
   `del(. as [$q] ?// $q | ([map(getpath(["a"]))] and (.a)?) | .c)` now refuses where jq's catchable error retries the second alternative, the `?//` retry gap its
   `.a` twin already had on `main`. Pinned by `test_map_f_in_path_position_raises_where_jq_does_3865`.
+- **jq: a `reduce` whose INIT cannot move the path register leaves it where it entered, whatever its source and `UPDATE` navigate** (#3732).
+  jq runs a `reduce`'s source and every `UPDATE` in a looped branch that ends in a `BACKTRACK`, and INIT before the `FORK`, so only INIT's own
+  navigation survives the fold: `path(.a as $x | reduce (1) as $i (.; .a) | try ($x | .b))` is empty in jq (the `try` catches the near-access
+  error). The resolver read the fold as having lost the register, classified the later refusal of `$x` as its own guess, and made it uncatchable, so
+  it exited 5 here, and `del`/`=`/`|=` through the same shape refused. A bare-pattern `reduce` with a non-navigating INIT, and a source and `UPDATE`
+  the resolver checks as jq does (`register_movement_tracked`), now states the register unmoved (`reduce_leaves_register_in_place`, read by
+  `resolve_reduce` and by `leaves_register_in_place`). #3710 had admitted only a fold none of whose parts navigate. The issue's two construction
+  repros (`{k: .a}` then `($v | select(true))`, under `try` and `?`) already answered like jq on `main` and are pinned. Still refused where jq
+  answers: a navigating INIT (`path(.a as $x | reduce (1) as $i (.a; .b) | $x)` is `["a"]`), a destructuring pattern, and a source or `UPDATE` outside
+  the allowlist. Swept with `scripts/jq-path-register-sweep.py` over 17 `reduce` operands (226,467 rows, against `main`): 0 regressions, `ACCEPT_WRONG`
+  unchanged at 315, `REFUSE_WRONG` 3,834 to 2,754, 1,084 rows newly match jq; the first, wider cut of the rule had 52 `ACCEPT_WRONG` regressions on a
+  source that destructures a computed value, which is what narrowed it. `scripts/jq-bind-origin-fuzz.py` (30,000 fold-weighted and 20,000
+  `?`-source programs): 0 new divergences. Pinned by `test_reduce_with_navigating_source_or_update_leaves_the_register_3732`.
 - **jq: an `and`/`or`/unary minus inside an `[E]` collect is judged as jq judges it when an operand is a bare `first`/`last`/`add` or a `map(f)`** (#3724, item 2).
   `path(. as $x | [first and .[0]] | $x)` raises near element 0 on `[true]` (`first` moved jq's register, so the right operand navigates off it) and is `[]`
   on `[false,1]` (the left operand short-circuits); `[first and true]`, `[add and 1]`, `[map(.) and true]` and `[-first]` are `[]`. The claim was
