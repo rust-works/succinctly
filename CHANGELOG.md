@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grammar now takes a comma and a navigation of the register's node as leaves (only on a tracked input, and never a slice, whose refusal a
   `try` would swallow), so the resolver places `.a // .`, `first(.a, .)` and `(., 1) | .` exactly; such a fold source is driven by the
   resolver (outside another fold's body and without a pattern of its own); and `may_alias_register` counts a handler's `.` when the body
-  can raise an aliasing value, and looks through zero-arity defs. Those write as jq does. A forwarding `def` and a lost register still
+  can raise an aliasing value, and looks through zero-arity defs (installed or defined inside the source) under a total work budget. Those write as jq does. A forwarding `def` and a lost register still
   cannot be placed, so they refuse loudly (exit 5) instead. Some #3423 rows that refused loudly now answer as jq does, and
   `path((.a | select(.b)) as $y | .a | $y)`, `path((.a // 1) as $y | .a | $y)` and the `if` spelling move from refuse-only to answered.
   Residual: a `?//` whose source forwards `.` through control flow still drops the write (`docs/compliance/jq/limitations.md`). Pinned by

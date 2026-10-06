@@ -107901,6 +107901,11 @@ fn test_bind_sources_beyond_the_alias_grammar_keep_the_write_3795() -> Result<()
         ),
         (
             doc,
+            r"del(foreach (def f: .; f) as $x (.; .; try $x.a))",
+            "{}",
+        ),
+        (
+            doc,
             r"del(def f: (., 1); foreach f as $x (null; .; try $x.a))",
             "{}",
         ),
@@ -107944,6 +107949,11 @@ fn test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795() -> Result<()
     for filter in [
         r"del(def f: .; f as $x | try $x.a)",
         r"del(def f: .; def g: f; g as $x | try $x.a)",
+        // The def inside the source itself (review): still a call to a zero-arity
+        // def that forwards `.`.
+        r"del((def f: .; f) as $x | try $x.a)",
+        r"((def f: .; f) as $x | try $x.a) = 9",
+        r"del(first(def f: .; f) as $x | try $x.a)",
         r#"del(ltrimstr("x") | ((., 1) | .) as $x | try $x.a)"#,
         r#"del(ltrimstr("x") | (if .z then 1 else . end) as $x | try $x.a)"#,
         r#"del(ltrimstr("x") | foreach ((., 1) | .) as $x (null; .; try $x.a))"#,

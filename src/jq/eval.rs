@@ -44156,12 +44156,7 @@ fn drive_fold_source_with<S: EvalSemantics>(
         // [`each_fold_bind`]'s `Unproven` marker.
         || (fold_body::depth() == 0
             && fold_source_may_alias_register::<S>(source)
-            && !any_subexpr(source, &mut |e| {
-                matches!(
-                    e,
-                    Expr::AsPattern { .. } | Expr::Reduce { .. } | Expr::Foreach { .. }
-                )
-            }));
+            && !binds_a_pattern_or_folds(source));
     // #3790: a fold whose source is the register itself (`.`) emits it as jq's
     // register-derived element at the root: `.` does not move the register and `$k`
     // is bound to that very node, so the element carries the root path (rebased
@@ -46262,6 +46257,29 @@ fn each_fold_bind<S: EvalSemantics>(
     }
 }
 
+/// Whether `source` binds a destructuring pattern or runs a fold anywhere, a
+/// called def's body included -- each distinct def looked into once, so a chain of
+/// defs that call the next many times stays linear (#3795).
+fn binds_a_pattern_or_folds(source: &Expr) -> bool {
+    let mut seen: Vec<*const FuncDefData> = Vec::new();
+    crate::jq::walk::search_subexpr(source, &mut |e| match e {
+        Expr::AsPattern { .. } | Expr::Reduce { .. } | Expr::Foreach { .. } => {
+            crate::jq::walk::Visit::Found
+        }
+        Expr::DefCall { def, args, .. } => {
+            let at = Rc::as_ptr(def);
+            // A call with arguments is walked again: its arguments differ per site.
+            if seen.contains(&at) && args.is_empty() {
+                crate::jq::walk::Visit::Skip
+            } else {
+                seen.push(at);
+                crate::jq::walk::Visit::Descend
+            }
+        }
+        _ => crate::jq::walk::Visit::Descend,
+    })
+}
+
 /// Whether a fold's source can hand jq's register back by pointer through control
 /// flow ([`may_alias_register`]), for [`each_fold_bind`]'s `Unproven` marker
 /// (#3795). Jq mode only, as at the `as` bind site ([`source_may_alias_register`]).
@@ -46443,7 +46461,7 @@ impl NavKind {
 /// `if`, `//`, `try`/`?`, `first`/`last`/`limit`/`nth`, `label`, a rebind's body,
 /// `select` and the type filters (which hand their input back), and a pipe, whose
 /// last stage sees what the stages before it left, and a zero-arity user def, which
-/// forwards what its body does (#3795, looked through a few calls deep). Everything
+/// forwards what its body does (#3795, under a total work budget). Everything
 /// else -- a builtin, a call with arguments, a navigation, a construction, a fold --
 /// is taken to produce a different value, which is jq's own doctrine for a computed
 /// one ([`could_be_lost_register`]); such a call or fold that forwards its input
@@ -46455,63 +46473,122 @@ impl NavKind {
 /// twins (`Builtin::FirstStream`, `Builtin::LastStream`, `Expr::NthExpr`) never
 /// reach a bind source.
 fn may_alias_register(source: &Expr, register_frame: Option<&Frame>) -> bool {
-    /// How many zero-arity calls deep a forwarding def is looked through (#3795): a
-    /// recursive def stops here, as a residual.
-    const CALL_DEPTH: u32 = 8;
-    fn alias(expr: &Expr, identity: bool, frame: Option<&Frame>, calls: u32) -> bool {
-        let any = |e: &Expr, identity: bool| alias(e, identity, frame, calls);
-        match unwrap_bind_source(expr) {
-            // #3795: a zero-arity user def forwards whatever its body forwards (`def
-            // f: .; f as $x`). A call with arguments stays a residual.
-            Expr::DefCall { def, args, .. } if args.is_empty() && def.params.is_empty() => {
-                calls > 0 && alias(&def.body, identity, frame, calls - 1)
+    /// How many zero-arity def bodies the walk may look into, in total (#3795): a
+    /// work budget, not a depth cap, so a chain of defs that each call the next
+    /// many times stays linear. Past it a call counts as computing, the residual.
+    const CALL_BUDGET: u32 = 64;
+    /// A zero-arity `def` in lexical scope at the walk's position, for an
+    /// unresolved call inside the source that defines it (`(def f: .; f)`).
+    struct Scope<'a> {
+        name: &'a str,
+        body: &'a Expr,
+        parent: Option<&'a Self>,
+    }
+    struct Walk<'a> {
+        frame: Option<&'a Frame>,
+        budget: core::cell::Cell<u32>,
+    }
+    impl Walk<'_> {
+        /// One more def body looked into, if the budget allows it.
+        fn charge(&self) -> bool {
+            let left = self.budget.get();
+            self.budget.set(left.saturating_sub(1));
+            left > 0
+        }
+        fn alias(&self, expr: &Expr, identity: bool, scope: Option<&Scope<'_>>) -> bool {
+            let any = |e: &Expr, identity: bool| self.alias(e, identity, scope);
+            match unwrap_bind_source(expr) {
+                // #3795: a zero-arity user def forwards whatever its body forwards
+                // (`def f: .; f as $x`), installed (`DefCall`) or still a call to a
+                // `def` the source itself makes (`(def f: .; f) as $x`). A call with
+                // arguments stays a residual.
+                Expr::DefCall { def, args, .. } if args.is_empty() && def.params.is_empty() => {
+                    self.charge() && self.alias(&def.body, identity, None)
+                }
+                Expr::FuncDef {
+                    name,
+                    params,
+                    body,
+                    then,
+                    ..
+                } => {
+                    if params.is_empty() {
+                        let inner = Scope {
+                            name,
+                            body,
+                            parent: scope,
+                        };
+                        self.alias(then, identity, Some(&inner))
+                    } else {
+                        // A def with parameters shadows any outer one of the name
+                        // only at its own arity, so the outer scope still holds.
+                        any(then, identity)
+                    }
+                }
+                Expr::FuncCall { name, args, .. } if args.is_empty() => {
+                    let mut at = scope;
+                    while let Some(def) = at {
+                        if def.name == name {
+                            // The body sees its own scope: itself, and what was in
+                            // scope where it was defined.
+                            return self.charge() && self.alias(def.body, identity, Some(def));
+                        }
+                        at = def.parent;
+                    }
+                    false
+                }
+                Expr::Identity => identity,
+                // A marker bound at a position the register's own frame can compare
+                // and does not name is a different node, whatever it equals (`.a as
+                // $y | .c | try (first($y) as {b:$q} | $q)` on equal siblings: jq
+                // catches it).
+                Expr::TrackedVar(marker) => !matches!(
+                    &marker.origin,
+                    Origin::At { invocation, path }
+                        if self.frame.is_some_and(|f| f.at.is_some() && !f.names(*invocation, path))
+                ),
+                Expr::Var(_) => true,
+                Expr::Comma(exprs) => exprs.iter().any(|e| any(e, identity)),
+                Expr::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => any(then_branch, identity) || any(else_branch, identity),
+                Expr::Alternative(left, right) => any(left, identity) || any(right, identity),
+                // The handler's `.` is the error payload, which is the register by
+                // pointer when the body raises it (#3795: `try error(.) catch .`).
+                Expr::Try { expr, catch } => {
+                    any(expr, identity)
+                        || catch
+                            .as_deref()
+                            .is_some_and(|c| any(c, try_body_may_raise_alias(expr)))
+                }
+                Expr::Optional(inner)
+                | Expr::FirstExpr(inner)
+                | Expr::LastExpr(inner)
+                | Expr::Limit { expr: inner, .. }
+                | Expr::Label { body: inner, .. }
+                | Expr::As { body: inner, .. }
+                | Expr::AsPattern { body: inner, .. }
+                | Expr::Builtin(Builtin::NthStream(_, inner)) => any(inner, identity),
+                Expr::Builtin(builtin)
+                    if matches!(builtin, Builtin::Select(_)) || is_type_filter(builtin) =>
+                {
+                    identity
+                }
+                // Each stage's `.` is what the stages before it left.
+                Expr::Pipe(stages) => stages
+                    .iter()
+                    .fold(identity, |input_aliases, stage| any(stage, input_aliases)),
+                _ => false,
             }
-            Expr::Identity => identity,
-            // A marker bound at a position the register's own frame can compare and
-            // does not name is a different node, whatever it equals (`.a as $y | .c
-            // | try (first($y) as {b:$q} | $q)` on equal siblings: jq catches it).
-            Expr::TrackedVar(marker) => !matches!(
-                &marker.origin,
-                Origin::At { invocation, path }
-                    if frame.is_some_and(|f| f.at.is_some() && !f.names(*invocation, path))
-            ),
-            Expr::Var(_) => true,
-            Expr::Comma(exprs) => exprs.iter().any(|e| any(e, identity)),
-            Expr::If {
-                then_branch,
-                else_branch,
-                ..
-            } => any(then_branch, identity) || any(else_branch, identity),
-            Expr::Alternative(left, right) => any(left, identity) || any(right, identity),
-            // The handler's `.` is the error payload, which is the register by
-            // pointer when the body raises it (#3795: `try error(.) catch .`).
-            Expr::Try { expr, catch } => {
-                any(expr, identity)
-                    || catch
-                        .as_deref()
-                        .is_some_and(|c| any(c, try_body_may_raise_alias(expr)))
-            }
-            Expr::Optional(inner)
-            | Expr::FirstExpr(inner)
-            | Expr::LastExpr(inner)
-            | Expr::Limit { expr: inner, .. }
-            | Expr::Label { body: inner, .. }
-            | Expr::As { body: inner, .. }
-            | Expr::AsPattern { body: inner, .. }
-            | Expr::Builtin(Builtin::NthStream(_, inner)) => any(inner, identity),
-            Expr::Builtin(builtin)
-                if matches!(builtin, Builtin::Select(_)) || is_type_filter(builtin) =>
-            {
-                identity
-            }
-            // Each stage's `.` is what the stages before it left.
-            Expr::Pipe(stages) => stages
-                .iter()
-                .fold(identity, |input_aliases, stage| any(stage, input_aliases)),
-            _ => false,
         }
     }
-    alias(source, true, register_frame, CALL_DEPTH)
+    Walk {
+        frame: register_frame,
+        budget: core::cell::Cell::new(CALL_BUDGET),
+    }
+    .alias(source, true, None)
 }
 
 /// Whether [`resolve_as_source_sink`] and the destructuring walk must treat `source`
@@ -123637,6 +123714,41 @@ mod tests {
                 "{filter} unmarked"
             );
         }
+    }
+
+    /// #3795 review: `may_alias_register` looks through a zero-arity def the source
+    /// itself defines (`(def f: .; f)`), lexically scoped, and under a total work
+    /// budget: a recursive def and a chain of defs that each call the next twelve
+    /// times both terminate at once instead of walking 12^8 bodies.
+    #[test]
+    fn test_may_alias_register_looks_through_inline_defs_under_a_budget_3795() {
+        for (filter, expected) in [
+            ("def f: .; f", true),
+            ("def f: (., 1); f", true),
+            ("def f: .; def g: f; g", true),
+            ("def f: .; first(f)", true),
+            // A def with parameters shadows only at its own arity.
+            ("def f: .; def f(g): 1; f", true),
+            ("def f: 1; f", false),
+            ("def f: .a; f", false),
+            ("def f: .; f | tostring", false),
+            // The body sees its own scope, not the call site's.
+            ("def g: 1; def f: g; def g: .; f", false),
+            // A recursive def is cut off by the budget.
+            ("def f: f; f", false),
+        ] {
+            let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            assert_eq!(may_alias_register(&expr, None), expected, "{filter}");
+        }
+        let mut chain = String::from("def d0: 1;");
+        for i in 1..=8 {
+            let calls = vec![format!("d{}", i - 1); 12].join(" // ");
+            chain.push_str(&format!(" def d{i}: {calls};"));
+        }
+        chain.push_str(" d8");
+        let expr = parse(&chain).unwrap();
+        // Every body computes, so an unbounded walk would visit all 12^8 calls.
+        assert!(!may_alias_register(&expr, None));
     }
 
     /// #3795: the transparent witness grammar takes a comma and a pure navigation
