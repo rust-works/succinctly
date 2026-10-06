@@ -118023,6 +118023,14 @@ mod tests {
                 "{filter}"
             );
         }
+        // A computed key is a subexp, so only the target of `.[K]` decides.
+        assert_eq!(
+            outputs(
+                br#"[{"k":"a","a":1}]"#,
+                r"del(. as $x | [map(.[.k])] | $x[0])"
+            ),
+            ["[]"]
+        );
         // `first` navigates an element that is an array.
         assert_eq!(
             outputs(br"[[1],[2]]", r"del(. as $x | [map(first)] | $x[0])"),
