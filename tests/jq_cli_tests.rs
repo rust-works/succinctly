@@ -68174,7 +68174,7 @@ fn test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3
 }
 
 /// #3770, characterization of what remains of a pre-existing bug. A `foreach`
-/// UPDATE whose body has a comma *above* every pipe still answers nothing where
+/// UPDATE whose body has a comma *above* every pipe (#3862) still answers nothing where
 /// jq answers a path, so a write through it is silently skipped: that is the
 /// split `fans_out` really guards (#3145: `(foreach .a as {a:$v} ?// {c:$v}
 /// (0; ($v[0]?, $v))) = 9` wrote `.a.c`), so the fold withholds the register.

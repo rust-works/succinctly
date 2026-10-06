@@ -2635,7 +2635,7 @@ is the revert that established what the other one costs.
    destructuring bind, a fold and a call *above* every pipe, the split #3145 guards, and such a
    body still differs from jq: `(foreach .x as $w (0; try (($w \| .a[]), $w); .)) = 9` is
    `{"a":[{"b":1}],"x":9}` in jq and leaves the document unchanged here, a silently skipped
-   write. Marking the withheld register lost (#3267) would make it refuse loudly, but also
+   write ([#3862](https://github.com/rust-works/succinctly/issues/3862)). Marking the withheld register lost (#3267) would make it refuse loudly, but also
    turns rows that match jq today into refusals, where jq's own `try` catches a real error
    (`(foreach .a as $w (0; try (($w \| .c \| .z), $w.b); .)) = 9` writes nothing in either).
    On a `null` document, `//` around a generator (`(foreach .a? as $k (0; try (($k \| .[]?) //

@@ -80,7 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   echoed the document here, and `path(...)` printed nothing where jq prints `["x","a"]` and `["x","b"]`. `fans_out` saw the comma anywhere
   in the body and withheld the fold's register, so the `try` caught the body's own refusal; the same body without `try`, a bare pipe,
   already matched. `fans_out` now stops at a nested pipe, which carries the register through its stages exactly as a top-level one does,
-  so only a split *above* every pipe still counts (#3145's `($v[0]?, $v)`). Such a body still skips the write silently:
+  so only a split *above* every pipe still counts (#3145's `($v[0]?, $v)`). Such a body still skips the write silently (#3862):
   `(foreach .x as $w (0; try (($w | .a[]), $w); .)) = 9` is `{"a":[{"b":1}],"x":9}` in jq and leaves the document unchanged here.
   Marking the withheld register lost (#3267) would make it refuse loudly, but also loses rows that match jq today, where jq's own `try`
   catches a real error (`(foreach .a as $w (0; try (($w | .c | .z), $w.b); .)) = 9`). Pinned by
