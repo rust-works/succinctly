@@ -42058,9 +42058,9 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // and `path(. as $x | [-.a] | $x)` on `{"a":1}` are `[]`, while
         // `path([.a and .b] | empty)` still refuses near `"b"`.
         Expr::And(l, r) | Expr::Or(l, r) => {
-            register_movement_tracked(l) && register_movement_tracked(r)
+            array_contents_are_checked(l) && array_contents_are_checked(r)
         }
-        Expr::Negate(e) => register_movement_tracked(e),
+        Expr::Negate(e) => array_contents_are_checked(e),
         // #2764: a primitive postfix `?` (`.a?`, `INDEX_OPT`) is not `try` at
         // all -- it is resolved natively by `resolve_optional_sink`'s own
         // primitive arm, so the claim still depends on whether the
