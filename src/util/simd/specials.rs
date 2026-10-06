@@ -23,13 +23,14 @@
 //! precheck lesson). A block is classified when a string asks for it, never
 //! before.
 
-#[cfg(all(
-    target_arch = "aarch64",
-    not(feature = "broadword-yaml"),
-    not(feature = "scalar-yaml")
-))]
+// The kernels are gated on the target architecture alone. `escape.rs` also
+// switches its kernels off under `scalar-yaml` / `broadword-yaml`, but those are
+// YAML-parser selectors; this module serves the JSON gate, whose own SIMD
+// (`json/simd`) ignores them, so a YAML measurement build keeps the JSON path
+// it ships with.
+#[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
-#[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
 /// Whether `b` is a special: the predicate every kernel below reproduces.
@@ -54,11 +55,7 @@ pub(crate) fn classify_64_scalar(block: &[u8; 64]) -> u64 {
 /// aarch64 NEON: four 16-byte compares reduced to one 64-bit mask. One
 /// vector-to-GPR transfer per 64 bytes (the `vpaddq` reduction), not one per
 /// 16 as with the nibble mask `escape.rs` uses for a single chunk (#2963).
-#[cfg(all(
-    target_arch = "aarch64",
-    not(feature = "broadword-yaml"),
-    not(feature = "scalar-yaml")
-))]
+#[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn classify_64_neon(block: &[u8; 64]) -> u64 {
@@ -89,7 +86,7 @@ unsafe fn classify_64_neon(block: &[u8; 64]) -> u64 {
 
 /// x86_64 SSE2 (the baseline, so no runtime dispatch and `no_std`-safe): four
 /// 16-byte compares and `movemask`s combined into one 64-bit mask.
-#[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "sse2")]
 unsafe fn classify_64_sse2(block: &[u8; 64]) -> u64 {
@@ -118,27 +115,24 @@ unsafe fn classify_64_sse2(block: &[u8; 64]) -> u64 {
 
 /// Bit `k` of the result is set iff `block[k]` is a special (`"`, `\`, `< 0x20`
 /// or DEL).
+///
+/// On an architecture with no kernel above (riscv, wasm, ...) this is the
+/// 64-iteration scalar loop, which has not been measured against the byte walk
+/// it replaces: a short string there classifies a whole block where the old
+/// loop stopped at its closing quote.
 #[inline(always)]
 pub(crate) fn classify_64(block: &[u8; 64]) -> u64 {
-    #[cfg(all(
-        target_arch = "aarch64",
-        not(feature = "broadword-yaml"),
-        not(feature = "scalar-yaml")
-    ))]
+    #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: NEON is mandatory on aarch64.
         unsafe { classify_64_neon(block) }
     }
-    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+    #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: SSE2 is the x86_64 baseline.
         unsafe { classify_64_sse2(block) }
     }
-    #[cfg(any(
-        feature = "scalar-yaml",
-        all(target_arch = "aarch64", feature = "broadword-yaml"),
-        not(any(target_arch = "aarch64", target_arch = "x86_64"))
-    ))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         classify_64_scalar(block)
     }
@@ -188,9 +182,12 @@ impl SpecialMask {
         }
     }
 
-    /// The partial final block. Out of line: it runs once per document, and
-    /// keeping it out of `fill` keeps the hot path's code small.
-    #[cold]
+    /// The partial final block (fewer than 64 bytes left), classified byte by
+    /// byte. It runs at most once per cache, i.e. once per
+    /// `canonical_compact_jq_span_end` call, and only for a string that starts
+    /// in the buffer's last 63 bytes -- but a *small* value near the end of a
+    /// document, or a document under 64 bytes, always does, so it is not
+    /// `#[cold]`. Out of line only to keep `fill`'s hot path small.
     #[inline(never)]
     fn fill_tail(&mut self, bytes: &[u8], at: usize) {
         let tail = bytes.get(at..).unwrap_or(&[]);
@@ -246,6 +243,20 @@ mod tests {
         *seed
     }
 
+    /// An oracle written independently of `is_special` and of every kernel, so
+    /// the scalar fallback (the only arm on some targets) is checked against
+    /// something other than itself.
+    fn oracle_mask(block: &[u8; 64]) -> u64 {
+        let mut mask = 0u64;
+        for (k, b) in block.iter().enumerate() {
+            let special = *b == 0x22 || *b == 0x5C || *b <= 0x1F || *b == 0x7F;
+            if special {
+                mask |= 1 << k;
+            }
+        }
+        mask
+    }
+
     fn naive_next(bytes: &[u8], from: usize) -> Option<usize> {
         (from..bytes.len()).find(|&i| is_special(bytes[i]))
     }
@@ -259,7 +270,7 @@ mod tests {
         }
     }
 
-    /// Every byte value in every lane, against the scalar reference: a lane
+    /// Every byte value in every lane, against an independent oracle: a lane
     /// permutation bug (the NEON weight reduction, the SSE2 shifts) shows up as
     /// a single wrong bit position here.
     #[test]
@@ -268,10 +279,12 @@ mod tests {
             for b in 0u16..=255 {
                 let mut block = [b'a'; 64];
                 block[lane] = b as u8;
+                let expect = oracle_mask(&block);
+                assert_eq!(classify_64(&block), expect, "lane {lane} byte {b:#04x}");
                 assert_eq!(
-                    classify_64(&block),
                     classify_64_scalar(&block),
-                    "lane {lane} byte {b:#04x}"
+                    expect,
+                    "scalar lane {lane} byte {b:#04x}"
                 );
             }
         }
@@ -293,7 +306,9 @@ mod tests {
                     (r >> 16) as u8
                 };
             }
-            assert_eq!(classify_64(&block), classify_64_scalar(&block));
+            let expect = oracle_mask(&block);
+            assert_eq!(classify_64(&block), expect);
+            assert_eq!(classify_64_scalar(&block), expect);
         }
     }
 

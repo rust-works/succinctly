@@ -5489,6 +5489,100 @@ mod tests {
         }
     }
 
+    /// One mask carried across a whole document: many strings and keys, so
+    /// the cached block is reused, left behind and re-based dozens of times at
+    /// every offset. The expected answer is built from the byte-loop oracle one
+    /// string at a time (a document of `n` strings is canonical iff each
+    /// string is), so it shares nothing with the cache under test. The
+    /// alphabet only carries valid UTF-8 and no bare quote, so a body's
+    /// canonicality is the only thing that can fail the gate.
+    #[test]
+    fn gate_agrees_with_per_string_oracle_across_a_shared_mask_3340() {
+        let alphabet: [&[u8]; 12] = [
+            b"a",
+            b"bc",
+            b" ",
+            b"\\n",
+            b"\\\"",
+            b"\\\\",
+            b"\\u0000",
+            b"\\u007f",
+            b"\\u00e9",
+            b"\\x",
+            b"\x01",
+            "\u{e9}".as_bytes(),
+        ];
+        let mut seed = 0x0123_4567_89AB_CDEFu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..3000 {
+            let count = 1 + (next() % 40) as usize;
+            let mut bodies: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..count {
+                let mut body = Vec::new();
+                // Mostly short, so a 64-byte block holds several strings.
+                let n = if next() % 4 == 0 {
+                    next() % 30
+                } else {
+                    next() % 6
+                };
+                for _ in 0..n {
+                    body.extend_from_slice(alphabet[(next() >> 20) as usize % alphabet.len()]);
+                }
+                bodies.push(body);
+            }
+            let canonical = bodies.iter().all(|body| {
+                let mut lit = vec![b'"'];
+                lit.extend_from_slice(body);
+                lit.push(b'"');
+                scan_json_string_span_bytewise_reference(&lit, 0)
+                    == Some((1, lit.len() - 1, lit.len()))
+            });
+            // Array of strings, then an object whose (unique) keys and values are
+            // both strings, so key and value scans share the cache.
+            let mut array = vec![b'['];
+            let mut object = vec![b'{'];
+            for (k, body) in bodies.iter().enumerate() {
+                if k > 0 {
+                    array.push(b',');
+                    object.push(b',');
+                }
+                array.push(b'"');
+                array.extend_from_slice(body);
+                array.push(b'"');
+                object.extend_from_slice(format!("\"k{k}\":\"").as_bytes());
+                object.extend_from_slice(body);
+                object.push(b'"');
+            }
+            array.push(b']');
+            object.push(b'}');
+            for (shape, doc) in [("array", &array), ("object", &object)] {
+                let expect = canonical.then_some(doc.len());
+                assert_eq!(
+                    canonical_compact_jq_span_end(doc),
+                    expect,
+                    "round {round} {shape}: {:?}",
+                    String::from_utf8_lossy(doc)
+                );
+                // The same document padded in front, shifting every string
+                // across a different set of block boundaries.
+                let pad = (next() % 70) as usize;
+                let mut padded = vec![b'['];
+                padded.extend(core::iter::repeat(b'1').take(pad));
+                padded.push(b',');
+                let value_start = padded.len();
+                padded.extend_from_slice(doc);
+                padded.push(b']');
+                let got = canonical_compact_jq_span_end(&padded[value_start..]);
+                assert_eq!(got, expect, "round {round} {shape} pad {pad}");
+            }
+        }
+    }
+
     /// Escape-dense text -- the shape #3168 lost on -- driven by a seeded
     /// generator rather than a hand-picked list.
     #[test]
