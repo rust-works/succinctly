@@ -42058,9 +42058,9 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // and `path(. as $x | [-.a] | $x)` on `{"a":1}` are `[]`, while
         // `path([.a and .b] | empty)` still refuses near `"b"`.
         Expr::And(l, r) | Expr::Or(l, r) => {
-            array_contents_are_checked(l) && array_contents_are_checked(r)
+            and_or_operand_is_checked(l) && and_or_operand_is_checked(r)
         }
-        Expr::Negate(e) => array_contents_are_checked(e),
+        Expr::Negate(e) => and_or_operand_is_checked(e),
         // #2764: a primitive postfix `?` (`.a?`, `INDEX_OPT`) is not `try` at
         // all -- it is resolved natively by `resolve_optional_sink`'s own
         // primitive arm, so the claim still depends on whether the
@@ -42162,6 +42162,16 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         e if live_path_refusal(e).is_some() => true,
         other => cannot_move_register(other),
     }
+}
+
+/// Whether an `and`/`or`/unary minus operand inside `[E]` is one the resolver
+/// checks as jq does: either the register's position is known after it
+/// ([`register_movement_tracked`], the claim since #3289, which also covers an
+/// `as` source) or everything jq path-checks inside it is checked here
+/// ([`array_contents_are_checked`], which admits a bare `first`/`add`, a
+/// `map(f)`, `try`, `if`). Each is sound alone, so the claim is their union.
+fn and_or_operand_is_checked(operand: &Expr) -> bool {
+    register_movement_tracked(operand) || array_contents_are_checked(operand)
 }
 
 /// Whether `f`, the argument of a `map`/`any`/`all` inside an `[E]` collect,
