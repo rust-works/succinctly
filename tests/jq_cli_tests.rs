@@ -110235,3 +110235,179 @@ fn test_fold_source_bare_first_last_nth_moves_the_register_on_a_literal_input_34
     }
     Ok(())
 }
+
+/// #3859: a destructuring `?//` bind whose first alternative fails to destructure
+/// and whose retry body is a by-value `true`/`false`/`null` over the same-valued
+/// register. The failed destructure is restored by the fork, so the bare `$var`
+/// alternative that runs leaves jq's register where the stage entered, and the
+/// body re-establishes there (`path(.x | (. as [$q] ?// $z | true))` on
+/// `{"x":true}` is `["x"]`). A destructure that *succeeds* moves the register, so
+/// a body that lands on it keeps answering the moved position
+/// (`{"x":{"a":true}}` is `["x","a"]`), and a body whose value is not the
+/// register's (`1`, or `false` over `true`) still refuses. Every row captured
+/// from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_destructuring_alt_bind_with_a_failed_first_alternative_states_its_register_3859(
+) -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | true))",
+            "[\"x\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":false}"#,
+            r"path(.x | (. as [$q] ?// $z | false))",
+            "[\"x\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as {a:$q} ?// $z | true))",
+            "[\"x\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// {a:$q} ?// $z | true))",
+            "[\"x\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | (true,true)))",
+            "[\"x\"]\n[\"x\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(any(.x; (. as [$q] ?// $z | true)))",
+            "[\"x\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"[path(.x | (. as [$q] ?// $z | true))?]",
+            "[[\"x\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"del(.x | (. as [$q] ?// $z | true))",
+            "{}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | 1))",
+            "",
+            "Invalid path expression with result 1",
+            5,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | false))",
+            "",
+            "Invalid path expression with result false",
+            5,
+        ),
+        (
+            r#"{"x":{"a":true}}"#,
+            r"path(.x | (. as {a:$q} ?// $z | true))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":[null]}"#,
+            r"path(.x | (. as [$q] ?// $z | null))",
+            "[\"x\",0]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(.x | (. as [$q] ?// $z | true) | .y?)",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"path(1 | (. as [$q] ?// $z | true))",
+            "",
+            "Invalid path expression with result true",
+            5,
+        ),
+    ])
+}
+
+/// #3859: the write side of the rows above, and the state a `?//` retry resumes
+/// from. When a write raises, jq's `reduce` has handed its state slot back as
+/// `null` (`DUPN`), so the retried alternative's paths are written onto `null`:
+/// `(.x | .. | (. as [$q] ?// $z | $z)) = 9` on `{"x":[null],"k":3}` is
+/// `{"x":[9]}`, with `k` gone -- the nested path `["x",0,0]` fails once `["x",0]`
+/// holds `9`, and `$z` retries at `["x",0]`. Every row captured from jq 1.7.1.
+#[test]
+fn test_destructuring_alt_bind_writes_and_a_retry_resumes_from_null_3859() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r#"{"x":true}"#,
+            r"(.x | (. as [$q] ?// $z | true)) = 5",
+            "{\"x\":5}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":true}"#,
+            r"(.x | (. as [$q] ?// $z | true)) |= 5",
+            "{\"x\":5}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":[null],"k":3}"#,
+            r"(.x | .. | (. as [$q] ?// $z | $z)) = 9",
+            "{\"x\":[9]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":[null],"k":3}"#,
+            r"(.x | .. | (. as [$q] ?// $z | null)) = 9",
+            "{\"x\":[9]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":[null],"k":3}"#,
+            r"(.x | .. | (. as [$q] ?// {a:$q} ?// $z | null)) = 9",
+            "{\"x\":[{\"a\":9}]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"x":[null],"k":3}"#,
+            r"(.x | .. | (. as [$q] ?// {a:$q} | null)) = 9",
+            "{\"x\":[{\"a\":9}]}\n",
+            "",
+            0,
+        ),
+        (
+            r"[1]",
+            r"(. as $x ?// $y | .[if $x == null then 0 else -5 end]) = 1",
+            "[1]\n",
+            "",
+            0,
+        ),
+    ])
+}

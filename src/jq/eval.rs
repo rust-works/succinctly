@@ -29944,7 +29944,14 @@ fn stream_path_writes<S: EvalSemantics>(
         // A path arriving after a stop means a `?//` in `path_expr` retried
         // the next alternative (#2974 review): see [`RetryResumes`].
         if retry_resumes == RetryResumes::Yes {
-            parked.begin();
+            // #3859: a write that raised left jq's `reduce` state at the `null`
+            // its `DUPN` hands back for a slot still retained for backtracking,
+            // so the retried alternative's paths are written onto `null`, not
+            // onto what the earlier paths had built (`{"x":[null],"k":3}` with
+            // `(.x | .. | (. as [$q] ?// $z | $z)) = 9` is `{"x":[9]}`, `k` gone).
+            if parked.begin() {
+                *result = OwnedValue::Null;
+            }
         }
         match write(result, &path) {
             Ok(()) => Demand::Continue,
@@ -41147,24 +41154,39 @@ fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// carried copy, unless the leaf states a loss. Jq mode only, like every
 /// admission here (ADR-0018).
 ///
+/// A destructuring `?//` bind whose body cannot move the register states it per
+/// result too (#3859). A successful destructure takes tracked index steps, so
+/// its result navigated and is read the way it always was; a result that
+/// navigated nothing came from a bare `$var` alternative, reached once every
+/// earlier alternative failed, and a failed destructure or a body error is
+/// restored by the fork before the next alternative runs. Its register is the
+/// one the stage entered with, which is what `resolve_as_pattern` states
+/// (`Unmoved`), and a whole-stage `cannot_move_register` cannot say so: it is
+/// `false` for any destructuring alternative, because a *successful* one moves
+/// it. The body is held to `cannot_move_register` because the leaf's statement
+/// is not trusted for a compound body that mixes a navigating and a by-value part.
+///
 /// Not folded into [`stage_leaves_register_in_place`]: that is a per-*expression*
 /// fact, true of every result, and this one is not (`path(. as $x | any | $x)`
 /// on `{"a":true,"b":null}` is a path error in jq, because `.a` decided it and
 /// moved the register).
 fn stage_states_register_per_result<S: EvalSemantics>(expr: &Expr) -> bool {
     last_register_unmoved::<S>()
-        && matches!(
-            peel_register_transparent(expr),
+        && match peel_register_transparent(expr) {
             Expr::Builtin(
                 Builtin::Any
-                    | Builtin::All
-                    | Builtin::AnyF(_)
-                    | Builtin::AllF(_)
-                    | Builtin::AnyCond(..)
-                    | Builtin::AllCond(..)
-                    | Builtin::IsEmpty(_)
-            )
-        )
+                | Builtin::All
+                | Builtin::AnyF(_)
+                | Builtin::AllF(_)
+                | Builtin::AnyCond(..)
+                | Builtin::AllCond(..)
+                | Builtin::IsEmpty(_),
+            ) => true,
+            Expr::AsPattern { patterns, body, .. } => {
+                !patterns_all_bare(patterns) && cannot_move_register(body)
+            }
+            _ => false,
+        }
 }
 
 /// Whether `expr` is a `foreach` whose emissions state jq's register per emission
@@ -56960,19 +56982,23 @@ impl<T: Nonretryable> StashedVerdict<T> {
     /// if some wrapper let the closure run again -- the stale `Stop` such a
     /// wrapper swallows is that wrapper's bug, not a reason to run past a
     /// `halt`.
-    pub(crate) fn begin(&self) {
+    ///
+    /// Returns whether a retryable verdict was stashed, i.e. whether this is a
+    /// retry past the stop that stashed it (#3859).
+    pub(crate) fn begin(&self) -> bool {
         let Some(verdict) = self.slot.take() else {
-            return;
+            return false;
         };
         if verdict.is_nonretryable() {
             self.slot.set(Some(verdict));
-            return;
+            return false;
         }
         debug_assert!(
             terminal_retry::began_since(self.at.get()),
             "#3293: a driver's closure ran again after stashing a verdict and \
              answering Stop, with no `?//` attempt in between"
         );
+        true
     }
 
     /// Whether a verdict is currently stashed.

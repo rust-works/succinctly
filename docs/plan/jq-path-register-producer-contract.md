@@ -339,6 +339,11 @@ Consequences:
   only *admits reading* the leaf's statement; the claim itself stays the arm's.
   #3826: on an untracked entry the leaf states nothing (the register is carried by the stage), and the
   carried copy stands unless the step states a loss.
+  #3859: a destructuring `?//` bind whose body satisfies `cannot_move_register` is read the same way.
+  A successful destructure takes tracked index steps, so its result navigated and is read as before;
+  a result that navigated nothing came from a bare `$var` alternative reached after a failed
+  destructure (restored by the fork), whose leaf states `Unmoved(entry)`. A body mixing a navigating
+  and a by-value part is not admitted (#3899), for the reason D1 gives for `(.a // 1)`.
 
 ## 6. Delivery
 

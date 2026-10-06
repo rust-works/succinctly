@@ -5342,7 +5342,12 @@ succinctly keeps the first failed write's own error instead (`number (1) and str
 cannot be added`, here after firing the target twice), which keeps jq's exit code. `=` is
 different in jq, and succinctly follows it: `_assign`'s `reduce` carries on with the retried
 alternative, so `(. as $x ?// $y | .[if $x == null then 0 else -5 end]) = 1` on `[1]` is `[1]`
-(it raised `Out of bounds negative array index` here before #2974's review). A retry that
+(it raised `Out of bounds negative array index` here before #2974's review). It carries on
+from `null`, not from what the earlier paths built: a write that raised left the reduce state
+at the `null` its `DUPN` hands back, so the retried alternative's paths are written onto
+`null` (#3859). `(.x | .. | (. as [$q] ?// $z | $z)) = 9` on `{"x":[null],"k":3}` is
+`{"x":[9]}` in jq and here, with `k` gone (it kept `k` before #3859;
+`test_destructuring_alt_bind_writes_and_a_retry_resumes_from_null_3859`). A retry that
 resolves no path at all is a jq quirk too, `null` for `=`, and is not reproduced:
 `(. as $x ?// $y | ("A"|stderr) as $_ | if $x == null then empty else .[-5] end) = 1`
 on `[1]` retains `[1]`, writes `AA`, and exits 0 (pinned jq 1.7.1 writes `AA`,
@@ -10716,7 +10721,7 @@ The resolver drains the generator before it delivers the answers, so a retried
 alternative's side effects (`stderr`, `debug`) run before the first answer reaches the
 consumer: `path(.x | any(.; ...)) | ("H"|halt_error(3))` halts at the first answer in
 jq without running the retry, and here after it. The halt itself, its exit code and
-the output are the same (`test_any_all_path_answer_halt_is_not_retried_3827`); the ordering is tracked in #3859.
+the output are the same (`test_any_all_path_answer_halt_is_not_retried_3827`); the ordering is tracked in #3899.
 
 The identity element `any`/`all` answer once `gen` is exhausted after a swallowed answer
 is compared with the register where the call entered, since backtracking through every fork
@@ -10724,12 +10729,17 @@ of `gen` restores it (#3858): `path(.x | all(.; (1 as $x ?// $y | if $x then fal
 end)))` on `{"x":true}` is `["x"]` in jq and here
 (`test_any_all_path_identity_answer_is_at_the_entry_register_3858`).
 
-One shape in this family still diverges, and it is a *valid* answer rather than a refused
-one: a by-value `true`/`false` that follows a `?//` bind whose first alternative failed to
-destructure is a valid path in jq when it is identical to the register, and the resolver
-refuses it, with no `any`/`all` involved (`path(.x | (. as [$q] ?// $z | true))` on
-`{"x":true}` is `["x"]` in jq, and so is `any(.; (. as [$q] ?// $q | true))` there). The pipe stage's register rule does not admit a destructuring
-bind; tracked in #3859. An answer that is a valid path is printed before the raise of the
+A by-value `true`/`false`/`null` that follows a `?//` bind whose first alternative failed to
+destructure is a valid path in jq when it is identical to the register, with no `any`/`all`
+involved (`path(.x | (. as [$q] ?// $z | true))` on `{"x":true}` is `["x"]`), and so is the
+same bind inside `any(.; ...)`. A failed destructure is restored by the fork, so the bare
+`$var` alternative that runs leaves the register where the stage entered; the pipe stage
+reads that statement per result for a destructuring bind whose body cannot move the register
+(`stage_states_register_per_result`, #3859), while a destructure that *succeeds* moves the
+register and keeps answering the moved position
+(`test_destructuring_alt_bind_with_a_failed_first_alternative_states_its_register_3859`).
+A body that mixes a navigating and a by-value part (`(.a?, true)`) is not admitted and still
+refuses where jq answers (#3899). An answer that is a valid path is printed before the raise of the
 retry that follows it, as jq does (`test_any_all_path_answer_precedes_retry_raise_3827`).
 
 ## Provenance
