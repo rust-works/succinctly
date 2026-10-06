@@ -103155,6 +103155,209 @@ fn test_reduce_with_a_computing_update_leaves_the_register_3710() -> Result<()> 
     ])
 }
 
+/// #3732: a `reduce` whose INIT cannot move jq's register leaves it where the
+/// `reduce` entered, whatever its source and UPDATE navigate: jq runs both in the
+/// `FORK`ed loop, which `BACKTRACK`s the register back to its post-INIT state. So
+/// a marker frozen before it is not the register after it, and a `try` or `?`
+/// around a navigation through the marker catches jq's own near-access error,
+/// where the resolver's guess about a lost register made the refusal
+/// uncatchable. The first two rows are the issue's own `?`/`try` repros after a
+/// construction and a passthrough stage, which `main` already answers like jq;
+/// they pin it. The `del`/`=`/`|=` rows are the write side, where the guess lost
+/// or refused a write. A navigating INIT, a destructuring pattern and a
+/// navigating source feeding an UPDATE that navigates keep refusing. Every row
+/// captured from jq 1.7.1.
+#[test]
+fn test_reduce_with_navigating_source_or_update_leaves_the_register_3732() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"path(.a as $v1 | {k: .a} | ($v1 | select(true)) | try ($v1 | .b?))",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"x":2}"#,
+            r"path(.a as $v | {k: .a} | ($v | select(true)) | (($v | .b)?))",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(. as $x | reduce (1) as $i (.; .a) | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(.a as $x | reduce (1) as $i (.; .a) | try ($x | .b))",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"path(.a as $x | reduce (1) as $i (.; .a) | try ($x | .b))",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"path(.a as $v0 | reduce (1) as $i (.; .c) | try ($v0 | .b?))",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(.a as $x | reduce (1) as $i (.; .a) | try ($x | .b) // 5)",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r#"path(.a as $x | reduce (1) as $i (.; getpath(["a"])) | try ($x | .b?))"#,
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(.a as $x | reduce .c as $i (.; .) | try ($x | .b))",
+            "",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(.a as $x | reduce (1,2) as $i (.; .a, .c) | try ($x | .b))",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(.a as $x | reduce (1) as $i (.; .a) | ($x | .b))",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(. as $x | reduce .a as $i (.; .a) | $x)",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(. as $x | reduce (1) as $i (.; .a) | .a)",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(. as $x | reduce (1) as $i (.a; .) | $x)",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(.a as $x | reduce (1) as $i (.a; .) | $x)",
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(.a as $x | reduce (1) as [$j] (.; .a) | try ($x | .b))",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2}}"#,
+            r"path(.a as $x | foreach (1) as $i (.; .a; .) | try ($x | .b))",
+            "[\"a\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"del(. as $x | reduce (1) as $i (.; .a) | try ($x | .k))",
+            "{\"a\":{\"b\":1},\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"del(. as $x | reduce (1) as $i (.; .a) | try ($x | .zz))",
+            "{\"a\":{\"b\":1},\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"(. as $x | reduce (1) as $i (.; .a) | try ($x | .k)) = 9",
+            "{\"a\":{\"b\":1},\"k\":9,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"del(. as $x | reduce (1) as $i (.; .a) | $x.k)",
+            "{\"a\":{\"b\":1},\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"del(.a as $x | reduce (1) as $i (.; .a) | try ($x | .b))",
+            "{\"a\":{\"b\":1},\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1,"l":[1,2]}"#,
+            r"(.a as $x | reduce (1) as $i (.; .a) | try ($x | .b)) |= 9",
+            "{\"a\":{\"b\":1},\"k\":1,\"l\":[1,2]}\n",
+            "",
+            0,
+        ),
+        // A source that destructures a computed value is a path error in jq at the
+        // destructuring's `.a`; the fold does not model that, so such a source
+        // keeps the register lost (the first sweep accepted these: 52 rows).
+        (
+            r#"{"a":true}"#,
+            r"path(.a and (reduce (. as {a:$a} | .) as $k (.; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r#"{"a":true}"#,
+            r"del(.a and (reduce (. as {a:$a} | .) as $k (.; .)))",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | {a:{b:1}} | (reduce (. as {a:$a} | .) as $k (.; .)) | $x)",
+            "",
+            "Invalid path expression",
+            5,
+        ),
+    ])
+}
+
 /// #3742: #3504's whole-array-slice rule for a `foreach` UPDATE. jq hands the
 /// state back through the same buffer-sharing slice `reduce` does, so
 /// `.[0:]`/`.[null:]` of a non-empty array stays on the register from the
