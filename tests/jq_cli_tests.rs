@@ -68875,6 +68875,14 @@ fn test_foreach_update_alternate_shapes_the_3788_carry_does_not_reach_characteri
             refusal,
             5,
         ),
+        // jq: ["a"] (`first` is jq-defined, so the alternate may move the register)
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // first($k); .))",
+            "",
+            refusal,
+            5,
+        ),
         // jq: ["a"]
         (
             doc,

@@ -39473,10 +39473,8 @@ fn carry_frame_register<'a>(
     frame: &Frame,
 ) -> PathBranch<'a> {
     if !branch.trackable && matches!(branch.register, BranchRegister::None) {
-        if let Some(register) = frame.register() {
-            if cannot_move_register(operand) {
-                branch.register = BranchRegister::Unmoved(Cow::Owned(register.clone()));
-            }
+        if let Some(register) = frame.register().filter(|_| cannot_move_register(operand)) {
+            branch.register = BranchRegister::Unmoved(Cow::Owned(register.clone()));
         }
     }
     branch
