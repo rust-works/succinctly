@@ -134,10 +134,12 @@ fn test_yq_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
     // 6,000 one-element sequences: 12,001 nodes, past the cap.
     let doc = "- - 1\n".repeat(6000);
     let args = ["--jq-extensions", "-o=json", "-I=0"];
+    // `f` is spelled `.[]? | .`: a `cond` that cannot fork over bare `.[]?` is
+    // uncapped since #3737 (`test_yq_recurse_gated_cond_has_no_node_cap_3737`).
     for filter in [
-        "[recurse(.[]?; true)] | length",
-        "[path(recurse(.[]?; true))] | length",
-        "(recurse(.[]?; true) | select(type == \"!!int\")) |= . + 1",
+        "[recurse(.[]? | .; true)] | length",
+        "[path(recurse(.[]? | .; true))] | length",
+        "(recurse(.[]? | .; true) | select(type == \"!!int\")) |= . + 1",
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &args)?;
         assert_eq!(code, 1, "`{filter}` -- stdout: {stdout:?}");
@@ -151,11 +153,50 @@ fn test_yq_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
     // meets the cap.
     for (filter, want) in [
         ("[recurse(.[]?)] | length", "12001\n"),
-        ("[limit(3; recurse(.[]?; true))] | length", "3\n"),
+        ("[limit(3; recurse(.[]? | .; true))] | length", "3\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, &doc, &args)?;
         assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
     }
+    Ok(())
+}
+
+/// #3737: `recurse(.[]?; cond)` has no node cap in yq mode either, when `cond`
+/// yields at most one value.
+///
+/// No oracle exists (real yq's lexer rejects `recurse`, v4.53.3), so this is a
+/// succinctly extension behind `--jq-extensions` that follows jq's definition,
+/// `def r: ., (f | select(cond) | r); r;`; the pinned reference for the counts
+/// is yq's own `..`, which a `cond` that keeps every node must equal. A `cond`
+/// that forks is not bounded by the tree and keeps the cap.
+#[test]
+fn test_yq_recurse_gated_cond_has_no_node_cap_3737() -> Result<()> {
+    // 6,000 one-element sequences: 1 root + 6,000 sequences + 6,000 numbers.
+    let doc = "- - 1\n".repeat(6000);
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    for (filter, want) in [
+        ("[recurse(.[]?; true)] | length", "12001\n"),
+        ("[recurse(.[]?; . != null)] | length", "12001\n"),
+        ("[recurse(.[]?; type == \"!!seq\")] | length", "6001\n"),
+        ("[path(recurse(.[]?; true))] | length", "12001\n"),
+        ("[path(..)] | length", "12001\n"),
+        (
+            "(recurse(.[]?; true) | select(type == \"!!int\")) |= . + 1 | [.. | select(type == \"!!int\")] | length",
+            "6000\n",
+        ),
+        ("[limit(3; recurse(.[]?; true))] | length", "3\n"),
+        ("first(recurse(.[]?; true)) | length", "6000\n"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, &doc, &args)?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
+    }
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("[recurse(.[]?; (true, true))] | length", &doc, &args)?;
+    assert_eq!((stdout.as_str(), code), ("", 1), "{stderr:?}");
+    assert!(
+        stderr.contains("recurse: maximum nodes exceeded"),
+        "{stderr:?}"
+    );
     Ok(())
 }
 

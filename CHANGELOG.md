@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `first(f)` stay refused. jq mode only; yq is pinned unchanged. Against a clean `main`, the sweep (new `[map]`/`[any]`/`[all]` operands, and a full-grid sample)
   showed 0 regressions and 0 new `ACCEPT_WRONG`. Still open on #3724: item 2, the `and`/`or` arm. Pinned by
   `test_collect_map_any_all_navigating_f_keeps_the_register_3724` and `test_array_register_admits_navigating_tracked_f_3724`.
+- **jq/yq: `recurse(.[]?; cond)` visits every node when `cond` yields at most one value, instead of raising at 10,000** (#3737).
+  `recurse(f; cond)` is `def r: ., (f | select(cond) | r); r;`, so over `.[]?` a `cond` with one output keeps or drops each child once and
+  the walk is bounded by the tree, but the node cap meant for an unbounded `f` refused it: on a 12,001-node document `[recurse(.[]?; true)] | length`,
+  `[recurse(.[]?; . != null)] | length`, `[path(recurse(.[]?; true))] | length` and the writes through them raised
+  `recurse: maximum nodes exceeded` where jq answers 12001. The value walker now hands that shape to a direct walk that asks `cond` of
+  each node as it is reached, in jq's own order, and never runs `.[]?`; the path walker lifts its cap for it. A `cond` that can fork
+  (`(true, true)`) and any `f` but `.[]?` keep the cap. Measured against lifting only the cap (interleaved, an Apple M4 Pro under load, memory
+  capped): a 74 MB `users` document 2.2 s and 1.04 GB against 9.3 s and 2.41 GB, 63 MB of arrays 6.1 s and 3.97 GB against 29.7 s and 6.13 GB,
+  an 11.4 M-node alias expansion 2.04 GB against 7.83 GB. Below the cap it is faster too (a 7,001-node document, 2.39 s to 0.14 s over 300 walks).
+  Pinned by `test_recurse_of_each_optional_with_a_gating_cond_has_no_node_cap_3737`, `test_recurse_gated_cond_runs_in_jq_order_3737`,
+  `test_yq_recurse_gated_cond_has_no_node_cap_3737` and `walk_descendants_gated_agrees_with_the_evaluator_driven_walk_3737`; see
+  `docs/compliance/jq/limitations.md`.
 - **jq: `paths`, `leaf_paths` and the cursor-native `path(f)` walkers answer on documents nested 256-383 levels deep** (#3429).
   They shared the whole-document materializers' 256 ceiling, so a well-formed document in that band answered `[..]` but raised
   `nesting depth exceeds limit of 256` for `[paths]`, `[leaf_paths]`, `[.. | path]` and a static `path(.a.a...)` chain. They now stop at
