@@ -43875,6 +43875,9 @@ impl FoldRegister {
         // [`FoldRegister::advance`] carries `self` forward on it. Only a fold's own
         // UPDATE call reads it; the caller strips it from anything it forwards,
         // since a path relocated under a fold register is not the stage's.
+        // The shape of a fixed expression is constant, so it is asked at most once per
+        // call, and only when a branch actually carries a statement.
+        let mut forwards: Option<bool> = None;
         let mut deliver = |branch: PathBranch<'_>| {
             // Jq mode only, like every register admission here: yq's scalar-write
             // no-op convention would turn a wrongly carried register into silent
@@ -43888,7 +43891,9 @@ impl FoldRegister {
                 // Read only through an expression every producer of which forwards
                 // its branch unchanged ([`entry_marker_stage`]'s allowlist), and a
                 // handler's `Unmoved` against the fold's own register.
-                && matches!(entry_marker_shape(expr), EntryMarkers::Forwarded)
+                && *forwards.get_or_insert_with(|| {
+                    matches!(entry_marker_shape(expr), EntryMarkers::Forwarded)
+                })
                 && states_register_at_entry(
                     &branch.register,
                     self.trackable.then_some(&self.value),

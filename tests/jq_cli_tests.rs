@@ -68943,9 +68943,11 @@ fn test_path_register_more_by_value_builtins_do_not_move_it_3711() -> Result<()>
             bad,
             5,
         ),
-        // #3580: the handler's output of a caught `join` is at the `try`'s entry
-        // register, so `$x` re-establishes and the row answers as jq does (`[]`);
-        // it was a refuse-only row until the stage read a handler's statement.
+        // #3580: `join` succeeds here, so it is the `try` body's own output that
+        // states the register it left (a `join` is a backtracked `reduce`, #3711), and
+        // the stage now reads that statement per output: `$x` re-establishes and the
+        // row answers as jq does (`[]`). It was refuse-only while the stage's static
+        // verdict covered a compound `try ... catch` as a whole.
         (
             "{}",
             r#"path(. as $x | ["a"] | try join(",") catch . | $x)"#,
@@ -89412,7 +89414,8 @@ fn test_recurse_seed_behind_call_or_fork_keeps_register_3580() -> Result<()> {
 /// still refuse, loudly. Each is `[]` or a successful write in jq: a literal ahead of
 /// the recursion (`(1, ..)`, an untaken branch's `1`), a `nth(n; ..)` (not a
 /// forwarder), a destructuring bind or a `def` call around it (their arms re-seed
-/// the register), a `reduce` UPDATE whose recursion is `recurse(f)` (outside
+/// the register), a pipe nested inside a forwarder (`if c then (.. | select(true)) else . end`),
+/// a `reduce` UPDATE whose recursion is `recurse(f)` (outside
 /// `register_movement_tracked`), a `foreach` UPDATE that forks (`fans_out` withholds the
 /// register, so its emissions state nothing), and a fold inside an `[E]` collect. The rows
 /// pin the *current* refusal, and every write
@@ -89427,6 +89430,9 @@ fn test_recurse_seed_residuals_stay_loud_3580() -> Result<()> {
         (r"path(. as $x | 1 | nth(0; ..) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | (. as $q | ..) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | def f: ..; f | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        // a pipe nested inside a forwarder is opaque (the bare `(.. | select(true))` stage is answered by #3653's own rule)
+        (r"path(. as $x | 1 | if true then (.. | select(true)) else . end | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"del(. as $x | 1 | if true then (.. | select(true)) else . end | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | foreach (1,2) as $i (1; (try ..), 5; .) | $x)", "[]\n", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | foreach (1,2) as $i (1; (5, try ..); .) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
         (r"path(. as $x | 1 | [foreach (1,2) as $i (1; try ..; .)] | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),

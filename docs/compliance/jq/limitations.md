@@ -3258,8 +3258,10 @@ answers `["b"]` — and classified the two residuals appended below):
   output** ([#3580](https://github.com/rust-works/succinctly/issues/3580)): a recursion's seed
   (`recurse_family_root_seed`) and an untracked `.` carry a `BranchRegister::AtEntry`, and a `catch`
   handler's output already states the register it was seeded with (jq's fork restores the register
-  to the `try`'s entry before the handler runs, #3133; `resolve_catch_sink`). `resolve_seq_stage`
-  reads either on the one output that carries it (`states_register_at_entry`). It is `getpath`'s per-branch rule
+  to the `try`'s entry before the handler runs, #3133; `resolve_catch_sink`), as does any other output
+  that says `Unmoved` (a `try` body that is a `join`, a `reduce`). `resolve_seq_stage` reads either on
+  the one output that carries it (`states_register_at_entry`: an `Unmoved` counts only when it equals
+  the stage's own carried register, which every register inside an admitted stage derives from). It is `getpath`'s per-branch rule
   (below) taken one step finer, **per output**, so it cannot be a verdict on the stage's
   expression (`stage_preserves_register` would carry the register across every output of the
   recursion and fabricate paths): a stage that bounds or forks a recursion delivers the seed and
@@ -3289,7 +3291,8 @@ answers `["b"]` — and classified the two residuals appended below):
     `[]` in jq, and so is `nth(0; ..)`, which is not an audited forwarder;
   - a recursion behind a destructuring bind or a `def` call (`(. as $q | ..)`, `def f: ..; f`): the
     bind's pattern indexes before its body runs and a call's body is not named, so the stage is
-    opaque;
+    opaque; and so is a pipe (or `select`) nested inside a forwarder, `if true then (.. | select(true))
+    else . end`, though the bare `(.. | select(true))` stage is answered by #3653's own rule;
   - a `reduce` UPDATE whose recursion is `recurse(f)`: `register_movement_tracked` names `..`
     and not `recurse(f)`.
 - **A terminal `null`/`true`/`false` is the root path only while nothing navigated
