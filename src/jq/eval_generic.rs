@@ -1187,6 +1187,32 @@ impl CursorWalkOutput for CheckOnly {
     }
 }
 
+/// Walk one child of a container: a scalar the format's override answers is
+/// materialized here, without a call into the whole container-and-scalar walk
+/// below, whose entry cost is paid per node and is most of what separated the
+/// shared YAML walk from the hand-written one it replaced (#2664). Only a
+/// format that reuses member values ([`DocumentCursor::REUSE_FIELD_VALUE`])
+/// holds the child's value here, so for every other format `known` is `None`
+/// and this is the call it always was.
+#[inline(always)]
+fn walk_child<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOutput>(
+    cursor: &C,
+    known: Option<C::Value>,
+    depth: usize,
+    check_depth: &impl Fn(usize) -> Result<(), EvalError>,
+    scalar_override: &impl Fn(&C, &C::Value) -> Option<OwnedValue>,
+    nested: &[usize],
+) -> Result<B::Out, EvalError> {
+    if let Some(value) = &known {
+        // The callee's own first check, then its scalar-override arm.
+        check_depth(depth)?;
+        if let Some(owned) = scalar_override(cursor, value) {
+            return Ok(B::scalar(owned));
+        }
+    }
+    to_owned_cursor_at_depth::<S, _, B>(cursor, known, depth, check_depth, scalar_override, nested)
+}
+
 /// `nested` names the in-scope binding's nodes inside this walk's subtree:
 /// such a child comes back as that binding's own value
 /// ([`embed_shared_nested`], #3179). Only [`to_owned_cursor`] passes any,
@@ -1243,7 +1269,7 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             };
             let child = match embed_shared_nested::<_, B>(&field.value_cursor, depth + 1, nested) {
                 Some(child) => child,
-                None => to_owned_cursor_at_depth::<S, _, B>(
+                None => walk_child::<S, _, B>(
                     &field.value_cursor,
                     C::REUSE_FIELD_VALUE.then_some(field.value),
                     depth + 1,
@@ -1307,9 +1333,9 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
             items.push(
                 match embed_shared_nested::<_, B>(&elem_cursor, depth + 1, nested) {
                     Some(child) => child,
-                    None => to_owned_cursor_at_depth::<S, _, B>(
+                    None => walk_child::<S, _, B>(
                         &elem_cursor,
-                        None,
+                        C::REUSE_FIELD_VALUE.then(|| elem_cursor.value()),
                         depth + 1,
                         check_depth,
                         scalar_override,
