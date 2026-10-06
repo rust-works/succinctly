@@ -48366,14 +48366,16 @@ fn walk_descendants(
 ///
 /// What this saves over [`ValueRecurseWalk`] is the work `f` costs there:
 /// `.[]?` is not run at each node, so no node's reindexed document is kept
-/// alive while its children run (see [`each_recurse_walk`]'s memory note), and
-/// the walk is as cheap as [`walk_descendants`]'s plus one `cond` per node. That
-/// is what lets it go uncapped: a finite tree costs what `..` costs on it.
+/// alive while its children run (see [`each_recurse_walk`]'s memory note). That
+/// is what lets it go uncapped: the walk is bounded by the tree, at the price
+/// of one `cond` per node and of the owned tree that [`walk_descendants`]'s
+/// cursor twin avoids (1.5 to 1.8 times `..`'s time and about twice its
+/// memory, measured in `docs/compliance/jq/limitations.md`).
 ///
-/// `cond` yields at most one value, so a truthy verdict keeps the node and
-/// nothing else is needed; it runs on a child no walk produced the root of, so
-/// it takes the same pre-demoted, bridged route [`ValueRecurseWalk::gate`]'s
-/// does. An escape of its own ends the walk, with everything delivered kept.
+/// A container's children are pushed only once the sink has accepted it, so a
+/// consumer satisfied by the node itself pays nothing for them. The container
+/// is cloned for the sink (a shared-pointer copy) so its children can still be
+/// read from it; a leaf has none and is moved.
 fn walk_descendants_gated<S: EvalSemantics>(
     cond: &Expr,
     root: OwnedValue,
@@ -48384,28 +48386,22 @@ fn walk_descendants_gated<S: EvalSemantics>(
     let mut at_root = true;
     while let Some(node) = stack.pop() {
         if !core::mem::take(&mut at_root) {
-            let mut keep = false;
-            let flow = eval_each_owned::<S>(&cond, &node, false, Reentry::Proven, &mut |verdict| {
-                keep |= verdict.is_truthy();
-                Demand::Continue
-            });
-            match flow {
-                // `cond` is never stopped: the sink above always continues.
-                Flow::Exhausted | Flow::Stopped { .. } => {}
-                Flow::Escaped(control) => {
-                    return RecurseWalkEnd {
-                        drained: true,
-                        pending_error: Some(control.into()),
-                        stopped: false,
-                    };
-                }
-            }
-            if !keep {
-                continue;
+            match recurse_gate_verdict::<S>(&cond, &node) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(escape) => return RecurseAbort::walk_end(Some(RecurseAbort::Escaped(escape))),
             }
         }
-        // As in `walk_descendants`: children first, so the node moves into
-        // `sink`; pushed last-first so the first child is popped next.
+        if !matches!(node, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+            if sink(node) == Demand::Stop {
+                return RecurseAbort::walk_end(Some(RecurseAbort::Stopped(None)));
+            }
+            continue;
+        }
+        if sink(node.clone()) == Demand::Stop {
+            return RecurseAbort::walk_end(Some(RecurseAbort::Stopped(None)));
+        }
+        // Pushed last-first, so the first child is the next node popped.
         let first_child = stack.len();
         match &node {
             OwnedValue::Array(items) => stack.extend(items.iter().cloned()),
@@ -48413,18 +48409,43 @@ fn walk_descendants_gated<S: EvalSemantics>(
             _ => {}
         }
         stack[first_child..].reverse();
-        if sink(node) == Demand::Stop {
-            return RecurseWalkEnd {
-                drained: false,
-                pending_error: None,
-                stopped: true,
-            };
-        }
     }
-    RecurseWalkEnd {
-        drained: true,
-        pending_error: None,
-        stopped: false,
+    RecurseAbort::walk_end(None)
+}
+
+/// Whether `node` passes [`walk_descendants_gated`]'s `cond` (`cond` yields at
+/// most one value, [`yields_at_most_one_value`]): its truthiness, or the
+/// escape `cond` raised.
+///
+/// The verdict is read the way a loop's condition is ([`owned_cond_verdict`]),
+/// which answers a `length` or a comparison from the node directly; without it
+/// every such `cond` reindexed the node's whole subtree, a cost per container
+/// that grows with its depth. A `cond` outside that grammar takes the
+/// pre-demoted, bridged route [`ValueRecurseWalk::gate`]'s does.
+fn recurse_gate_verdict<S: EvalSemantics>(
+    cond: &Expr,
+    node: &OwnedValue,
+) -> Result<bool, EvalEscape> {
+    if let Some(verdict) = owned_cond_verdict::<S>(cond, node, false) {
+        return verdict.map_err(|e| EvalEscape::from(Control::Error(e)));
+    }
+    let mut verdicts = 0_u32;
+    let mut keep = false;
+    let flow = eval_each_owned::<S>(cond, node, false, Reentry::Proven, &mut |verdict| {
+        verdicts += 1;
+        keep |= verdict.is_truthy();
+        Demand::Continue
+    });
+    // The walk's bound rests on the admission rule: a second verdict would
+    // visit a child once per truthy output where this visits it once.
+    debug_assert!(
+        verdicts <= 1,
+        "an admitted `cond` yielded {verdicts} values"
+    );
+    match flow {
+        // `cond` is never stopped: the sink above always continues.
+        Flow::Exhausted | Flow::Stopped { .. } => Ok(keep),
+        Flow::Escaped(control) => Err(control.into()),
     }
 }
 
@@ -112596,6 +112617,13 @@ mod tests {
             "recurse(.[]?; (true, true))",
             "recurse(.[]?; .[]?)",
             "recurse(.[]?; (1, 2) > 0)",
+            // Non-forking, but outside `yields_at_most_one_value`'s grammar
+            // (`?`, `try`, a comma): refused, so capped. The cap is lifted by
+            // that whitelist and by nothing else.
+            "recurse(.[]?; tonumber? // false)",
+            "recurse(.[]?; try true)",
+            "recurse(.[]?; first(.[]?, true))",
+            "recurse(.[]?; limit(1; true))",
             "recurse(.[]; true)",
             "recurse(.a?; true)",
             "recurse(.[]? | .; true)",
@@ -112627,7 +112655,7 @@ mod tests {
             br#"[[],[[]],[[],[]],{"k":[{"k":[{}]}]}]"#,
         ];
         for doc in docs {
-            for (direct, driven, reference) in [
+            for (direct, gated, reference) in [
                 ("[recurse(.[]?)]", "[recurse(.[]?; true)]", "[..]"),
                 (
                     "[limit(3; recurse(.[]?))]",
@@ -112652,24 +112680,22 @@ mod tests {
             ] {
                 let want = outputs_and_end(doc, reference);
                 assert_eq!(outputs_and_end(doc, direct), want, "`{direct}` on {doc:?}");
-                assert_eq!(outputs_and_end(doc, driven), want, "`{driven}` on {doc:?}");
-                let evaluated = driven.replace("recurse(.[]?; true)", "recurse(.[]? | .; true)");
-                assert_ne!(evaluated, driven);
-                assert_eq!(
-                    outputs_and_end(doc, &evaluated),
-                    want,
-                    "`{evaluated}` on {doc:?}"
-                );
+                assert_eq!(outputs_and_end(doc, gated), want, "`{gated}` on {doc:?}");
+                let driven = gated.replace("recurse(.[]?; true)", "recurse(.[]? | .; true)");
+                assert_ne!(driven, gated);
+                assert_eq!(outputs_and_end(doc, &driven), want, "`{driven}` on {doc:?}");
             }
         }
     }
 
     /// #3737: [`walk_descendants_gated`] prunes by `cond` in jq's own order and
     /// agrees, node for node and error for error, with the evaluator-driven walk
-    /// (`f` spelled `.[]? | .`, which is never gated) over every `cond` that
-    /// cannot fork: kept and dropped children, a `cond` that raises (before and
-    /// after earlier siblings were delivered), one that never answers, and the
-    /// consumers that stop it.
+    /// (`f` spelled `.[]? | .`, which is never gated) over admitted `cond`s:
+    /// kept and dropped children, a `cond` that raises (before and after
+    /// earlier siblings were delivered), one that never answers, one the pure
+    /// verdict reads and one the bridge does, and the consumers that stop it.
+    /// Each `cond` is asserted to be admitted, so a row that fell back to the
+    /// evaluator-driven walk cannot pass for a gated one.
     #[test]
     fn walk_descendants_gated_agrees_with_the_evaluator_driven_walk_3737() {
         let docs: [&[u8]; 6] = [
@@ -112691,12 +112717,15 @@ mod tests {
             r#"if . == 3 then error("boom") else true end"#,
             r#"if . == 4 then error("boom") else true end"#,
             r#"if type == "string" then error("s") else true end"#,
-            "tonumber? // false",
-            "(.a? // true)",
-            "[.[]?] | length > 0",
             "not",
-            "first(.[]?, true)",
-            "limit(1; true)",
+            // The pure verdict (`owned_cond_verdict`) answers these, raising
+            // on a node that cannot be indexed.
+            ".a == 1",
+            ".[0] == 1",
+            r#"length == 2 or type == "object""#,
+            // Outside it, the bridge answers them.
+            "(.a // true)",
+            "tojson | length > 1",
         ];
         let consumers = [
             "[recurse(.[]?; COND)]",
@@ -112713,6 +112742,15 @@ mod tests {
             r#"(recurse(.[]?; COND) | select(type == "number")) |= . + 1"#,
             r#"del(recurse(.[]?; COND) | select(type == "number"))"#,
         ];
+        for cond in conds {
+            assert!(
+                matches!(
+                    parse(&format!("recurse(.[]?; {cond})")).unwrap(),
+                    Expr::Builtin(Builtin::RecurseCond(f, c)) if is_gated_structural_descent(&f, Some(&c))
+                ),
+                "`{cond}` is not admitted"
+            );
+        }
         for doc in docs {
             for cond in conds {
                 for consumer in consumers {
@@ -113140,18 +113178,27 @@ mod tests {
         // 'recurse(.[]?; if . == 3 then error("boom") else true end)'`
         // prints the root, `{"child":"leaf","leafflag":true}`, `"leaf"`,
         // and `true` (in that order) before erroring.
-        assert_eq!(
-            outputs(
-                br#"{"child":{"child":"leaf","leafflag":true},"bad":3}"#,
-                r#"recurse(.[]?; if . == 3 then error("boom") else true end)"#
-            ),
-            vec![
-                r#"{"child":{"child":"leaf","leafflag":true},"bad":3}"#,
-                r#"{"child":"leaf","leafflag":true}"#,
-                r#""leaf""#,
-                "true",
-            ]
-        );
+        // Both spellings: bare `.[]?` is the gated structural walk (#3737), and
+        // `.[]? | .` is the evaluator-driven one whose deferred-escape rule
+        // (#842/#854) this test was written for.
+        for filter in [
+            r#"recurse(.[]?; if . == 3 then error("boom") else true end)"#,
+            r#"recurse(.[]? | .; if . == 3 then error("boom") else true end)"#,
+        ] {
+            assert_eq!(
+                outputs(
+                    br#"{"child":{"child":"leaf","leafflag":true},"bad":3}"#,
+                    filter
+                ),
+                vec![
+                    r#"{"child":{"child":"leaf","leafflag":true},"bad":3}"#,
+                    r#"{"child":"leaf","leafflag":true}"#,
+                    r#""leaf""#,
+                    "true",
+                ],
+                "`{filter}`"
+            );
+        }
     }
 
     #[test]
@@ -113394,6 +113441,16 @@ mod tests {
             // (#856); path position must agree it's still emitted once but
             // not recursed into.
             (br#"{"a":null,"b":1}"#, "recurse(.[]?; true)"),
+            // The same three non-forking rows with `f` spelled so that it is
+            // not bare `.[]?`: bare `.[]?` over a `cond` that cannot fork is a
+            // gated structural walk (#3737), and these keep the evaluator-
+            // driven walkers' own agreement pinned.
+            (br#"{"a":1,"b":{"c":2}}"#, "recurse(.[]? | .; false)"),
+            (
+                br"[1,[2,3],[4]]",
+                r#"recurse(.[]? | .; type != "array" or length > 1)"#,
+            ),
+            (br#"{"a":null,"b":1}"#, "recurse(.[]? | .; true)"),
         ] {
             let filter = filter.to_string();
             let path_filter =

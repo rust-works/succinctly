@@ -181,8 +181,8 @@ fn test_yq_recurse_gated_cond_has_no_node_cap_3737() -> Result<()> {
         ("[path(recurse(.[]?; true))] | length", "12001\n"),
         ("[path(..)] | length", "12001\n"),
         (
-            "(recurse(.[]?; true) | select(type == \"!!int\")) |= . + 1 | [.. | select(type == \"!!int\")] | length",
-            "6000\n",
+            "(recurse(.[]?; true) | select(type == \"!!int\")) |= . + 1 | [.. | select(type == \"!!int\")] | add",
+            "12000\n",
         ),
         ("[limit(3; recurse(.[]?; true))] | length", "3\n"),
         ("first(recurse(.[]?; true)) | length", "6000\n"),

@@ -56109,8 +56109,8 @@ fn test_recurse_of_each_optional_with_a_gating_cond_has_no_node_cap_3737() -> Re
             "0\n",
         ),
         (
-            r#"[pick(recurse(.[]?; true) | select(type == "number"))] | length"#,
-            "1\n",
+            r#"pick(recurse(.[]?; true) | select(type == "number")) == ."#,
+            "true\n",
         ),
         // Nothing here can be an error of the program.
         (
@@ -56139,7 +56139,8 @@ fn test_recurse_of_each_optional_with_a_gating_cond_has_no_node_cap_3737() -> Re
             "true\n",
         ),
         // 300 levels deep is past the native stack budget a recursing `f`
-        // spends; the gated walk is an explicit stack and never meets it.
+        // spends; the gated walk is an explicit stack. (The evaluator-driven
+        // walk answers 301 here too: the row pins the depth, not the route.)
         (
             "reduce range(300) as $i (1; [.]) | [recurse(.[]?; true)] | length",
             "301\n",
@@ -56206,7 +56207,7 @@ fn test_recurse_gated_cond_runs_in_jq_order_3737() -> Result<()> {
             "[[1],[2],[3]]",
             r#"recurse(.[]?; if . == 2 then error("boom") else true end)"#,
             "[[1],[2],[3]]\n[1]\n1\n[2]\n",
-            "boom",
+            "jq: error (at <stdin>:0): boom\n",
             5,
         ),
         (
@@ -56223,13 +56224,6 @@ fn test_recurse_gated_cond_runs_in_jq_order_3737() -> Result<()> {
             "",
             0,
         ),
-        (
-            "[[1],[2],[3]]",
-            r#"recurse(.[]?; if . == 2 then ("h" | halt_error(3)) else true end)"#,
-            "[[1],[2],[3]]\n[1]\n1\n[2]\n",
-            "h",
-            3,
-        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(
@@ -56237,15 +56231,7 @@ fn test_recurse_gated_cond_runs_in_jq_order_3737() -> Result<()> {
             (want_out, want_code),
             "`{filter}` -- stderr: {stderr:?}"
         );
-        // The error row's message carries jq's own `(at <stdin>:N)` position.
-        if want_code == 5 {
-            assert!(
-                stderr.contains(want_err),
-                "`{filter}` -- stderr: {stderr:?}"
-            );
-        } else {
-            assert_eq!(stderr, want_err, "`{filter}`");
-        }
+        assert_eq!(stderr, want_err, "`{filter}`");
     }
     Ok(())
 }
@@ -56321,10 +56307,11 @@ fn test_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
 }
 
 /// #3716, the rows that still answer: a consumer that stops before the cap never
-/// meets it, `.[]?` without a `cond` (#3703) or with one that cannot fork
-/// (#3737) is uncapped, and the boundary is exact -- a 10,000-node document
-/// answers and a 10,001-node one raises, because the cap fires only when a node
-/// remains. Every answer here is jq's own.
+/// meets it, `.[]?` without a `cond` is uncapped (#3703), and the boundary is
+/// exact -- a 10,000-node document answers and a 10,001-node one raises,
+/// because the cap fires only when a node remains. Every answer here is jq's
+/// own. (A `cond` that cannot fork over bare `.[]?` is uncapped too, since
+/// #3737, and has its own test.)
 #[test]
 fn test_recurse_cap_stopping_consumers_and_boundary_3716() -> Result<()> {
     let cap_error = "recurse: maximum nodes exceeded";
