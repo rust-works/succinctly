@@ -10512,7 +10512,10 @@ and a `try`/`?` around them all name the last answer;
 One shape in this family still diverges, and it is a *valid* answer rather than a
 refused one: an answer identical to jq's register (a `true` over a `true` node) that
 follows an alternative's error is a valid path in jq, and the resolver refuses it
-(`path(.x | any(.; (. as [$q] ?// $q | true)))` on `{"x":true}` is `["x"]` in jq).
+(`path(.x | any(.; (. as [$q] ?// $q | true)))` on `{"x":true}` is `["x"]` in jq). The same holds for the
+identity element after a swallowed answer: `path(.x | all(.; (1 as $x ?// $y | if $x then false else empty end)))`
+on `{"x":true}` is `["x"]` in jq, because the retry restores the register the answer is compared with,
+where the resolver states it lost and refuses.
 An answer that is a valid path is printed before the raise of the retry that follows
 it, as jq does (`test_any_all_path_answer_precedes_retry_raise_3827`).
 
