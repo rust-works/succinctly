@@ -40781,6 +40781,12 @@ fn leaf_register<'a, S: EvalSemantics>(
 /// `.[]` that [`iterates_untracked_input`] refuses on an input the register is
 /// not on, once the call has produced a value (not in [`builtin_navigation`],
 /// whose pre-evaluation check would pre-empt an argument's own error, #2646).
+///
+/// #3732 adds a `reduce` whose INIT cannot move the register
+/// ([`reduce_leaves_register_in_place`]): jq backtracks its source and every
+/// `UPDATE` to the post-INIT register, so what they navigate does not matter,
+/// provided the resolver checks it as jq does ([`register_movement_tracked`]).
+/// Like `add`, it is not in [`cannot_move_register`]: it navigates.
 fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
     cannot_move_register(expr)
         || (S::TAG == EvalTag::Jq
@@ -42344,10 +42350,13 @@ fn patterns_all_bare(patterns: &[Pattern]) -> bool {
         .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
 }
 
-/// [`cannot_move_register`] for a `reduce`, shared with [`resolve_reduce`]'s
-/// final emission (#3710) so the two cannot disagree: a bare-variable pattern
-/// (a destructuring bind navigates, #2649) over a source, an `INIT` and an
-/// `UPDATE` none of which can move jq's register.
+/// [`cannot_move_register`] for a `reduce`: a bare-variable pattern (a
+/// destructuring bind navigates, #2649) over a source, an `INIT` and an
+/// `UPDATE` none of which can move jq's register. It was shared with
+/// [`resolve_reduce`]'s final emission (#3710); since #3732 that emission asks
+/// the weaker [`reduce_leaves_register_in_place`], which admits a navigating
+/// source and `UPDATE`, so this one now only answers [`cannot_move_register`]
+/// (and the `foreach` twin), where "navigates nothing" is the claim.
 fn reduce_cannot_move_register(
     patterns: &[Pattern],
     input: &Expr,
@@ -121369,8 +121378,26 @@ mod tests {
                 "leaves_register_in_place({src})"
             );
         }
+        // #3732: a `reduce` whose INIT cannot move the register, whatever a source
+        // and `UPDATE` the resolver checks navigate; a navigating INIT, a
+        // destructuring pattern and a source or `UPDATE` it does not check stay out.
+        for (src, stays) in [
+            ("reduce (1) as $i (.; .a)", true),
+            ("reduce .a as $i (.; .b)", true),
+            ("reduce (1) as $i (.; 5)", true),
+            ("reduce (1) as $i (.a; .)", false),
+            ("reduce (1) as [$i] (.; 5)", false),
+            ("reduce (. as {a:$a} | .) as $k (.; .)", false),
+            ("reduce (1) as $i (.; try .a catch .)", false),
+        ] {
+            assert_eq!(
+                leaves_register_in_place::<JqSemantics>(&parse(src).unwrap()),
+                stays,
+                "leaves_register_in_place({src})"
+            );
+        }
         // The extras are jq-only: yq keeps the allowlist it had.
-        for src in ["add", "map(.)"] {
+        for src in ["add", "map(.)", "reduce (1) as $i (.; .a)"] {
             assert!(
                 !leaves_register_in_place::<YqSemantics>(&parse(src).unwrap()),
                 "leaves_register_in_place::<yq>({src})"

@@ -103155,20 +103155,14 @@ fn test_reduce_with_a_computing_update_leaves_the_register_3710() -> Result<()> 
     ])
 }
 
-/// #3732: a `reduce` whose INIT cannot move jq's register leaves it where the
-/// `reduce` entered, whatever its source and UPDATE navigate: jq runs both in the
-/// `FORK`ed loop, which `BACKTRACK`s the register back to its post-INIT state. So
-/// a marker frozen before it is not the register after it, and a `try` or `?`
-/// around a navigation through the marker catches jq's own near-access error,
-/// where the resolver's guess about a lost register made the refusal
-/// uncatchable. The first two rows are the issue's own `?`/`try` repros after a
-/// construction and a passthrough stage, which `main` already answers like jq;
-/// they pin it. The `del`/`=`/`|=` rows are the write side, where the guess lost
-/// or refused a write. A navigating INIT, a destructuring pattern and a
-/// navigating source feeding an UPDATE that navigates keep refusing. Every row
-/// captured from jq 1.7.1.
+/// #3732: the issue's own `?`/`try` repros, a marker passed through a
+/// passthrough stage after a construction moved nothing jq tracks (a `{...}` is a
+/// subexp), so jq's own `try` or `?` catches the near-access error and the whole
+/// `path()` answers nothing. `main` already answers these like jq; this pins it
+/// apart from the `reduce` rule below, which is what the issue's remaining shapes
+/// needed. Every row captured from jq 1.7.1.
 #[test]
-fn test_reduce_with_navigating_source_or_update_leaves_the_register_3732() -> Result<()> {
+fn test_marker_after_construction_and_passthrough_is_caught_3732() -> Result<()> {
     assert_path_rows_3289(&[
         (
             r#"{"a":{"b":1},"c":{"b":1}}"#,
@@ -103183,6 +103177,37 @@ fn test_reduce_with_navigating_source_or_update_leaves_the_register_3732() -> Re
             "",
             "",
             0,
+        ),
+    ])
+}
+
+/// #3732: a `reduce` whose INIT cannot move jq's register leaves it where the
+/// `reduce` entered, whatever its source and UPDATE navigate: jq runs both in the
+/// `FORK`ed loop, which `BACKTRACK`s the register back to its post-INIT state. So
+/// a marker frozen before it is not the register after it, and a `try` or `?`
+/// around a navigation through the marker catches jq's own near-access error,
+/// where the resolver's guess about a lost register made the refusal
+/// uncatchable. The `del`/`=`/`|=` rows are the write side, where the guess lost
+/// or refused a write. A navigating INIT (where jq's register stays on INIT's
+/// node), a destructuring pattern, a source that destructures a computed value
+/// and a navigating source feeding an UPDATE that navigates keep refusing. Every
+/// row captured from jq 1.7.1.
+#[test]
+fn test_reduce_with_navigating_source_or_update_leaves_the_register_3732() -> Result<()> {
+    assert_path_rows_3289(&[
+        (
+            r#"{"a":{"b":1},"c":{"b":2},"k":1}"#,
+            r"path(. as $x | reduce (1) as $i (.a; .b) | $x)",
+            "",
+            "Invalid path expression with result",
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"c":{"b":2},"k":1}"#,
+            r"path(. as $x | reduce .a as $i (.a; .b) | $x)",
+            "",
+            "Invalid path expression near attempt to access element",
+            5,
         ),
         (
             r#"{"a":{"b":1},"c":{"b":2}}"#,

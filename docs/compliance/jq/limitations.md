@@ -1778,8 +1778,9 @@ is the revert that established what the other one costs.
    now states it unmoved whatever its source and `UPDATE` navigate, when they are ones the resolver checks as jq does
    (`reduce_leaves_register_in_place`). Still refused where jq answers: a `reduce` whose INIT navigates
    (`path(.a as $x \| reduce (1) as $i (.a; .b) \| $x)` is `["a"]` in jq, where the register stays on INIT's node), a
-   destructuring pattern, and a source or `UPDATE` outside that allowlist (a source that destructures a computed value is a
-   path error in jq the fold does not model, so accepting the stage there would answer where jq refuses).
+   destructuring pattern, and a source or `UPDATE` outside that allowlist: a `try ... catch` or `//` in the `UPDATE`
+   (`path(. as $x \| reduce (1) as $i (.; .a // 1) \| $x)` is `[]` in jq), and a source that destructures a computed
+   value, which is a path error in jq the fold does not model, so accepting the stage there would answer where jq refuses.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

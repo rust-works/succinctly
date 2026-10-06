@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resolve_reduce` and by `leaves_register_in_place`). #3710 had admitted only a fold none of whose parts navigate. The issue's two construction
   repros (`{k: .a}` then `($v | select(true))`, under `try` and `?`) already answered like jq on `main` and are pinned. Still refused where jq
   answers: a navigating INIT (`path(.a as $x | reduce (1) as $i (.a; .b) | $x)` is `["a"]`), a destructuring pattern, and a source or `UPDATE` outside
-  the allowlist. Swept with `scripts/jq-path-register-sweep.py` over 17 `reduce` operands (226,467 rows, against `main`): 0 regressions, `ACCEPT_WRONG`
+  the allowlist (a `try ... catch` or `//` in the `UPDATE`: `path(. as $x | reduce (1) as $i (.; .a // 1) | $x)` is `[]` in jq). Swept with `scripts/jq-path-register-sweep.py` over 17 `reduce` operands (226,467 rows, against `main`): 0 regressions, `ACCEPT_WRONG`
   unchanged at 315, `REFUSE_WRONG` 3,834 to 2,754, 1,084 rows newly match jq; the first, wider cut of the rule had 52 `ACCEPT_WRONG` regressions on a
   source that destructures a computed value, which is what narrowed it. `scripts/jq-bind-origin-fuzz.py` (30,000 fold-weighted and 20,000
   `?`-source programs): 0 new divergences. Pinned by `test_reduce_with_navigating_source_or_update_leaves_the_register_3732`.
