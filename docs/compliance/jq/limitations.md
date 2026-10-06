@@ -3050,7 +3050,8 @@ answers `["b"]` — and classified the two residuals appended below):
     way: it hands its values out off the resolver's root path and used to read as a literal that
     never touched the register (`(foreach (foreach .[]? as $x (0; .+1)) as $k (.; .; .)) = 9` on
     `{"a":{"a":1},"k":"a"}` replaced the document with `9`; jq raises), and is now a lost
-    register -- a refusal where jq may answer (recorded here; it has no issue of its own).
+    register -- a refusal where jq may answer. Tracked as
+    [#3883](https://github.com/rust-works/succinctly/issues/3883).
   - **jq's pointer identity**: the accumulator's node is not carried from one source element to
     the next (`path(foreach (1, .a) as $k (.; .a))`), `tostring` of a string is the same `jv`
     (`path(foreach (.b|tostring) as $k (.; $k))` on `{"b":"s"}` is `["b"]`), and a full slice
