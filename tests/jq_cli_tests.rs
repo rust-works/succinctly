@@ -64712,6 +64712,111 @@ fn test_array_claim_over_composite_and_or_operands_carries_the_register_3456() -
     ])
 }
 
+/// #3724 (item 2): an `and`/`or`/unary minus inside an `[E]` collect whose operand
+/// jq leaves the register on but the resolver does not follow (a bare `first`,
+/// `last`, `add`, a `map(f)`) is judged as jq judges it. `and`/`or` are not subexps:
+/// `L` moves jq's register wherever it navigates, `R` runs on the original input
+/// against that register, and a short-circuit never runs `R`. So `[first and .[0]]`
+/// on `[true]` raises near element 0 where `[false,1]` answers `[]`, and a collect
+/// whose operands never navigate off the register (`[first and true]`) backtracks
+/// to the root. Every row captured from jq 1.7.1, on the stdin and `-n` routes.
+#[test]
+fn test_collect_and_or_over_register_moving_builtins_3724() -> Result<()> {
+    assert_path_rows_both_routes_3749(&[
+        (
+            r"[true]",
+            r"path(. as $x | [first and true] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | [first or .a] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"[1,2]", r"path(. as $x | [add and 1] | $x)", "[]\n", "", 0),
+        (
+            r"[true]",
+            r"path(. as $x | [map(.) and true] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (r"[0,2]", r"path(. as $x | [-first] | $x)", "[]\n", "", 0),
+        (
+            r"[true,2]",
+            r"path(. as $x | [(first and true) or last] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        // A short-circuit never runs the right operand, so it answers; the
+        // same program on a truthy `first` raises near element 0.
+        (
+            r"[false,1]",
+            r"path(. as $x | [first and .[0]] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true]",
+            r"path(. as $x | [first and .[0]] | $x)",
+            "",
+            "Invalid path expression near attempt to access element 0 of [true]",
+            5,
+        ),
+        (
+            r"[[1],[2]]",
+            r"path(. as $x | [last and first] | $x)",
+            "",
+            "Invalid path expression near attempt to access element 0 of [[1],[2]]",
+            5,
+        ),
+        // The register survives, so a write through `$x` lands on it, and a
+        // write whose collect raises is refused rather than lost.
+        (
+            r"[true,2]",
+            r"del(. as $x | [first and true] | $x[0])",
+            "[2]\n",
+            "",
+            0,
+        ),
+        (
+            r"[false,2]",
+            r"del(. as $x | [first and .[0]] | $x[0])",
+            "[2]\n",
+            "",
+            0,
+        ),
+        (
+            r"[true,2]",
+            r"del(. as $x | [first and .[0]] | $x[0])",
+            "",
+            "Invalid path expression near attempt to access element 0 of [true,2]",
+            5,
+        ),
+        (
+            r"[true,2]",
+            r"(. as $x | [first and true] | $x[0]) |= 9",
+            "[9,2]\n",
+            "",
+            0,
+        ),
+        // The collect's own output is computed, so navigating it still raises.
+        (
+            r"[true]",
+            r"path(. as $x | [first and first] | $x | .[0])",
+            "",
+            "Invalid path expression near attempt to access element 0 of [true]",
+            5,
+        ),
+    ])
+}
+
 /// #3289's negative control: a number or string register is never identical
 /// to a fresh boolean, so these stay refused -- the conjunct that keeps the
 /// class-B acceptance from turning into a write jq refuses.

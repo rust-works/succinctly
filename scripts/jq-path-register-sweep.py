@@ -635,6 +635,27 @@ OPERANDS = [
     "[.[] | map(.a)]",
     "[map(map(.a))]",
     "[map(.a | map(.b))]",
+    # (#3724, item 2) an `and`/`or`/unary minus inside an `[E]` collect whose operands
+    # the narrower `register_movement_tracked` allowlist rejected and
+    # `array_contents_are_checked` accepts: a bare `first`/`last`/`add`/`any`, a
+    # `map(f)`, `last(f)`. jq's answer depends on the value (a short-circuit never
+    # runs the right operand), so each is swept over inputs that decide both ways.
+    "[first and true]",
+    "[first and .[0]]",
+    "[.[0] and first]",
+    "[first or .a]",
+    "[last and first]",
+    "[add and 1]",
+    "[any and all]",
+    "[map(.) and true]",
+    "[map(.a) and .[0]]",
+    "[true or first]",
+    "[-first]",
+    "[-(add)]",
+    "[(first and true) or last]",
+    "[last(.a) and first]",
+    "[.a? and first]",
+    "[(.a, .[0]) and last]",
 ]
 
 # The other side of a two-operand shape. Chosen so that, against the inputs

@@ -41351,12 +41351,14 @@ fn and_or_negate_resolves_live<S: EvalSemantics>(expr: &Expr) -> bool {
 /// (`first` is `.[0]`), a `def`, `try`, `if` (whose untaken branch drops the
 /// register statically) -- answers `false`.
 ///
-/// Read only by [`array_contents_are_checked`] since #3428: the `and`/`or`
-/// arms no longer decline an operand this rejects, because each operand's
-/// branch states its own register ([`register_after`]). An `[E]` still needs
-/// the allowlist, because its claim is that the resolver checks everything
-/// jq checks inside the brackets -- a stronger statement than "the register
-/// is known afterwards" -- and widening it is a separate promotion.
+/// Read only by [`and_or_operand_is_checked`] since #3428 (and, through it, by
+/// [`array_contents_are_checked`]'s `and`/`or`/minus arm): the `and`/`or` arms
+/// no longer decline an operand this rejects, because each operand's branch
+/// states its own register ([`register_after`]). An `[E]` still needs an
+/// allowlist, because its claim is that the resolver checks everything jq
+/// checks inside the brackets -- a stronger statement than "the register is
+/// known afterwards". Since #3724 that claim is this predicate *or*
+/// [`array_contents_are_checked`].
 ///
 /// Unlike [`array_contents_are_checked`], which admits a bare `first`
 /// because it cannot *fail* against a tracked input, this asks whether the
@@ -42047,16 +42049,17 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         Expr::LastExpr(f) | Expr::Builtin(Builtin::LastStream(f)) => array_contents_are_checked(f),
         // #3289: `resolve_node_sink` resolves `and`/`or`/unary minus live in
         // jq mode, checking each operand's navigation against the register
-        // as jq does. Since #3428 it does so for every operand; this claim
-        // keeps the narrower allowlist ([`register_movement_tracked`]) it was
-        // written against, which a bare `first` fails even though
-        // `array_contents_are_checked` admits it: `[first and .[0]]` on
-        // `[true]` is refused by jq near element 0. Widening an `[E]` claim
-        // is a promotion with oracle rows of its own (#3456, section 10 of
-        // the design note), not part of closing #3428.
-        // Confirmed live against jq 1.7.1: `path(. as $x | [.a and 5] | $x)`
-        // and `path(. as $x | [-.a] | $x)` on `{"a":1}` are `[]`, while
-        // `path([.a and .b] | empty)` still refuses near `"b"`.
+        // as jq does, and since #3428 it does so for every operand. The claim
+        // started on the narrower allowlist ([`register_movement_tracked`]),
+        // which a bare `first` fails; #3724 (item 2) widened it to the union
+        // with [`array_contents_are_checked`] ([`and_or_operand_is_checked`]),
+        // so `[first and .[0]]` is judged as jq judges it: on `[true]` the
+        // right operand navigates off the register `first` moved and both raise
+        // near element 0, on `[false,1]` the left operand short-circuits and
+        // both answer `[]`. Confirmed live against jq 1.7.1:
+        // `path(. as $x | [.a and 5] | $x)` and `path(. as $x | [-.a] | $x)` on
+        // `{"a":1}` are `[]`, while `path([.a and .b] | empty)` still refuses
+        // near `"b"`.
         Expr::And(l, r) | Expr::Or(l, r) => {
             and_or_operand_is_checked(l) && and_or_operand_is_checked(r)
         }
