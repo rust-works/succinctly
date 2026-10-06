@@ -110633,6 +110633,18 @@ fn test_slurp_multiple_files_keep_order_and_last_file_location_2847() -> Result<
     assert_eq!(code, 5);
     assert_eq!(err, format!("jq: error (at {}:0): x\n", paths[1]));
 
+    // A malformed member read lazily is reported at the slurped value's
+    // location, which is the *last* file even when the member is in an
+    // earlier one (jq fails at parse time instead, with no file at all).
+    let (out, err, code, paths) =
+        run_jq_over_files(&["-sc", ".[0]"], &[concat!("{", "123:1}\n"), "2\n"])?;
+    assert_eq!(code, 5, "out {out:?}");
+    assert!(out.is_empty(), "out {out:?}");
+    assert!(
+        err.starts_with(&format!("jq: error (at {}:1): ", paths[1])),
+        "stderr: {err}"
+    );
+
     // stdin: one newline per value here.
     let (_, err, code) = run_jq_full(&["-sc", r#"error("x")"#], Some("1\n2\n"))?;
     assert_eq!(code, 5);

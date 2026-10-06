@@ -4244,7 +4244,8 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
 
     // The lazy path preserves number formatting and uses less memory.
     // It's available when:
-    // - Not using features that require serde_json parsing (slurp, raw_input, seq input, dsv)
+    // - Not using features that require serde_json parsing (raw_input, seq input, dsv).
+    //   `--slurp` is no longer one of them (#2847, see below).
     // - Not using input/inputs/input_line_number (#723): those need the
     //   "original" path's own already-materialized Vec<OwnedValue> to share
     //   with the shared input queue below; the lazy path never builds one.
@@ -6359,9 +6360,13 @@ struct SlurpedInput {
 /// failures (and `--validate`) still stop the whole stream, as they always did
 /// under `--slurp`.
 ///
-/// `raw_inputs` is consumed so each file's buffer is freed as soon as it has
-/// been copied. Failures surface in file order, each file validated and split
-/// before the next is looked at, as `get_inputs` has always done.
+/// `raw_inputs` is consumed so each file's buffer is freed once it has been
+/// copied: a run over several files gives memory back as the join grows, while
+/// a single file is held alongside its copy until the copy is complete, so the
+/// transient peak is about twice that file (the index then replaces it). The
+/// spans cost 16 bytes per top-level value on top. Failures surface in file
+/// order, each file validated and split before the next is looked at, as
+/// `get_inputs` has always done.
 fn slurp_documents(
     raw_inputs: Vec<Vec<u8>>,
     files: &[PathBuf],

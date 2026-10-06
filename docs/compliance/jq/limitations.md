@@ -7189,8 +7189,10 @@ reads) plus two consequences of the route:
   `-sc 'map(type)'` on `{123:1} 2` answer at exit 0; `-sc '.[0]'` still exits 5 with nothing
   printed, and `-sc '.[]'` on `1 {123:1}` prints `1` and then exits 5, as the default route
   does for a stream of documents. The error is the lazy route's own diagnostic, at the
-  slurped value's location (the last file's EOF line, as every other `-s` error), where it
-  used to be the document parser's at `<file>:0`.
+  slurped value's location (the last file's EOF line, as every other `-s` error, **even when
+  the member lives in an earlier file**: `-sc '.[0]' bad.json ok.json` names `ok.json`), where
+  it used to be the document parser's at `<file>:0`. jq itself has no per-member position
+  here: it fails at parse time, with no file in its message.
 - What the splitter cannot delimit is **unchanged** and still all-or-nothing under `-s` — a
   truncated container or string, a byte that starts no token, a raw control character in a
   string — and `--validate` still checks each file in order first. `1 2 }` and `[1,2` exit 5
@@ -7403,9 +7405,11 @@ baseline for both is a filter that already had a native arm.
 
 **What did not change.** A filter that reads `.` still materializes and still validates
 everything it materializes — `. as $x | $x`, `if . then . else . end`, `[.]`, `{k: .}`,
-`. and true`, `range(length; 3)`, and `.` itself all keep their exit 5. So do the
-materializing flag routes (`-S`, `-a`, `-s`, `-C`, `-n`), which never reach these sites and
-are #2662's (and, for `-s`, #2847's). And a document whose *root* the reader cannot delimit at all — `xyz123`,
+`. and true`, `range(length; 3)`, and `.` itself all keep their exit 5. So did the
+materializing flag routes (`-S`, `-a`, `-s`, `-C`, `-n`) when this was written: they never
+reached these sites. #2662 (`-S`/`-a`/`-C`) and #2847 (`-s`) have since moved onto the lazy
+route these entries describe, and only `-n`/`input` still validates whatever it materializes.
+And a document whose *root* the reader cannot delimit at all — `xyz123`,
 `[1,2`, `["a`, `[1] x` — still fails for every filter including `empty`, because there is
 no value to skip reading; that is the reader, not a filter, and it matches jq.
 
