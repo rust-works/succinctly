@@ -60866,6 +60866,56 @@ fn test_indices_family_evaluates_its_pattern_once_3347() -> Result<()> {
     Ok(())
 }
 
+/// #3347: control flow out of the pattern behaves as it does in jq: a `halt` ends
+/// the process even after an earlier pattern value ran its search, an error after
+/// a successful search is the error, the pattern's *first* value is the one that
+/// raises the path error (a later `error` is never reached), and a `break`
+/// ends the search quietly. Captured live from jq 1.7.1.
+#[test]
+fn test_indices_family_pattern_control_flow_3347() -> Result<()> {
+    for (filter, stdout, stderr, exit) in [
+        (
+            r#"[path(("abc" | indices("b", ("x" | halt_error(3)))) | empty)]"#,
+            "",
+            "x",
+            3,
+        ),
+        (
+            r#"[path(("abc" | indices("b", error("e"))) | empty)]"#,
+            "",
+            "e",
+            5,
+        ),
+        (
+            r#"[path(([1] | indices(1, error("e"))) | empty)]"#,
+            "",
+            "element [1] of [1]",
+            5,
+        ),
+        (
+            r#"[label $out | path(("abc" | indices("b", break $out, "c")) | empty)]"#,
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"first(path(("abc" | indices("b", "c")) | empty), 7)"#,
+            "7\n",
+            "",
+            0,
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_eq!(
+            (out.as_str(), code),
+            (stdout, exit),
+            "#3347: `{filter}`: {err:?}"
+        );
+        assert!(err.contains(stderr), "#3347: `{filter}`: {err:?}");
+    }
+    Ok(())
+}
+
 /// #3347: the raise reaches the write consumers of `path()` too, where the old
 /// by-value answer was an empty path set (`del` echoed the document, `=` wrote
 /// nothing, both exit 0). Captured live from jq 1.7.1.

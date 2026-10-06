@@ -2255,8 +2255,10 @@ is the revert that established what the other one costs.
    it (`.[[$i]]`), any other input names the pattern as it came, and a string searched for a
    string only reads — except that `index` and `rindex` then apply `.[0]` / `.[-1:]` to the array
    of positions `indices` built, which is never the register. A pattern that is empty or raises
-   never reaches the access, as in jq. The rule has no oracle in yq (its lexer rejects all three),
-   so it holds in both modes, reached in yq only through `--jq-extensions` (ADR-0018). Pinned in
+   never reaches the access, as in jq. The raise is the resolver's own refusal, so a `?//` does not retry it: `del(. as [$q] ?// $q | (indices(true) and (.a)?))`
+   refuses where jq's retry answers, as `first`, `reverse` and `.[0:1]` already do there. Unlike the jq-mode-only rule above (which covers `map`, `any`, `all` and
+   `flatten`, real yq builtins), this one is not gated: yq has no oracle for these three (its lexer
+   rejects them), so it holds in both modes, reached in yq only through `--jq-extensions` (ADR-0018). Pinned in
    `test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347` and its siblings. Still
    diverging, each tracked: an array input on a *tracked* value, where jq answers a path through
    an array key (`path(.a | indices(1))` is `["a",[1]]`), and a string `index`/`rindex` there

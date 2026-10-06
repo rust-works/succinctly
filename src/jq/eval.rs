@@ -39870,6 +39870,36 @@ fn eval_each_pattern_search<S: EvalSemantics>(
     (flow, refusal)
 }
 
+/// [`eval_each_owned`] over a leaf's own `expr`, with the one leaf that must
+/// observe its argument routed through [`eval_each_pattern_search`] (#3347):
+/// `indices`/`index`/`rindex` name their pattern in the access they raise on an
+/// untracked input, which only the evaluation that produces the pattern can tell.
+/// Shared by [`resolve_leaf`] and [`resolve_leaf_sink`] so the two forms cannot
+/// disagree about it. The refusal it returns, if any, is read like the caller's
+/// own `construct_refusal`.
+fn eval_leaf_each<S: EvalSemantics>(
+    expr: &Expr,
+    value: &OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    register_loss: &RegisterLoss,
+    on_value: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> (Flow, Option<EvalError>) {
+    let reentry = Reentry::at_register(trackable);
+    match PatternSearch::of(expr).filter(|_| !trackable) {
+        Some((search, pattern)) => {
+            let refuse = |e: EvalError, step: Option<NavKind>| {
+                guess_refusal(e, register_loss, snapshot, value, step)
+            };
+            eval_each_pattern_search::<S>(search, pattern, value, reentry, &refuse, on_value)
+        }
+        None => (
+            eval_each_owned::<S>(expr, value, false, reentry, on_value),
+            None,
+        ),
+    }
+}
+
 /// #3271: six kinds of construct (eleven `Expr`/`Builtin` variants between
 /// them) whose jq-defined bodies always fail jq's own internal path-check
 /// once they have actually *produced a value* -- `with_entries`,
@@ -40451,22 +40481,15 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
             Demand::Continue
         }
     };
-    let reentry = Reentry::at_register(trackable);
-    let pattern_search = PatternSearch::of(expr).filter(|_| !trackable);
-    let flow = if let Some((search, pattern)) = pattern_search {
-        // #3347: `indices`/`index`/`rindex` name their pattern in the access
-        // they raise on an untracked input, which only the evaluation that
-        // produces the pattern can tell.
-        let refuse = |e: EvalError, step: Option<NavKind>| {
-            guess_refusal(e, register_loss, snapshot, value, step)
-        };
-        let (flow, refusal) =
-            eval_each_pattern_search::<S>(search, pattern, value, reentry, &refuse, &mut on_value);
-        construct_refusal = construct_refusal.or(refusal);
-        flow
-    } else {
-        eval_each_owned::<S>(expr, value, false, reentry, &mut on_value)
-    };
+    let (flow, refusal) = eval_leaf_each::<S>(
+        expr,
+        value,
+        trackable,
+        snapshot,
+        register_loss,
+        &mut on_value,
+    );
+    construct_refusal = construct_refusal.or(refusal);
 
     // Halt first, exactly as the collecting form checks `trailing` first: an
     // already-triggered halt must never be downgraded into a catchable path
@@ -40796,20 +40819,15 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             Demand::Continue
         }
     };
-    let reentry = Reentry::at_register(trackable);
-    let pattern_search = PatternSearch::of(expr).filter(|_| !trackable);
-    let flow = if let Some((search, pattern)) = pattern_search {
-        // #3347: as in `resolve_leaf_sink`.
-        let refuse = |e: EvalError, step: Option<NavKind>| {
-            guess_refusal(e, register_loss, snapshot, value, step)
-        };
-        let (flow, refusal) =
-            eval_each_pattern_search::<S>(search, pattern, value, reentry, &refuse, &mut on_value);
-        construct_refusal = construct_refusal.or(refusal);
-        flow
-    } else {
-        eval_each_owned::<S>(expr, value, false, reentry, &mut on_value)
-    };
+    let (flow, refusal) = eval_leaf_each::<S>(
+        expr,
+        value,
+        trackable,
+        snapshot,
+        register_loss,
+        &mut on_value,
+    );
+    construct_refusal = construct_refusal.or(refusal);
 
     // Halt-first, exactly as the eager version checked `trailing` first —
     // an already-triggered halt (whether it escaped bare, or is `pending`
