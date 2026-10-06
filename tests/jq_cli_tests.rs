@@ -68089,57 +68089,128 @@ fn test_foreach_update_under_try_around_a_generator_keeps_the_register_3770() ->
     ])
 }
 
+/// #3770: a `foreach` UPDATE under `try` whose body has a comma *inside a
+/// pipe* keeps jq's path register. `fans_out` used to see the comma anywhere in
+/// the body, so the fold withheld the register, the `try` caught its own
+/// refusal and a write through it was silently skipped -- while the same body
+/// without `try`, a bare pipe, already matched. A nested pipe threads the
+/// register through its stages exactly as that top-level one does. Every row
+/// captured from jq 1.7.1 with `-c`.
+#[test]
+fn test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770() -> Result<()>
+{
+    let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#;
+    assert_path_rows_3289(&[
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a, .b?); .))",
+            "[\"x\",\"a\"]\n[\"x\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"del(foreach .x as $w (0; try ($w | .a, .b?); .))",
+            "{\"a\":[{\"b\":1}],\"x\":{}}\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a[] | (.b, .c)); .))",
+            "[\"x\",\"a\",0,\"b\"]\n[\"x\",\"a\",0,\"c\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"(foreach .x as $w (0; try ($w | .a[] | (.b, .c)); .)) = 9",
+            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":9,\"c\":9}]}}\n",
+            "",
+            0,
+        ),
+        // A `def` inside the pipe, and the pipe under `//` as well as `try`.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | def f: .a, .b; f); .))",
+            "[\"x\",\"a\"]\n[\"x\",\"b\"]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(foreach .x as $w (0; (try ($w | .a, .b?)) // 1; .))",
+            "[\"x\",\"a\"]\n",
+            "",
+            0,
+        ),
+        // #3145's destructuring shape, with the comma moved inside the pipe.
+        (
+            r#"{"a":{"c":[5]}}"#,
+            r"(foreach .a as {a:$v} ?// {c:$v} (0; try ($v | (.[0], .)); .)) = 9",
+            "{\"a\":{\"c\":[5],\"a\":9}}\n",
+            "",
+            0,
+        ),
+        // The EXTRACT is the register itself, which a frozen `$w` is not identical to.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try ($w | .a, .b?); $w))",
+            "",
+            "Invalid path expression with result {\"a\":[{\"b\":1}]}",
+            5,
+        ),
+    ])
+}
+
 /// #3770, characterization of what remains of a pre-existing bug. A `foreach`
-/// UPDATE whose body has a comma still answers nothing where jq answers a path,
-/// so a write through it is silently skipped: a comma is the split `fans_out`
-/// really guards (#3145: `(foreach .a as {a:$v} ?// {c:$v} (0; ($v[0]?, $v))) =
-/// 9` wrote `.a.c`). On `null`, `//` around a generator now refuses loudly where
-/// it used to answer nothing: a bare `$k` alternate cannot relocate to the
-/// register once the body navigates anywhere (#3788), and an `and` body leaves
-/// the EXTRACT's `$k` with no register. jq 1.7.1's answers are in the comments;
-/// update the expectations when these are fixed.
+/// UPDATE whose body has a comma *above* any pipe still answers differently
+/// from jq: that is the split `fans_out` really guards (#3145: `(foreach .a as
+/// {a:$v} ?// {c:$v} (0; ($v[0]?, $v))) = 9` wrote `.a.c`), so the fold
+/// withholds the register. It now marks the register lost, so the refusal is
+/// loud (exit 5) instead of being caught by the body's `try` into a silently
+/// skipped write. A refusal of a value that cannot be the register stays
+/// catchable (`try (.zz, $w)`, which matches jq). On `null`, `//` around a
+/// generator refuses loudly where jq answers: a bare `$k` alternate cannot
+/// relocate to the register once the body navigates anywhere (#3788), and an
+/// `and` body leaves the EXTRACT's `$k` with no register. jq 1.7.1's answers
+/// are in the comments; update the expectations when these are fixed.
 #[test]
 fn test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770(
 ) -> Result<()> {
     let doc = r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#;
+    let refused =
+        r#"Invalid path expression near attempt to access element "a" of {"a":[{"b":1}]}"#;
     assert_path_rows_3289(&[
-        // jq: ["x","a"] and ["x","b"]
-        (
-            doc,
-            r"path(foreach .x as $w (0; try ($w | .a, .b?); .))",
-            "",
-            "",
-            0,
-        ),
         // jq: ["x","a",0] and ["x"]
         (
             doc,
             r"path(foreach .x as $w (0; try (($w | .a[]), $w); .))",
             "",
-            "",
-            0,
-        ),
-        // jq: ["x","a",0,"b"] and ["x","a",0,"c"]
-        (
-            doc,
-            r"path(foreach .x as $w (0; try ($w | .a[] | (.b, .c)); .))",
-            "",
-            "",
-            0,
-        ),
-        // jq: {"a":[{"b":1}],"x":{}}
-        (
-            doc,
-            r"del(foreach .x as $w (0; try ($w | .a, .b?); .))",
-            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}]}}\n",
-            "",
-            0,
+            refused,
+            5,
         ),
         // jq: {"a":[{"b":1}],"x":9}
         (
             doc,
             r"(foreach .x as $w (0; try (($w | .a[]), $w); .)) = 9",
-            "{\"a\":[{\"b\":1}],\"x\":{\"a\":[{\"b\":1}]}}\n",
+            "",
+            refused,
+            5,
+        ),
+        // jq: {"a":[{"b":1}],"x":{}}
+        (
+            doc,
+            r"del(foreach .x as $w (0; try (($w | .a), ($w | .b)); .))",
+            "",
+            refused,
+            5,
+        ),
+        // Matches jq: `.zz` of the accumulator `0` is not a guess about the register.
+        (
+            doc,
+            r"path(foreach .x as $w (0; try (.zz, $w); .))",
+            "",
             "",
             0,
         ),

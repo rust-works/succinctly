@@ -75,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `path((.a | select(.b)) as $y | .a | $y)`, `path((.a // 1) as $y | .a | $y)` and the `if` spelling move from refuse-only to answered.
   Residual: a `?//` whose source forwards `.` through control flow still drops the write (`docs/compliance/jq/limitations.md`). Pinned by
   `test_bind_sources_beyond_the_alias_grammar_keep_the_write_3795` and `test_bind_sources_the_resolver_cannot_place_refuse_loudly_3795`.
+- **jq: a `foreach` UPDATE or EXTRACT under `try` whose body has a comma inside a pipe no longer silently skips a write** (#3770, after #3792).
+  `del(foreach .x as $w (0; try ($w | .a, .b?); .))` on `{"a":[{"b":1}],"x":{"a":[{"b":1}]}}` is `{"a":[{"b":1}],"x":{}}` in jq and
+  echoed the document here, and `path(...)` printed nothing where jq prints `["x","a"]` and `["x","b"]`. `fans_out` saw the comma anywhere
+  in the body and withheld the fold's register, so the `try` caught the body's own refusal; the same body without `try`, a bare pipe,
+  already matched. `fans_out` now stops at a nested pipe, which carries the register through its stages exactly as a top-level one does,
+  so only a split *above* every pipe still counts (#3145's `($v[0]?, $v)`). Where the register is still withheld, the fold now marks it
+  lost (#3267), so `(foreach .x as $w (0; try (($w | .a[]), $w); .)) = 9` (`{"a":[{"b":1}],"x":9}` in jq) refuses loudly (exit 5)
+  instead of leaving the document unchanged with exit 0. Pinned by `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770`
+  and `test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`.
 - **jq: `paths`, `leaf_paths` and the cursor-native `path(f)` walkers answer on documents nested 256-383 levels deep** (#3429).
   They shared the whole-document materializers' 256 ceiling, so a well-formed document in that band answered `[..]` but raised
   `nesting depth exceeds limit of 256` for `[paths]`, `[leaf_paths]`, `[.. | path]` and a static `path(.a.a...)` chain. They now stop at

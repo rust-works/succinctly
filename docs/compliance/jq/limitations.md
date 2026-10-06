@@ -2628,15 +2628,21 @@ is the revert that established what the other one costs.
    echoed the document where jq empties `.x.a`, and `(...) = 9` skipped the write (as did the
    same body as the EXTRACT). #3738 exempted one chain of stages; #3770 stopped counting a
    generator as a split at all, so `//`, `select`, `first(...)`, `limit`, `if`, `getpath(...)`, a
-   computed key and a `catch` handler around one keep the register too. `fans_out` still counts
-   a comma, a destructuring bind, a fold and a call, and a comma body still answers nothing
-   where jq answers, so a write through it is silently skipped (`path(foreach .x as $w (0; try ($w \| .a, .b?); .))` is `["x","a"]`, `["x","b"]` in jq).
+   computed key and a `catch` handler around one keep the register too. `fans_out` then stopped
+   at a nested pipe, which carries the register through its own stages as a top-level pipe body
+   does, so a comma or call inside one keeps it as well (`path(foreach .x as $w (0; try ($w \|
+   .a, .b?); .))` is `["x","a"]`, `["x","b"]`, as in jq). It still counts a comma, a
+   destructuring bind, a fold and a call *above* every pipe, the split #3145 guards, and such a
+   body still differs from jq: `(foreach .x as $w (0; try (($w \| .a[]), $w); .)) = 9` is
+   `{"a":[{"b":1}],"x":9}` in jq. The fold marks the withheld register lost (#3267), so that
+   refuses loudly (exit 5) rather than silently skipping the write.
    On a `null` document, `//` around a generator (`(foreach .a? as $k (0; try (($k \| .[]?) //
    $k); .)) = 9`, `{"a":9}` in jq) now refuses loudly where it used to skip the write: the bare
    `$k` alternate cannot relocate to the register once the body navigates anywhere
    ([#3788](https://github.com/rust-works/succinctly/issues/3788)). Pinned by
    `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`,
-   `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770` and, for what stays,
+   `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`,
+   `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770` and, for what stays,
    `test_foreach_update_under_try_with_sibling_branches_characterize_preexisting_bug_3770`.
 
    **`resolve_as_pattern`'s own first-step identity test recognizes every
