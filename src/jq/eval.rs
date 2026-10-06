@@ -39408,7 +39408,15 @@ fn resolve_alternative_sink<'a, S: EvalSemantics>(
 ) -> ResolveFlow {
     if let Expr::Literal(lit) = unwrap_paren(left) {
         if !literal_to_owned(lit).is_truthy() {
-            return resolve_node_sink::<S>(right, value, trackable, snapshot, frame, keep, sink);
+            return resolve_node_sink::<S>(
+                right,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                &mut |branch| sink(carry_frame_register(right, branch, frame)),
+            );
         }
     }
     let mut emitted = false;
@@ -39456,17 +39464,19 @@ fn resolve_alternative_sink<'a, S: EvalSemantics>(
 /// own answer is the right one -- this is that answer, stated on the branch.
 /// A tracked branch already states its own, and a branch that already says
 /// anything keeps it.
+///
+/// The checks run cheapest first: `frame` has a register only in a jq-mode
+/// fold, so `operand` is walked only for a branch that could use the answer.
 fn carry_frame_register<'a>(
     operand: &Expr,
     mut branch: PathBranch<'a>,
     frame: &Frame,
 ) -> PathBranch<'a> {
-    if !branch.trackable
-        && matches!(branch.register, BranchRegister::None)
-        && cannot_move_register(operand)
-    {
+    if !branch.trackable && matches!(branch.register, BranchRegister::None) {
         if let Some(register) = frame.register() {
-            branch.register = BranchRegister::Unmoved(Cow::Owned(register.clone()));
+            if cannot_move_register(operand) {
+                branch.register = BranchRegister::Unmoved(Cow::Owned(register.clone()));
+            }
         }
     }
     branch

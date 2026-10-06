@@ -2717,8 +2717,11 @@ is the revert that established what the other one costs.
    ([#3788](https://github.com/rust-works/succinctly/issues/3788), pinned by
    `test_foreach_update_bare_var_alternate_keeps_the_register_3788`). Still refused loudly where
    jq answers: a bare `$k` in a comma body (`path(foreach .a as $k (0; $k, ($k \| .c); .))`,
-   the register is withheld from a body that fans out) and a by-value alternate followed by an
-   EXTRACT `$k` (`path(foreach .a as $k (0; ($k \| .b) // 5; $k))`). Pinned by
+   the register is withheld from a body that fans out), a by-value alternate followed by an
+   EXTRACT `$k` (`path(foreach .a as $k (0; ($k \| .b) // 5; $k))`), and an alternate that is
+   not a bare operand: a pipe after the `//` (`(($k \| .b) // $k) \| .c`, `... // $k \| $k`) or a
+   comma inside it (`($k \| .b) // ($k, $k)`), all pinned by
+   `test_foreach_update_alternate_shapes_the_3788_carry_does_not_reach_characterize`. Pinned by
    `test_foreach_update_under_try_over_a_generator_keeps_the_register_3738`,
    `test_foreach_update_under_try_around_a_generator_keeps_the_register_3770`,
    `test_foreach_update_under_try_with_a_comma_inside_a_pipe_keeps_the_register_3770` and, for what stays,

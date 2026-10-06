@@ -68832,6 +68832,60 @@ fn test_foreach_update_bare_var_alternate_keeps_the_register_3788() -> Result<()
     ])
 }
 
+/// #3788, characterization of what the fix leaves refusing loudly where jq 1.7.1 answers (the
+/// safe direction, and the same on `main`). jq's answers are in the comments; update the
+/// expectations when these are fixed. A bare `$k` in a comma body needs the register the fold
+/// withholds from a body that fans out (#3145, #3862); a `//` whose alternate is not a bare
+/// operand (a pipe after it, a comma inside it, a by-value alternate with an EXTRACT `$k`) is
+/// answered by the stage's own gate, not by the branch the carry states.
+#[test]
+fn test_foreach_update_alternate_shapes_the_3788_carry_does_not_reach_characterize() -> Result<()> {
+    let doc = r#"{"a":{"c":1}}"#;
+    let refusal = "Invalid path expression";
+    assert_path_rows_3289(&[
+        // jq: ["a"] and ["a","c"]
+        (
+            doc,
+            r"path(foreach .a as $k (0; $k, ($k | .c); .))",
+            "",
+            refusal,
+            5,
+        ),
+        // jq: ["a"]
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // 5; $k))",
+            "",
+            refusal,
+            5,
+        ),
+        // jq: ["a","c"]
+        (
+            doc,
+            r"path(foreach .a as $k (0; (($k | .b) // $k) | .c; .))",
+            "",
+            refusal,
+            5,
+        ),
+        // jq: ["a"] and ["a"]
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // ($k, $k); .))",
+            "",
+            refusal,
+            5,
+        ),
+        // jq: ["a"]
+        (
+            doc,
+            r"path(foreach .a as $k (0; ($k | .b) // $k | $k; .))",
+            "",
+            refusal,
+            5,
+        ),
+    ])
+}
+
 /// #3361: `add`, `flatten`, `map(f)` and `walk(f)` are jq-defined over a
 /// source they backtrack (`reduce .[] as $x ...`, `[.[] | f]`), `to_entries`
 /// keeps every step inside an `as` source or an object construction, and `sort`
