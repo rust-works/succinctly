@@ -2242,7 +2242,29 @@ is the revert that established what the other one costs.
    | Still diverging                                                                     | jq 1.7.1                                        | succinctly | Tracked                                                                  |
    | ----------------------------------------------------------------------------------- | ----------------------------------------------- | ---------- | ------------------------------------------------------------------------ |
    | `[path(([1] \| unique) \| empty)]`, and `unique_by`/`map_values`/`with_entries`, `walk` on an *object* (or an array holding one at any depth, since #3283 step 3 — `array_reaches_object`), `sub`/`gsub` (with or without flags), `ascii_downcase`/`ascii_upcase`, `fromstream(f)`, the `match`/`scan`/`capture`/`splits` family, and every update assignment (`\|=`, a compound `op=`, `//=`; plain `=` is exempt, #3186) | raises, naming a **derived** container (`iterate through [[1]]`) once the construct's own type-check and argument evaluation have already succeeded | raises the same `ErrorKind::UntrackedNavigation` (ordinarily catchable, same as jq — confirmed live, `try with_entries(.)` and `try (.k \|= 3)` are both caught in both tools), naming the value the construct actually produced rather than jq's `to_entries`/`group_by`/`match`/`_modify`/`explode`/`foreach`-accumulator intermediate. Checked only *after* by-value evaluation succeeds, so jq's own type error, or an `error(...)`/`empty` from an argument or right-hand side, still wins exactly as it did before — a first cut of this fix checked `expr`'s bare shape before evaluating it and wrongly pre-empted all of those. `with_entries(error("x"))` is one further, narrower message-only residual on top of that: jq raises its own path error first (its `map` iterates the constructed `to_entries` before `f` runs), where this resolver raises `x` — the argument's own `error(...)` "still wins" rule this row already documents holds for `op=` but not for `with_entries`; only the message differs, and both exit 5 (#3271 residual, found while implementing #3284) | [#3271](https://github.com/rust-works/succinctly/issues/3271) and #2743's own follow-through, fully narrowing [#2743](https://github.com/rust-works/succinctly/issues/2743) |
-   | `[path(([1,2,3] \| nth(2)) \| empty)]`, and `indices`/`index`/`rindex`; `INDEX(f)` and `transpose` | raises; element depends on an argument this table cannot evaluate without a probe that duplicates real evaluation's side effects or mis-handles a multi-output argument (found live during #2744's own review) | `[]`       | [#3347](https://github.com/rust-works/succinctly/issues/3347), split off [#2744](https://github.com/rust-works/succinctly/issues/2744) |
+   | `[path(([[1]] \| INDEX(.)) \| empty)]`, and `transpose` | raises `near attempt to iterate through`; neither takes an argument, so no probe is involved (`INDEX(f)` is a constant `Iterate`, `transpose` depends only on its input, #2743) | `[]`       | [#3888](https://github.com/rust-works/succinctly/issues/3888) |
+
+   *Closed.* The second row used to list `nth(n)` and `indices`/`index`/`rindex` too: their
+   element is the *evaluated argument*, which a static table cannot hold and which #2744's
+   first attempt fetched with a speculative probe (it ran an `input`/`debug` in the argument
+   twice, and named a multi-output argument as one collected array where jq raises on its first
+   value). `nth(n)` is the `.[n]` path step since #3550. `indices`/`index`/`rindex` are fixed
+   by observing the pattern instead of probing it (#3347): the leaf resolvers evaluate it once and
+   run the real search per value, which is jq's own `PATTERN as $i | BODY` desugaring. On an
+   untracked input an array input names the pattern (`.[$i]`) or the one-element array holding
+   it (`.[[$i]]`), any other input names the pattern as it came, and a string searched for a
+   string only reads — except that `index` and `rindex` then apply `.[0]` / `.[-1:]` to the array
+   of positions `indices` built, which is never the register. A pattern that is empty or raises
+   never reaches the access, as in jq. The raise is the resolver's own refusal, so a `?//` does not retry it: `del(. as [$q] ?// $q | (indices(true) and (.a)?))`
+   refuses where jq's retry answers, as `first`, `reverse` and `.[0:1]` already do there. Unlike the jq-mode-only rule above (which covers `map`, `any`, `all` and
+   `flatten`, real yq builtins), this one is not gated: yq has no oracle for these three (its lexer
+   rejects them), so it holds in both modes, reached in yq only through `--jq-extensions` (ADR-0018). Pinned in
+   `test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347` and its siblings. Still
+   diverging, each tracked: an array input on a *tracked* value, where jq answers a path through
+   an array key (`path(.a | indices(1))` is `["a",[1]]`), and a string `index`/`rindex` there
+   ([#3890](https://github.com/rust-works/succinctly/issues/3890)), and the by-value answer for an
+   empty string needle (`"abc" | indices("")` is `[]` in jq 1.7.1 and `[0,1,2]` here,
+   [#3889](https://github.com/rust-works/succinctly/issues/3889)).
 
    The rule is **jq-mode only** (ADR-0018): `map`, `any`, `all` and `flatten` are real yq
    builtins, and yq v4.53.3 raises for none of them, so `succinctly yq` does not either.
