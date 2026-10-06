@@ -65722,6 +65722,20 @@ fn test_collect_map_any_all_navigating_f_keeps_the_register_3724() -> Result<()>
         // A chain may end in a stage that navigates nothing.
         (
             doc,
+            r"path(. as $x | [map(.a, length)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
+            r"path(. as $x | [map(if .a then .b else length end)] | $x)",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            doc,
             r"path(. as $x | [map(.b | length)] | $x)",
             "[]\n",
             "",
