@@ -32,8 +32,8 @@ the alphabet. Run `--self-test` to print the pools.
 
 Two-sided staleness gate, as the other oracle sweeps have: the run fails on
 any divergence outside `KNOWN_RESIDUALS` -- the (source, category) pairs whose
-remaining divergences are tracked (#3460: pointer identity; a nested navigating
-`foreach`) -- and on any tracked pair that
+remaining divergences are recorded (#3460: pointer identity; a nested navigating
+`foreach`, recorded in docs/compliance/jq/limitations.md) -- and on any recorded pair that
 *stops* occurring, so the table cannot go stale. `--print-residuals` prints
 the observed table for regenerating it after a deliberate change.
 

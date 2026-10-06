@@ -2994,8 +2994,9 @@ answers `["b"]` — and classified the two residuals appended below):
 
 - ~~**A fold source whose navigation is discarded by a later non-navigating stage still
   clobbers jq's real path register, undetected.**~~ **Mostly closed by
-  [#2159](https://github.com/rust-works/succinctly/issues/2159); what remains is tracked in
-  #3459 and #3460 below.** `path(foreach (.a|tostring) as $k (.; .a))` on
+  [#2159](https://github.com/rust-works/succinctly/issues/2159); the dangerous direction was
+  closed by [#3459](https://github.com/rust-works/succinctly/issues/3459), and what remains is
+  recorded below (#3460 tracks the pointer-identity part).** `path(foreach (.a|tostring) as $k (.; .a))` on
   `{"a":1,"b":{"c":2}}` raises `Invalid path expression near attempt to access element "a" of
   {"a":1,"b":{"c":2}}` in jq, and succinctly printed `["a"]`. `.a` genuinely navigates -- moving
   jq's real register -- and the `tostring` after it only stops the register moving further; but

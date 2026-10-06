@@ -43975,7 +43975,9 @@ fn fold_slice_ok(patterns: &[Pattern], source: &Expr) -> bool {
 /// [`drive_fold_source`] counts those through its own jq-only clause (#3459); this
 /// one serves the whole-array-slice rule (#3504), which only ever *refuses more*
 /// when this says yes, and `reduce first as $a (.; .[0:])` is refused by jq
-/// (#3734).
+/// (#3734). It deliberately does not list `map`/`flatten`/`add`, which the gate in
+/// [`drive_fold_source_with`] counts: those matter for a register the INIT moved off
+/// the input, a question the slice rule does not ask.
 fn fold_source_moves_register(source: &Expr) -> bool {
     any_subexpr(source, &mut |e| {
         is_fold_source_navigation(e)

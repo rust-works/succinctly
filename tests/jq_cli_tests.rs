@@ -108984,7 +108984,8 @@ fn test_consumer_of_a_prefetched_path_context_body_follows_jq_3639() -> Result<(
 /// rows cover each builtin alone and before a computing stage, `path` and `=`,
 /// `foreach` and `reduce`, array/`null`/object inputs, UPDATEs that navigate
 /// after the moved register, and the neighbouring shapes that must not move
-/// (`.a|first`, `map(1)|length`, `first(f)`, `nth(n; f)`, a user `def first`).
+/// (`.a|first`, `first(f)`, `nth(n; f)`, a user `def first`); the `map`/`flatten`/`add`
+/// sources have their own table below.
 /// Every value is captured from jq 1.7.1 -- `(input, filter, stdout, exit)`.
 const FOLD_SOURCE_BARE_INDEX_BUILTIN_ROWS_3459: &[(&str, &str, &str, i32)] = &[
     (
