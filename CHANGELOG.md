@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a navigating `map(f)` in `path()`/`del()`/`=` is resolved as `[.[] | f]`, so jq's path error inside `f` is raised even when the result is discarded** (#3865).
+  `path(map({k:1} | .k) | empty)` answered nothing and `del([map({k:1} | .k)] and (.a)?)` deleted nothing at exit 0, where jq raises
+  `near attempt to access element "k"`: the by-value leaf evaluated `map(f)` as one opaque value and never path-checked `f`. A `map(f)` whose `f` can move
+  the register now resolves as the collect jq defines, through the `[E]` arm's own body; an `f` that cannot move it keeps the by-value leaf. A `getpath`
+  inside such an `f` no longer sends the enclosing `[E]` to the eager fallback (it is never the first stage of `.[] | f`), so `[map(getpath(["a"]))]` on an
+  untracked entry raises as in jq. jq mode only; yq is pinned unchanged. Against a clean `main`, seeded sweeps over 15 `map(f)` operands (50,027 rows), the #3724
+  operands (60,027) and the whole grid (60,027) showed 0 regressions on the first and last (`ACCEPT_WRONG` 81 to 0 and 14 to 10) and one lost match on the #3724 operands:
+  `del(. as [$q] ?// $q | ([map(getpath(["a"]))] and (.a)?) | .c)` now refuses where jq's catchable error retries the second alternative, the `?//` retry gap its
+  `.a` twin already had on `main`. Pinned by `test_map_f_in_path_position_raises_where_jq_does_3865`.
 - **jq: an `and`/`or`/unary minus inside an `[E]` collect is judged as jq judges it when an operand is a bare `first`/`last`/`add` or a `map(f)`** (#3724, item 2).
   `path(. as $x | [first and .[0]] | $x)` raises near element 0 on `[true]` (`first` moved jq's register, so the right operand navigates off it) and is `[]`
   on `[false,1]` (the left operand short-circuits); `[first and true]`, `[add and 1]`, `[map(.) and true]` and `[-first]` are `[]`. The claim was

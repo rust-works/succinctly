@@ -64867,6 +64867,132 @@ fn test_collect_and_or_over_register_moving_builtins_3724() -> Result<()> {
     ])
 }
 
+/// #3865: jq defines `map(f)` as `[.[] | f]`, so in `path()`/`del()` an `f` that
+/// navigates a computed value raises there whatever the stage does with the result.
+/// The by-value leaf never raised, so a stage that discarded the output accepted
+/// (`path(map({k:1} | .k) | empty)` answered nothing, `del([map({k:1} | .k)] and
+/// (.a)?)` deleted nothing at exit 0). A navigating `map(f)` is now resolved as the
+/// collect jq defines, so its path errors surface where jq's do. An `f` jq answers
+/// (`.a`, `.[0]`, `first`, `//`, a trailing non-navigating stage) and an empty input,
+/// where `f` never runs, still answer. Every row captured from jq 1.7.1, on the
+/// stdin and `-n` routes.
+#[test]
+// The `{k:1}` rows are jq filter literals, not formatting strings.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_map_f_in_path_position_raises_where_jq_does_3865() -> Result<()> {
+    let near_k = r#"Invalid path expression near attempt to access element "k" of {"k":1}"#;
+    assert_path_rows_both_routes_3749(&[
+        // Raises: `f` navigates a computed value, however the result is used.
+        (
+            r"[true]",
+            r"del([map({k:1} | .k)] and (.a)?)",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            r"[[1],[1]]",
+            r"path([map({k:1} | .k)] | empty)",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            r"[[1],[1]]",
+            r"path(map({k:1} | .k) | empty)",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            r#"{"x":{"a":1}}"#,
+            r"path(map({k:1} | .k) | empty)",
+            "",
+            near_k,
+            5,
+        ),
+        (
+            r"[[1],[1]]",
+            r"del([map(sort | .[0])] and (.a | .b)?)",
+            "",
+            "Invalid path expression near attempt to access element 0 of [1]",
+            5,
+        ),
+        // An untracked input still raises from the iteration, with or without `getpath`
+        // in `f` (the by-value leaf keeps that check for the `getpath` case).
+        (
+            r"null",
+            r#"path(. as $x | {a:{b:1}} | map(getpath(["a"])) | $x)"#,
+            "",
+            r#"Invalid path expression near attempt to iterate through {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r"null",
+            r"path(. as $x | {a:{b:1}} | map(.a) | $x)",
+            "",
+            r#"Invalid path expression near attempt to iterate through {"a":{"b":1}}"#,
+            5,
+        ),
+        // `getpath` inside `f` does not hide jq's path error, and an untracked entry
+        // still raises through the enclosing collect (`getpath` is never the first stage
+        // of `.[] | f`).
+        (
+            r#"[{"a":1}]"#,
+            r#"path(map(getpath(["a"]) | {k:1} | .k) | empty)"#,
+            "",
+            near_k,
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r#"path(map({k:1} | .k, getpath(["a"])) | empty)"#,
+            "",
+            near_k,
+            5,
+        ),
+        (
+            r"null",
+            r#"path(. as $x | {a:{b:1}} | [map(getpath(["a"]))] | $x)"#,
+            "",
+            r#"Invalid path expression near attempt to iterate through {"a":{"b":1}}"#,
+            5,
+        ),
+        (
+            r#"[{"a":1}]"#,
+            r#"path(map(getpath(["a"])) | empty)"#,
+            "",
+            "",
+            0,
+        ),
+        // Pinned refuse-only: under a `?//` destructuring alternative the entry is untracked,
+        // so the live `.[]` raises a refusal the retry does not catch, where jq's own
+        // catchable error retries the second alternative and writes nothing (the `.a` twin
+        // refused the same way before #3865).
+        (
+            r#"[{"a":1}]"#,
+            r"del(. as [$q] ?// $q | ([map(.a)] and (.a)?) | .c)",
+            "",
+            r#"Invalid path expression near attempt to iterate through [{"a":1}]"#,
+            5,
+        ),
+        // Answers: `f` only navigates the elements it is given, or runs on none.
+        (r#"[{"a":1}]"#, r"path(map(.a) | empty)", "", "", 0),
+        (r#"[{"a":1}]"#, r"path(map(.a // .b) | empty)", "", "", 0),
+        (r"[[1],[1]]", r"path(map(.[0]) | empty)", "", "", 0),
+        (r"[[1],[1]]", r"path(map(first) | empty)", "", "", 0),
+        (r#"[{"a":1}]"#, r"path(map(.a | length) | empty)", "", "", 0),
+        (r"[]", r"path(map({k:1} | .k) | empty)", "", "", 0),
+        (
+            r#"[{"a":1}]"#,
+            r"del(map(.a) | empty)",
+            "[{\"a\":1}]\n",
+            "",
+            0,
+        ),
+    ])
+}
+
 /// #3289's negative control: a number or string register is never identical
 /// to a fresh boolean, so these stay refused -- the conjunct that keeps the
 /// class-B acceptance from turning into a write jq refuses.

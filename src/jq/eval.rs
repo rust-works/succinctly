@@ -37423,6 +37423,60 @@ fn fold_pattern_admitted<S: EvalSemantics>(patterns: &[Pattern]) -> bool {
     }
 }
 
+/// Whether a `map(f)` in path position is resolved as the collect jq defines
+/// (`[.[] | f]`, #3865) rather than evaluated by value: jq mode, and an `f`
+/// that can move the register -- one that cannot has nothing path-checked in it,
+/// so the by-value leaf answers the same without the clone and the live walk.
+/// The one definition the `map` arm and [`array_resolves_live`]'s `getpath`
+/// prune both read, so the prune can never cover a `map` the arm leaves by value.
+fn map_f_resolves_live<S: EvalSemantics>(f: &Expr) -> bool {
+    S::TAG == EvalTag::Jq && !cannot_move_register(f)
+}
+
+/// `[inner]` in path position, resolved live: `inner` runs against the register,
+/// every navigation in it is path-checked as jq checks it, and the collect
+/// backtracks to where it began. The body of the resolver's `[E]` arm
+/// (#3263), shared with the `map(f)` arm (#3865), which reaches it for an `f`
+/// the `[E]` arm's own gate would leave to the eager fallback.
+fn resolve_collect_live<'a, S: EvalSemantics>(
+    inner: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let mut items = Vec::new();
+    let flow = resolve_node_sink::<S>(
+        inner,
+        value,
+        trackable,
+        snapshot,
+        frame,
+        Keep::AtMost(usize::MAX),
+        &mut |branch| {
+            items.push(branch.value.into_owned());
+            Demand::Continue
+        },
+    );
+    // #3263: jq's collect backtracks to where it began, so the
+    // register is where it was entering -- `value` itself when
+    // trackable -- but only when every navigation inside was
+    // checked here too. Otherwise none is claimed, and on a trackable
+    // entry that is a loss with no position ([`BranchRegister::
+    // LostSomewhere`]): `LostAt(value)` would be the precise answer,
+    // and would let a refusal of a `$x` frozen elsewhere be caught --
+    // a promotion with oracle rows of its own, not this arm's.
+    let register = if !trackable {
+        BranchRegister::None
+    } else if array_contents_are_checked(inner) {
+        BranchRegister::Unmoved(Cow::Borrowed(value))
+    } else {
+        BranchRegister::LostSomewhere
+    };
+    forward_drained_result(flow, OwnedValue::Array(items.into()), register, sink)
+}
+
 /// Emits each branch to `sink` as it is produced (#1952), so a bounded
 /// consumer answers [`Demand::Stop`] and the generator underneath is
 /// never asked for the branch after it — the path-mode twin of
@@ -37495,6 +37549,28 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 -1
             });
             resolve_node_sink::<S>(&component, value, trackable, snapshot, frame, keep, sink)
+        }
+        // #3865: jq defines `map(f)` as `[.[] | f]`, so in a path `f` runs on each
+        // element with the register on it and path-checks whatever it navigates.
+        // The by-value leaf evaluated `map(f)` as one opaque value and never
+        // raised for an `f` that navigates a computed value (`{k:1} | .k`,
+        // `sort | .[0]`), so a stage that discarded the result accepted where jq
+        // raises: `path(map({k:1} | .k) | empty)` answered nothing, and
+        // `del([map({k:1} | .k)] and (.a)?)` deleted nothing at exit 0. Resolving
+        // the collect jq defines reuses every rule the `[E]` arm has -- the pipe's
+        // register, the near-access wording, an untracked input's raise from the
+        // `.[]`. It is that arm's body ([`resolve_collect_live`]) and not the arm
+        // itself, because the arm's gate leaves any collect holding `getpath` to
+        // the eager fallback (#2759: a `getpath` that is the *first* stage meets no
+        // carried register), and `.[] | f` never starts with one. An `f` that cannot
+        // move the register keeps the by-value leaf: nothing in it is path-checked, so
+        // the answer is the same and the clone and the live walk are skipped (a sweep
+        // over `map(.)` and `map(tostring)`, 20,027 rows, found no row that differs
+        // without the guard, so it is a cost guard, not a behaviour one). jq mode
+        // only (ADR-0018).
+        Expr::Builtin(Builtin::Map(f)) if map_f_resolves_live::<S>(f) => {
+            let inner = Expr::Pipe(vec![Expr::Iterate, (**f).clone()]);
+            resolve_collect_live::<S>(&inner, value, trackable, snapshot, frame, sink)
         }
         // #3551 (yq mode): real yq's bare `first` is a path step at the head of
         // an expression, so `first = 9`, `first |= 5`, `first += 1` and
@@ -38555,35 +38631,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         //
         // The scan is O(|inner|), the same order as resolving it.
         Expr::Array(inner) if array_resolves_live::<S>(inner, trackable) => {
-            let mut items = Vec::new();
-            let flow = resolve_node_sink::<S>(
-                inner,
-                value,
-                trackable,
-                snapshot,
-                frame,
-                Keep::AtMost(usize::MAX),
-                &mut |branch| {
-                    items.push(branch.value.into_owned());
-                    Demand::Continue
-                },
-            );
-            // #3263: jq's collect backtracks to where it began, so the
-            // register is where it was entering -- `value` itself when
-            // trackable -- but only when every navigation inside was
-            // checked here too. Otherwise none is claimed, and on a trackable
-            // entry that is a loss with no position ([`BranchRegister::
-            // LostSomewhere`]): `LostAt(value)` would be the precise answer,
-            // and would let a refusal of a `$x` frozen elsewhere be caught --
-            // a promotion with oracle rows of its own, not this arm's.
-            let register = if !trackable {
-                BranchRegister::None
-            } else if array_contents_are_checked(inner) {
-                BranchRegister::Unmoved(Cow::Borrowed(value))
-            } else {
-                BranchRegister::LostSomewhere
-            };
-            forward_drained_result(flow, OwnedValue::Array(items.into()), register, sink)
+            resolve_collect_live::<S>(inner, value, trackable, snapshot, frame, sink)
         }
 
         // `and`/`or`/unary minus in path position, jq mode (#2760, #3289).
@@ -41991,14 +42039,24 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
 /// necessary for carrying the register but not sufficient; see
 /// [`array_contents_are_checked`]. The one shape excluded here (`GetPath`) is
 /// the one whose own untracked handling is still wrong (#2759 -- see the
-/// arm's own comment). A `TrackedVar` exclusion lived here too until #3290
+/// arm's own comment), except inside the `f` of a navigating `map(f)`
+/// ([`map_f_resolves_live`]): that is resolved as `.[] | f`, which never starts
+/// with a `getpath`, so the pruned subtree is not the case #2759 describes
+/// (#3865). A `TrackedVar` exclusion lived here too until #3290
 /// found it disqualified live resolution for a whole mixed array the moment
 /// a marker appeared anywhere inside it, not just at the marker itself.
 fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool {
     S::TAG == EvalTag::Jq
         && (!trackable || !cannot_move_register(inner))
-        && !any_subexpr(inner, &mut |e| {
-            matches!(e, Expr::Builtin(Builtin::GetPath(_)))
+        && !crate::jq::walk::search_subexpr(inner, &mut |e| match e {
+            Expr::Builtin(Builtin::GetPath(_)) => crate::jq::walk::Visit::Found,
+            // #3865: a navigating `map(f)` resolves as `[.[] | f]`, which never starts
+            // with `getpath`, so a `getpath` inside its `f` meets the carried register
+            // the first-stage case lacks and is not what this gate guards against.
+            Expr::Builtin(Builtin::Map(f)) if map_f_resolves_live::<S>(f) => {
+                crate::jq::walk::Visit::Skip
+            }
+            _ => crate::jq::walk::Visit::Descend,
         })
 }
 

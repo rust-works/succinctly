@@ -51096,6 +51096,27 @@ fn test_yq_collect_map_navigating_f_keeps_no_path_register_3724() -> Result<()> 
     Ok(())
 }
 
+/// #3865: a navigating `map(f)` in path position is resolved as jq's `[.[] | f]` in
+/// jq mode only (ADR-0018). yq's `map` is its own builtin with no oracle for how it
+/// path-checks `f`, so `succinctly yq` keeps evaluating it by value: the discarded
+/// `map({k:1} | .k)` stays a silent no-op, as it was before.
+#[test]
+// The `{k:1}` rows are jq filter literals, not formatting strings.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_yq_map_f_in_path_position_stays_by_value_3865() -> Result<()> {
+    let doc = r#"[{"a":1},{"a":2}]"#;
+    let unchanged = "[\n  {\n    \"a\": 1\n  },\n  {\n    \"a\": 2\n  }\n]\n";
+    for filter in [
+        "(map({k:1} | .k) | empty) = 5",
+        "del(map({k:1} | .k) | empty)",
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, doc, &["-o", "json"])?;
+        assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
+        assert_eq!(stdout, unchanged, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #3758: a pipe stage reading the backtracked-register verdict of `any`/`all`
 /// is a jq-mode admission too (ADR-0018). yq's `any`/`all` are its own builtins
 /// with no oracle for how they leave the register, so `succinctly yq` keeps the
