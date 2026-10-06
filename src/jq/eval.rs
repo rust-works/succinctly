@@ -42169,40 +42169,23 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
 /// fabricate `[]`. So the predicate is an allowlist, the safe direction:
 ///
 /// - an `f` that navigates nothing at all ([`cannot_move_register`]), the
-///   original #3283 admission;
+///   original #3283 admission; or
 /// - a navigation chain in which every stage keeps jq's register on the node it
-///   navigated to ([`stays_on_the_register`]); or
-/// - such a chain ending in one stage that navigates nothing (`.a | length`),
-///   whose computed output nothing then navigates.
-///
-/// An `f` that forks (`,`, `if`) is judged branch by branch: jq backtracks the
-/// register between them.
+///   navigated to ([`stays_on_the_register`]), optionally ending in one stage
+///   that navigates nothing (`.a | length`), whose computed output nothing then
+///   navigates. An `f` that forks (`,`, `if`) is judged branch by branch: jq
+///   backtracks the register between them.
 fn navigates_only_the_register(f: &Expr) -> bool {
-    if cannot_move_register(f) || stays_on_the_register(f) {
-        return true;
-    }
-    match f {
-        Expr::Paren(inner) => navigates_only_the_register(inner),
-        Expr::Comma(branches) => branches.iter().all(navigates_only_the_register),
-        Expr::If {
-            then_branch,
-            else_branch,
-            ..
-        } => navigates_only_the_register(then_branch) && navigates_only_the_register(else_branch),
-        // Every stage but the last must hand the next one a tracked value; the
-        // last may be anything that navigates nothing or stays on the register.
-        Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, init)| {
-            init.iter().all(stays_on_the_register) && navigates_only_the_register(last)
-        }),
-        _ => false,
-    }
+    cannot_move_register(f) || stays_on_the_register(f, true)
 }
 
 /// Whether every step of `e` navigates from the register's node to another
 /// node jq's register follows (or passes the register's node through), so the
 /// output of `e` is itself on the register -- the property a stage needs for a
-/// *following* stage to navigate it (#3724). [`navigates_only_the_register`]
-/// allows a stage that navigates nothing only at the end.
+/// *following* stage to navigate it (#3724). With `terminal` set nothing
+/// navigates `e`'s output, so a stage that navigates nothing
+/// ([`cannot_move_register`]) is allowed as well; it is checked at the leaves
+/// only, so the walk stays linear.
 ///
 /// The navigation primitives, `first`/`last` (jq defines them as `.[0]`/`.[-1]`),
 /// and a `select`/type filter, which passes its input through and whose
@@ -42210,7 +42193,7 @@ fn navigates_only_the_register(f: &Expr) -> bool {
 /// target decides. `?` on a primitive only suppresses a value error
 /// (`INDEX_OPT`), not a path error; every other `?` is jq's `try`, which the
 /// resolver reaches by another route, so it stays refused here.
-fn stays_on_the_register(e: &Expr) -> bool {
+fn stays_on_the_register(e: &Expr, terminal: bool) -> bool {
     match e {
         Expr::Identity
         | Expr::Field(_)
@@ -42219,21 +42202,30 @@ fn stays_on_the_register(e: &Expr) -> bool {
         | Expr::Iterate
         | Expr::RecursiveDescent
         | Expr::Builtin(Builtin::First | Builtin::Last) => true,
+        // Only the target is navigated; the key or bound is a subexp.
         Expr::IndexExpr { target, .. } | Expr::SliceExpr { target, .. } => {
-            stays_on_the_register(target)
+            stays_on_the_register(target, false)
         }
-        Expr::Paren(inner) => stays_on_the_register(inner),
+        Expr::Paren(inner) => stays_on_the_register(inner, terminal),
         Expr::Optional(inner) if is_postfix_optional_primitive(inner) => {
-            stays_on_the_register(inner)
+            stays_on_the_register(inner, false)
         }
         e if is_select_stage(e) => true,
-        Expr::Pipe(stages) | Expr::Comma(stages) => stages.iter().all(stays_on_the_register),
+        Expr::Comma(branches) => branches.iter().all(|b| stays_on_the_register(b, terminal)),
         Expr::If {
             then_branch,
             else_branch,
             ..
-        } => stays_on_the_register(then_branch) && stays_on_the_register(else_branch),
-        _ => false,
+        } => {
+            stays_on_the_register(then_branch, terminal)
+                && stays_on_the_register(else_branch, terminal)
+        }
+        // Every stage but the last must hand the next one a tracked value.
+        Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, init)| {
+            init.iter().all(|stage| stays_on_the_register(stage, false))
+                && stays_on_the_register(last, terminal)
+        }),
+        other => terminal && cannot_move_register(other),
     }
 }
 
@@ -118028,6 +118020,26 @@ mod tests {
             assert_eq!(
                 outputs(doc.as_bytes(), filter),
                 [r#"[{"a":3}]"#],
+                "{filter}"
+            );
+        }
+        // `last` and a slice navigate an element that is an array; a computed bound
+        // is a subexp, so only the target of `.a[S:T]` decides.
+        assert_eq!(
+            outputs(br"[[1,2],[3]]", r"del(. as $x | [map(last)] | $x[0])"),
+            ["[[3]]"]
+        );
+        assert_eq!(
+            outputs(br"[[1,2],[3]]", r"del(. as $x | [map(.[0:1])] | $x[0])"),
+            ["[[3]]"]
+        );
+        for filter in [
+            r"del(. as $x | [map(.a[.k:])] | $x[0])",
+            r"del(. as $x | [map(.a[.k:1])] | $x[0])",
+        ] {
+            assert_eq!(
+                outputs(br#"[{"k":0,"a":[1,2]}]"#, filter),
+                ["[]"],
                 "{filter}"
             );
         }
