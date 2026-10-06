@@ -36159,6 +36159,24 @@ enum BranchRegister<'a> {
     LostAt(Rc<OwnedValue>),
     /// A live register entered and nothing is known about where it went.
     LostSomewhere,
+    /// This output is one jq emits with its path register exactly where the
+    /// stage that is consuming it entered (#3580): a recursion's own seed (the
+    /// `.` of `def r: ., (f | r)`, emitted before anything indexes) and an
+    /// untracked `.`. It states no value -- on an untracked entry the register is
+    /// the one the *stage* carries, which no leaf sees -- so it is the per-*output*
+    /// statement [`resolve_seq_stage`] needs and a static verdict on the stage's
+    /// expression cannot make: a stage that forks (`,`, `if`, `//`) or bounds
+    /// (`first`, `limit`) a recursion delivers the seed and the outputs that
+    /// navigate side by side, and only the seed leaves the register. (A `catch`
+    /// handler's output says the same with the value, as an
+    /// [`Unmoved`](Self::Unmoved): [`states_register_at_entry`].)
+    ///
+    /// Everywhere but that consumer it reads as [`None`](Self::None): it does not
+    /// outlive a stage ([`keep_unmoved`](Self::keep_unmoved)), and a wrapper that
+    /// forwards the branch forwards the statement with it. The consumer trusts it
+    /// only through [`entry_marker_stage`], the allowlist of wrappers that are known
+    /// to forward a branch without having moved the register first.
+    AtEntry,
 }
 
 impl<'a> BranchRegister<'a> {
@@ -36167,7 +36185,7 @@ impl<'a> BranchRegister<'a> {
     fn into_unmoved(self) -> Option<Cow<'a, OwnedValue>> {
         match self {
             Self::Unmoved(register) => Some(register),
-            Self::None | Self::LostAt(_) | Self::LostSomewhere => None,
+            Self::None | Self::LostAt(_) | Self::LostSomewhere | Self::AtEntry => None,
         }
     }
 
@@ -36175,7 +36193,7 @@ impl<'a> BranchRegister<'a> {
     fn unmoved_value(&self) -> Option<&OwnedValue> {
         match self {
             Self::Unmoved(register) => Some(register),
-            Self::None | Self::LostAt(_) | Self::LostSomewhere => None,
+            Self::None | Self::LostAt(_) | Self::LostSomewhere | Self::AtEntry => None,
         }
     }
 
@@ -36189,7 +36207,7 @@ impl<'a> BranchRegister<'a> {
         match self {
             Self::Unmoved(register) => RegisterLoss::LostAt(Rc::new(OwnedValue::clone(register))),
             Self::LostAt(register) => RegisterLoss::LostAt(Rc::clone(register)),
-            Self::None | Self::LostSomewhere => RegisterLoss::LostSomewhere,
+            Self::None | Self::LostSomewhere | Self::AtEntry => RegisterLoss::LostSomewhere,
         }
     }
 
@@ -36199,7 +36217,7 @@ impl<'a> BranchRegister<'a> {
     fn keep_unmoved(self) -> Self {
         match self {
             Self::Unmoved(_) | Self::None => self,
-            Self::LostAt(_) | Self::LostSomewhere => Self::None,
+            Self::LostAt(_) | Self::LostSomewhere | Self::AtEntry => Self::None,
         }
     }
 
@@ -36211,6 +36229,7 @@ impl<'a> BranchRegister<'a> {
             Self::Unmoved(register) => BranchRegister::Unmoved(Cow::Owned(register.into_owned())),
             Self::LostAt(register) => BranchRegister::LostAt(register),
             Self::LostSomewhere => BranchRegister::LostSomewhere,
+            Self::AtEntry => BranchRegister::AtEntry,
         }
     }
 }
@@ -36491,6 +36510,16 @@ impl<'a> PathBranch<'a> {
              storing a second one would let a reader answer from a stale copy",
         );
         self.register = register;
+        self
+    }
+
+    /// This branch without an [`BranchRegister::AtEntry`] statement: one that
+    /// was made relative to a register that is not the consumer's must not reach
+    /// it (#3580).
+    fn without_entry_statement(mut self) -> Self {
+        if matches!(self.register, BranchRegister::AtEntry) {
+            self.register = BranchRegister::None;
+        }
         self
     }
 
@@ -40408,12 +40437,16 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         // alone would. `Field`/`Index`/`Slice` never reach this arm: the
         // `navigation_element` check above already raised for them.
         if matches!(expr, Expr::Identity) {
+            // #3580: `.` is the stage's own input, so it is at the register the
+            // stage entered with -- stated for `(., ..)`, whose other half is a
+            // recursion's seed (the stage cannot say so statically: `..` moves it).
             return Some(Ok(vec![PathBranch::passthrough(
                 PathPrefix::root(),
                 Cow::Borrowed(value),
                 false,
                 snapshot.clone(),
-            )]));
+            )
+            .with_register(BranchRegister::AtEntry)]));
         }
     }
 
@@ -40847,8 +40880,9 @@ fn leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
 /// [`cannot_move_register`] and not folded into it: that predicate also stands
 /// for "navigates nothing, so a register not on this input is never checked"
 /// ([`resolve_from_restored_input`]), and these stages either navigate or take a
-/// navigating condition. (`recurse_seed_keeps_register` peels its own, different
-/// set of wrappers; the two answer different questions.)
+/// navigating condition. (`entry_marker_stage` reads a per-output statement
+/// through its own, different set of wrappers; the two answer different
+/// questions.)
 fn stage_leaves_register_in_place<S: EvalSemantics>(expr: &Expr) -> bool {
     last_register_unmoved::<S>() && {
         let stage = peel_register_transparent(expr);
@@ -40890,6 +40924,22 @@ fn stage_states_register_per_result<S: EvalSemantics>(expr: &Expr) -> bool {
                     | Builtin::AllCond(..)
                     | Builtin::IsEmpty(_)
             )
+        )
+}
+
+/// Whether `expr` is a `foreach` whose emissions state jq's register per emission
+/// (#3580), read through the wrappers [`peel_register_transparent`] passes the
+/// register through: one that [`foreach_outside_update_cannot_move`] and whose
+/// `UPDATE` may navigate (a stage that cannot is already
+/// [`cannot_move_register`]'s). [`resolve_foreach`] states `Unmoved` on the
+/// emissions whose `UPDATE` output was at the entry and nothing on the rest, so
+/// this only admits the stage to *read* the statement; jq mode only.
+fn foreach_states_register_per_emission<S: EvalSemantics>(expr: &Expr) -> bool {
+    last_register_unmoved::<S>()
+        && matches!(
+            peel_register_transparent(expr),
+            Expr::Foreach { patterns, input, init, extract, .. }
+                if foreach_outside_update_cannot_move(patterns, input, init, extract.as_deref())
         )
 }
 
@@ -41754,22 +41804,33 @@ fn untracked_branches<'a, S: EvalSemantics>(
 /// by genuine descent (structural, or through `f`), which breaks the mark
 /// regardless of ambient — only this one root entry is built this way.
 ///
-/// **It is always the first branch a recursion delivers** (#3272):
-/// `resolve_seq_stage` keeps jq's path register across that one output
-/// ([`recurse_seed_keeps_register`]) and not past it, so a producer that
-/// emitted anything ahead of the seed would carry the register onto a
-/// navigated value. Keep the seed first in every walk that calls this.
+/// **It is always the first branch a recursion delivers, and the only one that
+/// states anything** (#3272, #3580): the seed carries a
+/// [`BranchRegister::AtEntry`], which `resolve_seq_stage` reads per output
+/// ([`entry_marker_stage`]) to keep jq's path register across that one output
+/// and not past it, so a walk that stated it on a navigated node, or put a
+/// navigated node ahead of the seed, would carry the register onto it. Keep the
+/// seed first, and every other node's statement `None`, in every walk that calls
+/// this.
 fn recurse_family_root_seed<'a>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: &Snapshot,
 ) -> PathBranch<'a> {
-    PathBranch::passthrough(
+    let seed = PathBranch::passthrough(
         PathPrefix::root(),
         Cow::Borrowed(value),
         trackable,
         snapshot.clone(),
-    )
+    );
+    // #3580: the seed is the one output a recursion emits before anything
+    // indexes, so it states that the register is where the stage entered. A
+    // trackable branch is its own register and has nothing to state.
+    if trackable {
+        seed
+    } else {
+        seed.with_register(BranchRegister::AtEntry)
+    }
 }
 
 /// Sink-shaped `..`/bare `recurse`/`recurse_down` (#2696, following #2235's
@@ -41893,7 +41954,9 @@ fn resolve_recursive_descent_sink<'a>(
             value: current,
             trackable: node_trackable,
             snapshot: node_snapshot,
-            register: _,
+            // #3580: the seed's own statement (`AtEntry`); every child is
+            // built by `DescentFrame::next_child`, which states nothing.
+            register,
         } = popped;
         assert_value_tree_depth(prefix.depth());
         if sink(PathBranch {
@@ -41901,7 +41964,7 @@ fn resolve_recursive_descent_sink<'a>(
             value: current.clone(),
             trackable: node_trackable,
             snapshot: node_snapshot,
-            register: BranchRegister::None,
+            register,
         }) == Demand::Stop
         {
             return ResolveFlow::Stopped;
@@ -42414,7 +42477,41 @@ fn reduce_leaves_register_in_place(
     patterns_all_bare(patterns)
         && cannot_move_register(init)
         && register_movement_tracked(input)
-        && register_movement_tracked(update)
+        && fold_update_movement_tracked(update)
+}
+
+/// [`register_movement_tracked`] for a fold's `UPDATE`, which also admits a `try`
+/// (or `?`) around one (#3580): jq backtracks the register to where the `try`
+/// entered whether its body raised or not (#3133), so what the body navigates is
+/// not what the fold leaves, and `reduce (1,2) as $i (1; try ..)` leaves it at the
+/// entry. Kept out of [`register_movement_tracked`] itself: that predicate is also
+/// what an `and`/`or` operand and an `[E]` are judged by ([`array_contents_are_checked`]),
+/// where a `try` *is* a way for the resolver to swallow an error jq raises.
+fn fold_update_movement_tracked(update: &Expr) -> bool {
+    register_movement_tracked(update)
+        || match update {
+            Expr::Paren(inner) | Expr::Optional(inner) => fold_update_movement_tracked(inner),
+            Expr::Try { expr, catch: None } => fold_update_movement_tracked(expr),
+            _ => false,
+        }
+}
+
+/// Whether everything in a `foreach` but its `UPDATE` leaves jq's register alone
+/// (#3580): a bare-variable pattern, a source, an `INIT` and an `EXTRACT` that
+/// cannot navigate. jq emits from inside the loop, so the register an emission
+/// carries is the one `UPDATE`'s output left -- the fold's entry whenever that
+/// output said so ([`BranchRegister::AtEntry`]). Shared by [`resolve_foreach`],
+/// which states it per emission, and [`resolve_seq_stage`], which reads it.
+fn foreach_outside_update_cannot_move(
+    patterns: &[Pattern],
+    input: &Expr,
+    init: &Expr,
+    extract: Option<&Expr>,
+) -> bool {
+    patterns_all_bare(patterns)
+        && cannot_move_register(input)
+        && cannot_move_register(init)
+        && extract.map_or(true, cannot_move_register)
 }
 
 /// [`reduce_cannot_move_register`]'s `foreach` twin: EXTRACT runs in the same
@@ -42980,11 +43077,11 @@ fn getpath_preserves_register<S: EvalSemantics>(
             .is_some_and(|(invocation, path)| !stage_frame.names(invocation, path))
 }
 
-/// [`getpath_preserves_register`]'s sibling for the recurse family (#3272):
-/// whether the **first** output of a recursion stage entering on an
-/// already-untracked branch leaves jq's register where it was.
+/// [`getpath_preserves_register`]'s sibling for the recurse family (#3272, #3580):
+/// whether a pipe stage entering on an already-untracked branch may trust the
+/// [`BranchRegister::AtEntry`] statements its outputs carry.
 ///
-/// The answer is per *output*, not per expression, so it cannot live in
+/// The answer is per *output*, not per expression, so the verdict cannot live in
 /// [`cannot_move_register`]. jq defines every spelling as `def r: ., (f | r);
 /// r;`, and the `.` is emitted down the first `FORK` branch before anything
 /// indexes -- the register is untouched for that one output. Every later output
@@ -42998,12 +43095,35 @@ fn getpath_preserves_register<S: EvalSemantics>(
 ///                        # ... and only the *next* output raises
 /// $ jq -c 'path(. as $x | 1 | try recurse(.a) | $x)'
 /// []                     # a caught later navigation is invisible
+/// $ jq -c 'path(. as $x | 1 | try recurse(.a) catch 7 | $x)'
+/// []
+/// []                     # and the handler's output is at the `try`'s entry
 /// ```
 ///
-/// Dropping the register for the whole stage refused the `$x` at the seed
-/// with a guessed "with result" error before the recursion's own navigation
-/// error was ever reached, so a `try`/`?` around the recursion could not
-/// answer where jq does.
+/// Dropping the register for the whole stage refused the `$x` at the seed with
+/// a guessed "with result" error before the recursion's own navigation error
+/// was ever reached, so a `try`/`?` around the recursion could not answer where
+/// jq does.
+///
+/// **Who says what.** The producers say it, as an `AtEntry` on the one branch
+/// that earned it: [`recurse_family_root_seed`] for a recursion's seed and the
+/// untracked `.` leaf. A `catch` handler's output says it with the register it
+/// was seeded with, an `Unmoved` ([`resolve_catch_sink`], #3133). [`resolve_seq_stage`]
+/// reads either per output (`seed` in `place_step`,
+/// [`states_register_at_entry`]) and nothing else: a stage that forks or bounds a
+/// recursion delivers the seed and the outputs that navigate side by side, which
+/// no static verdict on the expression could tell apart (#3580).
+///
+/// **Which stages may read it.** The statement is only as good as the wrappers
+/// it travelled through, and each must hand a branch on without having moved the
+/// register first. An allowlist, [`entry_marker_shape`], of the wrappers whose
+/// resolver arm forwards the branch it is given unchanged: `Paren`, `Shared`,
+/// `?`, `try` (and its handler), `,`, `if` (its condition is a subexp), `//`
+/// (the right side runs after the left was backtracked), `first(f)`,
+/// `limit(n; f)` and `label`. Anything else that hosts a producer -- a
+/// destructuring bind, whose pattern indexes before its body runs, a fold, a
+/// `def` call -- is *opaque*: the stage reads nothing, and the refusal it had
+/// before stays. A stage that hosts no producer has nothing to read.
 ///
 /// True only when all of these hold, each load-bearing:
 ///
@@ -43014,42 +43134,121 @@ fn getpath_preserves_register<S: EvalSemantics>(
 ///   [`trackable_step_register_eligible`] gives).
 /// - **An untracked branch.** A trackable one is its own register, so there
 ///   is nothing to carry.
-/// - **The element is a recurse-family node**, seen through `Paren`,
-///   `Shared` (resolved exactly as a paren is, #3149), `Optional` and `try`.
-///   A `try`'s handler only ever runs *after* the seed, so the seed is covered
-///   with or without one -- the handler's own output is not, and still
-///   refuses (#3580). Not through `Pipe`, `Comma`, `If` or a call
-///   (`first(..)`, `limit(n; ..)`): their first output is not provably the
-///   seed, and naming a call's body is what [`cannot_move_register`] refuses
-///   to do. Those stay refuse-only.
+/// - **Every producer in the element is reached through an allowlisted wrapper**
+///   ([`EntryMarkers::Forwarded`]).
+fn entry_marker_stage<S: EvalSemantics>(element: &Expr, branch_trackable: bool) -> bool {
+    S::TAG == EvalTag::Jq
+        && !branch_trackable
+        && matches!(entry_marker_shape(element), EntryMarkers::Forwarded)
+}
+
+/// Whether an output's register statement says jq's register is at `entry`, the
+/// register the consuming stage (or a fold's UPDATE) entered with (#3580).
 ///
-/// The caller consumes this on the **first** step the stage delivers only.
-/// That step is always the seed: `resolve_node_sink`'s jq untracked arm,
-/// [`resolve_recursive_descent_sink`] and [`resolve_recurse_sink`] all emit
-/// [`recurse_family_root_seed`] before anything else.
-fn recurse_seed_keeps_register<S: EvalSemantics>(element: &Expr, branch_trackable: bool) -> bool {
-    if S::TAG != EvalTag::Jq || branch_trackable {
-        return false;
+/// A recursion's seed and an untracked `.` state it as an
+/// [`AtEntry`](BranchRegister::AtEntry): they do not know the register's value. A
+/// `catch` handler's output already states `Unmoved(register)` -- the register jq
+/// restored at the `try`'s entry, which [`resolve_catch_sink`] seeds the handler's
+/// pipe with (#3133) -- and that statement is left as it is, because other readers
+/// of an `Unmoved` (`register_after`, an `any`/`all` generator, a fold source) need
+/// the value. It is *this* stage's register exactly when it equals `entry`: every
+/// register inside a stage [`entry_marker_stage`] admits derives from the stage's own
+/// frame, so the comparison cannot meet a look-alike from a re-seeding arm.
+fn states_register_at_entry(statement: &BranchRegister<'_>, entry: Option<&OwnedValue>) -> bool {
+    match statement {
+        BranchRegister::AtEntry => true,
+        BranchRegister::Unmoved(stated) => entry.is_some_and(|entry| stated.as_ref() == entry),
+        _ => false,
     }
-    let mut peeled = element;
-    loop {
-        match peeled {
-            Expr::Paren(inner) | Expr::Optional(inner) => peeled = inner,
-            Expr::Shared(inner) => peeled = inner.expr(),
-            Expr::Try { expr, .. } => peeled = expr,
-            _ => break,
+}
+
+/// What an expression does with the [`BranchRegister::AtEntry`] statements its
+/// producers make, read by [`entry_marker_stage`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryMarkers {
+    /// No producer anywhere inside: the stage has nothing to read.
+    None,
+    /// Every producer inside is reached only through wrappers that forward a
+    /// branch unchanged.
+    Forwarded,
+    /// A producer sits somewhere a wrapper not on the allowlist could have moved
+    /// the register ahead of it, or re-fed its branch.
+    Opaque,
+}
+
+impl EntryMarkers {
+    /// `Opaque` dominates, then `Forwarded`.
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Opaque, _) | (_, Self::Opaque) => Self::Opaque,
+            (Self::Forwarded, _) | (_, Self::Forwarded) => Self::Forwarded,
+            _ => Self::None,
         }
     }
+}
+
+/// A node that produces an [`BranchRegister::AtEntry`] itself: a recursion (its
+/// seed), an untracked `.`, or a `try` with a handler (the handler's outputs,
+/// [`resolve_catch_sink`]).
+fn is_entry_marker_producer(expr: &Expr) -> bool {
     matches!(
-        peeled,
-        Expr::RecursiveDescent
+        expr,
+        Expr::Identity
+            | Expr::RecursiveDescent
             | Expr::Builtin(
                 Builtin::Recurse
                     | Builtin::RecurseDown
                     | Builtin::RecurseF(_)
                     | Builtin::RecurseCond(_, _)
             )
+            | Expr::Try { catch: Some(_), .. }
     )
+}
+
+/// [`EntryMarkers`] for `expr`, peeling the wrappers [`entry_marker_stage`]
+/// lists. Each arm is the resolver's own forwarding arm in `resolve_node_sink`
+/// (or its sink helper): the closure parameters of `first`/`limit` and the
+/// condition of an `if` are subexps and never reach the sink.
+fn entry_marker_shape(expr: &Expr) -> EntryMarkers {
+    match expr {
+        Expr::Identity
+        | Expr::RecursiveDescent
+        | Expr::Builtin(
+            Builtin::Recurse
+            | Builtin::RecurseDown
+            | Builtin::RecurseF(_)
+            | Builtin::RecurseCond(_, _),
+        ) => EntryMarkers::Forwarded,
+        Expr::Paren(inner)
+        | Expr::Optional(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::Builtin(Builtin::FirstStream(inner))
+        | Expr::Limit { expr: inner, .. }
+        | Expr::Label { body: inner, .. }
+        | Expr::Try {
+            expr: inner,
+            catch: None,
+        } => entry_marker_shape(inner),
+        Expr::Shared(inner) => entry_marker_shape(inner.expr()),
+        // The handler's outputs state the register `resolve_catch_sink` seeded
+        // them with whatever the body is, so a `try` with a handler is a producer
+        // in its own right.
+        Expr::Try {
+            expr: inner,
+            catch: Some(_),
+        } => entry_marker_shape(inner).join(EntryMarkers::Forwarded),
+        Expr::Comma(items) => items.iter().fold(EntryMarkers::None, |acc, item| {
+            acc.join(entry_marker_shape(item))
+        }),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => entry_marker_shape(then_branch).join(entry_marker_shape(else_branch)),
+        Expr::Alternative(left, right) => entry_marker_shape(left).join(entry_marker_shape(right)),
+        other if any_subexpr(other, &mut is_entry_marker_producer) => EntryMarkers::Opaque,
+        _ => EntryMarkers::None,
+    }
 }
 
 /// Whether `expr` can split into sibling branches that would see the fold's
@@ -43672,8 +43871,41 @@ impl FoldRegister {
         let identical_eligible = cannot_move_register(expr);
         // Each branch is owned before it leaves, which is what lets `sink`
         // keep it past `input`'s own scope.
+        //
+        // #3580: an `AtEntry` statement survives the relocation, relative to *this*
+        // register: it says the expression left the register where it entered, and
+        // [`FoldRegister::advance`] carries `self` forward on it. Only a fold's own
+        // UPDATE call reads it; the caller strips it from anything it forwards,
+        // since a path relocated under a fold register is not the stage's.
+        // The shape of a fixed expression is constant, so it is asked at most once per
+        // call, and only when a branch actually carries a statement.
+        let mut forwards: Option<bool> = None;
         let mut deliver = |branch: PathBranch<'_>| {
-            sink(self.relocate_one::<S>(branch.into_owned_value(), identical_eligible))
+            // Jq mode only, like every register admission here: yq's scalar-write
+            // no-op convention would turn a wrongly carried register into silent
+            // corruption, and `advance` is not generic over the mode.
+            let at_entry = S::TAG == EvalTag::Jq
+                && !branch.trackable
+                && matches!(
+                    branch.register,
+                    BranchRegister::AtEntry | BranchRegister::Unmoved(_)
+                )
+                // Read only through an expression every producer of which forwards
+                // its branch unchanged ([`entry_marker_stage`]'s allowlist), and a
+                // handler's `Unmoved` against the fold's own register.
+                && *forwards.get_or_insert_with(|| {
+                    matches!(entry_marker_shape(expr), EntryMarkers::Forwarded)
+                })
+                && states_register_at_entry(
+                    &branch.register,
+                    self.trackable.then_some(&self.value),
+                );
+            let relocated = self.relocate_one::<S>(branch.into_owned_value(), identical_eligible);
+            sink(if at_entry && !relocated.trackable {
+                relocated.with_register(BranchRegister::AtEntry)
+            } else {
+                relocated
+            })
         };
         if let Expr::Pipe(exprs) = unwrap_paren(expr) {
             // The register goes in as the explicit argument here, which
@@ -43898,7 +44130,12 @@ impl FoldRegister {
                 trackable: true,
                 frame: fold_frame.extend(&branch.path),
             }
-        } else if cannot_move_register(update_expr) {
+        } else if cannot_move_register(update_expr)
+            // #3580: UPDATE could navigate, but this output is one it emitted
+            // before it did (a recursion's seed, a caught body's handler): the
+            // register is where UPDATE entered, which is `self`.
+            || matches!(branch.register, BranchRegister::AtEntry)
+        {
             Self {
                 path: Rc::clone(&self.path),
                 value: self.value.clone(),
@@ -48051,11 +48288,20 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     let register_unmoved = S::TAG == EvalTag::Jq
         && trackable
         && foreach_cannot_move_register(patterns, input, init, update, extract);
+    // #3580: everything but UPDATE leaves the register where the fold entered, so
+    // an emission is at the entry exactly when the UPDATE output it came from was
+    // (an `AtEntry`, or a handler's `Unmoved` of the fold's register). jq emits from
+    // inside the loop, so the register an emission carries is the one UPDATE's
+    // output left. The statement is per emission; this only says it may be read.
+    let update_states_entry = S::TAG == EvalTag::Jq
+        && trackable
+        && !register_unmoved
+        && foreach_outside_update_cannot_move(patterns, input, init, extract);
     let mut stating_sink = |branch: PathBranch<'a>| -> Demand {
         if register_unmoved && !branch.trackable {
             sink(branch.with_register(BranchRegister::Unmoved(Cow::Borrowed(value))))
         } else {
-            sink(branch)
+            sink(branch.without_entry_statement())
         }
     };
     let sink: &mut dyn FnMut(PathBranch<'a>) -> Demand = &mut stating_sink;
@@ -48312,6 +48558,19 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 slice_ok,
                             );
                             state = update_branch.value.clone().into_owned();
+                            // #3580: this emission's register is the one UPDATE's
+                            // output left, which is the entry's when it said so.
+                            let update_unmoved = update_states_entry
+                                && matches!(update_branch.register, BranchRegister::AtEntry);
+                            let mut emit = |branch: PathBranch<'a>| -> Demand {
+                                if update_unmoved && !branch.trackable {
+                                    sink(branch.with_register(BranchRegister::Unmoved(
+                                        Cow::Borrowed(value),
+                                    )))
+                                } else {
+                                    sink(branch)
+                                }
+                            };
                             if let Some(ext_expr) = &bound_extract {
                                 if let Some(control) = charge_budget(&mut budget, "foreach") {
                                     outcome = Some(FoldStepOutcome::Return(aborted.stop(control)));
@@ -48337,7 +48596,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                     extract_at_register,
                                     &extract_snapshot,
                                     keep,
-                                    sink,
+                                    &mut emit,
                                 ) {
                                     // #2979 rule 3: anything after `STOREV` that escapes --
                                     // EXTRACT, or the terminal `path()` check refusing the
@@ -48356,7 +48615,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                     }
                                     ResolveFlow::Exhausted => {}
                                 }
-                            } else if sink(foreach_emitted_branch(update_branch)) == Demand::Stop {
+                            } else if emit(foreach_emitted_branch(update_branch)) == Demand::Stop {
                                 outcome = Some(fold_stop_outcome(is_last, &mut downstream_stopped));
                                 return Demand::Stop;
                             }
@@ -49948,7 +50207,9 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
         PathBranch {
             path: Rc::clone(&node.path),
             value: node.value.clone(),
-            register: BranchRegister::None,
+            // #3580: only the seed states anything (`AtEntry`); every node
+            // reached through `f` is built with `BranchRegister::None`.
+            register: node.register.clone(),
             // Propagated rather than assumed `true`: in jq mode an
             // untracked seed enters this walk (#2764) and is delivered as
             // the passthrough it is, for a terminal to refuse "with result"
@@ -52456,20 +52717,27 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // stands, at `prefix + components`; with none in hand the rule below is
     // unchanged and a nested route cannot have re-established anything.
     let step_may_reestablish = stage_frame.register().is_some();
-    // #3272: a recursion stage's *first* output is its own seed -- `.`, no
-    // navigation -- which leaves jq's register where it was, whatever the later
-    // outputs do ([`recurse_seed_keeps_register`]). Consumed by the first step
-    // delivered, so only the seed can use it.
+    // #3272, #3580: a recursion's seed -- `.`, no navigation -- and a `catch`
+    // handler's output leave jq's register where the stage entered, whatever the
+    // outputs around them do. The producers say so per output
+    // ([`BranchRegister::AtEntry`]); this only asks whether the stage's
+    // expression forwards such a statement unchanged ([`entry_marker_stage`]),
+    // so a stage that forks or bounds a recursion (`first(..)`, `(., ..)`,
+    // `if c then .. else 1 end`) reads the seed and still refuses what navigates.
     // Only asked when the stage would otherwise drop the register: a stage
-    // that already preserves it has nothing for the seed to add.
-    let mut seed_pending =
-        !stage_preserves_register && recurse_seed_keeps_register::<S>(element, branch_trackable);
+    // that already preserves it has nothing for the statement to add.
+    let stage_states_entry =
+        !stage_preserves_register && entry_marker_stage::<S>(element, branch_trackable);
     // #3758: read once per stage, applied per result inside `place_step`.
-    let stages_per_result_register = stage_states_register_per_result::<S>(element);
+    // #3580: a `foreach` states its register per emission too -- the UPDATE
+    // output's -- but only on a trackable entry, where the statement is `Unmoved`;
+    // an untracked entry reads an absent statement as the carried copy standing
+    // (#3826), which is wrong for an emission whose UPDATE navigated.
+    let stages_per_result_register = stage_states_register_per_result::<S>(element)
+        || (branch_trackable && foreach_states_register_per_emission::<S>(element));
     let mut place_step = |step: PathBranch<'a>| -> Demand {
         // #3293: only a `?//` retry re-invokes this after a stop.
         downstream.begin();
-        let first_step = core::mem::take(&mut seed_pending);
         let PathBranch {
             path: components,
             value: resulting,
@@ -52477,16 +52745,18 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             snapshot: step_snapshot,
             register: step_register,
         } = step;
-        // The tripwire for the first-output invariant
-        // ([`recurse_family_root_seed`]): a recursion that delivered something
-        // before its seed would have this exemption carry the register onto a
-        // navigated value. Release builds stay safe on the same check: a step
-        // that navigated is never the seed.
+        // The tripwire for the statement's invariant: an `AtEntry` is only ever
+        // put on a branch that has navigated nowhere ([`recurse_family_root_seed`],
+        // [`resolve_catch_sink`]), so one that carries a path was re-fed by a
+        // route this stage's allowlist does not know. Release builds stay safe on
+        // the same check below: a step that navigated is never the seed.
         debug_assert!(
-            !first_step || components.depth() == 0,
-            "a recurse-family stage's first delivered step navigated (#3272)"
+            !matches!(step_register, BranchRegister::AtEntry) || components.depth() == 0,
+            "an AtEntry branch navigated (#3580)"
         );
-        let seed = first_step && components.depth() == 0;
+        let seed = stage_states_entry
+            && components.depth() == 0
+            && states_register_at_entry(&step_register, carried_register.as_deref());
         // #3456: what the step's producer says the register is after its
         // leaf ran -- `Unmoved` only when the leaf provably left it alone, a
         // lost state when it may not have.
@@ -117853,15 +118123,14 @@ mod tests {
     // raises. Every expectation is confirmed live against jq 1.7.1.
     // =========================================================================
 
-    /// The predicate's truth table: jq mode, an untracked branch, and a
-    /// recurse-family node seen through the wrappers that cannot put an output
-    /// ahead of its seed. A call, a fork or a nested pipe is not provably the
-    /// seed and stays refuse-only.
+    /// The admission's truth table: jq mode, an untracked branch, and a producer
+    /// (a recursion, an untracked `.`, a `try` with a handler) reached only through
+    /// the wrappers whose resolver arm forwards a branch unchanged. A stage that
+    /// hosts a producer anywhere else -- a pipe, an array, a destructuring bind, a
+    /// `def` -- is opaque, and one that hosts none has nothing to read (#3580).
     #[test]
-    fn test_recurse_seed_keeps_register_predicate_3272() {
-        let jq = |filter: &str| {
-            recurse_seed_keeps_register::<JqSemantics>(&parse(filter).unwrap(), false)
-        };
+    fn test_entry_marker_stage_predicate_3580() {
+        let jq = |filter: &str| entry_marker_stage::<JqSemantics>(&parse(filter).unwrap(), false);
         for filter in [
             "..",
             "recurse",
@@ -117874,53 +118143,60 @@ mod tests {
             "try ..",
             "try .. catch 7",
             "try (try recurse(.a))",
+            // #3580: the call and fork wrappers whose arms forward the branch.
+            "first(..)",
+            "limit(2; ..)",
+            "(., ..)",
+            "(.., 1)",
+            "if true then .. else 1 end",
+            "if .a then 1 else .. end",
+            ".. // 3",
+            "(try ..) // 3",
+            "try recurse(.a) catch 7",
+            "label $out | ..",
+            "first(try ..)",
+            "(first(..), limit(1; recurse(.a)))",
         ] {
             assert!(jq(filter), "{filter}");
         }
         for filter in [
-            "first(..)",
-            "limit(2; ..)",
-            "(.., 1)",
+            // A pipe re-seeds: its inner stage reads the statement, not this one.
             ".. | .",
             "(.. | select(true))",
-            "if true then .. else 1 end",
-            "[..]",
-            ".. // 3",
             "recurse(.a) | .",
+            // A container, a bind, a call and a fold are not forwarders.
+            "[..]",
+            "{a: ..}",
+            ". as {a: $q} | ..",
+            ". as $v | ..",
+            "def f: ..; f",
+            "reduce .. as $i (0; .)",
+            "foreach .. as $i (0; .)",
+            // Skipped outputs and `nth` are not audited.
+            "skip(1; ..)",
+            "nth(0; ..)",
+            // One opaque host spoils a comma that is otherwise forwarded.
+            "(.., [..])",
+            "if true then .. else (.a | ..) end",
+            // Nothing to read.
             "1",
             ".a",
             "empty",
+            ".[]",
         ] {
             assert!(!jq(filter), "{filter}");
         }
         // A closure parameter is as transparent as a paren (#3149).
         let shared = |filter: &str| Expr::Shared(Rc::new(SharedArg::new(parse(filter).unwrap())));
-        assert!(recurse_seed_keeps_register::<JqSemantics>(
-            &shared(".."),
-            false
-        ));
-        assert!(!recurse_seed_keeps_register::<JqSemantics>(
-            &shared("1"),
-            false
-        ));
-        // ... but only as transparent as one: a parameter that wraps a pipe, a
-        // fork or a call is not provably the seed either.
-        for filter in [".. | .", "(.., 1)", "first(..)", "(.. | select(true))"] {
-            assert!(
-                !recurse_seed_keeps_register::<JqSemantics>(&shared(filter), false),
-                "{filter}"
-            );
-        }
+        assert!(entry_marker_stage::<JqSemantics>(&shared(".."), false));
+        assert!(!entry_marker_stage::<JqSemantics>(&shared("1"), false));
+        assert!(!entry_marker_stage::<JqSemantics>(&shared(".. | ."), false));
         // A trackable branch is its own register, so there is nothing to carry.
         let recursion = parse("..").unwrap();
-        assert!(!recurse_seed_keeps_register::<JqSemantics>(
-            &recursion, true
-        ));
+        assert!(!entry_marker_stage::<JqSemantics>(&recursion, true));
         // yq keeps its eager guard: no oracle, and a wrong acceptance there is
         // a silent write rather than a loud error.
-        assert!(!recurse_seed_keeps_register::<YqSemantics>(
-            &recursion, false
-        ));
+        assert!(!entry_marker_stage::<YqSemantics>(&recursion, false));
     }
 
     /// The filed repro, read and write: the seed re-establishes the register,
@@ -117976,15 +118252,16 @@ mod tests {
         }
     }
 
-    /// The contract the seed exemption rests on: every recurse-family producer
-    /// delivers its seed first -- a zero-component passthrough of its input,
-    /// still untracked -- before anything that navigates. `resolve_seq_stage`
-    /// spends the exemption on the first step a stage delivers, so a producer
-    /// that emitted anything ahead of its seed would carry jq's register onto a
-    /// navigated or computed value. Read from three producers by hand when the
-    /// rule was added (`resolve_node_sink`'s jq untracked arm,
-    /// [`resolve_recursive_descent_sink`], [`resolve_recurse_sink`]); this makes
-    /// that reading a test.
+    /// The contract the seed statement rests on: every recurse-family producer
+    /// delivers its seed first -- a zero-component passthrough of its input, still
+    /// untracked, stating [`BranchRegister::AtEntry`] -- before anything that
+    /// navigates, and states nothing on any output after it. `resolve_seq_stage`
+    /// reads the statement per output (#3580; #3272 spent it on the first step a
+    /// stage delivered), so a producer that stated it on a navigated output, or
+    /// left it off the seed, would carry jq's register onto the wrong value or
+    /// drop it. Read from three producers by hand when the rule was added
+    /// (`resolve_node_sink`'s jq untracked arm, [`resolve_recursive_descent_sink`],
+    /// [`resolve_recurse_sink`]); this makes that reading a test.
     #[test]
     fn test_recurse_producers_deliver_their_seed_first_3272() {
         let nested = OwnedValue::array_from(vec![
@@ -118002,7 +118279,7 @@ mod tests {
                 let expr = parse(filter).unwrap();
                 let frame = Frame::enter(&expr);
                 let mut delivered = Vec::new();
-                let flow = resolve_node_sink::<JqSemantics>(
+                let _ = resolve_node_sink::<JqSemantics>(
                     &expr,
                     &value,
                     false,
@@ -118010,14 +118287,26 @@ mod tests {
                     &frame,
                     Keep::AtMost(usize::MAX),
                     &mut |branch| {
-                        delivered.push((branch.path.depth(), (*branch.value).clone()));
                         assert!(!branch.trackable, "{filter}");
-                        Demand::Stop
+                        delivered.push((
+                            branch.path.depth(),
+                            (*branch.value).clone(),
+                            matches!(branch.register, BranchRegister::AtEntry),
+                        ));
+                        Demand::Continue
                     },
                 );
-                assert!(matches!(flow, ResolveFlow::Stopped), "{filter}: {flow:?}");
-                // Stopped at the first delivery, which is the seed itself.
-                assert_eq!(delivered, [(0, value.clone())], "{filter}");
+                // The seed is first, at the root, and the only one that states
+                // anything.
+                assert_eq!(
+                    delivered.first(),
+                    Some(&(0, value.clone(), true)),
+                    "{filter}"
+                );
+                assert!(
+                    delivered.iter().skip(1).all(|(_, _, stated)| !stated),
+                    "{filter}: {delivered:?}"
+                );
             }
         }
     }

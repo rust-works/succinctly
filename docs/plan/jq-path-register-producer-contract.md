@@ -548,6 +548,21 @@ Each turns a refusal into an answer and needs its own oracle rows:
   BACKTRACK`, so the register is where INIT left it, and an INIT that cannot move it leaves it at the entry whatever
   the loop navigates. A navigating INIT, a destructuring pattern and `foreach` (which emits from inside the loop) stay
   refused.
+- ~~A recursion's seed behind a call or a fork, the output a `catch` handler adds after it, and a caught recursion in a
+  fold body (#3272's residuals).~~ Done by #3580, as a *per-output* statement and not a stage verdict: a recursion's seed
+  (`recurse_family_root_seed`) and an untracked `.` state `BranchRegister::AtEntry` (no value: on an untracked entry the register
+  is the stage's carried one), and a `catch` handler's output already states `Unmoved(register)` (#3133). `place_step` reads either
+  per output (`states_register_at_entry`) through `entry_marker_shape`'s allowlist of wrappers whose resolver arm forwards a branch
+  unchanged (`Paren`, a closure parameter, `?`, `try`, `,`, `if`, `//`, `first(f)`, `limit(n; f)`, `label`); a producer anywhere else makes the
+  stage opaque. The two fold rows are the same idea at the fold's own register: a `reduce` admits a `try` around a tracked UPDATE
+  (`fold_update_movement_tracked`), and `foreach` states `Unmoved(entry)` per emission whose UPDATE output was at the entry
+  (`FoldRegister::resolve_sink` keeps the statement, `advance` carries `self` on it, `foreach_states_register_per_emission` admits the
+  stage on a trackable entry only: an untracked one reads an absent statement as "the carried copy stands", #3826). Still
+  refused where jq answers, pinned by `test_recurse_seed_residuals_stay_loud_3580`: a literal ahead of the recursion (`(1, ..)`,
+  the taken `else 1`), `nth(n; ..)`, a recursion behind a bind or a `def` call, a `reduce` UPDATE of `recurse(f)`, a forking
+  `foreach` UPDATE, and a fold inside an `[E]`. A design note for whoever extends it: **do not convert the handler's `Unmoved` to
+  `AtEntry`** -- the first cut did, and 44 `-(try (.a | error) catch 7)` rows lost a match, because `register_after`, an `any`/`all`
+  generator and a fold source all read the value out of an `Unmoved`.
 - The stage-level downgrade in `place_step`: a leaf-local verdict for `,`/`//`/`if`/`try`, which
   turns the three rows pinned by `test_path_register_compound_stage_is_refused_as_a_whole_3456`
   into jq's `[]`. Cheap now, because the producers already say it.
