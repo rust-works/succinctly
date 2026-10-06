@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: `indices` of a string no longer panics on a needle that starts with a multi-byte character** (#3903).
+  `"éé" | indices("é")` (and `"日本日本" | indices("日")`, `"😀a😀" | indices("😀")`) panicked with `byte index 1 is not a char boundary`: the scan resumed one *byte* after each match and sliced the haystack
+  there. It now resumes after the match's first character, which finds the same overlapping matches as jq 1.7.1's byte-wise scan (`"ééé" | indices("éé")` is `[0,2]`) and reports the same byte offsets.
+  A differential fuzz over 260 multi-byte haystacks and every needle of one or two characters (15,600 `indices`/`index`/`rindex` results) matched jq on all of them. Pinned by
+  `test_string_indices_of_a_multibyte_needle_do_not_panic_3903`.
 - **jq: a string searched for the empty string has no match** (#3889).
   `"abc" | indices("")` answered `[0,1,2]`, `index("")` `0` and `rindex("")` `3` (`str::find` matches an empty needle at every position), where jq 1.7.1's `_strindices` has no
   window to try and answers `[]`, `null` and `null`, for an empty input too. Every needle that does match is unchanged, and an array searched for `[]` already answered this way. Found
