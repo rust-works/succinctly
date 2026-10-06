@@ -10501,9 +10501,20 @@ Both routes and the unary forms follow this. `test_any_all_condition_retry_extra
 pins the matrix and `test_any_all_direct_condition_retry_extra_verdicts_3819` the
 direct-retry case that needs no std retry generation.
 
-One path still diverges: the path-position resolver, where `path(.x | any(.; ...))`
-raises `Invalid path expression with result true` on the first answer where jq
-raises with `result false` on the last. Both raise, so only the message differs. Tracked in #3827.
+The path-position resolver follows the same answers (#3827). jq checks each one
+against its register as it is emitted, and the `?//` that swallowed the decisive
+output's `break` also swallows the refusal that check raises, so only the last
+answer's refusal survives: `path(.x | any(.; ...))` raises `Invalid path expression
+with result false` (the identity element), not `result true`. `path`, `del`, `|=`
+and a `try`/`?` around them all name the last answer;
+`test_any_all_path_condition_retry_names_last_answer_3827` pins the matrix.
+
+One shape in this family still diverges, and it is a *valid* answer rather than a
+refused one: an answer identical to jq's register (a `true` over a `true` node) that
+follows an alternative's error is a valid path in jq, and the resolver refuses it
+(`path(.x | any(.; (. as [$q] ?// $q | true)))` on `{"x":true}` is `["x"]` in jq).
+An answer that is a valid path is printed before the raise of the retry that follows
+it, as jq does (`test_any_all_path_answer_precedes_retry_raise_3827`).
 
 ## Provenance
 
