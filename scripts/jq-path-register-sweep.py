@@ -681,6 +681,10 @@ OPERANDS = [
     "map(select(.a))",
     "map(.a, {k:1} | .k)",
     "map(getpath([\"a\"]))",
+    # ...and the residual the review of #3865 found: a `getpath` anywhere in `f` keeps the by-value
+    # leaf, so jq's path error inside such an `f` is still not raised.
+    "map(getpath([\"a\"]) | {k:1} | .k)",
+    "map({k:1} | .k, getpath([\"a\"]))",
     "map(error(\"x\"))",
     "map(empty)",
 ]
