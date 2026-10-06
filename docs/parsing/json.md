@@ -462,31 +462,33 @@ The Ir ratio is the same at 2 MB and 10 MB, as a per-number constant-factor savi
 
 | row                    | M4 Pro hold   | M4 Pro head       | 7950X hold    | 7950X head      |
 |------------------------|---------------|-------------------|---------------|-----------------|
-| tiny (0-3 B strings)   | +2.6% / +2.2% | −13.2% / −12.6%   | −1.2% / −1.2% | −14.3% / −14.8% |
-| s4                     | +2.2% / +7.8% | −0.9% / −0.5%     | −3.7% / −1.6% | −8.8% / −7.3%   |
-| s8                     | +1.0% / −0.8% | −4.3% / −4.3%     | −4.2% / −3.4% | −15.1% / −14.9% |
-| s16                    | +1.3% / −1.5% | −15.7% / −16.3%   | −5.0% / −3.7% | −19.1% / −18.6% |
-| s64                    | −0.5% / +0.2% | −21.8% / −22.5%   | −5.7% / −6.0% | −24.4% / −24.7% |
-| escape-dense           | +0.6% / +0.6% | −1.6% / −1.4%     | −1.6% / −2.1% | −5.6% / −5.6%   |
-| short-key records      | +3.3% / +2.3% | −2.4% / −2.0%     | −2.0% / −1.9% | −9.2% / −7.6%   |
-| data 2 MB              | +1.6% / +1.2% | −3.0% / −2.6%     | −3.0% / −2.2% | −8.6% / −9.4%   |
-| data 10 MB             | +2.7% / +2.3% | −2.7% / −3.7%     | −3.6% / −3.6% | −10.0% / −11.1% |
-| users 2 MB             | +1.9% / +1.0% | −2.5% / −2.5%     | −3.2% / −3.0% | −9.5% / −8.3%   |
-| arrays 10 MB           | −0.9% / −1.4% | −0.3% / −1.4%     | −2.8% / −2.4% | −1.4% / −1.7%   |
-| wide 2 MB              | +0.1% / +0.5% | **+2.3% / +1.0%** | −2.9% / −7.1% | −3.5% / −7.4%   |
-| generated wide 8 MB    | +0.6% / +0.9% | **+1.7% / +0.6%** | −2.8% / −2.5% | −2.6% / −3.5%   |
-| generated users 8 MB   | +2.0% / +2.3% | −2.7% / −3.4%     | −3.6% / −3.9% | −10.7% / −9.1%  |
-| generated strings 8 MB | −1.5% / −0.2% | −31.6% / −31.2%   | −5.0% / −4.7% | −24.5% / −25.1% |
-| generated unicode 8 MB | +0.8% / +1.8% | −12.7% / −13.5%   | −2.6% / −0.6% | −16.2% / −16.7% |
-| late-fail twin         | −0.8% / −0.1% | −1.6% / −0.8%     | −1.0% / −1.2% | −3.2% / −3.3%   |
-| early-fail twin        | +0.4% / +0.4% | −0.7% / −0.3%     | −1.4% / −1.5% | −1.5% / −1.6%   |
-| pretty `.` (control)   | −1.2% / +0.0% | +0.5% / +0.4%     | −3.2% / −2.8% | −3.3% / −3.0%   |
+| tiny (0-3 B strings)   | +2.0% / +2.0% | −12.4% / −12.0%   | −0.2% / −0.2% | −14.0% / −14.2% |
+| s4                     | +2.6% / +2.0% | −1.5% / −1.9%     | −2.9% / −3.4% | −8.9% / −11.1%  |
+| s8                     | +1.8% / +1.0% | −3.7% / −4.6%     | −4.6% / +0.4% | −14.1% / −13.5% |
+| s16                    | +0.4% / +0.1% | −13.9% / −13.8%   | −5.7% / −3.8% | −19.0% / −19.1% |
+| s64                    | +0.1% / +0.8% | −22.3% / −22.4%   | −5.1% / −5.3% | −24.2% / −23.3% |
+| escape-dense           | +0.3% / +0.5% | −1.2% / −1.0%     | −2.4% / −2.9% | −4.4% / −4.4%   |
+| short-key records      | +2.5% / +2.2% | −2.4% / −1.8%     | −2.0% / −3.0% | −10.2% / −12.0% |
+| data 2 MB              | +2.7% / +0.1% | −1.4% / −1.6%     | −4.3% / −3.3% | −8.6% / −8.4%   |
+| data 10 MB             | +1.7% / +2.0% | −2.5% / −3.2%     | −2.6% / −2.7% | −9.4% / −10.1%  |
+| users 2 MB             | +2.6% / +1.0% | −1.7% / −1.5%     | −2.9% / −3.1% | −8.2% / −9.1%   |
+| arrays 10 MB           | −0.2% / −2.0% | +0.5% / −0.4%     | −2.9% / −2.5% | −2.8% / −2.7%   |
+| wide 2 MB              | +1.4% / +1.1% | **+2.4% / +1.3%** | −1.6% / −1.9% | −2.8% / −1.2%   |
+| generated wide 8 MB    | +0.5% / +0.7% | **+0.9% / +1.3%** | −1.9% / −1.8% | −3.5% / −4.0%   |
+| generated users 8 MB   | +4.3% / +2.5% | −3.6% / −3.2%     | −3.7% / −4.1% | −8.7% / −9.6%   |
+| generated strings 8 MB | −0.3% / +5.1% | −30.8% / −31.5%   | −6.8% / −7.3% | −25.0% / −24.8% |
+| generated unicode 8 MB | +0.6% / +1.4% | −12.9% / −13.7%   | −2.3% / −1.3% | −15.8% / −16.1% |
+| late-fail twin         | +0.4% / +0.7% | +0.3% / −0.8%     | −0.6% / −0.9% | −2.3% / −2.5%   |
+| early-fail twin        | −0.8% / −0.2% | +0.1% / −0.3%     | −0.8% / −1.4% | −0.9% / −1.4%   |
+| pretty `.` (control)   | −0.3% / −0.4% | +0.4% / +0.1%     | −2.8% / −3.3% | −3.5% / −3.0%   |
 
-`ab-cli.py --control` read −1.3%..+1.9% (min) and −0.9%..+2.5% (median) on the M4 Pro, and −0.7%..+0.9% (min) and −4.3%..+5.0% (median) on the 7950X. The late-fail twin, the precheck-cost control, did not get worse: its string work is now cheaper, and the re-render that follows is untouched. The mechanism wins at every string length #3168 lost at: 0-3-byte strings (−12.6% / −14.8%), the 4-byte and 8-byte rows, the escape-dense and short-key rows that cost the SIMD skip +5% to +17%.
+`ab-cli.py --control` read −1.3%..+2.0% (min) and −2.4%..+1.4% (median) on the M4 Pro, and −1.4%..+1.2% (min) and −1.8%..+4.3% (median) on the 7950X. The table is the final tree (`a2db8360d`, after review); an earlier revision of the same code read within 1.5 points of every cell. The late-fail twin, the precheck-cost control, did not get worse: its string work is now cheaper, and the re-render that follows is untouched. The mechanism wins at every string length #3168 lost at: 0-3-byte strings (−12.6% / −14.8%), the 4-byte and 8-byte rows, the escape-dense and short-key rows that cost the SIMD skip +5% to +17%.
 
-Instruction counts (M4 Pro `time -l` instructions retired, min of 5; 7950X cachegrind `Ir`), `head` vs `base`, with `hold` beside it: `tiny` +6.3% (hold +6.9%) and +2.8% (+2.9%); `s4` −4.5% (+5.3%) and −5.4% (+2.2%); `short keys` +2.4% (+5.7%) and +0.1% (+2.6%); `wide 2 MB` −3.5% (+1.8%) and −4.1% (+0.9%); `data` 2 MB −6.7% (+1.3%) on the 7950X; `data 10 MB` late-fail −2.2% (+1.0%) on the M4 Pro; early-fail and `arrays` unchanged to 0.3%. No row executes more instructions than its holdout, and the numbers-only `arrays` row, which never classifies a block, is the proof the laziness holds.
+Instruction counts (M4 Pro `time -l` instructions retired, min of 5; 7950X cachegrind `Ir`), `head` vs `base`, with `hold` beside it: `tiny` +7.0% (hold +7.9%) and +2.3% (+3.2%); `s4` −3.9% (+6.1%) and −5.8% (+2.4%); `short keys` +3.0% (+6.6%) and −0.3% (+2.8%); `wide 2 MB` −3.3% (+2.0%) and −4.1% (+1.0%); `data` 2 MB −6.8% (+1.4%) on the 7950X; `data 10 MB` late-fail −2.1% (+1.0%) on the M4 Pro; early-fail and `arrays` unchanged to 0.3%. No row executes more instructions than its holdout, and the numbers-only `arrays` row, which never classifies a block, is the proof the laziness holds.
 
-**One residual, recorded rather than hidden:** the two `wide` rows (one object of 136k `"kN":N` members, each key 2-8 bytes) read +2.3% / +1.0% and +1.7% / +0.6% on the M4 Pro against a holdout at +0.1% / +0.5% and +0.6% / +0.9%, while retiring 5% *fewer* instructions. That is about +1% to +2% net on one shape, inside two control floors; it has the signature #2963 describes (a vector-to-GPR transfer on the critical path of a short string) rather than an instruction-count cost, and the same rows are −3% to −7% on the 7950X. Not chased: the shape is a flat object with numeric values, the rest of the table moves the other way by 2% to 31%.
+**One residual, recorded rather than hidden:** the two `wide` rows (one object of 136k `"kN":N` members, each key 2-8 bytes) read +2.4% / +1.3% and +0.9% / +1.3% on the M4 Pro against a holdout at +1.4% / +1.1% and +0.5% / +0.7%, while retiring 3% *fewer* instructions: about +0.5% to +1% net, inside the control floor, and −1% to −4% on the 7950X. A first revision of the tree read +2.3% / +1.0% against a holdout at +0.1% / +0.5%, so the figure moves with layout. It has the signature #2963 describes (a vector-to-GPR transfer on the critical path of a short string) rather than an instruction-count cost. Not chased: the shape is a flat object with numeric values, and the rest of the table moves the other way by 2% to 31%.
+
+The per-element shape, `-c '.[]'` over the array files (each output element runs the gate on its own, so a 64-byte block is classified for a short element), is neutral: `head` tracks `hold` on every row on both boxes (M4 Pro min −2.1%..+2.8%, median −0.9%..+0.6%; 7950X min −6.5%..−0.6% against `hold` at −6.1%..−0.3%). The one outlier, `s16` on the M4 Pro (+2.8% min against `hold` at −0.5%), reads +0.5% / +0.3% in the median.
 
 `string_scan_agrees_with_the_bytewise_reference_across_block_boundaries_3340` and `..._on_random_strings_3340` pin the new scan against the old byte loop (kept in the test module as an independent oracle) with the opening quote at every offset of a 64-byte block and a special of every kind planted at every offset across two boundaries; `src/util/simd/specials.rs` pins the kernel against a scalar reference for every byte value in every lane.
 
