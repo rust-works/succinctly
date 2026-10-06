@@ -21291,6 +21291,18 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 _ => return QueryResult::Error(non_string_pattern(value, pattern)),
             };
             match s.as_str() {
+                // jq 1.7.1's `_strindices` has no window to try for an empty
+                // needle, so `indices` answers `[]` and `index`/`rindex` (its
+                // `.[0]` / `.[-1:][0]`) answer `null`, for an empty input too
+                // (#3889). `str::find` matches an empty needle at every
+                // position, which is not what jq reports. The array arm above
+                // already answers an empty needle this way.
+                Ok(_) if pattern_str.is_empty() => match occurrence {
+                    SearchOccurrence::All => QueryResult::Owned(OwnedValue::array_from(Vec::new())),
+                    SearchOccurrence::First | SearchOccurrence::Last => {
+                        QueryResult::Owned(OwnedValue::Null)
+                    }
+                },
                 Ok(cow) => match occurrence {
                     SearchOccurrence::All => {
                         let mut indices = Vec::new();
