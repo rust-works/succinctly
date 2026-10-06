@@ -390,6 +390,11 @@ OPERANDS = [
     "(reduce . as $k (.; $k))",
     "(reduce . as $k (0; $k.a?))",
     "(foreach . as [$a] (0; $a; .))",
+    # ...a fold over `.` nested in another fold's UPDATE (not recognised there: the accumulator
+    # may have been moved off the register by the outer source), and one piped after a fold.
+    "(reduce .a? as $x (.; foreach . as $k (0; $k; .)))",
+    "(reduce first as $x (.; foreach . as $k (0; ($k | .a?) // $k; .)))",
+    "(foreach . as $x (.; .; .) | foreach . as $k (0; $k; .))",
     "try (foreach . as $k (0; $k; .)) catch 7",
     "(reduce (foreach . as {a:$a} (.; .; .)) as $k (.; .))",
     "(reduce . as [[$a]] (0; .))",

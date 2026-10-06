@@ -636,6 +636,28 @@ $x (.; .[$x:]))` raises `E2`, was the slice error). What it leaves:
   (running its generator again would repeat its effects,
   `test_fold_pattern_computed_key_is_not_run_twice_3743`), so it keeps the same behaviour.
 
+## A fold over the register itself (#3790)
+
+`path(foreach . as $k (0; $k; .))` is `[]` in jq for any document, and succinctly answers it: a fold
+whose SOURCE yields only the register (`.`, or a comma or pipe of them, `yields_only_the_register`)
+emits its elements at the root path, so a bare `$k` is a path and a write through it lands on the
+root (`foreach` and `reduce` alike). What it leaves, all refusals where jq answers (the safe
+direction), pinned or swept:
+
+- **Inside another fold's UPDATE or EXTRACT, and after a fold in a pipe.** `fold_body` counts the
+  UPDATE/EXTRACT bodies being resolved on the thread and the recognition is off while it is
+  non-zero. There `.` is the accumulator, which the enclosing fold's source may have moved off the
+  register while the ambient still reads as trackable (a first cut answered a root where jq refuses,
+  and `del(reduce .[]? as $k (.; foreach . as $k (0; ($k | .a?) // $k; .)))` deleted the
+  document). The count is held across the downstream continuation too, so a fold piped after a
+  `foreach` (`foreach . as $x (.; .; .) | foreach . as $k (0; $k; .)`) and `path(reduce .a as $x (.;
+  foreach . as $k (0; $k; .)))` refuse where jq answers `[]`/`[[]]`. A parameter set only while the
+  accumulator is provably not at the register would recover them.
+- **A source that is not literally `.`**: `. as $x | .`, `select(true)`, `(empty, .)`, and a
+  `first($k)` in UPDATE (`path(foreach . as $k (0; first($k); .))` on `{"a":{}}`) keep the by-value
+  drive and its refusal.
+- **`no_std`** has no thread-local, so the recognition is off there and the previous answer stands.
+
 ## Path-mode slice bounds and a `?//` retry (#3293)
 
 A `?//` in a computed slice bound under `path`/`del`/`=`/`|=`/`+=`/`//=`/`pick` retries past

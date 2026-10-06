@@ -62689,6 +62689,42 @@ fn test_foreach_over_the_register_binds_it_as_a_path_3790() -> Result<()> {
             r#"Invalid path expression near attempt to access element "a""#,
             5,
         ),
+        // Later INIT forks, and a bounded consumer stopping the source.
+        (
+            r#"{"a":1}"#,
+            r"[path(foreach . as $k ((0,1); $k; .))]",
+            "",
+            r"Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(foreach . as $k ((0,1); .; $k))]",
+            "",
+            r"Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(reduce . as $k ((0,1); $k))]",
+            "",
+            r"Invalid path expression with result null",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(first(foreach (., .) as $k (0; $k; .)))",
+            "[]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(limit(1; foreach (., .) as $k (0; $k; .)))]",
+            "[[]]\n",
+            "",
+            0,
+        ),
     ])
 }
 
