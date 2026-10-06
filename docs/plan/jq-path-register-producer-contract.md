@@ -567,15 +567,25 @@ Each turns a refusal into an answer and needs its own oracle rows:
   call has produced a value (`iterates_untracked_input`; not `builtin_navigation`, #2646). Still
   refused, each needing its own row: a `map(f)`/`walk(f)` whose `f` navigates, and the rest of
   the builtins jq leaves in place (`ltrimstr`/`rtrimstr`, ...).
-- ~~A register-position-aware `try` for the guess a lost `and`/`or` operand raises, so a refusal jq
-  catches can be caught here too (the `var-rebind-nav` rows).~~ Done for the operands #3645 names,
-  without a new mechanism: #3749 and #3763 made `any`/`all`/`isempty(g)` state the register they
-  left, so the refusal of `R` is exact and a `try` catches it as jq's does, and #3361 made
-  `flatten`/`sort`/`to_entries` leave it where it entered; pinned by
-  `test_try_around_and_or_by_value_operand_answers_as_jq_3645`. Swept over `any`, `all`,
-  `isempty(.[]?)`, `any(.[]?; .)`, `all(.[]?; .)`, `flatten` and `sort` (93,267 rows, jq 1.7.1): 0
-  `ACCEPT_WRONG`, 0 `DIFF`, and none of the 629 refusals in a `try`, `?`, `first` or `//` context.
-  What is left refuses for other reasons, and none is a lost `and`/`or` operand: a `reduce` operand
-  states no register (D7); `try (X) | try ($y | .b)` refuses whenever `X` merely *contains* a
-  navigation, even one that never runs (`try (true or .a)`), which is the stage-level downgrade
-  above; a `?//` retry's guess (#3293); and a `null` input after a navigation (#3579).
+- A register-position-aware `try` for the guess a lost `and`/`or` operand raises, so a refusal jq
+  catches can be caught here too (the `var-rebind-nav` rows). **Not built as such, and not needed
+  for the operands #3645 named**: #3749 and #3763 made `any`/`all`/`isempty(g)` state the register
+  they left, so the refusal of `R` is exact and a `try` catches it as jq's does, and #3361 made
+  `flatten`/`sort`/`to_entries` leave it where it entered. Pinned by
+  `test_try_around_and_or_by_value_operand_answers_as_jq_3645`. Re-measured on `main` at
+  `4b1e9e86a` (a debug build against jq 1.7.1):
+
+  ```console
+  $ ./scripts/jq-path-register-sweep.py --candidate target/debug/succinctly --jobs 8 \
+      --operand any --operand all --operand 'isempty(.[]?)' --operand 'any(.[]?; .)' \
+      --operand 'all(.[]?; .)' --operand flatten --operand sort
+  ```
+
+  93,267 rows: 0 `ACCEPT_WRONG`, 0 `DIFF`, 629 `REFUSE_WRONG`, none in a `try-del`,
+  `try-catch`, `try-catch-update`, `optional`, `first-wrap` or `alt-wrap` context (558 are the
+  `?//` retry contexts, 34 `var-rebind-nav`, 28 `foreach-update-try-var`, 9 `foreach-source`). What
+  still refuses where jq answers is not a lost `and`/`or` operand: a fold operand
+  (`reduce`, `foreach`) states no register (D7); `try (X) | try ($y | .b)` refuses whenever `X` merely *contains* a navigation,
+  even one that never runs (`try (true or .a)`), which is the stage-level downgrade listed above; a
+  `?//` retry's guess (#3293); and the `null`-input rows, which look like the terminal-`null`
+  bucket of #3579 but were not attributed individually. None of these is tracked by this item.
