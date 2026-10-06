@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a recursion's seed and a `catch` handler's output keep the path register one output at a time, so a recursion behind `first`/`limit`/`,`/`if`/`//`, a caught recursion's handler, and a caught recursion in a fold body answer as jq does** (#3580, #3272's residuals).
+  jq emits a recursion's seed (`.` of `def r: ., (f | r)`) before anything indexes, and runs a `catch` handler with the register restored to the `try`'s entry, so
+  `path(. as $x | 1 | first(..) | $x)`, `limit(2; ..)`, `(., ..)`, `if true then .. else 1 end`, `(try ..) // 3`, `try recurse(.a) catch 7`,
+  `reduce (1,2) as $i (1; try ..)` and `foreach (1,2) as $i (1; try ..; .)` are `[]` in jq (the later outputs raise, as jq does). #3272 kept the register across a
+  recursion stage's *first delivered step* only, which cannot tell a seed from an output that navigates once the stage forks or bounds the recursion, so each
+  was a loud refusal (and the `del`/`=`/`|=` forms refused). The recursion's seed and an untracked `.` now state `BranchRegister::AtEntry`, a `catch` handler's
+  output already stated its `Unmoved` register, and `resolve_seq_stage` reads either per output (`states_register_at_entry`) through the wrappers whose resolver arm forwards a
+  branch unchanged (`entry_marker_shape`: `Paren`, a closure parameter, `?`, `try`, `,`, `if`, `//`, `first(f)`, `limit(n; f)`, `label`); a producer anywhere else
+  (a pipe, a destructuring bind, a fold, a `def` call) leaves the stage opaque and refusing. A `reduce` also admits a `try` around a tracked UPDATE
+  (`fold_update_movement_tracked`), and a `foreach` states the register per emission (`foreach_states_register_per_emission`). Two #3579 rows and one #3711 row that were pinned
+  as refusals now answer as jq does (`(.a as $x | .a | 5 | first(..) | $x) = 9` on `null` writes `{"a":9}`). jq mode only; yq is unchanged. Still refused, each pinned loud by
+  `test_recurse_seed_residuals_stay_loud_3580`: a literal ahead of the recursion (`(1, ..)`), `nth(0; ..)`, a recursion behind a bind or a `def` call, a `reduce` UPDATE of
+  `recurse(f)`, a forking `foreach` UPDATE. Swept with `scripts/jq-path-register-sweep.py` against the merge-base build (a debug build, jq 1.7.1): the 67 new operands as bare stages (59,463 rows) went from 56,124 to 57,186 matches with `ACCEPT_WRONG` 34 to 34 and 0 regressions; a seeded 30,027-row sample of their full shapes had 0 regressions and `ACCEPT_WRONG` 8 to 8; seeded samples of the whole grid (40,027 rows without a `null` input, 25,027 with only one) had 0 regressions and `ACCEPT_WRONG` 14 to 14 and 22 to 22; `scripts/jq-bind-origin-fuzz.py` over six seeds (3,000 to 4,000 programs each, `--fold-p` 0, 0.3 and 0.7) found no fabricate, mismatch or new refuse-only row. Pinned by `test_recurse_seed_behind_call_or_fork_keeps_register_3580`.
 - **jq: a `?//` chain over a freshly built source in a `reduce`/`foreach` source runs the alternative jq runs in `path()`/`del()`/`=`** (#3651).
   A pattern step in path position is a tracked index, and a fresh value is never the register's node, so jq's `[[1]] as [$x] ?// $y | $x` raises in
   alternative one and runs `$y`. The fold source was driven by value, where alternative one succeeded: `first(path(foreach ([[1]] as [$x] ?// $y | $x) as $w
