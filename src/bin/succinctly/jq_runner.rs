@@ -6270,6 +6270,15 @@ fn scan_one_json_token(bytes: &[u8], pos: usize) -> Option<usize> {
 }
 
 /// Find the end of an object or array starting at `pos`.
+///
+/// `#[inline(never)]` keeps this per-byte loop out of `split_json_values`'s
+/// register allocation (#3350). Once #3035 grew `scan_one_json_token`'s
+/// keyword arm, LLVM's ARM64 allocator spilled this loop's `close` byte and
+/// `depth` to the stack inside the inlined copy: two reloads and a move per
+/// input byte (+6.3M `Ir` on `perf-guard`'s 2 MiB `arrays` fixture, +5.9% on
+/// `arrays_first_map_iterate`, whose total is small). x86_64 was unaffected.
+/// The call is paid once per top-level container, never per byte.
+#[inline(never)]
 fn find_matching_close(bytes: &[u8], pos: usize) -> Option<usize> {
     let open = bytes[pos];
     let close = if open == b'{' { b'}' } else { b']' };
