@@ -60968,6 +60968,42 @@ fn test_string_search_for_an_empty_needle_finds_nothing_3889() -> Result<()> {
     Ok(())
 }
 
+/// #3903: `indices` of a string resumes its scan after the first *character* of a
+/// match, not its first byte, so a needle that starts with a multi-byte character
+/// no longer slices the haystack inside it (a panic). Offsets stay byte offsets and
+/// overlapping matches are still all found, as in jq 1.7.1, whose scan is
+/// byte-wise. Captured live from jq 1.7.1; each row runs on a literal and on a
+/// document.
+#[test]
+fn test_string_indices_of_a_multibyte_needle_do_not_panic_3903() -> Result<()> {
+    for (input, filter, expected) in [
+        (r#""éé""#, r#"indices("é")"#, "[0,2]\n"),
+        (r#""日本日本""#, r#"indices("日")"#, "[0,6]\n"),
+        (r#""😀a😀""#, r#"indices("😀")"#, "[0,5]\n"),
+        // Overlapping matches, with the second starting inside the first.
+        (r#""ééé""#, r#"indices("éé")"#, "[0,2]\n"),
+        (r#""aaa""#, r#"indices("aa")"#, "[0,1]\n"),
+        (r#""aéé""#, r#"indices("éé")"#, "[1]\n"),
+        (r#""éé""#, r#"index("é")"#, "0\n"),
+        (r#""éé""#, r#"rindex("é")"#, "2\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "#3903: `{filter}` on {input}: {stderr:?}"
+        );
+        let program = format!("{input} | {filter}");
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", &program], None)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "#3903: `{program}`: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #3347: the raise reaches the write consumers of `path()` too, where the old
 /// by-value answer was an empty path set (`del` echoed the document, `=` wrote
 /// nothing, both exit 0). Captured live from jq 1.7.1.

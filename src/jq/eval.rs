@@ -21307,9 +21307,16 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     SearchOccurrence::All => {
                         let mut indices = Vec::new();
                         let mut start = 0;
+                        // Resume after the *first character* of the match, not
+                        // its first byte: a match that begins with a multi-byte
+                        // character would leave `start` inside it and the next
+                        // slice would panic (#3903). A valid UTF-8 needle can
+                        // only match on a character boundary, so this finds
+                        // exactly the overlapping matches jq's byte-wise scan does.
+                        let step = pattern_str.chars().next().map_or(1, char::len_utf8);
                         while let Some(pos) = cow[start..].find(pattern_str.as_str()) {
                             indices.push(OwnedValue::Int((start + pos) as i64));
-                            start += pos + 1;
+                            start += pos + step;
                             if start >= cow.len() {
                                 break;
                             }
