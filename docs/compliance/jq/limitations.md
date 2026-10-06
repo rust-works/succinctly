@@ -1905,7 +1905,7 @@ is the revert that established what the other one costs.
    | `. as $x \| ltrimstr("z") \| path($x)` (and a no-match `sub`/`rtrimstr`, `abs`, `walk(.)`, `setpath([]; .)`, `tostring \| tostring`, `reduce . as $y (null; $y)`) on a scalar | #3191 gives a bound string or number literal storage identity, but these builtins run through the owned re-index round trip, which hands `path()` a fresh copy -- the scalar twin of the bridged-builtin residual above. One more stays refused for a reason of its own: jq's constant pool (`def f: 5; f as $x \| f \| path($x)` is one `jv`) has no counterpart here, where each evaluation of a literal is a fresh value. The sweep's `scalar-*` rows pin each                                                                                                                       |
    | `. as $x \| .a as $y \| [.] \| path(.[0].a \| $y)`                                                                                                                            | `$x` is bound first, so `[.]` reuses `$x`'s own value, whose `.a` is `$x`'s materialization, not `$y`'s: sharing it needs an *ancestor* lookup when `$y` is bound, the mirror of #3179's nested reuse (jq `[0,"a"]`; the other bind order answers since #3179)                                                                                                                                                                                                                                                                                                                          |
    | `reduce (1) as $i (.; if true then . else 1 end) \| path($x)`                                                                                                                 | the UPDATE is not one of the owned fast paths (`eval_owned_navigation`/`eval_owned_relocating_fold`), so the fold's own hoisted per-step reroot rebuilds the accumulator before `path($x)` reads it                                                                                                                                                                                                                                                                                                                                                                                     |
-   | `reduce (.) as $x (.; path($x))`                                                                                                                                              | a fold's own loop variable is a literal, never a marker ([#3329](https://github.com/rust-works/succinctly/issues/3329)); the owned fold input ([#3328](https://github.com/rust-works/succinctly/issues/3328)) and `-n` owned-identity ([#3331](https://github.com/rust-works/succinctly/issues/3331)) rows that shared this cell answer since #3069                                                                                                                                                                                                                                     |
+   | `reduce .[] as $x (.; del(.[0] \| $x))` (and a computed INIT such as `{k:.} \| .k`) on stdin                                                                                  | a fold's loop variable is marked, and INIT's own `Rc` registered for the source to reuse, only for a node INIT itself names ([#3329](https://github.com/rust-works/succinctly/issues/3329)): a source that navigates *below* INIT's node, or a computed INIT with no cursor, needs the ancestor lookup #3179's nested reuse has no mirror for. A scalar loop variable (`reduce (.) as $x (.; path($x))` on a string or number) has no storage identity until a bind promotes it (#3191)                                                                                                 |
    | `no_std` builds                                                                                                                                                               | `embed_table` is thread-local; without `std` it is a no-op, refuse-only like `file_index`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
    | `succinctly yq`                                                                                                                                                               | unchanged by design — `RootWitness::of_owned` is gated on `S::TAG == EvalTag::Jq`; yq's node model is #2643's business (ADR-0018)                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
@@ -1930,8 +1930,8 @@ is the revert that established what the other one costs.
    (`map(.a |= .)`, `{} + .`, `tojson | fromjson`, a sibling); the bridge only returns storage
    for the node that went in. On a 2124-row stage-by-tail sweep (`. as $x | STAGE | TAIL` over
    60 stages and 12 `path()`/write tails), rows refused where jq answers went from 434 to 44,
-   and no row answers where jq refuses. The 44 are the fold loop variable (#3329) and
-   destructuring binds (`as {a:$v}`, `?//`; those answer since #3466, below). Pinned in
+   and no row answers where jq refuses. The 44 were the fold loop variable (answers since #3329,
+   below) and destructuring binds (`as {a:$v}`, `?//`; those answer since #3466, below). Pinned in
    `test_bridge_provenance_keeps_path_identity_3069` and
    `test_bridge_provenance_never_certifies_a_rebuilt_copy_3069`.
 
@@ -1948,13 +1948,62 @@ is the revert that established what the other one costs.
 
    - a step after one whose UPDATE rebuilt the accumulator, which a witnessed step always does
      (its UPDATE crosses the re-index bridge, as in the `if true then . else 1 end` row above):
-     `reduce (1,2) as $i (.; if $i == 2 then ($x.a) = 9 else . end)`;
-   - the fold's own loop variable ([#3329](https://github.com/rust-works/succinctly/issues/3329)).
+     `reduce (1,2) as $i (.; if $i == 2 then ($x.a) = 9 else . end)`.
+
+   The fold's own loop variable, which this section listed as a second residual, answers
+   since [#3329](https://github.com/rust-works/succinctly/issues/3329) (next paragraph).
 
    A fold over an owned input ([#3328](https://github.com/rust-works/succinctly/issues/3328)) and
    a navigated bind on the `-n 'input | ...'` route or in `while`/`until`
    ([#3331](https://github.com/rust-works/succinctly/issues/3331)) answer since #3069: the
    accumulator the bridge hands back is the bound storage itself.
+
+   **[#3329](https://github.com/rust-works/succinctly/issues/3329), now closed: a fold's own loop
+   variable in path position.** `reduce (.) as $x (.; ($x.a) = 9)` is `{"a":9}` in jq, because
+   `$x` is the very `jv` the source yielded and INIT `.` placed the same one. The fold spliced each
+   binding in as a rebuilt literal (`substitute_fold_step` → `owned_to_expr`), which has no storage
+   identity for the resolver's storage clause (#3177) to match, so every such row refused. Two
+   changes, both gated on jq mode, on the program reading a variable in path position at all
+   (`scalar_identity_readable`, decided once per program) and on the fold's own UPDATE or EXTRACT
+   reading one of its loop variables *as a path step* (`fold_loop_variable_is_marked`): inside a
+   `path`/`del`/`pick`/assignment target at a position that carries the register, or as an
+   argument of a call outside an assignment's right-hand side. The tight `reduce .[] as $x (0; . +
+   $x)` shape and every fold that only reads its variable by value are untouched. That last test is load-bearing: a marker anywhere in an
+   assignment makes `owned_assign_step` decline, so `reduce .[] as $r ({}; .[$r.name] =
+   $r.score)` (`$r` is a key, read by value) would copy the accumulator on every step
+   (`fold_assign_step_copies_nothing_3138`):
+
+   - a container loop variable is substituted as an `Origin::Untracked` marker holding the source
+     element's own storage (the shape `keep_container_identity` gives an `as` bind, #3069), so every
+     `$x` reads one `Rc` — on the `-n 'input | ...'` route, where INIT and source read the same
+     owned value, that alone answers;
+   - on the generic (stdin) route INIT and the source are materialized from the cursor separately,
+     so INIT's first output is registered on the embed table for the fork it starts
+     (`drive_foreach_init_generic`), and the source's later materialization of the same node returns
+     INIT's own `Rc`. The entry makes the accumulator's first in-place write copy once; only a fold
+     that marks its loop variables asks for it.
+
+   **Only the first INIT fork is marked.** jq 1.7.1 evaluates SOURCE against `null` on every later
+   fork (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through `$x` answers once
+   and then refuses (`reduce (.) as $x ((.,.); ($x.a) = 9)` prints `{"a":9}`, then errors); marking
+   the later forks would have answered them too. That jq quirk itself — `$x` is `null` there — is not
+   reproduced (a pre-existing divergence: this implementation hands every fork the real source), only
+   the path-position refusal that follows from it.
+
+   Still refused where jq answers, none answering where jq refuses (pinned in
+   `test_fold_loop_variable_in_path_position_3329` and the sweep's `fold-loop-var-*` rows):
+
+   - on the stdin route, a source that navigates *below* INIT's node (`reduce .[] as $x (.; del(.[0]
+     | $x))`, `reduce .a as $x (.; del(.a | $x))`), or a computed INIT with no cursor (`{k:.} | .k`,
+     `. + {}`): the embed table reuses a node's own `Rc`, never a descendant of one it holds (the
+     ancestor lookup #3179's nested reuse has no mirror for);
+   - a scalar loop variable (`reduce (.) as $x (.; path($x))` on a string or number): no storage
+     identity until a bind promotes it (#3191);
+   - a loop variable that reaches the resolver only through a rebinding (`reduce (.) as $x (.; $x |
+     . as $y | ($y.a) = 9)`): the gate does not see it, so it is not marked;
+   - `walk(.)`/`map_values(.)` as the source, and `[.][]` as the source on `-n`;
+   - `no_std` builds (the embed table is a no-op there, so the stdin route stays refuse-only) and
+     `succinctly yq` (ADR-0018: jq mode only).
 
    **[#2575](https://github.com/rust-works/succinctly/issues/2575)
    closed one row of this residual as a side effect, not a targeted fix**: `[.] \| .[0] \|
@@ -2123,9 +2172,9 @@ is the revert that established what the other one costs.
    `reduce empty as $i (.; .)`, `getpath([])`, `nth(0; .)`, `until(true; .)`,
    `ltrimstr("x")`, ...} and `input | . as $x | try error($x) catch path($x)`.
    `input | reduce (.) as $x (.; ($x.a = 9))` — a fold's own loop variable, demoted with the
-   accumulator's re-index, as the generic fold has done since #2642 — is a different,
-   unrelated residual: the loop variable is `Snapshot` with no node at all, embed table or
-   not, so it is untouched by anything below.
+   accumulator's re-index, as the generic fold has done since #2642 — was a different,
+   unrelated residual: the loop variable was a literal with no node at all, embed table or
+   not, so nothing below touched it. It answers since #3329 (see the paragraph after #3181's).
    Pinned in `tests/jq_cli_tests.rs` (`*_3036`), swept by
    `scripts/jq-bind-origin-oracle-sweep.sh`'s `in-evaluator-*` rows and fuzzed by
    `scripts/jq-bind-origin-fuzz.py`'s `ROUTES` family.
