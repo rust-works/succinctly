@@ -123,6 +123,41 @@ fn test_try_body_as_binding_and_catch_3371() -> Result<()> {
     Ok(())
 }
 
+/// #3822: a `try` body that fails at its first stage no longer pays a second
+/// path-context walk of the unevaluated remainder per error. The answers are
+/// unchanged -- captured from /usr/bin/jq 1.7.1 -- for a failing head, a
+/// succeeding one, and a null-yielding one, with a tail long enough to matter.
+#[test]
+fn test_try_body_failing_head_long_tail_3822() -> Result<()> {
+    let input = r#"[0,"a",{"foo":5},{"foo":null},[1]]"#;
+    let sum = vec!["1"; 200].join("+");
+    for (filter, expected) in [
+        (
+            format!(r#"map(try (.foo | ({sum})) catch "x")"#),
+            r#"["x","x",200,200,"x"]"#,
+        ),
+        (
+            format!(r#"[.[] | try (.foo | . + 1 | ({sum})) catch "x"]"#),
+            r#"["x","x",200,200,"x"]"#,
+        ),
+        (
+            r#"map(try (.foo | tostring | length) catch "x")"#.to_string(),
+            r#"["x","x",1,4,"x"]"#,
+        ),
+        (
+            format!(r#"map(try (. | ({sum})) catch "x")"#),
+            "[200,200,200,200,200]",
+        ),
+    ] {
+        assert_eq!(
+            run_jq_full(&["-c", &filter], Some(input))?,
+            (format!("{expected}\n"), String::new(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// Captured from /usr/bin/jq 1.7.1-apple for both CLI input routes.
 #[test]
 fn test_parenthesized_pattern_bind_pipe_retry_cli_3031() -> Result<()> {

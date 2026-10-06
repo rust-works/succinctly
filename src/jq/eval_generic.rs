@@ -10436,6 +10436,14 @@ fn eval_single_pipe<S: EvalSemantics, V: DocumentValue>(
     // one, and its loop returns `false` at the first stage that is neither
     // navigational nor node-preserving unless a later stage does), so with it
     // clear the call could only repeat the walk above to answer `false`.
+    //
+    // Debug builds still ask, so a later edit to `owned_identity_pipe_applies`
+    // that breaks the premise fails the whole test suite, not just the
+    // hand-picked corpus of `owned_identity_pipe_applies_is_false_without_path_context_3822`.
+    debug_assert!(
+        needs_path || !owned_identity_pipe_applies(exprs),
+        "owned_identity_pipe_applies is true for a pipe with no path-context stage (#3822)"
+    );
     if needs_path && owned_identity_pipe_applies(exprs) {
         return collect_each_generic::<S, V>(whole.get(exprs), value, optional, cursor);
     }
