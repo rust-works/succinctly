@@ -25657,19 +25657,108 @@ fn test_key_past_a_seeded_deep_position_does_not_panic_3020() -> Result<()> {
 /// evaluated inside the same walked portion, not through a re-seeded
 /// downstream candidate) genuinely does recurse natively once per document
 /// level via `path_context_step_recurse` -- confirmed by the panic site
-/// itself (`eval_generic.rs:18990`, that function's own entry guard, not
-/// `path_field_step_generic`'s). This must keep failing past the 256 limit;
-/// #3020's fix only stopped a *seeded* trail from being miscounted as
-/// native recursion, it did not raise or remove the recursion guard itself.
+/// itself (that function's own entry guard, not `path_field_step_generic`'s).
+/// This must keep failing past its recursion ceiling; #3020's fix only
+/// stopped a *seeded* trail from being miscounted as native recursion, it did
+/// not raise or remove the recursion guard itself. That ceiling is
+/// `MAX_PATH_WALK_DEPTH` (384) since #3429, not the materializers' 256.
 #[test]
 fn test_recurse_only_walk_past_the_limit_still_fails_cleanly_3020() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(&["-c", "[.. | key]"], Some(&nested_arrays(300)))?;
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[.. | key]"], Some(&nested_arrays(400)))?;
     assert_eq!(stdout.trim_end(), "");
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
+        stderr.contains("nesting depth exceeds limit of 384"),
         "stderr: {stderr:?}"
     );
+    Ok(())
+}
+
+/// #3429: `paths`/`leaf_paths` walk a document natively, so they answer up to
+/// `MAX_PATH_WALK_DEPTH` (384) -- where `[..]` already did -- instead of
+/// stopping at the materializers' 256. 383 is the deepest document they
+/// accept: a path as long as the document is deep must stay under the ceiling.
+#[test]
+fn test_paths_and_leaf_paths_answer_between_256_and_384_3429() -> Result<()> {
+    for depth in [255, 256, 300, 383] {
+        let doc = nested_arrays(depth);
+        for (filter, expected) in [("[paths] | length", depth), ("[leaf_paths] | length", 1)] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+            assert_eq!(
+                code, 0,
+                "{filter} @ {depth}: stdout: {stdout:?} stderr: {stderr:?}"
+            );
+            assert_eq!(
+                stdout.trim_end(),
+                expected.to_string(),
+                "{filter} @ {depth}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3429: past 384 the same builtins refuse cleanly, and with the ceiling
+/// they actually enforce (384), not the materializers' 256.
+#[test]
+fn test_paths_and_leaf_paths_past_384_refuse_cleanly_3429() -> Result<()> {
+    for depth in [384, 500] {
+        let doc = nested_arrays(depth);
+        for filter in [
+            "[paths] | length",
+            "[leaf_paths] | length",
+            "[.. | path] | length",
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+            assert_eq!(stdout.trim_end(), "", "{filter} @ {depth}");
+            assert_eq!(
+                code, 5,
+                "{filter} @ {depth}: stdout: {stdout:?} stderr: {stderr:?}"
+            );
+            assert!(
+                stderr.contains("nesting depth exceeds limit of 384"),
+                "{filter} @ {depth}: stderr: {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3429 residual: `path(..)` and `paths(f)` materialize the whole document
+/// first (`to_owned_with_cursor`, a native recursion that overflows a 2 MiB
+/// debug thread at ~360 levels on aarch64, ~385 on x86_64), so they keep the materializers' 256 ceiling
+/// even though `paths` and `.. | path` over the same document answer. Pinned
+/// so that lifting it is a deliberate change that also re-measures the
+/// materializer's stack (see `MAX_PATH_WALK_DEPTH`).
+#[test]
+fn test_materializing_path_forms_still_stop_at_the_materializer_ceiling_3429() -> Result<()> {
+    let doc = nested_arrays(300);
+    for filter in [
+        "[path(..)] | length",
+        "[paths(type == \"number\")] | length",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&doc))?;
+        assert_eq!(stdout.trim_end(), "", "{filter}");
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("nesting depth exceeds limit of 256"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[.. | path] | length"], Some(&doc))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "301");
+    Ok(())
+}
+
+/// #3429: the same walk answers on a document between the materializers'
+/// 256 and the path walkers' 384, where `[..]` already did.
+#[test]
+fn test_recurse_only_walk_between_256_and_384_answers_3429() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[.. | key] | length"], Some(&nested_arrays(300)))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "300");
     Ok(())
 }
 
@@ -32868,9 +32957,10 @@ fn test_map_identity_reports_clean_error_on_adversarial_nesting_1793() -> Result
 /// crashed with a raw stack overflow (`fatal runtime error: stack overflow,
 /// aborting`, SIGABRT, no diagnostic at all) rather than any clean error,
 /// confirmed live with 1,000,000 segments at review. This test uses a much
-/// smaller, CI-friendly depth that still clears `MAX_NESTING_DEPTH` (256,
-/// #2061's cursor-native fast path this shape reaches) -- the crash
-/// reproduces at any depth past that limit, not only at a million.
+/// smaller, CI-friendly depth that still clears `MAX_PATH_WALK_DEPTH` (384
+/// since #3429, 256 before; #2061's cursor-native fast path this shape
+/// reaches) -- the crash reproduces at any depth past that limit, not only at
+/// a million.
 /// `path(.a.a.a...)` alone is fully cursor-navigable
 /// (`path_expr_is_cursor_navigable`), so this reaches the same #1793
 /// `catch_unwind` this file's other adversarial-nesting tests above already
@@ -32878,17 +32968,34 @@ fn test_map_identity_reports_clean_error_on_adversarial_nesting_1793() -> Result
 #[test]
 fn test_path_cursor_native_deep_static_chain_reports_cleanly_not_stack_overflow_2058() -> Result<()>
 {
-    let filter = format!("path({})", ".a".repeat(300));
+    let filter = format!("path({})", ".a".repeat(400));
     let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
+        stderr.contains("nesting depth exceeds limit of 384"),
         "stderr: {stderr:?}"
     );
     assert!(
         !stderr.contains("stack overflow") && !stderr.contains("fatal runtime error"),
         "stderr: {stderr:?}"
     );
+    Ok(())
+}
+
+/// #3429: a static chain between the old 256 ceiling and the new 384 one
+/// answers -- the guard runs before each stage's step, so 384 components are
+/// the most the walker takes (the 385th is the first refused).
+#[test]
+fn test_path_cursor_native_static_chain_up_to_384_answers_3429() -> Result<()> {
+    for components in [300, 384] {
+        let filter = format!("path({}) | length", ".a".repeat(components));
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
+        assert_eq!(
+            code, 0,
+            "{components}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), components.to_string());
+    }
     Ok(())
 }
 

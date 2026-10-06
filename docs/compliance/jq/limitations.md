@@ -9257,18 +9257,25 @@ answers, which differ from the evaluator it used before in these ways. Each is e
 unreadable-value row above, a place the previous evaluator was the outlier, or a documented
 narrowing:
 
-- **Nesting depth.** `paths`, `leaf_paths`, `path(..)`, `getpath` and the other path builtins
-  now stop at nesting depth 256 (the generic walkers' ceiling, chosen for native-stack safety)
-  where the previous evaluator answered up to 384. Past it they return
-  `nesting depth exceeds limit of 256` as a `QueryResult::Error`, tagged as a decode failure so
-  a `try` in the filter does not swallow it, and never as an unwinding panic: the walkers report
-  it as an error, as do the comment-preserving and standard-JSON materializers and the owned
-  `..` walk, and `eval()` contains a 256-level panic from anywhere else, such as the public
-  `JqValue::materialize` (with the `std` feature; without it there is no unwinding to
-  catch). Raising the ceiling is
-  [#3429](https://github.com/rust-works/succinctly/issues/3429). Pinned by
-  `test_public_eval_path_family_over_depth_is_a_clean_error_3457`
-  (`tests/jq_library_eval_nesting_depth_tests.rs`).
+- **Nesting depth.** The path builtins stop at a nesting depth the previous evaluator, which
+  answered up to 384, did not have. `paths`, `leaf_paths` and the cursor-native `path(f)`
+  walkers stop at 384 ([#3429](https://github.com/rust-works/succinctly/issues/3429) raised
+  them from 256); the forms that materialize the whole document first (`path(..)`,
+  `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among others) stop at 256, the materializers'
+  ceiling, chosen for native-stack safety. Past the ceiling they return
+  `nesting depth exceeds limit of 384` (or `256`) as a `QueryResult::Error`, tagged as a decode
+  failure so a `try` in the filter does not swallow it, and never as an unwinding panic: the
+  walkers report it as an error, as do the comment-preserving and standard-JSON materializers
+  and the owned `..` walk, and `eval()` contains a 256-level panic from anywhere else, such as
+  the public `JqValue::materialize` (with the `std` feature; without it there is no unwinding
+  to catch). Pinned by `test_public_eval_path_family_over_depth_is_a_clean_error_3457`
+  (`tests/jq_library_eval_nesting_depth_tests.rs`). **The materializing forms are the residual
+  of #3429, not an oversight:** the materializer (`to_owned_cursor`) overflows a 2 MiB debug
+  thread at about 360 levels (aarch64) to 385 (x86_64) with its guard lifted, so it cannot take 384 without a
+  heap-stack rewrite or a stack-aware ceiling (the options are on the issue), and a path
+  builtin that reaches it keeps 256. Pinned by
+  `test_materializing_path_forms_still_stop_at_the_materializer_ceiling_3429`
+  (`tests/jq_cli_tests.rs`), so lifting it is a deliberate change.
 - **Result shape.** A single navigated value is still `QueryResult::One` and `.` is still
   `OneCursor`, but a computed `null` is `Owned(Null)` where it was `One(Null)` and an empty
   iteration is `None` where it was `Many([])`. The values are the same.

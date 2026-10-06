@@ -27729,13 +27729,18 @@ fn count_elements<W: Clone + AsRef<[u64]>>(
 ///
 /// # Nesting depth
 ///
-/// A document nested 256 levels or deeper makes the queries that walk it
-/// (`paths`, `path(..)`, ...) return `nesting depth exceeds limit of 256` as
-/// a [`QueryResult::Error`]. The error is tagged as a decode failure, so a
-/// `try` in the filter does not swallow it, and it is a return value, not an
-/// unwinding panic. The evaluator this entry used before #3457 answered these
-/// up to 384 levels; raising the ceiling is #3429. Every depth guard the
-/// evaluator itself reaches reports the error this way. As a backstop, with
+/// A document nested too deep for the queries that walk it returns
+/// `nesting depth exceeds limit of N` as a [`QueryResult::Error`]: `paths`,
+/// `leaf_paths` and the cursor-native `path(f)` walkers answer up to 383
+/// levels (N is 384), while the forms that materialize the document first
+/// (`path(..)`, `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among
+/// others) stop at 255 (N is 256). The error is tagged as a decode failure, so a `try` in the
+/// filter does not swallow it, and it is a return value, not an unwinding
+/// panic. The evaluator this entry used before #3457 answered all of these up
+/// to 384 levels; the materializing forms stay at 256 because the
+/// materializer's native recursion cannot be raised safely (#3429). Every
+/// depth guard the evaluator itself reaches reports the error this way. As a
+/// backstop, with
 /// the `std` feature a panic of the 256-level guard from anywhere else (the
 /// public `JqValue::materialize` still panics there by contract) is caught
 /// and returned the same way, though the default panic hook still prints its

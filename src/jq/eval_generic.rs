@@ -210,20 +210,22 @@ pub fn assert_nesting_depth(depth: usize) {
 /// `validate_json_delimiters`, reached before any user filter runs) that
 /// already threads a `Result` and has no such concern.
 pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
-    check_depth_with(depth, EvalError::new)
+    check_depth_with(depth, MAX_NESTING_DEPTH, EvalError::new)
 }
 
-/// The one [`MAX_NESTING_DEPTH`] comparison and message behind
-/// [`check_nesting_depth`] and [`guard_nesting_depth`], which differ only in
-/// how the error is tagged (`make`).
+/// The one depth comparison and message behind [`check_nesting_depth`],
+/// [`guard_nesting_depth`] and [`guard_path_walk_depth`], which differ only in
+/// the ceiling (`max`) and how the error is tagged (`make`).
 #[inline]
-fn check_depth_with(depth: usize, make: fn(String) -> EvalError) -> Result<(), EvalError> {
-    if depth < MAX_NESTING_DEPTH {
+fn check_depth_with(
+    depth: usize,
+    max: usize,
+    make: fn(String) -> EvalError,
+) -> Result<(), EvalError> {
+    if depth < max {
         Ok(())
     } else {
-        Err(make(super::value::nesting_depth_exceeded_message(
-            MAX_NESTING_DEPTH,
-        )))
+        Err(make(super::value::nesting_depth_exceeded_message(max)))
     }
 }
 
@@ -256,13 +258,16 @@ pub fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Opt
         .then(|| text.to_string())
 }
 
-/// The path walkers' depth guard (#3457): [`assert_nesting_depth`]'s
+/// The materializers' depth guard (#3457): [`assert_nesting_depth`]'s
 /// ceiling, reported as a `decode_failure`-tagged `Err` instead of a panic.
 ///
-/// The walkers (`collect_paths_generic`, `path_walk_generic` and the
-/// `path_*step*` family) already return a `Result`, so -- like
-/// [`to_owned`] after #2627 -- only the signalling needed to change, not
-/// the signatures. The tag keeps the property the panic was chosen for: a
+/// Used by the walks that build an owned tree (`to_owned_with_comments_at_depth`,
+/// `owned_from_standard_json_at_depth`, `owned_identity_recurse_step`). The
+/// path walkers (`collect_paths_generic`, `path_walk_generic` and the
+/// `path_*step*` family) report the same way against their own, higher ceiling
+/// through [`guard_path_walk_depth`] (#3429). Both already return a `Result`,
+/// so -- like [`to_owned`] after #2627 -- only the signalling needed to change,
+/// not the signatures. The tag keeps the property the panic was chosen for: a
 /// stack-safety guard must not be swallowed by a `try`/`catch` in the
 /// running filter (see [`check_nesting_depth`], whose plain error would be).
 /// It also means a library caller of `jq::eval` gets a `QueryResult::Error`
@@ -270,7 +275,53 @@ pub fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Opt
 /// `catch_unwind` to report it.
 #[inline]
 pub(crate) fn guard_nesting_depth(depth: usize) -> Result<(), EvalError> {
-    check_depth_with(depth, EvalError::decode_failure)
+    check_depth_with(depth, MAX_NESTING_DEPTH, EvalError::decode_failure)
+}
+
+/// The ceiling for the path walkers' native recursion (#3429).
+///
+/// The same [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) (384)
+/// that value recursion (`..`, `recurse`) is bounded by, where
+/// [`MAX_NESTING_DEPTH`] (256) stays the ceiling for the whole-document
+/// materializers (`to_owned_cursor` and friends).
+///
+/// `paths`/`leaf_paths` and the cursor-native `path(f)` walkers
+/// (`path_walk_generic`, `path_step_generic` and their pipe/iterate/field/index
+/// siblings, `path_context_step_recurse`) used to share the materializers' 256,
+/// so a well-formed document nested 256-383 levels deep answered `[..]` but
+/// refused `[paths]`. Raising it is a stack-safety question, not a constant
+/// bump. Measured on a debug build (the fatter frames), the smallest stack a
+/// route needs to answer a 383-deep document, against the 2 MiB a library
+/// caller's thread or a `cargo test` thread gets:
+///
+/// - `collect_paths_generic` (`paths`, `leaf_paths`): ~1.4 MiB on aarch64 and
+///   ~1.3 MiB on x86_64, a ~1.4-1.5x margin;
+/// - `path_context_step_recurse` (`.. | path`): ~0.45 / ~0.43 MiB, ~4.6x;
+/// - a 383-component static chain (`path(.k.k...k)`): ~0.5 / ~0.47 MiB, ~4x.
+///
+/// The first is the same margin 256 gives the materializer today (it overflows
+/// a 2 MiB debug thread at ~360 levels on aarch64 and ~385 on x86_64 with its
+/// guard lifted, against its 256 ceiling), so it is accepted; the CLI's own
+/// thread is 256 MB-2 GB. The materializer itself does *not* clear 384 -- it
+/// would abort a 2 MiB debug thread before reaching its own guard on aarch64,
+/// and leave no margin at all on x86_64 -- so it keeps
+/// [`MAX_NESTING_DEPTH`], and a route that materializes the document first
+/// (`path(..)`, `path(recurse(f; c))`, `paths(f)`, `path(getpath(p))`, among
+/// others) still refuses past 256; see `docs/compliance/jq/limitations.md`.
+///
+/// The guard is `depth < ceiling` and the walkers count differently, so state
+/// the boundary in what a caller can observe: `paths`/`leaf_paths` and
+/// `.. | path` take a *document* nested up to 383 levels (a path as long as the
+/// document is deep must stay under the ceiling), and a static chain
+/// (`path(.a.a...)`) takes up to 384 *components*, because the guard runs
+/// before each stage's step.
+pub const MAX_PATH_WALK_DEPTH: usize = super::value::MAX_VALUE_TREE_DEPTH;
+
+/// [`guard_nesting_depth`]'s sibling for the path walkers: a
+/// `decode_failure`-tagged `Err` past [`MAX_PATH_WALK_DEPTH`] levels (#3429).
+#[inline]
+pub(crate) fn guard_path_walk_depth(depth: usize) -> Result<(), EvalError> {
+    check_depth_with(depth, MAX_PATH_WALK_DEPTH, EvalError::decode_failure)
 }
 
 /// A document number's double under `S`'s number model, for the
@@ -8031,9 +8082,12 @@ pub fn eval_with_cursor<C: DocumentCursor>(expr: &Expr, cursor: C) -> GenericRes
 /// wraps it in `[.]`, where [`eval_using`], which is handed a decoded value,
 /// can (#3266). Other constructions (`[., 1]`, `[[.]]`, `{a: .}`,
 /// `. as $x | [$x]`) materialize the value here too, and raise; that split is
-/// accepted, not pending (#3427). A document nested deeper
-/// than 256 levels makes the `path`/`paths`/`leaf_paths`/`getpath` walkers
-/// return a decode-failure-tagged error (#3429 tracks the ceiling).
+/// accepted, not pending (#3427). A document nested too
+/// deep for a path walker returns a decode-failure-tagged error instead: past
+/// [`MAX_PATH_WALK_DEPTH`] (384) levels for `paths`/`leaf_paths` and the
+/// cursor-native `path(f)` walkers, past [`MAX_NESTING_DEPTH`] (256) for the
+/// forms that materialize the document first (`path(..)`,
+/// `path(recurse(f; c))`, `paths(f)` and `path(getpath(p))`) (#3429).
 ///
 /// Same `takes_input_queue_bridge` condition as [`eval_using`] (#1504),
 /// cursor-metadata carve-out included; see its doc comment for why the
@@ -19868,10 +19922,12 @@ fn slice_one_generic_computed<S: EvalSemantics, V: DocumentValue>(
 /// duplicate-key concept to reconcile, so there's nothing `effective_fields`
 /// buys here that a plain cons-list walk doesn't already give for free.
 ///
-/// Panics past [`MAX_NESTING_DEPTH`] levels of nesting, the same guard
-/// `to_owned`/`to_owned_cursor` already carry -- `current_path.len()` tracks
-/// depth without a separate counter, same shape as `collect_paths`'s own
-/// `#1021` guard.
+/// Returns a decode-failure-tagged `Err` past [`MAX_PATH_WALK_DEPTH`] levels of
+/// nesting (a panic at [`MAX_NESTING_DEPTH`] before #3457/#3429) --
+/// `current_path.len()` tracks depth without a separate counter, same shape as
+/// `collect_paths`'s own `#1021` guard. A path as long as the document is deep
+/// must stay under the ceiling, so a document nested 383 levels is the deepest
+/// this walk takes.
 ///
 /// #1829: `effective_fields_checked`, not the infallible `effective_fields`
 /// -- this is the CLI's own native `Builtin::Paths`/`Builtin::LeafPaths`
@@ -19892,7 +19948,7 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
     paths: &mut Vec<OwnedValue>,
     leaves_only: bool,
 ) -> Result<(), EvalError> {
-    guard_nesting_depth(current_path.len())?;
+    guard_path_walk_depth(current_path.len())?;
     if let Some(fields) = value.as_object() {
         let checked = effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS)?;
         if checked.is_empty() {
@@ -20483,7 +20539,7 @@ fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
 /// `Clone` shares the trail (an `Rc` bump) for a step that keeps the position.
 trait StepTrail<V: DocumentValue>: Clone {
     /// Steps taken by native recursion since this walk's own root; O(1) --
-    /// what [`assert_nesting_depth`] guards against a Rust stack overflow,
+    /// what [`guard_path_walk_depth`] guards against a Rust stack overflow,
     /// not the trail's distance from the *document* root (#3020). `PathTrail`
     /// never starts anywhere but empty, so the two coincide for it; a
     /// [`PathContextTrail`] can start already seeded with a nested input's
@@ -20520,7 +20576,7 @@ impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
 /// link nor the component it would have named.
 ///
 /// Its depth is always 0, which is what the walk it replaces reported too: it
-/// restarted from [`PathTrail::root`] at every node. [`guard_nesting_depth`]
+/// restarted from [`PathTrail::root`] at every node. [`guard_path_walk_depth`]
 /// therefore never has anything to refuse here, and the walk is iterative
 /// (#3457), so no native recursion is left for it to bound.
 #[derive(Clone, Copy)]
@@ -20838,10 +20894,11 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
     path: &Rc<PathTrail>,
     out: &mut Vec<OwnedValue>,
 ) -> Result<(), EvalError> {
-    // Errors past `MAX_NESTING_DEPTH` levels (code review on #2058; a
-    // `decode_failure`-tagged `Err` rather than a panic since #3457), the
-    // same guard `collect_paths_generic` already carries for its own
-    // recursive path-array walk in this file. `PathTrail` has no depth cap
+    // Errors past `MAX_PATH_WALK_DEPTH` levels (code review on #2058; a
+    // `decode_failure`-tagged `Err` rather than a panic since #3457, and a
+    // 384 rather than 256 ceiling since #3429), the same guard
+    // `collect_paths_generic` already carries for its own recursive
+    // path-array walk in this file. `PathTrail` has no depth cap
     // of its own -- a static chain (`path(.a.a.a...)`) recurses this
     // function's own call graph (`path_walk_pipe_generic`/`path_step_
     // generic`/`path_step_pipe_generic` below all funnel back through it)
@@ -20850,7 +20907,7 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
     // (confirmed live) once this PR's fix made `path()` fast enough to
     // reach that depth in practice -- pre-fix, the O(d^2) cost made the
     // same input time out long before ever getting there.
-    guard_nesting_depth(path.depth())?;
+    guard_path_walk_depth(path.depth())?;
     match expr {
         Expr::Identity => {
             out.push(OwnedValue::Array(path.to_vec().into()));
@@ -20939,7 +20996,7 @@ fn path_walk_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     // See `path_walk_generic`'s own doc comment -- this function recurses
     // into itself once per pipe stage without ever passing back through
     // that entry check, so it needs its own (#2058 code review).
-    guard_nesting_depth(path.depth())?;
+    guard_path_walk_depth(path.depth())?;
     let Some((first, rest)) = exprs.split_first() else {
         out.push(OwnedValue::Array(path.to_vec().into())); // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
         return Ok(());
@@ -20971,7 +21028,7 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     node: &PathNode<V>,
     path: &T,
 ) -> Result<Option<(T, PathNode<V>)>, EvalError> {
-    guard_nesting_depth(path.recursion_depth())?;
+    guard_path_walk_depth(path.recursion_depth())?;
     let next = match node {
         PathNode::Absent => PathNode::Absent,
         PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"), // omni-dev: coverage tolerate-line reason="unreachable: both step dispatchers route owned nodes to path_step_owned before calling this cursor helper (#3022)"
@@ -21018,7 +21075,7 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     node: &PathNode<V>,
     path: &T,
 ) -> Result<Option<(T, PathNode<V>)>, EvalError> {
-    guard_nesting_depth(path.recursion_depth())?;
+    guard_path_walk_depth(path.recursion_depth())?;
     let mut component = index_component_value(idx, key);
     let next = match node {
         PathNode::Absent => PathNode::Absent,
@@ -21075,7 +21132,7 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
     collapse_duplicate_keys: bool,
     emit: &mut dyn FnMut(T, PathNode<V>) -> Demand,
 ) -> Result<Demand, EvalError> {
-    guard_nesting_depth(path.recursion_depth())?;
+    guard_path_walk_depth(path.recursion_depth())?;
     match node {
         // #2346: real yq's `.[]` over any non-container -- including a
         // missing/null node here -- is a silent no-op (confirmed live
@@ -21266,7 +21323,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     out: &mut Vec<(T, PathNode<V>)>,
 ) -> Result<(), EvalError> {
     // See `path_walk_generic`'s own doc comment (#2058 code review).
-    guard_nesting_depth(path.recursion_depth())?;
+    guard_path_walk_depth(path.recursion_depth())?;
     // spine 2416 (walk residue): a step from an owned value descends the
     // value itself, with the components the owned identity pipe would name.
     // Only the path-context walk produces such a node (`path()`'s own walk
@@ -21485,7 +21542,7 @@ fn path_step_pipe_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     // See `path_walk_generic`'s own doc comment -- like `path_walk_pipe_
     // generic`, this recurses into itself once per pipe stage (#2058 code
     // review).
-    guard_nesting_depth(path.recursion_depth())?;
+    guard_path_walk_depth(path.recursion_depth())?;
     let Some((first, rest)) = exprs.split_first() else {
         out.push((path.clone(), node.clone()));
         return Ok(());
@@ -23067,7 +23124,7 @@ fn path_context_step_recurse<S: EvalSemantics, V: DocumentValue>(
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
-    guard_nesting_depth(pos.trail.recursion_depth())?;
+    guard_path_walk_depth(pos.trail.recursion_depth())?;
     out.push(pos.clone());
     let mut children = Vec::new();
     path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;

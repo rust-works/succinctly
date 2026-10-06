@@ -19,8 +19,8 @@
 //! for the depth-scaling *timing* benchmark this issue also adds.
 //!
 //! These call `eval_full`, not `eval`: since #3457 the public `eval` is the generic
-//! evaluator, whose path walkers stop at nesting depth 256, so it would not reach
-//! the code #626 touches. The public entry's own depth behaviour is pinned in
+//! evaluator, where `path(..)`/`path(recurse)` materialize the document and stop at
+//! nesting depth 256 (#3429), so it would not reach the code #626 touches. The public entry's own depth behaviour is pinned in
 //! `tests/jq_library_eval_nesting_depth_tests.rs`.
 //!
 //! Run with: cargo test --test jq_recurse_depth_tests
