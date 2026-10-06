@@ -8110,6 +8110,19 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
         Some((field.key(), field.key_cursor(), rest))
     }
 
+    #[inline]
+    fn try_for_each_member(
+        &self,
+        mut each: impl FnMut(Self::Value, Self::Value, Self::Cursor) -> Result<(), EvalError>,
+    ) -> Result<(), EvalError> {
+        // YAML's grammar never leaves a member unpaired (`ends_unpaired` is
+        // `false`), so there is no tail to check.
+        for field in self.clone() {
+            each(field.key(), field.value(), field.value_cursor())?;
+        }
+        Ok(())
+    }
+
     // #1995: `Ok` unconditionally -- YAML's grammar has no equivalent
     // "keys must be strings" rule to enforce (unlike JSON's own
     // `DocumentFields::find` impl, `src/json/light.rs`), so there is

@@ -1741,6 +1741,32 @@ pub trait DocumentFields: Sized + Clone {
         Some((field.key, field.key_cursor, rest))
     }
 
+    /// Visit every field as `(key, value, value cursor)`, stopping at the
+    /// first error, then check the list ended where it should (#2664).
+    ///
+    /// [`uncons`](Self::uncons) per member builds a whole [`DocumentField`]
+    /// (176 bytes for YAML), and returns it with the rest of the list through
+    /// memory; this hands the three things a walk that checks no member
+    /// delimiters ([`DocumentCursor::HAS_DELIMITER_CHECKS`] is `false`) reads
+    /// to a callback instead, with no key cursor and nothing to move.
+    ///
+    /// The default is the `uncons` loop, so a format pays nothing to ignore
+    /// it; YAML overrides it with its own iterator.
+    fn try_for_each_member(
+        &self,
+        mut each: impl FnMut(Self::Value, Self::Value, Self::Cursor) -> Result<(), EvalError>,
+    ) -> Result<(), EvalError> {
+        let mut f = self.clone();
+        while let Some((field, rest)) = f.uncons() {
+            each(field.key, field.value, field.value_cursor)?;
+            f = rest;
+        }
+        if f.ends_unpaired() {
+            return Err(f.malformed_member_error());
+        }
+        Ok(())
+    }
+
     /// Walk every field, keeping every occurrence of a repeated key in
     /// document order.
     ///
@@ -3843,9 +3869,7 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
     where
         F: DocumentFields<Value = V, Cursor = C>,
     {
-        let Some(key) = resolve_display_key(&self.key, map, guard)? else {
-            return Err(fields.malformed_member_error());
-        };
+        let key = checked_member_key(&self.key, fields, map, guard)?;
         if !self.delimiters_ok::<F>(is_first) {
             return Err(fields.malformed_member_error());
         }
@@ -3880,6 +3904,25 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
         }
         Ok(())
     }
+}
+
+/// The key half of [`DocumentField::checked_key`], with no delimiter check.
+///
+/// A member's display key under the #1642 collision rules, or the
+/// malformed-member error for a key that will not stringify at all (#1194).
+/// One definition for `checked_key` and for the walks that read a member as
+/// `(key, value, cursor)` ([`DocumentFields::try_for_each_member`]) because
+/// their format checks no delimiters (#2664).
+pub fn checked_member_key<F, T>(
+    key: &F::Value,
+    fields: &F,
+    map: &IndexMap<String, T>,
+    guard: &mut DisplayKeyGuard,
+) -> Result<String, EvalError>
+where
+    F: DocumentFields,
+{
+    resolve_display_key(key, map, guard)?.ok_or_else(|| fields.malformed_member_error())
 }
 
 /// The #1642 key-collision bookkeeping of an object walk that keeps none of

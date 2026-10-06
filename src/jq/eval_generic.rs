@@ -43,11 +43,11 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    child_tail_gap_ok, collapsed_fields, collapsed_fields_if, container_tail_gap_ok,
-    effective_fields_checked, effective_fields_with_raw_last, effective_len_checked,
-    empty_elements_tail_gap_ok, empty_fields_tail_gap_ok, key_delimiter_ok, key_display_string,
-    key_display_string_kind, key_hash, key_is_malformed, resolve_display_key, tail_gap_ok,
-    trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
+    checked_member_key, child_tail_gap_ok, collapsed_fields, collapsed_fields_if,
+    container_tail_gap_ok, effective_fields_checked, effective_fields_with_raw_last,
+    effective_len_checked, empty_elements_tail_gap_ok, empty_fields_tail_gap_ok, key_delimiter_ok,
+    key_display_string, key_display_string_kind, key_hash, key_is_malformed, resolve_display_key,
+    tail_gap_ok, trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
     DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
     LazyKeyLedger,
 };
@@ -1255,6 +1255,28 @@ fn to_owned_cursor_at_depth<S: EvalSemantics, C: DocumentCursor, B: CursorWalkOu
         // #3134: the members whose node an anchor is waiting on, with their
         // keys -- empty unless `nested` names one.
         let mut watched: Vec<(usize, OwnedValue)> = Vec::new();
+        if C::REUSE_FIELD_VALUE && !C::HAS_DELIMITER_CHECKS && B::KEEPS_MEMBERS && nested.is_empty()
+        {
+            // A format that holds each member's value and checks no member
+            // delimiters needs neither the key cursor nor the whole
+            // `DocumentField`: the same key rule (`resolve_display_key`, the
+            // half of `checked_key` that is not a delimiter check) on a
+            // slimmer member (#2664).
+            f.try_for_each_member(|key, member_value, value_cursor| {
+                let key = checked_member_key(&key, &f, &map, &mut guard)?;
+                let child = walk_child::<S, _, B>(
+                    &value_cursor,
+                    Some(member_value),
+                    depth + 1,
+                    check_depth,
+                    scalar_override,
+                    nested,
+                )?;
+                map.insert(key, child);
+                Ok(())
+            })?;
+            return Ok(B::object(map));
+        }
         while let Some((field, rest)) = f.uncons() {
             // Same key and delimiter handling as `to_owned_at_depth` above,
             // and since #1803 literally the same call -- these two
