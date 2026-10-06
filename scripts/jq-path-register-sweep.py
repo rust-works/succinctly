@@ -494,6 +494,8 @@ OPERANDS = [
     "try (last(.a), error(\"e\")) catch .",
     "try (select(.) | error(\"z\")) catch .",
     "try error(\"z\") catch .",
+    "try last(error) catch .",
+    "try last(.a) catch input",
     "limit(1; try last(.a) catch .)",
     "limit(1; (last(.a), select(.)))",
     "limit(1; (.a | select(.)))",

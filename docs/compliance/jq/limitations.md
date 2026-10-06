@@ -1409,8 +1409,10 @@ is the revert that established what the other one costs.
    handler after a backtrack that restores the register, so the inner stage decides, pinned by
    `test_register_catch_handler_over_register_keeping_stage_3767`. A handler that navigates
    (`try last(.a) catch .a`: it raises when it runs, as in jq, but when it never runs jq answers
-   `[]`) and a compound inner stage (`try (last(.a), error("e")) catch .`) are still refused. Under a `try` the refusal of such a
-   shape inside a lost-register `and`/`or` operand is caught, so the write jq makes is
+   `[]`), a handler whose payload is the register's own value (`try last(error) catch .`, where
+   the error payload is the root itself) or that reads `input` (`catch input`), and a compound
+   inner stage (`try (last(.a), error("e")) catch .`) are still refused where jq answers `[]`.
+   Under a `try` the refusal of a `limit`/`first` wrapper shape inside a lost-register `and`/`or` operand is caught, so the write jq makes is
    **silently skipped** (`del(.a? as $y \| try ((.a)? and limit(1; 5)) \| try ($y \| .b))` on
    `{"a":{"b":1},"k":2}` leaves the document unchanged where jq gives `{"a":{},"k":2}`); the
    same shapes with `first(...)` in place of `limit(...)` behave identically, so this predates

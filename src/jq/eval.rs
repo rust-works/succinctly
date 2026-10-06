@@ -41280,7 +41280,8 @@ fn is_select_stage(stage: &Expr) -> bool {
 /// - `E?` and `try E` with no `catch` touch neither the path nor
 ///   `value_at_path`; only the body can move them, so the register is where `E`
 ///   left it (`last(.a)?`, `(select(.))?`, `try numbers`). A handler is not
-///   peeled: it runs on a caught error's payload, a register of its own.
+///   peeled here: whether it leaves the register alone is a second question, asked by
+///   [`stage_is_register_keeping`] (#3767).
 /// - `first(E)` emits `E`'s output from inside `E`, so the register is wherever
 ///   `E` left it: back where it entered for `last(f)` and `select(f)` (`first(
 ///   last(.a))`, `first(select(.))`), but moved for any other `E` (`first(.a)`).
