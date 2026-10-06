@@ -345,7 +345,11 @@ DEFAULT_THRESHOLD = 5.0
 # `arrays_first_map_iterate` (#3035) carried overrides of the same kind --
 # a one-off cost that only shows against a merge-base predating the change
 # (the canonical-compact echo fast path and its precheck cost for the
-# former two, an evaluator-monomorph codegen ripple for the latter). All
+# former two, a codegen ripple for the latter -- on ARM64 only, the byte
+# loop of `find_matching_close` spilled two values to the stack inside its
+# inlined copy in `split_json_values`, +3 `Ir` per input byte, which
+# #3350 bisected to #3035's own commit and fixed with `#[inline(never)]`).
+# All
 # three changes are now in `main`; the entries were removed together
 # (#3170, #3175) once every row read ~0% again against a merge-base that
 # already included all three.
