@@ -10755,18 +10755,21 @@ mod tests {
     /// a file with no value in it contributes none.
     #[test]
     fn slurp_documents_joins_every_value_in_file_order_2847() {
-        let join = |files: &[&str]| {
+        let join_with = |files: &[&str], validate: bool| {
             let raw = files.iter().map(|f| f.as_bytes().to_vec()).collect();
-            match slurp_documents(raw, &[], false) {
+            match slurp_documents(raw, &[], validate) {
                 Ok(s) => Ok((
                     String::from_utf8(s.combined).unwrap(),
                     s.last_source,
                     s.eof_line,
                 )),
-                Err(SlurpFailure::Unsplittable) => Err("unsplittable"),
-                Err(SlurpFailure::Validation(_)) => Err("validation"),
+                Err(f) => Err(match f {
+                    SlurpFailure::Unsplittable => "unsplittable",
+                    SlurpFailure::Validation(_) => "validation",
+                }),
             }
         };
+        let join = |files: &[&str]| join_with(files, false);
         assert_eq!(join(&[""]), Ok(("[]".into(), 0, 0)));
         assert_eq!(join(&["1\n", "2\n"]), Ok(("[1,2]".into(), 1, 1)));
         assert_eq!(
@@ -10779,6 +10782,14 @@ mod tests {
         // after clean ones.
         assert_eq!(join(&["1", "[1,"]), Err("unsplittable"));
         assert_eq!(join(&["1 }"]), Err("unsplittable"));
+
+        // `--validate` rejects a file before it is split, even one the
+        // splitter would have accepted, and a clean stream joins as before.
+        assert_eq!(join_with(&["1", "{\"a\" 1}"], true), Err("validation"));
+        assert_eq!(
+            join_with(&["1", "{\"a\":1}"], true),
+            Ok(("[1,{\"a\":1}]".into(), 1, 0))
+        );
     }
 
     #[test]

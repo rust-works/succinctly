@@ -110733,3 +110733,93 @@ fn test_slurp_wrapper_level_does_not_reject_a_document_at_jq_depth_limit_2847() 
     assert_eq!(out, format!("[{}{}]\n", "[".repeat(256), "]".repeat(256)));
     Ok(())
 }
+
+/// `-s` combined with an input builtin, or with `--seq`, still materializes
+/// every document (#2847 moved plain `-s` off that route, so these rows are
+/// what keeps the route's own `-s` handling pinned): the stream's failures
+/// come out in jq's channel at exit 5, a file it cannot open at exit 2, and
+/// `--validate` at exit 3, all before anything is evaluated.
+#[test]
+fn test_slurp_with_an_input_builtin_still_reports_the_materializing_route_failures_2847(
+) -> Result<()> {
+    // A document the splitter or the delimiter walk rejects fails the whole
+    // slurped stream, `input?` or not. Every row is exit 5 in jq 1.7.1 too.
+    for (stdin, want) in [
+        ("1 [", "Invalid JSON text"),
+        ("[1 2]", "expected ',' or ']', found '2'"),
+        ("[1,]", "Invalid JSON text"),
+        ("{\"a\" 1}", "expected ':', found '1'"),
+        ("{\"a\":1 \"b\":2}", "Invalid JSON text"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-s", "-c", "input?"], Some(stdin))?;
+        assert_eq!(code, 5, "{stdin:?}: out {out:?} stderr {err}");
+        assert!(out.is_empty(), "{stdin:?}: out {out:?}");
+        assert!(err.contains(want), "{stdin:?}: stderr {err}");
+    }
+
+    // A file that cannot be opened is jq's usage error, not a data error.
+    let missing = tempfile::tempdir()?.path().join("missing.json");
+    let missing = missing.to_string_lossy().into_owned();
+    let (out, err, code) = run_jq_full(&["-s", "-c", "input?", &missing], None)?;
+    assert_eq!(code, 2, "out {out:?} stderr {err}");
+    assert!(err.contains("Could not open file"), "stderr: {err}");
+
+    // `--validate` checks each file's own bytes first, including a file that
+    // is not UTF-8 at all, which plain `-s` would have substituted.
+    for body in [&b"{\"a\" 1}"[..], &b"\xff[1]"[..]] {
+        let (out, err, code, _) =
+            run_jq_over_byte_files(&["--validate", "-s", "-c", "input?"], &[body])?;
+        assert_eq!(code, 3, "{body:?}: out {out:?} stderr {err}");
+        assert!(err.contains("validation error"), "{body:?}: stderr {err}");
+    }
+
+    // Without `--validate` the same bytes are substituted, so a non-UTF-8
+    // document reaches the parser as U+FFFD text and fails there instead.
+    let (out, err, code, _) = run_jq_over_byte_files(&["-s", "-c", "input?"], &[b"\xff[1]"])?;
+    assert_eq!(code, 5, "out {out:?} stderr {err}");
+    assert!(!err.contains("validation error"), "stderr: {err}");
+    Ok(())
+}
+
+/// `--seq` keeps `-s` on the materializing route (its output is RS-prefixed), so the slurped array and
+/// an object root both reach the writer's lazy shapes (`keys`, `map`) through
+/// `materialize_stream_item`, and an array one level past the evaluator's
+/// ceiling is reported cleanly instead of panicking (#2299). The last row is
+/// a recorded divergence (jq 1.7.1 prints the 257-deep array): the ceiling is
+/// `MAX_NESTING_DEPTH`, which the lazy route's own printer limit does not share.
+#[test]
+fn test_seq_slurp_materializes_lazy_results_and_the_wrap_boundary_2847() -> Result<()> {
+    for (stdin, args, want) in [
+        (
+            "\x1e{\"b\":1,\"a\":2}\n",
+            &["--seq", "-c", "keys"][..],
+            "\x1e[\"a\",\"b\"]\n",
+        ),
+        (
+            "\x1e{\"b\":1,\"a\":2}\n",
+            &["--seq", "-s", "-c", ".[0] | keys"][..],
+            "\x1e[\"a\",\"b\"]\n",
+        ),
+        (
+            "\x1e1\n\x1e2\n",
+            &["--seq", "-s", "-c", "map(.+1)"][..],
+            "\x1e[2,3]\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(args, Some(stdin))?;
+        assert_eq!((out.as_str(), code), (want, 0), "{args:?}: stderr {err}");
+    }
+
+    // 256 empty arrays: the reader accepts it, and the slurp wrapper is the
+    // 257th level.
+    let doc = format!("\x1e{}{}\n", "[".repeat(256), "]".repeat(256));
+    let (out, err, code) = run_jq_full(&["--seq", "-s", "-c", "."], Some(&doc))?;
+    assert_eq!(code, 5, "out {out:?} stderr {err}");
+    assert!(out.is_empty(), "out {out:?}");
+    assert!(
+        err.contains("nesting depth exceeds limit of 256"),
+        "stderr: {err}"
+    );
+    assert!(!err.contains("panicked"), "stderr: {err}");
+    Ok(())
+}
