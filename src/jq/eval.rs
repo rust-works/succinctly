@@ -118012,6 +118012,11 @@ mod tests {
             r"del(. as $x | [map(.a, .b)] | $x[0])",
             r"del(. as $x | [map(if .a then .b else .a end)] | $x[0])",
             r"del(. as $x | [map(.b | length)] | $x[0])",
+            // A fork is judged branch by branch, so a branch that navigates
+            // nothing may sit beside one that stays on the register.
+            r"del(. as $x | [map(.a, length)] | $x[0])",
+            r"del(. as $x | [map(if .a then .b else length end)] | $x[0])",
+            r"del(. as $x | [map(if .a then length else .b end)] | $x[0])",
             r"del(. as $x | [any(.a)] | $x[0])",
             r"del(. as $x | [all(.a)] | $x[0])",
             r"del(. as $x | [map(..)] | $x[0])",

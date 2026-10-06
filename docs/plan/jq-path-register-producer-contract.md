@@ -548,6 +548,10 @@ Each turns a refusal into an answer and needs its own oracle rows:
   into jq's `[]`. Cheap now, because the producers already say it.
 - `LostAt(entry)` for an unchecked `[E]`, and passing `LostAt`'s position through `register_after`
   instead of `LostSomewhere`.
+- ~~An `[E]` collect of `map(f)`/`any(f)`/`all(f)` whose `f` navigates but stays on the register.~~ Done by #3724
+  (`navigates_only_the_register`: a chain of register navigations, optionally ending in one stage that navigates
+  nothing, forked branch by branch). Still refused where jq answers: a `//`, `try` or `first(f)` inside `f`, and
+  the `and`/`or` operands below.
 - Widening `array_contents_are_checked` past `register_movement_tracked`.
 - ~~Static `Unmoved` for the other builtins jq leaves in place (`sort`, `to_entries`, ...), one oracle
   row each.~~ Done for `sort`, `to_entries`, `flatten`, `add`, `map(f)` and `walk(f)` by #3361, at the

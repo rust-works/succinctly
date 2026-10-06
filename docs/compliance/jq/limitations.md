@@ -1402,7 +1402,11 @@ is the revert that established what the other one costs.
    `first`/`last`/`add`/`any`/`all`/`flatten`, no argument — jq's internal `.[0]`/`.[]` is
    `path_intact` against a tracked input and cannot path-fail there, and an untracked input
    already raises through `builtin_navigation` before this claim is reached); a
-   `map(f)`/`any(f)`/`all(f)`/`walk(f)` argument that itself navigates nothing at all; plain
+   `map(f)`/`any(f)`/`all(f)` argument that navigates nothing or only the register's own
+   node (`[map(.a)]`, `[all(.a)]`, `[map(first)]`, since
+   [#3724](https://github.com/rust-works/succinctly/issues/3724): a chain of `.a`/`.[i]`/`.[]`/`..`/`first`/`last`/`select`,
+   optionally ending in one stage that navigates nothing, forked by `,`/`if` branch by branch), and a
+   `walk(f)` argument that navigates nothing at all; plain
    `=` (a subexp, #3186, whose `path(paths)`/reduce backtrack never move the register); a
    `try`/`?` with **no handler** (never lets an error out, so the claim never depends on
    whether its body is otherwise checked — a *handler* still has to stay checked, since a
@@ -1419,10 +1423,12 @@ is the revert that established what the other one costs.
    resolver still evaluates by value (`getpath`:
    `path(. as $x \| [.a \| getpath(["b"])] \| $x)`), one it resolves but does not count as
    checked (`//`, `first(f)`: `path(. as $x \| [first(.a)] \| $x)` — note the *argument* form,
-   distinct from the bare `first` just admitted above), or a `map`/`any`/`all`/`walk` argument
-   that navigates but stays tracked (`[map(.a)]`, `[all(.a)]`, `[map(first)]`, all `[]` in jq —
-   needs its own navigates-only-the-register predicate,
-   [#3724](https://github.com/rust-works/succinctly/issues/3724)). The second is an array nested in
+   distinct from the bare `first` just admitted above), or a `map`/`any`/`all` argument
+   outside the chain [#3724](https://github.com/rust-works/succinctly/issues/3724) admits (`[map(.a // .b)]`,
+   `[map(try .a)]`, `[map(first(.a))]`, `[map(.a | getpath(["b"]))]`, all `[]` in jq). An argument that navigates a
+   *computed* value (`[map({k:1} | .k)]`, `[map(.a | tostring | .b)]`) is not in that list on purpose: jq raises, and so do we.
+   A `walk(f)` argument that navigates stays refused for the same reason
+   ([#3723](https://github.com/rust-works/succinctly/issues/3723)). The second is an array nested in
    another stage's expression (`if true then [.a] else 1 end`, `([.a], [.k])`). The third is a
    `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call
    to its body is not something a syntactic predicate can do from a name).
