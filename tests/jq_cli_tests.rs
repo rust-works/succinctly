@@ -56060,6 +56060,182 @@ fn test_recurse_of_each_optional_has_no_node_cap_3703() -> Result<()> {
     Ok(())
 }
 
+/// #3737: `recurse(.[]?; cond)` is bounded by the tree it walks when `cond` yields
+/// at most one value, so it has no node cap either.
+///
+/// jq's `recurse(f; cond)` is `def r: ., (f | select(cond) | r); r;`: over
+/// `.[]?` every child is a node of the tree, and a `cond` with one output keeps
+/// or drops it once, so the walk visits each node at most once. The cap
+/// (`RECURSE_MAX_ITEMS`, raising since #3716) exists for an `f` that can be
+/// unbounded, and stopped this one at 10,000 nodes with `recurse: maximum nodes
+/// exceeded` where jq answers. A `cond` that forks re-emits a child once per
+/// truthy output, so those walks are not bounded by the tree and keep the cap.
+///
+/// Every expectation is captured from jq 1.7.1.
+#[test]
+fn test_recurse_of_each_optional_with_a_gating_cond_has_no_node_cap_3737() -> Result<()> {
+    // 6,000 one-element arrays: 1 root + 6,000 arrays + 6,000 numbers.
+    let doc = format!("[{}]", vec!["[1]"; 6000].join(","));
+    for (filter, want) in [
+        ("[recurse(.[]?; true)] | length", "12001\n"),
+        ("[recurse(.[]?; . != null)] | length", "12001\n"),
+        (
+            r#"[recurse(.[]?; type == "array" or type == "number")] | length"#,
+            "12001\n",
+        ),
+        // `cond` prunes: a dropped child's subtree is never visited.
+        ("[recurse(.[]?; . != 1)] | length", "6001\n"),
+        ("[recurse(.[]?; . != [1])] | length", "1\n"),
+        ("[recurse(.[]?; empty)] | length", "1\n"),
+        ("[path(recurse(.[]?; true))] | length", "12001\n"),
+        ("[paths(recurse(.[]?; true))] | length", "18000\n"),
+        ("[limit(12000; recurse(.[]?; true))] | length", "12000\n"),
+        ("[limit(12001; recurse(.[]?; true))] | length", "12001\n"),
+        ("first(recurse(.[]?; true)) | length", "6000\n"),
+        ("[limit(3; recurse(.[]?; true))] | length", "3\n"),
+        ("isempty(recurse(.[]?; true))", "false\n"),
+        ("[nth(12000; recurse(.[]?; true))]", "[1]\n"),
+        ("[limit(2; path(recurse(.[]?; true)))]", "[[],[0]]\n"),
+        (
+            r#"(recurse(.[]?; true) | select(type == "number")) |= . + 1 | [.. | numbers] | add"#,
+            "12000\n",
+        ),
+        (
+            r#"(recurse(.[]?; . != [1]) | select(type == "number")) |= . + 1 | [.. | numbers] | add"#,
+            "6000\n",
+        ),
+        (
+            r#"del(recurse(.[]?; true) | select(type == "number")) | [.. | numbers] | length"#,
+            "0\n",
+        ),
+        (
+            r#"pick(recurse(.[]?; true) | select(type == "number")) == ."#,
+            "true\n",
+        ),
+        // Nothing here can be an error of the program.
+        (
+            r#"try ([recurse(.[]?; true)] | length) catch "c""#,
+            "12001\n",
+        ),
+        ("[recurse(.[]?; true)?] | length", "12001\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc.as_str()))?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout, want, "`{filter}` -- stderr: {stderr:?}");
+    }
+    // The owned evaluator, with the document built inside the filter; the
+    // object row covers the other container kind.
+    for (filter, want) in [
+        (
+            "[range(6000) | [1]] | [recurse(.[]?; true)] | length",
+            "12001\n",
+        ),
+        (
+            "[range(6000) | [1]] | [path(recurse(.[]?; true))] | length",
+            "12001\n",
+        ),
+        (
+            r#"[range(12000) | {key: tostring, value: 1}] | from_entries | [recurse(.[]?; type != "null")] == [..]"#,
+            "true\n",
+        ),
+        // 300 levels deep is past the native stack budget a recursing `f`
+        // spends; the gated walk is an explicit stack. (The evaluator-driven
+        // walk answers 301 here too: the row pins the depth, not the route.)
+        (
+            "reduce range(300) as $i (1; [.]) | [recurse(.[]?; true)] | length",
+            "301\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout, want, "`{filter}` -- stderr: {stderr:?}");
+    }
+    // A `cond` that forks is not bounded by the tree (jq: 13 here, and 36001 on
+    // the document above): it keeps the cap and raises.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[recurse(.[]?; (true, true))] | length"],
+        Some(doc.as_str()),
+    )?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
+    assert!(
+        stderr.contains("recurse: maximum nodes exceeded"),
+        "{stderr:?}"
+    );
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[recurse(.[]?; (true, true))] | length"],
+        Some("[[1],[2]]"),
+    )?;
+    assert_eq!((stdout.as_str(), code), ("13\n", 0), "{stderr:?}");
+    Ok(())
+}
+
+/// #3737: the gated walk asks `cond` of a node when it reaches it, in jq's own
+/// order, so the effects and the errors of `cond` land where jq's do.
+///
+/// jq asks `cond` of a child only after the previous sibling's whole subtree was
+/// delivered: a consumer satisfied early never runs it on the nodes it did not
+/// reach, the root is delivered without asking it, and a `cond` that raises does
+/// so after everything before it was delivered. Stdout, stderr and the exit code
+/// are captured whole from jq 1.7.1.
+#[test]
+fn test_recurse_gated_cond_runs_in_jq_order_3737() -> Result<()> {
+    for (doc, filter, want_out, want_err, want_code) in [
+        (
+            "[[1],[2],[3]]",
+            "[limit(2; recurse(.[]?; debug | true))]",
+            "[[[1],[2],[3]],[1]]\n",
+            "[\"DEBUG:\",[1]]\n",
+            0,
+        ),
+        (
+            "[[1]]",
+            "[limit(1; recurse(.[]?; debug | true))]",
+            "[[[1]]]\n",
+            "",
+            0,
+        ),
+        (
+            "[[1],[2]]",
+            "[recurse(.[]?; debug | true)] | length",
+            "5\n",
+            "[\"DEBUG:\",[1]]\n[\"DEBUG:\",1]\n[\"DEBUG:\",[2]]\n[\"DEBUG:\",2]\n",
+            0,
+        ),
+        // A raising `cond` ends the walk there: the root, `[1]`, `1` and `[2]`
+        // were delivered, `2` raised, and `[3]` was never asked.
+        (
+            "[[1],[2],[3]]",
+            r#"recurse(.[]?; if . == 2 then error("boom") else true end)"#,
+            "[[1],[2],[3]]\n[1]\n1\n[2]\n",
+            "jq: error (at <stdin>:0): boom\n",
+            5,
+        ),
+        (
+            "[[1],[2],[3]]",
+            r#"[recurse(.[]?; if . == 2 then error("boom") else true end)?]"#,
+            "[[[1],[2],[3]],[1],1,[2]]\n",
+            "",
+            0,
+        ),
+        (
+            "[[1],[2],[3]]",
+            r#"try [recurse(.[]?; if . == 2 then error("boom") else true end)] catch ."#,
+            "\"boom\"\n",
+            "",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want_out, want_code),
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+        assert_eq!(stderr, want_err, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #3716: a `recurse` walk that reaches `RECURSE_MAX_ITEMS` (10,000) with a
 /// node still to visit raises, uncatchably, like every other evaluator cap
 /// (`range`, `until`, `reduce`: #2132). It used to end as though the walk had
@@ -56074,6 +56250,10 @@ fn test_recurse_of_each_optional_has_no_node_cap_3703() -> Result<()> {
 /// 10,000-node document answers and a 10,001-node one raises, because the cap
 /// fires only when a node remains. Streamed consumers have delivered 10,000
 /// outputs by then, which is jq's own prefix.
+///
+/// The rows spell `f` as `.[]? | .`, which walks the same tree but is not the
+/// bare `.[]?` whose walk is provably bounded by it: a `cond` that cannot fork
+/// over bare `.[]?` is uncapped since #3737, and no longer reaches the cap.
 #[test]
 fn test_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
     let cap_error = "recurse: maximum nodes exceeded";
@@ -56081,29 +56261,29 @@ fn test_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
     let doc = format!("[{}]", vec!["[1]"; 6000].join(","));
     for filter in [
         // jq: 12001, for each of these three.
-        "[recurse(.[]?; true)] | length",
-        "[recurse(.[]?; . != null)] | length",
+        "[recurse(.[]? | .; true)] | length",
+        "[recurse(.[]? | .; . != null)] | length",
         r#"[recurse(if type == "array" then .[] else empty end)] | length"#,
-        "[path(recurse(.[]?; true))] | length",
+        "[path(recurse(.[]? | .; true))] | length",
         // jq: 18000. jq 1.7.1 defines `paths(f)` as `path(..|select(f)) |
         // select(length > 0)`, so it runs `f` on the root too and discards that
         // output; here that walk is the whole document, past the cap. The silent
         // truncation of the discarded root walk used to leave jq's count intact
         // by luck.
-        "[paths(recurse(.[]?; true))] | length",
+        "[paths(recurse(.[]? | .; true))] | length",
         // jq: every number incremented, replaced, deleted, picked. Nothing is
         // written here, rather than the first 10,000 nodes' worth.
-        r#"(recurse(.[]?; true) | select(type == "number")) |= . + 1"#,
-        r#"(recurse(.[]?; true) | select(type == "number")) = 7"#,
-        r#"del(recurse(.[]?; true) | select(type == "number"))"#,
-        r#"[pick(recurse(.[]?; true) | select(type == "number"))] | length"#,
+        r#"(recurse(.[]? | .; true) | select(type == "number")) |= . + 1"#,
+        r#"(recurse(.[]? | .; true) | select(type == "number")) = 7"#,
+        r#"del(recurse(.[]? | .; true) | select(type == "number"))"#,
+        r#"[pick(recurse(.[]? | .; true) | select(type == "number"))] | length"#,
         // jq: 10001, past a consumer that asks for more than the cap.
-        "[limit(10001; recurse(.[]?; true))] | length",
+        "[limit(10001; recurse(.[]? | .; true))] | length",
         // Uncatchable: `try`, `?` and a `?//` retry never read the cap as an
         // error of the program.
-        r#"try ([recurse(.[]?; true)] | length) catch "c""#,
-        "[recurse(.[]?; true)?] | length",
-        "([recurse(.[]?; true)] | length) as [$a] ?// $a | $a",
+        r#"try ([recurse(.[]? | .; true)] | length) catch "c""#,
+        "[recurse(.[]? | .; true)?] | length",
+        "([recurse(.[]? | .; true)] | length) as [$a] ?// $a | $a",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc.as_str()))?;
         assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?}");
@@ -56114,7 +56294,10 @@ fn test_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
         );
     }
     // Streamed: the 10,000 nodes before the cap are delivered, then the raise.
-    for filter in ["recurse(.[]?; true) | length", "path(recurse(.[]?; true))"] {
+    for filter in [
+        "recurse(.[]? | .; true) | length",
+        "path(recurse(.[]? | .; true))",
+    ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc.as_str()))?;
         assert_eq!(code, 5, "`{filter}` -- stderr: {stderr:?}");
         assert_eq!(stdout.lines().count(), 10_000, "`{filter}`");
@@ -56125,8 +56308,10 @@ fn test_recurse_cap_raises_instead_of_ending_silently_3716() -> Result<()> {
 
 /// #3716, the rows that still answer: a consumer that stops before the cap never
 /// meets it, `.[]?` without a `cond` is uncapped (#3703), and the boundary is
-/// exact -- a 10,000-node document answers and a 10,001-node one raises, because
-/// the cap fires only when a node remains. Every answer here is jq's own.
+/// exact -- a 10,000-node document answers and a 10,001-node one raises,
+/// because the cap fires only when a node remains. Every answer here is jq's
+/// own. (A `cond` that cannot fork over bare `.[]?` is uncapped too, since
+/// #3737, and has its own test.)
 #[test]
 fn test_recurse_cap_stopping_consumers_and_boundary_3716() -> Result<()> {
     let cap_error = "recurse: maximum nodes exceeded";
@@ -56135,13 +56320,16 @@ fn test_recurse_cap_stopping_consumers_and_boundary_3716() -> Result<()> {
     // `cond` is still uncapped (#3703).
     for (filter, want) in [
         (
-            r#"first(recurse(.[]?; true) | select(type == "number"))"#,
+            r#"first(recurse(.[]? | .; true) | select(type == "number"))"#,
             "1\n",
         ),
-        ("[limit(3; recurse(.[]?; true))] | length", "3\n"),
-        ("[limit(10000; recurse(.[]?; true))] | length", "10000\n"),
-        ("isempty(recurse(.[]?; true))", "false\n"),
-        ("[nth(9999; recurse(.[]?; true))] | length", "1\n"),
+        ("[limit(3; recurse(.[]? | .; true))] | length", "3\n"),
+        (
+            "[limit(10000; recurse(.[]? | .; true))] | length",
+            "10000\n",
+        ),
+        ("isempty(recurse(.[]? | .; true))", "false\n"),
+        ("[nth(9999; recurse(.[]? | .; true))] | length", "1\n"),
         ("[recurse(.[]?)] | length", "12001\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc.as_str()))?;
@@ -56153,8 +56341,8 @@ fn test_recurse_cap_stopping_consumers_and_boundary_3716() -> Result<()> {
     let at_cap = format!("[{}]", [vec!["[1]"; 4999], vec!["1"]].concat().join(","));
     let past_cap = format!("[{}]", vec!["[1]"; 5000].join(","));
     for filter in [
-        "[recurse(.[]?; true)] | length",
-        "[path(recurse(.[]?; true))] | length",
+        "[recurse(.[]? | .; true)] | length",
+        "[path(recurse(.[]? | .; true))] | length",
         r#"[recurse(if type == "array" then .[] else empty end)] | length"#,
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(at_cap.as_str()))?;
@@ -56182,9 +56370,9 @@ fn test_recurse_cap_queued_walk_retry_and_null_loop_3716() -> Result<()> {
     // 300 levels deep ending in a 10,001-element array, so the cap is met in the
     // queued part, in the value walker, the path walker and a write through it.
     for filter in [
-        "reduce range(300) as $i ([range(10001)]; [.]) | [recurse(.[]?; true)] | length",
-        "reduce range(300) as $i ([range(10001)]; [.]) | [path(recurse(.[]?; true))] | length",
-        r#"reduce range(300) as $i ([range(10001)]; [.]) | (recurse(.[]?; true) | select(type == "number")) |= . + 1"#,
+        "reduce range(300) as $i ([range(10001)]; [.]) | [recurse(.[]? | .; true)] | length",
+        "reduce range(300) as $i ([range(10001)]; [.]) | [path(recurse(.[]? | .; true))] | length",
+        r#"reduce range(300) as $i ([range(10001)]; [.]) | (recurse(.[]? | .; true) | select(type == "number")) |= . + 1"#,
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!((stdout.as_str(), code), ("", 5), "`{filter}` -- {stderr:?}");
@@ -56194,7 +56382,7 @@ fn test_recurse_cap_queued_walk_retry_and_null_loop_3716() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-nc",
-            "reduce range(300) as $i ([range(9000)]; [.]) | [recurse(.[]?; true)] | length",
+            "reduce range(300) as $i ([range(9000)]; [.]) | [recurse(.[]? | .; true)] | length",
         ],
         None,
     )?;
