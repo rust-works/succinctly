@@ -2260,10 +2260,11 @@ is the revert that established what the other one costs.
    `flatten`, real yq builtins), this one is not gated: yq has no oracle for these three (its lexer
    rejects them), so it holds in both modes, reached in yq only through `--jq-extensions` (ADR-0018). Pinned in
    `test_indices_family_raises_inside_path_on_the_evaluated_pattern_3347` and its siblings. Still
-   diverging, each tracked: an array input on a *tracked* value, where jq answers a path through
+   diverging, tracked: an array input on a *tracked* value, where jq answers a path through
    an array key (`path(.a | indices(1))` is `["a",[1]]`), and a string `index`/`rindex` there
-   ([#3890](https://github.com/rust-works/succinctly/issues/3890)), and the by-value answer for an
-   empty string needle (`"abc" | indices("")` is `[]` in jq 1.7.1 and `[0,1,2]` here,
+   ([#3890](https://github.com/rust-works/succinctly/issues/3890)). A string searched for the empty
+   string has no match, by value and in these errors alike (`"abc" | indices("")` is `[]`, `index`
+   and `rindex` are `null`, as in jq 1.7.1; it was `[0,1,2]`, `0` and `3` until
    [#3889](https://github.com/rust-works/succinctly/issues/3889)).
 
    The rule is **jq-mode only** (ADR-0018): `map`, `any`, `all` and `flatten` are real yq

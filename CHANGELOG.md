@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **jq: a string searched for the empty string has no match** (#3889).
+  `"abc" | indices("")` answered `[0,1,2]`, `index("")` `0` and `rindex("")` `3` (`str::find` matches an empty needle at every position), where jq 1.7.1's `_strindices` has no
+  window to try and answers `[]`, `null` and `null`, for an empty input too. Every needle that does match is unchanged, and an array searched for `[]` already answered this way. Found
+  while pinning #3347's matrix, where the four rows that still differed from jq were these (they name the array of positions `index`/`rindex` index into). Pinned by
+  `test_string_search_for_an_empty_needle_finds_nothing_3889` on a literal and on a document.
 - **jq: a recursion's seed and a `catch` handler's output keep the path register one output at a time, so a recursion behind `first`/`limit`/`,`/`if`/`//`, a caught recursion's handler, and a caught recursion in a fold body answer as jq does** (#3580, #3272's residuals).
   jq emits a recursion's seed (`.` of `def r: ., (f | r)`) before anything indexes, and runs a `catch` handler with the register restored to the `try`'s entry, so
   `path(. as $x | 1 | first(..) | $x)`, `limit(2; ..)`, `(., ..)`, `if true then .. else 1 end`, `(try ..) // 3`, `try recurse(.a) catch 7`,
