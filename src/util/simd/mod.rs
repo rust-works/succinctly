@@ -16,6 +16,10 @@ pub mod x86;
 /// Shared SIMD escape scanning (portable; SIMD kernels are gated internally).
 pub(crate) mod escape;
 
+/// 64-byte block classification of a JSON string's specials, for the
+/// canonical-echo gate's string scan (#3340).
+pub(crate) mod specials;
+
 /// Shared DSV quote-mask tail for every SIMD backend (#182). Gated to the arches
 /// that have a DSV SIMD backend; elsewhere `dsv::simd` falls back to the scalar
 /// parser and nothing here is reachable.

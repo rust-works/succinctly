@@ -49,6 +49,7 @@ use core::cell::{Cell, OnceCell};
 
 use crate::trees::BalancedParens;
 use crate::util::broadword::select_in_word;
+use crate::util::simd::specials::SpecialMask;
 
 // ============================================================================
 // JsonIndex: Holds the IB and BP index structures
@@ -3322,7 +3323,7 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   every debug build and test run.
 #[must_use]
 pub(crate) fn canonical_compact_jq_span_end(bytes: &[u8]) -> Option<usize> {
-    scan_canonical_value(bytes, 0, 0)
+    scan_canonical_value(bytes, 0, 0, &mut SpecialMask::new())
 }
 
 /// The whole-buffer form of [`canonical_compact_jq_span_end`]: true iff
@@ -3357,15 +3358,20 @@ pub(crate) fn is_canonical_compact_jq_span(bytes: &[u8]) -> bool {
 /// `stream_json_pretty`'s counter would. The string arm stays one
 /// out-of-line call ([`scan_json_string_span`]).
 #[inline(always)]
-fn scan_canonical_value(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
+fn scan_canonical_value(
+    bytes: &[u8],
+    pos: usize,
+    depth: usize,
+    specials: &mut SpecialMask,
+) -> Option<usize> {
     if depth >= MAX_VALUE_TREE_DEPTH {
         return None;
     }
     let byte = *bytes.get(pos)?;
     match byte {
-        b'{' => scan_canonical_object(bytes, pos, depth),
-        b'[' => scan_canonical_array(bytes, pos, depth),
-        b'"' => scan_json_string_span(bytes, pos).map(|(.., end)| end),
+        b'{' => scan_canonical_object(bytes, pos, depth, specials),
+        b'[' => scan_canonical_array(bytes, pos, depth, specials),
+        b'"' => scan_json_string_span(bytes, pos, specials).map(|(.., end)| end),
         b't' => scan_canonical_literal(bytes, pos, b"true"),
         b'f' => scan_canonical_literal(bytes, pos, b"false"),
         b'n' => scan_canonical_literal(bytes, pos, b"null"),
@@ -3466,53 +3472,59 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 /// validation at all, and only the CLI substitutes invalid input ahead of
 /// indexing (`utf8_lossy_document`, `src/bin/succinctly/jq_runner.rs`), so a
 /// library caller can hand a `JsonCursor` a buffer with any byte in it.
-fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
+fn scan_json_string_span(
+    bytes: &[u8],
+    pos: usize,
+    specials: &mut SpecialMask,
+) -> Option<(usize, usize, usize)> {
     debug_assert_eq!(bytes.get(pos), Some(&b'"'));
     let content_start = pos + 1;
     let mut i = content_start;
     loop {
-        match *bytes.get(i)? {
-            b'"' => {
-                return Some((content_start, i, i + 1));
-            }
-            b'\\' => {
-                let esc = *bytes.get(i + 1)?;
-                match esc {
-                    b'"' | b'\\' | b'b' | b'f' | b'n' | b'r' | b't' => i += 2,
-                    b'u' => {
-                        let hex = bytes.get(i + 2..i + 6)?;
-                        if !hex
-                            .iter()
-                            .all(|h| h.is_ascii_digit() || matches!(h, b'a'..=b'f'))
-                        {
-                            return None;
-                        }
-                        let cp = hex.iter().fold(0u32, |acc, &h| {
-                            let digit = if h.is_ascii_digit() {
-                                h - b'0'
-                            } else {
-                                h - b'a' + 10
-                            };
-                            (acc << 4) | u32::from(digit)
-                        });
-                        if !matches!(cp, 0x00..=0x07 | 0x0B | 0x0E..=0x1F | 0x7F) {
-                            return None;
-                        }
-                        i += 6;
-                    }
-                    // `/` (never escaped by jq's writer), any other letter,
-                    // or an unrecognized byte after `\` -- all not
-                    // canonical.
-                    _ => return None,
-                }
-            }
-            b if b < 0x20 || b == 0x7F => return None,
-            // Every other byte -- ASCII, or any byte of a multi-byte UTF-8
-            // sequence -- is one byte of literal content. UTF-8 validity is
-            // deliberately *not* decided here; see this function's own doc
-            // comment.
-            _ => i += 1,
+        // Jump straight to the next byte this arm must decide on (#3340):
+        // the plain bytes between are never visited, and no per-string
+        // vector entry is paid -- `specials` answers from a 64-byte block it
+        // classified once. No special before the end of the buffer is an
+        // unterminated string, which is not canonical.
+        i = specials.next_special(bytes, i)?;
+        match bytes[i] {
+            b'"' => return Some((content_start, i, i + 1)),
+            b'\\' => i += canonical_escape_len(bytes, i)?,
+            // A literal control byte or DEL, which the writer always escapes.
+            _ => return None,
         }
+    }
+}
+
+/// The length of the escape sequence that starts at the `\` at `bytes[i]`
+/// (2 for a short escape, 6 for a `\u00XX`), iff it is exactly one
+/// [`write_json_body_jq`] would itself emit; `None` otherwise. The escape
+/// half of [`scan_json_string_span`]'s accept rule, see its doc comment.
+fn canonical_escape_len(bytes: &[u8], i: usize) -> Option<usize> {
+    debug_assert_eq!(bytes.get(i), Some(&b'\\'));
+    match *bytes.get(i + 1)? {
+        b'"' | b'\\' | b'b' | b'f' | b'n' | b'r' | b't' => Some(2),
+        b'u' => {
+            let hex = bytes.get(i + 2..i + 6)?;
+            if !hex
+                .iter()
+                .all(|h| h.is_ascii_digit() || matches!(h, b'a'..=b'f'))
+            {
+                return None;
+            }
+            let cp = hex.iter().fold(0u32, |acc, &h| {
+                let digit = if h.is_ascii_digit() {
+                    h - b'0'
+                } else {
+                    h - b'a' + 10
+                };
+                (acc << 4) | u32::from(digit)
+            });
+            matches!(cp, 0x00..=0x07 | 0x0B | 0x0E..=0x1F | 0x7F).then_some(6)
+        }
+        // `/` (never escaped by jq's writer), any other letter, or an
+        // unrecognized byte after `\` -- all not canonical.
+        _ => None,
     }
 }
 
@@ -3523,7 +3535,12 @@ fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usiz
 /// comment for why that's sound) to bail on any repeat -- pairwise below
 /// [`PAIRWISE_SPAN_SCAN_LIMIT`] keys, through a fresh per-object
 /// [`KeyHashes`] above it.
-fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
+fn scan_canonical_object(
+    bytes: &[u8],
+    pos: usize,
+    depth: usize,
+    specials: &mut SpecialMask,
+) -> Option<usize> {
     debug_assert_eq!(bytes.get(pos), Some(&b'{'));
     let mut i = pos + 1;
     if bytes.get(i) == Some(&b'}') {
@@ -3543,7 +3560,7 @@ fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize
         if bytes.get(i) != Some(&b'"') {
             return None;
         }
-        let (key_start, key_end, after_key) = scan_json_string_span(bytes, i)?;
+        let (key_start, key_end, after_key) = scan_json_string_span(bytes, i, specials)?;
         if let Some(seen) = seen_keys.as_mut() {
             // #2919 review: `saturated()` is checked right after `insert`,
             // matching every other `KeyHashes` caller in the tree
@@ -3597,7 +3614,7 @@ fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize
         if bytes.get(after_key) != Some(&b':') {
             return None;
         }
-        i = scan_canonical_value(bytes, after_key + 1, depth + 1)?;
+        i = scan_canonical_value(bytes, after_key + 1, depth + 1, specials)?;
         match bytes.get(i) {
             Some(b',') => i += 1,
             Some(b'}') => return Some(i + 1),
@@ -3608,14 +3625,19 @@ fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize
 
 /// The array-token rule: `[`, then either an immediate `]` or `value`
 /// items separated by exactly one `,` with no trailing comma.
-fn scan_canonical_array(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
+fn scan_canonical_array(
+    bytes: &[u8],
+    pos: usize,
+    depth: usize,
+    specials: &mut SpecialMask,
+) -> Option<usize> {
     debug_assert_eq!(bytes.get(pos), Some(&b'['));
     let mut i = pos + 1;
     if bytes.get(i) == Some(&b']') {
         return Some(i + 1);
     }
     loop {
-        i = scan_canonical_value(bytes, i, depth + 1)?;
+        i = scan_canonical_value(bytes, i, depth + 1, specials)?;
         match bytes.get(i) {
             Some(b',') => i += 1,
             Some(b']') => return Some(i + 1),
@@ -5334,6 +5356,161 @@ fn stream_json_yaml_double_quoted<Out: core::fmt::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // #3340: the string arm walks `SpecialMask` blocks instead of bytes.
+    // ------------------------------------------------------------------
+
+    /// The byte-at-a-time string scan this module used before #3340, kept
+    /// verbatim as an *independent* oracle: it shares no code with the block
+    /// classifier or `canonical_escape_len`, so a divergence in either shows
+    /// up as a disagreement here instead of being copied into both sides.
+    fn scan_json_string_span_bytewise_reference(
+        bytes: &[u8],
+        pos: usize,
+    ) -> Option<(usize, usize, usize)> {
+        debug_assert_eq!(bytes.get(pos), Some(&b'"'));
+        let content_start = pos + 1;
+        let mut i = content_start;
+        loop {
+            match *bytes.get(i)? {
+                b'"' => {
+                    return Some((content_start, i, i + 1));
+                }
+                b'\\' => {
+                    let esc = *bytes.get(i + 1)?;
+                    match esc {
+                        b'"' | b'\\' | b'b' | b'f' | b'n' | b'r' | b't' => i += 2,
+                        b'u' => {
+                            let hex = bytes.get(i + 2..i + 6)?;
+                            if !hex
+                                .iter()
+                                .all(|h| h.is_ascii_digit() || matches!(h, b'a'..=b'f'))
+                            {
+                                return None;
+                            }
+                            let cp = hex.iter().fold(0u32, |acc, &h| {
+                                let digit = if h.is_ascii_digit() {
+                                    h - b'0'
+                                } else {
+                                    h - b'a' + 10
+                                };
+                                (acc << 4) | u32::from(digit)
+                            });
+                            if !matches!(cp, 0x00..=0x07 | 0x0B | 0x0E..=0x1F | 0x7F) {
+                                return None;
+                            }
+                            i += 6;
+                        }
+                        // `/` (never escaped by jq's writer), any other letter,
+                        // or an unrecognized byte after `\` -- all not
+                        // canonical.
+                        _ => return None,
+                    }
+                }
+                b if b < 0x20 || b == 0x7F => return None,
+                // Every other byte -- ASCII, or any byte of a multi-byte UTF-8
+                // sequence -- is one byte of literal content. UTF-8 validity is
+                // deliberately *not* decided here; see this function's own doc
+                // comment.
+                _ => i += 1,
+            }
+        }
+    }
+
+    /// Builds one string literal around `body` and checks the block-walking
+    /// scan against the byte-loop oracle at every start offset it can sit at
+    /// inside a 64-byte block (the padding shifts the opening quote across
+    /// every lane and across the block boundary).
+    fn assert_string_scan_agrees(body: &[u8]) {
+        for pad in 0..130usize {
+            let mut doc = vec![b'['; 0];
+            doc.extend(core::iter::repeat(b'1').take(pad));
+            let pos = doc.len();
+            doc.push(b'"');
+            doc.extend_from_slice(body);
+            doc.push(b'"');
+            doc.extend_from_slice(b",1]");
+            let expect = scan_json_string_span_bytewise_reference(&doc, pos);
+            let got = scan_json_string_span(&doc, pos, &mut SpecialMask::new());
+            assert_eq!(got, expect, "pad {pad} body {body:?}");
+            // And with no closing quote at all: an unterminated string bails.
+            let open = &doc[..doc.len() - 3];
+            assert_eq!(
+                scan_json_string_span(&open[..open.len() - 1], pos, &mut SpecialMask::new()),
+                scan_json_string_span_bytewise_reference(&open[..open.len() - 1], pos),
+                "unterminated, pad {pad} body {body:?}"
+            );
+        }
+    }
+
+    /// Plain strings of every length across and past two block boundaries, and
+    /// the same with one special of each kind (and one multi-byte character)
+    /// planted at every offset: the closing quote, a `\`-escape, a `\u` escape
+    /// and a control byte each land on every lane and straddle the boundary at
+    /// some offset.
+    #[test]
+    fn string_scan_agrees_with_the_bytewise_reference_across_block_boundaries_3340() {
+        for len in 0..140usize {
+            let plain = vec![b'a'; len];
+            assert_string_scan_agrees(&plain);
+        }
+        let units: [&[u8]; 9] = [
+            b"\\n",
+            b"\\\"",
+            b"\\\\",
+            b"\\u0001",
+            b"\\u007f",
+            b"\\u001F",
+            b"\\/",
+            b"\x01",
+            "\u{e9}\u{4e16}".as_bytes(),
+        ];
+        for unit in units {
+            for at in (0..70usize).chain(120..134) {
+                let mut body = vec![b'a'; at + 8];
+                body.splice(at..at, unit.iter().copied());
+                assert_string_scan_agrees(&body);
+            }
+        }
+    }
+
+    /// Escape-dense text -- the shape #3168 lost on -- driven by a seeded
+    /// generator rather than a hand-picked list.
+    #[test]
+    fn string_scan_agrees_with_the_bytewise_reference_on_random_strings_3340() {
+        let alphabet: [&[u8]; 14] = [
+            b"a",
+            b"b",
+            b" ",
+            b"\\n",
+            b"\\t",
+            b"\\\"",
+            b"\\\\",
+            b"\\u0000",
+            b"\\u001f",
+            b"\\u00e9",
+            b"\\x",
+            b"\x7f",
+            b"\x1f",
+            "\u{1f600}".as_bytes(),
+        ];
+        let mut seed = 0xDEAD_BEEF_CAFE_F00Du64;
+        for _ in 0..4000 {
+            let mut body = Vec::new();
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let n = (seed % 90) as usize;
+            for _ in 0..n {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                body.extend_from_slice(alphabet[(seed >> 20) as usize % alphabet.len()]);
+            }
+            assert_string_scan_agrees(&body);
+        }
+    }
 
     /// A node-dense document for the #2168 tests below: ~12 interest bits
     /// per 64-byte word in the number array, where the old fixed `rank / 8`
