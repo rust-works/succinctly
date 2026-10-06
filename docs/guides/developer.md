@@ -170,7 +170,8 @@ section). To reproduce its numbers and the PR patch-coverage list locally:
 
 ```bash
 cargo llvm-cov --features cli,simd,regex,serde --workspace --summary-only --fail-under-lines 0
-omni-dev coverage diff
+cargo llvm-cov report --lcov --output-path target/coverage.lcov
+patchcov diff --report target/coverage.lcov
 ```
 
 The two `jq_cli_tests` listed in `scripts/deep-recursion-tests.sh` are `#[ignore]`d under
@@ -194,6 +195,68 @@ cargo llvm-cov --features $F --test jq_cli_tests --lcov --output-path two.info \
 covered() { awk '/^SF:/{f=$0} /^DA:/{split(substr($0,4),a,","); if (a[2]>0) print f":"a[1]}' "$1" | sort -u; }
 comm -13 <(covered rest.info) <(covered two.info)   # lines only the two cover; empty = nothing lost
 ```
+
+#### Patchcov migration verification
+
+The shared coverage action uses `omni-dev-coverage-check@v2` with **patchcov 0.1.1**
+(#3873). The other omni-dev commands still use `.omni-dev/`; coverage alone reads
+`.patchcov/config.yaml`. Install the pinned tool with `cargo install patchcov --version 0.1.1`.
+CI runs `patchcov lint-markers --include 'src/**/*.rs'` before reporting, alongside the
+existing pooled-profile check. The migrated source has 361 `tolerate-line`, 21 `tolerate`
+and 21 `end` markers across 17 Rust files; every Rust edit changes only the introducer.
+
+Verification on 2026-10-06 used the released macOS ARM64 binaries of omni-dev 0.46.0
+and patchcov 0.1.1, and unchanged x86_64 main artifacts from baseline runs
+[37457872796](https://github.com/rust-works/succinctly/actions/runs/37457872796)
+(`1c71942d0`) and [37458546292](https://github.com/rust-works/succinctly/actions/runs/37458546292)
+(`c4a62bfbb`). Both artifacts contain `coverage-head.lcov`; no baseline conversion is needed.
+
+To repeat, download `coverage-baseline-x86_64` from each run with `gh run download`,
+and extract each revision with `git archive` into temporary Git repositories. Commit
+base then head in one repository with the original markers/config, and in another with
+both revisions' marker introducers and config path migrated. Keep every source line in
+place. Run the old `omni-dev coverage diff` and new `patchcov diff` with the corresponding
+snapshot refs and identical reports/options:
+
+```bash
+# BASE_OLD/HEAD_OLD and BASE_NEW/HEAD_NEW are snapshot refs; OLD/NEW are their roots.
+# REPORTS holds base/coverage-head.lcov and head/coverage-head.lcov from the two runs.
+for format in markdown json; do
+  omni-dev coverage diff -C "$OLD" --base-ref "$BASE_OLD" --head-ref "$HEAD_OLD" \
+    --baseline-report "$REPORTS/base/coverage-head.lcov" \
+    --report "$REPORTS/head/coverage-head.lcov" \
+    --strip-prefix /home/runner/work/succinctly/succinctly --all-files -o "$format"
+  patchcov diff -C "$NEW" --base-ref "$BASE_NEW" --head-ref "$HEAD_NEW" \
+    --baseline-report "$REPORTS/base/coverage-head.lcov" \
+    --report "$REPORTS/head/coverage-head.lcov" \
+    --strip-prefix /home/runner/work/succinctly/succinctly --all-files -o "$format"
+done
+```
+
+Both tools reported **266/269 (98.88%) patch coverage**, project totals **94.84% → 94.86%**,
+identical per-file deltas, indirect changes and uncovered lines (`src/jq/eval.rs:67206`,
+`src/jq/eval.rs:67207`, `src/jq/eval_generic.rs:1063`). Zeroing all added executable `DA:`
+records in a copy of the head lcov changed both to **0/269**, with identical uncovered
+lists and deltas. Patchcov adds a Markdown exclusion note and a JSON `excluded_files`
+object (plus its explanation field); those disclosures are the only output differences.
+
+Mutation checks deliberately force report hit flips so stable/unreachable lines exercise
+the masks. Setting `src/jq/value.rs:365` to one hit in the baseline and zero in head
+keeps that file's effective delta at **0.00pp** with its `tolerate-line`; removing that
+single marker suffix from both source snapshots changes the delta to **−0.02pp**.
+For the config check, zero all head `DA:` counts in `src/bits/popcount.rs`, then run
+with and without its ignore entry (an empty `--config-dir` is equivalent): the excluded
+file reappeared and changed the total from **94.86% to 94.77%**. Keep these mutations
+in temporary fixtures.
+
+A third snapshot kept the original baseline source/config and migrated only head.
+Patchcov consumed the old lcov unchanged and produced identical project totals,
+per-file deltas and indirect changes: head markers drive tolerance masking. Its patch
+coverage was **276/613 (45.02%)**, because replacing a marker suffix on an executable
+line makes that line newly added in the Git diff. This affects the migration PR itself;
+`tolerate` does not forgive newly added executable lines. The patch gate remains
+report-only, and subsequent PRs compare migrated source on both sides. Baseline artifact
+names, the `cargo llvm-cov` 55% floor and profile pooling stay the same.
 
 #### `warning: N functions have mismatched data`
 

@@ -654,7 +654,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::NumberLiteral(literal) => {
                 OwnedValue::from_number_literal_boxed::<JqSemantics>(literal)
             }
-            JqValue::String(s) => OwnedValue::String(s.into()), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
+            JqValue::String(s) => OwnedValue::String(s.into()), // patchcov: coverage tolerate-line reason="pre-existing zero-hit line; #3191 changed only how its string payload is constructed"
             JqValue::Array(arr) => OwnedValue::Array(
                 arr.into_iter()
                     .map(|v| v.into_owned_at_depth(depth + 1))
@@ -1471,7 +1471,7 @@ mod tests {
     fn test_nan_instance_stays_a_nan_3309() {
         let instance = OwnedValue::fresh_nan_instance(false);
         let OwnedValue::NumberLiteral(repr, text) = instance.clone() else {
-            panic!("a NaN instance is a literal"); // omni-dev: coverage tolerate-line reason="failure message for the shape the test asserts"
+            panic!("a NaN instance is a literal"); // patchcov: coverage tolerate-line reason="failure message for the shape the test asserts"
         };
         let from_literal: JqValue<'_, Vec<u64>> =
             JqValue::from_literal(&Literal::NumberLiteral(repr, text.to_string()));

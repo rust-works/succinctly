@@ -1329,7 +1329,7 @@ impl ModuleLoader {
                 false,
                 &module_def_names,
             )
-            .unwrap_or(program) // omni-dev: coverage tolerate-line reason="unreachable: widening the shadow-candidate set never rejects a program the first parse accepted, for the identical reason run_jq's own analogous fallback (#2395) is tolerated -- see that line's own comment (#2950)"
+            .unwrap_or(program) // patchcov: coverage tolerate-line reason="unreachable: widening the shadow-candidate set never rejects a program the first parse accepted, for the identical reason run_jq's own analogous fallback (#2395) is tolerated -- see that line's own comment (#2950)"
         };
 
         // Stamp `$__loc__` BEFORE wrapping, never after: `stamp_loc_file`
@@ -1702,7 +1702,7 @@ impl ModuleLoader {
         // ever drift apart, the loader's own report is the one to print: an
         // empty one would read `jq: 0 compile errors` with no message.
         if walk.entries.is_empty() {
-            return first; // omni-dev: coverage tolerate-line reason="unreachable while the walk and the loader agree on what fails: both resolve with resolve_module_in/resolve_data_file_in, parse with parse_program and name a cycle by canonical file, which the fuzz in #3573 held over thousands of programs; kept so drift prints the loader's failure and not `0 compile errors`"
+            return first; // patchcov: coverage tolerate-line reason="unreachable while the walk and the loader agree on what fails: both resolve with resolve_module_in/resolve_data_file_in, parse with parse_program and name a cycle by canonical file, which the fuzz in #3573 held over thousands of programs; kept so drift prints the loader's failure and not `0 compile errors`"
         }
         ModuleLoadError {
             entries: walk.entries,
@@ -2419,7 +2419,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         // #798: yq-mode-only grammar (the parser never produces this in jq
         // mode, where namespaced calls/imports live), but still rewritten
         // for consistency with every other assignment-family variant above.
-        // omni-dev: coverage tolerate reason="unreachable: `try_parse_meta_op` only fires under `ParserMode::Yq` (src/jq/parser.rs), and `rewrite_namespaced_calls` is only reached via `ModuleProcessor::process_program`, which jq_runner's own jq-mode `run` is the sole caller of -- so a `MetaAssign` node can never reach this function (#798)"
+        // patchcov: coverage tolerate reason="unreachable: `try_parse_meta_op` only fires under `ParserMode::Yq` (src/jq/parser.rs), and `rewrite_namespaced_calls` is only reached via `ModuleProcessor::process_program`, which jq_runner's own jq-mode `run` is the sole caller of -- so a `MetaAssign` node can never reach this function (#798)"
         Expr::MetaAssign {
             target,
             slot,
@@ -2431,7 +2431,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             value: Box::new(rewrite_namespaced_calls(*value)),
             is_update,
         },
-        // omni-dev: coverage end
+        // patchcov: coverage end
         // Label-break
         Expr::Label { name, body } => Expr::Label {
             name,
@@ -3019,8 +3019,8 @@ impl MalformedJsonError {
         let (message, kind) = match err.value {
             EvalErrorPayload::Kind(kind) => (err.message, Some(kind)),
             EvalErrorPayload::None => (err.message, None),
-            EvalErrorPayload::Value(OwnedValue::String(text)) => (text.into_string(), None), // omni-dev: coverage tolerate-line reason="unreachable by construction: every error this wrapper receives today is a decode or nesting-depth failure the evaluator raised itself, never error(v); kept so a future one is rendered rather than dropped (#2999)"
-            EvalErrorPayload::Value(value) => (value.to_json(), None), // omni-dev: coverage tolerate-line reason="see the arm above (#2999)"
+            EvalErrorPayload::Value(OwnedValue::String(text)) => (text.into_string(), None), // patchcov: coverage tolerate-line reason="unreachable by construction: every error this wrapper receives today is a decode or nesting-depth failure the evaluator raised itself, never error(v); kept so a future one is rendered rather than dropped (#2999)"
+            EvalErrorPayload::Value(value) => (value.to_json(), None), // patchcov: coverage tolerate-line reason="see the arm above (#2999)"
         };
         Self { message, kind }
     }
@@ -3439,7 +3439,7 @@ impl ModuleSource {
                 let hi = sites.partition_point(|t| offset(t) < span.end);
                 &sites[lo..hi]
             }
-            None => sites, // omni-dev: coverage tolerate-line reason="unreachable in practice today: `def` is only `None` when `occurrences.module_def()` is `None`, which (given `origin` is `Some`) would require an open run whose innermost frame has no def set at a `check` point that isn't itself inside a module-level def body -- but every module run is a strict chain of `def` nodes (the loader's own defs, each wrapping its dependency stubs INSIDE its own body via `wrap_defs`/`dep_stubs_for`) terminated by the run's own end marker, so a diagnosable call/var/break site is always reached either inside a module-level def's body (module_def Some) or outside every run (origin None) -- and even when `def` is `Some`, `self.defs` is always `ModuleSource::read`'s own re-parse of the exact same file `run_id_for` interned this origin's id from, so `collect_def_sites` always finds the matching (name, arity, ordinal) span. Kept as a defensive fallback rather than a panic/unwrap in case that invariant is ever violated (#3085)"
+            None => sites, // patchcov: coverage tolerate-line reason="unreachable in practice today: `def` is only `None` when `occurrences.module_def()` is `None`, which (given `origin` is `Some`) would require an open run whose innermost frame has no def set at a `check` point that isn't itself inside a module-level def body -- but every module run is a strict chain of `def` nodes (the loader's own defs, each wrapping its dependency stubs INSIDE its own body via `wrap_defs`/`dep_stubs_for`) terminated by the run's own end marker, so a diagnosable call/var/break site is always reached either inside a module-level def's body (module_def Some) or outside every run (origin None) -- and even when `def` is `Some`, `self.defs` is always `ModuleSource::read`'s own re-parse of the exact same file `run_id_for` interned this origin's id from, so `collect_def_sites` always finds the matching (name, arity, ordinal) span. Kept as a defensive fallback rather than a panic/unwrap in case that invariant is ever violated (#3085)"
         }
     }
 }
@@ -3688,10 +3688,10 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                                 module.within(module.breaks(), |b| b.offset, module_def.as_ref());
                             report_unresolved_label(name, &at, &module.source, sites, *occurrence);
                         }
-                        // omni-dev: coverage tolerate reason="unreachable in a single-process run by construction: `run_id_for` (the sole source of an `origin` id) always inserts a `run_origins` entry for the id it hands back -- from a real load's canonical path, or its own literal-path fallback on a resolve failure -- and a def body only ever gets stamped with an `origin` after its module loaded successfully, so `at` always names a file that existed and was readable moments earlier. Reaching this arm needs that same file to vanish (or become unreadable) in the narrow window between that load and this re-read, entirely outside this process's control (#2964)"
+                        // patchcov: coverage tolerate reason="unreachable in a single-process run by construction: `run_id_for` (the sole source of an `origin` id) always inserts a `run_origins` entry for the id it hands back -- from a real load's canonical path, or its own literal-path fallback on a resolve failure -- and a def body only ever gets stamped with an `origin` after its module loaded successfully, so `at` always names a file that existed and was readable moments earlier. Reaching this arm needs that same file to vanish (or become unreadable) in the narrow window between that load and this re-read, entirely outside this process's control (#2964)"
                         None => {
                             eprintln!("jq: error: $*label-{name} is not defined at {at}");
-                        } // omni-dev: coverage end
+                        } // patchcov: coverage end
                     }
                     continue;
                 }
@@ -3957,7 +3957,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
         // costs only this filter's module-sourced shadowing -- exactly the
         // behavior before this fix -- where an error would reject a filter
         // that compiles today and that real jq accepts.
-        parse_filter(&module_def_names).unwrap_or(program) // omni-dev: coverage tolerate-line reason="unreachable: widening the shadow-candidate set never rejects a program the first parse accepted -- a newly covered name only wraps an already-successful dedicated parse, and a failing one would have propagated its error in the first parse too, so the retry budget is charged at the identical sites in both (#2395)"
+        parse_filter(&module_def_names).unwrap_or(program) // patchcov: coverage tolerate-line reason="unreachable: widening the shadow-candidate set never rejects a program the first parse accepted -- a newly covered name only wraps an already-successful dedicated parse, and a failing one would have propagated its error in the first parse too, so the retry budget is charged at the identical sites in both (#2395)"
     };
 
     let expr = match module_loader.process_program(&program) {
@@ -4548,7 +4548,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                 }));
                 match outcome {
                     Ok(written) => written?,
-                    // omni-dev: coverage tolerate reason="unreachable from any query this suite can build since #3457: the path walkers were the sites that panicked at MAX_NESTING_DEPTH here (sort/join/map, path()/paths/setpath/del()/assignment on a deep document), and they now return a decode-failure-tagged error, so a deep document is reported through the ordinary Err arm instead. The panic sites still in the evaluator (lazy.rs cursor_to_owned, owned_identity_recurse_step, owned_from_standard_json_at_depth, the YAML comment-preserving materialization) are not reached by a jq-mode CLI query at 250-500 levels, probed by hand; the catch is kept as the net for them and for a future guard that panics, and nesting_depth_panic_message itself is pinned by a unit test (#3457)"
+                    // patchcov: coverage tolerate reason="unreachable from any query this suite can build since #3457: the path walkers were the sites that panicked at MAX_NESTING_DEPTH here (sort/join/map, path()/paths/setpath/del()/assignment on a deep document), and they now return a decode-failure-tagged error, so a deep document is reported through the ordinary Err arm instead. The panic sites still in the evaluator (lazy.rs cursor_to_owned, owned_identity_recurse_step, owned_from_standard_json_at_depth, the YAML comment-preserving materialization) are not reached by a jq-mode CLI query at 250-500 levels, probed by hand; the catch is kept as the net for them and for a future guard that panics, and nesting_depth_panic_message itself is pinned by a unit test (#3457)"
                     Err(payload) => {
                         // `&*payload`, not `&payload` -- `payload` is a
                         // `Box<dyn Any + Send>`, and a bare `&payload`
@@ -4584,7 +4584,7 @@ pub fn run_jq(mut args: JqCommand) -> Result<i32> {
                         // reaches it on the same iteration; this one didn't).
                     }
                 }
-                // omni-dev: coverage end
+                // patchcov: coverage end
                 // halt/halt_error (#791) outranks everything else, including
                 // remaining values/files still to process. The panic arm above
                 // used to `continue` past this check and repeat it itself;
@@ -9841,7 +9841,7 @@ mod tests {
                 .into_iter()
                 .map(|e| match e {
                     jq::ResolveError::Call(c) => c.name.as_str(),
-                    other => panic!("only calls were built: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable: this test builds only ResolveError::Call values (#3313)"
+                    other => panic!("only calls were built: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable: this test builds only ResolveError::Call values (#3313)"
                 })
                 .collect();
             assert_eq!(
@@ -11850,7 +11850,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let StandardJson::Array(elements) = cursor.value() else {
-            panic!("expected an array"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixed b\"[1, 2, 3]\" literal above always decodes to StandardJson::Array (#2103)"
+            panic!("expected an array"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixed b\"[1, 2, 3]\" literal above always decodes to StandardJson::Array (#2103)"
         };
         let cursors: Vec<_> = elements.cursor_iter().collect();
         let at = InputLocation::at(None, 1);

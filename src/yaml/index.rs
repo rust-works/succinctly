@@ -1293,11 +1293,11 @@ mod tests {
         let index = YamlIndex::build(yaml).expect("valid YAML");
         let root = index.root(yaml);
         let YamlValue::Sequence(docs) = root.value() else {
-            panic!("root is always the virtual document sequence"); // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
+            panic!("root is always the virtual document sequence"); // patchcov: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
         };
         let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
         let YamlValue::Mapping(fields) = doc_cursor.value() else {
-            panic!("expected a mapping document"); // omni-dev: coverage tolerate-line reason="unreachable: every fixture field_key_head_foot is called with in this test module is a top-level mapping (#798)"
+            panic!("expected a mapping document"); // patchcov: coverage tolerate-line reason="unreachable: every fixture field_key_head_foot is called with in this test module is a top-level mapping (#798)"
         };
         for field in fields {
             if let YamlValue::String(k) = field.key() {
@@ -1308,9 +1308,9 @@ mod tests {
                         raw_lines(yaml, index.get_foot_comments(bp)),
                     );
                 }
-            } // omni-dev: coverage tolerate-line reason="unreachable: a mapping key is always emitted as YamlValue::String -- it is never type-inferred like a value (#222), so this if-let's pattern can never fail to match (#798)"
+            } // patchcov: coverage tolerate-line reason="unreachable: a mapping key is always emitted as YamlValue::String -- it is never type-inferred like a value (#222), so this if-let's pattern can never fail to match (#798)"
         }
-        panic!("key {key} not found"); // omni-dev: coverage tolerate-line reason="unreachable: every call to field_key_head_foot in this test module passes a key that the fixture's mapping actually has (#798)"
+        panic!("key {key} not found"); // patchcov: coverage tolerate-line reason="unreachable: every call to field_key_head_foot in this test module passes a key that the fixture's mapping actually has (#798)"
     }
 
     /// `head`/`foot` of a top-level sequence item's *content* node.
@@ -1320,11 +1320,11 @@ mod tests {
         let index = YamlIndex::build(yaml).expect("valid YAML");
         let root = index.root(yaml);
         let YamlValue::Sequence(docs) = root.value() else {
-            panic!("root is always the virtual document sequence"); // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
+            panic!("root is always the virtual document sequence"); // patchcov: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
         };
         let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
         let YamlValue::Sequence(items) = doc_cursor.value() else {
-            panic!("expected a sequence document"); // omni-dev: coverage tolerate-line reason="unreachable: every fixture seq_item_head_foot is called with in this test module is a top-level sequence (#798)"
+            panic!("expected a sequence document"); // patchcov: coverage tolerate-line reason="unreachable: every fixture seq_item_head_foot is called with in this test module is a top-level sequence (#798)"
         };
         let mut rest = items;
         for _ in 0..idx {
@@ -1347,7 +1347,7 @@ mod tests {
         let index = YamlIndex::build(yaml).expect("valid YAML");
         let root = index.root(yaml);
         let YamlValue::Sequence(docs) = root.value() else {
-            panic!("root is always the virtual document sequence"); // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
+            panic!("root is always the virtual document sequence"); // patchcov: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
         };
         let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
         let bp = doc_cursor.bp_position();
@@ -1366,7 +1366,7 @@ mod tests {
         let index = YamlIndex::build(yaml).expect("valid YAML");
         let root = index.root(yaml);
         let YamlValue::Sequence(docs) = root.value() else {
-            panic!("root is always the virtual document sequence"); // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
+            panic!("root is always the virtual document sequence"); // patchcov: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
         };
         let mut rest = docs;
         for _ in 0..di {
@@ -1389,7 +1389,7 @@ mod tests {
         let index = YamlIndex::build(yaml).expect("valid YAML");
         let root = index.root(yaml);
         let YamlValue::Sequence(docs) = root.value() else {
-            panic!("root is always the virtual document sequence"); // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
+            panic!("root is always the virtual document sequence"); // patchcov: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
         };
         let mut rest = docs;
         for _ in 0..di {
@@ -1398,7 +1398,7 @@ mod tests {
         }
         let (doc_cursor, _) = rest.uncons_cursor().expect("document index in range");
         let YamlValue::Mapping(fields) = doc_cursor.value() else {
-            panic!("expected a mapping document"); // omni-dev: coverage tolerate-line reason="unreachable: every fixture field_key_head_foot_in_doc is called with in this test module is a top-level mapping (#798)"
+            panic!("expected a mapping document"); // patchcov: coverage tolerate-line reason="unreachable: every fixture field_key_head_foot_in_doc is called with in this test module is a top-level mapping (#798)"
         };
         for field in fields {
             if let YamlValue::String(k) = field.key() {
@@ -1409,9 +1409,9 @@ mod tests {
                         raw_lines(yaml, index.get_foot_comments(bp)),
                     );
                 }
-            } // omni-dev: coverage tolerate-line reason="unreachable: a mapping key is always emitted as YamlValue::String -- it is never type-inferred like a value (#222), so this if-let's pattern can never fail to match (#798)"
+            } // patchcov: coverage tolerate-line reason="unreachable: a mapping key is always emitted as YamlValue::String -- it is never type-inferred like a value (#222), so this if-let's pattern can never fail to match (#798)"
         }
-        panic!("key {key} not found in document {di}"); // omni-dev: coverage tolerate-line reason="unreachable: every call to field_key_head_foot_in_doc in this test module passes a key that the fixture's document actually has (#798)"
+        panic!("key {key} not found in document {di}"); // patchcov: coverage tolerate-line reason="unreachable: every call to field_key_head_foot_in_doc in this test module passes a key that the fixture's document actually has (#798)"
     }
 
     /// `head`/`foot` of a nested mapping entry's key, reached as
@@ -1422,21 +1422,21 @@ mod tests {
         let index = YamlIndex::build(yaml).expect("valid YAML");
         let root = index.root(yaml);
         let YamlValue::Sequence(docs) = root.value() else {
-            panic!("root is always the virtual document sequence"); // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
+            panic!("root is always the virtual document sequence"); // patchcov: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
         };
         let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
         let YamlValue::Mapping(fields) = doc_cursor.value() else {
-            panic!("expected a mapping document"); // omni-dev: coverage tolerate-line reason="unreachable: every fixture nested_key_head_foot is called with in this test module is a top-level mapping (#798)"
+            panic!("expected a mapping document"); // patchcov: coverage tolerate-line reason="unreachable: every fixture nested_key_head_foot is called with in this test module is a top-level mapping (#798)"
         };
         for field in fields {
             let YamlValue::String(k) = field.key() else {
-                continue; // omni-dev: coverage tolerate-line reason="unreachable: a mapping key is always emitted as YamlValue::String -- it is never type-inferred like a value (#222), so this let-else's pattern can never fail to match (#798)"
+                continue; // patchcov: coverage tolerate-line reason="unreachable: a mapping key is always emitted as YamlValue::String -- it is never type-inferred like a value (#222), so this let-else's pattern can never fail to match (#798)"
             };
             if k.raw_bytes() != outer.as_bytes() {
                 continue;
             }
             let YamlValue::Mapping(inner_fields) = field.value() else {
-                panic!("expected a nested mapping under {outer}"); // omni-dev: coverage tolerate-line reason="unreachable: every fixture nested_key_head_foot is called with has a nested mapping under `outer` (#798)"
+                panic!("expected a nested mapping under {outer}"); // patchcov: coverage tolerate-line reason="unreachable: every fixture nested_key_head_foot is called with has a nested mapping under `outer` (#798)"
             };
             for inner_field in inner_fields {
                 if let YamlValue::String(ik) = inner_field.key() {
@@ -1447,10 +1447,10 @@ mod tests {
                             raw_lines(yaml, index.get_foot_comments(bp)),
                         );
                     }
-                } // omni-dev: coverage tolerate-line reason="unreachable: a mapping key is always emitted as YamlValue::String -- it is never type-inferred like a value (#222), so this if-let's pattern can never fail to match (#798)"
+                } // patchcov: coverage tolerate-line reason="unreachable: a mapping key is always emitted as YamlValue::String -- it is never type-inferred like a value (#222), so this if-let's pattern can never fail to match (#798)"
             }
         }
-        panic!("nested key {outer}.{inner} not found"); // omni-dev: coverage tolerate-line reason="unreachable: every call to nested_key_head_foot in this test module passes an outer.inner pair that the fixture actually has (#798)"
+        panic!("nested key {outer}.{inner} not found"); // patchcov: coverage tolerate-line reason="unreachable: every call to nested_key_head_foot in this test module passes an outer.inner pair that the fixture actually has (#798)"
     }
 
     /// A block sticks to whatever it is *not* separated from by a blank

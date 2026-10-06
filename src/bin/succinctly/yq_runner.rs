@@ -1647,7 +1647,7 @@ fn stream_yaml_sort_keys_alias_fallback<W: Write>(
             mark_json_sourced: false,
         },
     );
-    let (doc_results, num_docs) = eval_result?; // omni-dev: coverage tolerate-line reason="unreachable: bytes already parsed successfully by every caller (#1350)"
+    let (doc_results, num_docs) = eval_result?; // patchcov: coverage tolerate-line reason="unreachable: bytes already parsed successfully by every caller (#1350)"
     for results in doc_results {
         // #2486: `---` only ever separates distinct *documents*, never two
         // results produced from evaluating the same document (e.g. `.[]`
@@ -1749,9 +1749,9 @@ fn evaluate_input(
         // 300-level document fails at parse time with "nesting depth exceeds limit of
         // 128" before ever reaching this reindex (#3261).
         Err(e) => {
-            sink.report(DiagStyle::Yq, &e, &no_location()); // omni-dev: coverage tolerate-line reason="unreachable: see the block comment above this arm"
-            return Ok(Vec::new()); // omni-dev: coverage tolerate-line reason="unreachable: see the block comment above this arm"
-        } // omni-dev: coverage tolerate-line reason="unreachable: see the block comment above this arm"
+            sink.report(DiagStyle::Yq, &e, &no_location()); // patchcov: coverage tolerate-line reason="unreachable: see the block comment above this arm"
+            return Ok(Vec::new()); // patchcov: coverage tolerate-line reason="unreachable: see the block comment above this arm"
+        } // patchcov: coverage tolerate-line reason="unreachable: see the block comment above this arm"
     };
 
     // The converged evaluator (#3479), told which document it is evaluating:
@@ -3362,7 +3362,7 @@ fn plain_scalar_text(value: &OwnedValue) -> Option<String> {
 /// is too short.
 fn meta_path_from_value(path: &OwnedValue, current: &OwnedValue) -> Option<Vec<MetaPathStep>> {
     let OwnedValue::Array(steps) = path else {
-        return None; // omni-dev: coverage tolerate-line reason="unreachable: `path` is always the raw output of the `path(TARGET)` builtin evaluated a few lines up in `resolve_one_meta_assign` -- `path/1` is a jq/yq language invariant that always answers an array of path components (see `Expr::Builtin(Builtin::PathNoArg) => Ok(Some(OwnedValue::Array(..)))` in eval_generic.rs), never any other shape (#798)"
+        return None; // patchcov: coverage tolerate-line reason="unreachable: `path` is always the raw output of the `path(TARGET)` builtin evaluated a few lines up in `resolve_one_meta_assign` -- `path/1` is a jq/yq language invariant that always answers an array of path components (see `Expr::Builtin(Builtin::PathNoArg) => Ok(Some(OwnedValue::Array(..)))` in eval_generic.rs), never any other shape (#798)"
     };
     let mut out = Vec::with_capacity(steps.len());
     for step in steps {
@@ -3464,7 +3464,7 @@ fn count_meta_assigns(expr: &Expr) -> usize {
 fn flatten_pipe_stages<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
     match expr {
         Expr::Paren(inner) | Expr::Optional(inner) => flatten_pipe_stages(inner, out),
-        Expr::Shared(inner) => flatten_pipe_stages(inner, out), // omni-dev: coverage tolerate-line reason="unreachable: `resolve_meta_assign_writes` runs `expr` through this before any evaluation begins (see its own doc comment), and `Expr::Shared` is never constructed by the parser -- only at eval time, by function-call argument substitution (`substitute_func_param` in eval.rs) -- so a pre-evaluation AST can never contain one here (#798)"
+        Expr::Shared(inner) => flatten_pipe_stages(inner, out), // patchcov: coverage tolerate-line reason="unreachable: `resolve_meta_assign_writes` runs `expr` through this before any evaluation begins (see its own doc comment), and `Expr::Shared` is never constructed by the parser -- only at eval time, by function-call argument substitution (`substitute_func_param` in eval.rs) -- so a pre-evaluation AST can never contain one here (#798)"
         Expr::Pipe(stages) => stages.iter().for_each(|s| flatten_pipe_stages(s, out)),
         Expr::FuncDef { then, .. } => flatten_pipe_stages(then, out),
         _ => out.push(expr),
@@ -4120,7 +4120,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             for (value, comments) in docs.iter_mut() {
                 apply_meta_assign_writes(&resolved_meta_writes, value, comments);
             }
-        } // omni-dev: coverage tolerate-line reason="unreachable: every arm of the `match result { .. }` above that assigns `docs` (L3492-3622) constructs `Ok(..)` -- none ever produces `Err`, so this `if let`'s implicit else can't be taken; symmetric to L1625's `?` (#798)"
+        } // patchcov: coverage tolerate-line reason="unreachable: every arm of the `match result { .. }` above that assigns `docs` (L3492-3622) constructs `Ok(..)` -- none ever produces `Err`, so this `if let`'s implicit else can't be taken; symmetric to L1625's `?` (#798)"
     }
 
     // A bare top-level/navigated scalar result drops all its own styling,
@@ -6933,9 +6933,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 // `root` is the virtual document sequence; falsiness
                                 // lives on the actual document value (#178).
                                 if args.exit_status {
-                                    // omni-dev: coverage tolerate reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (documented above, verified in d4c03a6ca); only the formatting changed when `is_falsy()` dropped its `JsonConvention` parameter (#3222)"
+                                    // patchcov: coverage tolerate reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (documented above, verified in d4c03a6ca); only the formatting changed when `is_falsy()` dropped its `JsonConvention` parameter (#3222)"
                                     any_truthy |= root.first_child().is_some_and(|c| !c.is_falsy());
-                                    // omni-dev: coverage end
+                                    // patchcov: coverage end
                                 }
                             }
                         } else {
@@ -7124,12 +7124,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     // `root` is the virtual document sequence;
                                     // falsiness lives on the actual document
                                     // value (#178).
-                                    // omni-dev: coverage tolerate reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (documented above, verified in d4c03a6ca); only the formatting changed when `is_falsy()` dropped its `JsonConvention` parameter (#3222)"
+                                    // patchcov: coverage tolerate reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (documented above, verified in d4c03a6ca); only the formatting changed when `is_falsy()` dropped its `JsonConvention` parameter (#3222)"
                                     if args.exit_status {
                                         any_truthy |=
                                             root.first_child().is_some_and(|c| !c.is_falsy());
                                     }
-                                    // omni-dev: coverage end
+                                    // patchcov: coverage end
                                 }
                             } else {
                                 // M2 path: need to get the actual document cursor
@@ -7889,12 +7889,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         }
                                     }
                                     write_terminator(&mut buf_writer, &output_config)?;
-                                    // omni-dev: coverage tolerate reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (documented above, verified in d4c03a6ca); only the formatting changed when `is_falsy()` dropped its `JsonConvention` parameter (#3222)"
+                                    // patchcov: coverage tolerate reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (documented above, verified in d4c03a6ca); only the formatting changed when `is_falsy()` dropped its `JsonConvention` parameter (#3222)"
                                     if args.exit_status {
                                         any_truthy |=
                                             root.first_child().is_some_and(|c| !c.is_falsy());
                                     }
-                                    // omni-dev: coverage end
+                                    // patchcov: coverage end
                                 } else if let Some(doc_cursor) = root.first_child() {
                                     stream_cursor!(
                                         doc_cursor,

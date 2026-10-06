@@ -793,7 +793,7 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
             start_key: start_key.clone(),
             end_key: end_key.clone(),
         },
-        Expr::ArrayKey(key) => Expr::ArrayKey(key.clone()), // omni-dev: coverage tolerate-line reason="unreachable: ArrayKey is only built from a resolved key at path-resolution time, never parsed, so no rewrite of parsed source meets it (#3506)"
+        Expr::ArrayKey(key) => Expr::ArrayKey(key.clone()), // patchcov: coverage tolerate-line reason="unreachable: ArrayKey is only built from a resolved key at path-resolution time, never parsed, so no rewrite of parsed source meets it (#3506)"
         Expr::Iterate => Expr::Iterate,
         Expr::Literal(lit) => Expr::Literal(lit.clone()),
         Expr::RecursiveDescent => Expr::RecursiveDescent,

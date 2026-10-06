@@ -403,7 +403,7 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// where the format cannot say cheaply; a caller then treats the subtree
     /// as containing nothing.
     fn subtree_end(&self) -> Option<usize> {
-        None // omni-dev: coverage tolerate-line reason="unreachable: the only caller, eval_generic::embed_at_or_within, is gated on jq semantics, and the YAML cursor (the one implementor without an override) is only ever evaluated under yq semantics (#3179)"
+        None // patchcov: coverage tolerate-line reason="unreachable: the only caller, eval_generic::embed_at_or_within, is gated on jq semantics, and the YAML cursor (the one implementor without an override) is only ever evaluated under yq semantics (#3179)"
     }
 
     /// Check if this cursor points to a container (array or object) **with
@@ -1093,11 +1093,11 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// materialization. Default implementation returns false (conservative
     /// assumption); see
     /// [`StreamableValue::is_falsy`](crate::jq::stream::StreamableValue::is_falsy).
-    // omni-dev: coverage tolerate reason="unreachable: both implementors (JsonCursor, YamlCursor) override this; the default exists as the conservative-`false` contract a future implementor inherits (#3222)"
+    // patchcov: coverage tolerate reason="unreachable: both implementors (JsonCursor, YamlCursor) override this; the default exists as the conservative-`false` contract a future implementor inherits (#3222)"
     fn is_falsy(&self) -> bool {
         false
     }
-    // omni-dev: coverage end
+    // patchcov: coverage end
 }
 
 /// A value from a document (JSON value or YAML value).
@@ -1272,14 +1272,14 @@ pub trait DocumentValue: Sized + Clone {
     /// before the raw span. *Below* that probe it is the right call --
     /// `key_hash_of` uses it there, and YAML, which has no raw-span
     /// override at all, reaches it for every key.
-    // omni-dev: coverage tolerate reason="unreachable: both implementors (StandardJson, YamlValue) override this to decode once; the default exists as the contract a future implementor inherits, and is deliberately the two-call sequence it replaces (#965)"
+    // patchcov: coverage tolerate reason="unreachable: both implementors (StandardJson, YamlValue) override this to decode once; the default exists as the contract a future implementor inherits, and is deliberately the two-call sequence it replaces (#965)"
     fn decoded_key_str(&self) -> Result<Option<Cow<'_, str>>, &'static str> {
         if let Some(reason) = self.string_decode_error() {
             return Err(reason);
         }
         Ok(self.key_string())
     }
-    // omni-dev: coverage end
+    // patchcov: coverage end
 
     /// Decode a key for a strict consumer, retaining the object-key context
     /// on a decode failure. Unlike the display-key helpers, this never uses

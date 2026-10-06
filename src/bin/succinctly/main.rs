@@ -1369,7 +1369,7 @@ fn negative_filter_retry_candidates(args: &[String], err: &clap::error::Error) -
     let Some(clap::error::ContextValue::String(bad)) =
         err.get(clap::error::ContextKind::InvalidArg)
     else {
-        return Vec::new(); // omni-dev: coverage tolerate-line reason="unreachable given clap 4.6's own unknown_argument() error constructor: every ErrorKind::UnknownArgument it builds sets ContextKind::InvalidArg to ContextValue::String(arg) in the same call, so this arm only guards a future clap release changing that invariant"
+        return Vec::new(); // patchcov: coverage tolerate-line reason="unreachable given clap 4.6's own unknown_argument() error constructor: every ErrorKind::UnknownArgument it builds sets ContextKind::InvalidArg to ContextValue::String(arg) in the same call, so this arm only guards a future clap release changing that invariant"
     };
     if !looks_like_negative_filter(bad) {
         return Vec::new();
@@ -1538,7 +1538,7 @@ where
                 fixed.insert(idx, "--".to_string());
                 if let Ok(cmd) = P::try_parse_from(fixed) {
                     return cmd;
-                } // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_accepted_via_sjq_multicall_alias_3389's '-x' row demonstrably reaches the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
+                } // patchcov: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_accepted_via_sjq_multicall_alias_3389's '-x' row demonstrably reaches the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
             }
             e.exit()
         }
@@ -1707,7 +1707,7 @@ fn parse_cli_allowing_negative_filter() -> Cli {
                 fixed.insert(idx, "--".to_string());
                 if let Ok(cli) = Cli::try_parse_from(fixed) {
                     return cli;
-                } // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_boundary_characters_3389's '-x'/'-n1'/'--bogus' rows demonstrably reach the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
+                } // patchcov: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_boundary_characters_3389's '-x'/'-n1'/'--bogus' rows demonstrably reach the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
             }
             e.exit()
         }
@@ -1729,7 +1729,7 @@ fn run_main() -> Result<()> {
         }
         Command::Yq(args) => {
             let exit_code = yq_runner::run_yq(args)?;
-            exit_after_run(exit_code); // omni-dev: coverage tolerate-line reason="the CLI suites drive yq through the `syq` multi-call arm above; this arm is the same call reached only when spelled `succinctly yq` (#2999)"
+            exit_after_run(exit_code); // patchcov: coverage tolerate-line reason="the CLI suites drive yq through the `syq` multi-call arm above; this arm is the same call reached only when spelled `succinctly yq` (#2999)"
         }
         Command::JqLocate(args) => {
             let exit_code = jq_locate::run_jq_locate(args)?;

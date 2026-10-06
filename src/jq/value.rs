@@ -362,7 +362,7 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
         i += 1;
     }
     if !any_digit {
-        return None; // omni-dev: coverage tolerate-line reason="unreachable by construction: the slow path is entered only after `significant_digit_count` found 18+ digits over the same mantissa bytes this loop walks (#2936)"
+        return None; // patchcov: coverage tolerate-line reason="unreachable by construction: the slow path is entered only after `significant_digit_count` found 18+ digits over the same mantissa bytes this loop walks (#2936)"
     }
     if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
         // The exponent must be a sign and at least one digit, and nothing
@@ -386,7 +386,7 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
         return None;
     }
     if kept_len == 0 {
-        return Some(if negative { -0.0 } else { 0.0 }); // omni-dev: coverage tolerate-line reason="unreachable by construction: 18+ significant digits were counted, so at least one nonzero digit was kept (#2936)"
+        return Some(if negative { -0.0 } else { 0.0 }); // patchcov: coverage tolerate-line reason="unreachable by construction: 18+ significant digits were counted, so at least one nonzero digit was kept (#2936)"
     }
     // Round half-even on the 18th digit and everything after it.
     if kept_len > DOUBLE_PRECISION_DIGITS {
@@ -2903,7 +2903,7 @@ impl DerefMut for SharableString {
         // Inline by construction now: the block above leaves no `Shared`
         // behind, so no `&mut` into shared storage is ever handed out.
         let SharableStringInner::Owned(s) = &mut self.0 else {
-            unreachable!("un-shared just above") // omni-dev: coverage tolerate-line reason="unreachable by construction -- the block above replaces every `Shared` with `Owned` before this line (#3191)"
+            unreachable!("un-shared just above") // patchcov: coverage tolerate-line reason="unreachable by construction -- the block above replaces every `Shared` with `Owned` before this line (#3191)"
         };
         s
     }
@@ -3275,7 +3275,7 @@ impl OwnedValue {
             let text = crate::yaml::format_float_with_fraction(f);
             match parse_i64_or_f64(&text) {
                 Some(repr) => Self::NumberLiteral(repr, text.into()),
-                None => Self::Float(f), // omni-dev: coverage tolerate-line reason="unreachable: `format_float_with_fraction` of a finite double is always RFC 8259 number text, which `parse_i64_or_f64` reads (#2936)"
+                None => Self::Float(f), // patchcov: coverage tolerate-line reason="unreachable: `format_float_with_fraction` of a finite double is always RFC 8259 number text, which `parse_i64_or_f64` reads (#2936)"
             }
         } else {
             Self::Float(f)
@@ -5973,7 +5973,7 @@ mod tests {
 
         let mut s = OwnedValue::string("s");
         let OwnedValue::String(inner) = &mut s else {
-            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- built as a string on the line above (#3191)"
+            unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- built as a string on the line above (#3191)"
         };
         inner.promote();
         assert!(s.shares_storage_with(&s.clone()));
@@ -5982,7 +5982,7 @@ mod tests {
         let mut n = OwnedValue::NumberLiteral(NumberRepr::Int(5), "5".into());
         assert!(!n.shares_storage_with(&n.clone()));
         let OwnedValue::NumberLiteral(_, spelling) = &mut n else {
-            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- built as a number literal on the line above (#3191)"
+            unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- built as a number literal on the line above (#3191)"
         };
         spelling.promote();
         assert!(n.shares_storage_with(&n.clone()));
@@ -6123,7 +6123,7 @@ mod tests {
     fn as_array_vec(value: &OwnedValue) -> &ArrayVec {
         match value {
             OwnedValue::Array(items) => items,
-            other => panic!("built as an array: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every caller built the value as an array (#2999)"
+            other => panic!("built as an array: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every caller built the value as an array (#2999)"
         }
     }
 
@@ -6366,7 +6366,7 @@ mod tests {
             .skip(1)
         {
             let (OwnedValue::Object(a), OwnedValue::Object(b)) = (a, b) else {
-                unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
+                unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
             };
             assert!(a.is_shared() && b.is_shared());
             assert_eq!(a, b);
@@ -7188,7 +7188,7 @@ mod tests {
         let mut plain_disagrees = 0;
         for line in table.lines() {
             let Some((literal, jq_text)) = line.split_once('\t') else {
-                panic!("malformed oracle row: {line:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for a malformed oracle table (#2936)"
+                panic!("malformed oracle row: {line:?}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for a malformed oracle table (#2936)"
             };
             rows += 1;
             // jq prints an infinite double as the `DBL_MAX` text, so the
@@ -7577,7 +7577,7 @@ mod tests {
         let root = index.root(bytes);
         let crate::json::StandardJson::Number(n) = root.first_child().expect("one element").value()
         else {
-            panic!("{text} is not a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion the calling test makes"
+            panic!("{text} is not a number"); // patchcov: coverage tolerate-line reason="failure message for the assertion the calling test makes"
         };
         OwnedValue::from_json_number::<S>(&n)
     }
@@ -7909,7 +7909,7 @@ mod tests {
                 table.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
                 actual.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
                 "positions for {}",
-                doc.text() // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3069 test exists to make"
+                doc.text() // patchcov: coverage tolerate-line reason="failure message for the assertion this #3069 test exists to make"
             );
             for (position, recorded) in &table {
                 let descended =
@@ -7918,7 +7918,7 @@ mod tests {
                     alloc::format!("{descended:?}"),
                     alloc::format!("{recorded:?}"),
                     "descent to {position} of {}",
-                    doc.text() // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3069 test exists to make"
+                    doc.text() // patchcov: coverage tolerate-line reason="failure message for the assertion this #3069 test exists to make"
                 );
             }
             for ((position, recorded), (_, fresh)) in table.iter().zip(&actual) {
@@ -7926,7 +7926,7 @@ mod tests {
                     assert!(
                         bridge_round_trip_eq(recorded, fresh),
                         "container at {position} of {}: {recorded:?} vs {fresh:?}",
-                        doc.text() // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3069 test exists to make"
+                        doc.text() // patchcov: coverage tolerate-line reason="failure message for the assertion this #3069 test exists to make"
                     );
                 }
             }
@@ -8067,13 +8067,13 @@ mod tests {
         let mut children = doc.root().children();
         let crate::json::StandardJson::Number(nan) = children.next().expect("nan element").value()
         else {
-            panic!("expected a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
+            panic!("expected a number"); // patchcov: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
         };
         assert!(nan.as_f64().is_ok_and(f64::is_nan));
 
         let crate::json::StandardJson::Number(one) = children.next().expect("int element").value()
         else {
-            panic!("expected a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
+            panic!("expected a number"); // patchcov: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
         };
         assert_eq!(one.bridge_value(), None, "1 is not a bridge token");
         assert_eq!(one.as_f64(), Ok(1.0));
@@ -8185,7 +8185,7 @@ mod tests {
                     decodes,
                     value != OwnedValue::Null,
                     "{mode} {:?}",
-                    String::from_utf8_lossy(text) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #3222 sweep's own assertion, only evaluated if the assert's own condition is false (#3222)"
+                    String::from_utf8_lossy(text) // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #3222 sweep's own assertion, only evaluated if the assert's own condition is false (#3222)"
                 );
             }
         }
@@ -9301,7 +9301,7 @@ mod tests {
                 result.mantissa_str.len() <= PREVIEW_MANTISSA_DIGIT_CAP + 2,
                 "mantissa_str must stay capped regardless of input size \
                  (digit_count={digit_count}): got {} chars",
-                result.mantissa_str.len() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3281)"
+                result.mantissa_str.len() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3281)"
             );
             // `digit_count` itself must stay the *true* size -- the cap only
             // bounds what gets copied into `mantissa_str`, never the count
@@ -9319,7 +9319,7 @@ mod tests {
         assert!(
             preview.len() < 100,
             "preview output must stay small regardless of input size: got {} chars",
-            preview.len() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3281)"
+            preview.len() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#3281)"
         );
         assert!(preview.starts_with("9.999999999"), "got: {preview}");
     }
@@ -9852,7 +9852,7 @@ mod tests {
             match (new, old) {
                 (Ok(a), Ok(b)) => assert_eq!(a, b),
                 (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
-                (a, b) => panic!("depth {depth}: {a:?} vs {b:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make: the two serializers disagreeing on whether a nest is too deep (#3479)"
+                (a, b) => panic!("depth {depth}: {a:?} vs {b:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make: the two serializers disagreeing on whether a nest is too deep (#3479)"
             }
         }
     }

@@ -2806,13 +2806,13 @@ impl<'a> JsonNumber<'a> {
     /// Get the raw bytes of the number.
     #[inline]
     pub fn raw_bytes(&self) -> &'a [u8] {
-        // omni-dev: coverage tolerate reason="unreachable in practice: UNMEASURED_SPAN only arises when `end - text_pos` in `number_at` overflows u32 -- a single number span >= 4 GiB -- which no realistic (or practically constructible) test document approaches (#3222)"
+        // patchcov: coverage tolerate reason="unreachable in practice: UNMEASURED_SPAN only arises when `end - text_pos` in `number_at` overflows u32 -- a single number span >= 4 GiB -- which no realistic (or practically constructible) test document approaches (#3222)"
         let end = if self.len == UNMEASURED_SPAN {
             nested_number_span(self.text, self.start)
         } else {
             self.start + self.len as usize
         };
-        // omni-dev: coverage end
+        // patchcov: coverage end
         &self.text[self.start..end]
     }
 
@@ -3585,7 +3585,7 @@ fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize
                 let mut table = KeyHashes::with_capacity(small_count + 1);
                 for &(s, e) in &small_spans[..small_count] {
                     if table.insert(key_hash(&bytes[s..e])) {
-                        return None; // omni-dev: coverage tolerate-line reason="reachable only through a bare 64-bit hash collision between keys the pairwise scan already proved distinct"
+                        return None; // patchcov: coverage tolerate-line reason="reachable only through a bare 64-bit hash collision between keys the pairwise scan already proved distinct"
                     }
                 }
                 if table.insert(key_hash(&bytes[key_start..key_end])) || table.saturated() {
@@ -9260,7 +9260,7 @@ mod tests {
                 let StandardJson::Number(n) = cursor.value() else {
                     panic!(
                         "{doc}: expected a Number at {start}, got {:?}",
-                        cursor.value() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion this #2877 test exists to make"
+                        cursor.value() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion this #2877 test exists to make"
                     );
                 };
                 assert_eq!(n.raw_bytes(), token.as_bytes(), "{doc}");
@@ -9342,7 +9342,7 @@ mod tests {
                 assert!(
                     matches!(child.value(), StandardJson::Error(_)),
                     "{doc}: expected Error, got {:?}",
-                    child.value() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion this #2877 test exists to make"
+                    child.value() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion this #2877 test exists to make"
                 );
                 assert_eq!(child.text_range(), None, "{doc}: text_range");
             }
@@ -9431,7 +9431,7 @@ mod tests {
             let index = JsonIndex::build_reindex(bytes);
             let root = index.root(bytes);
             let StandardJson::Number(n) = root.first_child().expect("one child").value() else {
-                panic!("expected a number"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion this #2877 test exists to make"
+                panic!("expected a number"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion this #2877 test exists to make"
             };
             match expected {
                 None => assert!(n.as_f64().is_ok_and(f64::is_nan), "{token}"),
@@ -9464,7 +9464,7 @@ mod tests {
                 .expect("one child")
                 .value();
             let StandardJson::Number(n) = value else {
-                panic!("expected a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
+                panic!("expected a number"); // patchcov: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
             };
             assert!(
                 n.bridge_value().is_some(),
@@ -9493,7 +9493,7 @@ mod tests {
                 let StandardJson::Number(n) =
                     index.root(bytes).first_child().expect("one child").value()
                 else {
-                    panic!("expected a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
+                    panic!("expected a number"); // patchcov: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
                 };
                 assert!(n.as_f64().is_ok(), "{word}");
                 assert_eq!(n.bridge_value(), None, "{word}");
@@ -9581,12 +9581,12 @@ mod tests {
                             nested_number_span(&text, 0),
                             span.len(),
                             "{:?}",
-                            String::from_utf8_lossy(&span) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #3222 sweep's own assertion, only evaluated if the assert's own condition is false (#3222)"
+                            String::from_utf8_lossy(&span) // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #3222 sweep's own assertion, only evaluated if the assert's own condition is false (#3222)"
                         );
                         assert!(
                             crate::json::validate::number_span_decodes(&span),
                             "{:?}",
-                            String::from_utf8_lossy(&span) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- see the assert_eq! format argument above, same sweep (#3222)"
+                            String::from_utf8_lossy(&span) // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- see the assert_eq! format argument above, same sweep (#3222)"
                         );
                     }
                     next.push(span);
@@ -9612,7 +9612,7 @@ mod tests {
         assert!(
             cursors.len() > 10,
             "the fixture must be big enough to be worth walking, got {}",
-            cursors.len() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
+            cursors.len() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
         );
 
         for c in &cursors {
@@ -9623,7 +9623,7 @@ mod tests {
             assert!(
                 back.same_node(c),
                 "id {id} re-resolved to bp {} instead of {}",
-                back.node_id(), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
+                back.node_id(), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
                 id
             );
             assert_eq!(back.node_id(), id, "the round trip must be idempotent");
@@ -9704,7 +9704,7 @@ mod tests {
                 c.document_token(),
                 token,
                 "bp {} disagreed about its own document",
-                c.node_id() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
+                c.node_id() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
             );
         }
 
@@ -9728,13 +9728,13 @@ mod tests {
         fn fields(v: StandardJson<'_>) -> JsonFields<'_> {
             match v {
                 StandardJson::Object(f) => f,
-                _ => panic!("not an object"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every caller passes an object (#3180)"
+                _ => panic!("not an object"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every caller passes an object (#3180)"
             }
         }
         fn elements(v: StandardJson<'_>) -> JsonElements<'_> {
             match v {
                 StandardJson::Array(e) => e,
-                _ => panic!("not an array"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: every caller passes an array (#3180)"
+                _ => panic!("not an array"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite: every caller passes an array (#3180)"
             }
         }
 
@@ -9824,7 +9824,7 @@ mod tests {
         for json in [&b"{}"[..], b"[]", b"{\"a\":1}", b"[1]"] {
             let index = JsonIndex::build(json);
             let shown = format!("{:?}", index.root(json).value());
-            assert!(!shown.contains(&tag), "{shown}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- panic-message format argument (#3180)"
+            assert!(!shown.contains(&tag), "{shown}"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- panic-message format argument (#3180)"
             let empty = json.len() == 2;
             assert_eq!(shown.contains("empty_container"), empty, "{shown}");
         }

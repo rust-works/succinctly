@@ -102,7 +102,7 @@ impl Drop for Events {
         // in-process test that would have to set the variable for every
         // other test thread too; `exit_report` below is what is tested.
         if std::env::var_os("SUCCINCTLY_SHARE_STATS").is_some() {
-            std::eprint!("{}", exit_report(&self.0.borrow())); // omni-dev: coverage tolerate-line reason="process-global env var; exercised by the CLI audit run, not by an in-process test (#2999)"
+            std::eprint!("{}", exit_report(&self.0.borrow())); // patchcov: coverage tolerate-line reason="process-global env var; exercised by the CLI audit run, not by an in-process test (#2999)"
         }
     }
 }
