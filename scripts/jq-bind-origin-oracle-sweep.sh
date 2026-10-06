@@ -197,6 +197,19 @@
 # *computed* at a position, or an extremum rule that places the first of two
 # equal elements where jq returns the last, is no proof of the node there.
 #
+# The `fold-loop-var-*` rows are #3329: a fold's own loop variable used in
+# path position inside its UPDATE or EXTRACT. jq's `$x` is the very `jv` the
+# source yielded, so a write or `path()` through it answers exactly while the
+# accumulator still *is* that `jv`; the fold used to splice it in as a rebuilt
+# literal and refused all of them. A container loop variable is now a marker
+# sharing the source element's storage, and INIT's own `Rc` is registered so
+# the generic route's source reuses it. The `-refuses` rows are the other
+# half (a literal INIT, a rebuilt or written accumulator, a second step, a
+# round-tripped source, an equal sibling, and every later INIT fork -- jq
+# evaluates SOURCE against `null` there): both binaries must exit 5. The
+# `-input-route` rows reach `eval.rs`'s owned fold the same way the
+# `owned-embed-*` rows do.
+#
 # Usage:
 #   cargo build --release --features cli
 #   ./scripts/jq-bind-origin-oracle-sweep.sh                 # TSV + summary; exit 1 on fabricate/mismatch/new refuse-only
@@ -1120,6 +1133,32 @@ owned-embed-fold-assign-compound-sum	{"a":{"k":1},"b":2}	. as $d | reduce (1,2,3
 owned-embed-fold-assign-alt-first-wins	{"a":{"k":1},"b":2}	. as $d | reduce (1,2,3) as $i ({}; .a //= $i) | .a
 owned-embed-fold-assign-update-add	{"a":{"k":1},"b":2}	. as $d | reduce (1,2,3) as $i (.; .b |= . + $i) | .b
 owned-embed-fold-assign-deep-field	{"a":{"k":1},"b":2}	. as $d | reduce (1,2) as $i (.; .a.k = $i) | .a.k
+fold-loop-var-reduce-write	{"a":1}	reduce (.) as $x (.; ($x.a) = 9)
+fold-loop-var-foreach-write	{"a":1}	foreach (.) as $x (.; ($x.a) = 9)
+fold-loop-var-reduce-path	{"a":1}	reduce (.) as $x (.; path($x))
+fold-loop-var-owned-array-element	{"a":1}	[.] | reduce .[0] as $x (.; del(.[0] | $x))
+fold-loop-var-update-op	{"a":1}	reduce (.) as $x (.; ($x.a) |= . + 1)
+fold-loop-var-del	{"a":1}	reduce (.) as $x (.; del($x.a))
+fold-loop-var-foreach-extract-path	{"a":1}	foreach (.) as $x (.; .; path($x))
+fold-loop-var-foreach-extract-write	{"a":1}	foreach (.) as $x (.; .; ($x.a) = 9)
+fold-loop-var-nested-fold	{"a":1}	reduce (.) as $x (.; reduce (.) as $y (.; ($x.a) = 9))
+fold-loop-var-destructured	{"a":1}	reduce ([.]) as [$x] (.; ($x.a) = 9)
+fold-loop-var-destructured-object	{"a":1}	reduce ({k:.}) as {k:$x} (.; ($x.a) = 9)
+fold-loop-var-limit-foreach	{"a":1}	[limit(1; foreach (.,.) as $x (.; ($x.a) = 9; .))]
+fold-loop-var-same-init-navigated	{"a":{"b":1},"c":{"b":1}}	reduce .a as $x (.a; ($x.b) = 9)
+fold-loop-var-input-route	{"a":1} {"a":1}	input | reduce (.) as $x (.; ($x.a) = 9)
+fold-loop-var-input-route-path	{"a":1} {"a":1}	input | reduce (.) as $x (.; path($x))
+fold-loop-var-input-route-foreach	{"a":1} {"a":1}	input | foreach (.) as $x (.; ($x.a) = 9)
+fold-loop-var-literal-init-refuses	{"a":1}	reduce (.) as $x ({a:1}; ($x.a) = 9)
+fold-loop-var-rebuilt-update-refuses	{"a":1}	reduce (.) as $x (.; {a:1} | ($x.a) = 9)
+fold-loop-var-second-step-refuses	{"a":1}	reduce (.,.) as $x (.; ($x.a) = 9)
+fold-loop-var-written-acc-refuses	{"a":1}	reduce (.) as $x (.; .a = 5 | path($x))
+fold-loop-var-roundtrip-acc-refuses	{"a":1}	reduce (.) as $x (.; tojson | fromjson | path($x))
+fold-loop-var-roundtrip-source-refuses	{"a":1}	reduce (. | tojson | fromjson) as $x (.; path($x))
+fold-loop-var-equal-sibling-refuses	{"a":{"b":1},"c":{"b":1}}	reduce .a as $x (.c; ($x.b) = 9)
+fold-loop-var-later-init-fork-refuses	{"a":1}	reduce (.) as $x ((.,.); ($x.a) = 9)
+fold-loop-var-later-init-fork-foreach-refuses	{"a":1}	[foreach (.) as $x ((.,.); ($x.a) = 9; .)]
+fold-loop-var-scalar-refuses	"s"	reduce (.) as $x (.; path($x))
 CASES_EOF
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
@@ -1144,7 +1183,6 @@ destructure-alt-navigation:#2649 residue 3 -- the body navigates the ambient inp
 destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nested Pipe gets no register, so $q[0] inside a comma raises near-access (limitations.md, #2042)
 carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
-in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
 owned-embed-fold-update-rebuilt-by-nonwrite:#3181 review -- a witnessed step runs its UPDATE through the owned re-index bridge, so even an UPDATE returning `.` hands the next step a rebuilt copy (the owned-embed-fold-if-identity mechanism)
 owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
@@ -1172,6 +1210,7 @@ scalar-number-keeps-ltrimstr-passthrough:#3191 -- a bound scalar has storage ide
 scalar-constant-pool-number-def:#3191 -- jq's constant pool loads one `jv` for a def's literal across calls; here each evaluation of a literal is a fresh value and only a bind promotes one, so the two calls are two storages (the two-literal twin refuses in both)
 scalar-constant-pool-string-def:same as scalar-constant-pool-number-def, for a string literal
 bound-comma-nested-node-refuse-only:#3477 -- a comma sequence shares a node only when it names that node twice; `.a` inside a `.` element is a descendant of another element, and the materialized copy of `.` has already built its own `.a`, so jq's shared jv is not shared here (the exact-node memo is deliberate: descendant sharing is the embed table's job and needs a bind to register)
+fold-loop-var-scalar-refuses:#3329 -- a fold's loop variable is marked for containers only; a scalar has no storage identity until a bind promotes it (#3191), so `reduce (.) as $x (.; path($x))` on a string or number refuses where jq answers
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then
