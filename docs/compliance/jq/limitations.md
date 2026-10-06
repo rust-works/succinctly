@@ -1193,11 +1193,13 @@ is the revert that established what the other one costs.
      `any`, `all` and `isempty(g)` were the examples (`del(try (any and .a))` on `{"a":true}`
      leaves the document in jq); since #3749 and #3763 a deciding or emitting generator states the
      register it left, so the refusal of `.a` is exact and a `try` catches it as jq's does, and
-     the row now leaves the document here too. The same holds for a right operand
-     wrapped in `?`: a bare `.a?` is jq's `INDEX_OPT`, which suppresses a type error but not a
-     path error, so on the node the register may still be on its refusal is a guess even when the
-     step could never succeed, and a `(.a)?`/`(.a | .b)?` first step is no longer pruned silently
-     there. Refuse-only, and pinned
+     the row now leaves the document here too, as it does for `flatten`, `sort` and `to_entries`,
+     which leave the register where it entered (#3361; pinned by
+     `test_try_around_and_or_by_value_operand_answers_as_jq_3645`, #3645). The same holds for a
+     right operand wrapped in `?`: a bare `.a?` is jq's `INDEX_OPT`, which suppresses a type error
+     but not a path error, so on the node the register may still be on its refusal is a guess even
+     when the step could never succeed, and a `(.a)?`/`(.a | .b)?` first step is no longer pruned
+     silently there. Refuse-only, and pinned
      (`test_and_or_path_by_value_operands_track_the_register_3428`). The same holds for
      the refusal of an untracked iteration: `path(. as $x | ["a"] | try join(",") catch . | $x)`
      is `[]` in jq and exits 5 here, for `add`, `flatten` and `flatten(n)`/`join(s)` alike (the
